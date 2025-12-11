@@ -112,10 +112,11 @@ class BertSelfAttention(nn.Module):
 
         if self.config.aie_config.use_aie_softmax:
             self.softmax = AIESoftmax(
-                num_columns=8,
+                num_aie_columns=8,
                 num_channels=2,
-                size=512**2,
-                last_dim=512,
+                rows=512,
+                cols=512,
+                tile_size=512,
             )
         else:
             self.softmax = nn.Softmax(dim=-1)
@@ -224,7 +225,7 @@ class BertSelfOutput(nn.Module):
         if config.aie_config.use_aie_layernorm:
             self.LayerNorm = AIELayerNorm(
                 size=512 * config.model_config.hidden_size,
-                eps=config.model_config.layer_norm_eps,
+                # eps=config.model_config.layer_norm_eps,
                 num_aie_columns=8,
                 num_channels=2,
                 tile_size=config.model_config.hidden_size,
@@ -241,7 +242,7 @@ class BertSelfOutput(nn.Module):
         if self.use_aie_elementwise_add:
             self.aie_elementwise_add = AIEElementwiseAdd(
                 size=512 * config.model_config.hidden_size,
-                num_columns=8,
+                num_aie_columns=8,
                 num_channels=2,
                 tile_size=config.model_config.hidden_size,
             )

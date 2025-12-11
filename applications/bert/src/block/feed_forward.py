@@ -106,7 +106,7 @@ class BertOutput(nn.Module):
         if config.aie_config.use_aie_layernorm:
             self.LayerNorm = AIELayerNorm(
                 size=512 * config.model_config.hidden_size,
-                eps=config.model_config.layer_norm_eps,
+                # eps=config.model_config.layer_norm_eps,
                 num_aie_columns=8,
                 num_channels=2,
                 tile_size=config.model_config.hidden_size,
@@ -123,7 +123,7 @@ class BertOutput(nn.Module):
         if self.use_aie_elementwise_add:
             self.aie_elementwise_add = AIEElementwiseAdd(
                 size=512 * config.model_config.hidden_size,
-                num_columns=8,
+                num_aie_columns=8,
                 num_channels=2,
                 tile_size=config.model_config.hidden_size,
             )

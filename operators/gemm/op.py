@@ -250,7 +250,10 @@ class AIEGEMM(AIEOperatorBase):
                 A_inp = A.squeeze(0)
             if B is not None and len(B.shape) > 2 and B.shape[0] == 1:
                 B_inp = B.squeeze(0)
-            return self._do_unbatched_gemm(A_inp, B_inp)
+            result = self._do_unbatched_gemm(A_inp, B_inp)
+            if len(result.shape) < len(A.shape):
+                result = result.unsqueeze(0)
+            return result
         else:
             return self._do_batched_gemm(A, B)
 

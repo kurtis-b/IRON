@@ -18,10 +18,10 @@
     "device": "npu2",
     "dtype": "bfloat16",
     "use_aie_gemm": true,
-    "use_aie_gelu": false,
-    "use_aie_softmax": false,
-    "use_aie_layernorm": false,
-    "use_aie_elementwise_add": false,
+    "use_aie_gelu": true,
+    "use_aie_softmax": true,
+    "use_aie_layernorm": true,
+    "use_aie_elementwise_add": true,
     "use_aie_elementwise_mul": false,
     "use_aie_transpose": false
   }
