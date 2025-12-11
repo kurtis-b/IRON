@@ -22,10 +22,10 @@
 import torch
 import torch.nn as nn
 from ..utils import assign
-from src.operator.aie_gemm import AIEGEMM
-from src.operator.aie_softmax import AIESoftmax
-from src.operator.aie_elementwise_add import AIEElementwiseAdd
-from src.operator.aie_layer_norm import AIELayerNorm
+from operators import AIEGEMM
+from operators import AIESoftmax
+from operators import AIEElementwiseAdd
+from operators import AIELayerNorm
 
 
 class BertSelfAttention(nn.Module):
@@ -225,9 +225,10 @@ class BertSelfOutput(nn.Module):
             self.LayerNorm = AIELayerNorm(
                 size=512 * config.model_config.hidden_size,
                 eps=config.model_config.layer_norm_eps,
-                num_columns=8,
+                num_aie_columns=8,
                 num_channels=2,
                 tile_size=config.model_config.hidden_size,
+                weighted=True,
             )
         else:
             self.LayerNorm = nn.LayerNorm(

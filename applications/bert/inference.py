@@ -19,6 +19,13 @@
 # Reference used:
 # https://medium.com/@alexmriggio/bert-for-sequence-classification-from-scratch-code-and-theory-fb88053800fa
 
+import sys
+from pathlib import Path
+
+# Add IRON repository root to Python path
+repo_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(repo_root))
+
 import torch
 import torch.nn as nn
 from transformers import BertTokenizer
@@ -26,7 +33,6 @@ from transformers import (
     BertForSequenceClassification as HFBertForSequenceClassification,
 )
 import logging
-import sys
 from safetensors.torch import load_file
 import json
 from types import SimpleNamespace
@@ -38,8 +44,7 @@ from torch.utils.data import DataLoader
 import argparse
 from safetensors.torch import save_file
 from src.model import BertForSequenceClassification
-from src.operator.aie_base import AIEOperatorBase
-from src.model import BertForSequenceClassification
+from operators.common import AIEOperatorBase
 
 # Global logger for profiling
 _profile_logger = None

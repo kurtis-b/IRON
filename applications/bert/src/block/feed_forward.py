@@ -22,10 +22,10 @@
 import torch
 import torch.nn as nn
 from ..utils import assign
-from src.operator.aie_gemm import AIEGEMM
-from src.operator.aie_gelu import AIEGeLU
-from src.operator.aie_elementwise_add import AIEElementwiseAdd
-from src.operator.aie_layer_norm import AIELayerNorm
+from operators import AIEGEMM
+from operators import AIEGELU
+from operators import AIEElementwiseAdd
+from operators import AIELayerNorm
 
 
 class BertIntermediate(nn.Module):
@@ -54,9 +54,9 @@ class BertIntermediate(nn.Module):
                 dtype=config.aie_config.dtype,
             )
         if config.aie_config.use_aie_gelu:
-            self.gelu = AIEGeLU(
+            self.gelu = AIEGELU(
                 size=512 * config.model_config.intermediate_size,
-                num_columns=8,
+                num_aie_columns=8,
                 num_channels=2,
                 tile_size=config.model_config.intermediate_size,
             )
@@ -107,9 +107,10 @@ class BertOutput(nn.Module):
             self.LayerNorm = AIELayerNorm(
                 size=512 * config.model_config.hidden_size,
                 eps=config.model_config.layer_norm_eps,
-                num_columns=8,
+                num_aie_columns=8,
                 num_channels=2,
                 tile_size=config.model_config.hidden_size,
+                weighted=True,
             )
         else:
             self.LayerNorm = nn.LayerNorm(
