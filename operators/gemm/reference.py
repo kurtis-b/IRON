@@ -6,16 +6,120 @@ from operators.common.utils import torch_dtype_map
 
 
 def generate_golden_reference(
-    M: int, K: int, N: int, dtype="bf16", seed=42, b_col_maj=False, c_col_maj=False
+    M: int,
+    K: int,
+    N: int,
+    dtype="bf16",
+    seed=42,
+    b_col_maj=False,
+    c_col_maj=False,
+    batch_A=(1, 0),
+    batch_B=(1, 0),
+    batch_C=(1, 0),
 ):
+    """Generate golden reference for GEMM operation.
+
+    Args:
+        M: Number of rows in matrix A
+        K: Number of columns in A / rows in B
+        N: Number of columns in matrix B
+        dtype: Data type for tensors
+        seed: Random seed for reproducibility
+        b_col_maj: Whether B matrix is column-major
+        c_col_maj: Whether output C matrix is column-major
+        batch_A: Tuple of (batch size, batch stride dim) for matrix A
+        batch_B: Tuple of (batch size, batch stride dim) for matrix B
+        batch_C: Tuple of (batch size, batch stride dim) for output matrix C
+
+    Returns:
+        Dictionary with 'input', 'input_b', and 'output' tensors
+    """
     torch.manual_seed(seed)
     val_range = 4
     dtype_torch = torch_dtype_map[dtype]
-    input_a = torch.randn(M, K, dtype=dtype_torch) * val_range
-    input_b = torch.rand(K, N, dtype=dtype_torch) * val_range
-    output = torch.matmul(input_a, input_b)
-    if b_col_maj:
-        input_b = input_b.T
-    if c_col_maj:
-        output = output.T
+
+    batch_size_A, batch_stride_dim_A = batch_A
+    batch_size_B, batch_stride_dim_B = batch_B
+    batch_size_C, batch_stride_dim_C = batch_C
+
+    # Determine if this is a batched operation
+    is_batched = batch_size_C > 1
+
+    if is_batched:
+        # Generate batched inputs based on batch stride dimensions
+        if batch_stride_dim_A == 0:
+            input_a = torch.randn(batch_size_A, M, K, dtype=dtype_torch) * val_range
+        else:
+            input_a = torch.randn(M, batch_size_A, K, dtype=dtype_torch) * val_range
+
+        if batch_stride_dim_B == 0:
+            input_b = torch.rand(batch_size_B, K, N, dtype=dtype_torch) * val_range
+        else:
+            input_b = torch.rand(K, batch_size_B, N, dtype=dtype_torch) * val_range
+
+        # Compute batched matrix multiplication
+        # For batch_stride_dim == 0: (batch, M, K) @ (batch, K, N) -> (batch, M, N)
+        # For batch_stride_dim == 1: need to move batch dim for matmul
+        if batch_stride_dim_A == 0:
+            input_a_perm = input_a  # (batch, M, K)
+        else:
+            input_a_perm = input_a.permute(1, 0, 2)  # (batch, M, K)
+
+        if batch_stride_dim_B == 0:
+            input_b_perm = input_b  # (batch, K, N)
+        else:
+            input_b_perm = input_b.permute(1, 0, 2)  # (batch, K, N)
+
+        output_perm = torch.matmul(input_a_perm, input_b_perm)  # (batch, M, N)
+
+        if batch_stride_dim_C == 1:
+            output = output_perm.permute(1, 0, 2)  # (M, batch, N)
+        else:
+            output = output_perm  # (batch, M, N)
+
+        # Combine into 2D matrices across the batch stride dimension
+        if batch_stride_dim_A == 0:
+            # Combine along first dimension: (batch, M, K) -> (batch*M, K)
+            input_a = input_a.reshape(batch_size_A * M, K)
+        else:
+            # Combine along last dimension: (M, K, batch) -> (M, K*batch)
+            input_a = input_a.reshape(M, K * batch_size_A)
+
+        if batch_stride_dim_B == 0:
+            # Combine along first dimension: (batch, K, N) -> (batch*K, N)
+            input_b = input_b.reshape(batch_size_B * K, N)
+        else:
+            # Combine along last dimension: (K, N, batch) -> (K, N*batch)
+            input_b = input_b.reshape(K, N * batch_size_B)
+
+        if batch_stride_dim_C == 0:
+            # Combine along first dimension: (batch, M, N) -> (batch*M, N)
+            output = output.reshape(batch_size_C * M, N)
+        else:
+            # Combine along last dimension: (M, N, batch) -> (M, N*batch)
+            output = output.reshape(M, N * batch_size_C)
+
+        if b_col_maj:
+            # Transpose last two dimensions for each batch
+            if batch_stride_dim_B == 0:
+                input_b = input_b.transpose(-2, -1)
+            else:
+                input_b = input_b.transpose(0, 1)
+        if c_col_maj:
+            # Transpose last two dimensions for each batch
+            if batch_stride_dim_C == 0:
+                output = output.transpose(-2, -1)
+            else:
+                output = output.transpose(0, 1)
+    else:
+        # Generate non-batched inputs
+        input_a = torch.randn(M, K, dtype=dtype_torch) * val_range
+        input_b = torch.rand(K, N, dtype=dtype_torch) * val_range
+        output = torch.matmul(input_a, input_b)
+
+        if b_col_maj:
+            input_b = input_b.T
+        if c_col_maj:
+            output = output.T
+
     return {"input": input_a, "input_b": input_b, "output": output}

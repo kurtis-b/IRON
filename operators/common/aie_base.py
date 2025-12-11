@@ -89,25 +89,47 @@ class AIEOperatorBase(ABC):
     def get_bo(self, buffer_name):
         return self.buffer_bos[buffer_name]
 
-    def read_buffer(self, buffer_name, shape, dtype=bfloat16):
+    def read_buffer(self, buffer_name, shape, copy=False, dtype=bfloat16):
         """Read buffer and return values as a numpy array"""
-        size = np.prod(shape) * np.dtype(dtype).itemsize
-        output_bytes = self.get_bo(buffer_name).read(size, 0)
-        output_data_flat = np.frombuffer(output_bytes, dtype=dtype)
-        return output_data_flat.reshape(*shape)
+        # Total bytes
+        size = int(np.prod(shape)) * np.dtype(dtype).itemsize
+
+        # Map once; map() should return a Python buffer interface over the BO
+        mv = self.get_bo(buffer_name).map()
+
+        # Create a NumPy view over mapped memory (zero-copy)
+        arr = np.frombuffer(mv, dtype=dtype, count=np.prod(shape)).reshape(shape)
+
+        # Return a snapshot if the BO will be reused or modified later
+        return arr.copy() if copy else arr
 
     def read_buffer_as_torch(self, buffer_name, shape, dtype=bfloat16):
         return numpy_to_torch(self.read_buffer(buffer_name, shape, dtype))
 
     def write_buffer(self, buffer_name, array):
         """Write buffer from a numpy array into a XRT buffer object"""
-        if isinstance(array, torch.Tensor):
-            numpy_array = torch_to_numpy(array)
-        else:
-            numpy_array = array
         if buffer_name in self.buffer_static_data:
             raise RuntimeError(f"Cannot write to static buffer: {buffer_name}")
-        self.get_bo(buffer_name).write(numpy_array.flatten().view(np.uint8), 0)
+
+        # Normalize the source
+        if isinstance(array, torch.Tensor):
+            src = torch_to_numpy(array)
+        else:
+            src = np.asarray(array)
+
+        if not src.flags["C_CONTIGUOUS"]:
+            src = np.ascontiguousarray(src)
+
+        # Create a byte view of the source without extra copies
+        src_bytes = src.ravel().view(np.uint8)
+
+        bo = self.get_bo(buffer_name)
+        ptr = bo.map()  # pointer-like buffer
+        # Create a numpy array that aliases the BO memory
+        dst_bytes = np.frombuffer(ptr, dtype=np.uint8, count=bo.size())
+
+        # Copy bytes; releases GIL and uses optimized memcpy
+        np.copyto(dst_bytes[: src_bytes.size], src_bytes, casting="no")
 
     @abstractmethod
     def set_up_artifacts(self):
