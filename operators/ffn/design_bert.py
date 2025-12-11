@@ -12,16 +12,18 @@ from aie.iron import (
     Kernel,
     ObjectFifo,
     Program,
-    Buffer,
+    GlobalBuffer,
     Runtime,
     Worker,
     WorkerRuntimeBarrier,
+    LocalBuffer,
     str_to_dtype,
 )
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
+from aie.helpers.dialects.ext.scf import if_, else_
 
 
 microkernel_mac_dim_map = {
@@ -38,57 +40,6 @@ microkernel_mac_dim_map = {
 }
 
 
-# Parse batch configuration tuples
-def parse_batch_tuple(batch_str):
-    """Parse a batch configuration string like '(1,0,0)' into a tuple of ints."""
-    if batch_str is None:
-        return None
-    try:
-        # Remove parentheses and split by comma
-        batch_str = batch_str.strip()
-        if batch_str.startswith("("):
-            batch_str = batch_str[1:]
-        if batch_str.endswith(")"):
-            batch_str = batch_str[:-1]
-        parts = [int(x.strip()) for x in batch_str.split(",")]
-        if len(parts) != 3:
-            raise ValueError(
-                "Batch tuple must have exactly 3 elements: (batch_size, batch_stride_dim)"
-            )
-        return tuple(parts)
-    except Exception as e:
-        raise ValueError(
-            f"Invalid batch tuple format: {batch_str}. Expected format: '(batch_size,batch_stride_dim)'. Error: {e}"
-        )
-
-
-def get_batch_offset(dim_0, dim_1, batch_idx, batch_stride_dim, col_maj):
-    """dim_0 and dim_1 are the hardware dimensions"""
-    if col_maj:  # (dim_0, dim_1)
-        if batch_stride_dim == 0:  # stride across row dim for batch
-            return batch_idx * dim_0 * dim_1
-        else:  # stride across col dim for batch
-            return batch_idx * dim_1
-    else:  # (dim_1, dim_0)
-        if batch_stride_dim == 0:  # stride across row dim for batch
-            return batch_idx * dim_1 * dim_0
-        else:  # stride across col dim for batch
-            return batch_idx * dim_0
-
-
-def get_shape_with_batch(dim_0, dim_1, batch_size, batch_stride_dim, col_maj):
-    if col_maj:  # (dim_0, dim_1)
-        if batch_stride_dim == 0:  # batch size applied to row dim
-            return (dim_0 * batch_size, dim_1)
-        else:  # batch size applied to col dim
-            return (dim_0, dim_1 * batch_size)
-    else:  # (dim_1, dim_0)
-        if batch_stride_dim == 0:  # batch size applied to row dim
-            return (dim_1 * batch_size, dim_0)
-        else:  # batch size applied to col dim
-            return (dim_1, dim_0 * batch_size)
-
-
 def main():
     argparser = argparse.ArgumentParser(
         prog="AIE Matrix Multiplication MLIR Design (Whole Array)",
@@ -100,7 +51,8 @@ def main():
     argparser.add_argument("-N", type=int, default=512)
     argparser.add_argument("-m", type=int, default=64)
     argparser.add_argument("-k", type=int, default=64)
-    argparser.add_argument("-n", type=int, default=32)
+    argparser.add_argument("-n", type=int, default=64)
+    argparser.add_argument("-c", type=int, default=1)
     argparser.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=4)
     argparser.add_argument("--b-col-maj", type=int, choices=[0, 1], default=0)
     argparser.add_argument("--c-col-maj", type=int, choices=[0, 1], default=0)
@@ -136,27 +88,6 @@ def main():
         type=str,
         help="Output file path for the generated MLIR module",
     )
-    argparser.add_argument(
-        "--batch-A",
-        type=str,
-        default=None,
-        help="Batch configuration for matrix A as tuple: (batch_size, batch_stride_dim). "
-        "Example: '(2,0)' for batch_size=2, batch_stride_dim=0",
-    )
-    argparser.add_argument(
-        "--batch-B",
-        type=str,
-        default=None,
-        help="Batch configuration for matrix B as tuple: (batch_size, batch_stride_dim). "
-        "Example: '(2,0)' for batch_size=2, batch_stride_dim=0",
-    )
-    argparser.add_argument(
-        "--batch-C",
-        type=str,
-        default=None,
-        help="Batch configuration for matrix C as tuple: (batch_size, batch_stride_dim). "
-        "Example: '(2,0)' for batch_size=2, batch_stride_dim=0",
-    )
 
     args = argparser.parse_args()
     maybe_module = my_matmul(
@@ -167,6 +98,7 @@ def main():
         args.m,
         args.k,
         args.n,
+        args.c,
         args.n_aie_cols,
         args.dtype_in,
         args.dtype_out,
@@ -178,9 +110,6 @@ def main():
         args.trace_size,
         args.archive,
         args.generate_taps,
-        parse_batch_tuple(args.batch_A),
-        parse_batch_tuple(args.batch_B),
-        parse_batch_tuple(args.batch_C),
     )
 
     if args.generate_taps:
@@ -204,6 +133,7 @@ def my_matmul(
     m,
     k,
     n,
+    c,
     n_aie_cols,
     dtype_in_str,
     dtype_out_str,
@@ -215,38 +145,23 @@ def my_matmul(
     trace_size,
     archive=None,
     generate_taps=False,
-    batch_A=None,
-    batch_B=None,
-    batch_C=None,
 ):
-    batch_A_size, batch_A_stride_dim = batch_A
-    batch_B_size, batch_B_stride_dim = batch_B
-    batch_C_size, batch_C_stride_dim = batch_C
-    batched_A_shape = get_shape_with_batch(
-        K, M, batch_A_size, batch_A_stride_dim, col_maj=False
-    )
-    batched_B_shape = get_shape_with_batch(
-        N, K, batch_B_size, batch_B_stride_dim, col_maj=b_col_maj
-    )
-    batched_C_shape = get_shape_with_batch(
-        N, M, batch_C_size, batch_C_stride_dim, col_maj=c_col_maj
-    )
-    n_aie_rows = 4
+    n_aie_rows = 2
 
     dtype_in = str_to_dtype(dtype_in_str)
     dtype_out = str_to_dtype(dtype_out_str)
 
-    # When using more AIE columns than n_aie_rows (4) (applicable to NPU2),
+    # When using more AIE columns than n_aie_rows (2) (applicable to NPU2),
     # restrict the number of shim/mem tiles to n_aie_rows,
     # since we have only n_aie_rows row tiles for matrix A
-    # When using n_aie_rows (4) or less AIE columns (both NPU and NPU2),
+    # When using n_aie_rows (2) or less AIE columns (both NPU and NPU2),
     # the number of shim/mem tiles are equal to n_aie_cols.
     # We use the distribute pattern in object FIFO (see linking for A below),
-    # since we have n_aie_rows (4) row tiles for matrix A
+    # since we have n_aie_rows (2) row tiles for matrix A
     n_shim_mem_A = min(n_aie_cols, n_aie_rows)
 
-    # Integer division when n_aie_cols < 4, otherwise set to 1
-    n_A_tiles_per_shim = n_aie_rows // n_aie_cols if n_aie_cols < 4 else 1
+    # Integer division when n_aie_cols < 2, otherwise set to 1
+    n_A_tiles_per_shim = n_aie_rows // n_aie_cols if n_aie_cols < n_aie_rows else 1
 
     mem_tile_m_A = m * n_A_tiles_per_shim
     mem_tile_m_C = m * n_aie_rows
@@ -257,7 +172,7 @@ def my_matmul(
             dtype_out_str == "bf16"
         ), f"prio_accuracy flag is a feature only for bfloat16 output data types"
         use_larger_internal_buffer = True
-        # If prio_accuracy flag is enabled, gemm for bfloat16 will accumulate in place with a f32 buffer,
+        # If prio_accuracy flag is enabled, up_proj_gelu for bfloat16 will accumulate in place with a f32 buffer,
         # which will be converted to bf16 after the reduction loop finishes for output transfer to L2
         dtype_out_internal = str_to_dtype("f32")
         assert np.issubdtype(dtype_in, np.integer) == np.issubdtype(
@@ -308,8 +223,8 @@ def my_matmul(
     # Conceptually, we do the same as with A, but instead of broadcasting
     # across columns we broadcast across rows and distribute across columns.
     assert (
-        N % mem_tile_n == 0
-    ), """B must be tileable into (k, n * n_aie_cols)-sized blocks"""
+        N % (mem_tile_n * c) == 0
+    ), """B must be tileable into (k, n * n_aie_cols * c)-sized blocks"""
 
     # Output matrix C:
     # Conceptually, we divide output C into (m * n_rows, n)-sized blocks. These
@@ -349,9 +264,9 @@ def my_matmul(
     C_taps = []
 
     # Define tensor types
-    A_ty = np.ndarray[batched_A_shape, np.dtype[dtype_in]]
-    B_ty = np.ndarray[batched_B_shape, np.dtype[dtype_in]]
-    C_ty = np.ndarray[batched_C_shape, np.dtype[dtype_out]]
+    A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
+    B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
+    C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
     A_l2_ty = np.ndarray[(mem_tile_m_A * k,), np.dtype[dtype_in]]
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
     C_l2_ty = np.ndarray[(mem_tile_m_C * n,), np.dtype[dtype_out]]
@@ -361,7 +276,7 @@ def my_matmul(
 
     # AIE Core Function declarations
     scalar_suffix = "_scalar" if use_scalar else ""
-    archive_name = f"gemm_{m}x{k}x{n}_archive.a" if archive is None else archive
+    archive_name = f"ffn_{m}x{k}x{n}_archive.a" if archive is None else archive
     if use_larger_internal_buffer:
         # Fix fifo depth for C objfifo to 1 since 1 buffer will be used for accumulation
         # and another for transfer to L2
@@ -386,6 +301,11 @@ def my_matmul(
             archive_name,
             [A_l1_ty, B_l1_ty, C_l1_ty_internal],
         )
+        eltwise_add_vector = Kernel(
+            "eltwise_add_f32_vector",
+            archive_name,
+            [C_l1_ty_internal, C_l1_ty_internal, C_l1_ty_internal, np.int32],
+        )
     else:
         # No need to use separate buffers for accumulation and transfer to L2, so
         # we only need the zero and matmul kernels
@@ -401,6 +321,16 @@ def my_matmul(
             archive_name,
             [A_l1_ty, B_l1_ty, C_l1_ty],
         )
+        eltwise_add_vector = Kernel(
+            "eltwise_add_bf16_vector",
+            archive_name,
+            [C_l1_ty, C_l1_ty, C_l1_ty, np.int32],
+        )
+        mem_copy_fcn = Kernel(
+            "passThroughLine",
+            archive_name,
+            [C_l1_ty, C_l1_ty, np.int32],
+        )
 
     # Tile declarations as tile[row][col]
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
@@ -413,15 +343,35 @@ def my_matmul(
     B_l3l2_fifos = [None] * n_aie_cols
     B_l2l1_fifos = [None] * n_aie_cols
 
-    C_l1l2_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
-    C_l2l3_fifos = [None] * n_aie_cols
+    # Partial C tiles pipelined from up_proj_gelu core to add core
+    C_partial_l1l1_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
+
+    # Partial C tiles for accumulation
+    C_partial_l1l2_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
+    C_partial_l2l1_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
+
+    # Output C tiles
+    C_out_l1l2_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
+    C_out_l2l3_fifos = [None] * n_aie_cols
 
     # Runtime parameters
-    rtps = [
+    rtps_up_proj_gelu = [
         [
-            Buffer(
+            GlobalBuffer(
                 np.ndarray[(2,), np.dtype[np.int32]],
-                name=f"rtp{row}_{col}",
+                name=f"rtp_up_proj_gelu{row}_{col}",
+                initial_value=np.array([0, 0], dtype=np.int32),
+                use_write_rtp=True,
+            )
+            for col in range(n_aie_cols)
+        ]
+        for row in range(n_aie_rows)
+    ]
+    rtps_down_proj = [
+        [
+            GlobalBuffer(
+                np.ndarray[(2,), np.dtype[np.int32]],
+                name=f"rtp_down_proj{row}_{col}",
                 initial_value=np.array([0, 0], dtype=np.int32),
                 use_write_rtp=True,
             )
@@ -431,7 +381,11 @@ def my_matmul(
     ]
 
     # Create barriers to synchronize individual workers with the runtime sequence
-    workerBarriers = [
+    workerBarriersUpProj = [
+        [WorkerRuntimeBarrier() for col in range(n_aie_cols)]
+        for row in range(n_aie_rows)
+    ]
+    workerBarriersDownProj = [
         [WorkerRuntimeBarrier() for col in range(n_aie_cols)]
         for row in range(n_aie_rows)
     ]
@@ -489,14 +443,41 @@ def my_matmul(
             )
         )
 
-        # Output C
+    # Partial C
+    for col in range(n_aie_cols):
+        for row in range(n_aie_rows):
+            C_partial_l1l1_fifos[row][col] = ObjectFifo(
+                C_l1_ty_internal if use_larger_internal_buffer else C_l1_ty,
+                name=f"C_partial_L1L1_{col}_{row}",
+                depth=fifo_depth,
+            )
+            C_partial_l1l2_fifos[row][col] = ObjectFifo(
+                C_l1_ty_internal if use_larger_internal_buffer else C_l1_ty,
+                name=f"C_partial_L1L2_{col}_{row}",
+                depth=fifo_depth_out,
+            )
+            C_partial_l2l1_fifos[row][col] = (
+                C_partial_l1l2_fifos[row][col]
+                .cons(depth=c)
+                .forward(
+                    obj_type=(
+                        C_l1_ty_internal if use_larger_internal_buffer else C_l1_ty
+                    ),
+                    name=f"C_partial_L2L1_{col}_{row}",
+                    depth=c,
+                    placement=Tile(col, 1),
+                )
+            )
+
+    # Output C
+    for col in range(n_aie_cols):
         if c_col_maj:
             dims_to_stream = [(n // t, t * m), (t, r), (m // r, r * t), (r, 1)]
         else:
             dims_to_stream = [(m // r, r * n), (r, t), (n // t, r * t), (t, 1)]
-        C_l2l3_fifos[col] = ObjectFifo(
+        C_out_l2l3_fifos[col] = ObjectFifo(
             C_l2_ty,
-            name=f"C_L2L3_{col}",
+            name=f"C_out_L2L3_{col}",
             depth=fifo_depth,
             dims_to_stream=dims_to_stream,
         )
@@ -504,82 +485,102 @@ def my_matmul(
 
         # join along one column
         c_tmp_fifos = (
-            C_l2l3_fifos[col]
+            C_out_l2l3_fifos[col]
             .prod()
             .join(
                 of_offsets,
                 obj_types=[C_l1_ty] * n_aie_rows,
-                names=[f"C_L1L2_{col}_{row}" for row in range(n_aie_rows)],
-                depths=[fifo_depth_out] * n_aie_rows,
+                names=[f"C_out_L1L2_{col}_{row}" for row in range(n_aie_rows)],
+                depths=[fifo_depth] * n_aie_rows,
                 placement=Tile(col, 1),
             )
         )
         for j in range(n_aie_rows):
-            C_l1l2_fifos[j][col] = c_tmp_fifos[j]
+            C_out_l1l2_fifos[j][col] = c_tmp_fifos[j]
 
     # Tasks for each worker to perform
-    def core_fn(
-        in_a,
-        in_b,
-        out_c,
-        zero,
-        matmul,
-        convert_copy,
-        my_rtp,
-        barrier,
-        elem_out_internal,
+    def core_fn_up_proj_gelu(in_a, in_b, out_c, zero, matmul, my_rtp, barrier):
+        barrier.wait_for_value(1)
+        rtp_K_div_k = my_rtp[0]
+        rtp_n_c_col_tiles_per_core = my_rtp[1]
+        for _ in range_(rtp_K_div_k):
+            elem_in_a = in_a.acquire(1)
+            for _ in range_(rtp_n_c_col_tiles_per_core):
+                elem_out_internal = out_c.acquire(1)
+                zero(elem_out_internal)
+                elem_in_b = in_b.acquire(1)
+                matmul(elem_in_a, elem_in_b, elem_out_internal)
+                in_b.release(1)
+                out_c.release(1)
+            in_a.release(1)
+
+    def core_fn_down_proj(
+        in_c, curr_acc_c, new_acc_c, out_acc_c, zero, add, copy, my_rtp, barrier
     ):
         barrier.wait_for_value(1)
         rtp_K_div_k = my_rtp[0]
-        rtp_n_tiles_per_core = my_rtp[1]
-        loop = range(1)  # Workaround for issue #1547
-        if rtp_n_tiles_per_core > 1:
-            loop = range_(rtp_n_tiles_per_core)
-        for _ in loop:
-            if not use_larger_internal_buffer:
-                elem_out_internal = out_c.acquire(1)
-            zero(elem_out_internal)
-
-            for _ in range_(rtp_K_div_k):
-                elem_in_a = in_a.acquire(1)
-                elem_in_b = in_b.acquire(1)
-                matmul(elem_in_a, elem_in_b, elem_out_internal)
-                in_a.release(1)
-                in_b.release(1)
-
-            if use_larger_internal_buffer:
-                elem_out_transfer = out_c.acquire(1)
-                convert_copy(elem_out_internal, elem_out_transfer, m * n)
-                out_c.release(1)
-            else:
-                out_c.release(1)
+        rtp_n_c_col_tiles_per_core = my_rtp[1]
+        # First iteration just passes the partial C tile through
+        for _ in range_(rtp_n_c_col_tiles_per_core):
+            elem_acc_c = new_acc_c.acquire(1)
+            zero(elem_acc_c)
+            new_acc_c.release(1)
+        for _ in range_(rtp_K_div_k):
+            for _ in range_(rtp_n_c_col_tiles_per_core):
+                elem_in_c = in_c.acquire(1)
+                elem_curr_acc_c = curr_acc_c.acquire(1)
+                elem_new_acc_c = new_acc_c.acquire(1)
+                add(elem_in_c, elem_curr_acc_c, elem_new_acc_c, m * n)
+                new_acc_c.release(1)
+                curr_acc_c.release(1)
+                in_c.release(1)
+        for _ in range_(rtp_n_c_col_tiles_per_core):
+            elem_out_acc_c = out_acc_c.acquire(1)
+            elem_final_acc_c = curr_acc_c.acquire(1)
+            copy(elem_final_acc_c, elem_out_acc_c, m * n)
+            curr_acc_c.release(1)
+            out_acc_c.release(1)
 
     # Set up compute tiles
     workers = []
     for row in range(n_aie_rows):
         for col in range(n_aie_cols):
-            tile_col, tile_row = core_tiles[row][col]
-            acc_buffer = None
-            if use_larger_internal_buffer:
-                acc_buffer = Buffer(
-                    type=C_l1_ty_internal, name=f"acc_buffer_{row}_{col}"
-                )
-
+            tile_col, tile_row = core_tiles[row * 2][col]
             workers.append(
                 Worker(
-                    core_fn,
+                    core_fn_down_proj,
+                    [
+                        C_partial_l1l1_fifos[row][col].cons(),
+                        C_partial_l2l1_fifos[row][col].cons(depth=fifo_depth_out),
+                        C_partial_l1l2_fifos[row][col].prod(),
+                        C_out_l1l2_fifos[row][col].prod(),
+                        zero_kernel,
+                        eltwise_add_vector,
+                        (
+                            convert_copy_kernel
+                            if use_larger_internal_buffer
+                            else mem_copy_fcn
+                        ),
+                        rtps_down_proj[row][col],
+                        workerBarriersDownProj[row][col],
+                    ],
+                    placement=Tile(tile_col, tile_row),
+                    stack_size=0xD00,
+                )
+            )
+            workers.append(
+                Worker(
+                    core_fn_up_proj_gelu,
                     [
                         A_l2l1_fifos[row].cons(),
                         B_l2l1_fifos[col].cons(),
-                        C_l1l2_fifos[row][col].prod(),
+                        C_partial_l1l1_fifos[row][col].prod(),
                         zero_kernel,
                         matmul_kernel,
-                        convert_copy_kernel if use_larger_internal_buffer else None,
-                        rtps[row][col],
-                        workerBarriers[row][col],
-                        acc_buffer,
+                        rtps_up_proj_gelu[row][col],
+                        workerBarriersUpProj[row][col],
                     ],
-                    placement=Tile(tile_col, tile_row),
+                    placement=Tile(tile_col, tile_row + 1),
                     stack_size=0xD00,
                 )
             )
@@ -596,26 +597,35 @@ def my_matmul(
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
-    with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
+    with rt.sequence(A_ty, B_ty, B_ty, C_ty) as (A, B_Up, B_Down, C):
         rt.start(*workers)
 
         # Set runtime parameters
-        def set_rtps(*args):
+        def set_rtps_up_proj_gelu(*args):
             for row, rtps_row in enumerate(args):
                 for col, rtp_row_col in enumerate(rtps_row):
                     rtp_row_col[0] = K_div_k
-                    rtp_row_col[1] = n_c_row_tiles_per_core * n_c_col_tiles_per_core
+                    rtp_row_col[1] = c
 
-        rt.inline_ops(set_rtps, rtps)
+        rt.inline_ops(set_rtps_up_proj_gelu, rtps_up_proj_gelu)
+
+        def set_rtps_down_proj(*args):
+            for row, rtps_row in enumerate(args):
+                for col, rtp_row_col in enumerate(rtps_row):
+                    rtp_row_col[0] = K_div_k
+                    rtp_row_col[1] = c
+
+        rt.inline_ops(set_rtps_down_proj, rtps_down_proj)
 
         # Set the barriers to 1 to allow the worker to read the
         # runtime parameters and start the computation
         for row in range(n_aie_rows):
             for col in range(n_aie_cols):
-                rt.set_barrier(workerBarriers[row][col], 1)
+                rt.set_barrier(workerBarriersUpProj[row][col], 1)
+                rt.set_barrier(workerBarriersDownProj[row][col], 1)
 
         # Task groups will be used to determine when to sync/await/free DMA runtime ops
-        for batch_idx in range(batch_C_size):
+        for col_group in range(n_c_col_tiles_per_core // c):
             tg = rt.task_group()
             for tb in range(ceildiv(n_c_row_tiles_per_core, tb_max_n_rows)):
                 for pingpong in [0, 1]:
@@ -627,123 +637,69 @@ def my_matmul(
                         # For small input sizes, we may not even need a "pong" iteration
                         break
                     for col in range(n_aie_cols):
-                        # C Output Transfer:
-                        # The smallest transfer unit is a (m*n_aie_rows)-x-(n)-sized sub-tile of the matrix.
-                        # Transfer one such tile for every (n_aie_cols)-th column, evenly spaced,
-                        # then repeat that (current_tb_n_rows) times for the next contiguous blocks of rows.
-                        # Each shim will start at a different column offset, transferring interleaved
-                        # columns. For example, shim 0 may transfer the blocks marked 0 below, and shim 1
-                        # may transfer the blocks marked 1.
-                        #
-                        #             N
-                        #      ----------------
-                        #     |0011    0011    |
-                        #     |0011    0011    |
-                        #     |0011    0011    |
-                        # M   |0011    0011    |
-                        #     |                |
-                        #     |                |
-                        #     |                |
-                        #     |                |
-                        #      ----------------
-                        C_batch_offset = get_batch_offset(
-                            N, M, batch_idx, batch_C_stride_dim, col_maj=c_col_maj
-                        )
-                        if not c_col_maj:
-                            C_row_offset = row_base * mem_tile_m_C * batched_C_shape[-1]
-                            C_col_offset = col * n
-                            C_offset = C_col_offset + C_row_offset
-                            C_sizes = [
-                                current_tb_n_rows,
-                                N // mem_tile_n,
-                                mem_tile_m_C,
-                                n,
-                            ]
-                            C_strides = [
-                                mem_tile_m_C * batched_C_shape[-1],
-                                mem_tile_n,
-                                batched_C_shape[-1],
-                                1,
-                            ]
-                        else:
-                            C_row_offset = row_base * mem_tile_m_C
-                            C_col_offset = col * n * batched_C_shape[-1]
-                            C_offset = C_col_offset + C_row_offset
-                            C_sizes = [N // mem_tile_n, n_aie_rows, n, m]
-                            C_strides = [
-                                batched_C_shape[-1] * mem_tile_n,
-                                m,
-                                batched_C_shape[-1],
-                                1,
-                            ]
-                        C_tile = TensorAccessPattern(
-                            batched_C_shape,
-                            offset=C_offset + C_batch_offset,
-                            sizes=C_sizes,
-                            strides=C_strides,
-                        )
-
-                        # This line does not change MLIR output at all - it's just for recording data movement
-                        C_taps.append(C_tile)
-
-                        print("C drain...")
-                        rt.drain(
-                            C_l2l3_fifos[col].cons(),
-                            C,
-                            tap=C_tile,
-                            wait=True,
-                            task_group=tg,
-                            placement=Tile(col, 0),
-                        )
                         for tile_row in range(current_tb_n_rows):
-                            # A input transfer:
-                            #
-                            # The smallest transfer unit is a (m*n_A_tiles_per_shim)-sized sub-tile of the input matrix.
-                            # Transfer one such tile for every column, contiguously.
-                            # Repeat this transfer with identical tiles a total of (N//n//n_aie_cols) times.
-                            # Each shim transfers the tiles for separate rows. For example, shim 0 may transfer the
-                            # tiles marked 0 below, and shim 1 may transfer the tiles marked 1.
-                            #             K
-                            #      ----------------
-                            #     |0000000000000000|    (repeated N//n//n_aie_cols times)
-                            #     |0000000000000000|
-                            #     |1111111111111111|
-                            # M   |1111111111111111|
-                            #     |                |
-                            #     |                |
-                            #     |                |
-                            #     |                |
-                            #      ----------------
-                            A_batch_offset = get_batch_offset(
-                                K,
-                                M,
-                                batch_idx % batch_A_size,
-                                batch_A_stride_dim,
-                                col_maj=False,
+                            # C Output Transfer:
+                            C_col_offset = (
+                                (col * n + col_group * mem_tile_n * c)
+                                if not c_col_maj
+                                else (col * n * M + col_group * mem_tile_n * M * c)
                             )
+                            if not c_col_maj:
+                                C_block_offset = (
+                                    (row_base + tile_row) * n_aie_rows * m * N
+                                )  # base address for this transfer block for all BDs
+                                C_offset = C_col_offset + C_block_offset
+                                C_sizes = [
+                                    1,
+                                    c,
+                                    mem_tile_m_C,
+                                    n,
+                                ]
+                                C_strides = [0, mem_tile_n, N, 1]
+                            else:
+                                C_block_offset = (
+                                    (row_base + tile_row) * n_aie_rows * m
+                                )  # base address for this transfer block for all BDs
+                                C_offset = C_col_offset + C_block_offset
+                                C_sizes = [c, 1, n, m]
+                                C_strides = [M * mem_tile_n, 0, M, 1]
+                            C_tile = TensorAccessPattern(
+                                (N, M) if c_col_maj else (M, N),
+                                offset=C_offset,
+                                sizes=C_sizes,
+                                strides=C_strides,
+                            )
+                            rt.drain(
+                                C_out_l2l3_fifos[col].cons(),
+                                C,
+                                tap=C_tile,
+                                wait=True,
+                                task_group=tg,
+                                placement=Tile(col, 0),
+                            )
+                            # This line does not change MLIR output at all - it's just for recording data movement
+                            C_taps.append(C_tile)
+
+                            # A input transfer:
                             A_block_offset = (
-                                (row_base + tile_row)
-                                * n_aie_rows
-                                * m
-                                * batched_A_shape[-1]
+                                (row_base + tile_row) * n_aie_rows * m * K
                             )  # base address for this transfer block for all BDs
                             A_row_offset = (
-                                col * n_A_tiles_per_shim * m * batched_A_shape[-1]
+                                col * n_A_tiles_per_shim * m * K
                             )  # base address for the shim in this column
                             A_offset = A_block_offset + A_row_offset
                             A_sizes = [
-                                N // n // n_aie_cols,
-                                K // k,
-                                m * n_A_tiles_per_shim,
+                                1,
+                                K_div_k,
+                                mem_tile_m_A,
                                 k,
                             ]
-                            A_strides = [0, k, batched_A_shape[-1], 1]
-
+                            A_strides = [0, k, K, 1]
                             # always equal to n_aie_rows since we have n_aie_rows row tiles for matrix A
                             if col < n_aie_rows:
                                 A_tile = TensorAccessPattern(
-                                    batched_A_shape,
-                                    offset=A_offset + A_batch_offset,
+                                    (M, K),
+                                    offset=A_offset,
                                     sizes=A_sizes,
                                     strides=A_strides,
                                 )
@@ -758,59 +714,22 @@ def my_matmul(
                                 )
                                 # This line does not change MLIR output at all - it's just for recording data movement
                                 A_taps.append(A_tile)
-                            # Use the calculated sizes/strides/offsets to record the data movement
-                            # caused by the above call to npu_dma_memcpy_nd.
-                            # This line does not change MLIR output at all.
 
                             # B input transfer:
-                            # Transfer the first a (n)-wide block of columns of B,
-                            # Then transfer the (n_aie_columns)-th such block, and so on.
-                            # Each shim will start at a different column offset.
-                            # For example, shim 0 may transfer the tiles marked 0 below,
-                            # and shim 1 may transfer the tiles marked 1.
-                            #
-                            #             N
-                            #      ----------------
-                            #     |0011    0011    |
-                            #     |0011    0011    |
-                            #     |0011    0011    |
-                            # K   |0011    0011    |
-                            #     |0011    0011    |
-                            #     |0011    0011    |
-                            #     |0011    0011    |
-                            #     |0011    0011    |
-                            #      ----------------
-                            B_batch_offset = get_batch_offset(
-                                N,
-                                K,
-                                batch_idx % batch_B_size,
-                                batch_B_stride_dim,
-                                col_maj=b_col_maj,
-                            )
                             B_col_offset = (
-                                col * n
+                                (col * n + col_group * mem_tile_n * c)
                                 if not b_col_maj
-                                else col * n * batched_B_shape[-1]
+                                else (col * n * K + col_group * mem_tile_n * K * c)
                             )
                             if not b_col_maj:
-                                B_sizes = [N // n // n_aie_cols, K // k, k, n]
-                                B_strides = [
-                                    n * n_aie_cols,
-                                    k * batched_B_shape[-1],
-                                    batched_B_shape[-1],
-                                    1,
-                                ]
+                                B_sizes = [K_div_k, c, k, n]
+                                B_strides = [k * N, n * n_aie_cols, N, 1]
                             else:
-                                B_sizes = [N // n // n_aie_cols, K // k, n, k]
-                                B_strides = [
-                                    n * n_aie_cols * batched_B_shape[-1],
-                                    k,
-                                    batched_B_shape[-1],
-                                    1,
-                                ]
+                                B_sizes = [K_div_k, c, n, k]
+                                B_strides = [k, n * n_aie_cols * K, K, 1]
                             B_tile = TensorAccessPattern(
-                                batched_B_shape,
-                                offset=B_col_offset + B_batch_offset,
+                                (K, N),
+                                offset=B_col_offset,
                                 sizes=B_sizes,
                                 strides=B_strides,
                             )
@@ -822,7 +741,7 @@ def my_matmul(
                                 placement=Tile(col, 0),
                             )
 
-                            # This line does not change MLIR output at all - it's just for recording data movement
+                            # These lines do not change MLIR output at all - they are just for recording data movement
                             B_taps.append(B_tile)
                     if tb > 0 or (tb == 0 and pingpong > 0):
                         rt.finish_task_group(tg)

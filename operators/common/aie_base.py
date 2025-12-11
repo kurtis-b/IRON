@@ -181,6 +181,13 @@ class AIEOperatorBase(ABC):
             else:
                 artifact.set_path(context.build_dir / artifact.path)
             todo.extend(artifact.depends)
+            logging.debug(
+                f"Moved artifact: {artifact.path}, depends on {len(artifact.depends)}, left {len(todo)}."
+            )
+            if len(artifact.depends) > 1:
+                logging.debug(
+                    f"    Depends on more than 1: {', '.join(str(d.path) for d in artifact.depends)}"
+                )
 
     def run_runlist(self):
         elapsed = 0.0

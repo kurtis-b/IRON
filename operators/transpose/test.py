@@ -12,6 +12,8 @@ from operators.transpose.op import AIETranspose
 from operators.transpose.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
+TEST_BERT = True
+
 
 def generate_test_params(extensive=False):
     params = []
@@ -59,11 +61,44 @@ all_params = [
 ]
 
 
+def generate_test_params_bert(extensive=False):
+    params = []
+    names = []
+
+    params.extend(
+        [
+            (512, 768, 8, 2, 64, 96, 8),
+            (512, 768, 4, 2, 64, 96, 8),
+            (512, 768, 2, 2, 64, 96, 8),
+        ]
+    )
+    names.extend(
+        [
+            f"transpose_512_M_768_N_8_cols_2_channels_64_m_96_n_8_s",
+            f"transpose_512_M_768_N_4_cols_2_channels_64_m_96_n_8_s",
+            f"transpose_512_M_768_N_2_cols_2_channels_64_m_96_n_8_s",
+        ]
+    )
+
+    return params, names
+
+
+regular_params_bert, regular_names_bert = generate_test_params_bert(extensive=False)
+
+bert_params = [
+    pytest.param(*params, id=name)
+    for params, name in zip(regular_params_bert, regular_names_bert)
+]
+
+
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
-@pytest.mark.parametrize("M,N,aie_columns,channels,m,n,s", all_params)
+@pytest.mark.parametrize(
+    "M,N,aie_columns,channels,m,n,s",
+    all_params if not TEST_BERT else bert_params,
+)
 def test_transpose(M, N, aie_columns, channels, m, n, s, aie_context):
     golden_ref = generate_golden_reference(rows=M, cols=N)
 

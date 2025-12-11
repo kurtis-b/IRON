@@ -36,10 +36,10 @@ class AIESoftmax(AIEOperatorBase):
 
         AIEOperatorBase.__init__(self, context=context)
 
-    def set_up_artifacts(self):
+    def get_artifacts(self, prefix="softmax_"):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
-        file_name_base = f"softmax_{self.num_columns}c_{self.num_channels}ch_{self.size}_{self.cols}t"
+        file_name_base = f"{prefix}{self.num_columns}c_{self.num_channels}ch_{self.size}_{self.cols}t"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -76,6 +76,11 @@ class AIESoftmax(AIEOperatorBase):
         insts_artifact = InstsBinArtifact.new(
             f"gemm_{file_name_base}.bin", depends=[mlir_artifact]
         )
+
+        return (xclbin_artifact, insts_artifact)
+
+    def set_up_artifacts(self):
+        xclbin_artifact, insts_artifact = self.get_artifacts()
 
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
@@ -117,10 +122,7 @@ class AIESoftmax(AIEOperatorBase):
         results = []
         for i in range(heads):
             x_iter = x_list[i]
-            input_size = x_iter.nbytes
             self.write_buffer("in", x_iter)
-            test_pattern = np.zeros(len(x_iter), dtype=bfloat16)
-            self.write_buffer("output", test_pattern)
             self.run_runlist()
             result = self.read_buffer_as_torch(
                 "output", shape=x_list[i].shape, dtype=bfloat16

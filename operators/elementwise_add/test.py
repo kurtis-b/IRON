@@ -12,6 +12,8 @@ from operators.elementwise_add.op import AIEElementwiseAdd
 from operators.elementwise_add.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
+TEST_BERT = True
+
 
 def generate_test_params(extensive=False):
     max_aie_columns = 8
@@ -45,13 +47,43 @@ all_params = [
 ]
 
 
+def generate_test_params_bert(extensive=False):
+    params = []
+    names = []
+
+    params.extend(
+        [
+            (393216, 8, 2, 4096),
+            (393216, 4, 2, 4096),
+            (393216, 2, 2, 4096),
+        ]
+    )
+    names.extend(
+        [
+            f"eltwise_add_8_cols_2_channels_393216_tile_4096",
+            f"eltwise_add_4_cols_2_channels_393216_tile_4096",
+            f"eltwise_add_2_cols_2_channels_393216_tile_4096",
+        ]
+    )
+
+    return params, names
+
+
+regular_params_bert, regular_names_bert = generate_test_params_bert(extensive=False)
+
+bert_params = [
+    pytest.param(*params, id=name)
+    for params, name in zip(regular_params_bert, regular_names_bert)
+]
+
+
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
     "input_length,num_aie_columns,num_channels,tile_size",
-    all_params,
+    all_params if not TEST_BERT else bert_params,
 )
 def test_elementwise_add(
     input_length, num_aie_columns, num_channels, tile_size, aie_context

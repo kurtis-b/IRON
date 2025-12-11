@@ -29,6 +29,19 @@ template <typename T_in, typename T_out> void eltwise_vmul(T_in *a, T_in *b, T_o
     event1();
 }
 
+template <typename T_in, typename T_out> void eltwise_vmul_broadcasted_scalar(T_in *a, T_in *b, T_out *c, int size)
+{
+
+    event0();
+    auto B = aie::load_v<16>(b);
+    for (int i = 0; i < size; i += 16) {
+        auto A = aie::load_v<16>(a + i);
+        auto C = aie::mul(A, B).template to_vector<T_out>();
+        aie::store_v(c + i, C);
+    }
+    event1();
+}
+
 extern "C" {
 
 void eltwise_mul_bf16_scalar(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, int size)
@@ -38,5 +51,9 @@ void eltwise_mul_bf16_scalar(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, in
 void eltwise_mul_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, int size)
 {
     eltwise_vmul<bfloat16, bfloat16>(a_in, b_in, c_out, size);
+}
+void eltwise_mul_bf16_broadcasted_scalar(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, int size)
+{
+    eltwise_vmul_broadcasted_scalar<bfloat16, bfloat16>(a_in, b_in, c_out, size);
 }
 } // extern "C"
