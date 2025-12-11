@@ -102,8 +102,6 @@ class AIEGEMM(AIEOperatorBase):
         assert tile_m >= min_tile_m, f"tile_m ({tile_m}) must be >= {min_tile_m}"
         assert tile_k >= min_tile_k, f"tile_k ({tile_k}) must be >= {min_tile_k}"
         assert tile_n >= min_tile_n, f"tile_n ({tile_n}) must be >= {min_tile_n}"
-        assert tile_k & (tile_k - 1) == 0, f"tile_k ({tile_k}) must be power of 2"
-        assert tile_n & (tile_n - 1) == 0, f"tile_n ({tile_n}) must be power of 2"
 
         file_name_tile_base = f"{prefix}{tile_m}x{tile_k}x{tile_n}"
         file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
@@ -246,9 +244,15 @@ class AIEGEMM(AIEOperatorBase):
         batch size > 1, i.e batch_C[0] > 1
         """
         if self.batch_C[0] == 1:
-            return _do_unbatched_gemm(A, B)
+            A_inp = A
+            B_inp = B
+            if len(A.shape) > 2 and A.shape[0] == 1:
+                A_inp = A.squeeze(0)
+            if B is not None and len(B.shape) > 2 and B.shape[0] == 1:
+                B_inp = B.squeeze(0)
+            return self._do_unbatched_gemm(A_inp, B_inp)
         else:
-            return _do_batched_gemm(A, B)
+            return self._do_batched_gemm(A, B)
 
     def _do_unbatched_gemm(self, A, B=None):
         """Forward pass through GEMM operation: C = A @ B
@@ -289,6 +293,8 @@ class AIEGEMM(AIEOperatorBase):
         """Determine the 2D GEMM shapes from the 3D matrix shape based on the batch params"""
         batch_size, batch_stride_dim = batch_params
         # Assume the view of the tensor corresponds with the batch stride dim
+        if batch_params[0] == 1:
+            return mtx_shape
         if batch_stride_dim == 0:  # corresponds to (batch size, mtx_shape)
             if batch_size == mtx_shape[0]:
                 return mtx_shape[1:]
@@ -309,8 +315,8 @@ class AIEGEMM(AIEOperatorBase):
         A, B, C are expected to be 3D matrices
         """
         B_shape = B.shape if B is not None else self.weight.T.shape
-        K2, N = _get_gemm_shapes(B_shape, self.batch_B)
-        M, K = _get_gemm_shapes(A.shape, self.batch_B)
+        K2, N = self._get_gemm_shapes(B_shape, self.batch_B)
+        M, K = self._get_gemm_shapes(A.shape, self.batch_B)
         batch_size_C, batch_stride_dim_C = self.batch_C
         if batch_stride_dim_C == 0:
             expected_output_shape = (batch_size_C, M, N)

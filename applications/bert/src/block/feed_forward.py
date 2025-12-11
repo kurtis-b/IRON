@@ -35,8 +35,8 @@ class BertIntermediate(nn.Module):
             aie_gemm_config = {
                 "num_columns": 8,
                 "tile_m": 64,
-                "tile_k": 64,
-                "tile_n": 64,
+                "tile_k": 96,
+                "tile_n": 48,
                 "use_static_weight": True,
                 "emulate_bf16_mmul_with_bfp16": True,
                 "prio_accuracy": False,
@@ -85,8 +85,8 @@ class BertOutput(nn.Module):
             aie_gemm_config = {
                 "num_columns": 8,
                 "tile_m": 64,
-                "tile_k": 64,
-                "tile_n": 64,
+                "tile_k": 96,
+                "tile_n": 48,
                 "use_static_weight": True,
                 "emulate_bf16_mmul_with_bfp16": True,
                 "prio_accuracy": False,

@@ -527,7 +527,7 @@ def main():
     parser.add_argument(
         "--num_samples",
         type=int,
-        default=10,
+        default=1,
         help="Number of samples to classify",
     )
     parser.add_argument(
