@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import torch
+import torch.nn as nn
 import numpy as np
 from ml_dtypes import bfloat16
 from pathlib import Path
@@ -12,16 +14,25 @@ from iron.common import (
     XclbinArtifact,
     InstsBinArtifact,
     KernelObjectArtifact,
+    KernelArchiveArtifact,
     SourceArtifact,
     PythonGeneratedMLIRArtifact,
 )
+from operators.common.utils import torch_to_numpy
 
 
 class AIELayerNorm(AIEOperatorBase):
     """AIE-accelerated LAYER NORM operator"""
 
     def __init__(
-        self, size, num_aie_columns, num_channels, tile_size, trace_size=0, context=None
+        self,
+        size,
+        num_aie_columns=None,
+        num_channels=None,
+        tile_size=None,
+        weights=None,
+        trace_size=0,
+        context=None,
     ):
         max_multiple = num_aie_columns * tile_size
         padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
@@ -40,37 +51,67 @@ class AIELayerNorm(AIEOperatorBase):
 
         AIEOperatorBase.__init__(self, context=context)
 
-    def set_up_artifacts(self):
-        operator_dir = Path(__file__).parent
-        file_name_base = f"layer_norm_{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
+        if weights is not None:
+            self.weight_file_name = self.context.build_dir / f"layer_norm_weights_{self.size}.npy"
+            if not os.path.exists(self.weight_file_name.parent):
+                os.makedirs(self.weight_file_name.parent)
+            np.save(self.weight_file_name, torch_to_numpy(weights))
+        else:
+            self.weight_file_name = None
 
-        mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{file_name_base}.mlir",
-            import_path=operator_dir / "design.py",
-            callback_fn="my_layer_norm",
-            callback_args=[
-                self.context.device_manager.device_type,
-                self.size,
-                self.num_aie_columns,
-                self.num_channels,
-                self.trace_size,
-                self.tile_size,
-            ],
-        )
+    def get_artifacts(self, prefix="weighted_layer_norm_"):
+        # Compilation artifacts
+        operator_dir = Path(__file__).parent
+        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
+
+        if self.weight_file_name is not None:
+            mlir_artifact = PythonGeneratedMLIRArtifact.new(
+                f"{file_name_base}.mlir",
+                import_path=operator_dir / "design_weighted.py",
+                callback_fn="my_weighted_layer_norm",
+                callback_args=[
+                    self.context.device_manager.device_type,
+                    self.size,
+                    self.num_aie_columns,
+                    self.num_channels,
+                    self.tile_size,
+                    self.weight_file_name,
+                    0,
+                ],
+            )
+        else:
+            mlir_artifact = PythonGeneratedMLIRArtifact.new(
+                f"{file_name_base}.mlir",
+                import_path=operator_dir / "design.py",
+                callback_fn="my_layer_norm",
+                callback_args=[
+                    self.context.device_manager.device_type,
+                    self.size,
+                    self.num_aie_columns,
+                    self.num_channels,
+                    self.tile_size,
+                    0,
+                ],
+            )
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
             depends=[
                 mlir_artifact,
-                KernelObjectArtifact.new(
-                    f"layer_norm.o",
+                KernelArchiveArtifact.new(
+                    f"layer_norm_archive.a",
                     depends=[
-                        SourceArtifact.new(
-                            self.context.base_dir
-                            / "aie_kernels"
-                            / "aie2p"
-                            / "layer_norm.cc"
-                        )
+                        KernelObjectArtifact.new(
+                            f"layer_norm.o",
+                            depends=[
+                                SourceArtifact.new(
+                                    self.context.base_dir
+                                    / "aie_kernels"
+                                    / "aie2p"
+                                    / "layer_norm.cc"
+                                )
+                            ],
+                        ),
                     ],
                 ),
             ],
@@ -80,6 +121,11 @@ class AIELayerNorm(AIEOperatorBase):
             f"{file_name_base}.bin", depends=[mlir_artifact]
         )
 
+        return (xclbin_artifact, insts_artifact)
+
+    def set_up_artifacts(self):
+        xclbin_artifact, insts_artifact = self.get_artifacts()
+
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
         self.add_artifacts([xclbin_artifact, insts_artifact])
@@ -88,14 +134,14 @@ class AIELayerNorm(AIEOperatorBase):
         self.add_buffer("input", self.size)
         self.add_buffer("output", self.size)
         self.add_kernel(
-            "layer_norm",
+            "eltwise_mul",
             self.xclbin_artifact,
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_to_runlist("layer_norm", "input", "output")
+        self.add_to_runlist("eltwise_mul", "input", "output")
 
-    def forward(self, x):
+    def forward(self, x, y=None):
         if x.numel() > self.size:
             raise AIEOperatorConstraintError(
                 "AIELayerNorm: input too large for configured size"
@@ -109,9 +155,10 @@ class AIELayerNorm(AIEOperatorBase):
             x_flat = torch.nn.functional.pad(x_flat, (0, pad_len))
 
         self.write_buffer("input", x_flat)
-        self.write_buffer("output", np.zeros(self.size, dtype=bfloat16))
         self.run_runlist()
-        result = self.read_buffer_as_torch("output", shape=(self.size,), dtype=bfloat16)
+        result = self.read_buffer_as_torch(
+            "output", shape=(self.size,), dtype=bfloat16
+        )
 
         if pad_len > 0:
             result = result[: x_flat.numel() - pad_len]

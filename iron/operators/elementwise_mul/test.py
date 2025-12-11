@@ -11,6 +11,8 @@ from iron.operators.elementwise_mul.op import AIEElementwiseMul
 from iron.operators.elementwise_mul.reference import generate_golden_reference
 from iron.common.test_utils import run_test
 
+TEST_BERT = True
+
 
 def generate_test_params(extensive=False):
     max_aie_columns = 8
@@ -29,7 +31,7 @@ def generate_test_params(extensive=False):
             names.append(
                 f"eltwise_mul_{num_aie_columns}_cols_{num_channels}_channels_{input_length}_tile_{tile_size}"
             )
-            params.append((input_length, num_aie_columns, num_channels, tile_size))
+            params.append((input_length, num_aie_columns, num_channels, tile_size, None))
     return params, names
 
 
@@ -46,28 +48,61 @@ all_params = [
 ]
 
 
+def generate_test_params_bert(extensive=False):
+    params = []
+    names = []
+
+    params.extend(
+        [
+            (3145728, 8, 2, 4096, 0.125),
+            (3145728, 4, 2, 4096, 0.125),
+            (3145728, 2, 2, 4096, 0.125),
+        ]
+    )
+    names.extend(
+        [
+            f"eltwise_mul_8_cols_2_channels_3145728_tile_4096_0.125_broadcast",
+            f"eltwise_mul_4_cols_2_channels_3145728_tile_4096_0.125_broadcast",
+            f"eltwise_mul_2_cols_2_channels_3145728_tile_4096_0.125_broadcast",
+        ]
+    )
+
+    return params, names
+
+
+regular_params_bert, regular_names_bert = generate_test_params_bert(extensive=False)
+
+bert_params = [
+    pytest.param(*params, id=name)
+    for params, name in zip(regular_params_bert, regular_names_bert)
+]
+
+
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "input_length,num_aie_columns,num_channels,tile_size",
-    all_params,
+    "input_length,num_aie_columns,num_channels,tile_size,scalar_broadcast",
+    all_params if not TEST_BERT else bert_params,
 )
 def test_elementwise_mul(
-    input_length, num_aie_columns, num_channels, tile_size, aie_context
+    input_length, num_aie_columns, num_channels, tile_size, scalar_broadcast, aie_context
 ):
-    golden_ref = generate_golden_reference(input_length=input_length)
+    golden_ref = generate_golden_reference(input_length=input_length,scalar_broadcast=scalar_broadcast)
 
     operator = AIEElementwiseMul(
         size=input_length,
         num_aie_columns=num_aie_columns,
         num_channels=num_channels,
         tile_size=tile_size,
+        scalar_broadcast=scalar_broadcast,
         context=aie_context,
     )
 
-    input_buffers = {"input1": golden_ref["A"], "input2": golden_ref["B"]}
+    input_buffers = {"input1": golden_ref["A"]}
+    if scalar_broadcast is None:
+        input_buffers["input2"] = golden_ref["B"]
     output_buffers = {"output": golden_ref["C"]}
 
     errors, latency_us, bandwidth_gbps = run_test(

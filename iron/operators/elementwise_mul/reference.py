@@ -5,11 +5,15 @@ import torch
 from iron.common.utils import torch_dtype_map
 
 
-def generate_golden_reference(input_length: int, dtype="bf16", seed=42):
+def generate_golden_reference(input_length: int, scalar_broadcast=None, dtype="bf16", seed=42):
     torch.manual_seed(seed)
     val_range = 4
     dtype_torch = torch_dtype_map[dtype]
     input_a = torch.rand(input_length, dtype=dtype_torch) * val_range
-    input_b = torch.rand(input_length, dtype=dtype_torch) * val_range
-    output = input_a * input_b
-    return {"A": input_a, "B": input_b, "C": output}
+    if scalar_broadcast is None:
+        input_b = torch.rand(input_length, dtype=dtype_torch) * val_range
+        output = input_a * input_b
+        return {"A": input_a, "B": input_b, "C": output}
+    else:
+        output = input_a * scalar_broadcast
+        return {"A": input_a, "C": output}
