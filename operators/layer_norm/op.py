@@ -24,15 +24,14 @@ class AIELayerNorm(AIEOperatorBase):
     """AIE-accelerated LAYER NORM operator"""
 
     def __init__(
-        
         self,
         size,
-        num_aie_columns,
-        num_channels,
-        tile_size,
-        trace_size=0,
+        num_aie_columns=None,
+        num_channels=None,
+        tile_size=None,
         weighted=False,
-        context=None
+        trace_size=0,
+        context=None,
     ):
         max_multiple = num_aie_columns * tile_size
         padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
@@ -66,7 +65,7 @@ class AIELayerNorm(AIEOperatorBase):
                 import_path=operator_dir / "design_weighted.py",
                 callback_fn="my_weighted_layer_norm",
                 callback_args=[
-                    self.device_manager.device_type,
+                    self.context.device_manager.device_type,
                     self.size,
                     self.num_aie_columns,
                     self.num_channels,
@@ -86,7 +85,7 @@ class AIELayerNorm(AIEOperatorBase):
                                 f"layer_norm.o",
                                 depends=[
                                     SourceArtifact.new(
-                                        self.base_dir
+                                        self.context.base_dir
                                         / "aie_kernels"
                                         / "aie2p"
                                         / "layer_norm.cc"
@@ -97,7 +96,7 @@ class AIELayerNorm(AIEOperatorBase):
                                 "mul.o",
                                 depends=[
                                     SourceArtifact.new(
-                                        self.base_dir
+                                        self.context.base_dir
                                         / "aie_kernels"
                                         / "generic"
                                         / "mul.cc"

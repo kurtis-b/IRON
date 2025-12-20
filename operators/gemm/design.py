@@ -24,6 +24,7 @@ from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
 
+STRIDE_3_MAX = 1048576
 
 microkernel_mac_dim_map = {
     "npu": {
@@ -664,27 +665,55 @@ def my_matmul(
                                 batched_C_shape[-1],
                                 1,
                             ]
-                        C_tile = TensorAccessPattern(
-                            batched_C_shape,
-                            offset=C_offset + C_batch_offset,
-                            sizes=C_sizes,
-                            strides=C_strides,
-                        )
+                        if C_strides[0] <= STRIDE_3_MAX:
+                            C_tile = TensorAccessPattern(
+                                batched_C_shape,
+                                offset=C_offset + C_batch_offset,
+                                sizes=C_sizes,
+                                strides=C_strides,
+                            )
 
-                        # This line does not change MLIR output at all - it's just for recording data movement
-                        C_taps.append(C_tile)
+                            # This line does not change MLIR output at all - it's just for recording data movement
+                            C_taps.append(C_tile)
 
-                        rt.drain(
-                            C_l2l3_fifos[col].cons(),
-                            C,
-                            tap=C_tile,
-                            wait=True,
-                            task_group=tg,
-                            placement=Tile(col, 0),
-                        )
-
+                            rt.drain(
+                                C_l2l3_fifos[col].cons(),
+                                C,
+                                tap=C_tile,
+                                wait=True,
+                                task_group=tg,
+                                placement=Tile(col, 0),
+                            )
                         for tile_row in range(current_tb_n_rows):
+                            if C_strides[0] > STRIDE_3_MAX:
+                                C_sizes[0] = 1
+                                C_strides[0] = 0
+                                if not c_col_maj:
+                                    C_block_offset = (
+                                        (row_base + tile_row) * n_aie_rows * m * N
+                                    )  # base address for this transfer block for all BDs
+                                else:
+                                    C_block_offset = (
+                                        (row_base + tile_row) * n_aie_rows * m
+                                    )  # base address for this transfer block for all BDs
+                                C_tile = TensorAccessPattern(
+                                    batched_C_shape,
+                                    offset=C_offset + C_batch_offset + C_block_offset,
+                                    sizes=C_sizes,
+                                    strides=C_strides,
+                                )
 
+                                # This line does not change MLIR output at all - it's just for recording data movement
+                                C_taps.append(C_tile)
+
+                                rt.drain(
+                                    C_l2l3_fifos[col].cons(),
+                                    C,
+                                    tap=C_tile,
+                                    wait=True,
+                                    task_group=tg,
+                                    placement=Tile(col, 0),
+                                )
                             # A input transfer:
                             #
                             # The smallest transfer unit is a (m*n_A_tiles_per_shim)-sized sub-tile of the input matrix.
@@ -779,7 +808,7 @@ def my_matmul(
                             B_col_offset = (
                                 col * n
                                 if not b_col_maj
-                                else col * n * batched_B_shape[-2]
+                                else col * n * batched_B_shape[-1]
                             )
                             if not b_col_maj:
                                 B_sizes = [N // n // n_aie_cols, K // k, k, n]
@@ -797,19 +826,44 @@ def my_matmul(
                                     batched_B_shape[-1],
                                     1,
                                 ]
-                            B_tile = TensorAccessPattern(
-                                batched_B_shape,
-                                offset=B_col_offset + B_batch_offset,
-                                sizes=B_sizes,
-                                strides=B_strides,
-                            )
-                            rt.fill(
-                                B_l3l2_fifos[col].prod(),
-                                B,
-                                tap=B_tile,
-                                task_group=tg,
-                                placement=Tile(col, 0),
-                            )
+                            if B_strides[0] > STRIDE_3_MAX:
+                                B_tile_iters = B_sizes[0]
+                                B_tile_offset = B_strides[0] // B_tile_iters
+                                B_strides[0] = 0
+                                B_sizes[0] = 1
+                                tg_b = rt.task_group()
+                                for tile_idx in range(B_tile_iters):
+                                    B_tile = TensorAccessPattern(
+                                        batched_B_shape,
+                                        offset=B_col_offset + B_batch_offset + tile_idx * B_tile_offset,
+                                        sizes=B_sizes,
+                                        strides=B_strides,
+                                    )
+                                    rt.fill(
+                                        B_l3l2_fifos[col].prod(),
+                                        B,
+                                        tap=B_tile,
+                                        wait=True,
+                                        task_group=tg_b,
+                                        placement=Tile(col, 0),
+                                    )
+                                    # This line does not change MLIR output at all - it's just for recording data movement
+                                    B_taps.append(B_tile)
+                                rt.finish_task_group(tg_b)
+                            else:
+                                B_tile = TensorAccessPattern(
+                                    batched_B_shape,
+                                    offset=B_col_offset + B_batch_offset,
+                                    sizes=B_sizes,
+                                    strides=B_strides,
+                                )
+                                rt.fill(
+                                    B_l3l2_fifos[col].prod(),
+                                    B,
+                                    tap=B_tile,
+                                    task_group=tg,
+                                    placement=Tile(col, 0),
+                                )
 
                             # This line does not change MLIR output at all - it's just for recording data movement
                             B_taps.append(B_tile)

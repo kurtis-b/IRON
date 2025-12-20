@@ -150,6 +150,13 @@ To run a specific operator's tests:
 pytest operators/axpy/
 ```
 
+Example to run GEMM tests with debug-level logging enabled and for only 1 iteration each:
+``` bash
+pytest operators/gemm/ --iterations 1 --log-cli-level=DEBUG
+```
+
+Use `--co` to generate only the test names, i.e. the tests won't run. 
+
 ### Git Hooks (Optional but Recommended)
 
 To ensure your code passes CI linting checks before pushing, install the pre-push hook:

@@ -82,35 +82,43 @@ def generate_golden_reference(
             # Combine along first dimension: (batch, M, K) -> (batch*M, K)
             input_a = input_a.reshape(batch_size_A * M, K)
         else:
-            # Combine along last dimension: (M, K, batch) -> (M, K*batch)
+            # Combine along last dimension: (M, batch, K) -> (M, K*batch)
             input_a = input_a.reshape(M, K * batch_size_A)
 
-        if batch_stride_dim_B == 0:
-            # Combine along first dimension: (batch, K, N) -> (batch*K, N)
-            input_b = input_b.reshape(batch_size_B * K, N)
-        else:
-            # Combine along last dimension: (K, N, batch) -> (K, N*batch)
-            input_b = input_b.reshape(K, N * batch_size_B)
-
-        if batch_stride_dim_C == 0:
-            # Combine along first dimension: (batch, M, N) -> (batch*M, N)
-            output = output.reshape(batch_size_C * M, N)
-        else:
-            # Combine along last dimension: (M, N, batch) -> (M, N*batch)
-            output = output.reshape(M, N * batch_size_C)
-
         if b_col_maj:
-            # Transpose last two dimensions for each batch
             if batch_stride_dim_B == 0:
+                # Combine along first dimension: (batch, K, N) -> (batch, N, K) -> (batch*N, K)
                 input_b = input_b.transpose(-2, -1)
+                input_b = input_b.reshape(batch_size_B * N, K)
             else:
-                input_b = input_b.transpose(0, 1)
+                # Combine along last dimension: (K, batch, N) -> (N, batch, K) -> (N, K*batch)
+                input_b = input_b.transpose(0, 2)
+                input_b = input_b.reshape(N, K * batch_size_B)
+        else:
+            if batch_stride_dim_B == 0:
+                # Combine along first dimension: (batch, K, N) -> (batch*K, N)
+                input_b = input_b.reshape(batch_size_B * K, N)
+            else:
+                # Combine along last dimension: (K, batch, N) -> (K, N*batch)
+                input_b = input_b.reshape(K, N * batch_size_B)
+
         if c_col_maj:
             # Transpose last two dimensions for each batch
             if batch_stride_dim_C == 0:
+                # Combine along first dimension: (batch, M, N) -> (batch, N, M) -> (batch*N, M)
                 output = output.transpose(-2, -1)
+                output = output.reshape(batch_size_C * N, M)
             else:
-                output = output.transpose(0, 1)
+                # Combine along last dimension: (M, batch, N) -> (N, batch, M) -> (N, M*batch)
+                output = output.transpose(0, 2)
+                output = output.reshape(N, M * batch_size_C)
+        else:
+            if batch_stride_dim_C == 0:
+                # Combine along first dimension: (batch, M, N) -> (batch*M, N)
+                output = output.reshape(batch_size_C * M, N)
+            else:
+                # Combine along last dimension: (M, batch, N) -> (M, N*batch)
+                output = output.reshape(M, N * batch_size_C)
     else:
         # Generate non-batched inputs
         input_a = torch.randn(M, K, dtype=dtype_torch) * val_range

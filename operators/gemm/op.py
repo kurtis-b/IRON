@@ -105,6 +105,7 @@ class AIEGEMM(AIEOperatorBase):
 
         file_name_tile_base = f"{prefix}{tile_m}x{tile_k}x{tile_n}"
         file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
+        file_name_total_base += f"_batchA{self.batch_A[0]}d{self.batch_A[1]}_batchB{self.batch_B[0]}d{self.batch_B[1]}_batchC{self.batch_C[0]}d{self.batch_C[1]}"
         xclbin_kernel_name = f"gemm_{file_name_tile_base}"
         kernel_flags = [
             f"-DDIM_M={tile_m}",
@@ -369,8 +370,14 @@ class AIEGEMM(AIEOperatorBase):
         return result
 
     def _get_padded_dims(self, M, K, N):
-        tile_m, tile_k, tile_n = self.tile_m, self.tile_n, self.tile_k
+        tile_m, tile_k, tile_n = self.tile_m, self.tile_k, self.tile_n
         num_aie_columns = self.num_aie_columns
+        logging.info(
+            f"Calculating padded dimensions for requested M={M}, K={K}, N={N}"
+        )
+        logging.info(
+            f"Using tile sizes tile_m={tile_m}, tile_k={tile_k}, tile_n={tile_n}, num_aie_columns={num_aie_columns}"
+        )
 
         min_M = tile_m * self.n_aie_rows
         min_K = tile_k
