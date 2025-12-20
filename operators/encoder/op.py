@@ -129,9 +129,15 @@ class AIEBERTEncoder(AIEOperatorBase):
 
         kernel_id = 0x801
 
-        gelu_tile_size = (self.seq_len * self.intermediate_size) // (self.num_aie_columns * 2)
-        eltwise_mul_tile_size = (self.seq_len * self.seq_len * self.num_heads) // (self.num_aie_columns * 2)
-        eltwise_add_tile_size = (self.seq_len * self.hidden_size) // (self.num_aie_columns * 2)
+        gelu_tile_size = (self.seq_len * self.intermediate_size) // (
+            self.num_aie_columns * 2
+        )
+        eltwise_mul_tile_size = (self.seq_len * self.seq_len * self.num_heads) // (
+            self.num_aie_columns * 2
+        )
+        eltwise_add_tile_size = (self.seq_len * self.hidden_size) // (
+            self.num_aie_columns * 2
+        )
 
         # Layer 1a: Q projection
         q_proj = AIEGEMM(  # L1 utilization = 54 KB with double buffering
@@ -141,8 +147,9 @@ class AIEBERTEncoder(AIEOperatorBase):
             tile_m=64,
             tile_k=96,
             tile_n=48,  # N=768 processed across 8 columns with n=48
-            use_static_weight=True,
             num_aie_columns=self.num_aie_columns,
+            prio_accuracy=False,
+            emulate_bf16_mmul_with_bfp16=True,
         )
         self.q_proj_xclbin, self.q_proj_insts = q_proj.get_artifacts(
             prefix="encoder_q_proj_"
@@ -163,8 +170,9 @@ class AIEBERTEncoder(AIEOperatorBase):
             tile_m=64,
             tile_k=96,
             tile_n=48,  # N=768 processed across 8 columns with n=48
-            use_static_weight=True,
             num_aie_columns=self.num_aie_columns,
+            prio_accuracy=False,
+            emulate_bf16_mmul_with_bfp16=True,
         )
         self.k_proj_xclbin, self.k_proj_insts = k_proj.get_artifacts(
             prefix="encoder_k_proj_"
@@ -210,8 +218,9 @@ class AIEBERTEncoder(AIEOperatorBase):
             tile_m=64,
             tile_k=96,
             tile_n=48,  # N=768 processed across 8 columns with n=48
-            use_static_weight=True,
             num_aie_columns=self.num_aie_columns,
+            prio_accuracy=False,
+            emulate_bf16_mmul_with_bfp16=True,
         )
         self.v_proj_xclbin, self.v_proj_insts = v_proj.get_artifacts(
             prefix="encoder_v_proj_"
@@ -233,8 +242,10 @@ class AIEBERTEncoder(AIEOperatorBase):
             N=self.seq_len,
             num_aie_columns=self.num_aie_columns,
             batch_A=(self.num_heads, 1),  # Batch across heads, batch dim first
-            batch_B=(self.num_heads, 0),  # Batch across heads, batch dim first
+            batch_B=(self.num_heads, 1),  # Batch across heads, batch dim first
             batch_C=(self.num_heads, 0),  # Batch across heads, batch dim first
+            prio_accuracy=False,
+            emulate_bf16_mmul_with_bfp16=True,
         ).get_artifacts(prefix="encoder_attn_scores_")
         self.attn_scores_xclbin.xclbin_input = self.v_proj_xclbin
         self.attn_scores_xclbin.extra_flags += [
@@ -242,7 +253,11 @@ class AIEBERTEncoder(AIEOperatorBase):
             f"--xclbin-kernel-id={hex(kernel_id)}",
         ]
         self.attn_scores_xclbin.kernel_name = "encoder_attn_scores"
-        self.attn_scores_xclbin.depends += [self.q_proj_xclbin, self.k_transpose_xclbin, self.v_proj_xclbin]
+        self.attn_scores_xclbin.depends += [
+            self.q_proj_xclbin,
+            self.k_transpose_xclbin,
+            self.v_proj_xclbin,
+        ]
         artifacts.append(self.attn_scores_insts)
         kernel_id += 1
 
@@ -289,6 +304,8 @@ class AIEBERTEncoder(AIEOperatorBase):
             batch_A=(self.num_heads, 0),  # Batch across heads, batch dim first
             batch_B=(self.num_heads, 1),  # Batch across heads, batch dim first
             batch_C=(self.num_heads, 1),  # Batch across heads, batch dim first
+            prio_accuracy=False,
+            emulate_bf16_mmul_with_bfp16=True,
         ).get_artifacts(prefix="encoder_attn_output_")
         self.attn_output_xclbin.xclbin_input = self.attn_softmax_xclbin
         self.attn_output_xclbin.extra_flags += [
@@ -296,7 +313,10 @@ class AIEBERTEncoder(AIEOperatorBase):
             f"--xclbin-kernel-id={hex(kernel_id)}",
         ]
         self.attn_output_xclbin.kernel_name = "encoder_attn_output"
-        self.attn_output_xclbin.depends += [self.attn_softmax_xclbin, self.v_proj_xclbin]
+        self.attn_output_xclbin.depends += [
+            self.attn_softmax_xclbin,
+            self.v_proj_xclbin,
+        ]
         artifacts.append(self.attn_output_insts)
         kernel_id += 1
 
@@ -309,8 +329,9 @@ class AIEBERTEncoder(AIEOperatorBase):
                 tile_m=64,
                 tile_k=96,
                 tile_n=48,  # N=768 processed across 8 columns with n=48
-                use_static_weight=True,
                 num_aie_columns=self.num_aie_columns,
+                prio_accuracy=False,
+                emulate_bf16_mmul_with_bfp16=True,
             ).get_artifacts(prefix="encoder_output_proj_")
         )
         self.output_proj_xclbin.xclbin_input = self.attn_output_xclbin
@@ -367,8 +388,9 @@ class AIEBERTEncoder(AIEOperatorBase):
                 tile_m=64,
                 tile_k=96,
                 tile_n=48,  # N=768 processed across 8 columns with n=48
-                use_static_weight=True,
                 num_aie_columns=self.num_aie_columns,
+                prio_accuracy=False,
+                emulate_bf16_mmul_with_bfp16=True,
             ).get_artifacts(prefix="encoder_up_proj_")
         )
         self.up_proj_xclbin.xclbin_input = self.ln1_xclbin
@@ -407,8 +429,9 @@ class AIEBERTEncoder(AIEOperatorBase):
                 tile_m=64,
                 tile_k=96,
                 tile_n=48,  # N=768 processed across 8 columns with n=48
-                use_static_weight=True,
                 num_aie_columns=self.num_aie_columns,
+                prio_accuracy=False,
+                emulate_bf16_mmul_with_bfp16=True,
             ).get_artifacts(prefix="encoder_down_proj_")
         )
         self.down_proj_xclbin.xclbin_input = self.gelu_xclbin
@@ -464,39 +487,39 @@ class AIEBERTEncoder(AIEOperatorBase):
 
     def set_up_runtime(self):
         """Set up runtime buffers and kernels for all 13 layers."""
-        total_size = self.seq_len * self.hidden_size
+        act_size = self.seq_len * self.hidden_size
 
         # Input/output buffers
-        self.add_buffer("input", total_size)
-        self.add_buffer("output", total_size)
+        self.add_buffer("input", act_size)
+        self.add_buffer("output", act_size)
 
         # Weight buffers (separate Q/K/V weights)
         self.add_buffer(
             "q_weight",
             self.hidden_size * self.hidden_size,
             static_data=(
-                torch_to_numpy(self.q_weight) if self.q_weight is not None else None
+                torch_to_numpy(self.q_weight.T) if self.q_weight is not None else None
             ),
         )
         self.add_buffer(
             "k_weight",
             self.hidden_size * self.hidden_size,
             static_data=(
-                torch_to_numpy(self.k_weight) if self.k_weight is not None else None
+                torch_to_numpy(self.k_weight.T) if self.k_weight is not None else None
             ),
         )
         self.add_buffer(
             "v_weight",
             self.hidden_size * self.hidden_size,
             static_data=(
-                torch_to_numpy(self.v_weight) if self.v_weight is not None else None
+                torch_to_numpy(self.v_weight.T) if self.v_weight is not None else None
             ),
         )
         self.add_buffer(
             "attn_output_weight",
             self.hidden_size * self.hidden_size,
             static_data=(
-                torch_to_numpy(self.attn_output_weight)
+                torch_to_numpy(self.attn_output_weight.T)
                 if self.attn_output_weight is not None
                 else None
             ),
@@ -512,7 +535,7 @@ class AIEBERTEncoder(AIEOperatorBase):
             "ffn_up_weight",
             self.hidden_size * self.intermediate_size,
             static_data=(
-                torch_to_numpy(self.ffn_up_weight)
+                torch_to_numpy(self.ffn_up_weight.T)
                 if self.ffn_up_weight is not None
                 else None
             ),
@@ -521,7 +544,7 @@ class AIEBERTEncoder(AIEOperatorBase):
             "ffn_down_weight",
             self.intermediate_size * self.hidden_size,
             static_data=(
-                torch_to_numpy(self.ffn_down_weight)
+                torch_to_numpy(self.ffn_down_weight.T)
                 if self.ffn_down_weight is not None
                 else None
             ),
@@ -535,12 +558,10 @@ class AIEBERTEncoder(AIEOperatorBase):
         )
 
         # Intermediate buffers for all layers
-        self.add_buffer("q_output", self.seq_len * self.hidden_size)  # After layer 1a
-        self.add_buffer("k_output", self.seq_len * self.hidden_size)  # After layer 1b
-        self.add_buffer(
-            "k_transposed", self.seq_len * self.hidden_size
-        )  # After K transpose
-        self.add_buffer("v_output", self.seq_len * self.hidden_size)  # After layer 1c
+        self.add_buffer("q_output", act_size)  # After layer 1a
+        self.add_buffer("k_output", act_size)  # After layer 1b
+        self.add_buffer("k_transposed", act_size)  # After K transpose
+        self.add_buffer("v_output", act_size)  # After layer 1c
         self.add_buffer(
             "attn_scores_output", self.seq_len * self.seq_len * self.num_heads
         )  # After layer 2
@@ -550,26 +571,28 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.add_buffer(
             "attn_weights_output", self.seq_len * self.seq_len * self.num_heads
         )  # After layer 4
-        self.add_buffer(
-            "attn_heads_output", self.seq_len * self.hidden_size
-        )  # After layer 5
-        self.add_buffer("output_proj_output", total_size)  # After layer 6
-        self.add_buffer("add1_output", total_size)  # After layer 7
-        self.add_buffer("ln1_output", total_size)  # After layer 8
+        self.add_buffer("attn_heads_output", act_size)  # After layer 5
+        self.add_buffer("output_proj_output", act_size)  # After layer 6
+        self.add_buffer("add1_output", act_size)  # After layer 7
+        self.add_buffer("ln1_output", act_size)  # After layer 8
         self.add_buffer(
             "up_proj_output", self.seq_len * self.intermediate_size
         )  # After layer 9
         self.add_buffer(
             "gelu_output", self.seq_len * self.intermediate_size
         )  # After layer 10
-        self.add_buffer("down_proj_output", total_size)  # After layer 11
-        self.add_buffer("add2_output", total_size)  # After layer 12
+        self.add_buffer("down_proj_output", act_size)  # After layer 11
+        self.add_buffer("add2_output", act_size)  # After layer 12
         # Layer 13 outputs to "output" buffer
 
         # Scaling factor for attention
         # TODO: Should be scalar, but for now is a matrix
-        self.add_buffer("attn_scale_factor", self.seq_len * self.seq_len)
-        logging.info(f"Finished setting up {len(self.buffers)} BERT Encoder runtime buffers.")
+        self.add_buffer(
+            "attn_scale_factor", self.seq_len * self.seq_len * self.num_heads
+        )
+        logging.info(
+            f"Finished setting up {len(self.buffers)} BERT Encoder runtime buffers."
+        )
 
         # Add kernels for all layers
         self.add_kernel(
@@ -668,7 +691,9 @@ class AIEBERTEncoder(AIEOperatorBase):
             self.ln2_xclbin.kernel_name,
             self.ln2_insts,
         )
-        logging.info(f"Finished setting up {len(self.kernels)} BERT Encoder runtime kernels.")
+        logging.info(
+            f"Finished setting up {len(self.kernels)} BERT Encoder runtime kernels."
+        )
 
         # Build runlist for all layers
         # Layer 1a: Q projection
@@ -699,37 +724,39 @@ class AIEBERTEncoder(AIEOperatorBase):
             "encoder_attn_output",
             "attn_weights_output",
             "v_output",
-            "attn_heads_output",
+            # "attn_heads_output",
+            "output",
         )
         # Layer 6: Output projection
-        self.add_to_runlist(
-            "encoder_output_proj",
-            "attn_heads_output",
-            "attn_output_weight",
-            "output_proj_output",
-        )
-        # Layer 7: Residual connection
-        self.add_to_runlist(
-            "encoder_add1", "input", "output_proj_output", "add1_output"
-        )
-        # Layer 8: Layer normalization
-        self.add_to_runlist("encoder_ln1", "add1_output", "ln1_weight", "ln1_output")
-        # Layer 9: Up projection
-        self.add_to_runlist(
-            "encoder_up_proj", "ln1_output", "ffn_up_weight", "up_proj_output"
-        )
-        # Layer 10: GeLU activation
-        self.add_to_runlist("encoder_gelu", "up_proj_output", "gelu_output")
-        # Layer 11: Down projection
-        self.add_to_runlist(
-            "encoder_down_proj", "gelu_output", "ffn_down_weight", "down_proj_output"
-        )
-        # Layer 12: Residual connection
-        self.add_to_runlist(
-            "encoder_add2", "ln1_output", "down_proj_output", "add2_output"
-        )
-        # Layer 13: Layer normalization
-        self.add_to_runlist("encoder_ln2", "add2_output", "ln2_weight", "output")
+        # self.add_to_runlist(
+        #     "encoder_output_proj",
+        #     "attn_heads_output",
+        #     "attn_output_weight",
+        #     "output_proj_output",
+        # )
+        # # Layer 7: Residual connection
+        # self.add_to_runlist(
+        #     "encoder_add1", "input", "output_proj_output", "add1_output"
+        # )
+        # # Layer 8: Layer normalization
+        # self.add_to_runlist("encoder_ln1", "add1_output", "ln1_weight", "ln1_output")
+        # # Layer 9: Up projection
+        # self.add_to_runlist(
+        #     "encoder_up_proj", "ln1_output", "ffn_up_weight", "up_proj_output"
+        # )
+        # # Layer 10: GeLU activation
+        # self.add_to_runlist("encoder_gelu", "up_proj_output", "gelu_output")
+        # # Layer 11: Down projection
+        # self.add_to_runlist(
+        #     "encoder_down_proj", "gelu_output", "ffn_down_weight", "down_proj_output"
+        # )
+        # # Layer 12: Residual connection
+        # self.add_to_runlist(
+        #     "encoder_add2", "ln1_output", "down_proj_output", "add2_output"
+        # )
+        # # Layer 13: Layer normalization
+        # self.add_to_runlist("encoder_ln2", "add2_output", "ln2_weight", "output")
+
         logging.info(f"Finished setting up {len(self.runlist)} BERT Encoder runlist.")
 
     def forward(self, x, attention_mask=None):

@@ -3,6 +3,8 @@
 
 import sys
 import pytest
+import torch
+import math
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -42,16 +44,23 @@ def test_bert_encoder(seq_len, embedding_dim, ffn_dim, num_heads, aie_context):
         context=aie_context,
     )
 
-    operator.q_weight = golden_ref["weights"]["q_weight"].T
-    operator.k_weight = golden_ref["weights"]["k_weight"].T
-    operator.v_weight = golden_ref["weights"]["v_weight"].T
-    operator.attn_output_weight = golden_ref["weights"]["attn_output_weight"].T
+    operator.q_weight = golden_ref["weights"]["q_weight"]
+    operator.k_weight = golden_ref["weights"]["k_weight"]
+    operator.v_weight = golden_ref["weights"]["v_weight"]
+    operator.attn_output_weight = golden_ref["weights"]["attn_output_weight"]
     operator.ln1_weight = golden_ref["weights"]["ln1_weight"]
-    operator.ffn_up_weight = golden_ref["weights"]["ffn_up_weight"].T
-    operator.ffn_down_weight = golden_ref["weights"]["ffn_down_weight"].T
+    operator.ffn_up_weight = golden_ref["weights"]["ffn_up_weight"]
+    operator.ffn_down_weight = golden_ref["weights"]["ffn_down_weight"]
     operator.ln2_weight = golden_ref["weights"]["ln2_weight"]
 
-    input_buffers = {"input": golden_ref["input"]}
+    input_buffers = {
+        "input": golden_ref["input"],
+        "attn_scale_factor": torch.full(
+            (seq_len, seq_len, num_heads),
+            1.0 / math.sqrt(embedding_dim // num_heads),
+            dtype=torch.bfloat16,
+        ),
+    }
     output_buffers = {"output": golden_ref["output"]}
     intermediate_buffers = {}
 
