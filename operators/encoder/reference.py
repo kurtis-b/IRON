@@ -118,11 +118,9 @@ def generate_golden_reference(
         "v_weight": v_weight,
         "attn_output_weight": attn_output_weight,
         "ln1_weight": ln1_weight,
-        "ln1_bias": ln1_bias,
         "ffn_up_weight": ffn_up_weight,
         "ffn_down_weight": ffn_down_weight,
         "ln2_weight": ln2_weight,
-        "ln2_bias": ln2_bias,
     }
 
     return {

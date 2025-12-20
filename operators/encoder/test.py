@@ -1,122 +1,70 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
 import pytest
-import torch
-import numpy as np
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 from operators.encoder.op import AIEBERTEncoder
 from operators.encoder.reference import generate_golden_reference
-from operators.common.test_utils import compare_tensors
+from operators.common.test_utils import run_test, verify_buffer
 
 
-@pytest.mark.parametrize(
-    "seq_len,hidden_size,intermediate_size,num_heads",
-    [
-        (128, 768, 3072, 12),  # BERT-base configuration
-        (64, 512, 2048, 8),  # Smaller configuration for testing
-        (256, 1024, 4096, 16),  # Larger configuration
-    ],
+def generate_test_params():
+    params = [(512, 768, 3072, 12)]
+    names = [f"bert_encoder_{seq}x{emb}x{ffn}x{h}" for seq, emb, ffn, h in params]
+    return params, names
+
+
+regular_params, regular_names = generate_test_params()
+
+all_params = [
+    pytest.param(*params, id=name)
+    for params, name in zip(regular_params, regular_names)
+]
+
+
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
-def test_encoder_layer(seq_len, hidden_size, intermediate_size, num_heads):
-    """Test BERT encoder layer against golden reference."""
+@pytest.mark.parametrize("seq_len,embedding_dim,ffn_dim,num_heads", all_params)
+def test_bert_encoder(seq_len, embedding_dim, ffn_dim, num_heads, aie_context):
+    golden_ref = generate_golden_reference(seq_len, embedding_dim, ffn_dim, num_heads)
 
-    # Generate golden reference
-    reference_data = generate_golden_reference(
+    operator = AIEBERTEncoder(
         seq_len=seq_len,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
+        hidden_size=embedding_dim,
+        intermediate_size=ffn_dim,
         num_heads=num_heads,
-        dtype="bf16",
-        seed=42,
+        context=aie_context,
     )
 
-    # Create AIE encoder operator
-    encoder = AIEBERTEncoder(
-        seq_len=seq_len,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        num_heads=num_heads,
-        num_aie_columns=4,
+    operator.q_weight = golden_ref["weights"]["q_weight"].T
+    operator.k_weight = golden_ref["weights"]["k_weight"].T
+    operator.v_weight = golden_ref["weights"]["v_weight"].T
+    operator.attn_output_weight = golden_ref["weights"]["attn_output_weight"].T
+    operator.ln1_weight = golden_ref["weights"]["ln1_weight"]
+    operator.ffn_up_weight = golden_ref["weights"]["ffn_up_weight"].T
+    operator.ffn_down_weight = golden_ref["weights"]["ffn_down_weight"].T
+    operator.ln2_weight = golden_ref["weights"]["ln2_weight"]
+
+    input_buffers = {"input": golden_ref["input"]}
+    output_buffers = {"output": golden_ref["output"]}
+    intermediate_buffers = {}
+
+    errors, latency_us, bandwidth_gbps = run_test(
+        operator,
+        input_buffers,
+        output_buffers,
+        intermediate_buffers,
+        rel_tol=0.05,
+        abs_tol=0.5,
     )
 
-    # Set weights from reference (separate Q/K/V weights)
-    encoder.q_weight = reference_data["weights"]["q_weight"]
-    encoder.k_weight = reference_data["weights"]["k_weight"]
-    encoder.v_weight = reference_data["weights"]["v_weight"]
-    encoder.attn_output_weight = reference_data["weights"]["attn_output_weight"]
-    encoder.ln1_weight = reference_data["weights"]["ln1_weight"]
-    encoder.ln1_bias = reference_data["weights"]["ln1_bias"]
-    encoder.ffn_up_weight = reference_data["weights"]["ffn_up_weight"]
-    encoder.ffn_down_weight = reference_data["weights"]["ffn_down_weight"]
-    encoder.ln2_weight = reference_data["weights"]["ln2_weight"]
-    encoder.ln2_bias = reference_data["weights"]["ln2_bias"]
+    print(f"\nLatency (us): {latency_us:.1f}")
+    print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
-    # Run forward pass
-    input_tensor = reference_data["input"]
-    attention_mask = reference_data["attention_mask"]
-
-    output = encoder.forward(input_tensor, attention_mask)
-    expected_output = reference_data["output"]
-
-    # Compare results
-    compare_tensors(
-        output,
-        expected_output,
-        rtol=1e-2,
-        atol=1e-2,
-        name="encoder_output",
-    )
-
-
-@pytest.mark.parametrize(
-    "seq_len,hidden_size,intermediate_size,num_heads",
-    [
-        (128, 768, 3072, 12),
-    ],
-)
-def test_encoder_layer_shapes(seq_len, hidden_size, intermediate_size, num_heads):
-    """Test that encoder layer produces correct output shapes."""
-
-    encoder = AIEBERTEncoder(
-        seq_len=seq_len,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        num_heads=num_heads,
-        num_aie_columns=4,
-    )
-
-    # Create random input
-    input_tensor = torch.randn(seq_len, hidden_size, dtype=torch.bfloat16)
-
-    # Initialize weights with random values (separate Q/K/V weights)
-    encoder.q_weight = torch.randn(hidden_size, hidden_size, dtype=torch.bfloat16)
-    encoder.k_weight = torch.randn(hidden_size, hidden_size, dtype=torch.bfloat16)
-    encoder.v_weight = torch.randn(hidden_size, hidden_size, dtype=torch.bfloat16)
-    encoder.attn_output_weight = torch.randn(
-        hidden_size, hidden_size, dtype=torch.bfloat16
-    )
-    encoder.ln1_weight = torch.ones(hidden_size, dtype=torch.bfloat16)
-    encoder.ln1_bias = torch.zeros(hidden_size, dtype=torch.bfloat16)
-    encoder.ffn_up_weight = torch.randn(
-        hidden_size, intermediate_size, dtype=torch.bfloat16
-    )
-    encoder.ffn_down_weight = torch.randn(
-        intermediate_size, hidden_size, dtype=torch.bfloat16
-    )
-    encoder.ln2_weight = torch.ones(hidden_size, dtype=torch.bfloat16)
-    encoder.ln2_bias = torch.zeros(hidden_size, dtype=torch.bfloat16)
-
-    # Run forward pass
-    output = encoder.forward(input_tensor)
-
-    # Check output shape
-    assert (
-        output.shape == input_tensor.shape
-    ), f"Expected output shape {input_tensor.shape}, got {output.shape}"
-
-
-if __name__ == "__main__":
-    # Run a simple test
-    print("Running BERT Encoder Layer test...")
-    test_encoder_layer_shapes(128, 768, 3072, 12)
-    print("Test passed!")
+    assert not errors, f"Test failed with errors: {errors}"

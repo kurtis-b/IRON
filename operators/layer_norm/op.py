@@ -54,29 +54,28 @@ class AIELayerNorm(AIEOperatorBase):
 
         AIEOperatorBase.__init__(self, context=context)
 
-    def set_up_artifacts(self):
+    def get_artifacts(self, prefix="weighted_layer_norm_"):
+        # Compilation artifacts
         operator_dir = Path(__file__).parent
+        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
 
-        if self.weighted:
-            file_name_base = f"weighted_layer_norm_{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
+        mlir_artifact = PythonGeneratedMLIRArtifact.new(
+            f"{file_name_base}.mlir",
+            import_path=operator_dir / "design_weighted.py",
+            callback_fn="my_weighted_layer_norm",
+            callback_args=[
+                self.context.device_manager.device_type,
+                self.size,
+                self.num_aie_columns,
+                self.num_channels,
+                self.tile_size,
+                0,
+            ],
+        )
 
-            mlir_artifact = PythonGeneratedMLIRArtifact.new(
-                f"{file_name_base}.mlir",
-                import_path=operator_dir / "design_weighted.py",
-                callback_fn="my_weighted_layer_norm",
-                callback_args=[
-                    self.context.device_manager.device_type,
-                    self.size,
-                    self.num_aie_columns,
-                    self.num_channels,
-                    self.tile_size,
-                    0,
-                ],
-            )
-
-            xclbin_artifact = XclbinArtifact.new(
-                f"{file_name_base}.xclbin",
-                depends=[
+        xclbin_artifact = XclbinArtifact.new(
+            f"{file_name_base}.xclbin",
+            depends=[
                     mlir_artifact,
                     KernelArchiveArtifact.new(
                         f"layer_norm_archive.a",
@@ -106,45 +105,20 @@ class AIELayerNorm(AIEOperatorBase):
                         ],
                     ),
                 ],
-            )
-        else:
-            file_name_base = f"layer_norm_{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
-
-        mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{file_name_base}.mlir",
-            import_path=operator_dir / "design.py",
-            callback_fn="my_layer_norm",
-            callback_args=[
-                self.context.device_manager.device_type,
-                self.size,
-                self.num_aie_columns,
-                self.num_channels,
-                self.trace_size,
-                self.tile_size,
-            ],
-        )
-
-        xclbin_artifact = XclbinArtifact.new(
-            f"{file_name_base}.xclbin",
-            depends=[
-                mlir_artifact,
-                KernelObjectArtifact.new(
-                    f"layer_norm.o",
-                    depends=[
-                        SourceArtifact.new(
-                            self.context.base_dir
-                            / "aie_kernels"
-                            / "aie2p"
-                            / "layer_norm.cc"
-                        )
-                    ],
-                ),
-            ],
         )
 
         insts_artifact = InstsBinArtifact.new(
             f"{file_name_base}.bin", depends=[mlir_artifact]
         )
+
+        insts_artifact = InstsBinArtifact.new(
+            f"{file_name_base}.bin", depends=[mlir_artifact]
+        )
+
+        return (xclbin_artifact, insts_artifact)
+
+    def set_up_artifacts(self):
+        xclbin_artifact, insts_artifact = self.get_artifacts()
 
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact

@@ -37,9 +37,9 @@ class AIEGELU(AIEOperatorBase):
 
         AIEOperatorBase.__init__(self, context=context)
 
-    def set_up_artifacts(self):
+    def get_artifacts(self, prefix="gelu_"):
         operator_dir = Path(__file__).parent
-        file_name_base = f"gelu_{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
+        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -73,6 +73,11 @@ class AIEGELU(AIEOperatorBase):
         insts_artifact = InstsBinArtifact.new(
             f"{file_name_base}.bin", depends=[mlir_artifact]
         )
+
+        return (xclbin_artifact, insts_artifact)
+
+    def set_up_artifacts(self):
+        xclbin_artifact, insts_artifact = self.get_artifacts()
 
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
