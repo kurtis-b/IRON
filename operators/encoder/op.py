@@ -127,7 +127,7 @@ class AIEBERTEncoder(AIEOperatorBase):
         artifacts = []
         device_str = self.context.device_manager.device_str()
 
-        kernel_id = 0x801
+        kernel_id = 0x901
 
         gelu_tile_size = (self.seq_len * self.intermediate_size) // (
             self.num_aie_columns * 2
@@ -240,6 +240,9 @@ class AIEBERTEncoder(AIEOperatorBase):
             M=self.seq_len,
             K=self.head_dim,
             N=self.seq_len,
+            tile_m=64,
+            tile_k=64,
+            tile_n=64,
             num_aie_columns=self.num_aie_columns,
             batch_A=(self.num_heads, 1),  # Batch across heads, batch dim first
             batch_B=(self.num_heads, 1),  # Batch across heads, batch dim first
@@ -300,7 +303,10 @@ class AIEBERTEncoder(AIEOperatorBase):
             M=self.seq_len,
             K=self.seq_len,
             N=self.head_dim,
-            num_aie_columns=self.num_aie_columns,
+            tile_m=64,
+            tile_k=64,
+            tile_n=16,
+            num_aie_columns=4,
             batch_A=(self.num_heads, 0),  # Batch across heads, batch dim first
             batch_B=(self.num_heads, 1),  # Batch across heads, batch dim first
             batch_C=(self.num_heads, 1),  # Batch across heads, batch dim first
@@ -386,8 +392,8 @@ class AIEBERTEncoder(AIEOperatorBase):
                 K=self.hidden_size,
                 N=self.intermediate_size,
                 tile_m=64,
-                tile_k=96,
-                tile_n=48,  # N=768 processed across 8 columns with n=48
+                tile_k=48,
+                tile_n=96,
                 num_aie_columns=self.num_aie_columns,
                 prio_accuracy=False,
                 emulate_bf16_mmul_with_bfp16=True,
@@ -724,38 +730,37 @@ class AIEBERTEncoder(AIEOperatorBase):
             "encoder_attn_output",
             "attn_weights_output",
             "v_output",
-            # "attn_heads_output",
-            "output",
+            "attn_heads_output",
         )
         # Layer 6: Output projection
-        # self.add_to_runlist(
-        #     "encoder_output_proj",
-        #     "attn_heads_output",
-        #     "attn_output_weight",
-        #     "output_proj_output",
-        # )
-        # # Layer 7: Residual connection
-        # self.add_to_runlist(
-        #     "encoder_add1", "input", "output_proj_output", "add1_output"
-        # )
-        # # Layer 8: Layer normalization
-        # self.add_to_runlist("encoder_ln1", "add1_output", "ln1_weight", "ln1_output")
-        # # Layer 9: Up projection
-        # self.add_to_runlist(
-        #     "encoder_up_proj", "ln1_output", "ffn_up_weight", "up_proj_output"
-        # )
-        # # Layer 10: GeLU activation
-        # self.add_to_runlist("encoder_gelu", "up_proj_output", "gelu_output")
-        # # Layer 11: Down projection
-        # self.add_to_runlist(
-        #     "encoder_down_proj", "gelu_output", "ffn_down_weight", "down_proj_output"
-        # )
-        # # Layer 12: Residual connection
-        # self.add_to_runlist(
-        #     "encoder_add2", "ln1_output", "down_proj_output", "add2_output"
-        # )
-        # # Layer 13: Layer normalization
-        # self.add_to_runlist("encoder_ln2", "add2_output", "ln2_weight", "output")
+        self.add_to_runlist(
+            "encoder_output_proj",
+            "attn_heads_output",
+            "attn_output_weight",
+            "output_proj_output",
+        )
+        # Layer 7: Residual connection
+        self.add_to_runlist(
+            "encoder_add1", "input", "output_proj_output", "add1_output"
+        )
+        # Layer 8: Layer normalization
+        self.add_to_runlist("encoder_ln1", "add1_output", "ln1_weight", "ln1_output")
+        # Layer 9: Up projection
+        self.add_to_runlist(
+            "encoder_up_proj", "ln1_output", "ffn_up_weight", "up_proj_output"
+        )
+        # Layer 10: GeLU activation
+        self.add_to_runlist("encoder_gelu", "up_proj_output", "gelu_output")
+        # Layer 11: Down projection
+        self.add_to_runlist(
+            "encoder_down_proj", "gelu_output", "ffn_down_weight", "down_proj_output"
+        )
+        # Layer 12: Residual connection
+        self.add_to_runlist(
+            "encoder_add2", "ln1_output", "down_proj_output", "add2_output"
+        )
+        # Layer 13: Layer normalization
+        self.add_to_runlist("encoder_ln2", "add2_output", "ln2_weight", "output")
 
         logging.info(f"Finished setting up {len(self.runlist)} BERT Encoder runlist.")
 
