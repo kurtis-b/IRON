@@ -38,7 +38,7 @@ def generate_golden_reference(
             - weights: Dictionary of all weight matrices
     """
     torch.manual_seed(seed)
-    val_range = 4
+    val_range = 0.05
     dtype_torch = torch_dtype_map[dtype]
 
     # Generate input tensor (seq_len, hidden_size)

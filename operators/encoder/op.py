@@ -74,6 +74,11 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.ffn_up_weight = None
         self.ffn_down_weight = None
         self.ln2_weight = None
+        self.attn_scale_factor =  torch.full(
+            (seq_len, seq_len, num_heads),
+            math.sqrt(1.0 / self.head_dim),
+            dtype=torch.bfloat16,
+        )
 
         # Artifacts created by set_up_artifacts() - one per layer
         self.combined_xclbin = None
@@ -495,9 +500,8 @@ class AIEBERTEncoder(AIEOperatorBase):
         """Set up runtime buffers and kernels for all 13 layers."""
         act_size = self.seq_len * self.hidden_size
 
-        # Input/output buffers
+        # Input buffer
         self.add_buffer("input", act_size)
-        self.add_buffer("output", act_size)
 
         # Weight buffers (separate Q/K/V weights)
         self.add_buffer(
@@ -562,6 +566,12 @@ class AIEBERTEncoder(AIEOperatorBase):
                 torch_to_numpy(self.ln2_weight) if self.ln2_weight is not None else None
             ),
         )
+        # Scaling factor for attention
+        # TODO: Should be scalar, but for now is a matrix
+        self.add_buffer(
+            "attn_scale_factor", self.seq_len * self.seq_len * self.num_heads,
+            static_data=torch_to_numpy(self.attn_scale_factor),
+        )
 
         # Intermediate buffers for all layers
         self.add_buffer("q_output", act_size)  # After layer 1a
@@ -589,13 +599,9 @@ class AIEBERTEncoder(AIEOperatorBase):
         )  # After layer 10
         self.add_buffer("down_proj_output", act_size)  # After layer 11
         self.add_buffer("add2_output", act_size)  # After layer 12
-        # Layer 13 outputs to "output" buffer
 
-        # Scaling factor for attention
-        # TODO: Should be scalar, but for now is a matrix
-        self.add_buffer(
-            "attn_scale_factor", self.seq_len * self.seq_len * self.num_heads
-        )
+        # Output buffer
+        self.add_buffer("output", act_size)
         logging.info(
             f"Finished setting up {len(self.buffers)} BERT Encoder runtime buffers."
         )

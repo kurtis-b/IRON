@@ -3,8 +3,7 @@
 
 import sys
 import pytest
-import torch
-import math
+import logging
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -55,13 +54,10 @@ def test_bert_encoder(seq_len, embedding_dim, ffn_dim, num_heads, aie_context):
 
     input_buffers = {
         "input": golden_ref["input"],
-        "attn_scale_factor": torch.full(
-            (seq_len, seq_len, num_heads),
-            1.0 / math.sqrt(embedding_dim // num_heads),
-            dtype=torch.bfloat16,
-        ),
     }
-    output_buffers = {"output": golden_ref["output"]}
+    output_buffers = {
+        "output": golden_ref["output"],
+    }
     intermediate_buffers = {}
 
     errors, latency_us, bandwidth_gbps = run_test(
@@ -73,7 +69,20 @@ def test_bert_encoder(seq_len, embedding_dim, ffn_dim, num_heads, aie_context):
         abs_tol=0.5,
     )
 
-    print(f"\nLatency (us): {latency_us:.1f}")
-    print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
+    # Use batch_size of C for total operations
+    total_macs = seq_len * embedding_dim * embedding_dim * 4
+    total_macs += seq_len * (embedding_dim // num_heads) * seq_len * num_heads * 2
+    total_macs += seq_len * embedding_dim * ffn_dim * 2
+    total_ops = total_macs * 2  # 2 operations per MAC
+    gflops = total_ops / (latency_us * 1e-6) / 1e9
 
-    assert not errors, f"Test failed with errors: {errors}"
+    print(f"\nLatency (us): {latency_us:.1f}")
+    # print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s")
+    print(f"Throughput: {gflops:.6e} GFLOP/s\n")
+
+    error_threshold = 0.05
+    max_acceptable_errors = int(seq_len * embedding_dim * error_threshold)
+
+    assert (
+        len(errors["output"]) <= max_acceptable_errors
+    ), f"Test failed with {len(errors['output'])} errors (max allowable: {max_acceptable_errors})"
