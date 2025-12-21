@@ -76,35 +76,35 @@ class AIELayerNorm(AIEOperatorBase):
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
             depends=[
-                    mlir_artifact,
-                    KernelArchiveArtifact.new(
-                        f"layer_norm_archive.a",
-                        depends=[
-                            KernelObjectArtifact.new(
-                                f"layer_norm.o",
-                                depends=[
-                                    SourceArtifact.new(
-                                        self.context.base_dir
-                                        / "aie_kernels"
-                                        / "aie2p"
-                                        / "layer_norm.cc"
-                                    )
-                                ],
-                            ),
-                            KernelObjectArtifact.new(
-                                "mul.o",
-                                depends=[
-                                    SourceArtifact.new(
-                                        self.context.base_dir
-                                        / "aie_kernels"
-                                        / "generic"
-                                        / "mul.cc"
-                                    )
-                                ],
-                            ),
-                        ],
-                    ),
-                ],
+                mlir_artifact,
+                KernelArchiveArtifact.new(
+                    f"layer_norm_archive.a",
+                    depends=[
+                        KernelObjectArtifact.new(
+                            f"layer_norm.o",
+                            depends=[
+                                SourceArtifact.new(
+                                    self.context.base_dir
+                                    / "aie_kernels"
+                                    / "aie2p"
+                                    / "layer_norm.cc"
+                                )
+                            ],
+                        ),
+                        KernelObjectArtifact.new(
+                            "mul.o",
+                            depends=[
+                                SourceArtifact.new(
+                                    self.context.base_dir
+                                    / "aie_kernels"
+                                    / "generic"
+                                    / "mul.cc"
+                                )
+                            ],
+                        ),
+                    ],
+                ),
+            ],
         )
 
         insts_artifact = InstsBinArtifact.new(
