@@ -15,6 +15,7 @@ from operators.common.test_utils import run_test
 
 TEST_BERT = True
 
+
 def generate_test_params(extensive=False):
     M_list = [2048] if not extensive else [2048]
     K_list = [4096] if not extensive else [2048, 8192, 64]
@@ -73,6 +74,7 @@ all_params = [
     for params, name in zip(extensive_params, extensive_names)
 ]
 
+
 def generate_test_params_bert(extensive=False):
     params = []
     names = []
@@ -99,12 +101,14 @@ def generate_test_params_bert(extensive=False):
 
     return params, names
 
+
 regular_params_bert, regular_names_bert = generate_test_params_bert(extensive=False)
 
 bert_params = [
     pytest.param(*params, id=name)
     for params, name in zip(regular_params_bert, regular_names_bert)
 ]
+
 
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",

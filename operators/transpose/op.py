@@ -89,7 +89,7 @@ class AIETranspose(AIEOperatorBase):
             f"{file_name_base}.bin", depends=[mlir_artifact]
         )
 
-        return (xclbin_artifact, insts_artifact) 
+        return (xclbin_artifact, insts_artifact)
 
     def set_up_artifacts(self):
         xclbin_artifact, insts_artifact = self.get_artifacts()

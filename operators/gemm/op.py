@@ -372,9 +372,7 @@ class AIEGEMM(AIEOperatorBase):
     def _get_padded_dims(self, M, K, N):
         tile_m, tile_k, tile_n = self.tile_m, self.tile_k, self.tile_n
         num_aie_columns = self.num_aie_columns
-        logging.info(
-            f"Calculating padded dimensions for requested M={M}, K={K}, N={N}"
-        )
+        logging.info(f"Calculating padded dimensions for requested M={M}, K={K}, N={N}")
         logging.info(
             f"Using tile sizes tile_m={tile_m}, tile_k={tile_k}, tile_n={tile_n}, num_aie_columns={num_aie_columns}"
         )

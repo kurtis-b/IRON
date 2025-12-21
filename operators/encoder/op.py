@@ -74,7 +74,7 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.ffn_up_weight = None
         self.ffn_down_weight = None
         self.ln2_weight = None
-        self.attn_scale_factor =  torch.full(
+        self.attn_scale_factor = torch.full(
             (seq_len, seq_len, num_heads),
             math.sqrt(1.0 / self.head_dim),
             dtype=torch.bfloat16,
@@ -569,7 +569,8 @@ class AIEBERTEncoder(AIEOperatorBase):
         # Scaling factor for attention
         # TODO: Should be scalar, but for now is a matrix
         self.add_buffer(
-            "attn_scale_factor", self.seq_len * self.seq_len * self.num_heads,
+            "attn_scale_factor",
+            self.seq_len * self.seq_len * self.num_heads,
             static_data=torch_to_numpy(self.attn_scale_factor),
         )
 

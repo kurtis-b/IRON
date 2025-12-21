@@ -835,7 +835,9 @@ def my_matmul(
                                 for tile_idx in range(B_tile_iters):
                                     B_tile = TensorAccessPattern(
                                         batched_B_shape,
-                                        offset=B_col_offset + B_batch_offset + tile_idx * B_tile_offset,
+                                        offset=B_col_offset
+                                        + B_batch_offset
+                                        + tile_idx * B_tile_offset,
                                         sizes=B_sizes,
                                         strides=B_strides,
                                     )
