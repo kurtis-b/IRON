@@ -439,11 +439,11 @@ class AIEGEMM(AIEOperatorBase):
 
     def _execute_aie_operation(self, A_np, B_np=None):
         """Execute GEMM operation on AIE hardware"""
-        M, K = _get_gemm_shapes(A_np.shape, self.batch_A)
+        M, K = self._get_gemm_shapes(A_np.shape, self.batch_A)
         K2, N = (
-            _get_gemm_shapes(B_np.shape, self.batch_B)
+            self._get_gemm_shapes(B_np.shape, self.batch_B)
             if B_np is not None
-            else _get_gemm_shapes(self.weight.T.shape, self.batch_B)
+            else self._get_gemm_shapes(self.weight.T.shape, self.batch_B)
         )
 
         # If M is larger than kernel supports, split large GEMMs with many rows
