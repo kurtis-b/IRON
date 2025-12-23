@@ -31,6 +31,7 @@ from operators import AIELayerNorm
 class BertIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         if config.aie_config.use_aie_gemm:
             aie_gemm_config = {
                 "num_columns": 8,
@@ -69,18 +70,26 @@ class BertIntermediate(nn.Module):
         return hidden_states
 
     def assign_weights(self, l, dense_w, dense_b):
-        assign(
-            self.dense.weight,
-            dense_w,
-            f"bert.encoder.layer.{l}.intermediate.dense.weight",
-        )
-        # TODO: Need to implement bias assignment for AIEGEMM
-        # assign(self.dense.bias, dense_b, f"bert.encoder.layer.{l}.intermediate.dense.bias")
+        if self.config.aie_config.use_aie_gemm:
+            self.dense.weight = dense_w
+            # TODO: Need to implement bias assignment
+        else:
+            assign(
+                self.dense.weight,
+                dense_w,
+                f"bert.encoder.layer.{l}.intermediate.dense.weight",
+            )
+            assign(
+                self.dense.bias,
+                dense_b,
+                f"bert.encoder.layer.{l}.intermediate.dense.bias",
+            )
 
 
 class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         if config.aie_config.use_aie_gemm:
             aie_gemm_config = {
                 "num_columns": 8,
@@ -139,18 +148,29 @@ class BertOutput(nn.Module):
         return hidden_states
 
     def assign_weights(self, l, dense_w, dense_b, layernorm_w, layernorm_b):
-        assign(
-            self.dense.weight, dense_w, f"bert.encoder.layer.{l}.output.dense.weight"
-        )
-        assign(
-            self.LayerNorm.weight,
-            layernorm_w,
-            f"bert.encoder.layer.{l}.output.LayerNorm.gamma",
-        )
-        # TODO: Need to implement bias assignment
-        # assign(self.dense.bias, dense_b, f"bert.encoder.layer.{l}.output.dense.bias")
-        # assign(
-        #     self.LayerNorm.bias,
-        #     layernorm_b,
-        #     f"bert.encoder.layer.{l}.output.LayerNorm.beta",
-        # )
+        if self.config.aie_config.use_aie_gemm:
+            self.dense.weight = dense_w
+            # TODO: Need to implement bias assignment
+        else:
+            assign(
+                self.dense.weight,
+                dense_w,
+                f"bert.encoder.layer.{l}.output.dense.weight",
+            )
+            assign(
+                self.dense.bias, dense_b, f"bert.encoder.layer.{l}.output.dense.bias"
+            )
+        if self.config.aie_config.use_aie_layernorm:
+            self.LayerNorm.weight = layernorm_w
+            # TODO: Need to implement bias assignment
+        else:
+            assign(
+                self.LayerNorm.weight,
+                layernorm_w,
+                f"bert.encoder.layer.{l}.output.LayerNorm.gamma",
+            )
+            assign(
+                self.LayerNorm.bias,
+                layernorm_b,
+                f"bert.encoder.layer.{l}.output.LayerNorm.beta",
+            )

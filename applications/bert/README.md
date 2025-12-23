@@ -31,12 +31,12 @@ Before running `inference.py`, ensure you have the proper environment. To build 
 Inference with BERT can be run by invoking the `inference.py` script:  
 ```bash  
 cd applications/bert
-python inference.py /path/to/model.safetensors /path/to/config.json
+python3 inference.py /path/to/model.safetensors /path/to/config.json
 ```
 
 `inference.py` has the following command format:  
 ```bash
-python inference.py <weights_file_path> <config_file_path> [--num_samples NUM_SAMPLES] [--fine_tune]
+python3 inference.py <weights_file_path> <config_file_path> [--num_samples NUM_SAMPLES] [--fine_tune]
 ```
 
 ### Arguments:

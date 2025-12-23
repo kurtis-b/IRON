@@ -21,8 +21,10 @@
 
 import torch
 import torch.nn as nn
+from ..utils import assign
 from .feed_forward import BertIntermediate, BertOutput
 from .mha import BertAttention
+from operators import AIEBERTEncoder
 
 
 class BertLayer(nn.Module):
@@ -48,9 +50,37 @@ class BertEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList(
-            [BertLayer(config) for i in range(config.model_config.num_hidden_layers)]
-        )
+        offload_individual_operator = [
+            config.aie_config.use_aie_gemm == True,
+            config.aie_config.use_aie_gelu == True,
+            config.aie_config.use_aie_softmax == True,
+            config.aie_config.use_aie_layernorm == True,
+            config.aie_config.use_aie_elementwise_add == True,
+            config.aie_config.use_aie_elementwise_mul == True,
+            config.aie_config.use_aie_transpose == True,
+        ]
+        assert (
+            self.config.aie_config.use_aie_bert_encoder
+            and not any(offload_individual_operator)
+            or not self.config.aie_config.use_aie_bert_encoder
+        ), "Cannot mix Encoder runlist with individual AIE operators."
+        if config.aie_config.use_aie_bert_encoder:
+            self.layer = [
+                AIEBERTEncoder(
+                    seq_len=512,
+                    hidden_size=config.model_config.hidden_size,
+                    intermediate_size=config.model_config.intermediate_size,
+                    num_heads=config.model_config.num_attention_heads,
+                )
+                for i in range(config.model_config.num_hidden_layers)
+            ]
+        else:
+            self.layer = nn.ModuleList(
+                [
+                    BertLayer(config)
+                    for i in range(config.model_config.num_hidden_layers)
+                ]
+            )
 
     def forward(self, hidden_states, attention_mask):
         for i, layer_module in enumerate(self.layer):
@@ -60,3 +90,102 @@ class BertEncoder(nn.Module):
             )
 
         return hidden_states
+
+    def assign_weights(self, combined_weights):
+        if self.config.aie_config.use_aie_bert_encoder:
+            for l in range(self.config.model_config.num_hidden_layers):
+                self.layer[l].q_weight = combined_weights[
+                    f"bert.encoder.layer.{l}.attention.self.query.weight"
+                ].to(self.config.aie_config.dtype)
+                self.layer[l].k_weight = combined_weights[
+                    f"bert.encoder.layer.{l}.attention.self.key.weight"
+                ].to(self.config.aie_config.dtype)
+                self.layer[l].v_weight = combined_weights[
+                    f"bert.encoder.layer.{l}.attention.self.value.weight"
+                ].to(self.config.aie_config.dtype)
+                self.layer[l].attn_output_weight = combined_weights[
+                    f"bert.encoder.layer.{l}.attention.output.dense.weight"
+                ].to(self.config.aie_config.dtype)
+                self.layer[l].ln1_weight = combined_weights[
+                    f"bert.encoder.layer.{l}.attention.output.LayerNorm.gamma"
+                ].to(self.config.aie_config.dtype)
+                self.layer[l].ffn_up_weight = combined_weights[
+                    f"bert.encoder.layer.{l}.intermediate.dense.weight"
+                ].to(self.config.aie_config.dtype)
+                self.layer[l].ffn_down_weight = combined_weights[
+                    f"bert.encoder.layer.{l}.output.dense.weight"
+                ].to(self.config.aie_config.dtype)
+                self.layer[l].ln2_weight = combined_weights[
+                    f"bert.encoder.layer.{l}.output.LayerNorm.gamma"
+                ].to(self.config.aie_config.dtype)
+        else:
+            # Operators here could be offloaded to AIE
+            for l in range(self.config.model_config.num_hidden_layers):
+                self.layer[l].attention.output.assign_weights(
+                    l,
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.attention.output.dense.weight"
+                    ].to(self.config.aie_config.dtype),
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.attention.output.dense.bias"
+                    ].to(self.config.aie_config.dtype),
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.attention.output.LayerNorm.gamma"
+                    ].to(
+                        self.config.aie_config.dtype
+                    ),  # weight
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.attention.output.LayerNorm.beta"
+                    ].to(
+                        self.config.aie_config.dtype
+                    ),  # bias
+                )
+                self.layer[l].attention.self.assign_weights(
+                    l,
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.attention.self.query.weight"
+                    ].to(self.config.aie_config.dtype),
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.attention.self.query.bias"
+                    ].to(self.config.aie_config.dtype),
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.attention.self.key.weight"
+                    ].to(self.config.aie_config.dtype),
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.attention.self.key.bias"
+                    ].to(self.config.aie_config.dtype),
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.attention.self.value.weight"
+                    ].to(self.config.aie_config.dtype),
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.attention.self.value.bias"
+                    ].to(self.config.aie_config.dtype),
+                )
+                self.layer[l].intermediate.assign_weights(
+                    l,
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.intermediate.dense.weight"
+                    ].to(self.config.aie_config.dtype),
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.intermediate.dense.bias"
+                    ].to(self.config.aie_config.dtype),
+                )
+                self.layer[l].output.assign_weights(
+                    l,
+                    combined_weights[f"bert.encoder.layer.{l}.output.dense.weight"].to(
+                        self.config.aie_config.dtype
+                    ),
+                    combined_weights[f"bert.encoder.layer.{l}.output.dense.bias"].to(
+                        self.config.aie_config.dtype
+                    ),
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.output.LayerNorm.gamma"
+                    ].to(
+                        self.config.aie_config.dtype
+                    ),  # weight
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.output.LayerNorm.beta"
+                    ].to(
+                        self.config.aie_config.dtype
+                    ),  # bias
+                )

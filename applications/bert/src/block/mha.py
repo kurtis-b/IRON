@@ -179,27 +179,46 @@ class BertSelfAttention(nn.Module):
         return attn_output, attn_weights
 
     def assign_weights(self, l, query_w, query_b, key_w, key_b, value_w, value_b):
-        assign(
-            self.query.weight,
-            query_w,
-            f"bert.encoder.layer.{l}.attention.self.query.weight",
-        )
-        # assign(self.query.bias, query_b, f"bert.encoder.layer.{l}.attention.self.query.bias")
-        assign(
-            self.key.weight, key_w, f"bert.encoder.layer.{l}.attention.self.key.weight"
-        )
-        # assign(self.key.bias, key_b, f"bert.encoder.layer.{l}.attention.self.key.bias")
-        assign(
-            self.value.weight,
-            value_w,
-            f"bert.encoder.layer.{l}.attention.self.value.weight",
-        )
-        # assign(self.value.bias, value_b, f"bert.encoder.layer.{l}.attention.self.value.bias")
+        if self.config.aie_config.use_aie_gemm:
+            self.query.weight = query_w
+            self.key.weight = key_w
+            self.value.weight = value_w
+            # TODO: Need to implement bias assignment
+        else:
+            assign(
+                self.query.weight,
+                query_w,
+                f"bert.encoder.layer.{l}.attention.self.query.weight",
+            )
+            assign(
+                self.query.bias,
+                query_b,
+                f"bert.encoder.layer.{l}.attention.self.query.bias",
+            )
+            assign(
+                self.key.weight,
+                key_w,
+                f"bert.encoder.layer.{l}.attention.self.key.weight",
+            )
+            assign(
+                self.key.bias, key_b, f"bert.encoder.layer.{l}.attention.self.key.bias"
+            )
+            assign(
+                self.value.weight,
+                value_w,
+                f"bert.encoder.layer.{l}.attention.self.value.weight",
+            )
+            assign(
+                self.value.bias,
+                value_b,
+                f"bert.encoder.layer.{l}.attention.self.value.bias",
+            )
 
 
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         if config.aie_config.use_aie_gemm:
             aie_gemm_config = {
                 "num_columns": 8,
@@ -258,19 +277,34 @@ class BertSelfOutput(nn.Module):
         return hidden_states
 
     def assign_weights(self, l, dense_w, dense_b, layernorm_w, layernorm_b):
-        assign(
-            self.dense.weight,
-            dense_w,
-            f"bert.encoder.layer.{l}.attention.output.dense.weight",
-        )
-        assign(
-            self.LayerNorm.weight,
-            layernorm_w,
-            f"bert.encoder.layer.{l}.attention.output.LayerNorm.gamma",
-        )
-        # TODO: Need to implement bias assignment
-        # assign(self.dense.bias, dense_b, f"bert.encoder.layer.{l}.attention.output.dense.bias")
-        # assign(self.LayerNorm.bias, layernorm_b, f"bert.encoder.layer.{l}.attention.output.LayerNorm.beta")
+        if self.config.aie_config.use_aie_gemm:
+            self.dense.weight = dense_w
+            # TODO: Need to implement bias assignment
+        else:
+            assign(
+                self.dense.weight,
+                dense_w,
+                f"bert.encoder.layer.{l}.attention.output.dense.weight",
+            )
+            assign(
+                self.dense.bias,
+                dense_b,
+                f"bert.encoder.layer.{l}.attention.output.dense.bias",
+            )
+        if self.config.aie_config.use_aie_layernorm:
+            self.LayerNorm.weight = layernorm_w
+            # TODO: Need to implement bias assignment
+        else:
+            assign(
+                self.LayerNorm.weight,
+                layernorm_w,
+                f"bert.encoder.layer.{l}.attention.output.LayerNorm.gamma",
+            )
+            assign(
+                self.LayerNorm.bias,
+                layernorm_b,
+                f"bert.encoder.layer.{l}.attention.output.LayerNorm.beta",
+            )
 
 
 class BertAttention(nn.Module):

@@ -212,16 +212,13 @@ def classify_text(model, tokenizer, text, device="cpu"):
     - logits: Raw logits from the model
     """
     model.eval()
-
-    # Handle both single text and batch of texts
     is_single_text = isinstance(text, str)
-    texts = [text] if is_single_text else text
 
     # Tokenize input(s)
-    if len(texts) == 1:
-        # Use encode_plus for single text (backward compatibility)
+    if is_single_text:
+        # Use encode_plus for single text
         encoded = tokenizer.encode_plus(
-            texts[0],
+            text,
             padding="max_length",  # Pad to max_length
             truncation=True,  # Truncate if longer than max_length
             max_length=512,
@@ -230,7 +227,7 @@ def classify_text(model, tokenizer, text, device="cpu"):
     else:
         # Use batch_encode_plus for multiple texts
         encoded = tokenizer.batch_encode_plus(
-            texts,
+            text,
             padding="max_length",  # Pad to max_length
             truncation=True,  # Truncate if longer than max_length
             max_length=512,
@@ -250,6 +247,7 @@ def classify_text(model, tokenizer, text, device="cpu"):
     # print(input_ids.shape)
     # print(attention_mask.shape)
     # print(token_type_ids.shape)
+    print("attn_mask:", attention_mask.numpy())
 
     # # Adjust the sequence length accepted for the embeddings based on the input
     # model.bert.embeddings.position_embeddings.weight = nn.Parameter(model.bert.embeddings.position_embeddings.weight[:len(input_ids)])
@@ -263,7 +261,7 @@ def classify_text(model, tokenizer, text, device="cpu"):
     # Calculate the softmax of the logits
     probabilities = torch.nn.functional.softmax(logits, dim=-1)
 
-    # If input was a single text, squeeze the batch dimension for backward compatibility
+    # If input was a single text, squeeze the batch dimension
     if is_single_text:
         probabilities = probabilities.squeeze(0)
         logits = logits.squeeze(0)
@@ -568,32 +566,6 @@ def main():
         # for key in sorted(combined_weights.keys()):
         #     val = combined_weights[key]
         #     print(key, ":", val.shape)
-
-        model.bert.embeddings.word_embeddings.weight = assign(
-            model.bert.embeddings.word_embeddings.weight,
-            combined_weights["bert.embeddings.word_embeddings.weight"],
-            "bert.embeddings.word_embeddings.weight",
-        )
-        model.bert.embeddings.position_embeddings.weight = assign(
-            model.bert.embeddings.position_embeddings.weight,
-            combined_weights["bert.embeddings.position_embeddings.weight"],
-            "bert.embeddings.position_embeddings.weight",
-        )
-        model.bert.embeddings.token_type_embeddings.weight = assign(
-            model.bert.embeddings.token_type_embeddings.weight,
-            combined_weights["bert.embeddings.token_type_embeddings.weight"],
-            "bert.embeddings.token_type_embeddings.weight",
-        )
-        model.bert.embeddings.LayerNorm.bias = assign(
-            model.bert.embeddings.LayerNorm.bias,
-            combined_weights["bert.embeddings.LayerNorm.beta"],
-            "bert.embeddings.LayerNorm.beta",
-        )
-        model.bert.embeddings.LayerNorm.weight = assign(
-            model.bert.embeddings.LayerNorm.weight,
-            combined_weights["bert.embeddings.LayerNorm.gamma"],
-            "bert.embeddings.LayerNorm.gamma",
-        )
         # print("\n\nEmbedding weights:")
         # combined_weights_1 = load_file("model.safetensors")
         # combined_weights_2 = load_file("model_finetuned.safetensors")
@@ -635,71 +607,33 @@ def main():
         # print(combined_weights_2["bert.pooler.dense.bias"].mean())
         # print(combined_weights_2["bert.pooler.dense.bias"].std())
         # print("\n\n")
-        for l in range(config.model_config.num_hidden_layers):
-            model.bert.encoder.layer[l].attention.output.assign_weights(
-                l,
-                combined_weights[
-                    f"bert.encoder.layer.{l}.attention.output.dense.weight"
-                ].to(config.aie_config.dtype),
-                combined_weights[
-                    f"bert.encoder.layer.{l}.attention.output.dense.bias"
-                ].to(config.aie_config.dtype),
-                combined_weights[
-                    f"bert.encoder.layer.{l}.attention.output.LayerNorm.gamma"
-                ].to(
-                    config.aie_config.dtype
-                ),  # weight
-                combined_weights[
-                    f"bert.encoder.layer.{l}.attention.output.LayerNorm.beta"
-                ].to(
-                    config.aie_config.dtype
-                ),  # bias
-            )
-            model.bert.encoder.layer[l].attention.self.assign_weights(
-                l,
-                combined_weights[
-                    f"bert.encoder.layer.{l}.attention.self.query.weight"
-                ].to(config.aie_config.dtype),
-                combined_weights[
-                    f"bert.encoder.layer.{l}.attention.self.query.bias"
-                ].to(config.aie_config.dtype),
-                combined_weights[
-                    f"bert.encoder.layer.{l}.attention.self.key.weight"
-                ].to(config.aie_config.dtype),
-                combined_weights[f"bert.encoder.layer.{l}.attention.self.key.bias"].to(
-                    config.aie_config.dtype
-                ),
-                combined_weights[
-                    f"bert.encoder.layer.{l}.attention.self.value.weight"
-                ].to(config.aie_config.dtype),
-                combined_weights[
-                    f"bert.encoder.layer.{l}.attention.self.value.bias"
-                ].to(config.aie_config.dtype),
-            )
-            model.bert.encoder.layer[l].intermediate.assign_weights(
-                l,
-                combined_weights[
-                    f"bert.encoder.layer.{l}.intermediate.dense.weight"
-                ].to(config.aie_config.dtype),
-                combined_weights[f"bert.encoder.layer.{l}.intermediate.dense.bias"].to(
-                    config.aie_config.dtype
-                ),
-            )
-            model.bert.encoder.layer[l].output.assign_weights(
-                l,
-                combined_weights[f"bert.encoder.layer.{l}.output.dense.weight"].to(
-                    config.aie_config.dtype
-                ),
-                combined_weights[f"bert.encoder.layer.{l}.output.dense.bias"].to(
-                    config.aie_config.dtype
-                ),
-                combined_weights[f"bert.encoder.layer.{l}.output.LayerNorm.gamma"].to(
-                    config.aie_config.dtype
-                ),  # weight
-                combined_weights[f"bert.encoder.layer.{l}.output.LayerNorm.beta"].to(
-                    config.aie_config.dtype
-                ),  # bias
-            )
+
+        model.bert.embeddings.word_embeddings.weight = assign(
+            model.bert.embeddings.word_embeddings.weight,
+            combined_weights["bert.embeddings.word_embeddings.weight"],
+            "bert.embeddings.word_embeddings.weight",
+        )
+        model.bert.embeddings.position_embeddings.weight = assign(
+            model.bert.embeddings.position_embeddings.weight,
+            combined_weights["bert.embeddings.position_embeddings.weight"],
+            "bert.embeddings.position_embeddings.weight",
+        )
+        model.bert.embeddings.token_type_embeddings.weight = assign(
+            model.bert.embeddings.token_type_embeddings.weight,
+            combined_weights["bert.embeddings.token_type_embeddings.weight"],
+            "bert.embeddings.token_type_embeddings.weight",
+        )
+        model.bert.embeddings.LayerNorm.bias = assign(
+            model.bert.embeddings.LayerNorm.bias,
+            combined_weights["bert.embeddings.LayerNorm.beta"],
+            "bert.embeddings.LayerNorm.beta",
+        )
+        model.bert.embeddings.LayerNorm.weight = assign(
+            model.bert.embeddings.LayerNorm.weight,
+            combined_weights["bert.embeddings.LayerNorm.gamma"],
+            "bert.embeddings.LayerNorm.gamma",
+        )
+        model.bert.encoder.assign_weights(combined_weights)
         model.bert.pooler.dense.bias = assign(
             model.bert.pooler.dense.bias,
             combined_weights["bert.pooler.dense.bias"],
@@ -766,24 +700,29 @@ def main():
         torch.manual_seed(1608560892)
 
         # At this point the model is fully described (operators and their dimensions and how to compile them)
-        AIEOperatorBase.compile_all_operators()
-        AIEOperatorBase.prepare_runtime()
+        AIEOperatorBase.get_default_context().compile_all()
+        AIEOperatorBase.get_default_context().prepare_runtime()
+        logging.info("AIE operator preparation completed.")
 
         # Load validation dataset for evaluation
         print("Loading SST-2 validation dataset for evaluation...")
-        dataset = load_dataset("sst2", split="validation")
-
         num_samples_to_test = args.num_samples
-        # Half of dataset should be positive and other half negative
-        sorted_dataset = dataset.sort("label")
-        texts_to_classify = dataset["sentence"][: num_samples_to_test // 2]
-        texts_to_classify = (
-            texts_to_classify + dataset["sentence"][-num_samples_to_test // 2 :]
-        )
-        true_labels = dataset["label"][: num_samples_to_test // 2]
-        print(true_labels[:5])
-        true_labels = true_labels + dataset["label"][-num_samples_to_test // 2 :]
-        print(true_labels[num_samples_to_test // 2 : num_samples_to_test // 2 + 5])
+        if num_samples_to_test == 1:
+            texts_to_classify = ["That was great!"]
+            true_labels = [1]
+        else:
+            dataset = load_dataset("sst2", split="validation")
+
+            # Half of dataset should be positive and other half negative
+            sorted_dataset = dataset.sort("label")
+            texts_to_classify = dataset["sentence"][: num_samples_to_test // 2]
+            texts_to_classify = (
+                texts_to_classify + dataset["sentence"][-num_samples_to_test // 2 :]
+            )
+            true_labels = dataset["label"][: num_samples_to_test // 2]
+            print(true_labels[:5])
+            true_labels = true_labels + dataset["label"][-num_samples_to_test // 2 :]
+            print(true_labels[num_samples_to_test // 2 : num_samples_to_test // 2 + 5])
 
         correct_predictions = []
         wrong_predictions = []
