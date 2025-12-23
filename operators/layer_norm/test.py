@@ -78,12 +78,12 @@ def generate_test_params_bert(extensive=False):
 
     params.extend(
         [
-            (393216, 8, 2, 4096, True),
+            (393216, 8, 2, 768, True),
         ]
     )
     names.extend(
         [
-            f"weighted_layer_norm_8_cols_2_channels_393216_tile_4096",
+            f"weighted_layer_norm_8_cols_2_channels_393216_tile_768",
         ]
     )
 
