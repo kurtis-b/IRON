@@ -122,10 +122,7 @@ class AIESoftmax(AIEOperatorBase):
         results = []
         for i in range(heads):
             x_iter = x_list[i]
-            input_size = x_iter.nbytes
             self.write_buffer("in", x_iter)
-            test_pattern = np.zeros(len(x_iter), dtype=bfloat16)
-            self.write_buffer("output", test_pattern)
             self.run_runlist()
             result = self.read_buffer_as_torch(
                 "output", shape=x_list[i].shape, dtype=bfloat16

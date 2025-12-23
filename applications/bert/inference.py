@@ -49,6 +49,153 @@ from operators.common import AIEOperatorBase
 # Global logger for profiling
 _profile_logger = None
 
+SAMPLE_TEXT = """
+SCENE I. King Lear's palace.
+Enter KENT, GLOUCESTER, and EDMUND
+KENT
+I thought the king had more affected the Duke of
+Albany than Cornwall.
+GLOUCESTER
+It did always seem so to us: but now, in the
+division of the kingdom, it appears not which of
+the dukes he values most; for equalities are so
+weighed, that curiosity in neither can make choice
+of either's moiety.
+KENT
+Is not this your son, my lord?
+GLOUCESTER
+
+His breeding, sir, hath been at my charge: I have
+so often blushed to acknowledge him, that now I am
+brazed to it.
+KENT
+I cannot conceive you.
+GLOUCESTER
+Sir, this young fellow's mother could: whereupon
+she grew round-wombed, and had, indeed, sir, a son
+for her cradle ere she had a husband for her bed.
+Do you smell a fault?
+KENT
+I cannot wish the fault undone, the issue of it
+being so proper.
+GLOUCESTER
+But I have, sir, a son by order of law, some year
+elder than this, who yet is no dearer in my account:
+though this knave came something saucily into the
+world before he was sent for, yet was his mother
+fair; there was good sport at his making, and the
+whoreson must be acknowledged. Do you know this
+noble gentleman, Edmund?
+EDMUND
+No, my lord.
+GLOUCESTER
+My lord of Kent: remember him hereafter as my
+honourable friend.
+EDMUND
+My services to your lordship.
+KENT
+I must love you, and sue to know you better.
+EDMUND
+Sir, I shall study deserving.
+GLOUCESTER
+He hath been out nine years, and away he shall
+again. The king is coming.
+Sennet. Enter KING LEAR, CORNWALL, ALBANY, GONERIL, REGAN, CORDELIA, and Attendants
+
+KING LEAR
+Attend the lords of France and Burgundy, Gloucester.
+GLOUCESTER
+I shall, my liege.
+Exeunt GLOUCESTER and EDMUND
+KING LEAR
+Meantime we shall express our darker purpose.
+Give me the map there. Know that we have divided
+In three our kingdom: and 'tis our fast intent
+To shake all cares and business from our age;
+Conferring them on younger strengths, while we
+Unburthen'd crawl toward death. Our son of Cornwall,
+And you, our no less loving son of Albany,
+We have this hour a constant will to publish
+Our daughters' several dowers, that future strife
+May be prevented now. The princes, France and Burgundy,
+Great rivals in our youngest daughter's love,
+Long in our court have made their amorous sojourn,
+And here are to be answer'd. Tell me, my daughters,--
+Since now we will divest us both of rule,
+Interest of territory, cares of state,--
+Which of you shall we say doth love us most?
+That we our largest bounty may extend
+Where nature doth with merit challenge. Goneril,
+Our eldest-born, speak first.
+GONERIL
+Sir, I love you more than words can wield the matter;
+Dearer than eye-sight, space, and liberty;
+Beyond what can be valued, rich or rare;
+No less than life, with grace, health, beauty, honour;
+As much as child e'er loved, or father found;
+A love that makes breath poor, and speech unable;
+Beyond all manner of so much I love you.
+CORDELIA
+[Aside] What shall Cordelia do?
+Love, and be silent.
+LEAR
+Of all these bounds, even from this line to this,
+With shadowy forests and with champains rich'd,
+With plenteous rivers and wide-skirted meads,
+We make thee lady: to thine and Albany's issue
+Be this perpetual. What says our second daughter,
+Our dearest Regan, wife to Cornwall? Speak.
+REGAN
+Sir, I am made
+Of the self-same metal that my sister is,
+And prize me at her worth. In my true heart
+I find she names my very deed of love;
+Only she comes too short: that I profess
+Myself an enemy to all other joys,
+Which the most precious square of sense possesses;
+And find I am alone felicitate
+In your dear highness' love.
+CORDELIA
+[Aside] Then poor Cordelia!
+And yet not so; since, I am sure, my love's
+More richer than my tongue.
+KING LEAR
+To thee and thine hereditary ever
+Remain this ample third of our fair kingdom;
+No less in space, validity, and pleasure,
+Than that conferr'd on Goneril. Now, our joy,
+Although the last, not least; to whose young love
+The vines of France and milk of Burgundy
+Strive to be interess'd; what can you say to draw
+A third more opulent than your sisters? Speak.
+CORDELIA
+Nothing, my lord.
+KING LEAR
+Nothing!
+CORDELIA
+Nothing.
+KING LEAR
+Nothing will come of nothing: speak again.
+CORDELIA
+Unhappy that I am, I cannot heave
+My heart into my mouth: I love your majesty
+According to my bond; nor more nor less.
+KING LEAR
+How, how, Cordelia! mend your speech a little,
+Lest it may mar your fortunes.
+CORDELIA
+Good my lord,
+You have begot me, bred me, loved me: I
+Return those duties back as are right fit,
+Obey you, love you, and most honour you.
+Why have my sisters husbands, if they say
+They love you all? Haply, when I shall wed,
+That lord whose hand must take my plight shall carry
+Half my love with him, half my care and duty:
+Sure, I shall never marry like my sisters,
+To love my father all.
+"""
+
 
 def profile_function_calls(frame, event, arg):
     """
@@ -197,7 +344,7 @@ def load_bert_config(config_path=None):
     return config
 
 
-def classify_text(model, tokenizer, text, device="cpu"):
+def classify_text(model, tokenizer, text, runs_per_sample, device="cpu"):
     """
     Predict sentiment for input text(s).
 
@@ -253,10 +400,13 @@ def classify_text(model, tokenizer, text, device="cpu"):
     # model.bert.embeddings.position_embeddings.weight = nn.Parameter(model.bert.embeddings.position_embeddings.weight[:len(input_ids)])
     # model.bert.embeddings.position_ids = model.bert.embeddings.position_ids[:, :len(input_ids)]
     with torch.no_grad():
-        start = time.time()
-        logits = model(input_ids, token_type_ids, attention_mask=attention_mask)
-        end = time.time()
-        print(f"Inference time: {end - start:.4f} seconds")
+        avg_latency = 0
+        for _ in range(runs_per_sample):
+            start = time.time()
+            logits = model(input_ids, token_type_ids, attention_mask=attention_mask)
+            end = time.time()
+            print(f"Inference time: {end - start:.4f} seconds")
+            avg_latency += end - start
 
     # Calculate the softmax of the logits
     probabilities = torch.nn.functional.softmax(logits, dim=-1)
@@ -266,7 +416,7 @@ def classify_text(model, tokenizer, text, device="cpu"):
         probabilities = probabilities.squeeze(0)
         logits = logits.squeeze(0)
 
-    return probabilities, logits, end - start
+    return probabilities, logits, avg_latency / runs_per_sample
 
 
 def fine_tune_model(
@@ -540,6 +690,12 @@ def main():
         help="Use a custom profiler for performance measurements",
     )
     parser.add_argument(
+        "--runs_per_sample",
+        type=int,
+        default=1,
+        help="Number of times to run inference with each sample (for calculating average latency)",
+    )
+    parser.add_argument(
         "-v",
         action="count",
         default=0,
@@ -708,8 +864,9 @@ def main():
         print("Loading SST-2 validation dataset for evaluation...")
         num_samples_to_test = args.num_samples
         if num_samples_to_test == 1:
-            texts_to_classify = ["That was great!"]
-            true_labels = [1]
+            # NOTE: Using text that generates at least 512 tokens so that there's no attention masking
+            texts_to_classify = [SAMPLE_TEXT]
+            true_labels = [0] # Negative
         else:
             dataset = load_dataset("sst2", split="validation")
 
@@ -733,7 +890,7 @@ def main():
         for test_text, true_class in zip(texts_to_classify, true_labels):
             iteration_count = iteration_count + 1
             probabilities, logits, inference_time = classify_text(
-                model, tokenizer, test_text, device
+                model, tokenizer, test_text, args.runs_per_sample, device
             )
             total_inference_time += inference_time
             predicted_class = probabilities.argmax().item()

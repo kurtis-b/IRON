@@ -19,6 +19,7 @@
 # Reference used:
 # https://medium.com/@alexmriggio/bert-for-sequence-classification-from-scratch-code-and-theory-fb88053800fa
 
+import math
 import torch
 import torch.nn as nn
 from ..utils import assign
@@ -50,7 +51,7 @@ class BertSelfAttention(nn.Module):
 
         if config.aie_config.use_aie_gemm:
             aie_gemm_config = {
-                "num_columns": 8,
+                "num_aie_columns": 8,
                 "tile_m": 64,
                 "tile_k": 96,
                 "tile_n": 48,
@@ -94,7 +95,7 @@ class BertSelfAttention(nn.Module):
             )
         if config.aie_config.use_aie_gemm:
             aie_gemm_config = {
-                "num_columns": 8,
+                "num_aie_columns": 8,
                 "tile_m": 64,
                 "tile_k": 64,
                 "tile_n": 64,
@@ -105,6 +106,8 @@ class BertSelfAttention(nn.Module):
             self.attn_weights = AIEGEMM(
                 M=512, K=self.attention_head_size, N=512, **aie_gemm_config
             )
+            aie_gemm_config["tile_n"] = 16  # min tile for n is 2t in kernel
+            aie_gemm_config["num_aie_columns"] = 4  # Can only use 4 since N=64
             self.attn_score = AIEGEMM(
                 M=512, K=512, N=self.attention_head_size, **aie_gemm_config
             )
@@ -116,7 +119,6 @@ class BertSelfAttention(nn.Module):
                 num_channels=2,
                 rows=512,
                 cols=512,
-                tile_size=512,
             )
         else:
             self.softmax = nn.Softmax(dim=-1)
@@ -157,6 +159,8 @@ class BertSelfAttention(nn.Module):
             )
             attn_weights = attn_weights.masked_fill(attention_mask == 0, float("-inf"))
 
+        # TODO: Handle the attention masking in softmax--currently in "-inf" can lead to
+        # NaNs in the result
         attn_weights = self.softmax(attn_weights)
         attn_weights = nn.functional.dropout(attn_weights, p=0.0)
 
@@ -221,7 +225,7 @@ class BertSelfOutput(nn.Module):
         self.config = config
         if config.aie_config.use_aie_gemm:
             aie_gemm_config = {
-                "num_columns": 8,
+                "num_aie_columns": 8,
                 "tile_m": 64,
                 "tile_k": 96,
                 "tile_n": 48,
@@ -259,11 +263,14 @@ class BertSelfOutput(nn.Module):
         self.dropout = nn.Dropout(config.model_config.hidden_dropout_prob)
         self.use_aie_elementwise_add = config.aie_config.use_aie_elementwise_add
         if self.use_aie_elementwise_add:
+            eltwise_add_tile_size = (512 * config.model_config.hidden_size) // 16
             self.aie_elementwise_add = AIEElementwiseAdd(
                 size=512 * config.model_config.hidden_size,
                 num_aie_columns=8,
                 num_channels=2,
-                tile_size=config.model_config.hidden_size,
+                tile_size=min(
+                    math.gcd(4096, eltwise_add_tile_size), eltwise_add_tile_size
+                ),
             )
 
     def forward(self, hidden_states, input_tensor):

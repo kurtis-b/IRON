@@ -19,6 +19,7 @@
 # Reference used:
 # https://medium.com/@alexmriggio/bert-for-sequence-classification-from-scratch-code-and-theory-fb88053800fa
 
+import math
 import torch
 import torch.nn as nn
 from ..utils import assign
@@ -34,10 +35,10 @@ class BertIntermediate(nn.Module):
         self.config = config
         if config.aie_config.use_aie_gemm:
             aie_gemm_config = {
-                "num_columns": 8,
+                "num_aie_columns": 8,
                 "tile_m": 64,
-                "tile_k": 96,
-                "tile_n": 48,
+                "tile_k": 48,
+                "tile_n": 96,
                 "use_static_weight": True,
                 "emulate_bf16_mmul_with_bfp16": True,
                 "prio_accuracy": False,
@@ -55,11 +56,12 @@ class BertIntermediate(nn.Module):
                 dtype=config.aie_config.dtype,
             )
         if config.aie_config.use_aie_gelu:
+            gelu_tile_size = (512 * config.model_config.intermediate_size) // 16
             self.gelu = AIEGELU(
                 size=512 * config.model_config.intermediate_size,
                 num_aie_columns=8,
                 num_channels=2,
-                tile_size=config.model_config.intermediate_size,
+                tile_size=min(math.gcd(4096, gelu_tile_size), gelu_tile_size),
             )
         else:
             self.gelu = nn.GELU()
@@ -92,7 +94,7 @@ class BertOutput(nn.Module):
         self.config = config
         if config.aie_config.use_aie_gemm:
             aie_gemm_config = {
-                "num_columns": 8,
+                "num_aie_columns": 8,
                 "tile_m": 64,
                 "tile_k": 96,
                 "tile_n": 48,
@@ -130,11 +132,14 @@ class BertOutput(nn.Module):
         self.dropout = nn.Dropout(config.model_config.hidden_dropout_prob)
         self.use_aie_elementwise_add = config.aie_config.use_aie_elementwise_add
         if self.use_aie_elementwise_add:
+            eltwise_add_tile_size = (512 * config.model_config.hidden_size) // 16
             self.aie_elementwise_add = AIEElementwiseAdd(
                 size=512 * config.model_config.hidden_size,
                 num_aie_columns=8,
                 num_channels=2,
-                tile_size=config.model_config.hidden_size,
+                tile_size=min(
+                    math.gcd(4096, eltwise_add_tile_size), eltwise_add_tile_size
+                ),
             )
 
     def forward(self, hidden_states, input_tensor):

@@ -156,8 +156,6 @@ class AIEElementwiseMul(AIEOperatorBase):
 
         self.write_buffer("input1", x_flat)
         self.write_buffer("input2", y_flat)
-        test_pattern = np.zeros(len(x_flat), dtype=bfloat16)
-        self.write_buffer("output", test_pattern)
         self.run_runlist()
         result = self.read_buffer_as_torch("output", shape=x_flat.shape, dtype=bfloat16)
 

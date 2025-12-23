@@ -113,7 +113,6 @@ class AIEGELU(AIEOperatorBase):
 
         # Execute on AIE
         self.write_buffer("input", x_flat)
-        self.write_buffer("output", np.zeros(self.size, dtype=bfloat16))
         self.run_runlist()
         result = self.read_buffer_as_torch("output", shape=(self.size,), dtype=bfloat16)
 
