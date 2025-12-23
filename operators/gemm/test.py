@@ -93,7 +93,7 @@ def generate_test_params_bert(extensive=False):
         [
             "gemm_512x768x768_64x96x48_8_cols_0_bcolmaj_0_ccolmaj_0",
             "gemm_512x64x512_64x64x64_8_cols_0_bcolmaj_0_ccolmaj_0",
-            "gemm_512x512x64_64x64x8_4_cols_0_bcolmaj_0_ccolmaj_0",
+            "gemm_512x512x64_64x64x16_4_cols_0_bcolmaj_0_ccolmaj_0",
             "gemm_512x768x3072_64x48x96_8_cols_0_bcolmaj_0_ccolmaj_0",
             "gemm_512x3072x768_64x96x48_8_cols_0_bcolmaj_0_ccolmaj_0",
         ]

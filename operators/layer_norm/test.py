@@ -12,6 +12,8 @@ from operators.layer_norm.op import AIELayerNorm
 from operators.layer_norm.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
+TEST_BERT = True
+
 
 def generate_test_params(extensive=False):
     max_aie_columns = 8
@@ -70,13 +72,39 @@ all_params = [
 ]
 
 
+def generate_test_params_bert(extensive=False):
+    params = []
+    names = []
+
+    params.extend(
+        [
+            (393216, 8, 2, 4096, True),
+        ]
+    )
+    names.extend(
+        [
+            f"weighted_layer_norm_8_cols_2_channels_393216_tile_4096",
+        ]
+    )
+
+    return params, names
+
+
+regular_params_bert, regular_names_bert = generate_test_params_bert(extensive=False)
+
+bert_params = [
+    pytest.param(*params, id=name)
+    for params, name in zip(regular_params_bert, regular_names_bert)
+]
+
+
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
     "input_length,num_aie_columns,num_channels,tile_size,weighted",
-    all_params,
+    all_params if not TEST_BERT else bert_params,
 )
 def test_layer_norm(
     input_length, num_aie_columns, num_channels, tile_size, weighted, aie_context
