@@ -60,7 +60,7 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_heads = num_heads
-        self.num_aie_columns = num_aie_columns
+        self.num_aie_columns = num_aie_columns # NOTE: This value isn't used for GEMMs to generate the output heads since N=64 there
 
         # Derived dimensions
         self.head_dim = hidden_size // num_heads
