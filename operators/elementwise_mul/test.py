@@ -32,7 +32,7 @@ def generate_test_params(extensive=False):
             names.append(
                 f"eltwise_mul_{num_aie_columns}_cols_{num_channels}_channels_{input_length}_tile_{tile_size}"
             )
-            params.append((input_length, num_aie_columns, num_channels, tile_size))
+            params.append((input_length, num_aie_columns, num_channels, tile_size, None))
     return params, names
 
 
@@ -55,12 +55,12 @@ def generate_test_params_bert(extensive=False):
 
     params.extend(
         [
-            (3145728, 8, 2, 4096),
+            (3145728, 8, 2, 4096, 0.125),
         ]
     )
     names.extend(
         [
-            f"eltwise_mul_8_cols_2_channels_3145728_tile_4096",
+            f"eltwise_mul_8_cols_2_channels_3145728_tile_4096_0.125_broadcast",
         ]
     )
 
@@ -80,23 +80,26 @@ bert_params = [
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "input_length,num_aie_columns,num_channels,tile_size",
+    "input_length,num_aie_columns,num_channels,tile_size,scalar_broadcast",
     all_params if not TEST_BERT else bert_params,
 )
 def test_elementwise_mul(
-    input_length, num_aie_columns, num_channels, tile_size, aie_context
+    input_length, num_aie_columns, num_channels, tile_size, scalar_broadcast, aie_context
 ):
-    golden_ref = generate_golden_reference(input_length=input_length)
+    golden_ref = generate_golden_reference(input_length=input_length,scalar_broadcast=scalar_broadcast)
 
     operator = AIEElementwiseMul(
         size=input_length,
         num_aie_columns=num_aie_columns,
         num_channels=num_channels,
         tile_size=tile_size,
+        scalar_broadcast=scalar_broadcast,
         context=aie_context,
     )
 
-    input_buffers = {"input1": golden_ref["A"], "input2": golden_ref["B"]}
+    input_buffers = {"input1": golden_ref["A"]}
+    if scalar_broadcast is None:
+        input_buffers["input2"] = golden_ref["B"]
     output_buffers = {"output": golden_ref["C"]}
 
     errors, latency_us, bandwidth_gbps = run_test(

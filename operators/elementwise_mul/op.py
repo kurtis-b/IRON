@@ -22,7 +22,7 @@ class AIEElementwiseMul(AIEOperatorBase):
     """AIE-accelerated element-wise multiplication"""
 
     def __init__(
-        self, size, num_aie_columns, num_channels, tile_size, trace_size=0, context=None
+        self, size, num_aie_columns, num_channels, tile_size, scalar_broadcast=None, trace_size=0, context=None
     ):
         max_multiple = num_aie_columns * tile_size
         padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
@@ -31,6 +31,7 @@ class AIEElementwiseMul(AIEOperatorBase):
         self.tile_size = tile_size
         self.num_aie_columns = num_aie_columns
         self.num_channels = num_channels
+        self.scalar_broadcast = scalar_broadcast
         self.trace_size = trace_size
 
         total_shimdma_channels = self.num_aie_columns * self.num_channels
@@ -43,21 +44,36 @@ class AIEElementwiseMul(AIEOperatorBase):
 
     def get_artifacts(self, prefix="eltwise_mul_"):
         operator_dir = Path(__file__).parent
-        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
-
-        mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{file_name_base}.mlir",
-            import_path=operator_dir / "design.py",
-            callback_fn="my_eltwise_mul",
-            callback_args=[
-                self.context.device_manager.device_type,
-                self.size,
-                self.num_aie_columns,
-                self.num_channels,
-                self.tile_size,
-                self.trace_size,
-            ],
-        )
+        if self.scalar_broadcast is None:
+            file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
+            mlir_artifact = PythonGeneratedMLIRArtifact.new(
+                f"{file_name_base}.mlir",
+                import_path=operator_dir / "design.py",
+                callback_fn="my_eltwise_mul",
+                callback_args=[
+                    self.context.device_manager.device_type,
+                    self.size,
+                    self.num_aie_columns,
+                    self.tile_size,
+                    self.trace_size,
+                ],
+            )
+        else:
+            file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.scalar_broadcast}sb_{self.tile_size}t"
+            mlir_artifact = PythonGeneratedMLIRArtifact.new(
+                f"{file_name_base}.mlir",
+                import_path=operator_dir / "design.py",
+                callback_fn="my_eltwise_mul_broadcast_scalar",
+                callback_args=[
+                    self.context.device_manager.device_type,
+                    self.size,
+                    self.num_aie_columns,
+                    self.num_channels,
+                    self.tile_size,
+                    self.scalar_broadcast,
+                    self.trace_size,
+                ],
+            )
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
@@ -94,7 +110,8 @@ class AIEElementwiseMul(AIEOperatorBase):
 
     def set_up_runtime(self):
         self.add_buffer("input1", self.size)
-        self.add_buffer("input2", self.size)
+        if self.scalar_broadcast is None:
+            self.add_buffer("input2", self.size)
         self.add_buffer("output", self.size)
         self.add_kernel(
             "eltwise_mul",
@@ -102,9 +119,12 @@ class AIEElementwiseMul(AIEOperatorBase):
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_to_runlist("eltwise_mul", "input1", "input2", "output")
+        if self.scalar_broadcast is None:
+            self.add_to_runlist("eltwise_mul", "input1", "input2", "output")
+        else:
+            self.add_to_runlist("eltwise_mul", "input1", "output")
 
-    def forward(self, x, y):
+    def forward(self, x, y=None):
         """Forward pass for element-wise multiplication"""
         applicable = (
             len(x.shape) >= 1
@@ -121,12 +141,16 @@ class AIEElementwiseMul(AIEOperatorBase):
         original_shape = x.shape
         batch = x.shape[0] if x.dim() > 1 else 1
         x_flat = x.reshape(batch, -1)
-        y_flat = y.reshape(batch, -1)
+        if y is not None:
+            y_flat = y.reshape(batch, -1)
+        else:
+            y_flat = None
 
         pad_len = self.size - x_flat.shape[1]
         if pad_len > 0:
             x_flat = torch.nn.functional.pad(x_flat, (0, pad_len))
-            y_flat = torch.nn.functional.pad(y_flat, (0, pad_len))
+            if y_flat is not None:
+                y_flat = torch.nn.functional.pad(y_flat, (0, pad_len))
 
         out = self._execute_aie_operation(x_flat, y_flat)
 
@@ -139,23 +163,27 @@ class AIEElementwiseMul(AIEOperatorBase):
 
         return out
 
-    def _execute_aie_operation(self, x, y):
+    def _execute_aie_operation(self, x, y=None):
         """Execute element-wise multiplication operation on AIE hardware"""
         # x, y are [batch, size]
         batch = x.shape[0] if x.dim() > 1 else 1
 
         # Flatten inputs for AIE processing
         x_flat = x.view(-1)
-        y_flat = y.view(-1)
-
         # Verify size matches expected
-        if len(x_flat) != self.size or len(y_flat) != self.size:
+        if len(x_flat) != self.size:
             raise AIEOperatorConstraintError(
-                f"Input size x={len(x_flat)}, y={len(y_flat)} doesn't match configured size {self.size}"
+                f"Input size x={len(x_flat)} doesn't match configured size {self.size}"
             )
+        if y is not None:
+            y_flat = y.view(-1)
+            if len(y_flat) != self.size:
+                raise AIEOperatorConstraintError(
+                    f"Input size y={len(y_flat)} doesn't match configured size {self.size}"
+                )
+            self.write_buffer("input2", y_flat)
 
         self.write_buffer("input1", x_flat)
-        self.write_buffer("input2", y_flat)
         self.run_runlist()
         result = self.read_buffer_as_torch("output", shape=x_flat.shape, dtype=bfloat16)
 

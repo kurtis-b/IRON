@@ -74,11 +74,6 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.ffn_up_weight = None
         self.ffn_down_weight = None
         self.ln2_weight = None
-        self.attn_scale_factor = torch.full(
-            (seq_len, seq_len, num_heads),
-            math.sqrt(1.0 / self.head_dim),
-            dtype=torch.bfloat16,
-        )
 
         # Artifacts created by set_up_artifacts() - one per layer
         self.combined_xclbin = None
@@ -210,6 +205,7 @@ class AIEBERTEncoder(AIEOperatorBase):
             num_aie_columns=self.num_aie_columns,
             num_channels=2,
             tile_size=min(math.gcd(4096, eltwise_mul_tile_size), eltwise_mul_tile_size),
+            scalar_broadcast=math.sqrt(1.0 / self.head_dim),
         ).get_artifacts(prefix="encoder_attn_scale_")
         self.attn_scale_xclbin.xclbin_input = self.attn_scores_xclbin
         self.attn_scale_xclbin.extra_flags += [
@@ -441,13 +437,6 @@ class AIEBERTEncoder(AIEOperatorBase):
                 torch_to_numpy(self.ln2_weight) if self.ln2_weight is not None else None
             ),
         )
-        # Scaling factor for attention
-        # TODO: Should be scalar, but for now is a matrix
-        self.add_buffer(
-            "attn_scale_factor",
-            self.seq_len * self.seq_len * self.num_heads,
-            static_data=torch_to_numpy(self.attn_scale_factor),
-        )
 
         # Intermediate buffers for all layers
         self.add_buffer("q_output", act_size)  # After layer 1a
@@ -570,7 +559,6 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.add_to_runlist(
             "encoder_attn_scale",
             "attn_scores_output",
-            "attn_scale_factor",
             "attn_scaled_output",
         )
         # Attention weight calculations (Softmax)

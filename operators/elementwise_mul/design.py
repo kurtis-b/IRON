@@ -7,14 +7,111 @@ import numpy as np
 import argparse
 import sys
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker, LocalBuffer
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
+def my_eltwise_mul_broadcast_scalar(dev, num_elements, num_columns, num_channels, tile_size, scalar_broadcast, trace_size):
+    per_tile_elements = 4096 if tile_size > 4096 else tile_size
+    total_cores = num_columns * num_channels
+    n = per_tile_elements * total_cores
+    if num_elements % n != 0:
+        raise ValueError(
+            f"Number of elements ({num_elements}) must be a multiple of {n}."
+        )
+    N_div_n = num_elements // n
+    chunk = num_elements // num_columns // num_channels
+    dtype = bfloat16
 
-def my_eltwise_mul(dev, num_elements, num_columns, num_channels, tile_size, trace_size):
+    # Define tensor types
+    tensor_ty = np.ndarray[(num_elements,), np.dtype[dtype]]
+    tile_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
+    scalar_broadcasted_ty = np.ndarray[(16,), np.dtype[dtype]]
+
+    # AIE-array data movement with object fifos (one per column, not per channel)
+    of_in1s = [ObjectFifo(tile_ty, name=f"in1_{i}") for i in range(total_cores)]
+    of_outs = [ObjectFifo(tile_ty, name=f"out_{i}") for i in range(total_cores)]
+
+    # AIE Core Function declaration
+    eltwise_mul_bf16_vector = Kernel(
+        "eltwise_mul_bf16_broadcasted_scalar", "mul.o", [tile_ty, scalar_broadcasted_ty, tile_ty, np.int32]
+    )
+
+    # Define a task that will run on a compute tile
+    def core_body(of_in1, of_out, eltwise_mul):
+        # Number of sub-vector "tile" iterations
+        scalar_buffer = LocalBuffer(
+            type=scalar_broadcasted_ty,
+            initial_value=np.full(16, scalar_broadcast, dtype=dtype),
+        )
+        for _ in range_(N_div_n):
+            elem_in1 = of_in1.acquire(1)
+            elem_out = of_out.acquire(1)
+            eltwise_mul(elem_in1, scalar_buffer, elem_out, per_tile_elements)
+            of_in1.release(1)
+            of_out.release(1)
+
+    # Create a worker to run the task on a compute tile
+    my_workers = [
+        Worker(
+            core_body,
+            [
+                of_in1s[i].cons(),
+                of_outs[i].prod(),
+                eltwise_mul_bf16_vector,
+            ],
+        )
+        for i in range(total_cores)
+    ]
+
+    # Create a TensorAccessPattern for each column
+    # to describe the data movement
+    # The pattern chops the data in equal chunks
+    # and moves them in parallel across the columns
+    # and channels.
+    taps = [
+        TensorAccessPattern(
+            (1, num_elements),
+            chunk * i,
+            [1, 1, 1, chunk],
+            [0, 0, 0, 1],
+        )
+        for i in range(total_cores)
+    ]
+
+    # Runtime operations to move data to/from the AIE-array
+    rt = Runtime()
+    with rt.sequence(tensor_ty, tensor_ty) as (A, C):
+        rt.start(*my_workers)
+
+        # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
+        tg = rt.task_group()
+
+        # Fill the input objectFIFOs with data
+        for i in range(total_cores):
+            rt.fill(
+                of_in1s[i].prod(),
+                A,
+                taps[i],
+                task_group=tg,
+            )
+        # Drain the output objectFIFOs with data
+        for i in range(total_cores):
+            rt.drain(
+                of_outs[i].cons(),
+                C,
+                taps[i],
+                wait=True,  # wait for the transfer to complete and data to be available
+                task_group=tg,
+            )
+        rt.finish_task_group(tg)
+
+    # Place program components (assign them resources on the device) and generate an MLIR module
+    return Program(dev, rt).resolve_program(SequentialPlacer())
+
+def my_eltwise_mul(dev, num_elements, num_columns, tile_size, trace_size):
     per_tile_elements = 4096 if tile_size > 4096 else tile_size
     n = per_tile_elements * num_columns
     if num_elements % n != 0:
@@ -160,6 +257,15 @@ if __name__ == "__main__":
         default="1024",
         help="Tile size (elements per tile)",
     )
+    # A scalar to broadcast to the elements for vector-scalar elementwise mul
+    p.add_argument(
+        "-sb",
+        "--scalar-broadcast",
+        required=False,
+        dest="scalar_broadcast",
+        default=None,
+        help="Scalar to broadcast to vectors for vector-scalar eltwise mul",
+    )
     # Trace Size
     p.add_argument(
         "-t", "--trace-size", required=True, dest="trace_size", help="Trace size"
@@ -197,8 +303,12 @@ if __name__ == "__main__":
         )
         raise ValueError
     trace_size = int(opts.trace_size) if opts.trace_size is not None else 0
+    scalar_broadcast = args.scalar_broadcast
 
-    module = my_eltwise_mul(dev, length, columns, channels, tile_size, trace_size)
+    if scalar_broadcast is None:
+        module = my_eltwise_mul(dev, length, columns, tile_size, trace_size)
+    else:
+        module = my_eltwise_mul_broadcast_scalar(dev, length, columns, channels, tile_size, scalar_broadcast, trace_size)
 
     output_file_path = Path(opts.output_file_path)
 
