@@ -6,7 +6,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-template <typename T, int N> void layer_norm(const T *restrict input, T *restrict output, int32_t cols, int32_t rows_to_process)
+template <typename T, int N>
+void layer_norm(const T *restrict input, T *restrict output, int32_t cols, int32_t rows_to_process)
 {
     event0();
     constexpr float epsilon = 1e-5f;
@@ -106,14 +107,15 @@ void layer_norm_bf16_f32_calculation(const bfloat16 *restrict input, bfloat16 *r
     event1();
 }
 
-template <typename T_in, typename T_out> void eltwise_vmul(T_in *a, T_in *b, T_out *c, int32_t cols, int32_t rows_to_process)
+template <typename T_in, typename T_out>
+void eltwise_vmul(T_in *a, T_in *b, T_out *c, int32_t cols, int32_t rows_to_process)
 {
 
     event0();
     for (int i = 0; i < cols; i += 16) {
         auto B = aie::load_v<16>(b + i);
-        T_out * __restrict a_ptr = a + i;
-        T_out * __restrict c_ptr = c + i;
+        T_out *__restrict a_ptr = a + i;
+        T_out *__restrict c_ptr = c + i;
         for (int row = 0; row < rows_to_process; row++) {
             auto A = aie::load_v<16>(a_ptr);
             auto C = aie::mul(A, B).template to_vector<T_out>();
