@@ -15,15 +15,33 @@ from aie.iron.controlflow import range_
 from aie.helpers.util import np_ndarray_type_get_shape
 
 
+DATA_MEM_SIZE = 65536 # L1 size in bytes
+
+def get_rows_to_process(num_elements, weight_length):
+    # Determine per-tile elements based on weight_length
+    for i in range(1, num_elements // weight_length):
+        per_tile_elements = weight_length * i
+        # 1 input + 1 output + weight vector for second stage, bf16, double buffering
+        if (per_tile_elements * 2 + weight_length) * 2 * 2 > DATA_MEM_SIZE:
+            return i - 1
+    return num_elements // weight_length
+
 def my_weighted_layer_norm(
     dev, num_elements, num_columns, num_channels, weight_length, trace_size
 ):
     per_tile_elements = weight_length
+    rows_to_process = get_rows_to_process(num_elements, weight_length)
     total_cores = num_columns  # For each core that does layer norm, another core will take its output to do eltwise mul
-    n = per_tile_elements * total_cores
-    if num_elements % n != 0:
+    input_tile_size = per_tile_elements * rows_to_process
+    for _ in range(rows_to_process, 0, -1):
+        n = input_tile_size * total_cores
+        if num_elements % n == 0:
+            break
+        input_tile_size -= per_tile_elements
+        rows_to_process -= 1
+    if input_tile_size == 0:
         raise ValueError(
-            f"Number of elements ({num_elements}) must be a multiple of {n}."
+            f"Couldn't find tile size multiple for number of elements ({num_elements})"
         )
     N_div_n = num_elements // n
     chunk = num_elements // total_cores
@@ -31,7 +49,7 @@ def my_weighted_layer_norm(
     # Define tensor types
     tensor_ty = np.ndarray[(num_elements,), np.dtype[dtype]]
     weights_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
-    tile_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
+    tile_ty = np.ndarray[(input_tile_size,), np.dtype[dtype]]
 
     # Set fifodepth based on weight_length
     fifodepth = 1 if weight_length > 4096 else 2
@@ -53,12 +71,12 @@ def my_weighted_layer_norm(
 
     # AIE Core Function declaration
     layer_norm_kernel = Kernel(
-        "layer_norm", "layer_norm_archive.a", [tile_ty, tile_ty, np.int32]
+        "layer_norm", "layer_norm_archive.a", [tile_ty, tile_ty, np.int32, np.int32]
     )
     eltwise_mul_kernel = Kernel(
         "eltwise_mul_bf16_vector",
         "layer_norm_archive.a",
-        [tile_ty, weights_ty, tile_ty, np.int32],
+        [tile_ty, weights_ty, tile_ty, np.int32, np.int32],
     )
 
     # Define a task that will run on a compute tile
@@ -67,7 +85,7 @@ def my_weighted_layer_norm(
         for _ in range_(N_div_n):
             elem_in1 = of_in1.acquire(1)
             elem_out = of_out1.acquire(1)
-            layer_norm(elem_in1, elem_out, per_tile_elements)
+            layer_norm(elem_in1, elem_out, per_tile_elements, rows_to_process)
             of_in1.release(1)
             of_out1.release(1)
 
@@ -77,7 +95,7 @@ def my_weighted_layer_norm(
         for _ in range_(N_div_n):
             elem_in1 = of_in1.acquire(1)
             elem_out = of_out2.acquire(1)
-            eltwise_mul(elem_in1, elem_in2, elem_out, per_tile_elements)
+            eltwise_mul(elem_in1, elem_in2, elem_out, per_tile_elements, rows_to_process)
             of_in1.release(1)
             of_out2.release(1)
         of_in2.release(1)

@@ -91,24 +91,9 @@ class AIELayerNorm(AIEOperatorBase):
                                 )
                             ],
                         ),
-                        KernelObjectArtifact.new(
-                            "mul.o",
-                            depends=[
-                                SourceArtifact.new(
-                                    self.context.base_dir
-                                    / "aie_kernels"
-                                    / "generic"
-                                    / "mul.cc"
-                                )
-                            ],
-                        ),
                     ],
                 ),
             ],
-        )
-
-        insts_artifact = InstsBinArtifact.new(
-            f"{file_name_base}.bin", depends=[mlir_artifact]
         )
 
         insts_artifact = InstsBinArtifact.new(
