@@ -60,11 +60,15 @@ def generate_test_params_bert(extensive=False):
     params.extend(
         [
             (1572864, 8, 2, 4096),
+            (1572864, 4, 2, 4096),
+            (1572864, 2, 2, 4096),
         ]
     )
     names.extend(
         [
             f"gelu_8_cols_2_channels_1572864_tile_4096",
+            f"gelu_4_cols_2_channels_1572864_tile_4096",
+            f"gelu_2_cols_2_channels_1572864_tile_4096",
         ]
     )
 

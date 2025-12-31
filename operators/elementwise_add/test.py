@@ -54,11 +54,15 @@ def generate_test_params_bert(extensive=False):
     params.extend(
         [
             (393216, 8, 2, 4096),
+            (393216, 4, 2, 4096),
+            (393216, 2, 2, 4096),
         ]
     )
     names.extend(
         [
             f"eltwise_add_8_cols_2_channels_393216_tile_4096",
+            f"eltwise_add_4_cols_2_channels_393216_tile_4096",
+            f"eltwise_add_2_cols_2_channels_393216_tile_4096",
         ]
     )
 

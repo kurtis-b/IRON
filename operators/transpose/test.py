@@ -68,11 +68,15 @@ def generate_test_params_bert(extensive=False):
     params.extend(
         [
             (512, 768, 8, 2, 64, 96, 8),
+            (512, 768, 4, 2, 64, 96, 8),
+            (512, 768, 2, 2, 64, 96, 8),
         ]
     )
     names.extend(
         [
             f"transpose_512_M_768_N_8_cols_2_channels_64_m_96_n_8_s",
+            f"transpose_512_M_768_N_4_cols_2_channels_64_m_96_n_8_s",
+            f"transpose_512_M_768_N_2_cols_2_channels_64_m_96_n_8_s",
         ]
     )
 

@@ -73,11 +73,15 @@ def generate_test_params_bert(extensive=False):
     params.extend(
         [
             (3145728, 8, 2, 512),
+            (3145728, 4, 2, 512),
+            (3145728, 2, 2, 512),
         ]
     )
     names.extend(
         [
             f"softmax_8_cols_2_channels_3145728_tile_512",
+            f"softmax_4_cols_2_channels_3145728_tile_512",
+            f"softmax_2_cols_2_channels_3145728_tile_512",
         ]
     )
 

@@ -56,11 +56,15 @@ def generate_test_params_bert(extensive=False):
     params.extend(
         [
             (3145728, 8, 2, 4096, 0.125),
+            (3145728, 4, 2, 4096, 0.125),
+            (3145728, 2, 2, 4096, 0.125),
         ]
     )
     names.extend(
         [
             f"eltwise_mul_8_cols_2_channels_3145728_tile_4096_0.125_broadcast",
+            f"eltwise_mul_4_cols_2_channels_3145728_tile_4096_0.125_broadcast",
+            f"eltwise_mul_2_cols_2_channels_3145728_tile_4096_0.125_broadcast",
         ]
     )
 
