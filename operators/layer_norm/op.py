@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -29,7 +30,7 @@ class AIELayerNorm(AIEOperatorBase):
         num_aie_columns=None,
         num_channels=None,
         tile_size=None,
-        weighted=False,
+        weights=None,
         trace_size=0,
         context=None,
     ):
@@ -41,10 +42,6 @@ class AIELayerNorm(AIEOperatorBase):
         self.trace_size = trace_size
         self.num_aie_columns = num_aie_columns
         self.num_channels = num_channels
-        self.weighted = weighted
-
-        # Initializes weights to 1. Weights have size embedding dim, which is assumed to be tile size
-        self.weight = nn.Parameter(torch.ones(tile_size, dtype=torch.bfloat16))
 
         total_shimdma_channels = self.num_aie_columns * self.num_channels
         assert total_shimdma_channels <= 16, "Conservative ShimDMA limit"
@@ -54,24 +51,48 @@ class AIELayerNorm(AIEOperatorBase):
 
         AIEOperatorBase.__init__(self, context=context)
 
+        if weights is not None:
+            self.weight_file_name = self.context.build_dir / f"layer_norm_weights_{self.size}.npy"
+            if not os.path.exists(self.weight_file_name.parent):
+                os.makedirs(self.weight_file_name.parent)
+            np.save(self.weight_file_name, torch_to_numpy(weights))
+        else:
+            self.weight_file_name = None
+
     def get_artifacts(self, prefix="weighted_layer_norm_"):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
         file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
 
-        mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{file_name_base}.mlir",
-            import_path=operator_dir / "design_weighted.py",
-            callback_fn="my_weighted_layer_norm",
-            callback_args=[
-                self.context.device_manager.device_type,
-                self.size,
-                self.num_aie_columns,
-                self.num_channels,
-                self.tile_size,
-                0,
-            ],
-        )
+        if self.weight_file_name is not None:
+            mlir_artifact = PythonGeneratedMLIRArtifact.new(
+                f"{file_name_base}.mlir",
+                import_path=operator_dir / "design_weighted.py",
+                callback_fn="my_weighted_layer_norm",
+                callback_args=[
+                    self.context.device_manager.device_type,
+                    self.size,
+                    self.num_aie_columns,
+                    self.num_channels,
+                    self.tile_size,
+                    self.weight_file_name,
+                    0,
+                ],
+            )
+        else:
+            mlir_artifact = PythonGeneratedMLIRArtifact.new(
+                f"{file_name_base}.mlir",
+                import_path=operator_dir / "design.py",
+                callback_fn="my_layer_norm",
+                callback_args=[
+                    self.context.device_manager.device_type,
+                    self.size,
+                    self.num_aie_columns,
+                    self.num_channels,
+                    self.tile_size,
+                    0,
+                ],
+            )
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
@@ -110,31 +131,15 @@ class AIELayerNorm(AIEOperatorBase):
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
-        if self.weighted:
-            static_weights = None
-            if self.weight is not None:
-                static_weights = torch_to_numpy(self.weight)
-
-            self.add_buffer("input", self.size)
-            self.add_buffer("weight", self.tile_size, static_data=static_weights)
-            self.add_buffer("output", self.size)
-            self.add_kernel(
-                "eltwise_mul",
-                self.xclbin_artifact,
-                self.xclbin_artifact.kernel_name,
-                self.insts_artifact,
-            )
-            self.add_to_runlist("eltwise_mul", "input", "weight", "output")
-        else:
-            self.add_buffer("input", self.size)
-            self.add_buffer("output", self.size)
-            self.add_kernel(
-                "layer_norm",
-                self.xclbin_artifact,
-                self.xclbin_artifact.kernel_name,
-                self.insts_artifact,
-            )
-            self.add_to_runlist("layer_norm", "input", "output")
+        self.add_buffer("input", self.size)
+        self.add_buffer("output", self.size)
+        self.add_kernel(
+            "eltwise_mul",
+            self.xclbin_artifact,
+            self.xclbin_artifact.kernel_name,
+            self.insts_artifact,
+        )
+        self.add_to_runlist("eltwise_mul", "input", "output")
 
     def forward(self, x, y=None):
         if x.numel() > self.size:
@@ -149,24 +154,11 @@ class AIELayerNorm(AIEOperatorBase):
         if pad_len > 0:
             x_flat = torch.nn.functional.pad(x_flat, (0, pad_len))
 
-        if self.weighted:
-            self.write_buffer("input", x_flat)
-            if y is not None:
-                self.write_buffer("weight", y)
-            else:
-                assert (
-                    self.weight is not None
-                ), "Weights must be provided either as input or during initialization."
-            self.run_runlist()
-            result = self.read_buffer_as_torch(
-                "output", shape=(self.size,), dtype=bfloat16
-            )
-        else:
-            self.write_buffer("input", x_flat)
-            self.run_runlist()
-            result = self.read_buffer_as_torch(
-                "output", shape=(self.size,), dtype=bfloat16
-            )
+        self.write_buffer("input", x_flat)
+        self.run_runlist()
+        result = self.read_buffer_as_torch(
+            "output", shape=(self.size,), dtype=bfloat16
+        )
 
         if pad_len > 0:
             result = result[: x_flat.numel() - pad_len]

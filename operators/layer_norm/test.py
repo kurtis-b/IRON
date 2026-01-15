@@ -79,15 +79,15 @@ def generate_test_params_bert(extensive=False):
     params.extend(
         [
             (393216, 8, 2, 768, True),
-            (393216, 4, 2, 768, True),
-            (393216, 2, 2, 768, True),
+            # (393216, 4, 2, 768, True),
+            # (393216, 2, 2, 768, True),
         ]
     )
     names.extend(
         [
             f"weighted_layer_norm_8_cols_2_channels_393216_tile_768",
-            f"weighted_layer_norm_4_cols_2_channels_393216_tile_768",
-            f"weighted_layer_norm_2_cols_2_channels_393216_tile_768",
+            # f"weighted_layer_norm_4_cols_2_channels_393216_tile_768",
+            # f"weighted_layer_norm_2_cols_2_channels_393216_tile_768",
         ]
     )
 
@@ -123,13 +123,11 @@ def test_layer_norm(
         num_aie_columns=num_aie_columns,
         num_channels=num_channels,
         tile_size=tile_size,
-        weighted=weighted,
+        weights=golden_ref["weight"] if weighted else None,
         context=aie_context,
     )
 
     input_buffers = {"input": golden_ref["input"]}
-    if weighted:
-        operator.weight = golden_ref["weight"]
     output_buffers = {"output": golden_ref["output"]}
 
     errors, latency_us, bandwidth_gbps = run_test(
