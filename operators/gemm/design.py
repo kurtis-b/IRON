@@ -686,7 +686,6 @@ def my_matmul(
                         # This line does not change MLIR output at all - it's just for recording data movement
                         C_taps.append(C_tile)
 
-                        print("C drain...")
                         rt.drain(
                             C_l2l3_fifos[col].cons(),
                             C,
