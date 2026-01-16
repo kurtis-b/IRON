@@ -121,7 +121,7 @@ class BertOutput(nn.Module):
                 num_aie_columns=8,
                 num_channels=2,
                 tile_size=config.model_config.hidden_size,
-                weighted=True,
+                weights=torch.ones(config.model_config.hidden_size),
             )
         else:
             self.LayerNorm = nn.LayerNorm(
