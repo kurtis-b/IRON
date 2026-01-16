@@ -7,7 +7,7 @@ import numpy as np
 import argparse
 import sys
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker, LocalBuffer
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker, Buffer
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2, Tile
 from aie.helpers.taplib.tap import TensorAccessPattern
@@ -27,8 +27,11 @@ def get_rows_to_process(num_elements, weight_length):
     return num_elements // weight_length
 
 def my_weighted_layer_norm(
-    dev, num_elements, num_columns, num_channels, weight_length, static_weights, trace_size
+    dev, num_elements, num_columns, num_channels, weight_length, weight_file_path, trace_size
 ):
+    static_weights = np.load(weight_file_path)
+    if static_weights.shape[0] != weight_length:
+        raise ValueError("Static weights length does not match the specified weight length")
     per_tile_elements = weight_length
     rows_to_process = get_rows_to_process(num_elements, weight_length)
     total_cores = num_columns * num_channels  # For each core that does layer norm, another core will take its output to do eltwise mul
@@ -88,16 +91,12 @@ def my_weighted_layer_norm(
             of_in1.release(1)
             of_out1.release(1)
 
-    def core_body_mul(of_in1, of_out2, eltwise_mul):
-        weight_buffer = LocalBuffer(
-            type=weights_ty,
-            initial_value=static_weights,
-        )
+    def core_body_mul(of_in1, weights, of_out2, eltwise_mul):
         # Number of sub-vector "tile" iterations
         for _ in range_(N_div_n):
             elem_in1 = of_in1.acquire(1)
             elem_out = of_out2.acquire(1)
-            eltwise_mul(elem_in1, weight_buffer, elem_out, per_tile_elements, rows_to_process)
+            eltwise_mul(elem_in1, weights, elem_out, per_tile_elements, rows_to_process)
             of_in1.release(1)
             of_out2.release(1)
 
@@ -105,6 +104,11 @@ def my_weighted_layer_norm(
     # one core for layer norm and another pipelined to do eltwise mul
     my_workers = []
     for i in range(total_cores):
+        weights_buffer = Buffer(
+            type=weights_ty,
+            initial_value=static_weights,
+            name=f"weights_buffer_{i}",
+        )
         my_workers.append(
             Worker(
                 core_body_norm,
@@ -115,12 +119,12 @@ def my_weighted_layer_norm(
                 ],
             )
         )
-    for i in range(total_cores):
         my_workers.append(
             Worker(
                 core_body_mul,
                 [
                     of_out1s[i].cons(),
+                    weights_buffer,
                     of_out2s[i].prod(),
                     eltwise_mul_kernel,
                 ],
@@ -265,15 +269,10 @@ if __name__ == "__main__":
         raise ValueError
     # Load static weights
     weight_file_path = Path(opts.weight_file)
-    static_weights = np.load(weight_file_path)
-    print("weight_file_path: ", weight_file_path)
-    print("static_weights: ", static_weights)
-    if static_weights.shape[0] != weight_length:
-        raise ValueError("Static weights length does not match the specified weight length")
     trace_size = int(opts.trace_size) if opts.trace_size is not None else 0
 
     module = my_weighted_layer_norm(
-        dev, length, columns, channels, weight_length, static_weights, trace_size
+        dev, length, columns, channels, weight_length, weight_file_path, trace_size
     )
 
     output_file_path = Path(opts.output_file_path)

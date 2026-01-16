@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -49,22 +48,18 @@ class AIELayerNorm(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        self.weight = weights
 
-        if weights is not None:
-            self.weight_file_name = self.context.build_dir / f"layer_norm_weights_{self.size}.npy"
-            if not os.path.exists(self.weight_file_name.parent):
-                os.makedirs(self.weight_file_name.parent)
-            np.save(self.weight_file_name, torch_to_numpy(weights))
-        else:
-            self.weight_file_name = None
+        AIEOperatorBase.__init__(self, context=context)
 
     def get_artifacts(self, prefix="weighted_layer_norm_"):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
         file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
 
-        if self.weight_file_name is not None:
+        if self.weight is not None:
+            weight_file_name = self.context.build_dir / f"{file_name_base}_weights_{self.size}.npy"
+            np.save(weight_file_name, torch_to_numpy(self.weight))
             mlir_artifact = PythonGeneratedMLIRArtifact.new(
                 f"{file_name_base}.mlir",
                 import_path=operator_dir / "design_weighted.py",
@@ -75,7 +70,7 @@ class AIELayerNorm(AIEOperatorBase):
                     self.num_aie_columns,
                     self.num_channels,
                     self.tile_size,
-                    self.weight_file_name,
+                    weight_file_name,
                     0,
                 ],
             )
