@@ -55,6 +55,8 @@ class AIEBERTEncoder(AIEOperatorBase):
         num_heads,
         context=None,
         num_aie_columns=8,
+        ln1_weight=None,
+        ln2_weight=None,
     ):
         self.seq_len = seq_len
         self.hidden_size = hidden_size
@@ -70,10 +72,10 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.k_weight = None
         self.v_weight = None
         self.attn_output_weight = None
-        self.ln1_weight = None
+        self.ln1_weight = ln1_weight
         self.ffn_up_weight = None
         self.ffn_down_weight = None
-        self.ln2_weight = None
+        self.ln2_weight = ln2_weight
 
         # Artifacts created by set_up_artifacts() - one per layer
         self.combined_xclbin = None
@@ -95,8 +97,10 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.add_xclbin = None
         self.add_insts = None
         # Layer normalization
-        self.ln_xclbin = None
-        self.ln_insts = None
+        self.ln1_xclbin = None
+        self.ln1_insts = None
+        self.ln2_xclbin = None
+        self.ln2_insts = None
         # Up projection
         self.up_proj_xclbin = None
         self.up_proj_insts = None
@@ -279,21 +283,21 @@ class AIEBERTEncoder(AIEOperatorBase):
         kernel_id += 1
 
         # Layer normalization kernel
-        self.ln_xclbin, self.ln_insts = AIELayerNorm(
+        self.ln1_xclbin, self.ln1_insts = AIELayerNorm(
             size=self.seq_len * self.hidden_size,
             tile_size=self.hidden_size,
             num_aie_columns=self.num_aie_columns,
             num_channels=2,
-            weighted=True,
-        ).get_artifacts(prefix="encoder_ln_")
-        self.ln_xclbin.xclbin_input = self.add_xclbin
-        self.ln_xclbin.extra_flags += [
-            "--xclbin-instance-name=encoder_ln",
+            weights=self.ln1_weight,
+        ).get_artifacts(prefix="encoder_ln1_")
+        self.ln1_xclbin.xclbin_input = self.add_xclbin
+        self.ln1_xclbin.extra_flags += [
+            "--xclbin-instance-name=encoder_ln1",
             f"--xclbin-kernel-id={hex(kernel_id)}",
         ]
-        self.ln_xclbin.kernel_name = "encoder_ln"
-        self.ln_xclbin.depends += [self.add_xclbin]
-        artifacts.append(self.ln_insts)
+        self.ln1_xclbin.kernel_name = "encoder_ln1"
+        self.ln1_xclbin.depends += [self.add_xclbin]
+        artifacts.append(self.ln1_insts)
         kernel_id += 1
 
         # Up projection (GEMM with Up projection weight)
@@ -310,13 +314,13 @@ class AIEBERTEncoder(AIEOperatorBase):
                 emulate_bf16_mmul_with_bfp16=True,
             ).get_artifacts(prefix="encoder_up_proj_")
         )
-        self.up_proj_xclbin.xclbin_input = self.ln_xclbin
+        self.up_proj_xclbin.xclbin_input = self.ln1_xclbin
         self.up_proj_xclbin.extra_flags += [
             "--xclbin-instance-name=encoder_up_proj",
             f"--xclbin-kernel-id={hex(kernel_id)}",
         ]
         self.up_proj_xclbin.kernel_name = "encoder_up_proj"
-        self.up_proj_xclbin.depends += [self.ln_xclbin]
+        self.up_proj_xclbin.depends += [self.ln1_xclbin]
         artifacts.append(self.up_proj_insts)
         kernel_id += 1
 
@@ -358,11 +362,29 @@ class AIEBERTEncoder(AIEOperatorBase):
         ]
         self.down_proj_xclbin.kernel_name = "encoder_down_proj"
         self.down_proj_xclbin.depends += [self.gelu_xclbin]
-        artifacts.append(self.down_proj_xclbin)
         artifacts.append(self.down_proj_insts)
+        kernel_id += 1
+
+        # Second Layer normalization kernel
+        self.ln2_xclbin, self.ln2_insts = AIELayerNorm(
+            size=self.seq_len * self.hidden_size,
+            tile_size=self.hidden_size,
+            num_aie_columns=self.num_aie_columns,
+            num_channels=2,
+            weights=self.ln2_weight,
+        ).get_artifacts(prefix="encoder_ln2_")
+        self.ln2_xclbin.xclbin_input = self.down_proj_xclbin
+        self.ln2_xclbin.extra_flags += [
+            "--xclbin-instance-name=encoder_ln2",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.ln2_xclbin.kernel_name = "encoder_ln2"
+        self.ln2_xclbin.depends += [self.down_proj_xclbin]
+        artifacts.append(self.ln2_xclbin)
+        artifacts.append(self.ln2_insts)
 
         # Store final xclbin
-        self.combined_xclbin = self.down_proj_xclbin
+        self.combined_xclbin = self.ln2_xclbin
 
         self.add_artifacts(artifacts)
         logging.info(f"Finished setting up {len(artifacts)} BERT Encoder artifacts.")
@@ -515,10 +537,10 @@ class AIEBERTEncoder(AIEOperatorBase):
             self.add_insts,
         )
         self.add_kernel(
-            "encoder_ln",
+            "encoder_ln1",
             self.combined_xclbin,
-            self.ln_xclbin.kernel_name,
-            self.ln_insts,
+            self.ln1_xclbin.kernel_name,
+            self.ln1_insts,
         )
         self.add_kernel(
             "encoder_up_proj",
@@ -537,6 +559,12 @@ class AIEBERTEncoder(AIEOperatorBase):
             self.combined_xclbin,
             self.down_proj_xclbin.kernel_name,
             self.down_proj_insts,
+        )
+        self.add_kernel(
+            "encoder_ln2",
+            self.combined_xclbin,
+            self.ln2_xclbin.kernel_name,
+            self.ln2_insts,
         )
         logging.info(
             f"Finished setting up {len(self.kernels)} BERT Encoder runtime kernels."
@@ -582,7 +610,7 @@ class AIEBERTEncoder(AIEOperatorBase):
         # Residual connection
         self.add_to_runlist("encoder_add", "input", "output_proj_output", "add1_output")
         # Layer normalization
-        self.add_to_runlist("encoder_ln", "add1_output", "ln1_weight", "ln1_output")
+        self.add_to_runlist("encoder_ln1", "add1_output", "ln1_output")
         # Up projection
         self.add_to_runlist(
             "encoder_up_proj", "ln1_output", "ffn_up_weight", "up_proj_output"
@@ -598,7 +626,7 @@ class AIEBERTEncoder(AIEOperatorBase):
             "encoder_add", "ln1_output", "down_proj_output", "add2_output"
         )
         # Layer normalization
-        self.add_to_runlist("encoder_ln", "add2_output", "ln2_weight", "output")
+        self.add_to_runlist("encoder_ln2", "add2_output", "output")
 
         logging.info(f"Finished setting up {len(self.runlist)} BERT Encoder runlist.")
 
