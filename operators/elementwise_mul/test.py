@@ -32,7 +32,9 @@ def generate_test_params(extensive=False):
             names.append(
                 f"eltwise_mul_{num_aie_columns}_cols_{num_channels}_channels_{input_length}_tile_{tile_size}"
             )
-            params.append((input_length, num_aie_columns, num_channels, tile_size, None))
+            params.append(
+                (input_length, num_aie_columns, num_channels, tile_size, None)
+            )
     return params, names
 
 
@@ -88,9 +90,16 @@ bert_params = [
     all_params if not TEST_BERT else bert_params,
 )
 def test_elementwise_mul(
-    input_length, num_aie_columns, num_channels, tile_size, scalar_broadcast, aie_context
+    input_length,
+    num_aie_columns,
+    num_channels,
+    tile_size,
+    scalar_broadcast,
+    aie_context,
 ):
-    golden_ref = generate_golden_reference(input_length=input_length,scalar_broadcast=scalar_broadcast)
+    golden_ref = generate_golden_reference(
+        input_length=input_length, scalar_broadcast=scalar_broadcast
+    )
 
     operator = AIEElementwiseMul(
         size=input_length,

@@ -15,7 +15,10 @@ from operators.common.test_utils import run_test, verify_buffer
 
 def generate_test_params():
     params = [(512, 768, 12, True)]
-    names = [f"attn_scores_{seq}x{emb}x{h}x{use_sep_gemms}" for seq, emb, h, use_sep_gemms in params]
+    names = [
+        f"attn_scores_{seq}x{emb}x{h}x{use_sep_gemms}"
+        for seq, emb, h, use_sep_gemms in params
+    ]
     return params, names
 
 
@@ -33,7 +36,9 @@ all_params = [
 )
 @pytest.mark.parametrize("seq_len,embedding_dim,num_heads,use_sep_gemms", all_params)
 def test_bert_encoder(seq_len, embedding_dim, num_heads, use_sep_gemms, aie_context):
-    golden_ref = generate_golden_reference(seq_len, embedding_dim, num_heads, use_sep_gemms=use_sep_gemms)
+    golden_ref = generate_golden_reference(
+        seq_len, embedding_dim, num_heads, use_sep_gemms=use_sep_gemms
+    )
 
     operator = AIEAttnScores(
         seq_len=seq_len,
@@ -49,7 +54,10 @@ def test_bert_encoder(seq_len, embedding_dim, num_heads, use_sep_gemms, aie_cont
             **{f"k_{i}": golden_ref[f"k_{i}"] for i in range(num_heads)},
         }
         output_buffers = {
-            **{f"attn_scores_{i}": golden_ref[f"attn_scores_{i}"] for i in range(num_heads)},
+            **{
+                f"attn_scores_{i}": golden_ref[f"attn_scores_{i}"]
+                for i in range(num_heads)
+            },
         }
     else:
         input_buffers = {

@@ -15,7 +15,8 @@ from aie.iron.controlflow import range_
 from aie.helpers.util import np_ndarray_type_get_shape
 
 
-DATA_MEM_SIZE = 65536 # L1 size in bytes
+DATA_MEM_SIZE = 65536  # L1 size in bytes
+
 
 def get_rows_to_process(num_elements, weight_length):
     # Determine per-tile elements based on weight_length
@@ -26,15 +27,26 @@ def get_rows_to_process(num_elements, weight_length):
             return i - 1
     return num_elements // weight_length
 
+
 def my_weighted_layer_norm(
-    dev, num_elements, num_columns, num_channels, weight_length, weight_file_path, trace_size
+    dev,
+    num_elements,
+    num_columns,
+    num_channels,
+    weight_length,
+    weight_file_path,
+    trace_size,
 ):
     static_weights = np.load(weight_file_path)
     if static_weights.shape[0] != weight_length:
-        raise ValueError("Static weights length does not match the specified weight length")
+        raise ValueError(
+            "Static weights length does not match the specified weight length"
+        )
     per_tile_elements = weight_length
     rows_to_process = get_rows_to_process(num_elements, weight_length)
-    total_cores = num_columns * num_channels  # For each core that does layer norm, another core will take its output to do eltwise mul
+    total_cores = (
+        num_columns * num_channels
+    )  # For each core that does layer norm, another core will take its output to do eltwise mul
     input_tile_size = per_tile_elements * rows_to_process
     for _ in range(rows_to_process, 0, -1):
         n = input_tile_size * total_cores
@@ -160,7 +172,9 @@ def my_weighted_layer_norm(
                 A,
                 taps[i],
                 task_group=tg,
-                placement=Tile(i % 8, 0), # Place in 8 columns, interleaving rows across channels
+                placement=Tile(
+                    i % 8, 0
+                ),  # Place in 8 columns, interleaving rows across channels
             )
         # Drain the output objectFIFOs with data
         for i in range(total_cores):
@@ -170,7 +184,9 @@ def my_weighted_layer_norm(
                 taps[i],
                 wait=True,
                 task_group=tg,
-                placement=Tile(i % 8, 0), # Place in 8 columns, interleaving rows across channels
+                placement=Tile(
+                    i % 8, 0
+                ),  # Place in 8 columns, interleaving rows across channels
             )
         rt.finish_task_group(tg)
 

@@ -58,7 +58,9 @@ class AIELayerNorm(AIEOperatorBase):
         file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
 
         if self.weight is not None:
-            weight_file_name = self.context.build_dir / f"{file_name_base}_weights_{self.size}.npy"
+            weight_file_name = (
+                self.context.build_dir / f"{file_name_base}_weights_{self.size}.npy"
+            )
             np.save(weight_file_name, torch_to_numpy(self.weight))
             mlir_artifact = PythonGeneratedMLIRArtifact.new(
                 f"{file_name_base}.mlir",
@@ -151,9 +153,7 @@ class AIELayerNorm(AIEOperatorBase):
 
         self.write_buffer("input", x_flat)
         self.run_runlist()
-        result = self.read_buffer_as_torch(
-            "output", shape=(self.size,), dtype=bfloat16
-        )
+        result = self.read_buffer_as_torch("output", shape=(self.size,), dtype=bfloat16)
 
         if pad_len > 0:
             result = result[: x_flat.numel() - pad_len]
