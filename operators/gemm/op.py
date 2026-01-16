@@ -277,7 +277,7 @@ class AIEGEMM(AIEOperatorBase):
             B_padded = None
 
         logging.debug(
-            f"Executing GEMM for dimensions M={M}, K={K}, N={N} using NPU operator with M={self.M}, K={self.N}, N={self.N}"
+            f"Executing GEMM for dimensions M={M}, K={K}, N={N} using NPU operator with M={self.M}, K={self.K}, N={self.N}"
         )
 
         if self.c_col_maj:
@@ -472,31 +472,30 @@ class AIEGEMM(AIEOperatorBase):
         assert N == self.N
 
         self.write_buffer("A", A_np)
-        if B_nps is not None:
-            for i, B_np in enumerate(B_nps):
-                self.add_buffer(
-                    f"B_{i}",
-                    self.M * self.N,
-                    static_data=B_np,
-                )
+        if B_np is not None:
+            self.write_buffer("B", B_np)
         self.run_runlist()
-        if self.batch_C[1] == 0:
+        if self.batch_C[0] == 1:
             result_np = self.read_buffer(
-                "C", shape=(self.batch_C[0], M, N), dtype=bfloat16
+                "C", shape=(M, N), dtype=bfloat16
             )
         else:
-            result_np = self.read_buffer(
-                "C", shape=(M, N, self.batch_C[0]), dtype=bfloat16
-            )
+            if self.batch_C[1] == 0:
+                result_np = self.read_buffer(
+                    "C", shape=(self.batch_C[0], M, N), dtype=bfloat16
+                )
+            else:
+                result_np = self.read_buffer(
+                    "C", shape=(M, N, self.batch_C[0]), dtype=bfloat16
+                )
 
         # Check for NaN and fail hard
-        # for result_np in result_nps:
-        #     if np.isnan(result_np).any():
-        #         nan_count = np.isnan(result_np).sum()
-        #         total_count = result_np.size
-        #         raise RuntimeError(
-        #             f"AIE execution returned {nan_count}/{total_count} NaN values. "
-        #         )
+        # if np.isnan(result_np).any():
+        #     nan_count = np.isnan(result_np).sum()
+        #     total_count = result_np.size
+        #     raise RuntimeError(
+        #         f"AIE execution returned {nan_count}/{total_count} NaN values. "
+        #     )
 
         # Convert back to torch tensor
-        return result_nps
+        return result_np
