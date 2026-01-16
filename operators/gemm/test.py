@@ -17,41 +17,58 @@ TEST_BERT = True
 
 
 def generate_test_params(extensive=False):
-    # fmt: off
-    params = [
-        #   M,     K,     N, num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n, prio_accuracy, emulate_bf16, trace_size, batch_size, batch_stride_dim_A, batch_stride_dim_B, batch_stride_dim_C
-        (2048,  2048,  2048,               1,     False,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,  2048,  2048,               2,      True,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,  2048,  2048,               8,      True,      True,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        ( 384,  1536,  1792,               4,      True,     False,  32,  48,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (1792,   896,  1152,               8,     False,      True,  64,  32,  48, True,          False,        0,           1,         0,                  0,                  0),
-        ( 896,  1792,   640,               8,     False,      True,  32,  64,  80, True,          False,        0,           1,         0,                  0,                  0),
-        ( 192,   384,    64,               4,     False,     False,  48,  96,  16, True,          False,        0,           1,         0,                  0,                  0),
-        ( 192,   384,    64,               4,      True,      True,  48,  96,  16, True,          False,        0,           1,         0,                  0,                  0),
-        ( 512,   768,   768,               8,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
-        ( 512,    64,   512,               8,     False,     False,  64,  64,  64, False,          True,        0,          12,         1,                  1,                  0),
-        ( 512,   512,    64,               4,     False,     False,  64,  64,  16, False,          True,        0,          12,         0,                  1,                  1),
-        ( 512,   768,  3072,               8,     False,     False,  64,  48,  96, False,          True,        0,           1,         0,                  0,                  0),
-        ( 512,  3072,   768,               8,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
-    ]
-    extensive_params = [
-        (2048,  2048,  2048,               8,     False,     False,  32,  32, 128, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,  2048,  8192,               2,     False,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,  8192,  2048,               2,     False,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,    64,  2048,               2,     False,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,    64,  8192,               2,     False,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,  2048,  2048,               8,      True,     False, 128,  32,  32, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,  2048,  8192,               2,      True,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,  8192,  2048,               2,      True,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,    64,  2048,               2,      True,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,    64,  8192,               2,      True,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,  2048,  2048,               2,     False,      True,   8,  16,  32, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,  2048,  8192,               2,     False,      True,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,  8192,  2048,               2,     False,      True,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,    64,  2048,               2,     False,      True,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-        (2048,    64,  8192,               2,     False,      True,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
-    ]
-    # fmt: on
+    if TEST_BERT:
+        params = [
+            #   M,     K,     N, num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n, prio_accuracy, emulate_bf16, trace_size, batch_size, batch_stride_dim_A, batch_stride_dim_B, batch_stride_dim_C
+            ( 512,   768,   768,               8,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
+            ( 512,    64,   512,               8,     False,     False,  64,  64,  64, False,          True,        0,          12,         1,                  1,                  0),
+            ( 512,   512,    64,               4,     False,     False,  64,  64,  16, False,          True,        0,          12,         0,                  1,                  1),
+            ( 512,   768,  3072,               8,     False,     False,  64,  48,  96, False,          True,        0,           1,         0,                  0,                  0),
+            ( 512,  3072,   768,               8,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
+        ]
+        extensive_params = [
+            ( 512,   768,   768,               4,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
+            ( 512,    64,   512,               4,     False,     False,  64,  64,  64, False,          True,        0,          12,         1,                  1,                  0),
+            ( 512,   512,    64,               2,     False,     False,  64,  64,  16, False,          True,        0,          12,         0,                  1,                  1),
+            ( 512,   768,  3072,               4,     False,     False,  64,  48,  96, False,          True,        0,           1,         0,                  0,                  0),
+            ( 512,  3072,   768,               4,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
+        ]
+    else:
+        # fmt: off
+        params = [
+            #   M,     K,     N, num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n, prio_accuracy, emulate_bf16, trace_size, batch_size, batch_stride_dim_A, batch_stride_dim_B, batch_stride_dim_C
+            (2048,  2048,  2048,               1,     False,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,  2048,  2048,               2,      True,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,  2048,  2048,               8,      True,      True,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            ( 384,  1536,  1792,               4,      True,     False,  32,  48,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (1792,   896,  1152,               8,     False,      True,  64,  32,  48, True,          False,        0,           1,         0,                  0,                  0),
+            ( 896,  1792,   640,               8,     False,      True,  32,  64,  80, True,          False,        0,           1,         0,                  0,                  0),
+            ( 192,   384,    64,               4,     False,     False,  48,  96,  16, True,          False,        0,           1,         0,                  0,                  0),
+            ( 192,   384,    64,               4,      True,      True,  48,  96,  16, True,          False,        0,           1,         0,                  0,                  0),
+            ( 512,   768,   768,               8,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
+            ( 512,    64,   512,               8,     False,     False,  64,  64,  64, False,          True,        0,          12,         1,                  1,                  0),
+            ( 512,   512,    64,               4,     False,     False,  64,  64,  16, False,          True,        0,          12,         0,                  1,                  1),
+            ( 512,   768,  3072,               8,     False,     False,  64,  48,  96, False,          True,        0,           1,         0,                  0,                  0),
+            ( 512,  3072,   768,               8,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
+        ]
+        extensive_params = [
+            (2048,  2048,  2048,               8,     False,     False,  32,  32, 128, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,  2048,  8192,               2,     False,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,  8192,  2048,               2,     False,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,    64,  2048,               2,     False,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,    64,  8192,               2,     False,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,  2048,  2048,               8,      True,     False, 128,  32,  32, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,  2048,  8192,               2,      True,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,  8192,  2048,               2,      True,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,    64,  2048,               2,      True,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,    64,  8192,               2,      True,     False,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,  2048,  2048,               2,     False,      True,   8,  16,  32, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,  2048,  8192,               2,     False,      True,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,  8192,  2048,               2,     False,      True,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,    64,  2048,               2,     False,      True,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+            (2048,    64,  8192,               2,     False,      True,  64,  64,  64, True,          False,        0,           1,         0,                  0,                  0),
+        ]
+        # fmt: on
 
     if extensive:
         params = extensive_params
@@ -179,9 +196,14 @@ def test_gemm(
     }
     output_buffers = {"C": golden_ref["output"].flatten()}
 
-    errors, latency_us, bandwidth_gbps = run_test(
-        operator, input_buffers, output_buffers, rel_tol=0.1, abs_tol=0.5
-    )
+    if TEST_BERT:
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator, input_buffers, output_buffers, rel_tol=0.1, abs_tol=0.5, warmup_iters=10, timed_iters=100
+        )
+    else:
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator, input_buffers, output_buffers, rel_tol=0.1, abs_tol=0.5
+        )
 
     # Use batch_size of C for total operations
     gflops = (2.0 * M * K * N * batch_size) / (latency_us * 1e-6) / 1e9

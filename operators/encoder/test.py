@@ -67,6 +67,8 @@ def test_bert_encoder(seq_len, embedding_dim, ffn_dim, num_heads, aie_context):
         intermediate_buffers,
         rel_tol=0.05,
         abs_tol=0.5,
+        warmup_iters=10,
+        timed_iters=100,
     )
 
     # Use batch_size of C for total operations

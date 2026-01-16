@@ -130,9 +130,14 @@ def test_layer_norm(
     input_buffers = {"input": golden_ref["input"]}
     output_buffers = {"output": golden_ref["output"]}
 
-    errors, latency_us, bandwidth_gbps = run_test(
-        operator, input_buffers, output_buffers, rel_tol=0.1, abs_tol=0.1
-    )
+    if TEST_BERT:
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator, input_buffers, output_buffers, rel_tol=0.1, abs_tol=0.1, warmup_iters=10, timed_iters=100
+        )
+    else:
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator, input_buffers, output_buffers, rel_tol=0.1, abs_tol=0.1
+        )
 
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
