@@ -79,15 +79,15 @@ def generate_test_params_bert(extensive=False):
     params.extend(
         [
             (393216, 8, 2, 768, True),
-            # (393216, 4, 2, 768, True),
-            # (393216, 2, 2, 768, True),
+            (393216, 4, 2, 768, True),
+            (393216, 2, 2, 768, True),
         ]
     )
     names.extend(
         [
             f"weighted_layer_norm_8_cols_2_channels_393216_tile_768",
-            # f"weighted_layer_norm_4_cols_2_channels_393216_tile_768",
-            # f"weighted_layer_norm_2_cols_2_channels_393216_tile_768",
+            f"weighted_layer_norm_4_cols_2_channels_393216_tile_768",
+            f"weighted_layer_norm_2_cols_2_channels_393216_tile_768",
         ]
     )
 
