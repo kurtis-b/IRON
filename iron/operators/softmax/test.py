@@ -121,9 +121,14 @@ def test_softmax(input_length, num_aie_columns, num_channels, tile_size, aie_con
     input_buffers = {"in": golden_ref["input"]}
     output_buffers = {"output": golden_ref["output"]}
 
-    errors, latency_us, bandwidth_gbps = run_test(
-        operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-6
-    )
+    if TEST_BERT:
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-6, warmup_iters=10, timed_iters=100
+        )
+    else:
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-6
+        )
 
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
