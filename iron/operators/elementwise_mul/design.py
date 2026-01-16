@@ -7,7 +7,7 @@ import numpy as np
 import argparse
 import sys
 
-from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker, LocalBuffer
+from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker, Buffer
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
@@ -40,31 +40,34 @@ def my_eltwise_mul_broadcast_scalar(dev, num_elements, num_columns, num_channels
     )
 
     # Define a task that will run on a compute tile
-    def core_body(of_in1, of_out, eltwise_mul):
+    def core_body(of_in1, scalar, of_out, eltwise_mul):
         # Number of sub-vector "tile" iterations
-        scalar_buffer = LocalBuffer(
-            type=scalar_broadcasted_ty,
-            initial_value=np.full(16, scalar_broadcast, dtype=dtype),
-        )
         for _ in range_(N_div_n):
             elem_in1 = of_in1.acquire(1)
             elem_out = of_out.acquire(1)
-            eltwise_mul(elem_in1, scalar_buffer, elem_out, per_tile_elements)
+            eltwise_mul(elem_in1, scalar, elem_out, per_tile_elements)
             of_in1.release(1)
             of_out.release(1)
 
     # Create a worker to run the task on a compute tile
-    my_workers = [
-        Worker(
-            core_body,
-            [
-                of_in1s[i].cons(),
-                of_outs[i].prod(),
-                eltwise_mul_bf16_vector,
-            ],
+    my_workers = []
+    for i in range(total_cores):
+        scalar_buffer = Buffer(
+            type=scalar_broadcasted_ty,
+            initial_value=np.full(16, scalar_broadcast, dtype=dtype),
+            name=f"scalar_buffer_{i}",
         )
-        for i in range(total_cores)
-    ]
+        my_workers.append(
+            Worker(
+                core_body,
+                [
+                    of_in1s[i].cons(),
+                    scalar_buffer,
+                    of_outs[i].prod(),
+                    eltwise_mul_bf16_vector,
+                ],
+            )
+        )
 
     # Create a TensorAccessPattern for each column
     # to describe the data movement
