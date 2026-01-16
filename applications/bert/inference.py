@@ -866,7 +866,7 @@ def main():
         if num_samples_to_test == 1:
             # NOTE: Using text that generates at least 512 tokens so that there's no attention masking
             texts_to_classify = [SAMPLE_TEXT]
-            true_labels = [0] # Negative
+            true_labels = [0]  # Negative
         else:
             dataset = load_dataset("sst2", split="validation")
 

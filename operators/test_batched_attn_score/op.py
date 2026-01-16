@@ -142,9 +142,7 @@ class AIEAttnScores(AIEOperatorBase):
                     f"attn_scores_{i}",
                 )
         else:
-            self.add_to_runlist(
-                "encoder_attn_scores", "q", "k", "attn_scores"
-            )
+            self.add_to_runlist("encoder_attn_scores", "q", "k", "attn_scores")
 
         logging.info(f"Finished setting up {len(self.runlist)} BERT Encoder runlist.")
 

@@ -289,13 +289,9 @@ class AIEGEMM(AIEOperatorBase):
             result_parts = self._execute_aie_operation(A_part, B_padded)
             max_M = min(M_lo + self.M, M)
             if self.c_col_maj:
-                result_padded[:, M_lo:max_M] = (
-                    result_parts[:N, :max_M]
-                )
+                result_padded[:, M_lo:max_M] = result_parts[:N, :max_M]
             else:
-                result_padded[M_lo:max_M, :] = (
-                    result_parts[:max_M, :N]
-                )
+                result_padded[M_lo:max_M, :] = result_parts[:max_M, :N]
 
         # GEMM produces 2D result, reshape to expected output shape
         if self.c_col_maj:

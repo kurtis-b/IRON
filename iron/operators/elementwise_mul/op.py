@@ -22,7 +22,14 @@ class AIEElementwiseMul(AIEOperatorBase):
     """AIE-accelerated element-wise multiplication"""
 
     def __init__(
-        self, size, num_aie_columns, num_channels, tile_size, scalar_broadcast=None, trace_size=0, context=None
+        self,
+        size,
+        num_aie_columns,
+        num_channels,
+        tile_size,
+        scalar_broadcast=None,
+        trace_size=0,
+        context=None,
     ):
         max_multiple = num_aie_columns * tile_size
         padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple

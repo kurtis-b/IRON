@@ -44,12 +44,8 @@ def generate_golden_reference(
     attn_scores = torch.matmul(q, k)
 
     if use_sep_gemms:
-        buffer_q = {
-            f"q_{i}": q[i].contiguous() for i in range(num_heads)
-        }
-        buffer_k = {
-            f"k_{i}": k[i].contiguous() for i in range(num_heads)
-        }
+        buffer_q = {f"q_{i}": q[i].contiguous() for i in range(num_heads)}
+        buffer_k = {f"k_{i}": k[i].contiguous() for i in range(num_heads)}
         buffer_attn_scores = {
             f"attn_scores_{i}": attn_scores[i].contiguous() for i in range(num_heads)
         }

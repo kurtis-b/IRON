@@ -13,7 +13,16 @@ from aie.iron.device import NPU1, NPU2
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 
-def my_eltwise_mul_broadcast_scalar(dev, num_elements, num_columns, num_channels, tile_size, scalar_broadcast, trace_size):
+
+def my_eltwise_mul_broadcast_scalar(
+    dev,
+    num_elements,
+    num_columns,
+    num_channels,
+    tile_size,
+    scalar_broadcast,
+    trace_size,
+):
     per_tile_elements = 4096 if tile_size > 4096 else tile_size
     total_cores = num_columns * num_channels
     n = per_tile_elements * total_cores
@@ -36,7 +45,9 @@ def my_eltwise_mul_broadcast_scalar(dev, num_elements, num_columns, num_channels
 
     # AIE Core Function declaration
     eltwise_mul_bf16_vector = Kernel(
-        "eltwise_mul_bf16_broadcasted_scalar", "mul.o", [tile_ty, scalar_broadcasted_ty, tile_ty, np.int32]
+        "eltwise_mul_bf16_broadcasted_scalar",
+        "mul.o",
+        [tile_ty, scalar_broadcasted_ty, tile_ty, np.int32],
     )
 
     # Define a task that will run on a compute tile
@@ -113,6 +124,7 @@ def my_eltwise_mul_broadcast_scalar(dev, num_elements, num_columns, num_channels
 
     # Place program components (assign them resources on the device) and generate an MLIR module
     return Program(dev, rt).resolve_program(SequentialPlacer())
+
 
 def my_eltwise_mul(dev, num_elements, num_columns, tile_size, trace_size):
     per_tile_elements = 4096 if tile_size > 4096 else tile_size
@@ -311,7 +323,9 @@ if __name__ == "__main__":
     if scalar_broadcast is None:
         module = my_eltwise_mul(dev, length, columns, tile_size, trace_size)
     else:
-        module = my_eltwise_mul_broadcast_scalar(dev, length, columns, channels, tile_size, scalar_broadcast, trace_size)
+        module = my_eltwise_mul_broadcast_scalar(
+            dev, length, columns, channels, tile_size, scalar_broadcast, trace_size
+        )
 
     output_file_path = Path(opts.output_file_path)
 
