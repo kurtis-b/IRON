@@ -116,7 +116,13 @@ def test_elementwise_mul(
 
     if TEST_BERT:
         errors, latency_us, bandwidth_gbps = run_test(
-            operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-6, warmup_iters=10, timed_iters=100
+            operator,
+            input_buffers,
+            output_buffers,
+            rel_tol=0.04,
+            abs_tol=1e-6,
+            warmup_iters=10,
+            timed_iters=100,
         )
     else:
         errors, latency_us, bandwidth_gbps = run_test(

@@ -476,9 +476,7 @@ class AIEGEMM(AIEOperatorBase):
             self.write_buffer("B", B_np)
         self.run_runlist()
         if self.batch_C[0] == 1:
-            result_np = self.read_buffer(
-                "C", shape=(M, N), dtype=bfloat16
-            )
+            result_np = self.read_buffer("C", shape=(M, N), dtype=bfloat16)
         else:
             if self.batch_C[1] == 0:
                 result_np = self.read_buffer(

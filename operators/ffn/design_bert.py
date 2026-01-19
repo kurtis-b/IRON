@@ -683,7 +683,10 @@ def my_matmul(
                             C_col_offset = (
                                 (col * n + col_group * mem_tile_n * down_proj_depth)
                                 if not c_col_maj
-                                else (col * n * M + col_group * mem_tile_n * M * down_proj_depth)
+                                else (
+                                    col * n * M
+                                    + col_group * mem_tile_n * M * down_proj_depth
+                                )
                             )
                             if not c_col_maj:
                                 C_block_offset = (
@@ -760,7 +763,10 @@ def my_matmul(
                             B_col_offset = (
                                 (col * n + col_group * mem_tile_n * down_proj_depth)
                                 if not b_col_maj
-                                else (col * n * K + col_group * mem_tile_n * K * down_proj_depth)
+                                else (
+                                    col * n * K
+                                    + col_group * mem_tile_n * K * down_proj_depth
+                                )
                             )
                             if not b_col_maj:
                                 B_sizes = [K_div_k, down_proj_depth, k, n]

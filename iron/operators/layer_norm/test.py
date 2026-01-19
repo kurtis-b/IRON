@@ -131,7 +131,13 @@ def test_layer_norm(
 
     if TEST_BERT:
         errors, latency_us, bandwidth_gbps = run_test(
-            operator, input_buffers, output_buffers, rel_tol=0.1, abs_tol=0.1, warmup_iters=10, timed_iters=100
+            operator,
+            input_buffers,
+            output_buffers,
+            rel_tol=0.1,
+            abs_tol=0.1,
+            warmup_iters=10,
+            timed_iters=100,
         )
     else:
         errors, latency_us, bandwidth_gbps = run_test(
