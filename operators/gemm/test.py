@@ -20,18 +20,18 @@ def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
             #   M,     K,     N, num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n, prio_accuracy, emulate_bf16, trace_size, batch_size, batch_stride_dim_A, batch_stride_dim_B, batch_stride_dim_C
-            ( 512,   768,   768,               8,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
-            ( 512,    64,   512,               8,     False,     False,  64,  64,  64, False,          True,        0,          12,         1,                  1,                  0),
-            ( 512,   512,    64,               4,     False,     False,  64,  64,  16, False,          True,        0,          12,         0,                  1,                  1),
-            ( 512,   768,  3072,               8,     False,     False,  64,  48,  96, False,          True,        0,           1,         0,                  0,                  0),
-            ( 512,  3072,   768,               8,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
+            (512, 768, 768, 8, False, False, 64, 96, 48, False, True, 0, 1, 0, 0, 0),
+            (512, 64, 512, 8, False, False, 64, 64, 64, False, True, 0, 12, 1, 1, 0),
+            (512, 512, 64, 4, False, False, 64, 64, 16, False, True, 0, 12, 0, 1, 1),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 1, 0, 0, 0),
+            (512, 3072, 768, 8, False, False, 64, 96, 48, False, True, 0, 1, 0, 0, 0),
         ]
         extensive_params = [
-            ( 512,   768,   768,               4,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
-            ( 512,    64,   512,               4,     False,     False,  64,  64,  64, False,          True,        0,          12,         1,                  1,                  0),
-            ( 512,   512,    64,               2,     False,     False,  64,  64,  16, False,          True,        0,          12,         0,                  1,                  1),
-            ( 512,   768,  3072,               4,     False,     False,  64,  48,  96, False,          True,        0,           1,         0,                  0,                  0),
-            ( 512,  3072,   768,               4,     False,     False,  64,  96,  48, False,          True,        0,           1,         0,                  0,                  0),
+            (512, 768, 768, 4, False, False, 64, 96, 48, False, True, 0, 1, 0, 0, 0),
+            (512, 64, 512, 4, False, False, 64, 64, 64, False, True, 0, 12, 1, 1, 0),
+            (512, 512, 64, 2, False, False, 64, 64, 16, False, True, 0, 12, 0, 1, 1),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 0, 0, 0),
+            (512, 3072, 768, 4, False, False, 64, 96, 48, False, True, 0, 1, 0, 0, 0),
         ]
     else:
         # fmt: off
@@ -198,7 +198,13 @@ def test_gemm(
 
     if TEST_BERT:
         errors, latency_us, bandwidth_gbps = run_test(
-            operator, input_buffers, output_buffers, rel_tol=0.1, abs_tol=0.5, warmup_iters=10, timed_iters=100
+            operator,
+            input_buffers,
+            output_buffers,
+            rel_tol=0.1,
+            abs_tol=0.5,
+            warmup_iters=10,
+            timed_iters=100,
         )
     else:
         errors, latency_us, bandwidth_gbps = run_test(
