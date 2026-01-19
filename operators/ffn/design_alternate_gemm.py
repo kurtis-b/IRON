@@ -23,6 +23,7 @@ from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
+from aie.helpers.dialects.ext.scf import if_, else_
 
 
 microkernel_mac_dim_map = {
@@ -159,7 +160,7 @@ def my_matmul(
     # since we have n_aie_rows (2) row tiles for matrix A
     n_shim_mem_A = min(n_aie_cols, n_aie_rows)
 
-    # Integer division when n_aie_cols < n_aie_rows, otherwise set to 1
+    # Integer division when n_aie_cols < 2, otherwise set to 1
     n_A_tiles_per_shim = n_aie_rows // n_aie_cols if n_aie_cols < n_aie_rows else 1
 
     mem_tile_m_A = m * n_A_tiles_per_shim
@@ -171,7 +172,7 @@ def my_matmul(
             dtype_out_str == "bf16"
         ), f"prio_accuracy flag is a feature only for bfloat16 output data types"
         use_larger_internal_buffer = True
-        # If prio_accuracy flag is enabled, gemm for bfloat16 will accumulate in place with a f32 buffer,
+        # If prio_accuracy flag is enabled, up_proj_gelu for bfloat16 will accumulate in place with a f32 buffer,
         # which will be converted to bf16 after the reduction loop finishes for output transfer to L2
         dtype_out_internal = str_to_dtype("f32")
         assert np.issubdtype(dtype_in, np.integer) == np.issubdtype(
@@ -215,12 +216,8 @@ def my_matmul(
         M % mem_tile_m_A == 0
     ), """A must be tileable into (m * n_A_tiles_per_shim, k)-sized blocks"""
 
-    # Both A and B_Up are tiled in the K dimension into size k.
+    # Both A and B are tiled in the K dimension into size k.
     assert K % k == 0
-    # B_Down is tiled in the N dimension into size k.
-    assert N % k == 0
-    # n has to be the same as k since the tiling dimensions for up/down projection switch
-    assert n == k
 
     # Input matrix B:
     # Conceptually, we do the same as with A, but instead of broadcasting
@@ -274,8 +271,7 @@ def my_matmul(
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
     C_l2_ty = np.ndarray[(mem_tile_m_C * n,), np.dtype[dtype_out]]
     A_l1_ty = np.ndarray[(m, k), np.dtype[dtype_in]]
-    B_Up_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
-    B_Down_l1_ty = np.ndarray[(n, k), np.dtype[dtype_in]]
+    B_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
     C_l1_ty = np.ndarray[(m, n), np.dtype[dtype_out]]
 
     # AIE Core Function declarations
@@ -301,53 +297,40 @@ def my_matmul(
         )
         matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_f32"
         matmul_kernel = Kernel(
-            matmul_func_name + "_up_proj",
+            matmul_func_name,
             archive_name,
-            [A_l1_ty, B_Up_l1_ty, C_l1_ty_internal],
+            [A_l1_ty, B_l1_ty, C_l1_ty_internal],
         )
-        matmul_kernel = Kernel(
-            matmul_func_name + "_down_proj",
+        eltwise_add_vector = Kernel(
+            "eltwise_add_f32_vector",
             archive_name,
-            [C_l1_ty_internal, B_Down_l1_ty, A_l1_ty],
+            [C_l1_ty_internal, C_l1_ty_internal, C_l1_ty_internal, np.int32],
         )
     else:
         # No need to use separate buffers for accumulation and transfer to L2, so
         # we only need the zero and matmul kernels
         fifo_depth_out = fifo_depth
-        zero_kernel_up_proj = Kernel(
-            f"zero{scalar_suffix}_{dtype_out_str}_up_proj",
-            archive_name,
-            [C_l1_ty],
-        )
-        zero_kernel_down_proj = Kernel(
-            f"zero{scalar_suffix}_{dtype_out_str}_down_proj",
+        zero_kernel = Kernel(
+            f"zero{scalar_suffix}_{dtype_out_str}",
             archive_name,
             [C_l1_ty],
         )
         matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
         matmul_kernel = Kernel(
-            matmul_func_name + "_up_proj",
+            matmul_func_name,
             archive_name,
-            [A_l1_ty, B_Up_l1_ty, C_l1_ty],
+            [A_l1_ty, B_l1_ty, C_l1_ty],
         )
-        matmul_kernel = Kernel(
-            matmul_func_name + "_down_proj",
+        eltwise_add_vector = Kernel(
+            "eltwise_add_bf16_vector",
             archive_name,
-            [C_l1_ty, B_Down_l1_ty, A_l1_ty],
+            [C_l1_ty, C_l1_ty, C_l1_ty, np.int32],
         )
-    eltwise_add_vector = Kernel(
-        "eltwise_add_bf16_vector", archive_name, [C_l1_ty, C_l1_ty, C_l1_ty, np.int32]
-    )
-    mem_copy_fcn = Kernel(
-        "passThroughLine",
-        archive_name,
-        [C_l1_ty, C_l1_ty, np.int32],
-    )
-    gelu_kernel = Kernel(
-        "gelu_bf16",
-        archive_name,
-        [C_l1_ty, C_l1_ty, np.int32],
-    )
+        mem_copy_fcn = Kernel(
+            "passThroughLine",
+            archive_name,
+            [C_l1_ty, C_l1_ty, np.int32],
+        )
 
     # Tile declarations as tile[row][col]
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
@@ -357,10 +340,8 @@ def my_matmul(
     A_l3l2_fifos = [None] * n_shim_mem_A
     A_l2l1_fifos = [None] * n_aie_rows
 
-    B_Up_l3l2_fifos = [None] * n_aie_cols
-    B_Up_l2l1_fifos = [None] * n_aie_cols
-    B_Down_l3l2_fifos = [None] * n_aie_cols
-    B_Down_l2l1_fifos = [None] * n_aie_cols
+    B_l3l2_fifos = [None] * n_aie_cols
+    B_l2l1_fifos = [None] * n_aie_cols
 
     # Partial C tiles pipelined from up_proj_gelu core to add core
     C_partial_l1l1_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
@@ -444,41 +425,19 @@ def my_matmul(
         for j in range(stop_row - start_row):
             A_l2l1_fifos[j + start_row] = a_tmp_fifos[j]
 
-    # Input B_Up
+    # Input B
     for col in range(n_aie_cols):
-        B_Up_l3l2_fifos[col] = ObjectFifo(
-            B_l2_ty, name=f"B_Up_L3L2_{col}", depth=fifo_depth
-        )
+        B_l3l2_fifos[col] = ObjectFifo(B_l2_ty, name=f"B_L3L2_{col}", depth=fifo_depth)
         if b_col_maj:
             dims_to_stream = [(n // t, t * k), (k // s, s), (t, k), (s, 1)]
         else:
             dims_to_stream = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
-        B_Up_l2l1_fifos[col] = (
-            B_Up_l3l2_fifos[col]
+        B_l2l1_fifos[col] = (
+            B_l3l2_fifos[col]
             .cons()
             .forward(
-                obj_type=B_Up_l1_ty,
-                name=f"B_Up_L2L1_{col}",
-                dims_to_stream=dims_to_stream,
-                placement=Tile(col, 1),
-            )
-        )
-
-    # Input B_Down
-    for col in range(n_aie_cols):
-        B_Down_l3l2_fifos[col] = ObjectFifo(
-            B_l2_ty, name=f"B_Down_L3L2_{col}", depth=fifo_depth
-        )
-        if b_col_maj:
-            dims_to_stream = [(n // t, t * k), (k // s, s), (t, k), (s, 1)]
-        else:
-            dims_to_stream = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
-        B_Down_l2l1_fifos[col] = (
-            B_Down_l3l2_fifos[col]
-            .cons()
-            .forward(
-                obj_type=B_Down_l1_ty,
-                name=f"B_Down_L2L1_{col}",
+                obj_type=B_l1_ty,
+                name=f"B_L2L1_{col}",
                 dims_to_stream=dims_to_stream,
                 placement=Tile(col, 1),
             )
@@ -614,7 +573,7 @@ def my_matmul(
                     core_fn_up_proj_gelu,
                     [
                         A_l2l1_fifos[row].cons(),
-                        B_Up_l2l1_fifos[col].cons(),
+                        B_l2l1_fifos[col].cons(),
                         C_partial_l1l1_fifos[row][col].prod(),
                         zero_kernel,
                         matmul_kernel,
@@ -775,7 +734,7 @@ def my_matmul(
                                 strides=B_strides,
                             )
                             rt.fill(
-                                B_Up_l3l2_fifos[col].prod(),
+                                B_l3l2_fifos[col].prod(),
                                 B,
                                 tap=B_tile,
                                 task_group=tg,
