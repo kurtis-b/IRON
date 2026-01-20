@@ -146,6 +146,10 @@ def my_matmul(
     archive=None,
     generate_taps=False,
 ):
+    # This GEMM design implements a loop interchanged core function from the regular (accumulate-in-place) design
+    # By interchanging the loops, we can have each core compute partial C tiles that are sent to a separate core
+    # that accumulates the partial C tiles into the final output C tile. The MT is used to store the partial C tiles,
+    # which is sent back to the core that computed it for the next K iteration.
     n_aie_rows = 2
 
     dtype_in = str_to_dtype(dtype_in_str)
