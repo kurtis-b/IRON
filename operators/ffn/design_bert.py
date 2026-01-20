@@ -12,11 +12,10 @@ from aie.iron import (
     Kernel,
     ObjectFifo,
     Program,
-    GlobalBuffer,
+    Buffer,
     Runtime,
     Worker,
     WorkerRuntimeBarrier,
-    LocalBuffer,
     str_to_dtype,
 )
 from aie.iron.placers import SequentialPlacer
@@ -165,6 +164,7 @@ def my_matmul(
     mem_tile_m_A = m * n_A_tiles_per_shim
     mem_tile_m_C = m * n_aie_rows
     mem_tile_n = n * n_aie_cols
+    mem_tile_k = k * n_aie_cols
 
     if prio_accuracy:
         assert (
@@ -213,30 +213,46 @@ def my_matmul(
     # contiguous (m, k)-sized block of A.
     assert (
         M % mem_tile_m_A == 0
-    ), """A must be tileable into (m * n_A_tiles_per_shim, k)-sized blocks"""
+    ), """A must be tileable into (m * n_A_tiles_per_shim, k)-sized blocks for up projection loop"""
 
+    # Inner dimensions for GEMM:
     # Both A and B_Up are tiled in the K dimension into size k.
-    assert K % k == 0
-    # B_Down is tiled in the N dimension into size k.
-    assert N % k == 0
-    # n has to be the same as k since the tiling dimensions for up/down projection switch
-    assert n == k
+    assert (
+        K % k == 0
+    ), """K must be tileable into k-sized blocks for up projection loop"""
+    # Both C_Up and B_Down are tiled in the N dimension into size n.
+    assert (
+        N % n == 0
+    ), """N must be tileable into n-sized blocks for down projection loop"""
 
-    # Input matrix B:
+    # Input matrix B_Up:
     # Conceptually, we do the same as with A, but instead of broadcasting
     # across columns we broadcast across rows and distribute across columns.
     assert (
-        N % (mem_tile_n * down_proj_depth) == 0
-    ), """B must be tileable into (k, n * n_aie_cols * down_proj_depth)-sized blocks"""
+        N % mem_tile_n == 0
+    ), """B_Up must be tileable into (k, n * n_aie_cols)-sized blocks"""
+    # Input matrix B_Down:
+    # Conceptually, we do the same as with B_Up, but the K and N dimensions are swapped.
+    assert (
+        K % mem_tile_k == 0
+    ), """B_Down must be tileable into (n, k * n_aie_cols)-sized blocks"""
 
-    # Output matrix C:
-    # Conceptually, we divide output C into (m * n_rows, n)-sized blocks. These
+    # Intermediate C_Down
+    # Conceptually, we divide the C_Down matrix into (m, k * down_proj_depth)-sized blocks.
+    # The partial accumulations of C_Down are stored in the Memory tiles with the
+    # object FIFO depth based on the down_proj_depth parameter.
+    assert (
+        K % (mem_tile_k * down_proj_depth) == 0
+    ), """Partial C_Down must be tileable into (m, k * n_aie_cols * down_proj_depth)-sized blocks"""
+
+    # Output matrix C_Down:
+    # Conceptually, we divide the C output into (m * n_rows, k)-sized blocks. These
     # blocks are _distributed_ across AIE core columns, and _joined_ across
     # rows, s.t. each of the n_rows compute cores in a column send a
-    # contiguous (m, n)-sized block of C.
+    # contiguous (m, k)-sized block of C.
     assert (
         M % mem_tile_m_C == 0
-    ), """C must be tileable into (m * n_aie_rows, n)-sized blocks"""
+    ), """C must be tileable into (m * n_aie_rows, k)-sized blocks"""
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
     if not use_scalar:
@@ -263,7 +279,8 @@ def my_matmul(
     # These will hold TensorAccessPattern objects that represent the runtime
     # npu_dma_memcpy_nd operations of this design. They are only used if generate_taps is true
     A_taps = []
-    B_taps = []
+    B_up_proj_taps = []
+    B_down_proj_taps = []
     C_taps = []
 
     # Define tensor types
@@ -272,11 +289,12 @@ def my_matmul(
     C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
     A_l2_ty = np.ndarray[(mem_tile_m_A * k,), np.dtype[dtype_in]]
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
-    C_l2_ty = np.ndarray[(mem_tile_m_C * n,), np.dtype[dtype_out]]
+    C_l2_ty = np.ndarray[(mem_tile_m_C * k,), np.dtype[dtype_out]]
     A_l1_ty = np.ndarray[(m, k), np.dtype[dtype_in]]
-    B_Up_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
-    B_Down_l1_ty = np.ndarray[(n, k), np.dtype[dtype_in]]
-    C_l1_ty = np.ndarray[(m, n), np.dtype[dtype_out]]
+    B_up_proj_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
+    B_down_proj_l1_ty = np.ndarray[(n, k), np.dtype[dtype_in]]
+    C_up_proj_l1_ty = np.ndarray[(m, n), np.dtype[dtype_out]]
+    C_down_proj_l1_ty = np.ndarray[(m, k), np.dtype[dtype_out]]
 
     # AIE Core Function declarations
     scalar_suffix = "_scalar" if use_scalar else ""
@@ -285,68 +303,96 @@ def my_matmul(
         # Fix fifo depth for C objfifo to 1 since 1 buffer will be used for accumulation
         # and another for transfer to L2
         fifo_depth_out = 1
-        # Set the type for accumulation
-        C_l1_ty_internal = np.ndarray[(m, n), np.dtype[dtype_out_internal]]
+        # f32 buffers are used for the kernels
         # A kernel to convert from the internal f32 accumulation to bf16 for transfer to L2 is needed
-        convert_copy_kernel = Kernel(
-            f"convert_copy_f32_to_bf16",
-            archive_name,
-            [C_l1_ty_internal, C_l1_ty, np.int32],
-        )
-        # Fix the kernels to use f32 outputs
-        zero_kernel = Kernel(
-            f"zero{scalar_suffix}_f32",
-            archive_name,
-            [C_l1_ty_internal],
-        )
+        # Up projection
         matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_f32"
-        matmul_kernel = Kernel(
+        C_up_proj_l1_ty_internal = np.ndarray[(m, n), np.dtype[dtype_out_internal]]
+        convert_copy_kernel_up_proj = Kernel(
+            f"convert_copy_f32_to_bf16_up_proj",
+            archive_name,
+            [C_up_proj_l1_ty_internal, C_up_proj_l1_ty, np.int32],
+        )
+        zero_kernel_up_proj = Kernel(
+            f"zero{scalar_suffix}_f32_up_proj",
+            archive_name,
+            [C_up_proj_l1_ty_internal],
+        )
+        matmul_kernel_up_proj = Kernel(
             matmul_func_name + "_up_proj",
             archive_name,
-            [A_l1_ty, B_Up_l1_ty, C_l1_ty_internal],
+            [A_l1_ty, B_up_proj_l1_ty, C_up_proj_l1_ty_internal],
         )
-        matmul_kernel = Kernel(
+        # Down projection
+        matmul_func_name = f"matmul_with_acc_{dtype_in_str}_f32"
+        C_down_proj_l1_ty_internal = np.ndarray[(m, k), np.dtype[dtype_out_internal]]
+        convert_copy_kernel_down_proj = Kernel(
+            f"convert_copy_f32_to_bf16_down_proj",
+            archive_name,
+            [C_down_proj_l1_ty_internal, C_down_proj_l1_ty, np.int32],
+        )
+        zero_kernel_down_proj = Kernel(
+            f"zero{scalar_suffix}_f32_down_proj",
+            archive_name,
+            [C_down_proj_l1_ty_internal],
+        )
+        matmul_kernel_down_proj = Kernel(
             matmul_func_name + "_down_proj",
             archive_name,
-            [C_l1_ty_internal, B_Down_l1_ty, A_l1_ty],
+            [C_up_proj_l1_ty_internal, B_down_proj_l1_ty, C_down_proj_l1_ty_internal],
+        )
+        eltwise_add_vector = Kernel(
+            "eltwise_add_f32_vector",
+            archive_name,
+            [
+                C_down_proj_l1_ty_internal,
+                C_down_proj_l1_ty_internal,
+                C_down_proj_l1_ty_internal,
+                np.int32,
+            ],
         )
     else:
         # No need to use separate buffers for accumulation and transfer to L2, so
         # we only need the zero and matmul kernels
         fifo_depth_out = fifo_depth
+        # Up projection
+        matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
         zero_kernel_up_proj = Kernel(
             f"zero{scalar_suffix}_{dtype_out_str}_up_proj",
             archive_name,
-            [C_l1_ty],
+            [C_up_proj_l1_ty],
         )
+        matmul_kernel_up_proj = Kernel(
+            matmul_func_name + "_up_proj",
+            archive_name,
+            [A_l1_ty, B_up_proj_l1_ty, C_up_proj_l1_ty],
+        )
+        # Down projection
+        matmul_func_name = f"matmul_with_acc_{dtype_in_str}_{dtype_out_str}"
         zero_kernel_down_proj = Kernel(
             f"zero{scalar_suffix}_{dtype_out_str}_down_proj",
             archive_name,
-            [C_l1_ty],
+            [C_down_proj_l1_ty],
         )
-        matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
-        matmul_kernel = Kernel(
-            matmul_func_name + "_up_proj",
-            archive_name,
-            [A_l1_ty, B_Up_l1_ty, C_l1_ty],
-        )
-        matmul_kernel = Kernel(
+        matmul_kernel_down_proj = Kernel(
             matmul_func_name + "_down_proj",
             archive_name,
-            [C_l1_ty, B_Down_l1_ty, A_l1_ty],
+            [C_up_proj_l1_ty, B_down_proj_l1_ty, C_down_proj_l1_ty, C_down_proj_l1_ty],
         )
-    eltwise_add_vector = Kernel(
-        "eltwise_add_bf16_vector", archive_name, [C_l1_ty, C_l1_ty, C_l1_ty, np.int32]
-    )
-    mem_copy_fcn = Kernel(
-        "passThroughLine",
-        archive_name,
-        [C_l1_ty, C_l1_ty, np.int32],
-    )
+        mem_copy_fcn = Kernel(
+            "passThroughLine",
+            archive_name,
+            [C_down_proj_l1_ty, C_down_proj_l1_ty, np.int32],
+        )
+        eltwise_add_vector = Kernel(
+            "eltwise_add_bf16_vector",
+            archive_name,
+            [C_down_proj_l1_ty, C_down_proj_l1_ty, C_down_proj_l1_ty, np.int32],
+        )
     gelu_kernel = Kernel(
         "gelu_bf16",
         archive_name,
-        [C_l1_ty, C_l1_ty, np.int32],
+        [C_down_proj_l1_ty, C_down_proj_l1_ty, np.int32],
     )
 
     # Tile declarations as tile[row][col]
@@ -357,28 +403,28 @@ def my_matmul(
     A_l3l2_fifos = [None] * n_shim_mem_A
     A_l2l1_fifos = [None] * n_aie_rows
 
-    B_Up_l3l2_fifos = [None] * n_aie_cols
-    B_Up_l2l1_fifos = [None] * n_aie_cols
-    B_Down_l3l2_fifos = [None] * n_aie_cols
-    B_Down_l2l1_fifos = [None] * n_aie_cols
+    B_up_proj_l3l2_fifos = [None] * n_aie_cols
+    B_up_proj_l2l1_fifos = [None] * n_aie_cols
+    B_down_proj_l3l2_fifos = [None] * n_aie_cols
+    B_down_proj_l2l1_fifos = [None] * n_aie_cols
 
-    # Partial C tiles pipelined from up_proj_gelu core to add core
-    C_partial_l1l1_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
+    # C tiles pipelined from up_proj core to down_proj core
+    C_up_proj_l1l1_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
 
-    # Partial C tiles for accumulation
-    C_partial_l1l2_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
-    C_partial_l2l1_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
+    # Partial C tiles for accumulation between down_proj core and mem tile
+    C_down_proj_part_l1l2_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
+    C_down_proj_part_l2l1_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
 
-    # Output C tiles
-    C_out_l1l2_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
-    C_out_l2l3_fifos = [None] * n_aie_cols
+    # Output C tiles from down_proj core
+    C_down_proj_out_l1l2_fifos = [[None] * n_aie_cols for _ in range(n_aie_rows)]
+    C_down_proj_out_l2l3_fifos = [None] * n_aie_cols
 
     # Runtime parameters
-    rtps_up_proj_gelu = [
+    rtps_up_proj = [
         [
-            GlobalBuffer(
+            Buffer(
                 np.ndarray[(2,), np.dtype[np.int32]],
-                name=f"rtp_up_proj_gelu{row}_{col}",
+                name=f"rtp_up_proj{row}_{col}",
                 initial_value=np.array([0, 0], dtype=np.int32),
                 use_write_rtp=True,
             )
@@ -388,7 +434,7 @@ def my_matmul(
     ]
     rtps_down_proj = [
         [
-            GlobalBuffer(
+            Buffer(
                 np.ndarray[(2,), np.dtype[np.int32]],
                 name=f"rtp_down_proj{row}_{col}",
                 initial_value=np.array([0, 0], dtype=np.int32),
@@ -446,118 +492,165 @@ def my_matmul(
 
     # Input B_Up
     for col in range(n_aie_cols):
-        B_Up_l3l2_fifos[col] = ObjectFifo(
-            B_l2_ty, name=f"B_Up_L3L2_{col}", depth=fifo_depth
+        B_up_proj_l3l2_fifos[col] = ObjectFifo(
+            B_l2_ty, name=f"B_up_proj_L3L2_{col}", depth=fifo_depth
         )
         if b_col_maj:
             dims_to_stream = [(n // t, t * k), (k // s, s), (t, k), (s, 1)]
         else:
             dims_to_stream = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
-        B_Up_l2l1_fifos[col] = (
-            B_Up_l3l2_fifos[col]
+        B_up_proj_l2l1_fifos[col] = (
+            B_up_proj_l3l2_fifos[col]
             .cons()
             .forward(
-                obj_type=B_Up_l1_ty,
-                name=f"B_Up_L2L1_{col}",
+                obj_type=B_up_proj_l1_ty,
+                name=f"B_up_proj_L2L1_{col}",
                 dims_to_stream=dims_to_stream,
                 placement=Tile(col, 1),
             )
         )
 
-    # Input B_Down
+    # Input B_Down: n and k are swapped compared to B_Up
     for col in range(n_aie_cols):
-        B_Down_l3l2_fifos[col] = ObjectFifo(
-            B_l2_ty, name=f"B_Down_L3L2_{col}", depth=fifo_depth
+        B_down_proj_l3l2_fifos[col] = ObjectFifo(
+            B_l2_ty, name=f"B_down_proj_L3L2_{col}", depth=fifo_depth
         )
         if b_col_maj:
-            dims_to_stream = [(n // t, t * k), (k // s, s), (t, k), (s, 1)]
+            dims_to_stream = [(k // t, t * n), (n // s, s), (t, n), (s, 1)]
         else:
-            dims_to_stream = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
-        B_Down_l2l1_fifos[col] = (
-            B_Down_l3l2_fifos[col]
+            dims_to_stream = [(n // s, s * k), (k // t, t), (s, k), (t, 1)]
+        B_down_proj_l2l1_fifos[col] = (
+            B_down_proj_l3l2_fifos[col]
             .cons()
             .forward(
-                obj_type=B_Down_l1_ty,
-                name=f"B_Down_L2L1_{col}",
+                obj_type=B_down_proj_l1_ty,
+                name=f"B_down_proj_L2L1_{col}",
                 dims_to_stream=dims_to_stream,
                 placement=Tile(col, 1),
             )
         )
 
-    # Partial C
+    # Up proj C
     for col in range(n_aie_cols):
         for row in range(n_aie_rows):
-            C_partial_l1l1_fifos[row][col] = ObjectFifo(
-                C_l1_ty_internal if use_larger_internal_buffer else C_l1_ty,
-                name=f"C_partial_L1L1_{col}_{row}",
+            C_up_proj_l1l1_fifos[row][col] = ObjectFifo(
+                C_up_proj_l1_ty,
+                name=f"C_up_proj_L1L1_{col}_{row}",
                 depth=fifo_depth,
             )
-            C_partial_l1l2_fifos[row][col] = ObjectFifo(
-                C_l1_ty_internal if use_larger_internal_buffer else C_l1_ty,
-                name=f"C_partial_L1L2_{col}_{row}",
+
+    # Down proj partial C
+    for col in range(n_aie_cols):
+        for row in range(n_aie_rows):
+            C_down_proj_part_l1l2_fifos[row][col] = ObjectFifo(
+                (
+                    C_down_proj_l1_ty_internal
+                    if use_larger_internal_buffer
+                    else C_down_proj_l1_ty
+                ),
+                name=f"C_down_proj_part_L1L2_{col}_{row}",
                 depth=fifo_depth_out,
             )
-            C_partial_l2l1_fifos[row][col] = (
-                C_partial_l1l2_fifos[row][col]
+            C_down_proj_part_l2l1_fifos[row][col] = (
+                C_down_proj_part_l1l2_fifos[row][col]
                 .cons(depth=down_proj_depth)
                 .forward(
                     obj_type=(
-                        C_l1_ty_internal if use_larger_internal_buffer else C_l1_ty
+                        C_down_proj_l1_ty_internal
+                        if use_larger_internal_buffer
+                        else C_down_proj_l1_ty
                     ),
-                    name=f"C_partial_L2L1_{col}_{row}",
+                    name=f"C_down_proj_part_L2L1_{col}_{row}",
                     depth=down_proj_depth,
                     placement=Tile(col, 1),
                 )
             )
 
-    # Output C
+    # Down proj output C, m-by-k tiles
     for col in range(n_aie_cols):
         if c_col_maj:
-            dims_to_stream = [(n // t, t * m), (t, r), (m // r, r * t), (r, 1)]
+            dims_to_stream = [(k // t, t * m), (t, r), (m // r, r * t), (r, 1)]
         else:
-            dims_to_stream = [(m // r, r * n), (r, t), (n // t, r * t), (t, 1)]
-        C_out_l2l3_fifos[col] = ObjectFifo(
+            dims_to_stream = [(m // r, r * k), (r, t), (k // t, r * t), (t, 1)]
+        C_down_proj_out_l2l3_fifos[col] = ObjectFifo(
             C_l2_ty,
-            name=f"C_out_L2L3_{col}",
+            name=f"C_down_proj_out_L2L3_{col}",
             depth=fifo_depth,
             dims_to_stream=dims_to_stream,
         )
-        of_offsets = [m * n * i for i in range(n_aie_rows)]
+        of_offsets = [m * k * i for i in range(n_aie_rows)]
 
         # join along one column
         c_tmp_fifos = (
-            C_out_l2l3_fifos[col]
+            C_down_proj_out_l2l3_fifos[col]
             .prod()
             .join(
                 of_offsets,
-                obj_types=[C_l1_ty] * n_aie_rows,
-                names=[f"C_out_L1L2_{col}_{row}" for row in range(n_aie_rows)],
+                obj_types=[C_down_proj_l1_ty] * n_aie_rows,
+                names=[
+                    f"C_down_proj_out_L1L2_{col}_{row}" for row in range(n_aie_rows)
+                ],
                 depths=[fifo_depth] * n_aie_rows,
                 placement=Tile(col, 1),
             )
         )
         for j in range(n_aie_rows):
-            C_out_l1l2_fifos[j][col] = c_tmp_fifos[j]
+            C_down_proj_out_l1l2_fifos[j][col] = c_tmp_fifos[j]
 
     # Tasks for each worker to perform
-    def core_fn_up_proj_gelu(in_a, in_b, out_c, zero, matmul, my_rtp, barrier):
+    def core_fn_up_proj(
+        in_a,
+        in_b,
+        out_c,
+        zero,
+        matmul,
+        gelu,
+        convert_copy,
+        my_rtp,
+        barrier,
+        elem_out_internal,
+    ):
         barrier.wait_for_value(1)
         rtp_K_div_k = my_rtp[0]
-        rtp_n_c_col_tiles_per_core = my_rtp[1]
-        for _ in range_(rtp_K_div_k):
-            elem_in_a = in_a.acquire(1)
-            for _ in range_(rtp_n_c_col_tiles_per_core):
+        rtp_n_tiles_per_core = my_rtp[1]
+        loop = range(1)  # Workaround for issue #1547
+        if rtp_n_tiles_per_core > 1:
+            loop = range_(rtp_n_tiles_per_core)
+        for _ in loop:
+            if not use_larger_internal_buffer:
                 elem_out_internal = out_c.acquire(1)
-                zero(elem_out_internal)
+            zero(elem_out_internal)
+
+            for _ in range_(rtp_K_div_k):
+                elem_in_a = in_a.acquire(1)
                 elem_in_b = in_b.acquire(1)
                 matmul(elem_in_a, elem_in_b, elem_out_internal)
+                in_a.release(1)
                 in_b.release(1)
+
+            if use_larger_internal_buffer:
+                elem_out_transfer = out_c.acquire(1)
+                convert_copy(elem_out_internal, elem_out_transfer, m * n)
+                # TODO: Not sure if the below will affect synchronization--maybe there needs to be two separate objfifos?
+                gelu(elem_out_transfer, elem_out_transfer, m * n)
                 out_c.release(1)
-            in_a.release(1)
+            else:
+                gelu(elem_out_internal, elem_out_internal, m * n)
+                out_c.release(1)
 
     def core_fn_down_proj(
-        in_c, curr_acc_c, new_acc_c, out_acc_c, zero, add, copy, my_rtp, barrier
+        in_a,
+        in_b,
+        curr_acc_c,
+        new_acc_c,
+        out_acc_c,
+        zero,
+        matmul,
+        copy,
+        my_rtp,
+        barrier,
     ):
+        # No need to pass in internal buffer here since that will be in MT and not in the core
         barrier.wait_for_value(1)
         rtp_K_div_k = my_rtp[0]
         rtp_n_c_col_tiles_per_core = my_rtp[1]
@@ -567,14 +660,16 @@ def my_matmul(
             zero(elem_acc_c)
             new_acc_c.release(1)
         for _ in range_(rtp_K_div_k):
+            elem_in_a = in_a.acquire(1)
             for _ in range_(rtp_n_c_col_tiles_per_core):
-                elem_in_c = in_c.acquire(1)
-                elem_curr_acc_c = curr_acc_c.acquire(1)
+                elem_out_internal = curr_acc_c.acquire(1)
+                elem_in_b = in_b.acquire(1)
                 elem_new_acc_c = new_acc_c.acquire(1)
-                add(elem_in_c, elem_curr_acc_c, elem_new_acc_c, m * n)
+                matmul(elem_in_a, elem_in_b, elem_out_internal, elem_new_acc_c)
                 new_acc_c.release(1)
+                in_b.release(1)
                 curr_acc_c.release(1)
-                in_c.release(1)
+            in_a.release(1)
         for _ in range_(rtp_n_c_col_tiles_per_core):
             elem_out_acc_c = out_acc_c.acquire(1)
             elem_final_acc_c = curr_acc_c.acquire(1)
@@ -586,19 +681,51 @@ def my_matmul(
     workers = []
     for row in range(n_aie_rows):
         for col in range(n_aie_cols):
+            acc_buffer_up_proj = None
+            if use_larger_internal_buffer:
+                acc_buffer_up_proj = Buffer(
+                    type=C_l1_ty_internal, name=f"acc_buffer_up_proj_{row}_{col}"
+                )
+
             tile_col, tile_row = core_tiles[row * 2][col]
+            workers.append(
+                Worker(
+                    core_fn_up_proj,
+                    [
+                        A_l2l1_fifos[row].cons(),
+                        B_up_proj_l2l1_fifos[col].cons(),
+                        C_up_proj_l1l1_fifos[row][col].prod(),
+                        zero_kernel_up_proj,
+                        matmul_kernel_up_proj,
+                        gelu_kernel,
+                        (
+                            convert_copy_kernel_up_proj
+                            if use_larger_internal_buffer
+                            else None
+                        ),
+                        rtps_up_proj[row][col],
+                        workerBarriersUpProj[row][col],
+                        acc_buffer_up_proj,
+                    ],
+                    placement=Tile(tile_col, tile_row + 1),
+                    stack_size=0xD00,
+                )
+            )
             workers.append(
                 Worker(
                     core_fn_down_proj,
                     [
-                        C_partial_l1l1_fifos[row][col].cons(),
-                        C_partial_l2l1_fifos[row][col].cons(depth=fifo_depth_out),
-                        C_partial_l1l2_fifos[row][col].prod(),
-                        C_out_l1l2_fifos[row][col].prod(),
-                        zero_kernel,
-                        eltwise_add_vector,
+                        C_up_proj_l1l1_fifos[row][col].cons(),
+                        B_down_proj_l2l1_fifos[col].cons(),
+                        C_down_proj_part_l2l1_fifos[row][col].cons(
+                            depth=fifo_depth_out
+                        ),
+                        C_down_proj_part_l1l2_fifos[row][col].prod(),
+                        C_down_proj_out_l1l2_fifos[row][col].prod(),
+                        zero_kernel_down_proj,
+                        matmul_kernel_down_proj,
                         (
-                            convert_copy_kernel
+                            convert_copy_kernel_down_proj
                             if use_larger_internal_buffer
                             else mem_copy_fcn
                         ),
@@ -609,26 +736,12 @@ def my_matmul(
                     stack_size=0xD00,
                 )
             )
-            workers.append(
-                Worker(
-                    core_fn_up_proj_gelu,
-                    [
-                        A_l2l1_fifos[row].cons(),
-                        B_Up_l2l1_fifos[col].cons(),
-                        C_partial_l1l1_fifos[row][col].prod(),
-                        zero_kernel,
-                        matmul_kernel,
-                        rtps_up_proj_gelu[row][col],
-                        workerBarriersUpProj[row][col],
-                    ],
-                    placement=Tile(tile_col, tile_row + 1),
-                    stack_size=0xD00,
-                )
-            )
 
     # Calculate RTP values for the reduction loop and total C tiles
     K_div_k = K // k
-    n_c_col_tiles_per_core = N // mem_tile_n
+    N_div_n = N // n
+    n_c_up_col_tiles_per_core = N // mem_tile_n
+    n_c_down_col_tiles_per_core = K // mem_tile_k // down_proj_depth
     n_c_row_tiles_per_core = M // mem_tile_m_C
 
     # We are limited in the number of BDs. After synchronizing, we can reuse BDs.
@@ -642,19 +755,21 @@ def my_matmul(
         rt.start(*workers)
 
         # Set runtime parameters
-        def set_rtps_up_proj_gelu(*args):
+        def set_rtps_up_proj(*args):
             for row, rtps_row in enumerate(args):
                 for col, rtp_row_col in enumerate(rtps_row):
                     rtp_row_col[0] = K_div_k
-                    rtp_row_col[1] = down_proj_depth
+                    rtp_row_col[1] = n_c_up_col_tiles_per_core * n_c_row_tiles_per_core
 
-        rt.inline_ops(set_rtps_up_proj_gelu, rtps_up_proj_gelu)
+        rt.inline_ops(set_rtps_up_proj, rtps_up_proj)
 
         def set_rtps_down_proj(*args):
             for row, rtps_row in enumerate(args):
                 for col, rtp_row_col in enumerate(rtps_row):
-                    rtp_row_col[0] = K_div_k
-                    rtp_row_col[1] = down_proj_depth
+                    rtp_row_col[0] = N_div_n
+                    rtp_row_col[1] = (
+                        n_c_down_col_tiles_per_core * n_c_row_tiles_per_core
+                    )
 
         rt.inline_ops(set_rtps_down_proj, rtps_down_proj)
 
@@ -666,7 +781,7 @@ def my_matmul(
                 rt.set_barrier(workerBarriersDownProj[row][col], 1)
 
         # Task groups will be used to determine when to sync/await/free DMA runtime ops
-        for col_group in range(n_c_col_tiles_per_core // down_proj_depth):
+        for col_group in range(n_c_down_col_tiles_per_core):
             tg = rt.task_group()
             for tb in range(ceildiv(n_c_row_tiles_per_core, tb_max_n_rows)):
                 for pingpong in [0, 1]:
@@ -678,52 +793,52 @@ def my_matmul(
                         # For small input sizes, we may not even need a "pong" iteration
                         break
                     for col in range(n_aie_cols):
-                        for tile_row in range(current_tb_n_rows):
-                            # C Output Transfer:
-                            C_col_offset = (
-                                (col * n + col_group * mem_tile_n * down_proj_depth)
-                                if not c_col_maj
-                                else (
-                                    col * n * M
-                                    + col_group * mem_tile_n * M * down_proj_depth
-                                )
+                        # C Output Transfer:
+                        C_col_offset = (
+                            (col * k + col_group * mem_tile_k * down_proj_depth)
+                            if not c_col_maj
+                            else (
+                                col * k * M
+                                + col_group * mem_tile_k * M * down_proj_depth
                             )
-                            if not c_col_maj:
-                                C_block_offset = (
-                                    (row_base + tile_row) * n_aie_rows * m * N
-                                )  # base address for this transfer block for all BDs
-                                C_offset = C_col_offset + C_block_offset
-                                C_sizes = [
-                                    1,
-                                    down_proj_depth,
-                                    mem_tile_m_C,
-                                    n,
-                                ]
-                                C_strides = [0, mem_tile_n, N, 1]
-                            else:
-                                C_block_offset = (
-                                    (row_base + tile_row) * n_aie_rows * m
-                                )  # base address for this transfer block for all BDs
-                                C_offset = C_col_offset + C_block_offset
-                                C_sizes = [down_proj_depth, 1, n, m]
-                                C_strides = [M * mem_tile_n, 0, M, 1]
-                            C_tile = TensorAccessPattern(
-                                (N, M) if c_col_maj else (M, N),
-                                offset=C_offset,
-                                sizes=C_sizes,
-                                strides=C_strides,
-                            )
-                            rt.drain(
-                                C_out_l2l3_fifos[col].cons(),
-                                C,
-                                tap=C_tile,
-                                wait=True,
-                                task_group=tg,
-                                placement=Tile(col, 0),
-                            )
-                            # This line does not change MLIR output at all - it's just for recording data movement
-                            C_taps.append(C_tile)
+                        )
+                        if not c_col_maj:
+                            C_row_offset = (
+                                row_base * mem_tile_m_C * K
+                            )  # base address for this transfer block for all BDs
+                            C_offset = C_col_offset + C_row_offset
+                            C_sizes = [
+                                current_tb_n_rows,
+                                down_proj_depth,
+                                mem_tile_m_C,
+                                k,
+                            ]
+                            C_strides = [mem_tile_m_C * K, mem_tile_k, K, 1]
+                        else:
+                            C_row_offset = (
+                                row_base * mem_tile_m_C
+                            )  # base address for this transfer block for all BDs
+                            C_offset = C_col_offset + C_row_offset
+                            C_sizes = [down_proj_depth, n_aie_rows, k, m]
+                            C_strides = [M * mem_tile_k, m, M, 1]
+                        C_tile = TensorAccessPattern(
+                            (K, M) if c_col_maj else (M, K),
+                            offset=C_offset,
+                            sizes=C_sizes,
+                            strides=C_strides,
+                        )
+                        # This line does not change MLIR output at all - it's just for recording data movement
+                        C_taps.append(C_tile)
 
+                        rt.drain(
+                            C_down_proj_out_l2l3_fifos[col].cons(),
+                            C,
+                            tap=C_tile,
+                            wait=True,
+                            task_group=tg,
+                            placement=Tile(col, 0),
+                        )
+                        for tile_row in range(current_tb_n_rows):
                             # A input transfer:
                             A_block_offset = (
                                 (row_base + tile_row) * n_aie_rows * m * K
@@ -733,12 +848,13 @@ def my_matmul(
                             )  # base address for the shim in this column
                             A_offset = A_block_offset + A_row_offset
                             A_sizes = [
-                                1,
+                                n_c_up_col_tiles_per_core,
                                 K_div_k,
                                 mem_tile_m_A,
                                 k,
                             ]
                             A_strides = [0, k, K, 1]
+
                             # always equal to n_aie_rows since we have n_aie_rows row tiles for matrix A
                             if col < n_aie_rows:
                                 A_tile = TensorAccessPattern(
@@ -759,37 +875,84 @@ def my_matmul(
                                 # This line does not change MLIR output at all - it's just for recording data movement
                                 A_taps.append(A_tile)
 
-                            # B input transfer:
-                            B_col_offset = (
-                                (col * n + col_group * mem_tile_n * down_proj_depth)
+                            # B_Up input transfer:
+                            B_up_proj_col_offset = (
+                                col * n if not b_col_maj else col * n * K
+                            )
+                            if not b_col_maj:
+                                B_up_proj_sizes = [
+                                    n_c_up_col_tiles_per_core,
+                                    K_div_k,
+                                    k,
+                                    n,
+                                ]
+                                B_up_proj_strides = [
+                                    mem_tile_n,
+                                    k * N,
+                                    N,
+                                    1,
+                                ]
+                            else:
+                                B_up_proj_sizes = [
+                                    n_c_up_col_tiles_per_core,
+                                    K_div_k,
+                                    n,
+                                    k,
+                                ]
+                                B_up_proj_strides = [
+                                    mem_tile_n * K,
+                                    k,
+                                    K,
+                                    1,
+                                ]
+                            B_up_proj_tile = TensorAccessPattern(
+                                (K, N) if not b_col_maj else (N, K),
+                                offset=B_up_proj_col_offset,
+                                sizes=B_up_proj_sizes,
+                                strides=B_up_proj_strides,
+                            )
+                            rt.fill(
+                                B_up_proj_l3l2_fifos[col].prod(),
+                                B_Up,
+                                tap=B_up_proj_tile,
+                                task_group=tg,
+                                placement=Tile(col, 0),
+                            )
+
+                            # This line does not change MLIR output at all - it's just for recording data movement
+                            B_up_proj_taps.append(B_up_proj_tile)
+
+                            # B_Down input transfer:
+                            B_down_proj_col_offset = (
+                                (col * k + col_group * mem_tile_k * down_proj_depth)
                                 if not b_col_maj
                                 else (
-                                    col * n * K
-                                    + col_group * mem_tile_n * K * down_proj_depth
+                                    col * k * N
+                                    + col_group * mem_tile_k * N * down_proj_depth
                                 )
                             )
                             if not b_col_maj:
-                                B_sizes = [K_div_k, down_proj_depth, k, n]
-                                B_strides = [k * N, n * n_aie_cols, N, 1]
+                                B_down_proj_sizes = [N_div_n, down_proj_depth, n, k]
+                                B_down_proj_strides = [n * K, mem_tile_k, K, 1]
                             else:
-                                B_sizes = [K_div_k, down_proj_depth, n, k]
-                                B_strides = [k, n * n_aie_cols * K, K, 1]
-                            B_tile = TensorAccessPattern(
-                                (K, N),
-                                offset=B_col_offset,
-                                sizes=B_sizes,
-                                strides=B_strides,
+                                B_down_proj_sizes = [N_div_n, down_proj_depth, k, n]
+                                B_down_proj_strides = [n, mem_tile_k * N, N, 1]
+                            B_down_proj_tile = TensorAccessPattern(
+                                (N, K) if not b_col_maj else (K, N),
+                                offset=B_down_proj_col_offset,
+                                sizes=B_down_proj_sizes,
+                                strides=B_down_proj_strides,
                             )
                             rt.fill(
-                                B_Up_l3l2_fifos[col].prod(),
-                                B,
-                                tap=B_tile,
+                                B_down_proj_l3l2_fifos[col].prod(),
+                                B_Down,
+                                tap=B_down_proj_tile,
                                 task_group=tg,
                                 placement=Tile(col, 0),
                             )
 
                             # These lines do not change MLIR output at all - they are just for recording data movement
-                            B_taps.append(B_tile)
+                            B_down_proj_taps.append(B_down_proj_tile)
                     if tb > 0 or (tb == 0 and pingpong > 0):
                         rt.finish_task_group(tg)
                         tg = rt.task_group()
@@ -800,7 +963,8 @@ def my_matmul(
         # representing all the npu_dma_memcpy_nd runtime sequence operations per input/ouput tensor.
         return (
             TensorAccessSequence.from_taps(A_taps),
-            TensorAccessSequence.from_taps(B_taps),
+            TensorAccessSequence.from_taps(B_up_proj_taps),
+            TensorAccessSequence.from_taps(B_down_proj_taps),
             TensorAccessSequence.from_taps(C_taps),
         )
 
