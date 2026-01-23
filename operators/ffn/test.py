@@ -43,7 +43,7 @@ def generate_test_params(extensive=False):
             (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 1, 2),
             # Scaling within 8 columns (total cores utilized vary)
             (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 8, 8, 2),
-            # (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 8, 4, 4),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 8, 4, 4),
         ]
         extensive_params = []
     else:
