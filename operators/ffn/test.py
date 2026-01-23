@@ -36,10 +36,10 @@ def generate_test_params(extensive=False):
             (64, 48, 96 * 4, 8, False, False, 64, 48, 96, False, True, 0, 1, 1, 4),
             # BERT workload
             (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
-            # (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 4, 1, 1),
-            # (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 8, 1, 1),
-            # (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 4, 1),
-            # (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 1, 2),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 4, 1, 1),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 8, 1, 1),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 4, 1),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 1, 2),
             # (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 8, 8, 2),
         ]
         extensive_params = []

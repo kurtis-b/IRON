@@ -901,11 +901,11 @@ def my_matmul(
                                 m,
                                 k,
                             ]
-                            C_strides = [m * K, k, K, 1]
+                            C_strides = [m * K * n_a_tiles_distributed, k, K, 1]
                         else:
                             C_row_offset = (
-                                a_tile + row_base
-                            ) * m  # base address for this transfer block for all BDs
+                                (a_tile + row_base) * m * n_a_tiles_distributed
+                            )  # base address for this transfer block for all BDs
                             C_offset = C_col_offset + C_row_offset
                             C_sizes = [down_proj_depth, n_a_tiles_distributed, k, m]
                             C_strides = [M * k, m, M, 1]
