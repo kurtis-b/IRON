@@ -553,6 +553,9 @@ def my_matmul(
     # Down proj partial C
     for a_tile in range(n_a_tiles_distributed):
         for b_tile in range(n_b_tiles_distributed):
+            print(
+                f"Placeing at {(a_tile // n_b_tiles_distributed) * n_b_tiles_distributed + b_tile, 1}"
+            )
             C_down_proj_part_l1l2_fifos[a_tile][b_tile] = ObjectFifo(
                 (
                     C_down_proj_l1_ty_internal
@@ -574,7 +577,9 @@ def my_matmul(
                     name=f"C_down_proj_part_L2L1_{b_tile}_{a_tile}",
                     depth=down_proj_depth,
                     placement=Tile(
-                        (a_tile // n_b_tiles_distributed) * b_tile + b_tile, 1
+                        (a_tile // n_b_tiles_distributed) * n_b_tiles_distributed
+                        + b_tile,
+                        1,
                     ),
                 )
             )
