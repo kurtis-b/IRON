@@ -67,10 +67,13 @@ class AIEFFN(AIEOperatorBase):
         # Calls to forward() may supply matrices of different sizes, and the
         # Python code will perform necessary padding/repeated application of
         # the NPU operator.
-        M_padded, K_padded, N_padded = self._get_padded_dims(M, K, N)
-        self.M = M_padded
-        self.K = K_padded
-        self.N = N_padded
+        # M_padded, K_padded, N_padded = self._get_padded_dims(M, K, N)
+        # self.M = M_padded
+        # self.K = K_padded
+        # self.N = N_padded
+        self.M = M
+        self.K = K
+        self.N = N
 
         # Artifacts created by set_up_artifacts()
         self.xclbin_artifact = None
@@ -259,7 +262,10 @@ class AIEFFN(AIEOperatorBase):
                         ),
                         KernelObjectArtifact.new(
                             "passThrough.o",
-                            [
+                            extra_flags=[
+                                "-DBIT_WIDTH=16",
+                            ],
+                            depends=[
                                 SourceArtifact.new(
                                     base_dir
                                     / "aie_kernels"
@@ -378,20 +384,20 @@ class AIEFFN(AIEOperatorBase):
 
         return result
 
-    def _get_padded_dims(self, M, K, N):
-        tile_m, tile_k, tile_n = self.tile_m, self.tile_n, self.tile_k
-        num_aie_columns = self.num_aie_columns
+    # def _get_padded_dims(self, M, K, N):
+    #     tile_m, tile_k, tile_n = self.tile_m, self.tile_n, self.tile_k
+    #     num_aie_columns = self.num_aie_columns
 
-        min_M = tile_m * self.n_aie_rows
-        min_K = tile_k
-        min_N = tile_n * num_aie_columns
+    #     min_M = tile_m * self.n_aie_rows
+    #     min_K = tile_k
+    #     min_N = tile_n * num_aie_columns
 
-        # Calculate padded dimensions
-        M_padded = ((M + min_M - 1) // min_M) * min_M
-        K_padded = ((K + min_K - 1) // min_K) * min_K
-        N_padded = ((N + min_N - 1) // min_N) * min_N
+    #     # Calculate padded dimensions
+    #     M_padded = ((M + min_M - 1) // min_M) * min_M
+    #     K_padded = ((K + min_K - 1) // min_K) * min_K
+    #     N_padded = ((N + min_N - 1) // min_N) * min_N
 
-        return M_padded, K_padded, N_padded
+    #     return M_padded, K_padded, N_padded
 
     def _pad_A(self, A_np):
         M, K = A_np.shape
