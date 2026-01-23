@@ -321,7 +321,7 @@ class AIEFFN(AIEOperatorBase):
         self.add_buffer("A", self.M * self.K)
         self.add_buffer("B_Up", self.K * self.N, static_data=static_weights_up_proj)
         self.add_buffer("B_Down", self.K * self.N, static_data=static_weights_down_proj)
-        self.add_buffer("C", self.M * self.N)
+        self.add_buffer("C", self.M * self.K)
         self.add_to_runlist("ffn", "A", "B_Up", "B_Down", "C")
 
     def forward(self, A, B_Up=None, B_Down=None):

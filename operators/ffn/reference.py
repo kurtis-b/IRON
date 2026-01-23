@@ -64,6 +64,5 @@ def generate_golden_reference(
         "input": input_tensor,
         "input_b_up": up_weight,
         "input_b_down": down_weight,
-        "output": gelu_output,
+        "output": output,
     }
-    # return {"input": input_tensor, "input_b_up": up_weight, "input_b_down": down_weight, "output": output}
