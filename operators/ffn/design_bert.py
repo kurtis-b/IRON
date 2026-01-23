@@ -730,7 +730,7 @@ def my_matmul(
     workers = []
     # Up projection stage
     for a_tile in range(n_a_tiles_distributed):
-        b_tile_offset = a_tile // num_pipeline_stages
+        b_tile_offset = a_tile // n_dup_shim_b_streams
         for b_tile in range(n_b_tiles_distributed):
             # Calculate the tile placement (indexing by [row][col])
             # Dividing by 2 since the design can be duplicated within the same 2 columns (4 rows each column),
@@ -738,7 +738,7 @@ def my_matmul(
             # Modulo 2 as a row offset for the duplicated design in the same columns
             tile_col, tile_row = core_tiles[b_tile + (a_tile % 2) * 2][a_tile // 2 * 2]
             logging.debug(
-                f"Placing a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at tile ({tile_col}, {tile_row}) for up projection"
+                f"Placing up projection worker based on a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at tile ({tile_col}, {tile_row})"
             )
             acc_buffer_up_proj = None
             if use_larger_internal_buffer:
@@ -751,7 +751,12 @@ def my_matmul(
                     core_fn_up_proj,
                     [
                         A_l2l1_fifos[a_tile].cons(),
-                        B_up_proj_l2l1_fifos[b_tile_offset + b_tile].cons(),
+                        B_up_proj_l2l1_fifos[
+                            b_tile_offset
+                            // n_b_tiles_distributed
+                            * n_b_tiles_distributed
+                            + b_tile
+                        ].cons(),
                         C_up_proj_l1l1_fifos[a_tile][b_tile].prod(),
                         zero_kernel_up_proj,
                         matmul_kernel_up_proj,
@@ -771,7 +776,7 @@ def my_matmul(
             )
     # Down projection stage
     for a_tile in range(n_a_tiles_distributed):
-        b_tile_offset = a_tile // num_pipeline_stages
+        b_tile_offset = a_tile // n_dup_shim_b_streams
         for b_tile in range(n_b_tiles_distributed):
             # Calculate the tile placement (indexing by [row][col])
             # Dividing by 2 since the design can be duplicated within the same 2 columns (4 rows each column),
@@ -781,7 +786,7 @@ def my_matmul(
                 a_tile // 2 * 2 + 1  # Add one since it's the first stage
             ]
             logging.debug(
-                f"Placing a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at tile ({tile_col}, {tile_row}) for down projection"
+                f"Placing down projection worker based on a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at tile ({tile_col}, {tile_row})"
             )
             # The direction of reduction is always from left to right to avoid the
             # partial data for each core to be written in the same Data Memory
@@ -790,7 +795,12 @@ def my_matmul(
                     core_fn_down_proj,
                     [
                         C_up_proj_l1l1_fifos[a_tile][b_tile].cons(),
-                        B_down_proj_l2l1_fifos[b_tile_offset + b_tile].cons(),
+                        B_down_proj_l2l1_fifos[
+                            b_tile_offset
+                            // n_b_tiles_distributed
+                            * n_b_tiles_distributed
+                            + b_tile
+                        ].cons(),
                         C_down_proj_part_l2l1_fifos[a_tile][b_tile].cons(
                             depth=fifo_depth_out
                         ),
