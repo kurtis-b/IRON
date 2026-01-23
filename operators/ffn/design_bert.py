@@ -167,15 +167,19 @@ def my_matmul(
     n_dup_shim_b_streams = (
         n_aie_cols * shim_dma_ch_per_col - n_a_tiles_distributed
     ) // (n_b_tiles_distributed * num_pipeline_stages)
+    if n_dup_shim_b_streams < 1:
+        raise AssertionError(
+            f"Not enough AIE columns to distribute the A and B tiles needed (1 shim DMA channel * {n_a_tiles_distributed} for A and 1 shim DMA channel * {n_b_tiles_distributed} * {num_pipeline_stages} for B per pipeline stage)"
+        )
+
     a_tiles_per_b_stream = n_a_tiles_distributed // n_dup_shim_b_streams
 
     dtype_in = str_to_dtype(dtype_in_str)
     dtype_out = str_to_dtype(dtype_out_str)
 
-    mem_tile_m_A = m * n_a_tiles_distributed
     mem_tile_n = n * n_b_tiles_distributed
     logging.debug(
-        f"n_aie_cores_needed:{n_aie_cores_needed}, n_dup_shim_b_streams:{n_dup_shim_b_streams}, mem_tile_m_A:{mem_tile_m_A}, mem_tile_n:{mem_tile_n}"
+        f"n_aie_cores_needed:{n_aie_cores_needed}, n_dup_shim_b_streams:{n_dup_shim_b_streams}, mem_tile_n:{mem_tile_n}"
     )
 
     if prio_accuracy:
@@ -238,7 +242,7 @@ def my_matmul(
     # rows, s.t. each of the n_rows compute cores in a column receives a
     # contiguous (m, k)-sized block of A.
     assert (
-        M % mem_tile_m_A == 0
+        M % (m * n_a_tiles_distributed) == 0
     ), """A and C must be tileable into (m * n_a_tiles_distributed, k)-sized blocks for up projection loop"""
 
     # Inner dimensions for GEMM:
@@ -299,9 +303,9 @@ def my_matmul(
     A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
     B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
     C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
-    A_l2_ty = np.ndarray[(mem_tile_m_A * k,), np.dtype[dtype_in]]
+    A_l2_ty = np.ndarray[(m * k,), np.dtype[dtype_in]]
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
-    C_l2_ty = np.ndarray[(mem_tile_m_A * k,), np.dtype[dtype_out]]
+    C_l2_ty = np.ndarray[(m * k,), np.dtype[dtype_out]]
     A_l1_ty = np.ndarray[(m, k), np.dtype[dtype_in]]
     B_up_proj_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
     B_down_proj_l1_ty = np.ndarray[(n, k), np.dtype[dtype_in]]
@@ -818,7 +822,7 @@ def my_matmul(
     # Calculate RTP values for the reduction loop and total C tiles
     K_div_k = K // k
     n_c_up_col_tiles_per_core = N // mem_tile_n
-    n_c_row_tiles_per_core = M // mem_tile_m_A
+    n_c_row_tiles_per_core = M // m // n_a_tiles_distributed
 
     # We are limited in the number of BDs. After synchronizing, we can reuse BDs.
     # We only transfer 6 rows of tiles at once before starting a new transfer block.
@@ -880,26 +884,26 @@ def my_matmul(
                         )
                         # C Output Transfer:
                         C_col_offset = (
-                            (a_tile * k + col_group * k * down_proj_depth)
+                            (col_group * k * down_proj_depth)
                             if not c_col_maj
-                            else (a_tile * k * M + col_group * k * M * down_proj_depth)
+                            else (col_group * k * M * down_proj_depth)
                         )
                         if not c_col_maj:
                             C_row_offset = (
-                                row_base * mem_tile_m_A * K
+                                (a_tile + row_base) * m * K
                             )  # base address for this transfer block for all BDs
                             C_offset = C_col_offset + C_row_offset
                             C_sizes = [
                                 current_tb_n_rows,
                                 down_proj_depth,
-                                mem_tile_m_A,
+                                m,
                                 k,
                             ]
-                            C_strides = [mem_tile_m_A * K, k, K, 1]
+                            C_strides = [m * K, k, K, 1]
                         else:
                             C_row_offset = (
-                                row_base * mem_tile_m_A
-                            )  # base address for this transfer block for all BDs
+                                a_tile + row_base
+                            ) * m  # base address for this transfer block for all BDs
                             C_offset = C_col_offset + C_row_offset
                             C_sizes = [down_proj_depth, n_a_tiles_distributed, k, m]
                             C_strides = [M * k, m, M, 1]
@@ -921,7 +925,7 @@ def my_matmul(
                             placement=Tile(a_tile, 0),
                         )
                         logging.debug(
-                            f"    Placed C output transfer at ({a_tile}, 0), sizes: {C_sizes}, strides: {C_strides}"
+                            f"    Placed C output transfer at ({a_tile}, 0), offset: {C_offset}, sizes: {C_sizes}, strides: {C_strides}"
                         )
                         for tile_row in range(current_tb_n_rows):
                             logging.debug(f"    Tile row: {tile_row}")
@@ -936,7 +940,7 @@ def my_matmul(
                             A_sizes = [
                                 n_c_up_col_tiles_per_core,
                                 K_div_k,
-                                mem_tile_m_A,
+                                m,
                                 k,
                             ]
                             A_strides = [0, k, K, 1]
@@ -957,7 +961,7 @@ def my_matmul(
                                 ),
                             )
                             logging.debug(
-                                f"        Placed A input transfer at ({a_tile}, 0), sizes: {A_sizes}, strides: {A_strides}"
+                                f"        Placed A input transfer at ({a_tile}, 0), offset: {A_offset}, sizes: {A_sizes}, strides: {A_strides}"
                             )
                             # This line does not change MLIR output at all - it's just for recording data movement
                             A_taps.append(A_tile)
@@ -1026,7 +1030,7 @@ def my_matmul(
                                             ),
                                         )
                                         logging.debug(
-                                            f"        Placed B_Up input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages}, 0), sizes: {B_up_proj_sizes}, strides: {B_up_proj_strides}"
+                                            f"        Placed B_Up input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages}, 0), offset: {B_up_proj_col_offset}, sizes: {B_up_proj_sizes}, strides: {B_up_proj_strides}"
                                         )
                                         # This line does not change MLIR output at all - it's just for recording data movement
                                         B_up_proj_taps.append(B_up_proj_tile)
@@ -1080,7 +1084,7 @@ def my_matmul(
                                             ),
                                         )
                                         logging.debug(
-                                            f"        Placed B_Down input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages + 1}, 0), sizes: {B_down_proj_sizes}, strides: {B_down_proj_strides}"
+                                            f"        Placed B_Down input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages + 1}, 0), offset: {B_down_proj_col_offset}, sizes: {B_down_proj_sizes}, strides: {B_down_proj_strides}"
                                         )
                                         # These lines do not change MLIR output at all - they are just for recording data movement
                                         B_down_proj_taps.append(B_down_proj_tile)
