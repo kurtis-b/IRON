@@ -116,9 +116,7 @@ class AIEFFN(AIEOperatorBase):
         assert tile_k >= min_tile_k, f"tile_k ({tile_k}) must be >= {min_tile_k}"
         assert tile_n >= min_tile_n, f"tile_n ({tile_n}) must be >= {min_tile_n}"
 
-        file_name_tile_base = f"{prefix}{tile_m}x{tile_k}x{tile_n}"
-        file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{down_proj_depth}_{int(b_col_maj)}_{int(c_col_maj)}"
-        xclbin_kernel_name = f"ffn_{file_name_tile_base}"
+        file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{down_proj_depth}_{n_a_tiles_distributed}_{n_b_tiles_distributed}_{int(b_col_maj)}_{int(c_col_maj)}"
         kernel_flags_base = [
             "-DROUND_CONV_EVEN",
         ]

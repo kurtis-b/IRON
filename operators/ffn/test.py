@@ -21,6 +21,9 @@ def generate_test_params(extensive=False):
         params = [
             #   M,     K,     N,    num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n,   prio_accuracy, emulate_bf16, trace_size, down_proj_depth, n_a_tiles_distributed, n_b_tiles_distributed
             (64, 48, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            (64 * 4, 48, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            (64, 48, 96 * 4, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
             # (512, 768, 3072, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
             # (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 8, 8, 2),
         ]
@@ -102,6 +105,7 @@ def test_ffn(
     down_proj_depth,
     n_a_tiles_distributed,
     n_b_tiles_distributed,
+    aie_context,
 ):
     logging.debug(
         f"Testing GEMM with M={M}, K={K}, N={N}, m={m}, k={k}, n={n}, num_aie_columns={num_aie_columns}, b_col_maj={b_col_maj}, c_col_maj={c_col_maj}, prio_accuracy={prio_accuracy}, emulate_bf16={emulate_bf16}, down_proj_depth={down_proj_depth}, n_a_tiles_distributed={n_a_tiles_distributed}, n_b_tiles_distributed={n_b_tiles_distributed}"
@@ -132,6 +136,7 @@ def test_ffn(
         num_aie_columns=num_aie_columns,
         b_col_maj=b_col_maj,
         c_col_maj=c_col_maj,
+        context=aie_context,
         **aie_ffn_config,
     )
 
