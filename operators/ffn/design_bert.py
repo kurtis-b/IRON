@@ -749,7 +749,7 @@ def my_matmul(
                     core_fn_up_proj,
                     [
                         A_l2l1_fifos[a_tile].cons(),
-                        B_up_proj_l2l1_fifos[b_tile_offset].cons(),
+                        B_up_proj_l2l1_fifos[b_tile_offset + b_tile].cons(),
                         C_up_proj_l1l1_fifos[a_tile][b_tile].prod(),
                         zero_kernel_up_proj,
                         matmul_kernel_up_proj,
@@ -788,7 +788,7 @@ def my_matmul(
                     core_fn_down_proj,
                     [
                         C_up_proj_l1l1_fifos[a_tile][b_tile].cons(),
-                        B_down_proj_l2l1_fifos[b_tile_offset].cons(),
+                        B_down_proj_l2l1_fifos[b_tile_offset + b_tile].cons(),
                         C_down_proj_part_l2l1_fifos[a_tile][b_tile].cons(
                             depth=fifo_depth_out
                         ),
