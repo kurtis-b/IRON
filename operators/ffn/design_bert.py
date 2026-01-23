@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import argparse
 import sys
+import logging
 
 from aie.iron import (
     Kernel,
@@ -173,15 +174,8 @@ def my_matmul(
 
     mem_tile_m_A = m * n_a_tiles_distributed
     mem_tile_n = n * n_b_tiles_distributed
-    print(
-        "n_aie_cores_needed:",
-        n_aie_cores_needed,
-        "n_dup_shim_b_streams:",
-        n_dup_shim_b_streams,
-        "mem_tile_m_A:",
-        mem_tile_m_A,
-        "mem_tile_n:",
-        mem_tile_n,
+    logging.debug(
+        f"n_aie_cores_needed:{n_aie_cores_needed}, n_dup_shim_b_streams:{n_dup_shim_b_streams}, mem_tile_m_A:{mem_tile_m_A}, mem_tile_n:{mem_tile_n}"
     )
 
     if prio_accuracy:
@@ -420,8 +414,8 @@ def my_matmul(
     # AIE-array data movement with object fifos
     A_l3l2_fifos = [None] * n_a_tiles_distributed
     A_l2l1_fifos = [None] * n_a_tiles_distributed
-    print(
-        "Len A_l2l1_fifos:", len(A_l2l1_fifos), "len A_l3l2_fifos:", len(A_l3l2_fifos)
+    logging.debug(
+        f"Len A_l2l1_fifos: {len(A_l2l1_fifos)} len A_l3l2_fifos: {len(A_l3l2_fifos)}"
     )
 
     # The same data may be sent through different shim tiles depending on the num aie cols available and num b tiles to distribute to reduce routing distance
@@ -429,17 +423,8 @@ def my_matmul(
     B_up_proj_l2l1_fifos = [None] * (n_b_tiles_distributed * n_dup_shim_b_streams)
     B_down_proj_l3l2_fifos = [None] * (n_b_tiles_distributed * n_dup_shim_b_streams)
     B_down_proj_l2l1_fifos = [None] * (n_b_tiles_distributed * n_dup_shim_b_streams)
-    print(
-        "Len B_up_proj_l2l1_fifos:",
-        len(B_up_proj_l2l1_fifos),
-        "len B_up_proj_l3l2_fifos:",
-        len(B_up_proj_l3l2_fifos),
-        "len B_down_proj_l2l1_fifos:",
-        len(B_down_proj_l2l1_fifos),
-        "len B_down_proj_l3l2_fifos:",
-        len(B_down_proj_l3l2_fifos),
-        "len C_up_proj_l1l1_fifos:",
-        n_a_tiles_distributed * n_b_tiles_distributed,
+    logging.debug(
+        f"Len B_up_proj_l3l2_fifos: {len(B_up_proj_l3l2_fifos)}, Len B_up_proj_l2l1_fifos: {len(B_up_proj_l2l1_fifos)}, len B_up_proj_l3l2_fifos: {len(B_up_proj_l3l2_fifos)}, len B_down_proj_l2l1_fifos: {len(B_down_proj_l2l1_fifos)},"
     )
 
     # C tiles pipelined from up_proj core to down_proj core
@@ -454,13 +439,8 @@ def my_matmul(
     C_down_proj_part_l2l1_fifos = [
         [None] * n_b_tiles_distributed for _ in range(n_a_tiles_distributed)
     ]
-    print(
-        "len C_down_proj_part_l1l2_fifos:",
-        len(C_down_proj_part_l1l2_fifos),
-        "len C_down_proj_part_l2l1_fifos:",
-        len(C_down_proj_part_l2l1_fifos),
-        "len C_up_proj_l1l1_fifos:",
-        len(C_up_proj_l1l1_fifos),
+    logging.debug(
+        f"len C_up_proj_l1l1_fifos: {len(C_up_proj_l1l1_fifos)}, len C_down_proj_part_l1l2_fifos: {len(C_down_proj_part_l1l2_fifos)}, len C_down_proj_part_l2l1_fifos: {len(C_down_proj_part_l2l1_fifos)}"
     )
 
     # Output C tiles from down_proj core
@@ -469,13 +449,8 @@ def my_matmul(
     ]
     C_down_proj_out_l1l2_fifos = [None] * n_a_tiles_distributed
     C_down_proj_out_l2l3_fifos = [None] * n_a_tiles_distributed
-    print(
-        "len C_down_proj_out_l1l1_fifos:",
-        len(C_down_proj_out_l1l1_fifos),
-        "len C_down_proj_out_l1l2_fifos:",
-        len(C_down_proj_out_l1l2_fifos),
-        "len C_down_proj_out_l2l3_fifos:",
-        len(C_down_proj_out_l2l3_fifos),
+    logging.debug(
+        f"len C_down_proj_out_l1l1_fifos: {len(C_down_proj_out_l1l1_fifos)}, len C_down_proj_out_l1l2_fifos: {len(C_down_proj_out_l1l2_fifos)}, len C_down_proj_out_l2l3_fifos: {len(C_down_proj_out_l2l3_fifos)}"
     )
 
     # Runtime parameters
@@ -592,7 +567,7 @@ def my_matmul(
     # Down proj partial C
     for a_tile in range(n_a_tiles_distributed):
         for b_tile in range(n_b_tiles_distributed):
-            print(
+            logging.debug(
                 f"Placeing C_down_proj_part fifos at {(a_tile // n_b_tiles_distributed) * n_b_tiles_distributed + b_tile, 1}"
             )
             C_down_proj_part_l1l2_fifos[a_tile][b_tile] = ObjectFifo(
@@ -716,16 +691,16 @@ def my_matmul(
     ):
         # No need to pass in internal buffer here since that will be in MT and not in the core
         barrier.wait_for_value(1)
-        rtp_K_div_k = my_rtp[0]
-        rtp_n_c_col_tiles_per_core = my_rtp[1]
+        rtp_n_c_col_tiles_per_core = my_rtp[0]
+        rtp_down_proj_depth = my_rtp[1]
         # First iteration just passes the partial C tile through
-        for _ in range_(rtp_n_c_col_tiles_per_core):
+        for _ in range_(rtp_down_proj_depth):
             elem_acc_c = new_acc_c.acquire(1)
             zero(elem_acc_c)
             new_acc_c.release(1)
         for _ in range_(rtp_n_c_col_tiles_per_core):
             elem_in_a = in_a.acquire(1)
-            for _ in range_(rtp_K_div_k):
+            for _ in range_(rtp_down_proj_depth):
                 elem_out_internal = curr_acc_c.acquire(1)
                 elem_in_b = in_b.acquire(1)
                 elem_new_acc_c = new_acc_c.acquire(1)
@@ -734,7 +709,7 @@ def my_matmul(
                 in_b.release(1)
                 curr_acc_c.release(1)
             in_a.release(1)
-        for _ in range_(rtp_n_c_col_tiles_per_core):
+        for _ in range_(rtp_down_proj_depth):
             elem_out_acc_c = out_acc_c.acquire(1)
             elem_final_acc_c = curr_acc_c.acquire(1)
             if buffer_to_reduce:
@@ -756,7 +731,7 @@ def my_matmul(
             # i.e. each column can have 4 up_proj or 4 down_proj cores
             # Modulo 2 as a row offset for the duplicated design in the same columns
             tile_col, tile_row = core_tiles[b_tile + (a_tile % 2) * 2][a_tile // 2 * 2]
-            print(
+            logging.debug(
                 f"Placing a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at tile ({tile_col}, {tile_row}) for up projection"
             )
             acc_buffer_up_proj = None
@@ -799,7 +774,7 @@ def my_matmul(
             tile_col, tile_row = core_tiles[b_tile + (a_tile % 2) * 2][
                 a_tile // 2 * 2 + 1  # Add one since it's the first stage
             ]
-            print(
+            logging.debug(
                 f"Placing a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at tile ({tile_col}, {tile_row}) for down projection"
             )
             # The direction of reduction is always from left to right to avoid the
@@ -862,7 +837,7 @@ def my_matmul(
                     rtp_row_col[0] = K_div_k
                     rtp_row_col[1] = n_c_up_col_tiles_per_core * n_c_row_tiles_per_core
 
-        print(
+        logging.debug(
             f"Up proj RTPs: K_div_k={K_div_k}, n_c_up_col_tiles_per_core={n_c_up_col_tiles_per_core}, n_c_row_tiles_per_core={n_c_row_tiles_per_core}"
         )
 
@@ -871,11 +846,11 @@ def my_matmul(
         def set_rtps_down_proj(*args):
             for a_tile, rtps_row in enumerate(args):
                 for b_tile, rtp_row_col in enumerate(rtps_row):
-                    rtp_row_col[0] = n_c_up_col_tiles_per_core // down_proj_depth
-                    rtp_row_col[1] = K_div_k
+                    rtp_row_col[0] = n_c_up_col_tiles_per_core
+                    rtp_row_col[1] = down_proj_depth
 
-        print(
-            f"Down proj RTPs: n_c_up_col_tiles_per_core={n_c_up_col_tiles_per_core}, K_div_k={K_div_k}, down_proj_depth={down_proj_depth}"
+        logging.debug(
+            f"Down proj RTPs: n_c_up_col_tiles_per_core={n_c_up_col_tiles_per_core}, down_proj_depth={down_proj_depth}"
         )
 
         rt.inline_ops(set_rtps_down_proj, rtps_down_proj)
@@ -900,7 +875,7 @@ def my_matmul(
                         # For small input sizes, we may not even need a "pong" iteration
                         break
                     for a_tile in range(n_a_tiles_distributed):
-                        print(
+                        logging.debug(
                             f"Col group: {col_group}, TB: {tb}, PP: {pingpong}, A tile: {a_tile}"
                         )
                         # C Output Transfer:
@@ -945,11 +920,11 @@ def my_matmul(
                             task_group=tg,
                             placement=Tile(a_tile, 0),
                         )
-                        print(
+                        logging.debug(
                             f"    Placed C output transfer at ({a_tile}, 0), sizes: {C_sizes}, strides: {C_strides}"
                         )
                         for tile_row in range(current_tb_n_rows):
-                            print(f"    Tile row: {tile_row}")
+                            logging.debug(f"    Tile row: {tile_row}")
                             # A input transfer:
                             A_block_offset = (
                                 (row_base + tile_row) * n_a_tiles_distributed * m * K
@@ -981,7 +956,7 @@ def my_matmul(
                                     0,
                                 ),
                             )
-                            print(
+                            logging.debug(
                                 f"        Placed A input transfer at ({a_tile}, 0), sizes: {A_sizes}, strides: {A_strides}"
                             )
                             # This line does not change MLIR output at all - it's just for recording data movement
@@ -991,11 +966,11 @@ def my_matmul(
                         n_aie_cols // n_b_tiles_distributed // num_pipeline_stages
                     ):
                         b_tile_offset = duplicate_b_tile * n_b_tiles_distributed
-                        print(f"B tile offset: {b_tile_offset}")
+                        logging.debug(f"B tile offset: {b_tile_offset}")
                         for b_tile in range(n_b_tiles_distributed):
                             for stage in range(num_pipeline_stages):
                                 for tile_row in range(current_tb_n_rows):
-                                    print(
+                                    logging.debug(
                                         f"    B tile: {b_tile}, Stage: {stage}, Tile row: {tile_row}"
                                     )
                                     if stage == 0:
@@ -1050,7 +1025,7 @@ def my_matmul(
                                                 0,
                                             ),
                                         )
-                                        print(
+                                        logging.debug(
                                             f"        Placed B_Up input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages}, 0), sizes: {B_up_proj_sizes}, strides: {B_up_proj_strides}"
                                         )
                                         # This line does not change MLIR output at all - it's just for recording data movement
@@ -1104,7 +1079,7 @@ def my_matmul(
                                                 0,
                                             ),
                                         )
-                                        print(
+                                        logging.debug(
                                             f"        Placed B_Down input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages + 1}, 0), sizes: {B_down_proj_sizes}, strides: {B_down_proj_strides}"
                                         )
                                         # These lines do not change MLIR output at all - they are just for recording data movement
@@ -1130,11 +1105,11 @@ def my_matmul(
     for worker in workers:
         if worker is None:
             raise ValueError("Worker not properly created")
-        print(f"Worker {worker}")
+        logging.debug(f"Worker {worker}")
         for fifo in worker.fifos:
             if fifo is None:
                 raise ValueError("FIFO in worker not properly created")
-            print(f"    FIFO {fifo}")
+            logging.debug(f"    FIFO {fifo}")
             for ofe in fifo.all_of_endpoints():
                 if ofe is None:
                     raise ValueError(
