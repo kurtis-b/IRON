@@ -24,6 +24,7 @@ def generate_test_params(extensive=False):
             (64 * 4, 48, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
             (64, 48 * 4, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
             (64, 48, 96 * 4, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, False, True, 0, 4, 1, 1),
             # (512, 768, 3072, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
             # (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 8, 8, 2),
         ]
