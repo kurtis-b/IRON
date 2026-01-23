@@ -607,7 +607,6 @@ def my_matmul(
             C_down_proj_l1_ty,
             name=f"C_down_proj_out_L1L2_{a_tile}",
             depth=fifo_depth,
-            dims_to_stream=dims_to_stream,
         )
         C_down_proj_out_l2l3_fifos[a_tile] = (
             C_down_proj_out_l1l2_fifos[a_tile]
@@ -616,6 +615,7 @@ def my_matmul(
                 obj_type=C_l2_ty,
                 name=f"C_down_proj_out_L2L3_{a_tile}_{b_tile}",
                 depth=fifo_depth,
+                dims_to_stream=dims_to_stream,
                 placement=Tile(a_tile, 1),
             )
         )

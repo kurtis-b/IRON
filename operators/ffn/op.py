@@ -22,7 +22,13 @@ from operators.common.utils import torch_to_numpy, numpy_to_torch
 
 
 class AIEFFN(AIEOperatorBase):
-    """AIE-accelerated FFN block for BERT, which has an up-projection and down-projection with a GeLU in between"""
+    """
+    AIE-accelerated FFN block for BERT, which has an up-projection and down-projection with a GeLU in between.
+    The FFN block computes: C = GeLU(A @ B_Up) @ B_Down
+    where A is of shape (M, K), B_Up is of shape (K, N), B_Down is of shape (N, K), and C is of shape (M, K).
+    The operator supports static weights for B_Up and B_Down
+    The up-projection is fused with GeLU, and the output of this stage is pipelined to the down-projection.
+    """
 
     def __init__(
         self,
@@ -33,24 +39,25 @@ class AIEFFN(AIEOperatorBase):
         tile_m=64,
         tile_k=64,
         tile_n=64,
-        mt_count=1,
+        down_proj_depth=1,
         num_aie_columns=2,
+        context=None,
         **ffn_kwargs,
     ):
 
         self.tile_m = tile_m
         self.tile_k = tile_k
         self.tile_n = tile_n
-        self.mt_count = mt_count
+        self.down_proj_depth = down_proj_depth
         self.num_aie_columns = num_aie_columns
         self.n_aie_rows = 2
         self.ffn_args = ffn_kwargs
-        self.weight_up = (
+        self.weight_up_proj = (
             None
             if not use_static_weight
             else torch.zeros((K, N), dtype=torch.bfloat16).T
         )
-        self.weight_down = (
+        self.weight_down_proj = (
             None
             if not use_static_weight
             else torch.zeros((N, K), dtype=torch.bfloat16).T
@@ -69,7 +76,7 @@ class AIEFFN(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self)
+        AIEOperatorBase.__init__(self, context=context)
 
     def get_artifacts(self, prefix="ffn_"):
         # Get parameters from self
@@ -80,10 +87,10 @@ class AIEFFN(AIEOperatorBase):
         M = self.M
         K = self.K
         N = self.N
-        mt_count = self.mt_count
+        down_proj_depth = self.down_proj_depth
         num_aie_columns = self.num_aie_columns
-        base_dir = self.base_dir
-        device_str = self.device_manager.device_str()
+        base_dir = self.context.base_dir
+        device_str = self.context.device_manager.device_str()
 
         b_col_maj = self.ffn_args.get("b_col_maj", False)
         c_col_maj = self.ffn_args.get("c_col_maj", False)
@@ -95,6 +102,8 @@ class AIEFFN(AIEOperatorBase):
         prio_accuracy = self.ffn_args.get("prio_accuracy", False)
         use_scalar = self.ffn_args.get("use_scalar", False)
         round_conv_even = self.ffn_args.get("round_conv_even", True)
+        n_a_tiles_distributed = self.ffn_args.get("n_a_tiles_distributed", 1)
+        n_b_tiles_distributed = self.ffn_args.get("n_b_tiles_distributed", 1)
 
         if emulate_bf16_mmul_with_bfp16:
             min_tile_m, min_tile_k, min_tile_n = 8, 8, 8
@@ -103,11 +112,9 @@ class AIEFFN(AIEOperatorBase):
         assert tile_m >= min_tile_m, f"tile_m ({tile_m}) must be >= {min_tile_m}"
         assert tile_k >= min_tile_k, f"tile_k ({tile_k}) must be >= {min_tile_k}"
         assert tile_n >= min_tile_n, f"tile_n ({tile_n}) must be >= {min_tile_n}"
-        assert tile_k & (tile_k - 1) == 0, f"tile_k ({tile_k}) must be power of 2"
-        assert tile_n & (tile_n - 1) == 0, f"tile_n ({tile_n}) must be power of 2"
 
         file_name_tile_base = f"{prefix}{tile_m}x{tile_k}x{tile_n}"
-        file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{mt_count}_{int(b_col_maj)}_{int(c_col_maj)}"
+        file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{down_proj_depth}_{int(b_col_maj)}_{int(c_col_maj)}"
         xclbin_kernel_name = f"ffn_{file_name_tile_base}"
         kernel_flags_base = [
             "-DROUND_CONV_EVEN",
@@ -122,6 +129,7 @@ class AIEFFN(AIEOperatorBase):
             mm_down_proj_rename_symbols = {
                 "matmul_bf16_f32": "matmul_bf16_f32_down_proj",
                 "matmul_scalar_bf16_f32": "matmul_scalar_bf16_f32_down_proj",
+                "matmul_with_acc_bf16_f32": "matmul_with_acc_bf16_f32_down_proj",
                 "zero_f32": "zero_f32_down_proj",
                 "zero_scalar_f32": "zero_scalar_f32_down_proj",
             }
@@ -136,6 +144,7 @@ class AIEFFN(AIEOperatorBase):
             mm_down_proj_rename_symbols = {
                 "matmul_bf16_bf16": "matmul_bf16_bf16_down_proj",
                 "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_down_proj",
+                "matmul_with_acc_bf16_bf16": "matmul_with_acc_bf16_bf16_down_proj",
                 "zero_bf16": "zero_bf16_down_proj",
                 "zero_scalar_bf16": "zero_scalar_bf16_down_proj",
             }
@@ -157,6 +166,7 @@ class AIEFFN(AIEOperatorBase):
             f"-DDIM_M={tile_m}",
             f"-DDIM_K={tile_n}",
             f"-DDIM_N={tile_k}",
+            "-DGENERATE_MATMUL_WITH_ACC_KERNELS",
         ]
 
         kernel_archive = (
@@ -165,7 +175,7 @@ class AIEFFN(AIEOperatorBase):
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_total_base}.mlir",
-            import_path=operator_dir / "design.py",
+            import_path=operator_dir / "design_bert.py",
             callback_fn="my_matmul",
             callback_kwargs={
                 "dev": device_str,
@@ -175,7 +185,9 @@ class AIEFFN(AIEOperatorBase):
                 "m": tile_m,
                 "k": tile_k,
                 "n": tile_n,
-                # "c": mt_count,
+                "down_proj_depth": down_proj_depth,
+                "n_a_tiles_distributed": n_a_tiles_distributed,
+                "n_b_tiles_distributed": n_b_tiles_distributed,
                 "n_aie_cols": num_aie_columns,
                 "dtype_in_str": dtype_in,
                 "dtype_out_str": dtype_out,
@@ -272,7 +284,7 @@ class AIEFFN(AIEOperatorBase):
 
     def set_up_artifacts(self):
         # Describe required artifacts (xclbin, insts.bin)
-        device_str = self.device_manager.device_str()
+        device_str = self.context.device_manager.device_str()
         xclbin_artifact, insts_artifact = self.get_artifacts()
 
         self.xclbin_artifact = xclbin_artifact
@@ -284,16 +296,16 @@ class AIEFFN(AIEOperatorBase):
 
         # Describe runtime components
         # The static weights might not yet be loaded upon initialization; therefore, the provided self.static_weights field is a callback that provides the weights at set-up time.
-        static_weights_up = None
-        if self.weight_up is not None:
-            static_weights_up = self.weight_up.T
-            if isinstance(static_weights_up, torch.Tensor):
-                static_weights_up = torch_to_numpy(static_weights_up)
-        static_weights_down = None
-        if self.weight_down is not None:
-            static_weights_down = self.weight_down.T
-            if isinstance(static_weights_down, torch.Tensor):
-                static_weights_down = torch_to_numpy(static_weights_down)
+        static_weights_up_proj = None
+        if self.weight_up_proj is not None:
+            static_weights_up_proj = self.weight_up.T
+            if isinstance(static_weights_up_proj, torch.Tensor):
+                static_weights_up_proj = torch_to_numpy(static_weights_up_proj)
+        static_weights_down_proj = None
+        if self.weight_down_proj is not None:
+            static_weights_down_proj = self.weight_down.T
+            if isinstance(static_weights_down_proj, torch.Tensor):
+                static_weights_down_proj = torch_to_numpy(static_weights_down_proj)
         self.add_kernel(
             "ffn",
             self.xclbin_artifact,
@@ -301,8 +313,8 @@ class AIEFFN(AIEOperatorBase):
             self.insts_artifact,
         )
         self.add_buffer("A", self.M * self.K)
-        self.add_buffer("B_Up", self.K * self.N, static_data=static_weights_up)
-        self.add_buffer("B_Down", self.K * self.N, static_data=static_weights_down)
+        self.add_buffer("B_Up", self.K * self.N, static_data=static_weights_up_proj)
+        self.add_buffer("B_Down", self.K * self.N, static_data=static_weights_down_proj)
         self.add_buffer("C", self.M * self.N)
         self.add_to_runlist("ffn", "A", "B_Up", "B_Down", "C")
 
@@ -312,7 +324,7 @@ class AIEFFN(AIEOperatorBase):
         B_Down_shape = B_Down.shape if B_Down is not None else self.weight_down.T.shape
         expected_output_shape = A.shape
 
-        # Remove mt_count dimension, if any
+        # Remove down_proj_depth dimension, if any
         if len(A.shape) > 2:
             A = A.view(-1, A.shape[-1])
         if B_Up is not None and len(B_Up.shape) > 2:
