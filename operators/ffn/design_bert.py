@@ -50,7 +50,7 @@ def main():
     argparser.add_argument("-m", type=int, default=64)
     argparser.add_argument("-k", type=int, default=48)
     argparser.add_argument("-n", type=int, default=96)
-    argparser.add_argument("-down-proj-depth", type=int, default=1)
+    argparser.add_argument("--down-proj-depth", type=int, default=1)
     argparser.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=8)
     argparser.add_argument("--n-a-tiles-distributed", type=int, default=8)
     argparser.add_argument("--n-b-tiles-distributed", type=int, default=2)
@@ -150,21 +150,39 @@ def my_matmul(
     archive=None,
     generate_taps=False,
 ):
+    if n_aie_cols < 2:
+        raise AssertionError(
+            "n_aie_cols must be at least 2 due to 3 inputs (A, B_Up, B_Down)"
+        )
     # n_aie_cols will be used to determine whether to send the same data to through different shim tiles, while
     # n_b_tiles_distributed will be used to determine what data to send through which shim tiles
     # n_a_tiles_distributed replicates the pipelined design across the NPU array
     # There's 2 pipeline stages, and both use the same n_b_tiles_distributed parameter since the core fcn loops are the same
+    shim_dma_ch_per_col = 2
     num_pipeline_stages = 2  # Fused Up projection-GeLU and down projection stages
-    n_aie_cores = n_a_tiles_distributed * (
+    n_aie_cores_needed = n_a_tiles_distributed * (
         num_pipeline_stages * n_b_tiles_distributed
     )  # 2 stages with a separate B input for each stage
-    n_dup_b_streams = n_a_tiles_distributed // (n_aie_cols // num_pipeline_stages)
+    n_dup_shim_b_streams = (
+        n_aie_cols * shim_dma_ch_per_col - n_a_tiles_distributed
+    ) // (n_b_tiles_distributed * num_pipeline_stages)
+    a_tiles_per_b_stream = n_a_tiles_distributed // n_dup_shim_b_streams
 
     dtype_in = str_to_dtype(dtype_in_str)
     dtype_out = str_to_dtype(dtype_out_str)
 
     mem_tile_m_A = m * n_a_tiles_distributed
     mem_tile_n = n * n_b_tiles_distributed
+    print(
+        "n_aie_cores_needed:",
+        n_aie_cores_needed,
+        "n_dup_shim_b_streams:",
+        n_dup_shim_b_streams,
+        "mem_tile_m_A:",
+        mem_tile_m_A,
+        "mem_tile_n:",
+        mem_tile_n,
+    )
 
     if prio_accuracy:
         assert (
@@ -200,9 +218,9 @@ def my_matmul(
     # npu is a 4 row x 4 col array
     if dev == "npu" and n_aie_cols > 4:
         raise AssertionError("Invalid configuration: NPU (Phoenix/Hawk) has 4 columns")
-    if dev == "npu" and n_aie_cores > 16:
+    if dev == "npu" and n_aie_cores_needed > 16:
         raise AssertionError("Invalid configuration: NPU (Phoenix/Hawk) has 16 cores")
-    if dev == "npu" and n_aie_cores > n_aie_cols * 4:
+    if dev == "npu" and n_aie_cores_needed > n_aie_cols * 4:
         raise AssertionError(
             "Invalid configuration: NPU (Phoenix/Hawk) has 4 rows per column"
         )
@@ -211,11 +229,11 @@ def my_matmul(
         raise AssertionError(
             "Invalid configuration: NPU2 (Strix/Strix Halo/Krackan) has 8 columns"
         )
-    if dev == "npu2" and n_aie_cores > 32:
+    if dev == "npu2" and n_aie_cores_needed > 32:
         raise AssertionError(
             "Invalid configuration: NPU2 (Strix/Strix Halo/Krackan) has 32 cores"
         )
-    if dev == "npu2" and n_aie_cores > n_aie_cols * 4:
+    if dev == "npu2" and n_aie_cores_needed > n_aie_cols * 4:
         raise AssertionError(
             "Invalid configuration: NPU2 (Strix/Strix Halo/Krackan) has 4 rows per column"
         )
@@ -267,11 +285,11 @@ def my_matmul(
     fifo_depth = 2
 
     if dev == "npu":
-        if n_aie_cores <= 4:
+        if n_aie_cores_needed <= 4:
             dev_ty = NPU1Col1()
-        elif n_aie_cores <= 8:
+        elif n_aie_cores_needed <= 8:
             dev_ty = NPU1Col2()
-        elif n_aie_cores <= 16:
+        elif n_aie_cores_needed <= 16:
             dev_ty = NPU1()
     else:
         dev_ty = NPU2()
@@ -396,27 +414,32 @@ def my_matmul(
     )
 
     # Tile declarations as tile[row][col]
-    tiles = [
-        [(col, row) for col in range(0, n_a_tiles_distributed)] for row in range(0, 6)
-    ]
+    tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
     core_tiles = tiles[2:]
 
     # AIE-array data movement with object fifos
     A_l3l2_fifos = [None] * n_a_tiles_distributed
     A_l2l1_fifos = [None] * n_a_tiles_distributed
+    print(
+        "Len A_l2l1_fifos:", len(A_l2l1_fifos), "len A_l3l2_fifos:", len(A_l3l2_fifos)
+    )
 
     # The same data may be sent through different shim tiles depending on the num aie cols available and num b tiles to distribute to reduce routing distance
-    B_up_proj_l3l2_fifos = [None] * (
-        n_b_tiles_distributed * num_pipeline_stages * n_dup_b_streams
-    )
-    B_up_proj_l2l1_fifos = [None] * (
-        n_b_tiles_distributed * num_pipeline_stages * n_dup_b_streams
-    )
-    B_down_proj_l3l2_fifos = [None] * (
-        n_b_tiles_distributed * num_pipeline_stages * n_dup_b_streams
-    )
-    B_down_proj_l2l1_fifos = [None] * (
-        n_b_tiles_distributed * num_pipeline_stages * n_dup_b_streams
+    B_up_proj_l3l2_fifos = [None] * (n_b_tiles_distributed * n_dup_shim_b_streams)
+    B_up_proj_l2l1_fifos = [None] * (n_b_tiles_distributed * n_dup_shim_b_streams)
+    B_down_proj_l3l2_fifos = [None] * (n_b_tiles_distributed * n_dup_shim_b_streams)
+    B_down_proj_l2l1_fifos = [None] * (n_b_tiles_distributed * n_dup_shim_b_streams)
+    print(
+        "Len B_up_proj_l2l1_fifos:",
+        len(B_up_proj_l2l1_fifos),
+        "len B_up_proj_l3l2_fifos:",
+        len(B_up_proj_l3l2_fifos),
+        "len B_down_proj_l2l1_fifos:",
+        len(B_down_proj_l2l1_fifos),
+        "len B_down_proj_l3l2_fifos:",
+        len(B_down_proj_l3l2_fifos),
+        "len C_up_proj_l1l1_fifos:",
+        n_a_tiles_distributed * n_b_tiles_distributed,
     )
 
     # C tiles pipelined from up_proj core to down_proj core
@@ -431,6 +454,14 @@ def my_matmul(
     C_down_proj_part_l2l1_fifos = [
         [None] * n_b_tiles_distributed for _ in range(n_a_tiles_distributed)
     ]
+    print(
+        "len C_down_proj_part_l1l2_fifos:",
+        len(C_down_proj_part_l1l2_fifos),
+        "len C_down_proj_part_l2l1_fifos:",
+        len(C_down_proj_part_l2l1_fifos),
+        "len C_up_proj_l1l1_fifos:",
+        len(C_up_proj_l1l1_fifos),
+    )
 
     # Output C tiles from down_proj core
     C_down_proj_out_l1l1_fifos = [
@@ -438,6 +469,14 @@ def my_matmul(
     ]
     C_down_proj_out_l1l2_fifos = [None] * n_a_tiles_distributed
     C_down_proj_out_l2l3_fifos = [None] * n_a_tiles_distributed
+    print(
+        "len C_down_proj_out_l1l1_fifos:",
+        len(C_down_proj_out_l1l1_fifos),
+        "len C_down_proj_out_l1l2_fifos:",
+        len(C_down_proj_out_l1l2_fifos),
+        "len C_down_proj_out_l2l3_fifos:",
+        len(C_down_proj_out_l2l3_fifos),
+    )
 
     # Runtime parameters
     rtps_up_proj = [
@@ -498,7 +537,7 @@ def my_matmul(
         )
 
     # Input B_Up
-    for b_tile in range(n_b_tiles_distributed * num_pipeline_stages * n_dup_b_streams):
+    for b_tile in range(n_b_tiles_distributed * n_dup_shim_b_streams):
         B_up_proj_l3l2_fifos[b_tile] = ObjectFifo(
             B_l2_ty, name=f"B_up_proj_L3L2_{b_tile}", depth=fifo_depth
         )
@@ -520,7 +559,7 @@ def my_matmul(
         )
 
     # Input B_Down: n and k are swapped compared to B_Up
-    for b_tile in range(n_b_tiles_distributed * num_pipeline_stages * n_dup_b_streams):
+    for b_tile in range(n_b_tiles_distributed * n_dup_shim_b_streams):
         B_down_proj_l3l2_fifos[b_tile] = ObjectFifo(
             B_l2_ty, name=f"B_down_proj_L3L2_{b_tile}", depth=fifo_depth
         )
@@ -554,7 +593,7 @@ def my_matmul(
     for a_tile in range(n_a_tiles_distributed):
         for b_tile in range(n_b_tiles_distributed):
             print(
-                f"Placeing at {(a_tile // n_b_tiles_distributed) * n_b_tiles_distributed + b_tile, 1}"
+                f"Placeing C_down_proj_part fifos at {(a_tile // n_b_tiles_distributed) * n_b_tiles_distributed + b_tile, 1}"
             )
             C_down_proj_part_l1l2_fifos[a_tile][b_tile] = ObjectFifo(
                 (
@@ -684,9 +723,9 @@ def my_matmul(
             elem_acc_c = new_acc_c.acquire(1)
             zero(elem_acc_c)
             new_acc_c.release(1)
-        for _ in range_(rtp_K_div_k):
+        for _ in range_(rtp_n_c_col_tiles_per_core):
             elem_in_a = in_a.acquire(1)
-            for _ in range_(rtp_n_c_col_tiles_per_core):
+            for _ in range_(rtp_K_div_k):
                 elem_out_internal = curr_acc_c.acquire(1)
                 elem_in_b = in_b.acquire(1)
                 elem_new_acc_c = new_acc_c.acquire(1)
@@ -702,103 +741,107 @@ def my_matmul(
                 partial_acc_c = buffer_to_reduce.acquire(1)
                 add(partial_acc_c, elem_final_acc_c, elem_final_acc_c, m * k)
                 buffer_to_reduce.release(1)
-            copy(elem_final_acc_c, elem_out_acc_c, m * n)
+            copy(elem_final_acc_c, elem_out_acc_c, m * k)
             curr_acc_c.release(1)
             out_acc_c.release(1)
 
     # Set up compute tiles
     workers = []
-
+    # Up projection stage
+    for a_tile in range(n_a_tiles_distributed):
+        b_tile_offset = a_tile % a_tiles_per_b_stream
+        for b_tile in range(n_b_tiles_distributed):
+            # Calculate the tile placement (indexing by [row][col])
+            # Dividing by 2 since the design can be duplicated within the same 2 columns (4 rows each column),
+            # i.e. each column can have 4 up_proj or 4 down_proj cores
+            # Modulo 2 as a row offset for the duplicated design in the same columns
+            tile_col, tile_row = core_tiles[b_tile + (a_tile % 2) * 2][a_tile // 2 * 2]
+            print(
+                f"Placing a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at tile ({tile_col}, {tile_row}) for up projection"
+            )
+            acc_buffer_up_proj = None
+            if use_larger_internal_buffer:
+                acc_buffer_up_proj = Buffer(
+                    type=C_l1_ty_internal,
+                    name=f"acc_buffer_up_proj_{a_tile}_{b_tile}",
+                )
+            workers.append(
+                Worker(
+                    core_fn_up_proj,
+                    [
+                        A_l2l1_fifos[a_tile].cons(),
+                        B_up_proj_l2l1_fifos[b_tile_offset].cons(),
+                        C_up_proj_l1l1_fifos[a_tile][b_tile].prod(),
+                        zero_kernel_up_proj,
+                        matmul_kernel_up_proj,
+                        gelu_kernel,
+                        (
+                            convert_copy_kernel_up_proj
+                            if use_larger_internal_buffer
+                            else None
+                        ),
+                        rtps_up_proj[a_tile][b_tile],
+                        workerBarriersUpProj[a_tile][b_tile],
+                        acc_buffer_up_proj,
+                    ],
+                    placement=Tile(tile_col, tile_row),
+                    stack_size=0xD00,
+                )
+            )
+    # Down projection stage
     for a_tile in range(n_a_tiles_distributed):
         b_tile_offset = a_tile // num_pipeline_stages
-        for stage in range(num_pipeline_stages):
-            for b_tile in range(n_b_tiles_distributed):
-                # Calculate the tile placement
-                # Dividing by 2 since the design can be duplicated within the same 2 columns (4 rows each column),
-                # i.e. each column can have 4 up_proj or 4 down_proj cores
-                # Modulo 2 as a row offset for the duplicated design in the same columns
-                tile_col, tile_row = core_tiles[b_tile + (a_tile % 2) * 2][
-                    a_tile // 2 * 2 + stage
-                ]
-                print(
-                    f"Placing stage {stage} a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at tile ({tile_col}, {tile_row})"
+        for b_tile in range(n_b_tiles_distributed):
+            # Calculate the tile placement (indexing by [row][col])
+            # Dividing by 2 since the design can be duplicated within the same 2 columns (4 rows each column),
+            # i.e. each column can have 4 up_proj or 4 down_proj cores
+            # Modulo 2 as a row offset for the duplicated design in the same columns
+            tile_col, tile_row = core_tiles[b_tile + (a_tile % 2) * 2][
+                a_tile // 2 * 2 + 1  # Add one since it's the first stage
+            ]
+            print(
+                f"Placing a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at tile ({tile_col}, {tile_row}) for down projection"
+            )
+            # The direction of reduction is always from left to right to avoid the
+            # partial data for each core to be written in the same Data Memory
+            workers.append(
+                Worker(
+                    core_fn_down_proj,
+                    [
+                        C_up_proj_l1l1_fifos[a_tile][b_tile].cons(),
+                        B_down_proj_l2l1_fifos[b_tile_offset].cons(),
+                        C_down_proj_part_l2l1_fifos[a_tile][b_tile].cons(
+                            depth=fifo_depth_out
+                        ),
+                        C_down_proj_part_l1l2_fifos[a_tile][b_tile].prod(),
+                        (
+                            C_down_proj_out_l1l2_fifos[a_tile].prod()
+                            if b_tile == 0
+                            else C_down_proj_out_l1l1_fifos[a_tile][b_tile - 1].prod()
+                        ),
+                        zero_kernel_down_proj,
+                        matmul_kernel_down_proj,
+                        eltwise_add_vector,
+                        (
+                            convert_copy_kernel_down_proj
+                            if use_larger_internal_buffer
+                            else mem_copy_fcn
+                        ),
+                        rtps_down_proj[a_tile][b_tile],
+                        workerBarriersDownProj[a_tile][b_tile],
+                        (
+                            None
+                            if b_tile == n_b_tiles_distributed - 1
+                            else C_down_proj_out_l1l1_fifos[a_tile][b_tile].cons()
+                        ),
+                    ],
+                    placement=Tile(tile_col, tile_row),
+                    stack_size=0xD00,
                 )
-                if stage == 0:  # Up projection stage
-                    acc_buffer_up_proj = None
-                    if use_larger_internal_buffer:
-                        acc_buffer_up_proj = Buffer(
-                            type=C_l1_ty_internal,
-                            name=f"acc_buffer_up_proj_{a_tile}_{b_tile}",
-                        )
-                    workers.append(
-                        Worker(
-                            core_fn_up_proj,
-                            [
-                                A_l2l1_fifos[a_tile].cons(),
-                                B_up_proj_l2l1_fifos[b_tile_offset].cons(),
-                                C_up_proj_l1l1_fifos[a_tile][b_tile].prod(),
-                                zero_kernel_up_proj,
-                                matmul_kernel_up_proj,
-                                gelu_kernel,
-                                (
-                                    convert_copy_kernel_up_proj
-                                    if use_larger_internal_buffer
-                                    else None
-                                ),
-                                rtps_up_proj[a_tile][b_tile],
-                                workerBarriersUpProj[a_tile][b_tile],
-                                acc_buffer_up_proj,
-                            ],
-                            placement=Tile(tile_col, tile_row),
-                            stack_size=0xD00,
-                        )
-                    )
-                elif stage == 1:  # Down projection stage
-                    # The direction of reduction is always from left to right to avoid the
-                    # partial data for each core to be written in the same Data Memory
-                    workers.append(
-                        Worker(
-                            core_fn_down_proj,
-                            [
-                                C_up_proj_l1l1_fifos[a_tile][b_tile].cons(),
-                                B_down_proj_l2l1_fifos[b_tile_offset].cons(),
-                                C_down_proj_part_l2l1_fifos[a_tile][b_tile].cons(
-                                    depth=fifo_depth_out
-                                ),
-                                C_down_proj_part_l1l2_fifos[a_tile][b_tile].prod(),
-                                (
-                                    C_down_proj_out_l1l2_fifos[a_tile].prod()
-                                    if b_tile == 0
-                                    else C_down_proj_out_l1l1_fifos[a_tile][
-                                        b_tile - 1
-                                    ].prod()
-                                ),
-                                zero_kernel_down_proj,
-                                matmul_kernel_down_proj,
-                                eltwise_add_vector,
-                                (
-                                    convert_copy_kernel_down_proj
-                                    if use_larger_internal_buffer
-                                    else mem_copy_fcn
-                                ),
-                                rtps_down_proj[a_tile][b_tile],
-                                workerBarriersDownProj[a_tile][b_tile],
-                                (
-                                    None
-                                    if b_tile == n_b_tiles_distributed - 1
-                                    else C_down_proj_out_l1l1_fifos[a_tile][
-                                        b_tile
-                                    ].cons()
-                                ),
-                            ],
-                            placement=Tile(tile_col, tile_row),
-                            stack_size=0xD00,
-                        )
-                    )
+            )
 
     # Calculate RTP values for the reduction loop and total C tiles
     K_div_k = K // k
-    N_div_n = N // n
     n_c_up_col_tiles_per_core = N // mem_tile_n
     n_c_row_tiles_per_core = M // mem_tile_m_A
 
@@ -819,13 +862,21 @@ def my_matmul(
                     rtp_row_col[0] = K_div_k
                     rtp_row_col[1] = n_c_up_col_tiles_per_core * n_c_row_tiles_per_core
 
+        print(
+            f"Up proj RTPs: K_div_k={K_div_k}, n_c_up_col_tiles_per_core={n_c_up_col_tiles_per_core}, n_c_row_tiles_per_core={n_c_row_tiles_per_core}"
+        )
+
         rt.inline_ops(set_rtps_up_proj, rtps_up_proj)
 
         def set_rtps_down_proj(*args):
             for a_tile, rtps_row in enumerate(args):
                 for b_tile, rtp_row_col in enumerate(rtps_row):
-                    rtp_row_col[0] = n_c_up_col_tiles_per_core
-                    rtp_row_col[1] = K_div_k * n_c_row_tiles_per_core
+                    rtp_row_col[0] = n_c_up_col_tiles_per_core // down_proj_depth
+                    rtp_row_col[1] = K_div_k
+
+        print(
+            f"Down proj RTPs: n_c_up_col_tiles_per_core={n_c_up_col_tiles_per_core}, K_div_k={K_div_k}, down_proj_depth={down_proj_depth}"
+        )
 
         rt.inline_ops(set_rtps_down_proj, rtps_down_proj)
 
@@ -894,7 +945,9 @@ def my_matmul(
                             task_group=tg,
                             placement=Tile(a_tile, 0),
                         )
-                        print(f"    Placed C output transfer at ({a_tile}, 0)")
+                        print(
+                            f"    Placed C output transfer at ({a_tile}, 0), sizes: {C_sizes}, strides: {C_strides}"
+                        )
                         for tile_row in range(current_tb_n_rows):
                             print(f"    Tile row: {tile_row}")
                             # A input transfer:
@@ -928,7 +981,9 @@ def my_matmul(
                                     0,
                                 ),
                             )
-                            print(f"        Placed A input transfer at ({a_tile}, 0)")
+                            print(
+                                f"        Placed A input transfer at ({a_tile}, 0), sizes: {A_sizes}, strides: {A_strides}"
+                            )
                             # This line does not change MLIR output at all - it's just for recording data movement
                             A_taps.append(A_tile)
 
@@ -996,7 +1051,7 @@ def my_matmul(
                                             ),
                                         )
                                         print(
-                                            f"        Placed B_Up input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages}, 0)"
+                                            f"        Placed B_Up input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages}, 0), sizes: {B_up_proj_sizes}, strides: {B_up_proj_strides}"
                                         )
                                         # This line does not change MLIR output at all - it's just for recording data movement
                                         B_up_proj_taps.append(B_up_proj_tile)
@@ -1050,7 +1105,7 @@ def my_matmul(
                                             ),
                                         )
                                         print(
-                                            f"        Placed B_Down input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages + 1}, 0)"
+                                            f"        Placed B_Down input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages + 1}, 0), sizes: {B_down_proj_sizes}, strides: {B_down_proj_strides}"
                                         )
                                         # These lines do not change MLIR output at all - they are just for recording data movement
                                         B_down_proj_taps.append(B_down_proj_tile)

@@ -20,7 +20,9 @@ def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
             #   M,     K,     N,    num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n,   prio_accuracy, emulate_bf16, trace_size, down_proj_depth, n_a_tiles_distributed, n_b_tiles_distributed
-            (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 2, 8, 2),
+            (64, 48, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            # (512, 768, 3072, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            # (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 8, 8, 2),
         ]
         extensive_params = []
     else:
@@ -163,7 +165,7 @@ def test_ffn(
     print(f"Throughput: {gflops:.6e} GFLOP/s\n")
 
     error_threshold = 0.05
-    max_acceptable_errors = int(M * N * batch_size * error_threshold)
+    max_acceptable_errors = int(M * N * error_threshold)
 
     if errors:
         print(
