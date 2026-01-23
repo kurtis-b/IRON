@@ -166,13 +166,15 @@ def my_matmul(
     )  # 2 stages with a separate B input for each stage
     n_dup_shim_b_streams = (
         n_aie_cols * shim_dma_ch_per_col - n_a_tiles_distributed
-    ) // (n_b_tiles_distributed * num_pipeline_stages)
+    ) // (
+        n_b_tiles_distributed * num_pipeline_stages
+    )  # 1 means no duplication, 2 means each B stream is duplicated once through another shim DMA channel, etc.
     if n_dup_shim_b_streams < 1:
         raise AssertionError(
             f"Not enough AIE columns to distribute the A and B tiles needed (1 shim DMA channel * {n_a_tiles_distributed} for A and 1 shim DMA channel * {n_b_tiles_distributed} * {num_pipeline_stages} for B per pipeline stage)"
         )
-
-    a_tiles_per_b_stream = n_a_tiles_distributed // n_dup_shim_b_streams
+    elif n_dup_shim_b_streams > n_a_tiles_distributed:
+        n_dup_shim_b_streams = n_a_tiles_distributed
 
     dtype_in = str_to_dtype(dtype_in_str)
     dtype_out = str_to_dtype(dtype_out_str)
@@ -728,7 +730,7 @@ def my_matmul(
     workers = []
     # Up projection stage
     for a_tile in range(n_a_tiles_distributed):
-        b_tile_offset = a_tile % a_tiles_per_b_stream
+        b_tile_offset = a_tile // num_pipeline_stages
         for b_tile in range(n_b_tiles_distributed):
             # Calculate the tile placement (indexing by [row][col])
             # Dividing by 2 since the design can be duplicated within the same 2 columns (4 rows each column),
@@ -966,9 +968,7 @@ def my_matmul(
                             # This line does not change MLIR output at all - it's just for recording data movement
                             A_taps.append(A_tile)
 
-                    for duplicate_b_tile in range(
-                        n_aie_cols // n_b_tiles_distributed // num_pipeline_stages
-                    ):
+                    for duplicate_b_tile in range(n_dup_shim_b_streams):
                         b_tile_offset = duplicate_b_tile * n_b_tiles_distributed
                         logging.debug(f"B tile offset: {b_tile_offset}")
                         for b_tile in range(n_b_tiles_distributed):
