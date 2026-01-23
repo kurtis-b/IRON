@@ -20,13 +20,26 @@ def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
             #   M,     K,     N,    num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n,   prio_accuracy, emulate_bf16, trace_size, down_proj_depth, n_a_tiles_distributed, n_b_tiles_distributed
+            # baseline
             (64, 48, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            # M scaled up from baseline
             (64 * 4, 48, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            # K scaled up from baseline
             (64, 48 * 4, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            # N scaled up from baseline
             (64, 48, 96 * 4, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            # K scaled up with matching scaling with down_proj_depth (affects MT utilization)
             (64, 48 * 4, 96, 2, False, False, 64, 48, 96, False, True, 0, 4, 1, 1),
+            # M scaled up with mathing scaling with n_a_tiles_distributed (duplicates pipeline with more A streams)
             (64 * 4, 48, 96, 4, False, False, 64, 48, 96, False, True, 0, 1, 4, 1),
+            # N scaled up with matching scaling with n_b_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
             (64, 48, 96 * 4, 8, False, False, 64, 48, 96, False, True, 0, 1, 1, 4),
+            # BERT workload
+            (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            # (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 4, 1, 1),
+            # (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 8, 1, 1),
+            # (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 4, 1),
+            # (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 1, 2),
             # (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 8, 8, 2),
         ]
         extensive_params = []
