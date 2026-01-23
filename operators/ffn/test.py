@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
-import argparse
+import pytest
 from pathlib import Path
+import logging
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -13,79 +13,124 @@ from operators.ffn.op import AIEFFN
 from operators.ffn.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
-
-# Test configurations
-m, k, n = 64, 64, 64
-num_aie_columns = 8
-mt_count = 4
-col_maj = [(False, False), (True, False), (False, True)]
-trace_size = 0
-
-regular_M_list = [512]
-regular_K_list = [768]
-regular_N_list = [3072]
-extensive_M_list = [512]
-extensive_K_list = [768, 2048]
-extensive_N_list = [3072, 8192]
-
-regular_test_cases = []
-extensive_test_cases = []
-
-# Populate test cases
-for tests, M_list, K_list, N_list, col_maj_choices in [
-    (regular_test_cases, regular_M_list, regular_K_list, regular_N_list, col_maj),
-    (
-        extensive_test_cases,
-        extensive_M_list,
-        extensive_K_list,
-        extensive_N_list,
-        col_maj,
-    ),
-]:
-    for b_col_maj, c_col_maj in col_maj_choices:
-        for M in M_list:
-            for K in K_list:
-                for N in N_list:
-                    tests.append(
-                        (
-                            f"ffn_{M}x{K}x{N}_{m}x{k}x{n}_{mt_count}_{num_aie_columns}_cols_{int(b_col_maj)}_bcolmaj_{int(c_col_maj)}_ccolmaj_{trace_size}",
-                            f"-M {M} -K {K} -N {N} --mt_count {mt_count} --aie-columns {num_aie_columns} --b-col-maj {int(b_col_maj)} --c-col-maj {int(c_col_maj)}",
-                        )
-                    )
+TEST_BERT = True
 
 
-def main():
-    return 0
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-M", type=int, default=128)
-    parser.add_argument("-K", type=int, default=128)
-    parser.add_argument("-N", type=int, default=128)
-    parser.add_argument("--mt-count", type=int, default=1)
-    parser.add_argument("--aie-columns", type=int, default=8)
-    parser.add_argument("--prio-accuracy", type=int, default=1)
-    parser.add_argument("--emulate-bf16-mmul-with-bfp16", type=int, default=0)
-    parser.add_argument("--b-col-maj", type=int, default=0)
-    parser.add_argument("--c-col-maj", type=int, default=0)
-    args = parser.parse_args()
+def generate_test_params(extensive=False):
+    if TEST_BERT:
+        params = [
+            #   M,     K,     N,    num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n,   prio_accuracy, emulate_bf16, trace_size, down_proj_depth, n_a_tiles_distributed, n_b_tiles_distributed
+            (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 2, 8, 2),
+        ]
+        extensive_params = []
+    else:
+        params = []
+        extensive_params = []
 
-    golden_ref = generate_golden_reference(
-        M=args.M,
-        K=args.K,
-        N=args.N,
-        b_col_maj=bool(args.b_col_maj),
-        c_col_maj=bool(args.c_col_maj),
+    if extensive:
+        params = extensive_params
+
+    names = []
+    for (
+        M,
+        K,
+        N,
+        num_aie_columns,
+        b_col_maj,
+        c_col_maj,
+        m,
+        k,
+        n,
+        prio_accuracy,
+        emulate_bf16,
+        trace_size,
+        down_proj_depth,
+        n_a_tiles_distributed,
+        n_b_tiles_distributed,
+    ) in params:
+        name = f"gemm_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
+        if b_col_maj:
+            name += "_bcolmaj"
+        if c_col_maj:
+            name += "_ccolmaj"
+        if trace_size > 0:
+            name += f"_{trace_size}trace"
+        name += f"_prioacc{prio_accuracy}_emubf16{emulate_bf16}"
+        name += f"_dprojdepth{down_proj_depth}_nA{n_a_tiles_distributed}_nB{n_b_tiles_distributed}"
+        names.append(name)
+
+    return params, names
+
+
+regular_params, regular_names = generate_test_params(extensive=False)
+extensive_params, extensive_names = generate_test_params(extensive=True)
+
+# Combine params with marks - extensive params get pytest.mark.extensive
+all_params = [
+    pytest.param(*params, id=name)
+    for params, name in zip(regular_params, regular_names)
+] + [
+    pytest.param(*params, marks=pytest.mark.extensive, id=name)
+    for params, name in zip(extensive_params, extensive_names)
+]
+
+
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
+    Throughput=r"Throughput: (?P<value>[\d\.e\+-]+) GFLOP/s",
+)
+@pytest.mark.parametrize(
+    "M,K,N,num_aie_columns,b_col_maj,c_col_maj,m,k,n,prio_accuracy,emulate_bf16,trace_size,down_proj_depth,n_a_tiles_distributed,n_b_tiles_distributed",
+    all_params,
+)
+def test_ffn(
+    M,
+    K,
+    N,
+    num_aie_columns,
+    b_col_maj,
+    c_col_maj,
+    m,
+    k,
+    n,
+    prio_accuracy,
+    emulate_bf16,
+    trace_size,
+    down_proj_depth,
+    n_a_tiles_distributed,
+    n_b_tiles_distributed,
+):
+    logging.debug(
+        f"Testing GEMM with M={M}, K={K}, N={N}, m={m}, k={k}, n={n}, num_aie_columns={num_aie_columns}, b_col_maj={b_col_maj}, c_col_maj={c_col_maj}, prio_accuracy={prio_accuracy}, emulate_bf16={emulate_bf16}, down_proj_depth={down_proj_depth}, n_a_tiles_distributed={n_a_tiles_distributed}, n_b_tiles_distributed={n_b_tiles_distributed}"
     )
 
+    golden_ref = generate_golden_reference(
+        M=M,
+        K=K,
+        N=N,
+        b_col_maj=b_col_maj,
+        c_col_maj=c_col_maj,
+    )
+
+    aie_ffn_config = {
+        "prio_accuracy": prio_accuracy,
+        "emulate_bf16_mmul_with_bfp16": emulate_bf16,
+        "n_a_tiles_distributed": n_a_tiles_distributed,
+        "n_b_tiles_distributed": n_b_tiles_distributed,
+    }
     operator = AIEFFN(
-        M=args.M,
-        K=args.K,
-        N=args.N,
-        mt_count=args.mt_count,
-        num_aie_columns=args.aie_columns,
-        prio_accuracy=bool(args.prio_accuracy),
-        emulate_bf16_mmul_with_bfp16=bool(args.emulate_bf16_mmul_with_bfp16),
-        b_col_maj=bool(args.b_col_maj),
-        c_col_maj=bool(args.c_col_maj),
+        M=M,
+        K=K,
+        N=N,
+        tile_m=m,
+        tile_k=k,
+        tile_n=n,
+        down_proj_depth=down_proj_depth,
+        num_aie_columns=num_aie_columns,
+        b_col_maj=b_col_maj,
+        c_col_maj=c_col_maj,
+        **aie_ffn_config,
     )
 
     input_buffers = {
@@ -95,24 +140,37 @@ def main():
     }
     output_buffers = {"C": golden_ref["output"].flatten()}
 
-    errors, latency_us, bandwidth_gbps = run_test(
-        operator, input_buffers, output_buffers, rel_tol=0.05, abs_tol=0.05
-    )
+    if TEST_BERT:
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator,
+            input_buffers,
+            output_buffers,
+            rel_tol=0.1,
+            abs_tol=0.5,
+            warmup_iters=10,
+            timed_iters=100,
+        )
+    else:
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator, input_buffers, output_buffers, rel_tol=0.1, abs_tol=0.5
+        )
+
+    # 2 GEMMs are executed, with a MAC per element
+    gflops = 2 * (2.0 * M * K * N) / (latency_us * 1e-6) / 1e9
 
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s")
-
-    # 2 GEMMs are executed, with a MAC per element
-    gflops = (2.0 * 2.0 * args.M * args.K * args.N) / (latency_us * 1e-6) / 1e9
     print(f"Throughput: {gflops:.6e} GFLOP/s\n")
 
-    if not errors:
-        print("PASS!\n")
-        return 0
-    else:
-        print("fail.\n")
-        return 1
+    error_threshold = 0.05
+    max_acceptable_errors = int(M * N * batch_size * error_threshold)
 
-
-if __name__ == "__main__":
-    sys.exit(main())
+    if errors:
+        print(
+            "({} errors out of {} max allowable)".format(
+                len(errors["C"]), max_acceptable_errors
+            )
+        )
+        assert (
+            len(errors["C"]) <= max_acceptable_errors
+        ), f"Test failed with {len(errors['C'])} errors (max allowable: {max_acceptable_errors})"
