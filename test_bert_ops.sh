@@ -12,4 +12,5 @@ pytest operators/softmax/ --csv-output operators_softmax_results.csv --iteration
 pytest operators/layer_norm/ --csv-output operators_layer_norm_results.csv --iterations 1
 pytest operators/gelu/ --csv-output operators_gelu_results.csv --iterations 1
 pytest operators/encoder/ --csv-output operators_encoder_results.csv --iterations 1
+pytest operators/ffn/ --csv-output operators_ffn_results.csv --iterations 1
 cat operators*.csv > bert_operators_results.csv

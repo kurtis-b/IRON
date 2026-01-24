@@ -108,7 +108,7 @@ class AIEGEMM(AIEOperatorBase):
         assert tile_n >= min_tile_n, f"tile_n ({tile_n}) must be >= {min_tile_n}"
 
         file_name_tile_base = f"{prefix}{tile_m}x{tile_k}x{tile_n}"
-        file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
+        file_name_total_base = f"{prefix}{M}x{K}x{N}_{num_aie_columns}_{tile_m}x{tile_k}x{tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
         file_name_total_base += f"_batchA{self.batch_A[0]}d{self.batch_A[1]}_batchB{self.batch_B[0]}d{self.batch_B[1]}_batchC{self.batch_C[0]}d{self.batch_C[1]}"
         xclbin_kernel_name = f"gemm_{file_name_tile_base}"
         kernel_flags = [
