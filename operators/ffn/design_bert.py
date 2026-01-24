@@ -588,7 +588,7 @@ def my_matmul(
                     else C_down_proj_l1_ty
                 ),
                 name=f"C_down_proj_part_L1L2_{a_tile}_{b_tile}",
-                depth=fifo_depth_out,
+                depth=1,
             )
             C_down_proj_part_l2l1_fifos[a_tile][b_tile] = (
                 C_down_proj_part_l1l2_fifos[a_tile][b_tile]
@@ -754,14 +754,16 @@ def my_matmul(
                     curr_acc_c.release(1)
                 in_a.release(1)
             for _ in range_(rtp_down_proj_depth):
-                elem_out_acc_c = out_acc_c.acquire(1)
+                elem_out_acc_c = out_acc_c.acquire(
+                    1
+                )  # TODO: There might be a race condition with this objfifo since its depth is 1
                 elem_final_acc_c = curr_acc_c.acquire(1)
                 if buffer_to_reduce:
                     partial_acc_c = buffer_to_reduce.acquire(1)
                     add(partial_acc_c, elem_final_acc_c, elem_final_acc_c, m * k)
                     buffer_to_reduce.release(1)
-                copy(elem_final_acc_c, elem_out_acc_c, m * k)
                 curr_acc_c.release(1)
+                copy(elem_final_acc_c, elem_out_acc_c, m * k)
                 out_acc_c.release(1)
 
     # Set up compute tiles
@@ -836,9 +838,7 @@ def my_matmul(
                             * n_b_tiles_distributed
                             + b_tile
                         ].cons(),
-                        C_down_proj_part_l2l1_fifos[a_tile][b_tile].cons(
-                            depth=fifo_depth_out
-                        ),
+                        C_down_proj_part_l2l1_fifos[a_tile][b_tile].cons(depth=1),
                         C_down_proj_part_l1l2_fifos[a_tile][b_tile].prod(),
                         (
                             C_down_proj_out_l1l2_fifos[a_tile].prod()
