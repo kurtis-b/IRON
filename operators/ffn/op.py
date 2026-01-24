@@ -107,6 +107,9 @@ class AIEFFN(AIEOperatorBase):
         round_conv_even = self.ffn_args.get("round_conv_even", True)
         n_a_tiles_distributed = self.ffn_args.get("n_a_tiles_distributed", 1)
         n_b_tiles_distributed = self.ffn_args.get("n_b_tiles_distributed", 1)
+        stage_only = self.ffn_args.get(
+            "stage_only", None
+        )  # 0: up_proj only, 1: down_proj only, None: all
 
         if emulate_bf16_mmul_with_bfp16:
             min_tile_m, min_tile_k, min_tile_n = 8, 8, 8
@@ -116,7 +119,7 @@ class AIEFFN(AIEOperatorBase):
         assert tile_k >= min_tile_k, f"tile_k ({tile_k}) must be >= {min_tile_k}"
         assert tile_n >= min_tile_n, f"tile_n ({tile_n}) must be >= {min_tile_n}"
 
-        file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{down_proj_depth}_{n_a_tiles_distributed}_{n_b_tiles_distributed}_{int(b_col_maj)}_{int(c_col_maj)}"
+        file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{down_proj_depth}_{n_a_tiles_distributed}_{n_b_tiles_distributed}_{stage_only}_{int(b_col_maj)}_{int(c_col_maj)}"
         kernel_flags_base = [
             "-DROUND_CONV_EVEN",
         ]
@@ -198,6 +201,7 @@ class AIEFFN(AIEOperatorBase):
                 "emulate_bf16_mmul_with_bfp16": emulate_bf16_mmul_with_bfp16,
                 "prio_accuracy": prio_accuracy,
                 "trace_size": 0,
+                "stage_only": stage_only,
                 "archive": kernel_archive,
                 "generate_taps": False,
             },

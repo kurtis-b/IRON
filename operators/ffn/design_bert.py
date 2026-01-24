@@ -77,6 +77,7 @@ def main():
         default="bf16",
     )
     argparser.add_argument("--trace_size", type=int, default=0)
+    argparser.add_argument("--stage-only", type=int, choices=[0, 1], default=None)
     argparser.add_argument(
         "--generate-taps",
         action="store_true",
@@ -111,6 +112,7 @@ def main():
         args.emulate_bf16_mmul_with_bfp16,
         args.prio_accuracy,
         args.trace_size,
+        args.stage_only,
         args.archive,
         args.generate_taps,
     )
@@ -148,6 +150,7 @@ def my_matmul(
     emulate_bf16_mmul_with_bfp16,
     prio_accuracy,
     trace_size,
+    stage_only=None,
     archive=None,
     generate_taps=False,
 ):
@@ -653,6 +656,7 @@ def my_matmul(
         my_rtp,
         barrier,
         elem_out_internal,
+        stage_only,
     ):
         barrier.wait_for_value(1)
         rtp_K_div_k = my_rtp[0]
@@ -663,22 +667,30 @@ def my_matmul(
         for _ in loop:
             if not use_larger_internal_buffer:
                 elem_out_internal = out_c.acquire(1)
-            zero(elem_out_internal)
-
-            for _ in range_(rtp_K_div_k):
-                elem_in_a = in_a.acquire(1)
-                elem_in_b = in_b.acquire(1)
-                matmul(elem_in_a, elem_in_b, elem_out_internal)
-                in_a.release(1)
-                in_b.release(1)
-
-            if use_larger_internal_buffer:
-                elem_out_transfer = out_c.acquire(1)
-                convert_copy(elem_out_internal, elem_out_transfer, m * n)
-                # TODO: Not sure if the below will affect synchronization--maybe there needs to be two separate objfifos?
-                gelu(elem_out_transfer, elem_out_transfer, m * n)
+            # Check if up projection stage is enabled, None means all stages are enabled
+            if stage_only not in [0, None]:  # Skip computation for up projection stage
+                for _ in range_(rtp_K_div_k):
+                    elem_in_a = in_a.acquire(1)
+                    elem_in_b = in_b.acquire(1)
+                    in_a.release(1)
+                    in_b.release(1)
+                if use_larger_internal_buffer:
+                    elem_out_transfer = out_c.acquire(1)
                 out_c.release(1)
-            else:
+            else:  # Perform up projection stage computation
+                zero(elem_out_internal)
+                for _ in range_(rtp_K_div_k):
+                    elem_in_a = in_a.acquire(1)
+                    elem_in_b = in_b.acquire(1)
+                    matmul(elem_in_a, elem_in_b, elem_out_internal)
+                    in_a.release(1)
+                    in_b.release(1)
+
+                if use_larger_internal_buffer:
+                    elem_out_transfer = out_c.acquire(1)
+                    convert_copy(elem_out_internal, elem_out_transfer, m * n)
+                    # TODO: Not sure if the below will affect synchronization--maybe there needs to be two separate objfifos?
+                    gelu(elem_out_transfer, elem_out_transfer, m * n)
                 gelu(elem_out_internal, elem_out_internal, m * n)
                 out_c.release(1)
 
@@ -695,37 +707,62 @@ def my_matmul(
         my_rtp,
         barrier,
         buffer_to_reduce,
+        stage_only,
     ):
         # No need to pass in internal buffer here since that will be in MT and not in the core
         barrier.wait_for_value(1)
         rtp_n_c_col_tiles_per_core = my_rtp[0]
         rtp_down_proj_depth = my_rtp[1]
-        # First iteration just passes the partial C tile through
-        for _ in range_(rtp_down_proj_depth):
-            elem_acc_c = new_acc_c.acquire(1)
-            zero(elem_acc_c)
-            new_acc_c.release(1)
-        for _ in range_(rtp_n_c_col_tiles_per_core):
-            elem_in_a = in_a.acquire(1)
+        # Check if down projection stage is enabled, None means all stages are enabled
+        if stage_only not in [1, None]:  # Skip computation for down projection stage
             for _ in range_(rtp_down_proj_depth):
-                elem_out_internal = curr_acc_c.acquire(1)
-                elem_in_b = in_b.acquire(1)
-                elem_new_acc_c = new_acc_c.acquire(1)
-                matmul(elem_in_a, elem_in_b, elem_out_internal, elem_new_acc_c)
+                elem_acc_c = new_acc_c.acquire(1)
                 new_acc_c.release(1)
-                in_b.release(1)
+            for _ in range_(rtp_n_c_col_tiles_per_core):
+                elem_in_a = in_a.acquire(1)
+                for _ in range_(rtp_down_proj_depth):
+                    elem_out_internal = curr_acc_c.acquire(1)
+                    elem_in_b = in_b.acquire(1)
+                    elem_new_acc_c = new_acc_c.acquire(1)
+                    new_acc_c.release(1)
+                    in_b.release(1)
+                    curr_acc_c.release(1)
+                in_a.release(1)
+            for _ in range_(rtp_down_proj_depth):
+                elem_out_acc_c = out_acc_c.acquire(1)
+                elem_final_acc_c = curr_acc_c.acquire(1)
+                if buffer_to_reduce:
+                    partial_acc_c = buffer_to_reduce.acquire(1)
+                    buffer_to_reduce.release(1)
                 curr_acc_c.release(1)
-            in_a.release(1)
-        for _ in range_(rtp_down_proj_depth):
-            elem_out_acc_c = out_acc_c.acquire(1)
-            elem_final_acc_c = curr_acc_c.acquire(1)
-            if buffer_to_reduce:
-                partial_acc_c = buffer_to_reduce.acquire(1)
-                add(partial_acc_c, elem_final_acc_c, elem_final_acc_c, m * k)
-                buffer_to_reduce.release(1)
-            copy(elem_final_acc_c, elem_out_acc_c, m * k)
-            curr_acc_c.release(1)
-            out_acc_c.release(1)
+                out_acc_c.release(1)
+        else:  # Perform down projection stage computation
+            # First iteration just passes the partial C tile through
+            for _ in range_(rtp_down_proj_depth):
+                elem_acc_c = new_acc_c.acquire(1)
+                zero(elem_acc_c)
+                new_acc_c.release(1)
+            for _ in range_(rtp_n_c_col_tiles_per_core):
+                elem_in_a = in_a.acquire(1)
+                for _ in range_(rtp_down_proj_depth):
+                    elem_out_internal = curr_acc_c.acquire(1)
+                    elem_in_b = in_b.acquire(1)
+                    elem_new_acc_c = new_acc_c.acquire(1)
+                    matmul(elem_in_a, elem_in_b, elem_out_internal, elem_new_acc_c)
+                    new_acc_c.release(1)
+                    in_b.release(1)
+                    curr_acc_c.release(1)
+                in_a.release(1)
+            for _ in range_(rtp_down_proj_depth):
+                elem_out_acc_c = out_acc_c.acquire(1)
+                elem_final_acc_c = curr_acc_c.acquire(1)
+                if buffer_to_reduce:
+                    partial_acc_c = buffer_to_reduce.acquire(1)
+                    add(partial_acc_c, elem_final_acc_c, elem_final_acc_c, m * k)
+                    buffer_to_reduce.release(1)
+                copy(elem_final_acc_c, elem_out_acc_c, m * k)
+                curr_acc_c.release(1)
+                out_acc_c.release(1)
 
     # Set up compute tiles
     workers = []
@@ -776,6 +813,7 @@ def my_matmul(
                         rtps_up_proj[a_tile][b_tile],
                         workerBarriersUpProj[a_tile][b_tile],
                         acc_buffer_up_proj,
+                        stage_only,
                     ],
                     placement=Tile(tile_col, tile_row),
                     stack_size=0xD00,
@@ -822,6 +860,7 @@ def my_matmul(
                             if b_tile == n_b_tiles_distributed - 1
                             else C_down_proj_out_l1l1_fifos[a_tile][b_tile].cons()
                         ),
+                        stage_only,
                     ],
                     placement=Tile(tile_col + 1, tile_row),
                     stack_size=0xD00,

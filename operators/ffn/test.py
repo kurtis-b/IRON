@@ -19,31 +19,37 @@ TEST_BERT = True
 def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
-            #   M,     K,     N,    num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n,   prio_accuracy, emulate_bf16, trace_size, down_proj_depth, n_a_tiles_distributed, n_b_tiles_distributed
+            #   M,     K,     N,    num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n, trace_size, down_proj_depth, n_a_tiles_distributed, n_b_tiles_distributed, stage_only
             # baseline
-            (64, 48, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            (64, 48, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None),
             # M scaled up from baseline
-            (64 * 4, 48, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            (64 * 4, 48, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None),
             # K scaled up from baseline
-            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None),
             # N scaled up from baseline
-            (64, 48, 96 * 4, 2, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            (64, 48, 96 * 4, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None),
             # K scaled up with matching scaling with down_proj_depth (affects MT utilization)
-            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, False, True, 0, 4, 1, 1),
+            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, 0, 4, 1, 1, None),
             # M scaled up with mathing scaling with n_a_tiles_distributed (duplicates pipeline with more A streams)
-            (64 * 4, 48, 96, 4, False, False, 64, 48, 96, False, True, 0, 1, 4, 1),
+            (64 * 4, 48, 96, 4, False, False, 64, 48, 96, 0, 1, 4, 1, None),
             # N scaled up with matching scaling with n_b_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
-            (64, 48, 96 * 4, 8, False, False, 64, 48, 96, False, True, 0, 1, 1, 4),
+            (64, 48, 96 * 4, 8, False, False, 64, 48, 96, 0, 1, 1, 4, None),
             # BERT workload
-            (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 1, 1),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 1, 1, None),
             # Scaling within 4 columns (total cores utilized vary)
-            (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 4, 1, 1),
-            (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 8, 1, 1),
-            (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 4, 1),
-            (512, 768, 3072, 4, False, False, 64, 48, 96, False, True, 0, 1, 1, 2),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 4, 1, 1, None),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 8, 1, 1, None),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 4, 1, None),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 1, 2, None),
             # Scaling within 8 columns (total cores utilized vary)
-            (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 8, 8, 2),
-            (512, 768, 3072, 8, False, False, 64, 48, 96, False, True, 0, 8, 4, 4),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None),
+            # up_proj only
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 0),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 0),
+            # down_proj only
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 1),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 1),
         ]
         extensive_params = []
     else:
@@ -64,12 +70,11 @@ def generate_test_params(extensive=False):
         m,
         k,
         n,
-        prio_accuracy,
-        emulate_bf16,
         trace_size,
         down_proj_depth,
         n_a_tiles_distributed,
         n_b_tiles_distributed,
+        stage_only,
     ) in params:
         name = f"gemm_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
         if b_col_maj:
@@ -78,8 +83,9 @@ def generate_test_params(extensive=False):
             name += "_ccolmaj"
         if trace_size > 0:
             name += f"_{trace_size}trace"
-        name += f"_prioacc{prio_accuracy}_emubf16{emulate_bf16}"
         name += f"_dprojdepth{down_proj_depth}_nA{n_a_tiles_distributed}_nB{n_b_tiles_distributed}"
+        if stage_only is not None:
+            name += f"_stageonly{stage_only}"
         names.append(name)
 
     return params, names
@@ -104,7 +110,7 @@ all_params = [
     Throughput=r"Throughput: (?P<value>[\d\.e\+-]+) GFLOP/s",
 )
 @pytest.mark.parametrize(
-    "M,K,N,num_aie_columns,b_col_maj,c_col_maj,m,k,n,prio_accuracy,emulate_bf16,trace_size,down_proj_depth,n_a_tiles_distributed,n_b_tiles_distributed",
+    "M,K,N,num_aie_columns,b_col_maj,c_col_maj,m,k,n,trace_size,down_proj_depth,n_a_tiles_distributed,n_b_tiles_distributed,stage_only",
     all_params,
 )
 def test_ffn(
@@ -117,16 +123,15 @@ def test_ffn(
     m,
     k,
     n,
-    prio_accuracy,
-    emulate_bf16,
     trace_size,
     down_proj_depth,
     n_a_tiles_distributed,
     n_b_tiles_distributed,
+    stage_only,
     aie_context,
 ):
     logging.debug(
-        f"Testing GEMM with M={M}, K={K}, N={N}, m={m}, k={k}, n={n}, num_aie_columns={num_aie_columns}, b_col_maj={b_col_maj}, c_col_maj={c_col_maj}, prio_accuracy={prio_accuracy}, emulate_bf16={emulate_bf16}, down_proj_depth={down_proj_depth}, n_a_tiles_distributed={n_a_tiles_distributed}, n_b_tiles_distributed={n_b_tiles_distributed}"
+        f"Testing GEMM with M={M}, K={K}, N={N}, m={m}, k={k}, n={n}, num_aie_columns={num_aie_columns}, b_col_maj={b_col_maj}, c_col_maj={c_col_maj}, down_proj_depth={down_proj_depth}, n_a_tiles_distributed={n_a_tiles_distributed}, n_b_tiles_distributed={n_b_tiles_distributed}, stage_only={stage_only}"
     )
 
     golden_ref = generate_golden_reference(
@@ -138,10 +143,11 @@ def test_ffn(
     )
 
     aie_ffn_config = {
-        "prio_accuracy": prio_accuracy,
-        "emulate_bf16_mmul_with_bfp16": emulate_bf16,
+        "prio_accuracy": False,
+        "emulate_bf16_mmul_with_bfp16": True,
         "n_a_tiles_distributed": n_a_tiles_distributed,
         "n_b_tiles_distributed": n_b_tiles_distributed,
+        "stage_only": stage_only,
     }
     operator = AIEFFN(
         M=M,
@@ -190,7 +196,9 @@ def test_ffn(
     error_threshold = 0.05
     max_acceptable_errors = int(M * N * error_threshold)
 
-    if errors:
+    if (
+        errors and stage_only is None
+    ):  # If only one stage is performing the computation, skip error check since the output will always be wrong
         print(
             "({} errors out of {} max allowable)".format(
                 len(errors["C"]), max_acceptable_errors
