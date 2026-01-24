@@ -43,12 +43,16 @@ def generate_test_params(extensive=False):
             (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 1, 2, None),
             # Scaling within 8 columns (total cores utilized vary)
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, None),
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None),
             # up_proj only
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 0),
+            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, 0),
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 0),
             # down_proj only
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 1),
+            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, 1),
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 1),
         ]
         extensive_params = []
