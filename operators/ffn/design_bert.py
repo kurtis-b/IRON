@@ -664,16 +664,16 @@ def my_matmul(
                     curr_acc_c.release(1)
                 in_a.release(1)
             for _ in range_(rtp_down_proj_depth):
-                if buffer_to_reduce:
-                    elem_out_internal = curr_acc_c.acquire(1)
-                    elem_new_acc_c = new_acc_c.acquire(1)
-                    partial_acc_c = buffer_to_reduce.acquire(1)
-                    add(partial_acc_c, elem_out_internal, elem_new_acc_c, m * k)
-                    new_acc_c.release(1)
-                    buffer_to_reduce.release(1)
-                    curr_acc_c.release(1)
-                elem_out_acc_c = out_acc_c.acquire(1)
+                # Acquire what's in L2, which is the final accumulated result for the tile
                 elem_out_internal = curr_acc_c.acquire(1)
+                elem_out_acc_c = out_acc_c.acquire(1)
+                if buffer_to_reduce:
+                    # Don't send any new data to MT, i.e. new_acc_c, because that will affect
+                    # the data in the subsequent tiles. It's sufficient to just use
+                    # the internal buffer as input and output
+                    partial_acc_c = buffer_to_reduce.acquire(1)
+                    add(partial_acc_c, elem_out_internal, elem_out_internal, m * k)
+                    buffer_to_reduce.release(1)
                 copy(elem_out_internal, elem_out_acc_c, m * k)
                 curr_acc_c.release(1)
                 out_acc_c.release(1)
@@ -988,6 +988,8 @@ def my_matmul(
                                                 + col_group * k * N * down_proj_depth
                                             )
                                         )
+                                        # Notice how some of the sizes/strides are the same or similar
+                                        # to the ones in B_Up, but with accounting for the swapped n and k dimensions
                                         if not b_col_maj:
                                             B_down_proj_sizes = [
                                                 n_c_up_col_tiles_per_core,
@@ -995,7 +997,12 @@ def my_matmul(
                                                 n,
                                                 k,
                                             ]
-                                            B_down_proj_strides = [n * K, k, K, 1]
+                                            B_down_proj_strides = [
+                                                mem_tile_n * K,
+                                                k,
+                                                K,
+                                                1,
+                                            ]
                                         else:
                                             B_down_proj_sizes = [
                                                 n_c_up_col_tiles_per_core,
@@ -1003,7 +1010,12 @@ def my_matmul(
                                                 k,
                                                 n,
                                             ]
-                                            B_down_proj_strides = [n, k * N, N, 1]
+                                            B_down_proj_strides = [
+                                                mem_tile_n,
+                                                k * N,
+                                                N,
+                                                1,
+                                            ]
                                         B_down_proj_tile = TensorAccessPattern(
                                             (N, K) if not b_col_maj else (K, N),
                                             offset=B_down_proj_col_offset,
