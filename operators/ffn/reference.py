@@ -43,8 +43,6 @@ def generate_golden_reference(
     val_range = 4
     dtype_torch = torch_dtype_map[dtype]
 
-    debug_mode = True
-
     # Generate input tensor (M, K)
     if debug_mode:
         input_tensor = torch.arange(M * K, dtype=dtype_torch).reshape(M, K)
