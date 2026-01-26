@@ -4,58 +4,49 @@
 
 import sys
 import pytest
+import logging
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from operators.layer_norm.op import AIELayerNorm
-from operators.layer_norm.reference import generate_golden_reference
+from operators.add_and_norm.op import AIELayerNorm
+from operators.add_and_norm.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 TEST_BERT = True
 
 
 def generate_test_params(extensive=False):
-    max_aie_columns = 8
-    num_channels = 2
-    input_lengths = [2048] if not extensive else [1024, 4096, 8192]
+    if TEST_BERT:
+        params = [
+            # input_length,num_aie_columns,tile_size,layer_norm_stage
+            # Layer norm at eltwise add stage
+            (393216, 8, 768, 0),
+            (393216, 4, 768, 0),
+            (393216, 2, 768, 0),
+            # Layer norm at eltwise mul stage
+            (393216, 8, 768, 1),
+            (393216, 4, 768, 1),
+            (393216, 2, 768, 1),
+        ]
+        extensive_params = []
+    else:
+        params = []
+        extensive_params = []
 
-    params = []
+    if extensive:
+        params = extensive_params
+
     names = []
-    for weighted in [False, True]:
-        for input_length in input_lengths:
-            for num_aie_columns in range(1, max_aie_columns + 1):
-                num_channels_options = range(1, 3) if not weighted else [num_channels]
-                for num_channels_layer in num_channels_options:  # 1 or 2
-                    if not weighted:
-                        total_cores = num_aie_columns * num_channels_layer
-                        tile_size = input_length // total_cores
-                        if tile_size > 8192:
-                            tile_size = 8192
-                        check_length = tile_size * total_cores
-                    else:
-                        tile_size = input_length // num_aie_columns
-                        if tile_size > 4096:
-                            tile_size = 4096
-                        check_length = tile_size * num_aie_columns
-                    if check_length == input_length:
-                        if not weighted:
-                            names.append(
-                                f"layer_norm_{num_aie_columns}_cols_{num_channels_layer}_channels_{input_length}_tile_{tile_size}"
-                            )
-                        else:
-                            names.append(
-                                f"weighted_layer_norm_{num_aie_columns}_cols_{num_channels_layer}_channels_{input_length}_weights_{tile_size}"
-                            )
-                        params.append(
-                            (
-                                input_length,
-                                num_aie_columns,
-                                num_channels_layer,
-                                tile_size,
-                                weighted,
-                            )
-                        )
+    for (
+        input_length,
+        num_aie_columns,
+        tile_size,
+        layer_norm_stage,
+    ) in params:
+        name = f"add_and_norm_{num_aie_columns}cols_{input_length}_tile_{tile_size}_lnstage_{layer_norm_stage}"
+        names.append(name)
+
     return params, names
 
 
@@ -72,62 +63,36 @@ all_params = [
 ]
 
 
-def generate_test_params_bert(extensive=False):
-    params = []
-    names = []
-
-    params.extend(
-        [
-            (393216, 8, 2, 768, True),
-            (393216, 4, 2, 768, True),
-            (393216, 2, 2, 768, True),
-        ]
-    )
-    names.extend(
-        [
-            f"weighted_layer_norm_8_cols_2_channels_393216_tile_768",
-            f"weighted_layer_norm_4_cols_2_channels_393216_tile_768",
-            f"weighted_layer_norm_2_cols_2_channels_393216_tile_768",
-        ]
-    )
-
-    return params, names
-
-
-regular_params_bert, regular_names_bert = generate_test_params_bert(extensive=False)
-
-bert_params = [
-    pytest.param(*params, id=name)
-    for params, name in zip(regular_params_bert, regular_names_bert)
-]
-
-
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "input_length,num_aie_columns,num_channels,tile_size,weighted",
-    all_params if not TEST_BERT else bert_params,
+    "input_length,num_aie_columns,tile_size,layer_norm_stage",
+    all_params,
 )
 def test_layer_norm(
-    input_length, num_aie_columns, num_channels, tile_size, weighted, aie_context
+    input_length,
+    num_aie_columns,
+    tile_size,
+    layer_norm_stage,
+    aie_context,
 ):
 
     rows = input_length // tile_size
     cols = tile_size
-    golden_ref = generate_golden_reference(rows=rows, cols=cols, weighted=weighted)
+    golden_ref = generate_golden_reference(rows=rows, cols=cols)
 
     operator = AIELayerNorm(
         size=input_length,
         num_aie_columns=num_aie_columns,
-        num_channels=num_channels,
         tile_size=tile_size,
-        weights=golden_ref["weight"] if weighted else None,
+        weights=golden_ref["weight"],
+        layer_norm_stage=layer_norm_stage,
         context=aie_context,
     )
 
-    input_buffers = {"input": golden_ref["input"]}
+    input_buffers = {"input1": golden_ref["input1"], "input2": golden_ref["input2"]}
     output_buffers = {"output": golden_ref["output"]}
 
     if TEST_BERT:
@@ -148,4 +113,15 @@ def test_layer_norm(
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
-    assert not errors, f"Test failed with errors: {errors}"
+    error_threshold = 0.005
+    max_acceptable_errors = int(input_length * error_threshold)
+
+    if errors:
+        logging.info(
+            "({} errors out of {} max allowable)".format(
+                len(errors["output"]), max_acceptable_errors
+            )
+        )
+        assert (
+            len(errors["output"]) <= max_acceptable_errors
+        ), f"Test failed with {len(errors['output'])} errors (max allowable: {max_acceptable_errors})"

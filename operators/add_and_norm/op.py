@@ -27,9 +27,9 @@ class AIELayerNorm(AIEOperatorBase):
         self,
         size,
         num_aie_columns=None,
-        num_channels=None,
         tile_size=None,
         weights=None,
+        layer_norm_stage=0,
         trace_size=0,
         context=None,
     ):
@@ -40,72 +40,73 @@ class AIELayerNorm(AIEOperatorBase):
         self.tile_size = tile_size
         self.trace_size = trace_size
         self.num_aie_columns = num_aie_columns
-        self.num_channels = num_channels
 
-        total_shimdma_channels = self.num_aie_columns * self.num_channels
+        total_shimdma_channels = self.num_aie_columns
         assert total_shimdma_channels <= 16, "Conservative ShimDMA limit"
 
         self.xclbin_artifact = None
         self.insts_artifact = None
 
         self.weight = weights
+        self.layer_norm_stage = layer_norm_stage
 
         AIEOperatorBase.__init__(self, context=context)
 
     def get_artifacts(self, prefix="weighted_layer_norm_"):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
-        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
+        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.size}_{self.tile_size}t_lnstage_{self.layer_norm_stage}"
 
-        if self.weight is not None:
-            weight_file_name = (
-                self.context.build_dir / f"{file_name_base}_weights_{self.size}.npy"
-            )
-            np.save(weight_file_name, torch_to_numpy(self.weight))
-            mlir_artifact = PythonGeneratedMLIRArtifact.new(
-                f"{file_name_base}.mlir",
-                import_path=operator_dir / "design_weighted.py",
-                callback_fn="my_weighted_layer_norm",
-                callback_args=[
-                    self.context.device_manager.device_type,
-                    self.size,
-                    self.num_aie_columns,
-                    self.num_channels,
-                    self.tile_size,
-                    weight_file_name,
-                    0,
-                ],
-            )
-        else:
-            mlir_artifact = PythonGeneratedMLIRArtifact.new(
-                f"{file_name_base}.mlir",
-                import_path=operator_dir / "design.py",
-                callback_fn="my_layer_norm",
-                callback_args=[
-                    self.context.device_manager.device_type,
-                    self.size,
-                    self.num_aie_columns,
-                    self.num_channels,
-                    self.tile_size,
-                    0,
-                ],
-            )
+        # Save the weight weights to a npy file so that the design.py can load it at compile time
+        weight_file_name = (
+            self.context.build_dir / f"{file_name_base}_weights_{self.tile_size}.npy"
+        )
+        np.save(weight_file_name, torch_to_numpy(self.weight))
+
+        kernel_archive = f"{file_name_base}_layer_norm_archive.a"
+
+        mlir_artifact = PythonGeneratedMLIRArtifact.new(
+            f"{file_name_base}.mlir",
+            import_path=operator_dir / "design.py",
+            callback_fn="my_weighted_layer_norm",
+            callback_args=[
+                self.context.device_manager.device_type,
+                self.size,
+                self.num_aie_columns,
+                self.tile_size,
+                weight_file_name,
+                self.layer_norm_stage,
+                kernel_archive,
+                0,
+            ],
+        )
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
             depends=[
                 mlir_artifact,
                 KernelArchiveArtifact.new(
-                    f"layer_norm_archive.a",
+                    kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"layer_norm.o",
+                            f"{file_name_base}_layer_norm.o",
                             depends=[
                                 SourceArtifact.new(
                                     self.context.base_dir
                                     / "aie_kernels"
                                     / "aie2p"
                                     / "layer_norm.cc"
+                                )
+                            ],
+                        ),
+                        KernelObjectArtifact.new(
+                            f"{file_name_base}_add.o",
+                            depends=[
+                                SourceArtifact.new(
+                                    self.context.base_dir
+                                    / "aie_kernels"
+                                    / "generic"
+                                    / "add.cc"
                                 )
                             ],
                         ),
@@ -128,34 +129,74 @@ class AIELayerNorm(AIEOperatorBase):
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
-        self.add_buffer("input", self.size)
+        self.add_buffer("input1", self.size)
+        self.add_buffer("input2", self.size)
         self.add_buffer("output", self.size)
         self.add_kernel(
-            "eltwise_mul",
+            "add_and_norm",
             self.xclbin_artifact,
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_to_runlist("eltwise_mul", "input", "output")
+        self.add_to_runlist("add_and_norm", "input1", "input2", "output")
 
-    def forward(self, x, y=None):
-        if x.numel() > self.size:
+    def forward(self, x, y):
+        """Forward pass for element-wise addition"""
+        applicable = (
+            len(x.shape) >= 1
+            and len(y.shape) >= 1
+            and x.shape[-1] <= self.size
+            and y.shape[-1] <= self.size
+            and x.numel() <= self.size
+            and y.numel() <= self.size
+            and x.numel() == y.numel()
+            and x.shape == y.shape
+        )
+        if not applicable:
             raise AIEOperatorConstraintError(
-                "AIELayerNorm: input too large for configured size"
+                "AIEAddAndNorm: incompatible tensor shape(s)"
             )
 
+        # Always flatten to [batch, orig_size]
         original_shape = x.shape
-        x_flat = x.reshape(-1)
+        batch = x.shape[0] if x.dim() > 1 else 1
+        x_flat = x.reshape(batch, -1)
+        y_flat = y.reshape(batch, -1)
 
-        pad_len = self.size - x_flat.numel()
+        pad_len = self.size - x_flat.shape[1]
         if pad_len > 0:
             x_flat = torch.nn.functional.pad(x_flat, (0, pad_len))
+            y_flat = torch.nn.functional.pad(y_flat, (0, pad_len))
 
-        self.write_buffer("input", x_flat)
-        self.run_runlist()
-        result = self.read_buffer_as_torch("output", shape=(self.size,), dtype=bfloat16)
+        out = self._execute_aie_operation(x_flat, y_flat)
 
+        # Remove padding if added
+        numel = np.prod(original_shape)
         if pad_len > 0:
-            result = result[: x_flat.numel() - pad_len]
+            out = out.reshape(-1)[..., :numel]
+        # Restore original shape
+        out = out.reshape(*original_shape)
 
-        return result.reshape(*original_shape)
+        return out
+
+    def _execute_aie_operation(self, x, y):
+        """Execute element-wise addition operation on AIE hardware"""
+        # x, y are [batch, size]
+        batch = x.shape[0] if x.dim() > 1 else 1
+
+        # Flatten inputs for AIE processing
+        x_flat = x.view(-1)
+        y_flat = y.view(-1)
+
+        # Verify size matches expected
+        if len(x_flat) != self.size or len(y_flat) != self.size:
+            raise AIEOperatorConstraintError(
+                f"Input size x={len(x_flat)}, y={len(y_flat)} doesn't match configured size {self.size}"
+            )
+
+        self.write_buffer("input1", x_flat)
+        self.write_buffer("input2", y_flat)
+        self.run_runlist()
+        result = self.read_buffer_as_torch("output", shape=x_flat.shape, dtype=bfloat16)
+
+        return result

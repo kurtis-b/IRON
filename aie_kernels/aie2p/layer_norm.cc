@@ -107,10 +107,10 @@ void layer_norm_bf16_f32_calculation(const bfloat16 *restrict input, bfloat16 *r
     event1();
 }
 
+// Including eltwise multiply kernel here because it's necessary for layer norm
 template <typename T_in, typename T_out>
 void eltwise_vmul(T_in *a, T_in *b, T_out *c, int32_t cols, int32_t rows_to_process)
 {
-
     event0();
     for (int i = 0; i < cols; i += 16) {
         auto B = aie::load_v<16>(b + i);
