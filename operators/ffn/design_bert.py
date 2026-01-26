@@ -581,12 +581,12 @@ def my_matmul(
         for _ in loop:
             # Check if up projection stage is enabled, None means all stages are enabled
             if stage_only not in [0, None]:  # Skip computation for up projection stage
+                elem_out_matmul = out_c.acquire(1)
                 for _ in range_(rtp_K_div_k):
                     elem_in_a = in_a.acquire(1)
                     elem_in_b = in_b.acquire(1)
                     in_a.release(1)
                     in_b.release(1)
-                elem_out_matmul = out_c.acquire(1)
                 out_c.release(1)
             else:  # Perform up projection stage computation
                 elem_out_matmul = out_c.acquire(1)
@@ -597,7 +597,7 @@ def my_matmul(
                     matmul(elem_in_a, elem_in_b, elem_out_matmul)
                     in_a.release(1)
                     in_b.release(1)
-                gelu(elem_out_matmul, elem_out_matmul, m * n)
+                # gelu(elem_out_matmul, elem_out_matmul, m * n)
                 out_c.release(1)
 
     def core_fn_down_proj(
@@ -610,6 +610,7 @@ def my_matmul(
         matmul,
         add,
         copy,
+        gelu,
         my_rtp,
         barrier,
         buffer_to_reduce,
@@ -626,6 +627,7 @@ def my_matmul(
                 new_acc_c.release(1)
             for _ in range_(rtp_n_c_col_tiles_per_core):
                 elem_in_a = in_a.acquire(1)
+                gelu(elem_in_a, elem_in_a, m * n)
                 for _ in range_(rtp_down_proj_depth):
                     elem_out_internal = curr_acc_c.acquire(1)
                     elem_in_b = in_b.acquire(1)
@@ -744,6 +746,7 @@ def my_matmul(
                         matmul_kernel_down_proj,
                         eltwise_add_vector,
                         mem_copy_fcn,
+                        gelu_kernel,
                         rtps_down_proj[a_tile][b_tile],
                         workerBarriersDownProj[a_tile][b_tile],
                         (
