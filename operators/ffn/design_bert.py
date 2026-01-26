@@ -62,7 +62,13 @@ def main():
     argparser.add_argument(
         "--emulate-bf16-mmul-with-bfp16", action="store_true", default=True
     )
-    argparser.add_argument("--prio-accuracy", action="store_true", default=False)
+    argparser.add_argument(
+        "--gelu-stage",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Stage to insert the GeLU activation function: 0 for after up projection, 1 for after down projection",
+    )
     argparser.add_argument(
         "--archive",
         type=str,
@@ -77,7 +83,13 @@ def main():
         default="bf16",
     )
     argparser.add_argument("--trace_size", type=int, default=0)
-    argparser.add_argument("--stage-only", type=int, choices=[0, 1], default=None)
+    argparser.add_argument(
+        "--stage-only",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help="Compute enabled for 0: up_proj only, 1: down_proj only, None: all",
+    )
     argparser.add_argument(
         "--generate-taps",
         action="store_true",
@@ -111,6 +123,7 @@ def main():
         args.scalar,
         args.emulate_bf16_mmul_with_bfp16,
         args.trace_size,
+        arga.gelu_stage,
         args.stage_only,
         args.archive,
         args.generate_taps,
@@ -148,6 +161,7 @@ def my_matmul(
     use_scalar,
     emulate_bf16_mmul_with_bfp16,
     trace_size,
+    gelu_stage,
     stage_only=None,
     archive=None,
     generate_taps=False,
@@ -597,7 +611,8 @@ def my_matmul(
                     matmul(elem_in_a, elem_in_b, elem_out_matmul)
                     in_a.release(1)
                     in_b.release(1)
-                # gelu(elem_out_matmul, elem_out_matmul, m * n)
+                if gelu:
+                    gelu(elem_out_matmul, elem_out_matmul, m * n)
                 out_c.release(1)
 
     def core_fn_down_proj(
@@ -627,7 +642,6 @@ def my_matmul(
                 new_acc_c.release(1)
             for _ in range_(rtp_n_c_col_tiles_per_core):
                 elem_in_a = in_a.acquire(1)
-                gelu(elem_in_a, elem_in_a, m * n)
                 for _ in range_(rtp_down_proj_depth):
                     elem_out_internal = curr_acc_c.acquire(1)
                     elem_in_b = in_b.acquire(1)
@@ -652,6 +666,8 @@ def my_matmul(
                 new_acc_c.release(1)
             for _ in range_(rtp_n_c_col_tiles_per_core):
                 elem_in_a = in_a.acquire(1)
+                if gelu:
+                    gelu(elem_in_a, elem_in_a, m * n)
                 for _ in range_(rtp_down_proj_depth):
                     elem_in_b = in_b.acquire(1)
                     elem_out_internal = curr_acc_c.acquire(1)
@@ -709,7 +725,7 @@ def my_matmul(
                         C_up_proj_l1l1_fifos[a_tile][b_tile].prod(),
                         zero_kernel_up_proj,
                         matmul_kernel_up_proj,
-                        gelu_kernel,
+                        gelu_kernel if gelu_stage == 0 else None,
                         rtps_up_proj[a_tile][b_tile],
                         workerBarriersUpProj[a_tile][b_tile],
                         stage_only,
@@ -746,7 +762,7 @@ def my_matmul(
                         matmul_kernel_down_proj,
                         eltwise_add_vector,
                         mem_copy_fcn,
-                        gelu_kernel,
+                        gelu_kernel if gelu_stage == 1 else None,
                         rtps_down_proj[a_tile][b_tile],
                         workerBarriersDownProj[a_tile][b_tile],
                         (
