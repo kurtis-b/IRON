@@ -635,15 +635,11 @@ def my_matmul(
                     curr_acc_c.release(1)
                 in_a.release(1)
             for _ in range_(rtp_down_proj_depth):
-                if buffer_to_reduce:
-                    elem_out_internal = curr_acc_c.acquire(1)
-                    elem_new_acc_c = new_acc_c.acquire(1)
-                    partial_acc_c = buffer_to_reduce.acquire(1)
-                    new_acc_c.release(1)
-                    buffer_to_reduce.release(1)
-                    curr_acc_c.release(1)
                 elem_out_acc_c = out_acc_c.acquire(1)
                 elem_final_acc_c = curr_acc_c.acquire(1)
+                if buffer_to_reduce:
+                    partial_acc_c = buffer_to_reduce.acquire(1)
+                    buffer_to_reduce.release(1)
                 curr_acc_c.release(1)
                 out_acc_c.release(1)
         else:  # Perform down projection stage computation
@@ -833,7 +829,8 @@ def my_matmul(
                         )
                         if not c_col_maj:
                             C_row_offset = (
-                                (a_tile + row_base) * m * K
+                                row_base * m * n_a_tiles_distributed * K
+                                + a_tile * m * K
                             )  # base address for this transfer block for all BDs
                             C_offset = C_col_offset + C_row_offset
                             C_sizes = [
@@ -845,7 +842,7 @@ def my_matmul(
                             C_strides = [m * K * n_a_tiles_distributed, k, K, 1]
                         else:
                             C_row_offset = (
-                                (a_tile + row_base) * m * n_a_tiles_distributed
+                                row_base * m * n_a_tiles_distributed + a_tile * m
                             )  # base address for this transfer block for all BDs
                             C_offset = C_col_offset + C_row_offset
                             C_sizes = [down_proj_depth, n_a_tiles_distributed, k, m]
