@@ -43,17 +43,37 @@ def generate_test_params(extensive=False):
             (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 1, 2, None),
             # Scaling within 8 columns (total cores utilized vary)
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None),
-            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, None),
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, None),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, None),
             (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None),
             # up_proj only
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 0),
-            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, 0),
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 0),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, 0),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, 0),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, 0),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, 0),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, 0),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, 0),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, 0),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, 0),
             # down_proj only
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 1),
-            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, 1),
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 1),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, 1),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, 1),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, 1),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, 1),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, 1),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, 1),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, 1),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, 1),
         ]
         extensive_params = []
     else:
@@ -80,7 +100,7 @@ def generate_test_params(extensive=False):
         n_b_tiles_distributed,
         stage_only,
     ) in params:
-        name = f"gemm_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
+        name = f"ffn_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
         if b_col_maj:
             name += "_bcolmaj"
         if c_col_maj:
@@ -147,7 +167,8 @@ def test_ffn(
     )
 
     aie_ffn_config = {
-        "prio_accuracy": False,
+        "b_col_maj": b_col_maj,
+        "c_col_maj": c_col_maj,
         "emulate_bf16_mmul_with_bfp16": True,
         "n_a_tiles_distributed": n_a_tiles_distributed,
         "n_b_tiles_distributed": n_b_tiles_distributed,
@@ -162,8 +183,6 @@ def test_ffn(
         tile_n=n,
         down_proj_depth=down_proj_depth,
         num_aie_columns=num_aie_columns,
-        b_col_maj=b_col_maj,
-        c_col_maj=c_col_maj,
         context=aie_context,
         **aie_ffn_config,
     )
@@ -180,14 +199,14 @@ def test_ffn(
             operator,
             input_buffers,
             output_buffers,
-            rel_tol=0.1,
-            abs_tol=0.5,
+            rel_tol=4.0e-2,
+            abs_tol=1.5e-1,
             warmup_iters=10,
             timed_iters=100,
         )
     else:
         errors, latency_us, bandwidth_gbps = run_test(
-            operator, input_buffers, output_buffers, rel_tol=0.1, abs_tol=0.5
+            operator, input_buffers, output_buffers, rel_tol=4.0e-2, abs_tol=1.5e-1
         )
 
     # 2 GEMMs are executed, with a MAC per element
@@ -197,8 +216,8 @@ def test_ffn(
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s")
     print(f"Throughput: {gflops:.6e} GFLOP/s\n")
 
-    error_threshold = 0.05
-    max_acceptable_errors = int(M * N * error_threshold)
+    error_threshold = 0.005
+    max_acceptable_errors = int(M * K * error_threshold)
 
     if (
         errors and stage_only is None

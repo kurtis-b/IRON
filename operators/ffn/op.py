@@ -102,7 +102,6 @@ class AIEFFN(AIEOperatorBase):
         emulate_bf16_mmul_with_bfp16 = self.ffn_args.get(
             "emulate_bf16_mmul_with_bfp16", True
         )
-        prio_accuracy = self.ffn_args.get("prio_accuracy", False)
         use_scalar = self.ffn_args.get("use_scalar", False)
         round_conv_even = self.ffn_args.get("round_conv_even", True)
         n_a_tiles_distributed = self.ffn_args.get("n_a_tiles_distributed", 1)
@@ -120,39 +119,21 @@ class AIEFFN(AIEOperatorBase):
         assert tile_n >= min_tile_n, f"tile_n ({tile_n}) must be >= {min_tile_n}"
 
         file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{down_proj_depth}_{n_a_tiles_distributed}_{n_b_tiles_distributed}_{stage_only}_{int(b_col_maj)}_{int(c_col_maj)}"
-        kernel_flags_base = [
-            "-DROUND_CONV_EVEN",
-        ]
-        if prio_accuracy:
-            mm_up_proj_rename_symbols = {
-                "matmul_bf16_f32": "matmul_bf16_f32_up_proj",
-                "matmul_scalar_bf16_f32": "matmul_scalar_bf16_f32_up_proj",
-                "zero_f32": "zero_f32_up_proj",
-                "zero_scalar_f32": "zero_scalar_f32_up_proj",
-            }
-            mm_down_proj_rename_symbols = {
-                "matmul_bf16_f32": "matmul_bf16_f32_down_proj",
-                "matmul_scalar_bf16_f32": "matmul_scalar_bf16_f32_down_proj",
-                "matmul_with_acc_bf16_f32": "matmul_with_acc_bf16_f32_down_proj",
-                "zero_f32": "zero_f32_down_proj",
-                "zero_scalar_f32": "zero_scalar_f32_down_proj",
-            }
-            kernel_flags_base.append("-Dbf16_f32_ONLY")
-        else:
-            mm_up_proj_rename_symbols = {
-                "matmul_bf16_bf16": "matmul_bf16_bf16_up_proj",
-                "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_up_proj",
-                "zero_bf16": "zero_bf16_up_proj",
-                "zero_scalar_bf16": "zero_scalar_bf16_up_proj",
-            }
-            mm_down_proj_rename_symbols = {
-                "matmul_bf16_bf16": "matmul_bf16_bf16_down_proj",
-                "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_down_proj",
-                "matmul_with_acc_bf16_bf16": "matmul_with_acc_bf16_bf16_down_proj",
-                "zero_bf16": "zero_bf16_down_proj",
-                "zero_scalar_bf16": "zero_scalar_bf16_down_proj",
-            }
-            kernel_flags_base.append("-Dbf16_bf16_ONLY")
+        kernel_flags_base = []
+        mm_up_proj_rename_symbols = {
+            "matmul_bf16_bf16": "matmul_bf16_bf16_up_proj",
+            "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_up_proj",
+            "zero_bf16": "zero_bf16_up_proj",
+            "zero_scalar_bf16": "zero_scalar_bf16_up_proj",
+        }
+        mm_down_proj_rename_symbols = {
+            "matmul_bf16_bf16": "matmul_bf16_bf16_down_proj",
+            "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_down_proj",
+            "matmul_with_acc_bf16_bf16": "matmul_with_acc_bf16_bf16_down_proj",
+            "zero_bf16": "zero_bf16_down_proj",
+            "zero_scalar_bf16": "zero_scalar_bf16_down_proj",
+        }
+        kernel_flags_base.append("-Dbf16_bf16_ONLY")
         if round_conv_even:
             kernel_flags_base.append("-DROUND_CONV_EVEN")
         if emulate_bf16_mmul_with_bfp16:
@@ -199,7 +180,6 @@ class AIEFFN(AIEOperatorBase):
                 "c_col_maj": int(c_col_maj),
                 "use_scalar": use_scalar,
                 "emulate_bf16_mmul_with_bfp16": emulate_bf16_mmul_with_bfp16,
-                "prio_accuracy": prio_accuracy,
                 "trace_size": 0,
                 "stage_only": stage_only,
                 "archive": kernel_archive,
@@ -236,18 +216,7 @@ class AIEFFN(AIEOperatorBase):
                             rename_symbols=mm_down_proj_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
-                            "convert_copy.o",
-                            [
-                                SourceArtifact.new(
-                                    base_dir
-                                    / "aie_kernels"
-                                    / "generic"
-                                    / "convert_copy.cc"
-                                )
-                            ],
-                        ),
-                        KernelObjectArtifact.new(
-                            "add.o",
+                            f"add_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.o",
                             [
                                 SourceArtifact.new(
                                     base_dir / "aie_kernels" / "generic" / "add.cc"
@@ -255,7 +224,7 @@ class AIEFFN(AIEOperatorBase):
                             ],
                         ),
                         KernelObjectArtifact.new(
-                            "gelu.o",
+                            f"gelu_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.o",
                             [
                                 SourceArtifact.new(
                                     base_dir / "aie_kernels" / "aie2p" / "gelu.cc"
@@ -263,7 +232,7 @@ class AIEFFN(AIEOperatorBase):
                             ],
                         ),
                         KernelObjectArtifact.new(
-                            "passThrough.o",
+                            f"passThrough_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.o",
                             extra_flags=[
                                 "-DBIT_WIDTH=16",
                             ],

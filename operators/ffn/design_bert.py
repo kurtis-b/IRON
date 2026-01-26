@@ -110,7 +110,6 @@ def main():
         args.c_col_maj,
         args.scalar,
         args.emulate_bf16_mmul_with_bfp16,
-        args.prio_accuracy,
         args.trace_size,
         args.stage_only,
         args.archive,
@@ -148,7 +147,6 @@ def my_matmul(
     c_col_maj,
     use_scalar,
     emulate_bf16_mmul_with_bfp16,
-    prio_accuracy,
     trace_size,
     stage_only=None,
     archive=None,
@@ -187,23 +185,6 @@ def my_matmul(
     logging.debug(
         f"n_aie_cores_needed:{n_aie_cores_needed}, n_dup_shim_b_streams:{n_dup_shim_b_streams}, mem_tile_n:{mem_tile_n}"
     )
-
-    if prio_accuracy:
-        assert (
-            dtype_out_str == "bf16"
-        ), f"prio_accuracy flag is a feature only for bfloat16 output data types"
-        use_larger_internal_buffer = True
-        # If prio_accuracy flag is enabled, gemm for bfloat16 will accumulate in place with a f32 buffer,
-        # which will be converted to bf16 after the reduction loop finishes for output transfer to L2
-        dtype_out_internal = str_to_dtype("f32")
-        assert np.issubdtype(dtype_in, np.integer) == np.issubdtype(
-            dtype_out_internal, np.integer
-        ), f"Input dtype ({dtype_in}) and output dtype ({dtype_out_internal}) must either both be integral or both be float"
-        assert (
-            np.dtype(dtype_out_internal).itemsize >= np.dtype(dtype_in).itemsize
-        ), f"Output dtype ({dtype_out_internal}) must be equal or larger to input dtype ({dtype_in})"
-    else:
-        use_larger_internal_buffer = False
 
     assert np.issubdtype(dtype_in, np.integer) == np.issubdtype(
         dtype_out, np.integer
@@ -308,7 +289,7 @@ def my_matmul(
     # Define tensor types
     A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
     B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
-    C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
+    C_ty = np.ndarray[(M * K,), np.dtype[dtype_out]]
     A_l2_ty = np.ndarray[(m * k,), np.dtype[dtype_in]]
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
     C_l2_ty = np.ndarray[(m * k,), np.dtype[dtype_out]]
@@ -321,100 +302,47 @@ def my_matmul(
     # AIE Core Function declarations
     scalar_suffix = "_scalar" if use_scalar else ""
     archive_name = f"ffn_{m}x{k}x{n}_archive.a" if archive is None else archive
-    if use_larger_internal_buffer:
-        # Fix fifo depth for C objfifo to 1 since 1 buffer will be used for accumulation
-        # and another for transfer to L2
-        fifo_depth_out = 1
-        # f32 buffers are used for the kernels
-        # A kernel to convert from the internal f32 accumulation to bf16 for transfer to L2 is needed
-        # Up projection
-        matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_f32"
-        C_up_proj_l1_ty_internal = np.ndarray[(m, n), np.dtype[dtype_out_internal]]
-        convert_copy_kernel_up_proj = Kernel(
-            f"convert_copy_f32_to_bf16_up_proj",
-            archive_name,
-            [C_up_proj_l1_ty_internal, C_up_proj_l1_ty, np.int32],
-        )
-        zero_kernel_up_proj = Kernel(
-            f"zero{scalar_suffix}_f32_up_proj",
-            archive_name,
-            [C_up_proj_l1_ty_internal],
-        )
-        matmul_kernel_up_proj = Kernel(
-            matmul_func_name + "_up_proj",
-            archive_name,
-            [A_l1_ty, B_up_proj_l1_ty, C_up_proj_l1_ty_internal],
-        )
-        # Down projection
-        matmul_func_name = f"matmul_with_acc_{dtype_in_str}_f32"
-        C_down_proj_l1_ty_internal = np.ndarray[(m, k), np.dtype[dtype_out_internal]]
-        convert_copy_kernel_down_proj = Kernel(
-            f"convert_copy_f32_to_bf16_down_proj",
-            archive_name,
-            [C_down_proj_l1_ty_internal, C_down_proj_l1_ty, np.int32],
-        )
-        zero_kernel_down_proj = Kernel(
-            f"zero{scalar_suffix}_f32_down_proj",
-            archive_name,
-            [C_down_proj_l1_ty_internal],
-        )
-        matmul_kernel_down_proj = Kernel(
-            matmul_func_name + "_down_proj",
-            archive_name,
-            [C_up_proj_l1_ty_internal, B_down_proj_l1_ty, C_down_proj_l1_ty_internal],
-        )
-        eltwise_add_vector = Kernel(
-            "eltwise_add_f32_vector",
-            archive_name,
-            [
-                C_down_proj_l1_ty_internal,
-                C_down_proj_l1_ty_internal,
-                C_down_proj_l1_ty_internal,
-                np.int32,
-            ],
-        )
-    else:
-        # No need to use separate buffers for accumulation and transfer to L2, so
-        # we only need the zero and matmul kernels
-        fifo_depth_out = fifo_depth
-        # Up projection
-        matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
-        zero_kernel_up_proj = Kernel(
-            f"zero{scalar_suffix}_{dtype_out_str}_up_proj",
-            archive_name,
-            [C_up_proj_l1_ty],
-        )
-        matmul_kernel_up_proj = Kernel(
-            matmul_func_name + "_up_proj",
-            archive_name,
-            [A_l1_ty, B_up_proj_l1_ty, C_up_proj_l1_ty],
-        )
-        # Down projection
-        matmul_func_name = f"matmul_with_acc_{dtype_in_str}_{dtype_out_str}"
-        zero_kernel_down_proj = Kernel(
-            f"zero{scalar_suffix}_{dtype_out_str}_down_proj",
-            archive_name,
-            [C_down_proj_l1_ty],
-        )
-        matmul_kernel_down_proj = Kernel(
-            matmul_func_name + "_down_proj",
-            archive_name,
-            [C_up_proj_l1_ty, B_down_proj_l1_ty, C_down_proj_l1_ty, C_down_proj_l1_ty],
-        )
-        mem_copy_fcn = Kernel(
-            "passThroughLine",
-            archive_name,
-            [C_down_proj_l1_ty, C_down_proj_l1_ty, np.int32],
-        )
-        eltwise_add_vector = Kernel(
-            "eltwise_add_bf16_vector",
-            archive_name,
-            [C_down_proj_l1_ty, C_down_proj_l1_ty, C_down_proj_l1_ty, np.int32],
-        )
+    # No need to use separate buffers for accumulation and transfer to L2, so
+    # we only need the zero and matmul kernels
+    fifo_depth_out = fifo_depth
+    # Up projection
+    matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
+    zero_kernel_up_proj = Kernel(
+        f"zero{scalar_suffix}_{dtype_out_str}_up_proj",
+        archive_name,
+        [C_up_proj_l1_ty],
+    )
+    matmul_kernel_up_proj = Kernel(
+        matmul_func_name + "_up_proj",
+        archive_name,
+        [A_l1_ty, B_up_proj_l1_ty, C_up_proj_l1_ty],
+    )
     gelu_kernel = Kernel(
         "gelu_bf16",
         archive_name,
         [C_up_proj_l1_ty, C_up_proj_l1_ty, np.int32],
+    )
+    # Down projection
+    matmul_func_name = f"matmul_with_acc_{dtype_in_str}_{dtype_out_str}"
+    zero_kernel_down_proj = Kernel(
+        f"zero{scalar_suffix}_{dtype_out_str}_down_proj",
+        archive_name,
+        [C_down_proj_l1_ty],
+    )
+    matmul_kernel_down_proj = Kernel(
+        matmul_func_name + "_down_proj",
+        archive_name,
+        [C_up_proj_l1_ty, B_down_proj_l1_ty, C_down_proj_l1_ty, C_down_proj_l1_ty],
+    )
+    mem_copy_fcn = Kernel(
+        "passThroughLine",
+        archive_name,
+        [C_down_proj_l1_ty, C_down_proj_l1_ty, np.int32],
+    )
+    eltwise_add_vector = Kernel(
+        "eltwise_add_bf16_vector",
+        archive_name,
+        [C_down_proj_l1_ty, C_down_proj_l1_ty, C_down_proj_l1_ty, np.int32],
     )
 
     # Tile declarations as tile[row][col]
@@ -582,11 +510,7 @@ def my_matmul(
                 f"Placeing C_down_proj_part fifos at {(a_tile * n_b_tiles_distributed + b_tile) // 2, 1}"
             )
             C_down_proj_part_l1l2_fifos[a_tile][b_tile] = ObjectFifo(
-                (
-                    C_down_proj_l1_ty_internal
-                    if use_larger_internal_buffer
-                    else C_down_proj_l1_ty
-                ),
+                C_down_proj_l1_ty,
                 name=f"C_down_proj_part_L1L2_{a_tile}_{b_tile}",
                 depth=1,
             )
@@ -594,11 +518,7 @@ def my_matmul(
                 C_down_proj_part_l1l2_fifos[a_tile][b_tile]
                 .cons(depth=down_proj_depth)
                 .forward(
-                    obj_type=(
-                        C_down_proj_l1_ty_internal
-                        if use_larger_internal_buffer
-                        else C_down_proj_l1_ty
-                    ),
+                    obj_type=C_down_proj_l1_ty,
                     name=f"C_down_proj_part_L2L1_{b_tile}_{a_tile}",
                     depth=down_proj_depth,
                     placement=Tile(
@@ -612,11 +532,7 @@ def my_matmul(
     for a_tile in range(n_a_tiles_distributed):
         for b_tile in range(n_b_tiles_distributed - 1):
             C_down_proj_out_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
-                (
-                    C_down_proj_l1_ty_internal
-                    if use_larger_internal_buffer
-                    else C_down_proj_l1_ty
-                ),
+                C_down_proj_l1_ty,
                 name=f"C_down_proj_out_L1L1_{a_tile}_{b_tile}",
                 depth=fifo_depth_out,
             )
@@ -652,10 +568,8 @@ def my_matmul(
         zero,
         matmul,
         gelu,
-        convert_copy,
         my_rtp,
         barrier,
-        elem_out_internal,
         stage_only,
     ):
         barrier.wait_for_value(1)
@@ -665,8 +579,6 @@ def my_matmul(
         if rtp_n_tiles_per_core > 1:
             loop = range_(rtp_n_tiles_per_core)
         for _ in loop:
-            if not use_larger_internal_buffer:
-                elem_out_internal = out_c.acquire(1)
             # Check if up projection stage is enabled, None means all stages are enabled
             if stage_only not in [0, None]:  # Skip computation for up projection stage
                 for _ in range_(rtp_K_div_k):
@@ -674,24 +586,18 @@ def my_matmul(
                     elem_in_b = in_b.acquire(1)
                     in_a.release(1)
                     in_b.release(1)
-                if use_larger_internal_buffer:
-                    elem_out_transfer = out_c.acquire(1)
+                elem_out_matmul = out_c.acquire(1)
                 out_c.release(1)
             else:  # Perform up projection stage computation
-                zero(elem_out_internal)
+                elem_out_matmul = out_c.acquire(1)
+                zero(elem_out_matmul)
                 for _ in range_(rtp_K_div_k):
                     elem_in_a = in_a.acquire(1)
                     elem_in_b = in_b.acquire(1)
-                    matmul(elem_in_a, elem_in_b, elem_out_internal)
+                    matmul(elem_in_a, elem_in_b, elem_out_matmul)
                     in_a.release(1)
                     in_b.release(1)
-
-                if use_larger_internal_buffer:
-                    elem_out_transfer = out_c.acquire(1)
-                    convert_copy(elem_out_internal, elem_out_transfer, m * n)
-                    # TODO: Not sure if the below will affect synchronization--maybe there needs to be two separate objfifos?
-                    gelu(elem_out_transfer, elem_out_transfer, m * n)
-                gelu(elem_out_internal, elem_out_internal, m * n)
+                gelu(elem_out_matmul, elem_out_matmul, m * n)
                 out_c.release(1)
 
     def core_fn_down_proj(
@@ -729,11 +635,15 @@ def my_matmul(
                     curr_acc_c.release(1)
                 in_a.release(1)
             for _ in range_(rtp_down_proj_depth):
+                if buffer_to_reduce:
+                    elem_out_internal = curr_acc_c.acquire(1)
+                    elem_new_acc_c = new_acc_c.acquire(1)
+                    partial_acc_c = buffer_to_reduce.acquire(1)
+                    new_acc_c.release(1)
+                    buffer_to_reduce.release(1)
+                    curr_acc_c.release(1)
                 elem_out_acc_c = out_acc_c.acquire(1)
                 elem_final_acc_c = curr_acc_c.acquire(1)
-                if buffer_to_reduce:
-                    partial_acc_c = buffer_to_reduce.acquire(1)
-                    buffer_to_reduce.release(1)
                 curr_acc_c.release(1)
                 out_acc_c.release(1)
         else:  # Perform down projection stage computation
@@ -745,8 +655,8 @@ def my_matmul(
             for _ in range_(rtp_n_c_col_tiles_per_core):
                 elem_in_a = in_a.acquire(1)
                 for _ in range_(rtp_down_proj_depth):
-                    elem_out_internal = curr_acc_c.acquire(1)
                     elem_in_b = in_b.acquire(1)
+                    elem_out_internal = curr_acc_c.acquire(1)
                     elem_new_acc_c = new_acc_c.acquire(1)
                     matmul(elem_in_a, elem_in_b, elem_out_internal, elem_new_acc_c)
                     new_acc_c.release(1)
@@ -754,16 +664,18 @@ def my_matmul(
                     curr_acc_c.release(1)
                 in_a.release(1)
             for _ in range_(rtp_down_proj_depth):
-                elem_out_acc_c = out_acc_c.acquire(
-                    1
-                )  # TODO: There might be a race condition with this objfifo since its depth is 1
-                elem_final_acc_c = curr_acc_c.acquire(1)
                 if buffer_to_reduce:
+                    elem_out_internal = curr_acc_c.acquire(1)
+                    elem_new_acc_c = new_acc_c.acquire(1)
                     partial_acc_c = buffer_to_reduce.acquire(1)
-                    add(partial_acc_c, elem_final_acc_c, elem_final_acc_c, m * k)
+                    add(partial_acc_c, elem_out_internal, elem_new_acc_c, m * k)
+                    new_acc_c.release(1)
                     buffer_to_reduce.release(1)
+                    curr_acc_c.release(1)
+                elem_out_acc_c = out_acc_c.acquire(1)
+                elem_out_internal = curr_acc_c.acquire(1)
+                copy(elem_out_internal, elem_out_acc_c, m * k)
                 curr_acc_c.release(1)
-                copy(elem_final_acc_c, elem_out_acc_c, m * k)
                 out_acc_c.release(1)
 
     # Set up compute tiles
@@ -782,16 +694,9 @@ def my_matmul(
                 ((a_tile * n_b_tiles_distributed + b_tile) // cores_per_col)
                 * num_pipeline_stages
             ]
-            # tile_col, tile_row = core_tiles[b_tile + (a_tile % 2) * 2][a_tile // 2 * 2]
             logging.debug(
                 f"Placing up projection worker based on a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at tile ({tile_col}, {tile_row})"
             )
-            acc_buffer_up_proj = None
-            if use_larger_internal_buffer:
-                acc_buffer_up_proj = Buffer(
-                    type=C_l1_ty_internal,
-                    name=f"acc_buffer_up_proj_{a_tile}_{b_tile}",
-                )
             workers.append(
                 Worker(
                     core_fn_up_proj,
@@ -807,14 +712,8 @@ def my_matmul(
                         zero_kernel_up_proj,
                         matmul_kernel_up_proj,
                         gelu_kernel,
-                        (
-                            convert_copy_kernel_up_proj
-                            if use_larger_internal_buffer
-                            else None
-                        ),
                         rtps_up_proj[a_tile][b_tile],
                         workerBarriersUpProj[a_tile][b_tile],
-                        acc_buffer_up_proj,
                         stage_only,
                     ],
                     placement=Tile(tile_col, tile_row),
@@ -848,11 +747,7 @@ def my_matmul(
                         zero_kernel_down_proj,
                         matmul_kernel_down_proj,
                         eltwise_add_vector,
-                        (
-                            convert_copy_kernel_down_proj
-                            if use_larger_internal_buffer
-                            else mem_copy_fcn
-                        ),
+                        mem_copy_fcn,
                         rtps_down_proj[a_tile][b_tile],
                         workerBarriersDownProj[a_tile][b_tile],
                         (
@@ -973,7 +868,7 @@ def my_matmul(
                             placement=Tile(a_tile, 0),
                         )
                         logging.debug(
-                            f"    Placed C output transfer at ({a_tile}, 0), offset: {C_offset}, sizes: {C_sizes}, strides: {C_strides}"
+                            f"    Placed C output {a_tile} transfer at ({a_tile}, 0), offset: {C_offset}, sizes: {C_sizes}, strides: {C_strides}"
                         )
                         for tile_row in range(current_tb_n_rows):
                             logging.debug(f"    Tile row: {tile_row}")
@@ -1009,7 +904,7 @@ def my_matmul(
                                 ),
                             )
                             logging.debug(
-                                f"        Placed A input transfer at ({a_tile}, 0), offset: {A_offset}, sizes: {A_sizes}, strides: {A_strides}"
+                                f"        Placed A input {a_tile} transfer at ({a_tile}, 0), offset: {A_offset}, sizes: {A_sizes}, strides: {A_strides}"
                             )
                             # This line does not change MLIR output at all - it's just for recording data movement
                             A_taps.append(A_tile)
@@ -1076,7 +971,7 @@ def my_matmul(
                                             ),
                                         )
                                         logging.debug(
-                                            f"        Placed B_Up input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages}, 0), offset: {B_up_proj_col_offset}, sizes: {B_up_proj_sizes}, strides: {B_up_proj_strides}"
+                                            f"        Placed B_Up input {b_tile + b_tile_offset} transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages}, 0), offset: {B_up_proj_col_offset}, sizes: {B_up_proj_sizes}, strides: {B_up_proj_strides}"
                                         )
                                         # This line does not change MLIR output at all - it's just for recording data movement
                                         B_up_proj_taps.append(B_up_proj_tile)
@@ -1084,12 +979,12 @@ def my_matmul(
                                         # B_Down input transfer:
                                         B_down_proj_col_offset = (
                                             (
-                                                b_tile * k
+                                                b_tile * n * K
                                                 + col_group * k * down_proj_depth
                                             )
                                             if not b_col_maj
                                             else (
-                                                b_tile * k * N
+                                                b_tile * n
                                                 + col_group * k * N * down_proj_depth
                                             )
                                         )
@@ -1130,7 +1025,7 @@ def my_matmul(
                                             ),
                                         )
                                         logging.debug(
-                                            f"        Placed B_Down input transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages + 1}, 0), offset: {B_down_proj_col_offset}, sizes: {B_down_proj_sizes}, strides: {B_down_proj_strides}"
+                                            f"        Placed B_Down input {b_tile + b_tile_offset} transfer at ({(b_tile + b_tile_offset) * num_pipeline_stages + 1}, 0), offset: {B_down_proj_col_offset}, sizes: {B_down_proj_sizes}, strides: {B_down_proj_strides}"
                                         )
                                         # These lines do not change MLIR output at all - they are just for recording data movement
                                         B_down_proj_taps.append(B_down_proj_tile)
