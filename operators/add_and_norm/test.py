@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from operators.add_and_norm.op import AIELayerNorm
+from operators.add_and_norm.op import AIEAddAndNorm
 from operators.add_and_norm.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
@@ -83,7 +83,7 @@ def test_layer_norm(
     cols = tile_size
     golden_ref = generate_golden_reference(rows=rows, cols=cols)
 
-    operator = AIELayerNorm(
+    operator = AIEAddAndNorm(
         size=input_length,
         num_aie_columns=num_aie_columns,
         tile_size=tile_size,

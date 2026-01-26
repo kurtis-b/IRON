@@ -20,8 +20,8 @@ from operators.common import (
 from operators.common.utils import torch_to_numpy
 
 
-class AIELayerNorm(AIEOperatorBase):
-    """AIE-accelerated LAYER NORM operator"""
+class AIEAddAndNorm(AIEOperatorBase):
+    """AIE-accelerated ADD & LAYER NORM operator"""
 
     def __init__(
         self,
