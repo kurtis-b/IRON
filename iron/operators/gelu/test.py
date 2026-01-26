@@ -58,9 +58,18 @@ def generate_test_params_bert(extensive=False):
 
     params.extend(
         [
-            (1572864, 8, 2, 4096),
+            (1572864, 8, 2, 4096),  # e.g. 64x64 tiles
             (1572864, 4, 2, 4096),
             (1572864, 2, 2, 4096),
+            (1572864, 8, 2, 1024),  # e.g. 32x32 tiles
+            (1572864, 4, 2, 1024),
+            (1572864, 2, 2, 1024),
+            (1572864, 8, 2, 6144),  # e.g 64x96 tiles
+            (1572864, 4, 2, 6144),
+            (1572864, 2, 2, 6144),
+            (1572864, 8, 2, 1536),  # e.g. 32x48 tiles
+            (1572864, 4, 2, 1536),
+            (1572864, 2, 2, 1536),
         ]
     )
     names.extend(
@@ -68,6 +77,15 @@ def generate_test_params_bert(extensive=False):
             f"gelu_8_cols_2_channels_1572864_tile_4096",
             f"gelu_4_cols_2_channels_1572864_tile_4096",
             f"gelu_2_cols_2_channels_1572864_tile_4096",
+            f"gelu_8_cols_2_channels_1572864_tile_1024",
+            f"gelu_4_cols_2_channels_1572864_tile_1024",
+            f"gelu_2_cols_2_channels_1572864_tile_1024",
+            f"gelu_8_cols_2_channels_1572864_tile_6144",
+            f"gelu_4_cols_2_channels_1572864_tile_6144",
+            f"gelu_2_cols_2_channels_1572864_tile_6144",
+            f"gelu_8_cols_2_channels_1572864_tile_1536",
+            f"gelu_4_cols_2_channels_1572864_tile_1536",
+            f"gelu_2_cols_2_channels_1572864_tile_1536",
         ]
     )
 

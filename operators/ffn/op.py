@@ -109,6 +109,9 @@ class AIEFFN(AIEOperatorBase):
         stage_only = self.ffn_args.get(
             "stage_only", None
         )  # 0: up_proj only, 1: down_proj only, None: all
+        gelu_stage = self.ffn_args.get(
+            "gelu_stage", 1
+        )  # 0: after up_proj, 1: after down_proj
 
         if emulate_bf16_mmul_with_bfp16:
             min_tile_m, min_tile_k, min_tile_n = 8, 8, 8
@@ -118,7 +121,17 @@ class AIEFFN(AIEOperatorBase):
         assert tile_k >= min_tile_k, f"tile_k ({tile_k}) must be >= {min_tile_k}"
         assert tile_n >= min_tile_n, f"tile_n ({tile_n}) must be >= {min_tile_n}"
 
-        file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{down_proj_depth}_{n_a_tiles_distributed}_{n_b_tiles_distributed}_{stage_only}_{int(b_col_maj)}_{int(c_col_maj)}"
+        file_name_total_base = (
+            f"{prefix}{M}x{K}x{N}_"
+            f"{tile_m}x{tile_k}x{tile_n}_"
+            f"{down_proj_depth}_"
+            f"{n_a_tiles_distributed}_"
+            f"{n_b_tiles_distributed}_"
+            f"{stage_only}_"
+            f"{gelu_stage}_"
+            f"{int(b_col_maj)}_"
+            f"{int(c_col_maj)}"
+        )
         kernel_flags_base = []
         mm_up_proj_rename_symbols = {
             "matmul_bf16_bf16": "matmul_bf16_bf16_up_proj",
@@ -182,6 +195,7 @@ class AIEFFN(AIEOperatorBase):
                 "emulate_bf16_mmul_with_bfp16": emulate_bf16_mmul_with_bfp16,
                 "trace_size": 0,
                 "stage_only": stage_only,
+                "gelu_stage": gelu_stage,
                 "archive": kernel_archive,
                 "generate_taps": False,
             },

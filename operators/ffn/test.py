@@ -19,55 +19,105 @@ TEST_BERT = True
 def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
-            #   M,     K,     N,    num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n, trace_size, down_proj_depth, n_a_tiles_distributed, n_b_tiles_distributed, stage_only
+            #   M,     K,     N,    num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n, trace_size, down_proj_depth, n_a_tiles_distributed, n_b_tiles_distributed, stage_only, gelu_stage
+            # GeLU fused with up projection
             # baseline
-            (64, 48, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None),
+            (64, 48, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None, 0),
             # M scaled up from baseline
-            (64 * 4, 48, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None),
+            (64 * 4, 48, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None, 0),
             # K scaled up from baseline
-            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None),
+            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None, 0),
             # N scaled up from baseline
-            (64, 48, 96 * 4, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None),
+            (64, 48, 96 * 4, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None, 0),
             # K scaled up with matching scaling with down_proj_depth (affects MT utilization)
-            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, 0, 4, 1, 1, None),
+            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, 0, 4, 1, 1, None, 0),
             # M scaled up with mathing scaling with n_a_tiles_distributed (duplicates pipeline with more A streams)
-            (64 * 4, 48, 96, 4, False, False, 64, 48, 96, 0, 1, 4, 1, None),
+            (64 * 4, 48, 96, 4, False, False, 64, 48, 96, 0, 1, 4, 1, None, 0),
             # N scaled up with matching scaling with n_b_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
-            (64, 48, 96 * 4, 8, False, False, 64, 48, 96, 0, 1, 1, 4, None),
+            (64, 48, 96 * 4, 8, False, False, 64, 48, 96, 0, 1, 1, 4, None, 0),
             # BERT workload
-            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 1, 1, None),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 1, 1, None, 0),
             # Scaling within 4 columns (total cores utilized vary)
-            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 4, 1, 1, None),
-            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 8, 1, 1, None),
-            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 4, 1, None),
-            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 1, 2, None),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 4, 1, 1, None, 0),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 8, 1, 1, None, 0),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 4, 1, None, 0),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 1, 2, None, 0),
             # Scaling within 8 columns (total cores utilized vary)
-            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None),
-            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None),
-            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None),
-            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, None),
-            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, None),
-            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None),
-            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None),
-            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 0),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 0),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 0),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, None, 0),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, None, 0),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 0),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 0),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 0),
             # up_proj only
-            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 0),
-            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 0),
-            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, 0),
-            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, 0),
-            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, 0),
-            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, 0),
-            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, 0),
-            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, 0),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 0, 0),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 0, 0),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, 0, 0),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, 0, 0),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, 0, 0),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, 0, 0),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, 0, 0),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, 0, 0),
             # down_proj only
-            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 1),
-            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 1),
-            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, 1),
-            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, 1),
-            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, 1),
-            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, 1),
-            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, 1),
-            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, 1),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 1, 0),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 1, 0),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, 1, 0),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, 1, 0),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, 1, 0),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, 1, 0),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, 1, 0),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, 1, 0),
+            # GeLU fused with down projection
+            # baseline
+            (64, 48, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None, 1),
+            # M scaled up from baseline
+            (64 * 4, 48, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None, 1),
+            # K scaled up from baseline
+            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None, 1),
+            # N scaled up from baseline
+            (64, 48, 96 * 4, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None, 1),
+            # K scaled up with matching scaling with down_proj_depth (affects MT utilization)
+            (64, 48 * 4, 96, 2, False, False, 64, 48, 96, 0, 4, 1, 1, None, 1),
+            # M scaled up with mathing scaling with n_a_tiles_distributed (duplicates pipeline with more A streams)
+            (64 * 4, 48, 96, 4, False, False, 64, 48, 96, 0, 1, 4, 1, None, 1),
+            # N scaled up with matching scaling with n_b_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
+            (64, 48, 96 * 4, 8, False, False, 64, 48, 96, 0, 1, 1, 4, None, 1),
+            # BERT workload
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 1, 1, None, 1),
+            # Scaling within 4 columns (total cores utilized vary)
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 4, 1, 1, None, 1),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 8, 1, 1, None, 1),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 4, 1, None, 1),
+            (512, 768, 3072, 4, False, False, 64, 48, 96, 0, 1, 1, 2, None, 1),
+            # Scaling within 8 columns (total cores utilized vary)
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 1),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 1),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 1),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, None, 1),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, None, 1),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 1),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 1),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 1),
+            # up_proj only
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 0, 1),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 0, 1),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, 0, 1),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, 0, 1),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, 0, 1),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, 0, 1),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, 0, 1),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, 0, 1),
+            # down_proj only
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, 1, 1),
+            (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, 1, 1),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, 1, 1),
+            (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, 1, 1),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, 1, 1),
+            (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, 1, 1),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, 1, 1),
+            (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, 1, 1),
         ]
         extensive_params = []
     else:
@@ -93,6 +143,7 @@ def generate_test_params(extensive=False):
         n_a_tiles_distributed,
         n_b_tiles_distributed,
         stage_only,
+        gelu_stage,
     ) in params:
         name = f"ffn_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
         if b_col_maj:
@@ -104,6 +155,7 @@ def generate_test_params(extensive=False):
         name += f"_dprojdepth{down_proj_depth}_nA{n_a_tiles_distributed}_nB{n_b_tiles_distributed}"
         if stage_only is not None:
             name += f"_stageonly{stage_only}"
+        name += f"_gelustage{gelu_stage}"
         names.append(name)
 
     return params, names
@@ -128,7 +180,7 @@ all_params = [
     Throughput=r"Throughput: (?P<value>[\d\.e\+-]+) GFLOP/s",
 )
 @pytest.mark.parametrize(
-    "M,K,N,num_aie_columns,b_col_maj,c_col_maj,m,k,n,trace_size,down_proj_depth,n_a_tiles_distributed,n_b_tiles_distributed,stage_only",
+    "M,K,N,num_aie_columns,b_col_maj,c_col_maj,m,k,n,trace_size,down_proj_depth,n_a_tiles_distributed,n_b_tiles_distributed,stage_only,gelu_stage",
     all_params,
 )
 def test_ffn(
@@ -146,10 +198,16 @@ def test_ffn(
     n_a_tiles_distributed,
     n_b_tiles_distributed,
     stage_only,
+    gelu_stage,
     aie_context,
 ):
     logging.debug(
-        f"Testing GEMM with M={M}, K={K}, N={N}, m={m}, k={k}, n={n}, num_aie_columns={num_aie_columns}, b_col_maj={b_col_maj}, c_col_maj={c_col_maj}, down_proj_depth={down_proj_depth}, n_a_tiles_distributed={n_a_tiles_distributed}, n_b_tiles_distributed={n_b_tiles_distributed}, stage_only={stage_only}"
+        f"Testing GEMM with M={M}, K={K}, N={N}, m={m}, k={k}, n={n}, "
+        f"num_aie_columns={num_aie_columns}, b_col_maj={b_col_maj}, "
+        f"c_col_maj={c_col_maj}, down_proj_depth={down_proj_depth}, "
+        f"n_a_tiles_distributed={n_a_tiles_distributed}, "
+        f"n_b_tiles_distributed={n_b_tiles_distributed}, "
+        f"stage_only={stage_only}, gelu_stage={gelu_stage}"
     )
 
     golden_ref = generate_golden_reference(
@@ -167,6 +225,7 @@ def test_ffn(
         "n_a_tiles_distributed": n_a_tiles_distributed,
         "n_b_tiles_distributed": n_b_tiles_distributed,
         "stage_only": stage_only,
+        "gelu_stage": gelu_stage,
     }
     operator = AIEFFN(
         M=M,
