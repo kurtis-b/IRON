@@ -312,7 +312,9 @@ class AIEFFN(AIEOperatorBase):
     def forward(self, A, B_Up=None, B_Down=None):
         """Forward pass through FFN block: C = GeLU(A @ B_Up) @ B_Down"""
         B_Up_shape = B_Up.shape if B_Up is not None else self.weight_up_proj.T.shape
-        B_Down_shape = B_Down.shape if B_Down is not None else self.weight_down_proj.T.shape
+        B_Down_shape = (
+            B_Down.shape if B_Down is not None else self.weight_down_proj.T.shape
+        )
         expected_output_shape = A.shape
 
         # Remove down_proj_depth dimension, if any
@@ -415,7 +417,9 @@ class AIEFFN(AIEOperatorBase):
         """Execute FFN operation on AIE hardware"""
         M, K = A_np.shape
         K2, N = B_Up_np.shape if B_Up_np is not None else self.weight_up_proj.T.shape
-        N2, K3 = B_Down_np.shape if B_Down_np is not None else self.weight_down_proj.T.shape
+        N2, K3 = (
+            B_Down_np.shape if B_Down_np is not None else self.weight_down_proj.T.shape
+        )
 
         # If M is larger than kernel supports, split large GEMMs with many rows
         # into multiple invocations of the kernel. This is only supported for
