@@ -289,12 +289,12 @@ class AIEFFN(AIEOperatorBase):
         # The static weights might not yet be loaded upon initialization; therefore, the provided self.static_weights field is a callback that provides the weights at set-up time.
         static_weights_up_proj = None
         if self.weight_up_proj is not None:
-            static_weights_up_proj = self.weight_up.T
+            static_weights_up_proj = self.weight_up_proj.T
             if isinstance(static_weights_up_proj, torch.Tensor):
                 static_weights_up_proj = torch_to_numpy(static_weights_up_proj)
         static_weights_down_proj = None
         if self.weight_down_proj is not None:
-            static_weights_down_proj = self.weight_down.T
+            static_weights_down_proj = self.weight_down_proj.T
             if isinstance(static_weights_down_proj, torch.Tensor):
                 static_weights_down_proj = torch_to_numpy(static_weights_down_proj)
         self.add_kernel(
@@ -311,8 +311,8 @@ class AIEFFN(AIEOperatorBase):
 
     def forward(self, A, B_Up=None, B_Down=None):
         """Forward pass through FFN block: C = GeLU(A @ B_Up) @ B_Down"""
-        B_Up_shape = B_Up.shape if B_Up is not None else self.weight_up.T.shape
-        B_Down_shape = B_Down.shape if B_Down is not None else self.weight_down.T.shape
+        B_Up_shape = B_Up.shape if B_Up is not None else self.weight_up_proj.T.shape
+        B_Down_shape = B_Down.shape if B_Down is not None else self.weight_down_proj.T.shape
         expected_output_shape = A.shape
 
         # Remove down_proj_depth dimension, if any
@@ -414,8 +414,8 @@ class AIEFFN(AIEOperatorBase):
     def _execute_aie_operation(self, A_np, B_Up_np=None, B_Down_np=None):
         """Execute FFN operation on AIE hardware"""
         M, K = A_np.shape
-        K2, N = B_Up_np.shape if B_Up_np is not None else self.weight_up.T.shape
-        N2, K3 = B_Down.shape if B_Down is not None else self.weight_down.T.shape
+        K2, N = B_Up_np.shape if B_Up_np is not None else self.weight_up_proj.T.shape
+        N2, K3 = B_Down_np.shape if B_Down_np is not None else self.weight_down_proj.T.shape
 
         # If M is larger than kernel supports, split large GEMMs with many rows
         # into multiple invocations of the kernel. This is only supported for

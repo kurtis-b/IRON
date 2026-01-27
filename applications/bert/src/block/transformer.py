@@ -22,7 +22,7 @@
 import torch
 import torch.nn as nn
 from ..utils import assign
-from .feed_forward import BertIntermediate, BertOutput
+from .feed_forward import BertFeedForward
 from .mha import BertAttention
 from operators import AIEBERTEncoder
 
@@ -31,8 +31,7 @@ class BertLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attention = BertAttention(config)
-        self.intermediate = BertIntermediate(config)
-        self.output = BertOutput(config)
+        self.ffn = BertFeedForward(config)
 
     def forward(
         self,
@@ -41,9 +40,8 @@ class BertLayer(nn.Module):
     ) -> tuple[torch.Tensor]:
         self_attention_output, _ = self.attention(hidden_states, attention_mask)
         attention_output = self_attention_output
-        intermediate_output = self.intermediate(attention_output)
-        layer_output = self.output(intermediate_output, attention_output)
-        return layer_output
+        ffn_output = self.ffn(attention_output)
+        return ffn_output
 
 
 class BertEncoder(nn.Module):
@@ -58,6 +56,8 @@ class BertEncoder(nn.Module):
             config.aie_config.use_aie_elementwise_add == True,
             config.aie_config.use_aie_elementwise_mul == True,
             config.aie_config.use_aie_transpose == True,
+            config.aie_config.use_aie_ffn == True,
+            config.aie_config.use_aie_addandnorm == True,
         ]
         assert (
             self.config.aie_config.use_aie_bert_encoder
@@ -161,7 +161,7 @@ class BertEncoder(nn.Module):
                         f"bert.encoder.layer.{l}.attention.self.value.bias"
                     ].to(self.config.aie_config.dtype),
                 )
-                self.layer[l].intermediate.assign_weights(
+                self.layer[l].ffn.assign_weights(
                     l,
                     combined_weights[
                         f"bert.encoder.layer.{l}.intermediate.dense.weight"
@@ -169,9 +169,6 @@ class BertEncoder(nn.Module):
                     combined_weights[
                         f"bert.encoder.layer.{l}.intermediate.dense.bias"
                     ].to(self.config.aie_config.dtype),
-                )
-                self.layer[l].output.assign_weights(
-                    l,
                     combined_weights[f"bert.encoder.layer.{l}.output.dense.weight"].to(
                         self.config.aie_config.dtype
                     ),

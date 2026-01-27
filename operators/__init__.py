@@ -23,3 +23,5 @@ from .swiglu_prefill.op import AIESwiGLUPrefill
 from .tanh.op import AIETanh
 from .transpose.op import AIETranspose
 from .encoder.op import AIEBERTEncoder
+from .ffn.op import AIEFFN
+from .add_and_norm.op import AIEAddAndNorm
