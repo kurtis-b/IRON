@@ -136,7 +136,9 @@ class BertFeedForward(nn.Module):
                 )
             self.use_aie_elementwise_add = config.aie_config.use_aie_elementwise_add
             if self.use_aie_elementwise_add:
-                eltwise_add_tile_size = (seq_len * config.model_config.hidden_size) // 16
+                eltwise_add_tile_size = (
+                    seq_len * config.model_config.hidden_size
+                ) // 16
                 self.aie_elementwise_add = AIEElementwiseAdd(
                     size=seq_len * config.model_config.hidden_size,
                     num_aie_columns=8,
