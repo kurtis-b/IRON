@@ -26,12 +26,13 @@ class AIEContext:
         self.use_runlist = use_runlist
         self._runtime_prepared = False
 
-    def register_operator(self, operator):
+    def register_operator(self, operator, skip_add_to_list=False):
         """Register an operator with this context"""
         if self._runtime_prepared:
             raise RuntimeError("Cannot register operators after runtime is prepared")
         operator.context = self
-        self.operators.append(operator)
+        if not skip_add_to_list:
+            self.operators.append(operator)
 
     def compile_all(self):
         """Compile all registered operators"""

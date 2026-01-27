@@ -171,6 +171,7 @@ class AIEBERTEncoder(AIEOperatorBase):
             num_aie_columns=self.num_aie_columns,
             prio_accuracy=False,
             emulate_bf16_mmul_with_bfp16=True,
+            skip_add_to_list=True,
         )
         self.qkvo_proj_xclbin, self.qkvo_proj_insts = qkvo_proj.get_artifacts(
             prefix=f"{prefix_base}qkvo_proj_"
@@ -190,6 +191,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 d=self.head_dim,
                 num_KV_heads=self.num_heads,
                 num_of_pipelines=8,
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}mha_")
             self.mha_xclbin.xclbin_input = self.qkvo_proj_xclbin
             self.mha_xclbin.extra_flags += [
@@ -211,6 +213,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 m=64,
                 n=96,
                 s=8,
+                skip_add_to_list=True,
             )
             self.k_transpose_xclbin, self.k_transpose_insts = k_transpose.get_artifacts(
                 prefix=f"{prefix_base}k_transpose_"
@@ -239,6 +242,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 batch_C=(self.num_heads, 0),  # Batch across heads, batch dim first
                 prio_accuracy=False,
                 emulate_bf16_mmul_with_bfp16=True,
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}attn_scores_")
             self.attn_scores_xclbin.xclbin_input = self.k_transpose_xclbin
             self.attn_scores_xclbin.extra_flags += [
@@ -261,6 +265,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                     math.gcd(4096, eltwise_mul_tile_size), eltwise_mul_tile_size
                 ),
                 scalar_broadcast=math.sqrt(1.0 / self.head_dim),
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}attn_scale_")
             self.attn_scale_xclbin.xclbin_input = self.attn_scores_xclbin
             self.attn_scale_xclbin.extra_flags += [
@@ -278,6 +283,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 cols=self.seq_len,
                 num_aie_columns=self.num_aie_columns,
                 num_channels=2,
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}attn_softmax_")
             self.attn_softmax_xclbin.xclbin_input = self.attn_scale_xclbin
             self.attn_softmax_xclbin.extra_flags += [
@@ -303,6 +309,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 batch_C=(self.num_heads, 1),  # Batch across heads, batch dim first
                 prio_accuracy=False,
                 emulate_bf16_mmul_with_bfp16=True,
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}attn_output_")
             self.attn_output_xclbin.xclbin_input = self.attn_softmax_xclbin
             self.attn_output_xclbin.extra_flags += [
@@ -323,6 +330,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 num_aie_columns=self.num_aie_columns,
                 tile_size=self.hidden_size,
                 weights=self.ln1_weight,
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}add_norm1_")
             self.add_norm1_xclbin.xclbin_input = next_dep
             self.add_norm1_xclbin.extra_flags += [
@@ -345,6 +353,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 num_aie_columns=self.num_aie_columns,
                 num_channels=2,
                 weights=self.ln1_weight,
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}ln1_")
             self.ln1_xclbin.xclbin_input = next_dep
             self.ln1_xclbin.extra_flags += [
@@ -364,6 +373,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 tile_size=min(
                     math.gcd(4096, eltwise_add_tile_size), eltwise_add_tile_size
                 ),
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}add_")
             self.add_xclbin.xclbin_input = self.ln1_xclbin
             self.add_xclbin.extra_flags += [
@@ -395,6 +405,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 down_proj_depth=8,
                 num_aie_columns=self.num_aie_columns,
                 **aie_ffn_config,
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}ffn_")
             self.ffn_xclbin.xclbin_input = next_dep
             self.ffn_xclbin.extra_flags += [
@@ -419,6 +430,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                     num_aie_columns=self.num_aie_columns,
                     prio_accuracy=False,
                     emulate_bf16_mmul_with_bfp16=True,
+                    skip_add_to_list=True,
                 ).get_artifacts(prefix=f"{prefix_base}up_proj_")
             )
             self.up_proj_xclbin.xclbin_input = next_dep
@@ -437,6 +449,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 num_aie_columns=self.num_aie_columns,
                 num_channels=2,
                 tile_size=min(math.gcd(4096, gelu_tile_size), gelu_tile_size),
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}gelu_")
             self.gelu_xclbin.xclbin_input = self.up_proj_xclbin
             self.gelu_xclbin.extra_flags += [
@@ -460,6 +473,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                     num_aie_columns=self.num_aie_columns,
                     prio_accuracy=False,
                     emulate_bf16_mmul_with_bfp16=True,
+                    skip_add_to_list=True,
                 ).get_artifacts(prefix=f"{prefix_base}down_proj_")
             )
             self.down_proj_xclbin.xclbin_input = self.gelu_xclbin
@@ -479,6 +493,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 num_aie_columns=self.num_aie_columns,
                 tile_size=self.hidden_size,
                 weights=self.ln2_weight,
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}add_norm2_")
             self.add_norm2_xclbin.xclbin_input = next_dep
             self.add_norm2_xclbin.extra_flags += [
@@ -501,6 +516,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 num_aie_columns=self.num_aie_columns,
                 num_channels=2,
                 weights=self.ln2_weight,
+                skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}ln2_")
             self.ln2_xclbin.xclbin_input = next_dep
             self.ln2_xclbin.extra_flags += [

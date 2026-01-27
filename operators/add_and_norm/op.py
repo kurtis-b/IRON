@@ -31,6 +31,7 @@ class AIEAddAndNorm(AIEOperatorBase):
         weights=None,
         trace_size=0,
         context=None,
+        skip_add_to_list=False,
     ):
         max_multiple = num_aie_columns * tile_size
         padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
@@ -48,13 +49,15 @@ class AIEAddAndNorm(AIEOperatorBase):
 
         self.weight = weights
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
     def get_artifacts(self, prefix="weighted_layer_norm_"):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
         file_name_base = (
-            f"{prefix}{self.num_aie_columns}c_{self.size}_{self.tile_size}t_lnstage"
+            f"{prefix}{self.num_aie_columns}c_{self.size}_{self.tile_size}t"
         )
 
         # Save the weight weights to a npy file so that the design.py can load it at compile time

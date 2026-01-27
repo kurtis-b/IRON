@@ -42,6 +42,7 @@ class AIEFFN(AIEOperatorBase):
         down_proj_depth=1,
         num_aie_columns=2,
         context=None,
+        skip_add_to_list=False,
         **ffn_kwargs,
     ):
 
@@ -79,7 +80,9 @@ class AIEFFN(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
     def get_artifacts(self, prefix="ffn_"):
         # Get parameters from self

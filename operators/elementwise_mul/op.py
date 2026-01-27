@@ -30,6 +30,7 @@ class AIEElementwiseMul(AIEOperatorBase):
         scalar_broadcast=None,
         trace_size=0,
         context=None,
+        skip_add_to_list=False,
     ):
         max_multiple = num_aie_columns * tile_size
         padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
@@ -47,7 +48,9 @@ class AIEElementwiseMul(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
     def get_artifacts(self, prefix="eltwise_mul_"):
         operator_dir = Path(__file__).parent

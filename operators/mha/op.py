@@ -30,6 +30,7 @@ class AIEMHA(AIEOperatorBase):
         num_KV_heads: int,
         num_of_pipelines: int = 1,
         context=None,
+        skip_add_to_list=False,
     ):
         self.num_heads = num_heads
         self.seq_len = seq_len
@@ -44,7 +45,9 @@ class AIEMHA(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
     def get_artifacts(self, prefix="mha_"):
         # Set up compilation artifacts

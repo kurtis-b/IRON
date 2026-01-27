@@ -27,7 +27,10 @@ class AIEOperatorBase(ABC):
             AIEOperatorBase._default_context = AIEContext()
         return AIEOperatorBase._default_context
 
-    def __init__(self, context=None):
+    def __init__(self, context=None, skip_add_to_list=False):
+        # skip_add_to_list is for cases where the operator is a runlist implementation, which puts
+        # togegther a sequence of operators, which also execute this constructor. Those operators should not register
+        # themselves in the context's runlist again, otherwise the runtime setup will create kernels for them again.
         self.artifacts = (
             []
         )  # CompilationArtifact objects are uniqued within the context
@@ -47,7 +50,7 @@ class AIEOperatorBase(ABC):
 
         if context is None:
             context = self.get_default_context()
-        context.register_operator(self)
+        context.register_operator(self, skip_add_to_list=skip_add_to_list)
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
