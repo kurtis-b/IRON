@@ -14,4 +14,5 @@ pytest operators/gelu/ --csv-output operators_gelu_results.csv --iterations 1
 pytest operators/encoder/ --csv-output operators_encoder_results.csv --iterations 1
 pytest operators/ffn/ --csv-output operators_ffn_results.csv --iterations 1
 pytest operators/add_and_norm/ --csv-output operators_add_and_norm_results.csv --iterations 1
+pyteset operators/mha/ --csv-output operators_mha_results.csv --iterations 1
 cat operators*.csv > bert_operators_results.csv

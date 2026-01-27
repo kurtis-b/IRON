@@ -15,11 +15,15 @@ from operators.common.test_utils import run_test, verify_buffer
 
 def generate_test_params(extensive=False):
     params = [
-        # seq_len,embedding_dim,ffn_dim,num_heads,use_pip_ffn,use_pip_addnorm
-        (512, 768, 3072, 12, False, False),
-        (512, 768, 3072, 12, True, False),
-        (512, 768, 3072, 12, False, True),
-        (512, 768, 3072, 12, True, True),
+        # seq_len,embedding_dim,ffn_dim,num_heads,use_pip_ffn,use_pip_addnorm,use_pip_mha
+        (512, 768, 3072, 12, False, False, False),
+        (512, 768, 3072, 12, True, False, False),
+        (512, 768, 3072, 12, False, True, False),
+        (512, 768, 3072, 12, False, False, True),
+        (512, 768, 3072, 12, True, True, False),
+        (512, 768, 3072, 12, True, False, True),
+        (512, 768, 3072, 12, False, True, True),
+        (512, 768, 3072, 12, True, True, True),
     ]
     extensive_params = []
 
@@ -34,8 +38,9 @@ def generate_test_params(extensive=False):
         num_heads,
         use_pip_ffn,
         use_pip_addnorm,
+        use_pip_mha,
     ) in params:
-        name = f"bert_encoder_{seq_len}x{embedding_dim}x{ffn_dim}x{num_heads}xpipffn_{use_pip_ffn}_pipaddnorm_{use_pip_addnorm}"
+        name = f"bert_encoder_{seq_len}x{embedding_dim}x{ffn_dim}x{num_heads}xpipffn_{use_pip_ffn}_pipaddnorm_{use_pip_addnorm}_pipmha_{use_pip_mha}"
         names.append(name)
 
     return params, names
@@ -55,7 +60,8 @@ all_params = [
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "seq_len,embedding_dim,ffn_dim,num_heads,use_pip_ffn,use_pip_addnorm", all_params
+    "seq_len,embedding_dim,ffn_dim,num_heads,use_pip_ffn,use_pip_addnorm,use_pip_mha",
+    all_params,
 )
 def test_bert_encoder(
     seq_len,
@@ -64,6 +70,7 @@ def test_bert_encoder(
     num_heads,
     use_pip_ffn,
     use_pip_addnorm,
+    use_pip_mha,
     aie_context,
 ):
     golden_ref = generate_golden_reference(seq_len, embedding_dim, ffn_dim, num_heads)
@@ -75,6 +82,7 @@ def test_bert_encoder(
         num_heads=num_heads,
         use_pip_ffn=use_pip_ffn,
         use_pip_addnorm=use_pip_addnorm,
+        use_pip_mha=use_pip_mha,
         ln1_weight=golden_ref["weights"]["ln1_weight"],
         ln2_weight=golden_ref["weights"]["ln2_weight"],
         context=aie_context,

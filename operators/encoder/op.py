@@ -25,6 +25,7 @@ from operators.gelu.op import AIEGELU
 from operators.transpose.op import AIETranspose
 from operators.ffn.op import AIEFFN
 from operators.add_and_norm.op import AIEAddAndNorm
+from operators.mha.op import AIEMHA
 from operators.common.utils import torch_to_numpy
 
 
@@ -58,6 +59,7 @@ class AIEBERTEncoder(AIEOperatorBase):
         num_aie_columns=8,
         use_pip_ffn=True,
         use_pip_addnorm=True,
+        use_pip_mha=True,
         ln1_weight=None,
         ln2_weight=None,
         context=None,
@@ -82,6 +84,7 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.ln2_weight = ln2_weight
         self.use_pip_ffn = use_pip_ffn
         self.use_pip_addnorm = use_pip_addnorm
+        self.use_pip_mha = use_pip_mha
 
         # Artifacts created by set_up_artifacts() - one per layer
         self.combined_xclbin = None
@@ -89,16 +92,20 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.qkvo_proj_xclbin = None
         self.qkvo_proj_insts = None
         # Attention
-        self.k_transpose_xclbin = None
-        self.k_transpose_insts = None
-        self.attn_scores_xclbin = None
-        self.attn_scores_insts = None
-        self.attn_scale_xclbin = None
-        self.attn_scale_insts = None
-        self.attn_softmax_xclbin = None
-        self.attn_softmax_insts = None
-        self.attn_output_xclbin = None
-        self.attn_output_insts = None
+        if self.use_pip_mha:
+            self.mha_xclbin = None
+            self.mha_insts = None
+        else:
+            self.k_transpose_xclbin = None
+            self.k_transpose_insts = None
+            self.attn_scores_xclbin = None
+            self.attn_scores_insts = None
+            self.attn_scale_xclbin = None
+            self.attn_scale_insts = None
+            self.attn_softmax_xclbin = None
+            self.attn_softmax_insts = None
+            self.attn_output_xclbin = None
+            self.attn_output_insts = None
         if self.use_pip_addnorm:
             # Pipelined add & norm
             self.add_norm1_xclbin = None
@@ -150,7 +157,9 @@ class AIEBERTEncoder(AIEOperatorBase):
                 self.num_aie_columns * 2
             )
 
-        prefix_base = f"encoder_{self.use_pip_addnorm}_{self.use_pip_ffn}_"
+        prefix_base = (
+            f"encoder_{self.use_pip_addnorm}_{self.use_pip_ffn}_{self.use_pip_mha}_"
+        )
         # Q/K/V/O projection kernel
         qkvo_proj = AIEGEMM(  # L1 utilization = 54 KB with double buffering
             M=self.seq_len,
@@ -174,117 +183,139 @@ class AIEBERTEncoder(AIEOperatorBase):
         artifacts.append(self.qkvo_proj_insts)
         kernel_id += 1
 
-        # K Transpose kernel (transpose K matrix)
-        k_transpose = AIETranspose(
-            M=self.seq_len,
-            N=self.hidden_size,
-            num_aie_columns=self.num_aie_columns,
-            num_channels=2,
-            m=64,
-            n=96,
-            s=8,
-        )
-        self.k_transpose_xclbin, self.k_transpose_insts = k_transpose.get_artifacts(
-            prefix=f"{prefix_base}k_transpose_"
-        )
-        self.k_transpose_xclbin.xclbin_input = self.qkvo_proj_xclbin
-        self.k_transpose_xclbin.extra_flags += [
-            "--xclbin-instance-name=encoder_k_transpose",
-            f"--xclbin-kernel-id={hex(kernel_id)}",
-        ]
-        self.k_transpose_xclbin.kernel_name = "encoder_k_transpose"
-        self.k_transpose_xclbin.depends += [self.qkvo_proj_xclbin]
-        artifacts.append(self.k_transpose_insts)
-        kernel_id += 1
+        if self.use_pip_mha:
+            self.mha_xclbin, self.mha_insts = AIEMHA(
+                num_heads=self.num_heads,
+                seq_len=self.seq_len,
+                d=self.head_dim,
+                num_KV_heads=self.num_heads,
+                num_of_pipelines=8,
+            ).get_artifacts(prefix=f"{prefix_base}mha_")
+            self.mha_xclbin.xclbin_input = self.qkvo_proj_xclbin
+            self.mha_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_mha",
+                f"--xclbin-kernel-id={hex(kernel_id)}",
+            ]
+            self.mha_xclbin.kernel_name = "encoder_mha"
+            self.mha_xclbin.depends += [self.qkvo_proj_xclbin]
+            artifacts.append(self.mha_insts)
+            kernel_id += 1
+            next_dep = self.mha_xclbin
+        else:
+            # K Transpose kernel (transpose K matrix)
+            k_transpose = AIETranspose(
+                M=self.seq_len,
+                N=self.hidden_size,
+                num_aie_columns=self.num_aie_columns,
+                num_channels=2,
+                m=64,
+                n=96,
+                s=8,
+            )
+            self.k_transpose_xclbin, self.k_transpose_insts = k_transpose.get_artifacts(
+                prefix=f"{prefix_base}k_transpose_"
+            )
+            self.k_transpose_xclbin.xclbin_input = self.qkvo_proj_xclbin
+            self.k_transpose_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_k_transpose",
+                f"--xclbin-kernel-id={hex(kernel_id)}",
+            ]
+            self.k_transpose_xclbin.kernel_name = "encoder_k_transpose"
+            self.k_transpose_xclbin.depends += [self.qkvo_proj_xclbin]
+            artifacts.append(self.k_transpose_insts)
+            kernel_id += 1
 
-        # Attention score calculations (GEMM for Q*K^T, batched across heads)
-        self.attn_scores_xclbin, self.attn_scores_insts = AIEGEMM(
-            M=self.seq_len,
-            K=self.head_dim,
-            N=self.seq_len,
-            tile_m=64,
-            tile_k=64,
-            tile_n=64,
-            num_aie_columns=self.num_aie_columns,
-            batch_A=(self.num_heads, 1),  # Batch across heads, batch dim first
-            batch_B=(self.num_heads, 1),  # Batch across heads, batch dim first
-            batch_C=(self.num_heads, 0),  # Batch across heads, batch dim first
-            prio_accuracy=False,
-            emulate_bf16_mmul_with_bfp16=True,
-        ).get_artifacts(prefix=f"{prefix_base}attn_scores_")
-        self.attn_scores_xclbin.xclbin_input = self.k_transpose_xclbin
-        self.attn_scores_xclbin.extra_flags += [
-            "--xclbin-instance-name=encoder_attn_scores",
-            f"--xclbin-kernel-id={hex(kernel_id)}",
-        ]
-        self.attn_scores_xclbin.kernel_name = "encoder_attn_scores"
-        self.attn_scores_xclbin.depends += [
-            self.k_transpose_xclbin,
-        ]
-        artifacts.append(self.attn_scores_insts)
-        kernel_id += 1
+            # Attention score calculations (GEMM for Q*K^T, batched across heads)
+            self.attn_scores_xclbin, self.attn_scores_insts = AIEGEMM(
+                M=self.seq_len,
+                K=self.head_dim,
+                N=self.seq_len,
+                tile_m=64,
+                tile_k=64,
+                tile_n=64,
+                num_aie_columns=self.num_aie_columns,
+                batch_A=(self.num_heads, 1),  # Batch across heads, batch dim first
+                batch_B=(self.num_heads, 1),  # Batch across heads, batch dim first
+                batch_C=(self.num_heads, 0),  # Batch across heads, batch dim first
+                prio_accuracy=False,
+                emulate_bf16_mmul_with_bfp16=True,
+            ).get_artifacts(prefix=f"{prefix_base}attn_scores_")
+            self.attn_scores_xclbin.xclbin_input = self.k_transpose_xclbin
+            self.attn_scores_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_attn_scores",
+                f"--xclbin-kernel-id={hex(kernel_id)}",
+            ]
+            self.attn_scores_xclbin.kernel_name = "encoder_attn_scores"
+            self.attn_scores_xclbin.depends += [
+                self.k_transpose_xclbin,
+            ]
+            artifacts.append(self.attn_scores_insts)
+            kernel_id += 1
 
-        # Attention score scaling (Multiplication per attention score)
-        self.attn_scale_xclbin, self.attn_scale_insts = AIEElementwiseMul(
-            size=self.seq_len * self.seq_len * self.num_heads,
-            num_aie_columns=self.num_aie_columns,
-            num_channels=2,
-            tile_size=min(math.gcd(4096, eltwise_mul_tile_size), eltwise_mul_tile_size),
-            scalar_broadcast=math.sqrt(1.0 / self.head_dim),
-        ).get_artifacts(prefix=f"{prefix_base}attn_scale_")
-        self.attn_scale_xclbin.xclbin_input = self.attn_scores_xclbin
-        self.attn_scale_xclbin.extra_flags += [
-            "--xclbin-instance-name=encoder_attn_scale",
-            f"--xclbin-kernel-id={hex(kernel_id)}",
-        ]
-        self.attn_scale_xclbin.kernel_name = "encoder_attn_scale"
-        self.attn_scale_xclbin.depends += [self.attn_scores_xclbin]
-        artifacts.append(self.attn_scale_insts)
-        kernel_id += 1
+            # Attention score scaling (Multiplication per attention score)
+            self.attn_scale_xclbin, self.attn_scale_insts = AIEElementwiseMul(
+                size=self.seq_len * self.seq_len * self.num_heads,
+                num_aie_columns=self.num_aie_columns,
+                num_channels=2,
+                tile_size=min(
+                    math.gcd(4096, eltwise_mul_tile_size), eltwise_mul_tile_size
+                ),
+                scalar_broadcast=math.sqrt(1.0 / self.head_dim),
+            ).get_artifacts(prefix=f"{prefix_base}attn_scale_")
+            self.attn_scale_xclbin.xclbin_input = self.attn_scores_xclbin
+            self.attn_scale_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_attn_scale",
+                f"--xclbin-kernel-id={hex(kernel_id)}",
+            ]
+            self.attn_scale_xclbin.kernel_name = "encoder_attn_scale"
+            self.attn_scale_xclbin.depends += [self.attn_scores_xclbin]
+            artifacts.append(self.attn_scale_insts)
+            kernel_id += 1
 
-        # Attention weight calculations (Softmax per attention score)
-        self.attn_softmax_xclbin, self.attn_softmax_insts = AIESoftmax(
-            rows=self.seq_len * self.num_heads,
-            cols=self.seq_len,
-            num_aie_columns=self.num_aie_columns,
-            num_channels=2,
-        ).get_artifacts(prefix=f"{prefix_base}attn_softmax_")
-        self.attn_softmax_xclbin.xclbin_input = self.attn_scale_xclbin
-        self.attn_softmax_xclbin.extra_flags += [
-            "--xclbin-instance-name=encoder_attn_softmax",
-            f"--xclbin-kernel-id={hex(kernel_id)}",
-        ]
-        self.attn_softmax_xclbin.kernel_name = "encoder_attn_softmax"
-        self.attn_softmax_xclbin.depends += [self.attn_scale_xclbin]
-        artifacts.append(self.attn_softmax_insts)
-        kernel_id += 1
+            # Attention weight calculations (Softmax per attention score)
+            self.attn_softmax_xclbin, self.attn_softmax_insts = AIESoftmax(
+                rows=self.seq_len * self.num_heads,
+                cols=self.seq_len,
+                num_aie_columns=self.num_aie_columns,
+                num_channels=2,
+            ).get_artifacts(prefix=f"{prefix_base}attn_softmax_")
+            self.attn_softmax_xclbin.xclbin_input = self.attn_scale_xclbin
+            self.attn_softmax_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_attn_softmax",
+                f"--xclbin-kernel-id={hex(kernel_id)}",
+            ]
+            self.attn_softmax_xclbin.kernel_name = "encoder_attn_softmax"
+            self.attn_softmax_xclbin.depends += [self.attn_scale_xclbin]
+            artifacts.append(self.attn_softmax_insts)
+            kernel_id += 1
 
-        # Output head calculations (GEMM per attention weights/V heads, batched across heads)
-        self.attn_output_xclbin, self.attn_output_insts = AIEGEMM(
-            M=self.seq_len,
-            K=self.seq_len,
-            N=self.head_dim,
-            tile_m=64,
-            tile_k=64,
-            tile_n=16,
-            num_aie_columns=4,
-            batch_A=(self.num_heads, 0),  # Batch across heads, batch dim first
-            batch_B=(self.num_heads, 1),  # Batch across heads, batch dim first
-            batch_C=(self.num_heads, 1),  # Batch across heads, batch dim first
-            prio_accuracy=False,
-            emulate_bf16_mmul_with_bfp16=True,
-        ).get_artifacts(prefix=f"{prefix_base}attn_output_")
-        self.attn_output_xclbin.xclbin_input = self.attn_softmax_xclbin
-        self.attn_output_xclbin.extra_flags += [
-            "--xclbin-instance-name=encoder_attn_output",
-            f"--xclbin-kernel-id={hex(kernel_id)}",
-        ]
-        self.attn_output_xclbin.kernel_name = "encoder_attn_output"
-        self.attn_output_xclbin.depends += [
-            self.attn_softmax_xclbin,
-        ]
-        artifacts.append(self.attn_output_insts)
-        kernel_id += 1
+            # Output head calculations (GEMM per attention weights/V heads, batched across heads)
+            self.attn_output_xclbin, self.attn_output_insts = AIEGEMM(
+                M=self.seq_len,
+                K=self.seq_len,
+                N=self.head_dim,
+                tile_m=64,
+                tile_k=64,
+                tile_n=16,
+                num_aie_columns=4,
+                batch_A=(self.num_heads, 0),  # Batch across heads, batch dim first
+                batch_B=(self.num_heads, 1),  # Batch across heads, batch dim first
+                batch_C=(self.num_heads, 1),  # Batch across heads, batch dim first
+                prio_accuracy=False,
+                emulate_bf16_mmul_with_bfp16=True,
+            ).get_artifacts(prefix=f"{prefix_base}attn_output_")
+            self.attn_output_xclbin.xclbin_input = self.attn_softmax_xclbin
+            self.attn_output_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_attn_output",
+                f"--xclbin-kernel-id={hex(kernel_id)}",
+            ]
+            self.attn_output_xclbin.kernel_name = "encoder_attn_output"
+            self.attn_output_xclbin.depends += [
+                self.attn_softmax_xclbin,
+            ]
+            artifacts.append(self.attn_output_insts)
+            kernel_id += 1
+            next_dep = self.attn_output_xclbin
         if self.use_pip_addnorm:
             # Pipelined add & norm kernel
             self.add_norm1_xclbin, self.add_norm1_insts = AIEAddAndNorm(
@@ -293,7 +324,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 tile_size=self.hidden_size,
                 weights=self.ln1_weight,
             ).get_artifacts(prefix=f"{prefix_base}add_norm1_")
-            self.add_norm1_xclbin.xclbin_input = self.attn_output_xclbin
+            self.add_norm1_xclbin.xclbin_input = next_dep
             self.add_norm1_xclbin.extra_flags += [
                 "--xclbin-instance-name=encoder_add_norm1",
                 f"--xclbin-kernel-id={hex(kernel_id)}",
@@ -301,7 +332,7 @@ class AIEBERTEncoder(AIEOperatorBase):
             self.add_norm1_xclbin.kernel_name = "encoder_add_norm1"
             self.add_norm1_xclbin.depends += [
                 self.qkvo_proj_xclbin,
-                self.attn_output_xclbin,
+                next_dep,
             ]
             artifacts.append(self.add_norm1_insts)
             next_dep = self.add_norm1_xclbin
@@ -315,13 +346,13 @@ class AIEBERTEncoder(AIEOperatorBase):
                 num_channels=2,
                 weights=self.ln1_weight,
             ).get_artifacts(prefix=f"{prefix_base}ln1_")
-            self.ln1_xclbin.xclbin_input = self.attn_output_xclbin
+            self.ln1_xclbin.xclbin_input = next_dep
             self.ln1_xclbin.extra_flags += [
                 "--xclbin-instance-name=encoder_ln1",
                 f"--xclbin-kernel-id={hex(kernel_id)}",
             ]
             self.ln1_xclbin.kernel_name = "encoder_ln1"
-            self.ln1_xclbin.depends += [self.qkvo_proj_xclbin, self.attn_output_xclbin]
+            self.ln1_xclbin.depends += [self.qkvo_proj_xclbin, next_dep]
             artifacts.append(self.ln1_insts)
             kernel_id += 1
 
@@ -560,18 +591,21 @@ class AIEBERTEncoder(AIEOperatorBase):
         # Intermediate buffers for all layers
         self.add_buffer("q_output", act_size)  # After layer 1a
         self.add_buffer("k_output", act_size)  # After layer 1b
-        self.add_buffer("k_transposed", act_size)  # After K transpose
         self.add_buffer("v_output", act_size)  # After layer 1c
-        self.add_buffer(
-            "attn_scores_output", self.seq_len * self.seq_len * self.num_heads
-        )  # After layer 2
-        self.add_buffer(
-            "attn_scaled_output", self.seq_len * self.seq_len * self.num_heads
-        )  # After layer 3
-        self.add_buffer(
-            "attn_weights_output", self.seq_len * self.seq_len * self.num_heads
-        )  # After layer 4
-        self.add_buffer("attn_heads_output", act_size)  # After layer 5
+        if self.use_pip_mha:
+            self.add_buffer("mha_output", act_size)  # After layer 5
+        else:
+            self.add_buffer("k_transposed", act_size)  # After K transpose
+            self.add_buffer(
+                "attn_scores_output", self.seq_len * self.seq_len * self.num_heads
+            )  # After layer 2
+            self.add_buffer(
+                "attn_scaled_output", self.seq_len * self.seq_len * self.num_heads
+            )  # After layer 3
+            self.add_buffer(
+                "attn_weights_output", self.seq_len * self.seq_len * self.num_heads
+            )  # After layer 4
+            self.add_buffer("attn_heads_output", act_size)  # After layer 5
         self.add_buffer("output_proj_output", act_size)  # After layer 6
         if self.use_pip_addnorm:
             self.add_buffer("add_norm1_output", act_size)  # After layer 7
@@ -604,36 +638,44 @@ class AIEBERTEncoder(AIEOperatorBase):
             self.qkvo_proj_xclbin.kernel_name,
             self.qkvo_proj_insts,
         )
-        self.add_kernel(
-            "encoder_k_transpose",
-            self.combined_xclbin,
-            self.k_transpose_xclbin.kernel_name,
-            self.k_transpose_insts,
-        )
-        self.add_kernel(
-            "encoder_attn_scores",
-            self.combined_xclbin,
-            self.attn_scores_xclbin.kernel_name,
-            self.attn_scores_insts,
-        )
-        self.add_kernel(
-            "encoder_attn_scale",
-            self.combined_xclbin,
-            self.attn_scale_xclbin.kernel_name,
-            self.attn_scale_insts,
-        )
-        self.add_kernel(
-            "encoder_attn_softmax",
-            self.combined_xclbin,
-            self.attn_softmax_xclbin.kernel_name,
-            self.attn_softmax_insts,
-        )
-        self.add_kernel(
-            "encoder_attn_output",
-            self.combined_xclbin,
-            self.attn_output_xclbin.kernel_name,
-            self.attn_output_insts,
-        )
+        if self.use_pip_mha:
+            self.add_kernel(
+                "encoder_mha",
+                self.combined_xclbin,
+                self.mha_xclbin.kernel_name,
+                self.mha_insts,
+            )
+        else:
+            self.add_kernel(
+                "encoder_k_transpose",
+                self.combined_xclbin,
+                self.k_transpose_xclbin.kernel_name,
+                self.k_transpose_insts,
+            )
+            self.add_kernel(
+                "encoder_attn_scores",
+                self.combined_xclbin,
+                self.attn_scores_xclbin.kernel_name,
+                self.attn_scores_insts,
+            )
+            self.add_kernel(
+                "encoder_attn_scale",
+                self.combined_xclbin,
+                self.attn_scale_xclbin.kernel_name,
+                self.attn_scale_insts,
+            )
+            self.add_kernel(
+                "encoder_attn_softmax",
+                self.combined_xclbin,
+                self.attn_softmax_xclbin.kernel_name,
+                self.attn_softmax_insts,
+            )
+            self.add_kernel(
+                "encoder_attn_output",
+                self.combined_xclbin,
+                self.attn_output_xclbin.kernel_name,
+                self.attn_output_insts,
+            )
         if self.use_pip_addnorm:
             self.add_kernel(
                 "encoder_add_norm1",
@@ -705,33 +747,40 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.add_to_runlist("encoder_qkvo_proj", "input", "k_weight", "k_output")
         # V projection
         self.add_to_runlist("encoder_qkvo_proj", "input", "v_weight", "v_output")
-        # Transpose K matrix
-        self.add_to_runlist("encoder_k_transpose", "k_output", "k_transposed")
-        # Attention score calculations
-        self.add_to_runlist(
-            "encoder_attn_scores", "q_output", "k_transposed", "attn_scores_output"
-        )
-        # Attention score scaling
-        self.add_to_runlist(
-            "encoder_attn_scale",
-            "attn_scores_output",
-            "attn_scaled_output",
-        )
-        # Attention weight calculations (Softmax)
-        self.add_to_runlist(
-            "encoder_attn_softmax", "attn_scaled_output", "attn_weights_output"
-        )
-        # Output head calculations
-        self.add_to_runlist(
-            "encoder_attn_output",
-            "attn_weights_output",
-            "v_output",
-            "attn_heads_output",
-        )
+        if self.use_pip_mha:
+            self.add_to_runlist(
+                "encoder_mha", "q_output", "k_output", "v_output", "mha_output"
+            )
+            next_output = "mha_output"
+        else:
+            # Transpose K matrix
+            self.add_to_runlist("encoder_k_transpose", "k_output", "k_transposed")
+            # Attention score calculations
+            self.add_to_runlist(
+                "encoder_attn_scores", "q_output", "k_transposed", "attn_scores_output"
+            )
+            # Attention score scaling
+            self.add_to_runlist(
+                "encoder_attn_scale",
+                "attn_scores_output",
+                "attn_scaled_output",
+            )
+            # Attention weight calculations (Softmax)
+            self.add_to_runlist(
+                "encoder_attn_softmax", "attn_scaled_output", "attn_weights_output"
+            )
+            # Output head calculations
+            self.add_to_runlist(
+                "encoder_attn_output",
+                "attn_weights_output",
+                "v_output",
+                "attn_heads_output",
+            )
+            next_output = "attn_heads_output"
         # Output projection
         self.add_to_runlist(
             "encoder_qkvo_proj",
-            "attn_heads_output",
+            next_output,
             "attn_output_weight",
             "output_proj_output",
         )

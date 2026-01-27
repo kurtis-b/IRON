@@ -46,7 +46,7 @@ class AIEMHA(AIEOperatorBase):
 
         AIEOperatorBase.__init__(self, context=context)
 
-    def set_up_artifacts(self):
+    def get_artifacts(self, prefix="mha_"):
         # Set up compilation artifacts
         # ---
         operator_dir = Path(__file__).parent
@@ -83,6 +83,10 @@ class AIEMHA(AIEOperatorBase):
             "zero_scalar_bf16": "zero_scalar_bf16_rowmaj",
         }
 
+        kernel_archive = (
+            f"mha_kernels_{self.num_heads}h_{kv_heads}kv_{self.seq_len}s_{self.d}d.a"
+        )
+
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
             import_path=operator_dir / "design.py",
@@ -97,6 +101,7 @@ class AIEMHA(AIEOperatorBase):
                 "num_KV_heads": self.num_KV_heads,
                 "number_of_pipelines": self.num_of_pipelines,
                 "emulate_bf16_mmul_with_bfp16": True,
+                "kernel_archive": kernel_archive,
                 "trace_size": 0,
                 "verbose": False,
             },
@@ -107,28 +112,29 @@ class AIEMHA(AIEOperatorBase):
             depends=[
                 mlir_artifact,
                 KernelArchiveArtifact.new(
-                    f"mha_kernels.a",
+                    kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"mha_mm.o",
+                            f"mha_mm_{self.seq_len}s_{self.d}d.o",
                             extra_flags=mm_defines_colmaj,
                             depends=[SourceArtifact.new(mm_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_mm_rowmaj.o",
+                            f"mha_mm_rowmaj_{self.seq_len}s_{self.d}d.o",
                             extra_flags=mm_defines_rowmaj,
                             depends=[SourceArtifact.new(mm_source)],
                             rename_symbols=mm_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
-                            "mha_softmax.o",
+                            f"mha_softmax_{self.seq_len}s_{self.d}d.o",
                             depends=[SourceArtifact.new(softmax_source)],
                         ),
                         KernelObjectArtifact.new(
-                            "mha_mha.o", depends=[SourceArtifact.new(mha_source)]
+                            f"mha_mha_{self.seq_len}s_{self.d}d.o",
+                            depends=[SourceArtifact.new(mha_source)],
                         ),
                         KernelObjectArtifact.new(
-                            "mha_passThrough.o",
+                            f"mha_passThrough_{self.seq_len}s_{self.d}d.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[SourceArtifact.new(passthrough_source)],
                         ),
@@ -142,11 +148,17 @@ class AIEMHA(AIEOperatorBase):
             f"mha.bin", depends=[mlir_artifact], extra_flags=["--dynamic-objFifos"]
         )
 
+        return (xclbin_artifact, insts_artifact)
+
+    def set_up_artifacts(self):
+        # Describe required artifacts (xclbin, insts.bin)
+        device_str = self.context.device_manager.device_str()
+        xclbin_artifact, insts_artifact = self.get_artifacts()
+
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
 
-        artifacts = [xclbin_artifact, insts_artifact]
-        self.add_artifacts(artifacts)
+        self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
         # Set up runtime
