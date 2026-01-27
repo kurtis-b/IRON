@@ -67,6 +67,7 @@ def main():
     argparser.add_argument("--number-of-pipeline", type=int, default=1)
     argparser.add_argument("--emulate-bf16-mmul-with-bfp16", type=bool, default=False)
     argparser.add_argument("--trace_size", type=int, default=0)
+    argparser.add_argument("--kernel-archive", type=str, default="mha_kernels.a")
     argparser.add_argument(
         "--output-file-path",
         "-o",
@@ -90,6 +91,7 @@ def main():
         number_of_pipelines=args.number_of_pipeline,
         num_KV_heads=args.num_KV_heads,
         emulate_bf16_mmul_with_bfp16=args.emulate_bf16_mmul_with_bfp16,
+        kernel_archive=args.kernel_archive,
         trace_size=args.trace_size,
         verbose=args.verbose,
     )
@@ -113,6 +115,7 @@ def fused_mha(
     number_of_pipelines: int,
     num_KV_heads: int,
     emulate_bf16_mmul_with_bfp16: bool,
+    kernel_archive: str,
     trace_size: int = 0,
     verbose: bool = False,
 ):
@@ -205,7 +208,7 @@ def fused_mha(
 
     # AIE kernel declarations
     func_type = "" if vectorized else "_scalar"
-    bin_name = "mha_kernels.a"
+    bin_name = kernel_archive
 
     zero_kernel = Kernel(f"zero_{dtype_str}", bin_name, [qk_ty])
 

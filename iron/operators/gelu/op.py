@@ -20,7 +20,15 @@ from iron.common import (
 class AIEGELU(AIEOperatorBase):
     """AIE-accelerated GELU activation function"""
 
-    def __init__(self, size, num_aie_columns, num_channels, tile_size, context=None):
+    def __init__(
+        self,
+        size,
+        num_aie_columns,
+        num_channels,
+        tile_size,
+        context=None,
+        skip_add_to_list=False,
+    ):
         max_multiple = num_aie_columns * tile_size
         padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
         self.orig_size = size
@@ -35,7 +43,9 @@ class AIEGELU(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
     def get_artifacts(self, prefix="gelu_"):
         operator_dir = Path(__file__).parent

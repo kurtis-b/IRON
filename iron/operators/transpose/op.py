@@ -20,7 +20,18 @@ from iron.common import (
 class AIETranspose(AIEOperatorBase):
     """AIE-accelerated transpose operator"""
 
-    def __init__(self, M, N, num_aie_columns, num_channels, m, n, s, context=None):
+    def __init__(
+        self,
+        M,
+        N,
+        num_aie_columns,
+        num_channels,
+        m,
+        n,
+        s,
+        context=None,
+        skip_add_to_list=False,
+    ):
         self.M = M
         self.N = N
         self.m = m
@@ -40,7 +51,9 @@ class AIETranspose(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
     def get_artifacts(self, prefix="transpose_"):
         operator_dir = Path(__file__).parent

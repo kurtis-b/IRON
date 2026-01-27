@@ -275,7 +275,7 @@ def test_ffn(
     if (
         errors and stage_only is None
     ):  # If only one stage is performing the computation, skip error check since the output will always be wrong
-        print(
+        logging.info(
             "({} errors out of {} max allowable)".format(
                 len(errors["C"]), max_acceptable_errors
             )

@@ -93,10 +93,10 @@ def generate_golden_reference(
     attn_output = torch.matmul(attn_output, attn_output_weight)
 
     # 2. Add & Norm 1
-    hidden_states = input_tensor + attn_output
     hidden_states = torch.nn.functional.layer_norm(
-        hidden_states, (hidden_size,), ln1_weight, ln1_bias
+        attn_output, (hidden_size,), ln1_weight, ln1_bias
     )
+    hidden_states = input_tensor + hidden_states
 
     # 3. Feed-Forward Network
     # Up-projection
@@ -107,10 +107,10 @@ def generate_golden_reference(
     ffn_output = torch.matmul(intermediate, ffn_down_weight)
 
     # 4. Add & Norm 2
-    output = hidden_states + ffn_output
     output = torch.nn.functional.layer_norm(
-        output, (hidden_size,), ln2_weight, ln2_bias
+        ffn_output, (hidden_size,), ln2_weight, ln2_bias
     )
+    output = hidden_states + output
 
     weights = {
         "q_weight": q_weight,

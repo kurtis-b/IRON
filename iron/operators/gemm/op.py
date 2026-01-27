@@ -38,6 +38,7 @@ class AIEGEMM(AIEOperatorBase):
         batch_B=(1, 0),  # (batch size, batch stride dim)
         batch_C=(1, 0),  # (batch size, batch stride dim)
         context=None,
+        skip_add_to_list=False,
         **gemm_kwargs,
     ):
 
@@ -75,7 +76,9 @@ class AIEGEMM(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
     def get_artifacts(self, prefix="gemm_"):
         # Extract parameters from self

@@ -13,24 +13,8 @@ from iron.common.test_utils import run_test
 
 
 def generate_test_params(extensive=False):
-    # (seq_len, head_dim, heads, number_of_pipeline, num_kv_heads)
-
-    names = []
-
-    params = [(16384, 64, 1, 8, 0)]
-
-    if extensive:
-        params += [
-            (4096, 64, 8, 8, 4),
-            (4096, 64, 8, 8, 2),
-            (4096, 64, 8, 8, 0),
-        ]
-
-    for seq_len, head_dim, heads, number_of_pipeline, num_kv_heads in params:
-        names += [
-            f"mha_{seq_len}_{head_dim}_{heads}_{number_of_pipeline}_{num_kv_heads}"
-        ]
-
+    params = [(16384, 64, 1, 8), (2048, 64, 32, 8), (512, 64, 12, 8)]
+    names = ["mha_s16384_d64_h1_p8", "mha_s2048_d64_h32_p8", "bert_mha_s512_d64_h12_p8"]
     return params, names
 
 
