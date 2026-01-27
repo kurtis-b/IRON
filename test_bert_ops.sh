@@ -13,6 +13,6 @@ pytest operators/gelu/ --csv-output operators_gelu_results.csv --iterations 1
 pytest operators/gemm/ --csv-output operators_gemm_results.csv --iterations 1
 pytest operators/layer_norm/ --csv-output operators_layer_norm_results.csv --iterations 1
 pytest operators/mha/ --csv-output operators_mha_results.csv --iterations 1
-pytest operators/softmax/ --csv-output operators_softmax_results.csv --iterations 
+pytest operators/softmax/ --csv-output operators_softmax_results.csv --iterations 1
 pytest operators/transpose/ --csv-output operators_transpose_results.csv --iterations 1
 cat operators*.csv > bert_operators_results.csv
