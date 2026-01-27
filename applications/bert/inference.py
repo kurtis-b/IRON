@@ -776,7 +776,6 @@ def main():
 
         # Extend embeddings to 1024 rows
         for key in [
-            "bert.embeddings.word_embeddings.weight",
             "bert.embeddings.position_embeddings.weight",
         ]:
             if key in combined_weights:
@@ -786,6 +785,8 @@ def main():
                     num_repeats = (seq_len // original.shape[0]) + 1
                     extended = original.repeat(num_repeats, 1)[:seq_len]
                     combined_weights[key] = extended
+                if original.shape[0] > seq_len:
+                    combined_weights[key] = original[:seq_len, :]
 
         model.bert.embeddings.word_embeddings.weight = assign(
             model.bert.embeddings.word_embeddings.weight,
