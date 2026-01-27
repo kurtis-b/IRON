@@ -40,13 +40,13 @@ class AIEBERTEncoder(AIEOperatorBase):
     5. Attention weight calculations (Softmax per attention score)
     6. Output head calculations (GEMM per attention weights/V heads)
     7. Output projection (GEMM with O weight)
-    8. Residual connection (Eltwise add)
-    9. Layer normalization
+    8. Layer normalization
+    9. Residual connection (Eltwise add)
     10. Up projection (GEMM with Up projection weight)
     11. Activation function (GeLU)
     12. Down projection (GEMM with Down projection weight)
-    13. Residual connection (Eltwise add)
-    14. Layer normalization
+    13. Layer normalization
+    14. Residual connection (Eltwise add)
     """
 
     def __init__(
@@ -292,7 +292,6 @@ class AIEBERTEncoder(AIEOperatorBase):
                 num_aie_columns=self.num_aie_columns,
                 tile_size=self.hidden_size,
                 weights=self.ln1_weight,
-                layer_norm_stage=0,
             ).get_artifacts(prefix=f"{prefix_base}add_norm1_")
             self.add_norm1_xclbin.xclbin_input = self.attn_output_xclbin
             self.add_norm1_xclbin.extra_flags += [
@@ -308,6 +307,24 @@ class AIEBERTEncoder(AIEOperatorBase):
             next_dep = self.add_norm1_xclbin
             kernel_id += 1
         else:
+            # Layer normalization kernel
+            self.ln1_xclbin, self.ln1_insts = AIELayerNorm(
+                size=self.seq_len * self.hidden_size,
+                tile_size=self.hidden_size,
+                num_aie_columns=self.num_aie_columns,
+                num_channels=2,
+                weights=self.ln1_weight,
+            ).get_artifacts(prefix=f"{prefix_base}ln1_")
+            self.ln1_xclbin.xclbin_input = self.attn_output_xclbin
+            self.ln1_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_ln1",
+                f"--xclbin-kernel-id={hex(kernel_id)}",
+            ]
+            self.ln1_xclbin.kernel_name = "encoder_ln1"
+            self.ln1_xclbin.depends += [self.qkvo_proj_xclbin, self.attn_output_xclbin]
+            artifacts.append(self.ln1_insts)
+            kernel_id += 1
+
             # Residual connection kernel (Eltwise add)
             self.add_xclbin, self.add_insts = AIEElementwiseAdd(
                 size=self.seq_len * self.hidden_size,
@@ -317,33 +334,15 @@ class AIEBERTEncoder(AIEOperatorBase):
                     math.gcd(4096, eltwise_add_tile_size), eltwise_add_tile_size
                 ),
             ).get_artifacts(prefix=f"{prefix_base}add_")
-            self.add_xclbin.xclbin_input = self.attn_output_xclbin
+            self.add_xclbin.xclbin_input = self.ln1_xclbin
             self.add_xclbin.extra_flags += [
                 "--xclbin-instance-name=encoder_add",
                 f"--xclbin-kernel-id={hex(kernel_id)}",
             ]
             self.add_xclbin.kernel_name = "encoder_add"
-            self.add_xclbin.depends += [self.qkvo_proj_xclbin, self.attn_output_xclbin]
+            self.add_xclbin.depends += [self.ln1_xclbin]
             artifacts.append(self.add_insts)
-            kernel_id += 1
-
-            # Layer normalization kernel
-            self.ln1_xclbin, self.ln1_insts = AIELayerNorm(
-                size=self.seq_len * self.hidden_size,
-                tile_size=self.hidden_size,
-                num_aie_columns=self.num_aie_columns,
-                num_channels=2,
-                weights=self.ln1_weight,
-            ).get_artifacts(prefix=f"{prefix_base}ln1_")
-            self.ln1_xclbin.xclbin_input = self.add_xclbin
-            self.ln1_xclbin.extra_flags += [
-                "--xclbin-instance-name=encoder_ln1",
-                f"--xclbin-kernel-id={hex(kernel_id)}",
-            ]
-            self.ln1_xclbin.kernel_name = "encoder_ln1"
-            self.ln1_xclbin.depends += [self.add_xclbin]
-            artifacts.append(self.ln1_insts)
-            next_dep = self.ln1_xclbin
+            next_dep = self.add_xclbin
             kernel_id += 1
         if self.use_pip_ffn:
             aie_ffn_config = {
@@ -449,7 +448,6 @@ class AIEBERTEncoder(AIEOperatorBase):
                 num_aie_columns=self.num_aie_columns,
                 tile_size=self.hidden_size,
                 weights=self.ln2_weight,
-                layer_norm_stage=1,
             ).get_artifacts(prefix=f"{prefix_base}add_norm2_")
             self.add_norm2_xclbin.xclbin_input = next_dep
             self.add_norm2_xclbin.extra_flags += [
@@ -578,8 +576,8 @@ class AIEBERTEncoder(AIEOperatorBase):
         if self.use_pip_addnorm:
             self.add_buffer("add_norm1_output", act_size)  # After layer 7
         else:
-            self.add_buffer("add1_output", act_size)  # After layer 7
-            self.add_buffer("ln1_output", act_size)  # After layer 8
+            self.add_buffer("ln1_output", act_size)  # After layer 7
+            self.add_buffer("add1_output", act_size)  # After layer 8
         if self.use_pip_ffn:
             self.add_buffer("ffn_output", act_size)  # After layer 9-12
         else:
@@ -591,7 +589,7 @@ class AIEBERTEncoder(AIEOperatorBase):
             )  # After layer 10
             self.add_buffer("down_proj_output", act_size)  # After layer 11
         if not self.use_pip_addnorm:
-            self.add_buffer("add2_output", act_size)  # After layer 12
+            self.add_buffer("ln2_output", act_size)  # After layer 12
 
         # Output buffer
         self.add_buffer("output", act_size)
@@ -645,16 +643,16 @@ class AIEBERTEncoder(AIEOperatorBase):
             )
         else:
             self.add_kernel(
-                "encoder_add",
-                self.combined_xclbin,
-                self.add_xclbin.kernel_name,
-                self.add_insts,
-            )
-            self.add_kernel(
                 "encoder_ln1",
                 self.combined_xclbin,
                 self.ln1_xclbin.kernel_name,
                 self.ln1_insts,
+            )
+            self.add_kernel(
+                "encoder_add",
+                self.combined_xclbin,
+                self.add_xclbin.kernel_name,
+                self.add_insts,
             )
         if self.use_pip_ffn:
             self.add_kernel(
@@ -738,19 +736,17 @@ class AIEBERTEncoder(AIEOperatorBase):
             "output_proj_output",
         )
         if self.use_pip_addnorm:
-            # Pipelined add & norm
+            # Pipelined add & norm, 2nd input is for residual connection
             self.add_to_runlist(
-                "encoder_add_norm1", "input", "output_proj_output", "add_norm1_output"
+                "encoder_add_norm1", "output_proj_output", "input", "add_norm1_output"
             )
             next_output = "add_norm1_output"
         else:
-            # Residual connection
-            self.add_to_runlist(
-                "encoder_add", "input", "output_proj_output", "add1_output"
-            )
             # Layer normalization
-            self.add_to_runlist("encoder_ln1", "add1_output", "ln1_output")
-            next_output = "ln1_output"
+            self.add_to_runlist("encoder_ln1", "output_proj_output", "ln1_output")
+            # Residual connection
+            self.add_to_runlist("encoder_add", "input", "ln1_output", "add1_output")
+            next_output = "add1_output"
         if self.use_pip_ffn:
             # Pipelined FFN
             self.add_to_runlist(
@@ -777,15 +773,15 @@ class AIEBERTEncoder(AIEOperatorBase):
             )
             next_output = "down_proj_output"
         if self.use_pip_addnorm:
-            # Second Pipelined add & norm
+            # Second Pipelined add & norm, 2nd input is for residual connection
             self.add_to_runlist(
-                "encoder_add_norm2", "add_norm1_output", next_output, "output"
+                "encoder_add_norm2", next_output, "add_norm1_output", "output"
             )
         else:
-            # Residual connection
-            self.add_to_runlist("encoder_add", "ln1_output", next_output, "add2_output")
             # Layer normalization
-            self.add_to_runlist("encoder_ln2", "add2_output", "output")
+            self.add_to_runlist("encoder_ln2", next_output, "ln2_output")
+            # Residual connection
+            self.add_to_runlist("encoder_add", "add1_output", "ln2_output", "output")
 
         logging.info(f"Finished setting up {len(self.runlist)} BERT Encoder runlist.")
 
