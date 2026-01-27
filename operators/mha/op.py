@@ -55,7 +55,7 @@ class AIEMHA(AIEOperatorBase):
         operator_dir = Path(__file__).parent
 
         kv_heads = self.num_KV_heads if self.num_KV_heads > 0 else self.num_heads
-        file_name_base = f"mha_{self.num_heads}h_{kv_heads}kv_{self.seq_len}s_{self.d}d"
+        file_name_base = f"mha_{self.num_heads}h_{kv_heads}kv_{self.seq_len}s_{self.d}d_{self.num_of_pipelines}p"
 
         # Define source files
         mm_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mm.cc")
@@ -111,33 +111,33 @@ class AIEMHA(AIEOperatorBase):
         )
 
         xclbin_artifact = XclbinArtifact.new(
-            f"mha.xclbin",
+            f"{file_name_base}.xclbin",
             depends=[
                 mlir_artifact,
                 KernelArchiveArtifact.new(
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"mha_mm_{self.seq_len}s_{self.d}d.o",
+                            f"mha_mm_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv.o",
                             extra_flags=mm_defines_colmaj,
                             depends=[SourceArtifact.new(mm_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_mm_rowmaj_{self.seq_len}s_{self.d}d.o",
+                            f"mha_mm_rowmaj_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv.o",
                             extra_flags=mm_defines_rowmaj,
                             depends=[SourceArtifact.new(mm_source)],
                             rename_symbols=mm_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_softmax_{self.seq_len}s_{self.d}d.o",
+                            f"mha_softmax_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv.o",
                             depends=[SourceArtifact.new(softmax_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_mha_{self.seq_len}s_{self.d}d.o",
+                            f"mha_mha_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv.o",
                             depends=[SourceArtifact.new(mha_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_passThrough_{self.seq_len}s_{self.d}d.o",
+                            f"mha_passThrough_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[SourceArtifact.new(passthrough_source)],
                         ),
@@ -148,7 +148,9 @@ class AIEMHA(AIEOperatorBase):
         )
 
         insts_artifact = InstsBinArtifact.new(
-            f"mha.bin", depends=[mlir_artifact], extra_flags=["--dynamic-objFifos"]
+            f"{file_name_base}.bin",
+            depends=[mlir_artifact],
+            extra_flags=["--dynamic-objFifos"],
         )
 
         return (xclbin_artifact, insts_artifact)
