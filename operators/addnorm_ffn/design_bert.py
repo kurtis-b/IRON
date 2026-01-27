@@ -55,8 +55,6 @@ def main():
     argparser.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=8)
     argparser.add_argument("--n-a-tiles-distributed", type=int, default=8)
     argparser.add_argument("--n-b-tiles-distributed", type=int, default=2)
-    argparser.add_argument("--b-col-maj", type=int, choices=[0, 1], default=0)
-    argparser.add_argument("--c-col-maj", type=int, choices=[0, 1], default=0)
     # Whether to use the scalar kernel; this is low, but can be useful for debugging smaller sizes
     argparser.add_argument("--scalar", type=bool, choices=[0, 1], default=0)
     argparser.add_argument(
@@ -118,8 +116,6 @@ def main():
         args.n_b_tiles_distributed,
         args.dtype_in,
         args.dtype_out,
-        args.b_col_maj,
-        args.c_col_maj,
         args.scalar,
         args.emulate_bf16_mmul_with_bfp16,
         args.trace_size,
@@ -156,8 +152,6 @@ def my_matmul(
     n_b_tiles_distributed,
     dtype_in_str,
     dtype_out_str,
-    b_col_maj,
-    c_col_maj,
     use_scalar,
     emulate_bf16_mmul_with_bfp16,
     trace_size,
@@ -468,10 +462,7 @@ def my_matmul(
         B_up_proj_l3l2_fifos[b_tile] = ObjectFifo(
             B_l2_ty, name=f"B_up_proj_L3L2_{b_tile}", depth=fifo_depth
         )
-        if b_col_maj:
-            dims_to_stream = [(n // t, t * k), (k // s, s), (t, k), (s, 1)]
-        else:
-            dims_to_stream = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
+        dims_to_stream = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
         B_up_proj_l2l1_fifos[b_tile] = (
             B_up_proj_l3l2_fifos[b_tile]
             .cons()
@@ -490,10 +481,7 @@ def my_matmul(
         B_down_proj_l3l2_fifos[b_tile] = ObjectFifo(
             B_l2_ty, name=f"B_down_proj_L3L2_{b_tile}", depth=fifo_depth
         )
-        if b_col_maj:
-            dims_to_stream = [(k // t, t * n), (n // s, s), (t, n), (s, 1)]
-        else:
-            dims_to_stream = [(n // s, s * k), (k // t, t), (s, k), (t, 1)]
+        dims_to_stream = [(n // s, s * k), (k // t, t), (s, k), (t, 1)]
         B_down_proj_l2l1_fifos[b_tile] = (
             B_down_proj_l3l2_fifos[b_tile]
             .cons()
@@ -553,10 +541,7 @@ def my_matmul(
 
     # Down proj output C, m-by-k tiles
     for a_tile in range(n_a_tiles_distributed):
-        if c_col_maj:
-            dims_to_stream = [(k // t, t * m), (t, r), (m // r, r * t), (r, 1)]
-        else:
-            dims_to_stream = [(m // r, r * k), (r, t), (k // t, r * t), (t, 1)]
+        dims_to_stream = [(m // r, r * k), (r, t), (k // t, r * t), (t, 1)]
         C_down_proj_out_l1l2_fifos[a_tile] = ObjectFifo(
             C_down_proj_l1_ty,
             name=f"C_down_proj_out_L1L2_{a_tile}",
@@ -785,7 +770,7 @@ def my_matmul(
     # We are limited in the number of BDs. After synchronizing, we can reuse BDs.
     # We only transfer 6 rows of tiles at once before starting a new transfer block.
     # tb = transfer block; block of transfers before sync call
-    tb_max_n_rows = 4 if not c_col_maj else 2
+    tb_max_n_rows = 4
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
@@ -841,33 +826,20 @@ def my_matmul(
                             f"Col group: {col_group}, TB: {tb}, PP: {pingpong}, A tile: {a_tile}"
                         )
                         # C Output Transfer:
-                        C_col_offset = (
-                            (col_group * k * down_proj_depth)
-                            if not c_col_maj
-                            else (col_group * k * M * down_proj_depth)
-                        )
-                        if not c_col_maj:
-                            C_row_offset = (
-                                row_base * m * n_a_tiles_distributed * K
-                                + a_tile * m * K
-                            )  # base address for this transfer block for all BDs
-                            C_offset = C_col_offset + C_row_offset
-                            C_sizes = [
-                                current_tb_n_rows,
-                                down_proj_depth,
-                                m,
-                                k,
-                            ]
-                            C_strides = [m * K * n_a_tiles_distributed, k, K, 1]
-                        else:
-                            C_row_offset = (
-                                row_base * m * n_a_tiles_distributed + a_tile * m
-                            )  # base address for this transfer block for all BDs
-                            C_offset = C_col_offset + C_row_offset
-                            C_sizes = [down_proj_depth, n_a_tiles_distributed, k, m]
-                            C_strides = [M * k, m, M, 1]
+                        C_col_offset = col_group * k * down_proj_depth
+                        C_row_offset = (
+                            row_base * m * n_a_tiles_distributed * K + a_tile * m * K
+                        )  # base address for this transfer block for all BDs
+                        C_offset = C_col_offset + C_row_offset
+                        C_sizes = [
+                            current_tb_n_rows,
+                            down_proj_depth,
+                            m,
+                            k,
+                        ]
+                        C_strides = [m * K * n_a_tiles_distributed, k, K, 1]
                         C_tile = TensorAccessPattern(
-                            (K, M) if c_col_maj else (M, K),
+                            (M, K),
                             offset=C_offset,
                             sizes=C_sizes,
                             strides=C_strides,
@@ -936,39 +908,21 @@ def my_matmul(
                                     )
                                     if stage == 0:
                                         # B_Up input transfer:
-                                        B_up_proj_col_offset = (
-                                            b_tile * n
-                                            if not b_col_maj
-                                            else b_tile * n * K
-                                        )
-                                        if not b_col_maj:
-                                            B_up_proj_sizes = [
-                                                n_c_up_col_tiles_per_core,
-                                                K_div_k,
-                                                k,
-                                                n,
-                                            ]
-                                            B_up_proj_strides = [
-                                                mem_tile_n,
-                                                k * N,
-                                                N,
-                                                1,
-                                            ]
-                                        else:
-                                            B_up_proj_sizes = [
-                                                n_c_up_col_tiles_per_core,
-                                                K_div_k,
-                                                n,
-                                                k,
-                                            ]
-                                            B_up_proj_strides = [
-                                                mem_tile_n * K,
-                                                k,
-                                                K,
-                                                1,
-                                            ]
+                                        B_up_proj_col_offset = b_tile * n
+                                        B_up_proj_sizes = [
+                                            n_c_up_col_tiles_per_core,
+                                            K_div_k,
+                                            k,
+                                            n,
+                                        ]
+                                        B_up_proj_strides = [
+                                            mem_tile_n,
+                                            k * N,
+                                            N,
+                                            1,
+                                        ]
                                         B_up_proj_tile = TensorAccessPattern(
-                                            (K, N) if not b_col_maj else (N, K),
+                                            (N, K),
                                             offset=B_up_proj_col_offset,
                                             sizes=B_up_proj_sizes,
                                             strides=B_up_proj_strides,
@@ -994,46 +948,25 @@ def my_matmul(
                                     elif stage == 1:
                                         # B_Down input transfer:
                                         B_down_proj_col_offset = (
-                                            (
-                                                b_tile * n * K
-                                                + col_group * k * down_proj_depth
-                                            )
-                                            if not b_col_maj
-                                            else (
-                                                b_tile * n
-                                                + col_group * k * N * down_proj_depth
-                                            )
+                                            b_tile * n * K
+                                            + col_group * k * down_proj_depth
                                         )
                                         # Notice how some of the sizes/strides are the same or similar
                                         # to the ones in B_Up, but with accounting for the swapped n and k dimensions
-                                        if not b_col_maj:
-                                            B_down_proj_sizes = [
-                                                n_c_up_col_tiles_per_core,
-                                                down_proj_depth,
-                                                n,
-                                                k,
-                                            ]
-                                            B_down_proj_strides = [
-                                                mem_tile_n * K,
-                                                k,
-                                                K,
-                                                1,
-                                            ]
-                                        else:
-                                            B_down_proj_sizes = [
-                                                n_c_up_col_tiles_per_core,
-                                                down_proj_depth,
-                                                k,
-                                                n,
-                                            ]
-                                            B_down_proj_strides = [
-                                                mem_tile_n,
-                                                k * N,
-                                                N,
-                                                1,
-                                            ]
+                                        B_down_proj_sizes = [
+                                            n_c_up_col_tiles_per_core,
+                                            down_proj_depth,
+                                            n,
+                                            k,
+                                        ]
+                                        B_down_proj_strides = [
+                                            mem_tile_n * K,
+                                            k,
+                                            K,
+                                            1,
+                                        ]
                                         B_down_proj_tile = TensorAccessPattern(
-                                            (N, K) if not b_col_maj else (K, N),
+                                            (K, N),
                                             offset=B_down_proj_col_offset,
                                             sizes=B_down_proj_sizes,
                                             strides=B_down_proj_strides,

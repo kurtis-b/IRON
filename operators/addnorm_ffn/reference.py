@@ -11,12 +11,14 @@ def generate_golden_reference(
     N: int,
     dtype="bf16",
     seed=42,
-    b_col_maj=False,
-    c_col_maj=False,
     debug_mode=False,
 ):
     """
-    Generate golden reference for BERT FFN block. Using uniform distribution [0, 4) to populate tensors.
+    Generate golden reference for BERT Add & Norm -> FFN -> Add & Norm. Using uniform distribution [0, 4) to populate tensors.
+
+    A BERT Add & Norm consists of:
+    1. Layer Norm: layer_norm(input1, weight) -> (M, K)
+    2. Addition: layer_norm_out + input2 -> (M, K)
 
     A BERT FFN block consists of:
     1. Up-projection: input @ W1 -> (M, K) @ (K, N) = (M, N)
@@ -29,15 +31,15 @@ def generate_golden_reference(
         N: Intermediate size (typically 4*K for BERT)
         dtype: Data type for tensors
         seed: Random seed for reproducibility
-        b_col_maj: Whether weight matrix is column-major
-        c_col_maj: Whether output matrix is column-major
         debug_mode: If True, use row/col indices as input and identity matrices for weights
 
     Returns:
         Dictionary containing:
-            - input: Input tensor (M, K)
-            - input_b: Up-projection weight (K, N) or (N, K) if b_col_maj
-            - output: Final output after FFN block (M, K) or (K, M) if c_col_maj
+            - input: Input tensor for first layer norm (M, K)
+            - input_residual: Input tensor for first residual addition (M, K)
+            - input_b_up: Up-projection weight (K, N)
+            - input_b_down: Down-projection weight (N, K)
+            - output: Final output after FFN block (M, K)
     """
     torch.manual_seed(seed)
     val_range = 4
@@ -45,9 +47,23 @@ def generate_golden_reference(
 
     # Generate input tensor (M, K)
     if debug_mode:
-        input_tensor = torch.arange(M * K, dtype=dtype_torch).reshape(M, K)
+        input_tensor = torch.zeros(M, K, dtype=dtype_torch)
+        ln_weights = torch.zeros(K, dtype=dtype_torch)
     else:
         input_tensor = torch.rand(M, K, dtype=dtype_torch) * val_range
+        ln_weights = torch.rand(K, dtype=dtype_torch) * val_range
+
+    layer_norm1_output = torch.nn.functional.layer_norm(
+        input_tensor, normalized_shape=(K,), weight=ln_weights, bias=None
+    )
+
+    # Generate input for residual addition (M, K)
+    if debug_mode:
+        input_residual = torch.arange(M * K, dtype=dtype_torch).reshape(M, K)
+    else:
+        input_residual = torch.rand(M, K, dtype=dtype_torch) * val_range
+
+    add1_output = layer_norm1_output + input_residual
 
     # Generate up-projection weight (K, N)
     if debug_mode:
@@ -56,10 +72,10 @@ def generate_golden_reference(
         up_weight = torch.rand(K, N, dtype=dtype_torch) * val_range
 
     # Up-projection: (M, K) @ (K, N) = (M, N)
-    intermediate = torch.matmul(input_tensor, up_weight)
+    up_proj_output = torch.matmul(add1_output, up_weight)
 
     # GeLU activation
-    gelu_output = torch.nn.functional.gelu(intermediate)
+    gelu_output = torch.nn.functional.gelu(up_proj_output)
 
     # Generate down-projection weight (N, K)
     if debug_mode:
@@ -68,17 +84,19 @@ def generate_golden_reference(
         down_weight = torch.rand(N, K, dtype=dtype_torch) * val_range
 
     # Down-projection: (M, N) @ (N, K) = (M, K)
-    output = torch.matmul(gelu_output, down_weight)
+    down_proj_output = torch.matmul(gelu_output, down_weight)
 
-    # Handle column-major layouts if requested
-    if b_col_maj:
-        up_weight = up_weight.T
-        down_weight = down_weight.T
-    if c_col_maj:
-        output = output.T
+    # Final layer norm
+    layer_norm2_output = torch.nn.functional.layer_norm(
+        down_proj_output, normalized_shape=(K,), weight=ln_weights, bias=None
+    )
+
+    # Final addition with residual
+    output = layer_norm2_output + add1_output
 
     return {
         "input": input_tensor,
+        "input_residual": input_residual,
         "input_b_up": up_weight,
         "input_b_down": down_weight,
         "output": output,
