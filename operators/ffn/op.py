@@ -345,12 +345,12 @@ class AIEFFN(AIEOperatorBase):
 
         A_padded = self._pad_A(torch_to_numpy(A))
         if B_Up is not None:
-            B_Up_padded = self._pad_B(torch_to_numpy(B_Up, b_col_maj=False))
+            B_Up_padded = self._pad_B(torch_to_numpy(B_Up), b_col_maj=False)
         else:
             B_Up_padded = None
         if B_Down is not None:
             B_Down_padded = self._pad_B(
-                torch_to_numpy(B_Down, b_col_maj=True)
+                torch_to_numpy(B_Down), b_col_maj=True
             )  # B_Down is shaped like it's column major, but isn't laid out like column major
         else:
             B_Down_padded = None
