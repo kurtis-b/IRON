@@ -13,14 +13,42 @@ from operators.encoder.reference import generate_golden_reference
 from operators.common.test_utils import run_test, verify_buffer
 
 
-def generate_test_params():
-    params = [(512, 768, 3072, 12)]
-    names = [f"bert_encoder_{seq}x{emb}x{ffn}x{h}" for seq, emb, ffn, h in params]
+def generate_test_params(extensive=False):
+    params = [
+        # seq_len,embedding_dim,ffn_dim,num_heads,use_pip_ffn,use_pip_addnorm,use_pip_mha
+        (512, 768, 3072, 12, False, False, False),
+        (512, 768, 3072, 12, True, False, False),
+        (512, 768, 3072, 12, False, True, False),
+        (512, 768, 3072, 12, False, False, True),
+        (512, 768, 3072, 12, True, True, False),
+        (512, 768, 3072, 12, True, False, True),
+        (512, 768, 3072, 12, False, True, True),
+        (512, 768, 3072, 12, True, True, True),
+    ]
+    extensive_params = []
+
+    if extensive:
+        params = extensive_params
+
+    names = []
+    for (
+        seq_len,
+        embedding_dim,
+        ffn_dim,
+        num_heads,
+        use_pip_ffn,
+        use_pip_addnorm,
+        use_pip_mha,
+    ) in params:
+        name = f"bert_encoder_{seq_len}x{embedding_dim}x{ffn_dim}x{num_heads}xpipffn_{use_pip_ffn}_pipaddnorm_{use_pip_addnorm}_pipmha_{use_pip_mha}"
+        names.append(name)
+
     return params, names
 
 
 regular_params, regular_names = generate_test_params()
 
+# Combine params with marks - extensive params get pytest.mark.extensive
 all_params = [
     pytest.param(*params, id=name)
     for params, name in zip(regular_params, regular_names)
@@ -31,8 +59,20 @@ all_params = [
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
-@pytest.mark.parametrize("seq_len,embedding_dim,ffn_dim,num_heads", all_params)
-def test_bert_encoder(seq_len, embedding_dim, ffn_dim, num_heads, aie_context):
+@pytest.mark.parametrize(
+    "seq_len,embedding_dim,ffn_dim,num_heads,use_pip_ffn,use_pip_addnorm,use_pip_mha",
+    all_params,
+)
+def test_bert_encoder(
+    seq_len,
+    embedding_dim,
+    ffn_dim,
+    num_heads,
+    use_pip_ffn,
+    use_pip_addnorm,
+    use_pip_mha,
+    aie_context,
+):
     golden_ref = generate_golden_reference(seq_len, embedding_dim, ffn_dim, num_heads)
 
     operator = AIEBERTEncoder(
@@ -40,6 +80,11 @@ def test_bert_encoder(seq_len, embedding_dim, ffn_dim, num_heads, aie_context):
         hidden_size=embedding_dim,
         intermediate_size=ffn_dim,
         num_heads=num_heads,
+        use_pip_ffn=use_pip_ffn,
+        use_pip_addnorm=use_pip_addnorm,
+        use_pip_mha=use_pip_mha,
+        ln1_weight=golden_ref["weights"]["ln1_weight"],
+        ln2_weight=golden_ref["weights"]["ln2_weight"],
         context=aie_context,
     )
 
@@ -47,10 +92,8 @@ def test_bert_encoder(seq_len, embedding_dim, ffn_dim, num_heads, aie_context):
     operator.k_weight = golden_ref["weights"]["k_weight"]
     operator.v_weight = golden_ref["weights"]["v_weight"]
     operator.attn_output_weight = golden_ref["weights"]["attn_output_weight"]
-    operator.ln1_weight = golden_ref["weights"]["ln1_weight"]
     operator.ffn_up_weight = golden_ref["weights"]["ffn_up_weight"]
     operator.ffn_down_weight = golden_ref["weights"]["ffn_down_weight"]
-    operator.ln2_weight = golden_ref["weights"]["ln2_weight"]
 
     input_buffers = {
         "input": golden_ref["input"],

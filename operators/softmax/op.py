@@ -21,7 +21,13 @@ from operators.common import (
 class AIESoftmax(AIEOperatorBase):
 
     def __init__(
-        self, rows: int, cols: int, num_aie_columns=1, num_channels=1, context=None
+        self,
+        rows: int,
+        cols: int,
+        num_aie_columns=1,
+        num_channels=1,
+        context=None,
+        skip_add_to_list=False,
     ):
         self.size = rows * cols
         self.rows = rows
@@ -34,7 +40,9 @@ class AIESoftmax(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
     def get_artifacts(self, prefix="softmax_"):
         # Compilation artifacts

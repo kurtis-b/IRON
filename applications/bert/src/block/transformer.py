@@ -22,17 +22,16 @@
 import torch
 import torch.nn as nn
 from ..utils import assign
-from .feed_forward import BertIntermediate, BertOutput
+from .feed_forward import BertFeedForward
 from .mha import BertAttention
 from operators import AIEBERTEncoder
 
 
 class BertLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, seq_len=512):
         super().__init__()
-        self.attention = BertAttention(config)
-        self.intermediate = BertIntermediate(config)
-        self.output = BertOutput(config)
+        self.attention = BertAttention(config, seq_len=seq_len)
+        self.ffn = BertFeedForward(config, seq_len=seq_len)
 
     def forward(
         self,
@@ -41,13 +40,12 @@ class BertLayer(nn.Module):
     ) -> tuple[torch.Tensor]:
         self_attention_output, _ = self.attention(hidden_states, attention_mask)
         attention_output = self_attention_output
-        intermediate_output = self.intermediate(attention_output)
-        layer_output = self.output(intermediate_output, attention_output)
-        return layer_output
+        ffn_output = self.ffn(attention_output)
+        return ffn_output
 
 
 class BertEncoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, seq_len=512):
         super().__init__()
         self.config = config
         offload_individual_operator = [
@@ -58,16 +56,37 @@ class BertEncoder(nn.Module):
             config.aie_config.use_aie_elementwise_add == True,
             config.aie_config.use_aie_elementwise_mul == True,
             config.aie_config.use_aie_transpose == True,
+            config.aie_config.use_aie_ffn == True,
+            config.aie_config.use_aie_addandnorm == True,
         ]
         assert (
             self.config.aie_config.use_aie_bert_encoder
             and not any(offload_individual_operator)
             or not self.config.aie_config.use_aie_bert_encoder
         ), "Cannot mix Encoder runlist with individual AIE operators."
+        offload_individual_ffn_operator = [
+            # Don't check for aie gemm here since it's used in attention too
+            config.aie_config.use_aie_gelu
+            == True,
+        ]
+        assert (
+            self.config.aie_config.use_aie_ffn
+            and not any(offload_individual_ffn_operator)
+            or not self.config.aie_config.use_aie_ffn
+        ), "Cannot mix pipelined FFN with individual AIE operators."
+        offload_individual_addandnorm_operator = [
+            config.aie_config.use_aie_layernorm == True,
+            config.aie_config.use_aie_elementwise_add == True,
+        ]
+        assert (
+            self.config.aie_config.use_aie_addandnorm
+            and not any(offload_individual_addandnorm_operator)
+            or not self.config.aie_config.use_aie_addandnorm
+        ), "Cannot mix pipelined Add & Norm with individual AIE operators."
         if config.aie_config.use_aie_bert_encoder:
             self.layer = [
                 AIEBERTEncoder(
-                    seq_len=512,
+                    seq_len=seq_len,
                     hidden_size=config.model_config.hidden_size,
                     intermediate_size=config.model_config.intermediate_size,
                     num_heads=config.model_config.num_attention_heads,
@@ -77,7 +96,7 @@ class BertEncoder(nn.Module):
         else:
             self.layer = nn.ModuleList(
                 [
-                    BertLayer(config)
+                    BertLayer(config, seq_len=seq_len)
                     for i in range(config.model_config.num_hidden_layers)
                 ]
             )
@@ -161,7 +180,7 @@ class BertEncoder(nn.Module):
                         f"bert.encoder.layer.{l}.attention.self.value.bias"
                     ].to(self.config.aie_config.dtype),
                 )
-                self.layer[l].intermediate.assign_weights(
+                self.layer[l].ffn.assign_weights(
                     l,
                     combined_weights[
                         f"bert.encoder.layer.{l}.intermediate.dense.weight"
@@ -169,9 +188,6 @@ class BertEncoder(nn.Module):
                     combined_weights[
                         f"bert.encoder.layer.{l}.intermediate.dense.bias"
                     ].to(self.config.aie_config.dtype),
-                )
-                self.layer[l].output.assign_weights(
-                    l,
                     combined_weights[f"bert.encoder.layer.{l}.output.dense.weight"].to(
                         self.config.aie_config.dtype
                     ),
