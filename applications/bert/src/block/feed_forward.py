@@ -32,7 +32,7 @@ from operators import AIEAddAndNorm
 
 
 class BertFeedForward(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, seq_len=512):
         super().__init__()
         self.config = config
         if config.aie_config.use_aie_ffn:
@@ -47,7 +47,7 @@ class BertFeedForward(nn.Module):
                 "use_static_weight": True,
             }
             self.ffn = AIEFFN(
-                M=512,
+                M=seq_len,
                 K=config.model_config.hidden_size,
                 N=config.model_config.intermediate_size,
                 tile_m=64,
@@ -69,7 +69,7 @@ class BertFeedForward(nn.Module):
                     "prio_accuracy": False,
                 }
                 self.dense_up = AIEGEMM(
-                    M=512,
+                    M=seq_len,
                     K=config.model_config.hidden_size,
                     N=config.model_config.intermediate_size,
                     **aie_gemm_config,
@@ -81,9 +81,9 @@ class BertFeedForward(nn.Module):
                     dtype=config.aie_config.dtype,
                 )
             if config.aie_config.use_aie_gelu:
-                gelu_tile_size = (512 * config.model_config.intermediate_size) // 16
+                gelu_tile_size = (seq_len * config.model_config.intermediate_size) // 16
                 self.gelu = AIEGELU(
-                    size=512 * config.model_config.intermediate_size,
+                    size=seq_len * config.model_config.intermediate_size,
                     num_aie_columns=8,
                     num_channels=2,
                     tile_size=min(math.gcd(4096, gelu_tile_size), gelu_tile_size),
@@ -101,7 +101,7 @@ class BertFeedForward(nn.Module):
                     "prio_accuracy": False,
                 }
                 self.dense_down = AIEGEMM(
-                    M=512,
+                    M=seq_len,
                     K=config.model_config.intermediate_size,
                     N=config.model_config.hidden_size,
                     **aie_gemm_config,
@@ -114,14 +114,14 @@ class BertFeedForward(nn.Module):
                 )
         if config.aie_config.use_aie_addandnorm:
             self.aie_add_and_norm = AIEAddAndNorm(
-                size=512 * config.model_config.hidden_size,
+                size=seq_len * config.model_config.hidden_size,
                 num_aie_columns=8,
                 tile_size=config.model_config.hidden_size,
             )
         else:
             if config.aie_config.use_aie_layernorm:
                 self.LayerNorm = AIELayerNorm(
-                    size=512 * config.model_config.hidden_size,
+                    size=seq_len * config.model_config.hidden_size,
                     # eps=config.model_config.layer_norm_eps,
                     num_aie_columns=8,
                     num_channels=2,
@@ -136,9 +136,9 @@ class BertFeedForward(nn.Module):
                 )
             self.use_aie_elementwise_add = config.aie_config.use_aie_elementwise_add
             if self.use_aie_elementwise_add:
-                eltwise_add_tile_size = (512 * config.model_config.hidden_size) // 16
+                eltwise_add_tile_size = (seq_len * config.model_config.hidden_size) // 16
                 self.aie_elementwise_add = AIEElementwiseAdd(
-                    size=512 * config.model_config.hidden_size,
+                    size=seq_len * config.model_config.hidden_size,
                     num_aie_columns=8,
                     num_channels=2,
                     tile_size=min(

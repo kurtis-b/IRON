@@ -28,10 +28,10 @@ from operators import AIEBERTEncoder
 
 
 class BertLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, seq_len=512):
         super().__init__()
-        self.attention = BertAttention(config)
-        self.ffn = BertFeedForward(config)
+        self.attention = BertAttention(config, seq_len=seq_len)
+        self.ffn = BertFeedForward(config, seq_len=seq_len)
 
     def forward(
         self,
@@ -45,7 +45,7 @@ class BertLayer(nn.Module):
 
 
 class BertEncoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, seq_len=512):
         super().__init__()
         self.config = config
         offload_individual_operator = [
@@ -86,7 +86,7 @@ class BertEncoder(nn.Module):
         if config.aie_config.use_aie_bert_encoder:
             self.layer = [
                 AIEBERTEncoder(
-                    seq_len=512,
+                    seq_len=seq_len,
                     hidden_size=config.model_config.hidden_size,
                     intermediate_size=config.model_config.intermediate_size,
                     num_heads=config.model_config.num_attention_heads,
@@ -96,7 +96,7 @@ class BertEncoder(nn.Module):
         else:
             self.layer = nn.ModuleList(
                 [
-                    BertLayer(config)
+                    BertLayer(config, seq_len=seq_len)
                     for i in range(config.model_config.num_hidden_layers)
                 ]
             )

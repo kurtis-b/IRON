@@ -344,7 +344,7 @@ def load_bert_config(config_path=None):
     return config
 
 
-def classify_text(model, tokenizer, text, runs_per_sample, device="cpu"):
+def classify_text(model, tokenizer, text, runs_per_sample, device="cpu", seq_len=512):
     """
     Predict sentiment for input text(s).
 
@@ -368,7 +368,7 @@ def classify_text(model, tokenizer, text, runs_per_sample, device="cpu"):
             text,
             padding="max_length",  # Pad to max_length
             truncation=True,  # Truncate if longer than max_length
-            max_length=512,
+            max_length=seq_len,
             return_tensors="pt",  # Return PyTorch tensors
         )
     else:
@@ -377,7 +377,7 @@ def classify_text(model, tokenizer, text, runs_per_sample, device="cpu"):
             text,
             padding="max_length",  # Pad to max_length
             truncation=True,  # Truncate if longer than max_length
-            max_length=512,
+            max_length=seq_len,
             return_tensors="pt",  # Return PyTorch tensors
         )
 
@@ -428,6 +428,7 @@ def fine_tune_model(
     epochs=3,
     batch_size=8,
     learning_rate=2e-5,
+    seq_len=512,
 ):
     """
     Fine-tune the BERT model on the SST-2 training dataset.
@@ -472,7 +473,7 @@ def fine_tune_model(
             texts,
             padding="max_length",
             truncation=True,
-            max_length=512,
+            max_length=seq_len,
             return_tensors="pt",
         )
 
@@ -696,6 +697,12 @@ def main():
         help="Number of times to run inference with each sample (for calculating average latency)",
     )
     parser.add_argument(
+        "--seq_len",
+        type=int,
+        default=512,
+        help="Sequence length for BERT input",
+    )
+    parser.add_argument(
         "-v",
         action="count",
         default=0,
@@ -714,8 +721,11 @@ def main():
         # Load configuration from config.json
         config = load_bert_config(args.config_file_path)
         device = "cpu"
+        seq_len = args.seq_len
 
-        model = BertForSequenceClassification(config)
+        # Set the max sequence length in the model config and model for compilation of operations offloaded to the AIE
+        config.model_config.max_position_embeddings = seq_len
+        model = BertForSequenceClassification(config, seq_len=seq_len)
 
         # Load the weights
         combined_weights = load_file(args.weights_file_path)
@@ -764,6 +774,17 @@ def main():
         # print(combined_weights_2["bert.pooler.dense.bias"].std())
         # print("\n\n")
 
+        # Extend embeddings to 1024 rows
+        for key in ["bert.embeddings.word_embeddings.weight", 
+                "bert.embeddings.position_embeddings.weight",]:
+            if key in combined_weights:
+                original = combined_weights[key]
+                if original.shape[0] < seq_len:
+                    # Repeat or pad to reach 1024 rows
+                    num_repeats = (seq_len // original.shape[0]) + 1
+                    extended = original.repeat(num_repeats, 1)[:seq_len]
+                    combined_weights[key] = extended
+        
         model.bert.embeddings.word_embeddings.weight = assign(
             model.bert.embeddings.word_embeddings.weight,
             combined_weights["bert.embeddings.word_embeddings.weight"],
@@ -841,6 +862,7 @@ def main():
                 epochs=5,
                 batch_size=128,
                 learning_rate=2e-5,
+                seq_len=seq_len,
             )
         else:
             print("Skipping fine-tuning (use --fine-tune flag to enable)")
@@ -890,7 +912,7 @@ def main():
         for test_text, true_class in zip(texts_to_classify, true_labels):
             iteration_count = iteration_count + 1
             probabilities, logits, inference_time = classify_text(
-                model, tokenizer, test_text, args.runs_per_sample, device
+                model, tokenizer, test_text, args.runs_per_sample, device, seq_len
             )
             total_inference_time += inference_time
             predicted_class = probabilities.argmax().item()

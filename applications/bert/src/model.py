@@ -83,10 +83,10 @@ class BertPooler(nn.Module):
 
 
 class BertModel(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, seq_len=512):
         super().__init__()
         self.embeddings = BertEmbeddings(config)
-        self.encoder = BertEncoder(config)
+        self.encoder = BertEncoder(config, seq_len=seq_len)
         self.pooler = BertPooler(config)
         self.dtype = config.aie_config.dtype
 
@@ -109,11 +109,11 @@ class BertModel(nn.Module):
 
 
 class BertForSequenceClassification(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, seq_len=512):
         super().__init__()
         self.config = config
 
-        self.bert = BertModel(config)
+        self.bert = BertModel(config, seq_len=seq_len)
         self.dropout = nn.Dropout(config.model_config.hidden_dropout_prob)
         self.classifier = nn.Linear(
             config.model_config.hidden_size, config.model_config.num_labels
