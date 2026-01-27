@@ -35,23 +35,6 @@ class BertFeedForward(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        offload_individual_ffn_operator = [
-            config.aie_config.use_aie_gelu == True,
-        ]
-        assert (
-            self.config.aie_config.use_aie_ffn
-            and not any(offload_individual_ffn_operator)
-            or not self.config.aie_config.use_aie_ffn
-        ), "Cannot mix pipelined FFN with individual AIE operators."
-        offload_individual_addandnorm_operator = [
-            config.aie_config.use_aie_layernorm == True,
-            config.aie_config.use_aie_elementwise_add == True,
-        ]
-        assert (
-            self.config.aie_config.use_aie_addandnorm
-            and not any(offload_individual_addandnorm_operator)
-            or not self.config.aie_config.use_aie_addandnorm
-        ), "Cannot mix pipelined Add & Norm with individual AIE operators."
         if config.aie_config.use_aie_ffn:
             aie_ffn_config = {
                 "b_col_maj": False,
@@ -129,33 +112,40 @@ class BertFeedForward(nn.Module):
                     config.model_config.hidden_size,
                     dtype=config.aie_config.dtype,
                 )
-        if config.aie_config.use_aie_layernorm:
-            self.LayerNorm = AIELayerNorm(
+        if config.aie_config.use_aie_addandnorm:
+            self.aie_add_and_norm = AIEAddAndNorm(
                 size=512 * config.model_config.hidden_size,
-                # eps=config.model_config.layer_norm_eps,
                 num_aie_columns=8,
-                num_channels=2,
                 tile_size=config.model_config.hidden_size,
-                weights=torch.ones(config.model_config.hidden_size),
             )
         else:
-            self.LayerNorm = nn.LayerNorm(
-                config.model_config.hidden_size,
-                eps=config.model_config.layer_norm_eps,
-                dtype=config.aie_config.dtype,
-            )
+            if config.aie_config.use_aie_layernorm:
+                self.LayerNorm = AIELayerNorm(
+                    size=512 * config.model_config.hidden_size,
+                    # eps=config.model_config.layer_norm_eps,
+                    num_aie_columns=8,
+                    num_channels=2,
+                    tile_size=config.model_config.hidden_size,
+                    weights=torch.ones(config.model_config.hidden_size),
+                )
+            else:
+                self.LayerNorm = nn.LayerNorm(
+                    config.model_config.hidden_size,
+                    eps=config.model_config.layer_norm_eps,
+                    dtype=config.aie_config.dtype,
+                )
+            self.use_aie_elementwise_add = config.aie_config.use_aie_elementwise_add
+            if self.use_aie_elementwise_add:
+                eltwise_add_tile_size = (512 * config.model_config.hidden_size) // 16
+                self.aie_elementwise_add = AIEElementwiseAdd(
+                    size=512 * config.model_config.hidden_size,
+                    num_aie_columns=8,
+                    num_channels=2,
+                    tile_size=min(
+                        math.gcd(4096, eltwise_add_tile_size), eltwise_add_tile_size
+                    ),
+                )
         self.dropout = nn.Dropout(config.model_config.hidden_dropout_prob)
-        self.use_aie_elementwise_add = config.aie_config.use_aie_elementwise_add
-        if self.use_aie_elementwise_add:
-            eltwise_add_tile_size = (512 * config.model_config.hidden_size) // 16
-            self.aie_elementwise_add = AIEElementwiseAdd(
-                size=512 * config.model_config.hidden_size,
-                num_aie_columns=8,
-                num_channels=2,
-                tile_size=min(
-                    math.gcd(4096, eltwise_add_tile_size), eltwise_add_tile_size
-                ),
-            )
 
     def forward(self, hidden_states):
         input_tensor = hidden_states
@@ -166,11 +156,14 @@ class BertFeedForward(nn.Module):
             hidden_states = self.gelu(hidden_states)
             hidden_states = self.dense_down(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states)
-        if self.use_aie_elementwise_add:
-            hidden_states = self.aie_elementwise_add(hidden_states, input_tensor)
+        if self.config.aie_config.use_aie_addandnorm:
+            hidden_states = self.aie_add_and_norm(hidden_states, input_tensor)
         else:
-            hidden_states = hidden_states + input_tensor
+            hidden_states = self.LayerNorm(hidden_states)
+            if self.use_aie_elementwise_add:
+                hidden_states = self.aie_elementwise_add(hidden_states, input_tensor)
+            else:
+                hidden_states = hidden_states + input_tensor
         return hidden_states
 
     def assign_weights(
@@ -213,17 +206,21 @@ class BertFeedForward(nn.Module):
                     dense_down_b,
                     f"bert.encoder.layer.{l}.output.dense.bias",
                 )
-        if self.config.aie_config.use_aie_layernorm:
-            self.LayerNorm.weight = layernorm_w
+        if self.config.aie_config.use_aie_addandnorm:
+            self.aie_add_and_norm.weight = layernorm_w
             # TODO: Need to implement bias assignment
         else:
-            assign(
-                self.LayerNorm.weight,
-                layernorm_w,
-                f"bert.encoder.layer.{l}.output.LayerNorm.gamma",
-            )
-            assign(
-                self.LayerNorm.bias,
-                layernorm_b,
-                f"bert.encoder.layer.{l}.output.LayerNorm.beta",
-            )
+            if self.config.aie_config.use_aie_layernorm:
+                self.LayerNorm.weight = layernorm_w
+                # TODO: Need to implement bias assignment
+            else:
+                assign(
+                    self.LayerNorm.weight,
+                    layernorm_w,
+                    f"bert.encoder.layer.{l}.output.LayerNorm.gamma",
+                )
+                assign(
+                    self.LayerNorm.bias,
+                    layernorm_b,
+                    f"bert.encoder.layer.{l}.output.LayerNorm.beta",
+                )

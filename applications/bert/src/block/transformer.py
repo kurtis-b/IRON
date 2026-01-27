@@ -64,6 +64,25 @@ class BertEncoder(nn.Module):
             and not any(offload_individual_operator)
             or not self.config.aie_config.use_aie_bert_encoder
         ), "Cannot mix Encoder runlist with individual AIE operators."
+        offload_individual_ffn_operator = [
+            # Don't check for aie gemm here since it's used in attention too
+            config.aie_config.use_aie_gelu
+            == True,
+        ]
+        assert (
+            self.config.aie_config.use_aie_ffn
+            and not any(offload_individual_ffn_operator)
+            or not self.config.aie_config.use_aie_ffn
+        ), "Cannot mix pipelined FFN with individual AIE operators."
+        offload_individual_addandnorm_operator = [
+            config.aie_config.use_aie_layernorm == True,
+            config.aie_config.use_aie_elementwise_add == True,
+        ]
+        assert (
+            self.config.aie_config.use_aie_addandnorm
+            and not any(offload_individual_addandnorm_operator)
+            or not self.config.aie_config.use_aie_addandnorm
+        ), "Cannot mix pipelined Add & Norm with individual AIE operators."
         if config.aie_config.use_aie_bert_encoder:
             self.layer = [
                 AIEBERTEncoder(
