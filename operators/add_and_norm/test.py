@@ -19,15 +19,10 @@ TEST_BERT = True
 def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
-            # input_length,num_aie_columns,tile_size,layer_norm_stage
-            # Layer norm at eltwise add stage
-            (393216, 8, 768, 0),
-            (393216, 4, 768, 0),
-            (393216, 2, 768, 0),
-            # Layer norm at eltwise mul stage
-            (393216, 8, 768, 1),
-            (393216, 4, 768, 1),
-            (393216, 2, 768, 1),
+            # input_length,num_aie_columns,tile_size
+            (393216, 8, 768),
+            (393216, 4, 768),
+            (393216, 2, 768),
         ]
         extensive_params = []
     else:
@@ -42,9 +37,8 @@ def generate_test_params(extensive=False):
         input_length,
         num_aie_columns,
         tile_size,
-        layer_norm_stage,
     ) in params:
-        name = f"add_and_norm_{num_aie_columns}cols_{input_length}_tile_{tile_size}_lnstage_{layer_norm_stage}"
+        name = f"add_and_norm_{num_aie_columns}cols_{input_length}_tile_{tile_size}"
         names.append(name)
 
     return params, names
@@ -68,14 +62,13 @@ all_params = [
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "input_length,num_aie_columns,tile_size,layer_norm_stage",
+    "input_length,num_aie_columns,tile_size",
     all_params,
 )
 def test_layer_norm(
     input_length,
     num_aie_columns,
     tile_size,
-    layer_norm_stage,
     aie_context,
 ):
 
@@ -88,7 +81,6 @@ def test_layer_norm(
         num_aie_columns=num_aie_columns,
         tile_size=tile_size,
         weights=golden_ref["weight"],
-        layer_norm_stage=layer_norm_stage,
         context=aie_context,
     )
 

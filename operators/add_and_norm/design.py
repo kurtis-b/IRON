@@ -34,7 +34,6 @@ def my_weighted_layer_norm(
     num_columns,
     weight_length,
     weight_file_path,
-    layer_norm_stage,
     kernel_archive_path,
     trace_size,
 ):
@@ -102,34 +101,25 @@ def my_weighted_layer_norm(
     )
 
     # Define a task that will run on a compute tile
-    def core_body_norm(of_in1, of_in2, of_out1, add, layer_norm):
+    def core_body_stg1(of_in1, of_out1, layer_norm):
         # Number of sub-vector "tile" iterations
         for _ in range_(N_div_n):
             elem_in1 = of_in1.acquire(1)
-            elem_in2 = of_in2.acquire(1)
             elem_out = of_out1.acquire(1)
-            add(elem_in1, elem_in2, elem_out, per_tile_elements * rows_to_process)
-            if layer_norm_stage == 0:
-                layer_norm(elem_out, elem_out, per_tile_elements, rows_to_process)
+            layer_norm(elem_in1, elem_out, per_tile_elements, rows_to_process)
             of_in1.release(1)
-            of_in2.release(1)
             of_out1.release(1)
 
-    def core_body_mul(of_in1, weights, of_out2, eltwise_mul, layer_norm):
+    def core_body_stg2(of_in1, of_in2, weights, of_out2, eltwise_mul, add):
         # Number of sub-vector "tile" iterations
         for _ in range_(N_div_n):
             elem_in1 = of_in1.acquire(1)
             elem_out = of_out2.acquire(1)
-            if layer_norm_stage == 1:
-                layer_norm(elem_in1, elem_out, per_tile_elements, rows_to_process)
-                eltwise_mul(
-                    elem_out, weights, elem_out, per_tile_elements, rows_to_process
-                )
-            else:
-                eltwise_mul(
-                    elem_in1, weights, elem_out, per_tile_elements, rows_to_process
-                )
+            eltwise_mul(elem_in1, weights, elem_out, per_tile_elements, rows_to_process)
             of_in1.release(1)
+            elem_in2 = of_in2.acquire(1)
+            add(elem_out, elem_in2, elem_out, per_tile_elements * rows_to_process)
+            of_in2.release(1)
             of_out2.release(1)
 
     # Create workers to run the task on compute tiles,
@@ -143,25 +133,24 @@ def my_weighted_layer_norm(
         )
         my_workers.append(
             Worker(
-                core_body_norm,
+                core_body_stg1,
                 [
                     of_in1s[i].cons(),
-                    of_in2s[i].cons(),
                     of_out1s[i].prod(),
-                    eltwise_add_kernel,
                     layer_norm_kernel,
                 ],
             )
         )
         my_workers.append(
             Worker(
-                core_body_mul,
+                core_body_stg2,
                 [
                     of_out1s[i].cons(),
+                    of_in2s[i].cons(),
                     weights_buffer,
                     of_out2s[i].prod(),
                     eltwise_mul_kernel,
-                    layer_norm_kernel,
+                    eltwise_add_kernel,
                 ],
             )
         )
@@ -263,15 +252,6 @@ if __name__ == "__main__":
         dest="weight_file",
         help="Static weight values are expected to be saved in a numpy .npy file so they can be preloaded to buffers at compile time",
     )
-    # Layer norm stage (0: at eltwise add, 1: at eltwise mul)
-    p.add_argument(
-        "-ln",
-        "--layer-norm-stage",
-        required=True,
-        dest="layer_norm_stage",
-        choices=["0", "1"],
-        help="Layer norm stage",
-    )
     # Kernel archive
     p.add_argument(
         "-ka",
@@ -324,7 +304,6 @@ if __name__ == "__main__":
         columns,
         weight_length,
         weight_file_path,
-        int(opts.layer_norm_stage),
         opts.kernel_archive,
         trace_size,
     )

@@ -29,7 +29,6 @@ class AIEAddAndNorm(AIEOperatorBase):
         num_aie_columns=None,
         tile_size=None,
         weights=None,
-        layer_norm_stage=0,
         trace_size=0,
         context=None,
     ):
@@ -48,14 +47,15 @@ class AIEAddAndNorm(AIEOperatorBase):
         self.insts_artifact = None
 
         self.weight = weights
-        self.layer_norm_stage = layer_norm_stage
 
         AIEOperatorBase.__init__(self, context=context)
 
     def get_artifacts(self, prefix="weighted_layer_norm_"):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
-        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.size}_{self.tile_size}t_lnstage_{self.layer_norm_stage}"
+        file_name_base = (
+            f"{prefix}{self.num_aie_columns}c_{self.size}_{self.tile_size}t_lnstage"
+        )
 
         # Save the weight weights to a npy file so that the design.py can load it at compile time
         weight_file_name = (
@@ -75,7 +75,6 @@ class AIEAddAndNorm(AIEOperatorBase):
                 self.num_aie_columns,
                 self.tile_size,
                 weight_file_name,
-                self.layer_norm_stage,
                 kernel_archive,
                 0,
             ],
