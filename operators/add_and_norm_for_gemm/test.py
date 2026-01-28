@@ -9,8 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from operators.add_and_norm.op import AIEAddAndNorm
-from operators.add_and_norm.reference import generate_golden_reference
+from operators.add_and_norm_for_gemm.op import AIEAddAndNorm
+from operators.add_and_norm_for_gemm.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 TEST_BERT = True
@@ -19,10 +19,11 @@ TEST_BERT = True
 def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
-            # input_length,num_aie_columns,tile_size
-            (393216, 8, 768),
-            (393216, 4, 768),
-            (393216, 2, 768),
+            # M, K, m, k, t, num_aie_columns
+            # (512, 768, 4, 192, 8, 8),
+            # (512, 768, 4, 192, 8, 4),
+            # (512, 768, 4, 192, 8, 2),
+            (512, 768, 4, 192, 8, 1),
         ]
         extensive_params = []
     else:
@@ -34,11 +35,14 @@ def generate_test_params(extensive=False):
 
     names = []
     for (
-        input_length,
+        M,
+        K,
+        m,
+        k,
+        t,
         num_aie_columns,
-        tile_size,
     ) in params:
-        name = f"add_and_norm_{num_aie_columns}cols_{input_length}_tile_{tile_size}"
+        name = f"add_and_norm_{num_aie_columns}cols_{M}x{K}_tile_{m}x{k}x{t}"
         names.append(name)
 
     return params, names
@@ -62,24 +66,28 @@ all_params = [
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "input_length,num_aie_columns,tile_size",
+    "M,K,m,k,t,num_aie_columns",
     all_params,
 )
 def test_layer_norm(
-    input_length,
+    M,
+    K,
+    m,
+    k,
+    t,
     num_aie_columns,
-    tile_size,
     aie_context,
 ):
 
-    rows = input_length // tile_size
-    cols = tile_size
-    golden_ref = generate_golden_reference(rows=rows, cols=cols)
+    golden_ref = generate_golden_reference(M=M, K=K, m=m, k=k, t=t)
 
     operator = AIEAddAndNorm(
-        size=input_length,
+        M=M,
+        K=K,
+        m=m,
+        k=k,
+        t=t,
         num_aie_columns=num_aie_columns,
-        tile_size=tile_size,
         weights=golden_ref["weight"],
         context=aie_context,
     )
@@ -106,7 +114,7 @@ def test_layer_norm(
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
     error_threshold = 0.005
-    max_acceptable_errors = int(input_length * error_threshold)
+    max_acceptable_errors = int(M * K * error_threshold)
 
     if errors:
         logging.info(

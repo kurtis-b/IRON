@@ -25,24 +25,27 @@ class AIEAddAndNorm(AIEOperatorBase):
 
     def __init__(
         self,
-        size,
+        M=512,
+        K=768,
+        m=4,
+        k=192,
+        t=8,
         num_aie_columns=None,
-        tile_size=None,
         weights=None,
         trace_size=0,
         context=None,
         skip_add_to_list=False,
     ):
-        max_multiple = num_aie_columns * tile_size
-        padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
-        self.orig_size = size
-        self.size = padded_size
-        self.tile_size = tile_size
+        self.M = M
+        self.K = K
+        self.m = m
+        self.k = k
+        self.t = t
         self.trace_size = trace_size
         self.num_aie_columns = num_aie_columns
 
-        total_shimdma_channels = self.num_aie_columns
-        assert total_shimdma_channels <= 16, "Conservative ShimDMA limit"
+        used_shimdma_channels = self.num_aie_columns
+        assert used_shimdma_channels <= 16, "Conservative ShimDMA limit"
 
         self.xclbin_artifact = None
         self.insts_artifact = None
@@ -53,17 +56,13 @@ class AIEAddAndNorm(AIEOperatorBase):
             self, context=context, skip_add_to_list=skip_add_to_list
         )
 
-    def get_artifacts(self, prefix="weighted_layer_norm_"):
+    def get_artifacts(self, prefix="weighted_layer_norm_alt_"):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
-        file_name_base = (
-            f"{prefix}{self.num_aie_columns}c_{self.size}_{self.tile_size}t"
-        )
+        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.M}x{self.K}_{self.m}x{self.k}x{self.t}"
 
         # Save the weight weights to a npy file so that the design.py can load it at compile time
-        weight_file_name = (
-            self.context.build_dir / f"{file_name_base}_weights_{self.tile_size}.npy"
-        )
+        weight_file_name = self.context.build_dir / f"{file_name_base}_weights.npy"
         np.save(weight_file_name, torch_to_numpy(self.weight))
 
         kernel_archive = f"{file_name_base}_layer_norm_archive.a"
@@ -74,9 +73,12 @@ class AIEAddAndNorm(AIEOperatorBase):
             callback_fn="my_weighted_layer_norm",
             callback_args=[
                 self.context.device_manager.device_type,
-                self.size,
+                self.M,
+                self.K,
+                self.m,
+                self.k,
+                self.t,
                 self.num_aie_columns,
-                self.tile_size,
                 weight_file_name,
                 kernel_archive,
                 0,
@@ -131,9 +133,9 @@ class AIEAddAndNorm(AIEOperatorBase):
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
-        self.add_buffer("input1", self.size)
-        self.add_buffer("input2", self.size)
-        self.add_buffer("output", self.size)
+        self.add_buffer("input1", self.M * self.K)
+        self.add_buffer("input2", self.M * self.K)
+        self.add_buffer("output", self.M * self.K)
         self.add_kernel(
             "add_and_norm",
             self.xclbin_artifact,
@@ -147,10 +149,10 @@ class AIEAddAndNorm(AIEOperatorBase):
         applicable = (
             len(x.shape) >= 1
             and len(y.shape) >= 1
-            and x.shape[-1] <= self.size
-            and y.shape[-1] <= self.size
-            and x.numel() <= self.size
-            and y.numel() <= self.size
+            and x.shape[-1] <= self.K
+            and y.shape[-1] <= self.K
+            and x.numel() <= self.M * self.K
+            and y.numel() <= self.M * self.K
             and x.numel() == y.numel()
             and x.shape == y.shape
         )
@@ -165,7 +167,7 @@ class AIEAddAndNorm(AIEOperatorBase):
         x_flat = x.reshape(batch, -1)
         y_flat = y.reshape(batch, -1)
 
-        pad_len = self.size - x_flat.shape[1]
+        pad_len = self.M * self.K - x_flat.shape[1]
         if pad_len > 0:
             x_flat = torch.nn.functional.pad(x_flat, (0, pad_len))
             y_flat = torch.nn.functional.pad(y_flat, (0, pad_len))
@@ -191,9 +193,9 @@ class AIEAddAndNorm(AIEOperatorBase):
         y_flat = y.view(-1)
 
         # Verify size matches expected
-        if len(x_flat) != self.size or len(y_flat) != self.size:
+        if len(x_flat) != self.M * self.K or len(y_flat) != self.M * self.K:
             raise AIEOperatorConstraintError(
-                f"Input size x={len(x_flat)}, y={len(y_flat)} doesn't match configured size {self.size}"
+                f"Input size x={len(x_flat)}, y={len(y_flat)} doesn't match configured size {self.M * self.K}"
             )
 
         self.write_buffer("input1", x_flat)

@@ -137,9 +137,9 @@ def my_weighted_layer_norm(
     taps = [
         TensorAccessPattern(
             (1, M * K),
-            iters_per_core * K * i,
-            [1, 1, 1, iters_per_core * K],
-            [0, 0, 0, 1],
+            iters_per_core * m * K * i,
+            [1, K_div_k * iters_per_core, m, k],
+            [0, k, K, 1],
         )
         for i in range(num_columns)
     ]
