@@ -20,9 +20,9 @@ def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
             # M, K, m, k, s, num_aie_columns
-            # (512, 768, 4, 192, 8, 8),
-            # (512, 768, 4, 192, 8, 4),
-            # (512, 768, 4, 192, 8, 2),
+            (512, 768, 4, 192, 8, 8),
+            (512, 768, 4, 192, 8, 4),
+            (512, 768, 4, 192, 8, 2),
             (512, 768, 4, 192, 8, 1),
         ]
         extensive_params = []
