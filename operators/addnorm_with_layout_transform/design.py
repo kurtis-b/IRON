@@ -91,15 +91,13 @@ def my_weighted_layer_norm(
         )
 
     # AIE Core Function declaration
-    # Technically an array of pointers are passed as inputs and outputs
-    # to the kernels, but these kernel declarations here don't reflect that.
     fused_add_layer_norm_kernel = Kernel(
-        "fused_add_layer_norm",
+        "fused_add_layer_norm_1outs",
         kernel_archive_path,
         [tile_ty, tile_ty, weights_ty, tile_ty, np.int32, np.int32],
     )
     mem_copy_kernel = Kernel(
-        "ln_passThroughTile",
+        "ln_passThroughTile_out",
         kernel_archive_path,
         [tile_ty, out_ty, np.int32, np.int32, np.int32, np.int32],
     )
