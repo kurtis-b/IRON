@@ -170,13 +170,11 @@ class AIEANFFN(AIEOperatorBase):
 
         # Save the weight weights to a npy file so that the design.py can load it at compile time
         ln1_weight_file_name = (
-            self.context.build_dir
-            / f"{file_name_total_base}_ln1_weight_{self.tile_size}.npy"
+            self.context.build_dir / f"{file_name_total_base}_ln1_weight_{self.K}.npy"
         )
         np.save(ln1_weight_file_name, torch_to_numpy(self.ln1_weight))
         ln2_weight_file_name = (
-            self.context.build_dir
-            / f"{file_name_total_base}_ln2_weight_{self.tile_size}.npy"
+            self.context.build_dir / f"{file_name_total_base}_ln2_weight_{self.K}.npy"
         )
         np.save(ln2_weight_file_name, torch_to_numpy(self.ln2_weight))
 
@@ -270,6 +268,20 @@ class AIEANFFN(AIEOperatorBase):
                                 )
                             ],
                         ),
+                        KernelObjectArtifact.new(
+                            f"fused_layer_norm_{tile_m}x{tile_k}x{tile_n}.o",
+                            depends=[
+                                SourceArtifact.new(
+                                    self.context.base_dir
+                                    / "aie_kernels"
+                                    / "aie2p"
+                                    / "encoder.cc"
+                                )
+                            ],
+                            extra_flags=[
+                                "-DADD_NORM_LAYER",
+                            ],
+                        ),
                     ],
                 ),
             ],
@@ -315,20 +327,25 @@ class AIEANFFN(AIEOperatorBase):
             self.insts_artifact,
         )
         self.add_buffer("A", self.M * self.K)
+        self.add_buffer("R", self.M * self.K)
         self.add_buffer("B_Up", self.K * self.N, static_data=static_weights_up_proj)
         self.add_buffer("B_Down", self.K * self.N, static_data=static_weights_down_proj)
         self.add_buffer("C", self.M * self.K)
-        self.add_to_runlist("anffn", "A", "B_Up", "B_Down", "C")
+        self.add_to_runlist("anffn", "A", "R", "B_Up", "B_Down", "C")
 
-    def forward(self, A, B_Up=None, B_Down=None):
-        """Forward pass through ANFFN block: C = GeLU(A @ B_Up) @ B_Down"""
+    def forward(self, A, R, B_Up=None, B_Down=None):
+        """Forward pass through ANFFN block: R2 = LN(A) + R, C = LN(GeLU(R2 @ B_Up) @ B_Down) + R2"""
         B_Up_shape = B_Up.shape if B_Up is not None else self.weight_up_proj.T.shape
         B_Down_shape = (
             B_Down.shape if B_Down is not None else self.weight_down_proj.T.shape
         )
         expected_output_shape = A.shape
+        if expected_output_shape != R.shape:
+            raise AIEOperatorConstraintError(
+                "AIEANFFN: input A and residual R must have the same shape"
+            )
 
-        # Remove down_proj_depth dimension, if any
+        # Remove batch dimension, if any
         if len(A.shape) > 2:
             A = A.view(-1, A.shape[-1])
         if B_Up is not None and len(B_Up.shape) > 2:
@@ -352,6 +369,7 @@ class AIEANFFN(AIEOperatorBase):
             raise AIEOperatorConstraintError("AIEANFFN: incompatible tensor shape(s)")
 
         A_padded = self._pad_A(torch_to_numpy(A))
+        R_padded = self._pad_A(torch_to_numpy(R))
         if B_Up is not None:
             B_Up_padded = self._pad_B(torch_to_numpy(B_Up), b_col_maj=False)
         else:
@@ -370,8 +388,9 @@ class AIEANFFN(AIEOperatorBase):
         result_padded = np.zeros((M, self.K), dtype=A_padded.dtype)
         for M_lo in range(0, M, self.M):
             A_part = A_padded[M_lo : M_lo + self.M, :]
+            R_part = R_padded[M_lo : M_lo + self.M, :]
             result_part = self._execute_aie_operation(
-                A_part, B_Up_padded, B_Down_padded
+                A_part, R_part, B_Up_padded, B_Down_padded
             )
             max_M = min(M_lo + self.M, M)
             result_padded[M_lo:max_M, :] = result_part[:max_M, :]
@@ -424,7 +443,7 @@ class AIEANFFN(AIEOperatorBase):
             B_padded[:dim1_end, :dim2_end] = B_np
         return B_padded
 
-    def _execute_aie_operation(self, A_np, B_Up_np=None, B_Down_np=None):
+    def _execute_aie_operation(self, A_np, R_np, B_Up_np=None, B_Down_np=None):
         """Execute ANFFN operation on AIE hardware"""
         M, K = A_np.shape
         K2, N = B_Up_np.shape if B_Up_np is not None else self.weight_up_proj.T.shape
@@ -440,6 +459,7 @@ class AIEANFFN(AIEOperatorBase):
         assert N == N2 and N == self.N
 
         self.write_buffer("A", A_np)
+        self.write_buffer("R", R_np)
         if B_Up_np is not None:
             self.write_buffer("B_Up", B_Up_np)
         if B_Down_np is not None:

@@ -223,12 +223,15 @@ def test_ffn(
         tile_n=n,
         down_proj_depth=down_proj_depth,
         num_aie_columns=num_aie_columns,
+        ln1_weight=golden_ref["weight1"],
+        ln2_weight=golden_ref["weight2"],
         context=aie_context,
         **aie_ffn_config,
     )
 
     input_buffers = {
         "A": golden_ref["input"].flatten(),
+        "R": golden_ref["input_residual"].flatten(),
         "B_Up": golden_ref["input_b_up"].flatten(),
         "B_Down": golden_ref["input_b_down"].flatten(),
     }

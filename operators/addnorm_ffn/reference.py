@@ -48,13 +48,15 @@ def generate_golden_reference(
     # Generate input tensor (M, K)
     if debug_mode:
         input_tensor = torch.zeros(M, K, dtype=dtype_torch)
-        ln_weights = torch.zeros(K, dtype=dtype_torch)
+        ln1_weights = torch.zeros(K, dtype=dtype_torch)
+        ln2_weights = torch.zeros(K, dtype=dtype_torch)
     else:
         input_tensor = torch.rand(M, K, dtype=dtype_torch) * val_range
-        ln_weights = torch.rand(K, dtype=dtype_torch) * val_range
+        ln1_weights = torch.rand(K, dtype=dtype_torch) * val_range
+        ln2_weights = torch.rand(K, dtype=dtype_torch) * val_range
 
     layer_norm1_output = torch.nn.functional.layer_norm(
-        input_tensor, normalized_shape=(K,), weight=ln_weights, bias=None
+        input_tensor, normalized_shape=(K,), weight=ln1_weights, bias=None
     )
 
     # Generate input for residual addition (M, K)
@@ -88,7 +90,7 @@ def generate_golden_reference(
 
     # Final layer norm
     layer_norm2_output = torch.nn.functional.layer_norm(
-        down_proj_output, normalized_shape=(K,), weight=ln_weights, bias=None
+        down_proj_output, normalized_shape=(K,), weight=ln2_weights, bias=None
     )
 
     # Final addition with residual
@@ -99,5 +101,7 @@ def generate_golden_reference(
         "input_residual": input_residual,
         "input_b_up": up_weight,
         "input_b_down": down_weight,
+        "weight1": ln1_weights,
+        "weight2": ln2_weights,
         "output": output,
     }
