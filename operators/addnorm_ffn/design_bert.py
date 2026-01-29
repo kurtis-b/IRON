@@ -38,6 +38,18 @@ microkernel_mac_dim_map = {
     },
 }
 
+DATA_MEM_SIZE = 65536  # L1 size in bytes
+
+
+def ln_rows_to_process(num_elements, weight_length):
+    # Determine per-tile elements based on weight_length
+    for i in range(1, num_elements // weight_length):
+        per_tile_elements = weight_length * i
+        # 2 input + 1 output + weight vector for second stage, bf16, double buffering
+        if (per_tile_elements * 3 + weight_length) * 2 * 2 > DATA_MEM_SIZE:
+            return i - 1
+    return num_elements // weight_length
+
 
 def main():
     argparser = argparse.ArgumentParser(
@@ -80,6 +92,18 @@ def main():
         choices=["bf16", "f32"],
         default="bf16",
     )
+    argparser.add_argument(
+        "--ln1-w-file",
+        required=True,
+        type=str,
+        help="File path for the first layer norm weights",
+    )
+    argparser.add_argument(
+        "--ln2-w-file",
+        required=True,
+        type=str,
+        help="File path for the second layer norm weights",
+    )
     argparser.add_argument("--trace_size", type=int, default=0)
     argparser.add_argument(
         "--stage-only",
@@ -120,6 +144,8 @@ def main():
         args.emulate_bf16_mmul_with_bfp16,
         args.trace_size,
         arga.gelu_stage,
+        Path(args.ln1_w_file),
+        Path(args.ln2_w_file),
         args.stage_only,
         args.archive,
         args.generate_taps,
@@ -156,10 +182,19 @@ def my_matmul(
     emulate_bf16_mmul_with_bfp16,
     trace_size,
     gelu_stage,
+    ln1_weight_file,
+    ln2_weight_file,
     stage_only=None,
     archive=None,
     generate_taps=False,
 ):
+    static_ln1_weights = np.load(ln1_weight_file)
+    if static_ln1_weights.shape[0] != K:
+        raise ValueError("Static ln1 weights length does not match K")
+    static_ln2_weights = np.load(ln2_weight_file)
+    if static_ln2_weights.shape[0] != K:
+        raise ValueError("Static ln2 weights length does not match K")
+
     if n_aie_cols < 2:
         raise AssertionError(
             "n_aie_cols must be at least 2 due to 3 inputs (A, B_Up, B_Down)"

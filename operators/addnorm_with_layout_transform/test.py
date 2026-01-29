@@ -9,8 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from operators.add_and_norm_for_gemm.op import AIEAddAndNorm
-from operators.add_and_norm_for_gemm.reference import generate_golden_reference
+from operators.addnorm_with_layout_transform.op import AIEAddAndNorm
+from operators.addnorm_with_layout_transform.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 TEST_BERT = True
@@ -42,7 +42,7 @@ def generate_test_params(extensive=False):
         s,
         num_aie_columns,
     ) in params:
-        name = f"add_and_norm_{num_aie_columns}cols_{M}x{K}_tile_{m}x{k}_sub{s}"
+        name = f"addnorm_{num_aie_columns}cols_{M}x{K}_tile_{m}x{k}_sub{s}"
         names.append(name)
 
     return params, names

@@ -246,7 +246,7 @@ class BertSelfOutput(nn.Module):
                 dtype=config.aie_config.dtype,
             )
         if config.aie_config.use_aie_addandnorm:
-            self.aie_add_and_norm = AIEAddAndNorm(
+            self.aie_addnorm = AIEAddAndNorm(
                 size=seq_len * config.model_config.hidden_size,
                 num_aie_columns=8,
                 tile_size=config.model_config.hidden_size,
@@ -286,7 +286,7 @@ class BertSelfOutput(nn.Module):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
         if self.config.aie_config.use_aie_addandnorm:
-            hidden_states = self.aie_add_and_norm(hidden_states, input_tensor)
+            hidden_states = self.aie_addnorm(hidden_states, input_tensor)
         else:
             hidden_states = self.LayerNorm(hidden_states)
             if self.use_aie_elementwise_add:
@@ -311,7 +311,7 @@ class BertSelfOutput(nn.Module):
                 f"bert.encoder.layer.{l}.attention.output.dense.bias",
             )
         if self.config.aie_config.use_aie_addandnorm:
-            self.aie_add_and_norm.weight = layernorm_w
+            self.aie_addnorm.weight = layernorm_w
             # TODO: Need to implement bias assignment
         else:
             if self.config.aie_config.use_aie_layernorm:

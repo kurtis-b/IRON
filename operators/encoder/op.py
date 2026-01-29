@@ -24,7 +24,7 @@ from operators.elementwise_add.op import AIEElementwiseAdd
 from operators.gelu.op import AIEGELU
 from operators.transpose.op import AIETranspose
 from operators.ffn.op import AIEFFN
-from operators.add_and_norm.op import AIEAddAndNorm
+from operators.addnorm.op import AIEAddAndNorm
 from operators.mha.op import AIEMHA
 from operators.common.utils import torch_to_numpy
 
