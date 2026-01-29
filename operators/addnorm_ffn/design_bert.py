@@ -57,18 +57,16 @@ def main():
         description="Emits MLIR code for a matrix multiplication design of the given input size",
     )
     argparser.add_argument("--dev", type=str, choices=["npu", "npu2"], default="npu2")
-    argparser.add_argument("-M", type=int, default=512)
-    argparser.add_argument("-K", type=int, default=768)
-    argparser.add_argument("-N", type=int, default=3072)
+    argparser.add_argument("-M", type=int, default=64)
+    argparser.add_argument("-K", type=int, default=48)
+    argparser.add_argument("-N", type=int, default=96)
     argparser.add_argument("-m", type=int, default=64)
     argparser.add_argument("-k", type=int, default=48)
     argparser.add_argument("-n", type=int, default=96)
     argparser.add_argument("--down-proj-depth", type=int, default=1)
-    argparser.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=8)
-    argparser.add_argument("--n-a-tiles-distributed", type=int, default=8)
-    argparser.add_argument("--n-b-tiles-distributed", type=int, default=2)
-    # Whether to use the scalar kernel; this is low, but can be useful for debugging smaller sizes
-    argparser.add_argument("--scalar", type=bool, choices=[0, 1], default=0)
+    argparser.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=2)
+    argparser.add_argument("--n-a-tiles-distributed", type=int, default=1)
+    argparser.add_argument("--n-b-tiles-distributed", type=int, default=1)
     argparser.add_argument(
         "--emulate-bf16-mmul-with-bfp16", action="store_true", default=True
     )
@@ -94,14 +92,14 @@ def main():
     )
     argparser.add_argument(
         "--ln1-w-file",
-        required=True,
         type=str,
+        default=None,
         help="File path for the first layer norm weights",
     )
     argparser.add_argument(
         "--ln2-w-file",
-        required=True,
         type=str,
+        default=None,
         help="File path for the second layer norm weights",
     )
     argparser.add_argument("--trace_size", type=int, default=0)
@@ -140,12 +138,11 @@ def main():
         args.n_b_tiles_distributed,
         args.dtype_in,
         args.dtype_out,
-        args.scalar,
         args.emulate_bf16_mmul_with_bfp16,
         args.trace_size,
-        arga.gelu_stage,
-        Path(args.ln1_w_file),
-        Path(args.ln2_w_file),
+        args.gelu_stage,
+        args.ln1_w_file,
+        args.ln2_w_file,
         args.stage_only,
         args.archive,
         args.generate_taps,
@@ -178,7 +175,6 @@ def my_matmul(
     n_b_tiles_distributed,
     dtype_in_str,
     dtype_out_str,
-    use_scalar,
     emulate_bf16_mmul_with_bfp16,
     trace_size,
     gelu_stage,
@@ -188,16 +184,26 @@ def my_matmul(
     archive=None,
     generate_taps=False,
 ):
-    static_ln1_weights = np.load(ln1_weight_file)
-    if static_ln1_weights.shape[0] != K:
-        raise ValueError("Static ln1 weights length does not match K")
-    static_ln2_weights = np.load(ln2_weight_file)
-    if static_ln2_weights.shape[0] != K:
-        raise ValueError("Static ln2 weights length does not match K")
+
+    if (
+        ln1_weight_file is None or ln2_weight_file is None
+    ):  # Generate default weights if not provided
+        logging.warning(
+            "Layer norm weight files not provided; using default weights of all ones."
+        )
+        static_ln1_weights = np.ones(K, dtype=np.float32)
+        static_ln2_weights = np.ones(K, dtype=np.float32)
+    else:
+        static_ln1_weights = np.load(ln1_weight_file)
+        if static_ln1_weights.shape[0] != K:
+            raise ValueError("Static ln1 weights length does not match K")
+        static_ln2_weights = np.load(ln2_weight_file)
+        if static_ln2_weights.shape[0] != K:
+            raise ValueError("Static ln2 weights length does not match K")
 
     if n_aie_cols < 2:
         raise AssertionError(
-            "n_aie_cols must be at least 2 due to 3 inputs (A, B_Up, B_Down)"
+            "n_aie_cols must be at least 2 due to 4 inputs (A, R, B_Up, B_Down)"
         )
     # n_aie_cols will be used to determine whether to send the same data to through different shim tiles, while
     # n_b_tiles_distributed will be used to determine what data to send through which shim tiles
@@ -205,18 +211,20 @@ def my_matmul(
     # There's 2 pipeline stages, and both use the same n_b_tiles_distributed parameter since the core fcn loops are the same
     shim_dma_ch_per_col = 2
     cores_per_col = 4
+    ln_cores_per_na = 2  # 2 cores will generate the ln outputs, which for the first stage will be broadcast to the down proj cores without using MT
     num_pipeline_stages = 2  # Fused Up projection-GeLU and down projection stages
     n_aie_cores_needed = n_a_tiles_distributed * (
-        num_pipeline_stages * n_b_tiles_distributed
+        ln_cores_per_na + num_pipeline_stages * n_b_tiles_distributed
     )  # 2 stages with a separate B input for each stage
     n_dup_shim_b_streams = (
-        n_aie_cols * shim_dma_ch_per_col - n_a_tiles_distributed
+        n_aie_cols * shim_dma_ch_per_col
+        - n_a_tiles_distributed * 2  # A and R input per A tile
     ) // (
         n_b_tiles_distributed * num_pipeline_stages
     )  # 1 means no duplication, 2 means each B stream is duplicated once through another shim DMA channel, etc.
     if n_dup_shim_b_streams < 1:
         raise AssertionError(
-            f"Not enough AIE columns to distribute the A and B tiles needed (1 shim DMA channel * {n_a_tiles_distributed} for A and 1 shim DMA channel * {n_b_tiles_distributed} * {num_pipeline_stages} for B per pipeline stage)"
+            f"Not enough AIE columns to distribute the A and B tiles needed (2 shim DMA channel * {n_a_tiles_distributed} for A and 1 shim DMA channel * {n_b_tiles_distributed} * {num_pipeline_stages} for B per pipeline stage)"
         )
     elif n_dup_shim_b_streams > n_a_tiles_distributed:
         n_dup_shim_b_streams = n_a_tiles_distributed
@@ -228,6 +236,11 @@ def my_matmul(
     logging.debug(
         f"n_aie_cores_needed:{n_aie_cores_needed}, n_dup_shim_b_streams:{n_dup_shim_b_streams}, mem_tile_n:{mem_tile_n}"
     )
+
+    # Calculate RTP values for the reduction loop and total C tiles
+    K_div_k = K // k
+    n_c_up_col_tiles_per_core = N // mem_tile_n
+    n_c_row_tiles_per_core = M // m // n_a_tiles_distributed
 
     assert np.issubdtype(dtype_in, np.integer) == np.issubdtype(
         dtype_out, np.integer
@@ -266,6 +279,20 @@ def my_matmul(
             "Invalid configuration: NPU2 (Strix/Strix Halo/Krackan) has 4 rows per column"
         )
 
+    # Add & Norm checks:
+    if static_ln1_weights.shape[0] != K:
+        raise ValueError(
+            "Static ln1 weights length does not match the specified weight length"
+        )
+    if static_ln2_weights.shape[0] != K:
+        raise ValueError(
+            "Static ln2 weights length does not match the specified weight length"
+        )
+    assert (
+        M % (n_a_tiles_distributed * m // 2) == 0
+    ), "M must be multiple of n_a_tiles_distributed * m // 2"
+
+    # FFN checks:
     # Input matrix A and output matrix C_Down:
     # Conceptually, we divide input A into (m * n_rows, k)-sized blocks. These
     # blocks are _broadcast_ across AIE core columns, then _distributed_ across
@@ -301,10 +328,9 @@ def my_matmul(
     ), """Partial C_Down must be tileable into (m, k * down_proj_depth)-sized blocks"""
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
-    if not use_scalar:
-        assert m % r == 0
-        assert k % s == 0
-        assert n % t == 0
+    assert m % r == 0
+    assert k % s == 0
+    assert n % t == 0
 
     # If you get errors during CDO generation due to running out of program
     # memory, it may be because too much code is generated due to ObjectFIFO
@@ -343,15 +369,14 @@ def my_matmul(
     C_down_proj_l1_ty = np.ndarray[(m, k), np.dtype[dtype_out]]
 
     # AIE Core Function declarations
-    scalar_suffix = "_scalar" if use_scalar else ""
     archive_name = f"ffn_{m}x{k}x{n}_archive.a" if archive is None else archive
     # No need to use separate buffers for accumulation and transfer to L2, so
     # we only need the zero and matmul kernels
     fifo_depth_out = fifo_depth
     # Up projection
-    matmul_func_name = f"matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}"
+    matmul_func_name = f"matmul_{dtype_in_str}_{dtype_out_str}"
     zero_kernel_up_proj = Kernel(
-        f"zero{scalar_suffix}_{dtype_out_str}_up_proj",
+        f"zero_{dtype_out_str}_up_proj",
         archive_name,
         [C_up_proj_l1_ty],
     )
@@ -368,7 +393,7 @@ def my_matmul(
     # Down projection
     matmul_func_name = f"matmul_with_acc_{dtype_in_str}_{dtype_out_str}"
     zero_kernel_down_proj = Kernel(
-        f"zero{scalar_suffix}_{dtype_out_str}_down_proj",
+        f"zero_{dtype_out_str}_down_proj",
         archive_name,
         [C_down_proj_l1_ty],
     )
@@ -796,11 +821,6 @@ def my_matmul(
                     stack_size=0xD00,
                 )
             )
-
-    # Calculate RTP values for the reduction loop and total C tiles
-    K_div_k = K // k
-    n_c_up_col_tiles_per_core = N // mem_tile_n
-    n_c_row_tiles_per_core = M // m // n_a_tiles_distributed
 
     # We are limited in the number of BDs. After synchronizing, we can reuse BDs.
     # We only transfer 6 rows of tiles at once before starting a new transfer block.
