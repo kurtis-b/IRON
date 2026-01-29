@@ -19,7 +19,7 @@ TEST_BERT = True
 def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
-            #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, n_a_tiles_distributed, n_b_tiles_distributed, stage_only, gelu_stage
+            #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
             # GeLU fused with up projection
             # baseline
             (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
@@ -31,9 +31,9 @@ def generate_test_params(extensive=False):
             # (64, 48, 96 * 4, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
             # # K scaled up with matching scaling with down_proj_depth (affects MT utilization)
             # (64, 48 * 4, 96, 2, 64, 48, 96, 0, 4, 1, 1, None, 0),
-            # # M scaled up with mathing scaling with n_a_tiles_distributed (duplicates pipeline with more A streams)
+            # # M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
             # (64 * 4, 48, 96, 4, 64, 48, 96, 0, 1, 4, 1, None, 0),
-            # # N scaled up with matching scaling with n_b_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
+            # # N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
             # (64, 48, 96 * 4, 8, 64, 48, 96, 0, 1, 1, 4, None, 0),
             # # BERT workload
             # (512, 768, 3072, 4, 64, 48, 96, 0, 1, 1, 1, None, 0),
@@ -80,9 +80,9 @@ def generate_test_params(extensive=False):
             # (64, 48, 96 * 4, 2, 64, 48, 96, 0, 1, 1, 1, None, 1),
             # # K scaled up with matching scaling with down_proj_depth (affects MT utilization)
             # (64, 48 * 4, 96, 2, 64, 48, 96, 0, 4, 1, 1, None, 1),
-            # # M scaled up with mathing scaling with n_a_tiles_distributed (duplicates pipeline with more A streams)
+            # # M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
             # (64 * 4, 48, 96, 4, 64, 48, 96, 0, 1, 4, 1, None, 1),
-            # # N scaled up with matching scaling with n_b_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
+            # # N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
             # (64, 48, 96 * 4, 8, 64, 48, 96, 0, 1, 1, 4, None, 1),
             # # BERT workload
             # (512, 768, 3072, 4, 64, 48, 96, 0, 1, 1, 1, None, 1),
@@ -138,15 +138,15 @@ def generate_test_params(extensive=False):
         n,
         trace_size,
         down_proj_depth,
-        n_a_tiles_distributed,
-        n_b_tiles_distributed,
+        nA_tiles_distributed,
+        nB_tiles_distributed,
         stage_only,
         gelu_stage,
     ) in params:
         name = f"ffn_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
         if trace_size > 0:
             name += f"_{trace_size}trace"
-        name += f"_dprojdepth{down_proj_depth}_nA{n_a_tiles_distributed}_nB{n_b_tiles_distributed}"
+        name += f"_dprojdepth{down_proj_depth}_nA{nA_tiles_distributed}_nB{nB_tiles_distributed}"
         if stage_only is not None:
             name += f"_stageonly{stage_only}"
         name += f"_gelustage{gelu_stage}"
@@ -174,7 +174,7 @@ all_params = [
     Throughput=r"Throughput: (?P<value>[\d\.e\+-]+) GFLOP/s",
 )
 @pytest.mark.parametrize(
-    "M,K,N,num_aie_columns,m,k,n,trace_size,down_proj_depth,n_a_tiles_distributed,n_b_tiles_distributed,stage_only,gelu_stage",
+    "M,K,N,num_aie_columns,m,k,n,trace_size,down_proj_depth,nA_tiles_distributed,nB_tiles_distributed,stage_only,gelu_stage",
     all_params,
 )
 def test_ffn(
@@ -187,8 +187,8 @@ def test_ffn(
     n,
     trace_size,
     down_proj_depth,
-    n_a_tiles_distributed,
-    n_b_tiles_distributed,
+    nA_tiles_distributed,
+    nB_tiles_distributed,
     stage_only,
     gelu_stage,
     aie_context,
@@ -196,8 +196,8 @@ def test_ffn(
     logging.debug(
         f"Testing GEMM with M={M}, K={K}, N={N}, m={m}, k={k}, n={n}, "
         f"num_aie_columns={num_aie_columns}, down_proj_depth={down_proj_depth}, "
-        f"n_a_tiles_distributed={n_a_tiles_distributed}, "
-        f"n_b_tiles_distributed={n_b_tiles_distributed}, "
+        f"nA_tiles_distributed={nA_tiles_distributed}, "
+        f"nB_tiles_distributed={nB_tiles_distributed}, "
         f"stage_only={stage_only}, gelu_stage={gelu_stage}"
     )
 
@@ -209,8 +209,8 @@ def test_ffn(
 
     aie_ffn_config = {
         "emulate_bf16_mmul_with_bfp16": True,
-        "n_a_tiles_distributed": n_a_tiles_distributed,
-        "n_b_tiles_distributed": n_b_tiles_distributed,
+        "nA_tiles_distributed": nA_tiles_distributed,
+        "nB_tiles_distributed": nB_tiles_distributed,
         "stage_only": stage_only,
         "gelu_stage": gelu_stage,
     }

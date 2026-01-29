@@ -111,8 +111,8 @@ class AIEANFFN(AIEOperatorBase):
         )
         use_scalar = self.anffn_args.get("use_scalar", False)
         round_conv_even = self.anffn_args.get("round_conv_even", True)
-        n_a_tiles_distributed = self.anffn_args.get("n_a_tiles_distributed", 1)
-        n_b_tiles_distributed = self.anffn_args.get("n_b_tiles_distributed", 1)
+        nA_tiles_distributed = self.anffn_args.get("nA_tiles_distributed", 1)
+        nB_tiles_distributed = self.anffn_args.get("nB_tiles_distributed", 1)
         stage_only = self.anffn_args.get(
             "stage_only", None
         )  # 0: up_proj only, 1: down_proj only, None: all
@@ -132,8 +132,8 @@ class AIEANFFN(AIEOperatorBase):
             f"{prefix}{M}x{K}x{N}_"
             f"{tile_m}x{tile_k}x{tile_n}_"
             f"{down_proj_depth}_"
-            f"{n_a_tiles_distributed}_"
-            f"{n_b_tiles_distributed}_"
+            f"{nA_tiles_distributed}_"
+            f"{nB_tiles_distributed}_"
             f"{stage_only}_"
             f"{gelu_stage}_"
         )
@@ -193,8 +193,8 @@ class AIEANFFN(AIEOperatorBase):
                 "k": tile_k,
                 "n": tile_n,
                 "down_proj_depth": down_proj_depth,
-                "n_a_tiles_distributed": n_a_tiles_distributed,
-                "n_b_tiles_distributed": n_b_tiles_distributed,
+                "nA_tiles_distributed": nA_tiles_distributed,
+                "nB_tiles_distributed": nB_tiles_distributed,
                 "n_aie_cols": num_aie_columns,
                 "dtype_in_str": dtype_in,
                 "dtype_out_str": dtype_out,

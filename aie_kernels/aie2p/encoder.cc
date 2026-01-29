@@ -122,12 +122,12 @@ void fused_add_layer_norm(bfloat16 *input,
     ::aie::set_rounding(aie::rounding_mode::conv_even);
     fused_add_layer_norm<bfloat16, 32>(input, residual, weights, output, cols, rows_to_process);
 }
-void ln_passThroughTile(int16_t *in,
-                        int16_t *out,
-                        int32_t cols,
-                        int32_t cols_to_process,
-                        int32_t rows_to_process,
-                        int32_t col_offset)
+void ln_passThroughTile_out(int16_t *in,
+                            int16_t *out,
+                            int32_t cols,
+                            int32_t cols_to_process,
+                            int32_t rows_to_process,
+                            int32_t col_offset)
 {
     passThrough_aie<int16_t, 32>(in, out, cols, cols_to_process, rows_to_process, col_offset);
 }
