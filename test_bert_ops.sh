@@ -4,8 +4,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 rm -r build/
-pytest operators/add_and_norm/ --csv-output operators_add_and_norm_results.csv --iterations 1
-pytest operators/add_and_norm_for_gemm/ --csv-output operators_add_and_norm_for_gemm_results.csv --iterations 1
+pytest operators/addnorm/ --csv-output operators_addnorm_results.csv --iterations 1
+pytest operators/addnorm_with_layout_transform/ --csv-output operators_addnorm_with_layout_transform_results.csv --iterations 1
 pytest operators/elementwise_add/ --csv-output operators_elementwise_add_results.csv --iterations 1
 pytest operators/elementwise_mul/ --csv-output operators_elementwise_mul_results.csv --iterations 1
 pytest operators/encoder/ --csv-output operators_encoder_results.csv --iterations 1
