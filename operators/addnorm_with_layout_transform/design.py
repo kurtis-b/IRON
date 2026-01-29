@@ -99,7 +99,7 @@ def my_weighted_layer_norm(
         [tile_ty, tile_ty, weights_ty, tile_ty, np.int32, np.int32],
     )
     mem_copy_kernel = Kernel(
-        "passThroughTile",
+        "ln_passThroughTile",
         kernel_archive_path,
         [tile_ty, out_ty, np.int32, np.int32, np.int32, np.int32],
     )
