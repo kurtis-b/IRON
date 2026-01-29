@@ -29,7 +29,7 @@ class AIEAddAndNorm(AIEOperatorBase):
         K=768,
         m=4,
         k=192,
-        t=8,
+        s=8,
         num_aie_columns=None,
         weights=None,
         trace_size=0,
@@ -40,7 +40,7 @@ class AIEAddAndNorm(AIEOperatorBase):
         self.K = K
         self.m = m
         self.k = k
-        self.t = t
+        self.s = s
         self.trace_size = trace_size
         self.num_aie_columns = num_aie_columns
 
@@ -59,7 +59,7 @@ class AIEAddAndNorm(AIEOperatorBase):
     def get_artifacts(self, prefix="weighted_layer_norm_alt_"):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
-        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.M}x{self.K}_{self.m}x{self.k}x{self.t}"
+        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.M}x{self.K}_{self.m}x{self.k}x{self.s}"
 
         # Save the weight weights to a npy file so that the design.py can load it at compile time
         weight_file_name = self.context.build_dir / f"{file_name_base}_weights.npy"
@@ -77,7 +77,7 @@ class AIEAddAndNorm(AIEOperatorBase):
                 self.K,
                 self.m,
                 self.k,
-                self.t,
+                self.s,
                 self.num_aie_columns,
                 weight_file_name,
                 kernel_archive,
@@ -93,25 +93,17 @@ class AIEAddAndNorm(AIEOperatorBase):
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"{file_name_base}_layer_norm.o",
+                            f"{file_name_base}_fused_layer_norm.o",
                             depends=[
                                 SourceArtifact.new(
                                     self.context.base_dir
                                     / "aie_kernels"
                                     / "aie2p"
-                                    / "layer_norm.cc"
+                                    / "encoder.cc"
                                 )
                             ],
-                        ),
-                        KernelObjectArtifact.new(
-                            f"{file_name_base}_add.o",
-                            depends=[
-                                SourceArtifact.new(
-                                    self.context.base_dir
-                                    / "aie_kernels"
-                                    / "generic"
-                                    / "add.cc"
-                                )
+                            extra_flags=[
+                                "-DADD_NORM_LAYER",
                             ],
                         ),
                     ],

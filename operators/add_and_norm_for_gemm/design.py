@@ -13,17 +13,19 @@ from aie.iron.device import NPU1, NPU2, Tile
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 from aie.helpers.util import np_ndarray_type_get_shape
+import aie.dialects.index as index
+from aie.dialects.aiex import *
 
 
 """
 This design computes weighted layer norm + eltwise add on AIE cores.
 The data movement is written in such a way that the outputs can be used
-to feed directly to a GEMM core. The t parameter is the microkernel
+to feed directly to a GEMM core. The s parameter is the microkernel
 col dim layout parameter for the GEMM core that would consume the output of 
 this design. It's ASSUMED that m == r of the microkernel row dim layout
 for GEMM. The output stream through shim DMA is organized in tiles
 of size (m x k), where within each tile the data is contiguously laid
-out in the (m x t) subtiles required for the mmul API call for the AIE.
+out in the (m x s) subtiles required for the mmul API call for the AIE.
 """
 
 
@@ -33,7 +35,7 @@ def my_weighted_layer_norm(
     K,
     m,
     k,
-    t,
+    s,
     num_columns,
     weight_file_path,
     kernel_archive_path,
@@ -46,7 +48,7 @@ def my_weighted_layer_norm(
         )
     assert M % (num_columns * m) == 0, "M must be multiple of num_columns * m"
     assert K % k == 0, "K must be multiple of k"
-    assert k % t == 0, "k must be multiple of t"
+    assert k % s == 0, "k must be multiple of s"
     M_div_m = M // m
     K_div_k = K // k  # Will be used as the obj fifo depth
     iters_per_core = M_div_m // num_columns
@@ -54,57 +56,70 @@ def my_weighted_layer_norm(
     # Define tensor types
     tensor_ty = np.ndarray[(M * K,), np.dtype[dtype]]
     weights_ty = np.ndarray[(K,), np.dtype[dtype]]
-    tile_ty = np.ndarray[(m * k,), np.dtype[dtype]]
+    tile_ty = np.ndarray[(m * K,), np.dtype[dtype]]
+    out_ty = np.ndarray[(m * k,), np.dtype[dtype]]
     fifodepth = 2  # For double buffering
 
     # AIE-array data movement with object fifos
     of_in1s = [
-        ObjectFifo(tile_ty, name=f"in1_{i}", depth=K_div_k * fifodepth)
+        ObjectFifo(tile_ty, name=f"in1_{i}", depth=fifodepth)
         for i in range(num_columns)
     ]
     of_in2s = [
-        ObjectFifo(tile_ty, name=f"in2_{i}", depth=K_div_k * fifodepth)
-        for i in range(num_columns)
-    ]
-    dims_to_stream_out = [(k // t, t), (m, k), (t, 1)]
-    of_out1s = [
-        ObjectFifo(
-            tile_ty,
-            name=f"out2_{i}",
-            depth=K_div_k * fifodepth,
-            dims_to_stream=dims_to_stream_out,
-        )
+        ObjectFifo(tile_ty, name=f"in2_{i}", depth=fifodepth)
         for i in range(num_columns)
     ]
 
+    of_out1s_l1l2 = [None] * num_columns
+    of_out1s_l2l3 = [None] * num_columns
+    for i in range(num_columns):
+        dims_to_stream_out = [(k // s, s), (m, k), (s, 1)]
+        of_out1s_l1l2[i] = ObjectFifo(
+            out_ty,
+            name=f"outl1l2_{i}",
+            depth=1,
+        )
+        of_out1s_l2l3[i] = (
+            of_out1s_l1l2[i]
+            .cons(depth=fifodepth)
+            .forward(
+                obj_type=out_ty,
+                depth=fifodepth,
+                name=f"outl2l3_{i}",
+                dims_to_stream=dims_to_stream_out,
+            )
+        )
+
     # AIE Core Function declaration
-    layer_norm_kernel = Kernel(
-        "layer_norm", kernel_archive_path, [tile_ty, tile_ty, np.int32, np.int32]
-    )
-    eltwise_mul_kernel = Kernel(
-        "eltwise_mul_bf16_vector",
+    # Technically an array of pointers are passed as inputs and outputs
+    # to the kernels, but these kernel declarations here don't reflect that.
+    fused_add_layer_norm_kernel = Kernel(
+        "fused_add_layer_norm",
         kernel_archive_path,
-        [tile_ty, weights_ty, tile_ty, np.int32, np.int32],
+        [tile_ty, tile_ty, weights_ty, tile_ty, np.int32, np.int32],
     )
-    eltwise_add_kernel = Kernel(
-        "eltwise_add_bf16_vector",
+    mem_copy_kernel = Kernel(
+        "passThroughTile",
         kernel_archive_path,
-        [tile_ty, tile_ty, tile_ty, np.int32],
+        [tile_ty, out_ty, np.int32, np.int32, np.int32, np.int32],
     )
 
     # Define a task that will run on a compute tile
-    def core_body(of_in1, of_in2, of_out1, weights, layer_norm, eltwise_mul, add):
+    def core_body(
+        of_in1, of_in2, weights, internal_out, of_out1, fused_add_layer_norm, copy
+    ):
         # Number of sub-vector "tile" iterations
-        for _ in range_(iters_per_core):
-            elem_in1 = of_in1.acquire(K_div_k)
-            elem_in2 = of_in2.acquire(K_div_k)
-            elem_out = of_out1.acquire(K_div_k)
-            # layer_norm(elem_in1, elem_out, K, m)
-            # eltwise_mul(elem_out, weights, elem_out, K, m)
-            # add(elem_out, elem_in2, elem_out, K * m)
-            of_in1.release(K_div_k)
-            of_in2.release(K_div_k)
-            of_out1.release(K_div_k)
+        for row_idx in range_(iters_per_core):
+            elem_in1 = of_in1.acquire(1)
+            elem_in2 = of_in2.acquire(1)
+            fused_add_layer_norm(elem_in1, elem_in2, weights, internal_out, K, m)
+            of_in1.release(1)
+            of_in2.release(1)
+            for col_idx in range_(K_div_k):
+                col_i32 = index.casts(T.i32(), col_idx)
+                elem_out = of_out1.acquire(1)
+                copy(internal_out, elem_out, K, k, m, col_i32)
+                of_out1.release(1)
 
     # Create workers to run the task on compute tiles,
     # one core for layer norm and another pipelined to do eltwise mul
@@ -115,18 +130,23 @@ def my_weighted_layer_norm(
             initial_value=static_weights,
             name=f"weights_buffer_{i}",
         )
+        out_buffer = Buffer(
+            type=tile_ty,
+            name=f"internal_out_buffer_{i}",
+        )
         my_workers.append(
             Worker(
                 core_body,
                 [
                     of_in1s[i].cons(),
                     of_in2s[i].cons(),
-                    of_out1s[i].prod(),
                     weights_buffer,
-                    layer_norm_kernel,
-                    eltwise_mul_kernel,
-                    eltwise_add_kernel,
+                    out_buffer,
+                    of_out1s_l1l2[i].prod(),
+                    fused_add_layer_norm_kernel,
+                    mem_copy_kernel,
                 ],
+                stack_size=0xF00,
             )
         )
 
@@ -138,8 +158,8 @@ def my_weighted_layer_norm(
         TensorAccessPattern(
             (1, M * K),
             iters_per_core * m * K * i,
-            [1, K_div_k * iters_per_core, m, k],
-            [0, k, K, 1],
+            [1, 1, 1, iters_per_core * m * K],
+            [0, 0, 0, 1],
         )
         for i in range(num_columns)
     ]
@@ -169,7 +189,7 @@ def my_weighted_layer_norm(
         # Drain the output objectFIFOs with data
         for i in range(num_columns):
             rt.drain(
-                of_out1s[i].cons(),
+                of_out1s_l2l3[i].cons(),
                 C,
                 taps[i],
                 wait=True,
@@ -228,9 +248,9 @@ if __name__ == "__main__":
         help="Number of tile cols",
     )
     p.add_argument(
-        "-t",
+        "-s",
         required=True,
-        dest="t",
+        dest="s",
         help="Number of subtile cols",
     )
     # Number of columns is required to define the number of columns to be used
@@ -272,7 +292,7 @@ if __name__ == "__main__":
     K = int(opts.K)
     m = int(opts.m)
     k = int(opts.k)
-    t = int(opts.t)
+    s = int(opts.s)
     columns = int(opts.cols)
     dev = opts.device  # Now this is already a device object!
 
@@ -302,7 +322,7 @@ if __name__ == "__main__":
         K,
         m,
         k,
-        t,
+        s,
         columns,
         weight_file_path,
         opts.kernel_archive,

@@ -19,7 +19,7 @@ TEST_BERT = True
 def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
-            # M, K, m, k, t, num_aie_columns
+            # M, K, m, k, s, num_aie_columns
             # (512, 768, 4, 192, 8, 8),
             # (512, 768, 4, 192, 8, 4),
             # (512, 768, 4, 192, 8, 2),
@@ -39,10 +39,10 @@ def generate_test_params(extensive=False):
         K,
         m,
         k,
-        t,
+        s,
         num_aie_columns,
     ) in params:
-        name = f"add_and_norm_{num_aie_columns}cols_{M}x{K}_tile_{m}x{k}x{t}"
+        name = f"add_and_norm_{num_aie_columns}cols_{M}x{K}_tile_{m}x{k}_sub{s}"
         names.append(name)
 
     return params, names
@@ -66,7 +66,7 @@ all_params = [
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "M,K,m,k,t,num_aie_columns",
+    "M,K,m,k,s,num_aie_columns",
     all_params,
 )
 def test_layer_norm(
@@ -74,19 +74,19 @@ def test_layer_norm(
     K,
     m,
     k,
-    t,
+    s,
     num_aie_columns,
     aie_context,
 ):
 
-    golden_ref = generate_golden_reference(M=M, K=K, m=m, k=k, t=t)
+    golden_ref = generate_golden_reference(M=M, K=K, m=m, k=k, s=s)
 
     operator = AIEAddAndNorm(
         M=M,
         K=K,
         m=m,
         k=k,
-        t=t,
+        s=s,
         num_aie_columns=num_aie_columns,
         weights=golden_ref["weight"],
         context=aie_context,
