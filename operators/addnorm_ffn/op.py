@@ -217,24 +217,18 @@ class AIEANFFN(AIEOperatorBase):
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"up_proj_{tile_m}x{tile_k}x{tile_n}.o",
-                            extra_flags=kernel_flags_up_proj,
+                            f"fused_encoder_{tile_m}x{tile_k}x{tile_n}.o",
                             depends=[
                                 SourceArtifact.new(
-                                    base_dir / "aie_kernels" / "aie2p" / "mm.cc"
+                                    self.context.base_dir
+                                    / "aie_kernels"
+                                    / "aie2p"
+                                    / "encoder.cc"
                                 )
                             ],
-                            rename_symbols=mm_up_proj_rename_symbols,
-                        ),
-                        KernelObjectArtifact.new(
-                            f"down_proj_{tile_m}x{tile_k}x{tile_n}.o",
-                            extra_flags=kernel_flags_down_proj,
-                            depends=[
-                                SourceArtifact.new(
-                                    base_dir / "aie_kernels" / "aie2p" / "mm.cc"
-                                )
+                            extra_flags=[
+                                "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
                             ],
-                            rename_symbols=mm_down_proj_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
                             f"add_{tile_m}x{tile_k}x{tile_n}.o",
@@ -264,20 +258,6 @@ class AIEANFFN(AIEOperatorBase):
                                     / "generic"
                                     / "passThrough.cc"
                                 )
-                            ],
-                        ),
-                        KernelObjectArtifact.new(
-                            f"fused_layer_norm_{tile_m}x{tile_k}x{tile_n}.o",
-                            depends=[
-                                SourceArtifact.new(
-                                    self.context.base_dir
-                                    / "aie_kernels"
-                                    / "aie2p"
-                                    / "encoder.cc"
-                                )
-                            ],
-                            extra_flags=[
-                                "-DADD_NORM_LAYER",
                             ],
                         ),
                     ],

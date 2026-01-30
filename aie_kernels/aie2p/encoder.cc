@@ -2,11 +2,288 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "../aie_kernel_utils.h"
+#include "zero.cc"
 
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* Blocked MatMul kernel (vectorized) utilizing the aie::mmul class.
+ * The matrices are assumed to be pre-tiled with the following shapes
+ * for the aie:mmul class: A => rxs, B => sxt, C => rxt.
+ *
+ * The matrix dimensions of the kernel are defined by rowA, colA and colB.
+ * In this particular kernel we expand the aie::mmul two times in each
+ * input matrices A (in 'm' dimension, or rowA) and B (in 'n' dimension, or
+ * ColB), leading to a 1x4 expansion in output matrix C (see C00, C01, C02, C03
+ * below). This expansion helps with accumulator registers usage, which leads in
+ * attaining high kernel efficiency (SIMD utilization).
+ *
+ * Data within each tile (rxs, sxt and rxt) are assumed to be in row-major
+ * order. Also, the entire tiles themselves are stored in row-major order, as
+ * shown in the example below for matrix A:
+ *
+ *      <-s->
+ *    _  ________________________
+ * 	  r |  1 |  2 |  3 | ...
+ * 	  _ |____|____|____|
+ * 	    |  x | x+1| x+2| ...
+ * 	    |____|____|____|
+ * 	    |.
+ * 	    |.
+ * 	    |.
+ *
+ * A simplified example of this kernel can be found in the AIE-API
+ * documentation: https://xilinx.github.io/aie_api/group__group__mmul.html
+ */
+template <typename T_in,
+          typename T_out,
+          unsigned rowA,
+          unsigned colA,
+          unsigned colB,
+          unsigned r,
+          unsigned s,
+          unsigned t>
+void matmul_vectorized_1x4_mmul(const T_in *__restrict pHalfA1,
+                                const T_in *__restrict pHalfA2,
+                                const T_in *__restrict pB,
+                                T_out *__restrict pC)
+{
+
+    using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
+
+    event0();
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
+
+        T_out *__restrict pC1;
+        pC1 = pC + (z * colB) * MMUL::size_C;
+
+        for (unsigned j = 0; j < colB; j += 4)
+#ifdef OPT_PERF_ENABLED
+            AIE_LOOP_FLATTEN
+#endif
+            {
+
+                const T_in *__restrict pHA1 = pHalfA1 + (z * colA) * MMUL::size_A;
+                const T_in *__restrict pHA2 = pHalfA2 + (z * colA) * MMUL::size_A;
+                const T_in *__restrict pB1;
+                const T_in *__restrict pB2;
+                const T_in *__restrict pB3;
+                const T_in *__restrict pB4;
+                pB1 = pB + (j)*MMUL::size_B;
+                pB2 = pB + (j + 1) * MMUL::size_B;
+                aie::vector<T_in, MMUL::size_A / 2> HA10;
+                aie::vector<T_in, MMUL::size_A / 2> HA20;
+                aie::vector<T_in, MMUL::size_B> B0;
+                aie::vector<T_in, MMUL::size_B> B1;
+                aie::vector<T_in, MMUL::size_B> B2;
+                aie::vector<T_in, MMUL::size_B> B3;
+
+                // Load partial results from C buffer for accumulation in-place. The
+                // zero.cc function handles the zeroing of data when a new
+                // accumulation is needed (after the 'K' reduction dimension)
+                aie::vector<T_out, MMUL::size_C> acc_C00;
+                aie::vector<T_out, MMUL::size_C> acc_C01;
+                aie::vector<T_out, MMUL::size_C> acc_C02;
+                aie::vector<T_out, MMUL::size_C> acc_C03;
+                acc_C00 = aie::load_v<MMUL::size_C>(pC1);
+                acc_C01 = aie::load_v<MMUL::size_C>(pC1 + MMUL::size_C);
+                acc_C02 = aie::load_v<MMUL::size_C>(pC1 + 2 * MMUL::size_C);
+                acc_C03 = aie::load_v<MMUL::size_C>(pC1 + 3 * MMUL::size_C);
+
+                MMUL C00(acc_C00);
+                MMUL C01(acc_C01);
+                MMUL C02(acc_C02);
+                MMUL C03(acc_C03);
+
+                for (unsigned i = 0; i < colA; ++i)
+#ifdef OPT_PERF_ENABLED
+                    AIE_LOOP_FLATTEN
+#endif
+                    {
+                        HA10 = aie::load_v<MMUL::size_A / 2>(pHA1);
+                        pHA1 += MMUL::size_A;
+                        HA20 = aie::load_v<MMUL::size_A / 2>(pHA2);
+                        pHA2 += MMUL::size_A;
+                        auto A0 = HA10.template grow<MMUL::size_A>(0);
+                        A0.insert(1, HA20);
+                        B0 = aie::load_v<MMUL::size_B>(pB1);
+                        pB1 += MMUL::size_B * colB;
+                        B1 = aie::load_v<MMUL::size_B>(pB2);
+                        pB2 += MMUL::size_B * colB;
+                        B2 = aie::load_v<MMUL::size_B>(pB3);
+                        pB3 += MMUL::size_B * colB;
+                        B3 = aie::load_v<MMUL::size_B>(pB4);
+                        pB4 += MMUL::size_B * colB;
+
+                        C00.mac(A0, B0);
+                        C01.mac(A0, B1);
+                        C02.mac(A0, B2);
+                        C03.mac(A0, B3);
+                    }
+
+                // TODO make shift right here to keep most significat bits
+                // when lowering the output
+                // example below shows how to shift right 10 bits
+                // #define SHIFT 10
+                // aie::store_v(pC1, C00.template to_vector<T_out>(SHIFT));
+
+                aie::store_v(pC1, C00.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C01.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C02.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C03.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+            }
+    }
+
+    event1();
+}
+
+/* Blocked MatMul kernel (vectorized) utilizing the aie::mmul class.
+ * The matrices are assumed to be pre-tiled with the following shapes
+ * for the aie:mmul class: A => rxs, B => sxt, C => rxt.
+ *
+ * The matrix dimensions of the kernel are defined by rowA, colA and colB.
+ * In this particular kernel we expand the aie::mmul two times in each
+ * input matrices A (in 'm' dimension, or rowA) and B (in 'n' dimension, or
+ * ColB), leading to a 1x4 expansion in output matrix C (see C00, C01, C02, C03
+ * below). This expansion helps with accumulator registers usage, which leads in
+ * attaining high kernel efficiency (SIMD utilization).
+ *
+ * Data within each tile (rxs, sxt and rxt) are assumed to be in row-major
+ * order. Also, the entire tiles themselves are stored in row-major order, as
+ * shown in the example below for matrix A:
+ *
+ *      <-s->
+ *    _  ________________________
+ * 	  r |  1 |  2 |  3 | ...
+ * 	  _ |____|____|____|
+ * 	    |  x | x+1| x+2| ...
+ * 	    |____|____|____|
+ * 	    |.
+ * 	    |.
+ * 	    |.
+ *
+ * A simplified example of this kernel can be found in the AIE-API
+ * documentation: https://xilinx.github.io/aie_api/group__group__mmul.html
+ */
+template <typename T_in,
+          typename T_out,
+          unsigned rowA,
+          unsigned colA,
+          unsigned colB,
+          unsigned r,
+          unsigned s,
+          unsigned t>
+void matmul_with_acc_vectorized_1x4_mmul(const T_in *__restrict pA,
+                                         const T_in *__restrict pB,
+                                         const T_out *__restrict pAcc,
+                                         T_out *__restrict pC)
+{
+
+    using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
+
+    event0();
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
+
+        const T_out *__restrict pAcc1;
+        T_out *__restrict pC1;
+        pAcc1 = pAcc + (z * colB) * MMUL::size_C;
+        pC1 = pC + (z * colB) * MMUL::size_C;
+
+        for (unsigned j = 0; j < colB; j += 4)
+#ifdef OPT_PERF_ENABLED
+            AIE_LOOP_FLATTEN
+#endif
+            {
+
+                const T_in *__restrict pA1 = pA + (z * colA) * MMUL::size_A;
+                const T_in *__restrict pB1;
+                const T_in *__restrict pB2;
+                const T_in *__restrict pB3;
+                const T_in *__restrict pB4;
+                pB1 = pB + (j)*MMUL::size_B;
+                pB2 = pB + (j + 1) * MMUL::size_B;
+                pB3 = pB + (j + 2) * MMUL::size_B;
+                pB4 = pB + (j + 3) * MMUL::size_B;
+                aie::vector<T_in, MMUL::size_A> A0;
+                aie::vector<T_in, MMUL::size_B> B0;
+                aie::vector<T_in, MMUL::size_B> B1;
+                aie::vector<T_in, MMUL::size_B> B2;
+                aie::vector<T_in, MMUL::size_B> B3;
+
+                // Load partial results from C buffer for accumulation in-place. The
+                // zero.cc function handles the zeroing of data when a new
+                // accumulation is needed (after the 'K' reduction dimension)
+                aie::vector<T_out, MMUL::size_C> acc_C00;
+                aie::vector<T_out, MMUL::size_C> acc_C01;
+                aie::vector<T_out, MMUL::size_C> acc_C02;
+                aie::vector<T_out, MMUL::size_C> acc_C03;
+                acc_C00 = aie::load_v<MMUL::size_C>(pAcc1);
+                pAcc1 += MMUL::size_C;
+                acc_C01 = aie::load_v<MMUL::size_C>(pAcc1);
+                pAcc1 += MMUL::size_C;
+                acc_C02 = aie::load_v<MMUL::size_C>(pAcc1);
+                pAcc1 += MMUL::size_C;
+                acc_C03 = aie::load_v<MMUL::size_C>(pAcc1);
+                pAcc1 += MMUL::size_C;
+
+                MMUL C00(acc_C00);
+                MMUL C01(acc_C01);
+                MMUL C02(acc_C02);
+                MMUL C03(acc_C03);
+
+                for (unsigned i = 0; i < colA; ++i)
+#ifdef OPT_PERF_ENABLED
+                    AIE_LOOP_FLATTEN
+#endif
+                    {
+                        A0 = aie::load_v<MMUL::size_A>(pA1);
+                        pA1 += MMUL::size_A;
+                        B0 = aie::load_v<MMUL::size_B>(pB1);
+                        pB1 += MMUL::size_B * colB;
+                        B1 = aie::load_v<MMUL::size_B>(pB2);
+                        pB2 += MMUL::size_B * colB;
+                        B2 = aie::load_v<MMUL::size_B>(pB3);
+                        pB3 += MMUL::size_B * colB;
+                        B3 = aie::load_v<MMUL::size_B>(pB4);
+                        pB4 += MMUL::size_B * colB;
+
+                        C00.mac(A0, B0);
+                        C01.mac(A0, B1);
+                        C02.mac(A0, B2);
+                        C03.mac(A0, B3);
+                    }
+
+                // TODO make shift right here to keep most significat bits
+                // when lowering the output
+                // example below shows how to shift right 10 bits
+                // #define SHIFT 10
+                // aie::store_v(pC1, C00.template to_vector<T_out>(SHIFT));
+
+                aie::store_v(pC1, C00.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C01.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C02.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C03.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+            }
+    }
+
+    event1();
+}
 
 template <typename T, int N>
 void fused_add_layer_norm(const T *restrict input,
@@ -133,8 +410,36 @@ void fused_add_layer_norm(const T *restrict input,
     }
     event1();
 }
+
 template <typename T, int N>
-void passThrough_aie(T *restrict in, T *restrict out, int32_t K, int32_t k, int32_t m, int32_t col_offset)
+void ffn_passThrough_aie(T *restrict in,
+                         T *restrict out,
+                         int32_t m,
+                         int32_t k,
+                         int32_t rows_to_process,
+                         int32_t row_offset)
+{
+    event0();
+
+    v64uint8 *restrict outPtr = (v64uint8 *)out;
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(4)
+    for (unsigned row = 0; row < rows_to_process; row++) {
+
+        v64uint8 *restrict inPtr = (v64uint8 *)(in + (row + row_offset) * k);
+
+        for (int j = 0; j < k; j += N) { // Nx samples per loop
+
+            *outPtr++ = *inPtr++;
+        }
+    }
+
+    event1();
+}
+
+template <typename T, int N>
+void ln_passThrough_in_aie(T *restrict in, T *restrict out, int32_t K, int32_t k, int32_t m, int32_t col_offset)
 {
     event0();
 
@@ -145,6 +450,28 @@ void passThrough_aie(T *restrict in, T *restrict out, int32_t K, int32_t k, int3
     for (unsigned row = 0; row < m; row++) {
 
         v64uint8 *restrict inPtr = (v64uint8 *)(in + row * K + col_offset * k);
+
+        for (int j = 0; j < k; j += N) { // Nx samples per loop
+
+            *outPtr++ = *inPtr++;
+        }
+    }
+
+    event1();
+}
+
+template <typename T, int N>
+void ln_passThrough_out_aie(T *restrict in, T *restrict out, int32_t K, int32_t k, int32_t m, int32_t col_offset)
+{
+    event0();
+
+    v64uint8 *restrict inPtr = (v64uint8 *)in;
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(4)
+    for (unsigned row = 0; row < m; row++) {
+
+        v64uint8 *restrict outPtr = (v64uint8 *)(out + row * K + col_offset * k);
 
         for (int j = 0; j < k; j += N) { // Nx samples per loop
 
@@ -174,7 +501,63 @@ extern "C" {
 #define DIM_N 64
 #endif
 
-#ifdef ADD_NORM_LAYER
+// TODO: Make another version with 1 input only for down projection
+
+void zero_bf16_up_proj(bfloat16 *C)
+{
+    zero_vectorized<bfloat16, DIM_M, DIM_N>(C);
+}
+
+void zero_bf16_down_proj(bfloat16 *C)
+{
+    zero_vectorized<bfloat16, DIM_M, DIM_K>(C);
+}
+
+void matmul_bf16_bf16_up_proj_half_inps(bfloat16 *A1, bfloat16 *A2, bfloat16 *B, bfloat16 *C)
+{
+#ifndef AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
+    static_assert(false, "AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 must be defined for this kernel");
+#endif
+    constexpr int r = 8;
+    constexpr int s = 8;
+    constexpr int t = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_K % s == 0);
+    static_assert(DIM_N % (4 * t) == 0);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+    matmul_vectorized_1x4_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, s, t>(A1, A2, B, C);
+}
+
+void matmul_with_acc_bf16_bf16_down_proj(bfloat16 *A, bfloat16 *B, bfloat16 *pAcc, bfloat16 *C)
+{
+#ifndef AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
+    static_assert(false, "AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 must be defined for this kernel");
+#endif
+    constexpr int r = 8;
+    constexpr int s = 8;
+    constexpr int t = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_K % s == 0);
+    static_assert(DIM_N % (4 * t) == 0);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+    matmul_with_acc_vectorized_1x4_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, s, t>(
+        A, B, pAcc, C);
+}
+void ffn_passThroughTile_out(bfloat16 *in,
+                             bfloat16 *out,
+                             int32_t cols,
+                             int32_t rows,
+                             int32_t rows_to_process,
+                             int32_t row_offset)
+{
+    ffn_passThrough_aie<bfloat16, 32>(in, out, rows, cols, rows_to_process, row_offset);
+}
 
 void fused_add_layer_norm_1outs(bfloat16 *input,
                                 bfloat16 *residual,
@@ -204,7 +587,15 @@ void ln_passThroughTile_out(int16_t *in,
                             int32_t rows_to_process,
                             int32_t col_offset)
 {
-    passThrough_aie<int16_t, 32>(in, out, cols, cols_to_process, rows_to_process, col_offset);
+    ln_passThrough_in_aie<int16_t, 32>(in, out, cols, cols_to_process, rows_to_process, col_offset);
 }
-#endif
+void ln_passThroughTile_in(int16_t *in,
+                           int16_t *out,
+                           int32_t cols,
+                           int32_t cols_to_process,
+                           int32_t rows_to_process,
+                           int32_t col_offset)
+{
+    ln_passThrough_out_aie<int16_t, 32>(in, out, cols, cols_to_process, rows_to_process, col_offset);
+}
 }
