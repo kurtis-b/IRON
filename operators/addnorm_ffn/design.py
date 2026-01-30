@@ -791,7 +791,7 @@ def my_matmul(
                         of_out_from_adj
                     ):  # This is to send the next set of rows of the tile in the same column group for up projection
                         elem_out1 = of_out1.acquire(1)
-                        # elem_out_from_adj = of_out_from_adj.acquire(1)
+                        elem_out_from_adj = of_out_from_adj.acquire(1)
                         copy(
                             elem_out_from_adj,
                             elem_out1,

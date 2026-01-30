@@ -23,7 +23,11 @@ def generate_test_params(extensive=False):
             # GeLU fused with up projection
             # baselines
             (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, -1, 0),  # No compute
-            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0), # All compute executed
+            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 0, 0),  # Only first add & layer norm
+            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 1, 0),  # Only up projection + GeLU
+            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 2, 0),  # Only down projection
+            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 3, 0),  # Only second add & layer norm
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),  # All compute executed
             # # M scaled up from baseline
             # (64 * 4, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
             # # K scaled up from baseline
@@ -263,14 +267,17 @@ def test_ffn(
     error_threshold = 0.005
     max_acceptable_errors = int(M * K * error_threshold)
 
-    if (
-        errors and stage_only is None
-    ):  # If only one stage is performing the computation, skip error check since the output will always be wrong
-        logging.info(
-            "({} errors out of {} max allowable)".format(
-                len(errors["C"]), max_acceptable_errors
+    if stage_only is not None:
+        print(f"Stage only mode: {stage_only}, skipping error check.")
+    else:
+        if (
+            errors
+        ):  # If only one stage is performing the computation, skip error check since the output will always be wrong
+            logging.info(
+                "({} errors out of {} max allowable)".format(
+                    len(errors["C"]), max_acceptable_errors
+                )
             )
-        )
-        assert (
-            len(errors["C"]) <= max_acceptable_errors
-        ), f"Test failed with {len(errors['C'])} errors (max allowable: {max_acceptable_errors})"
+            assert (
+                len(errors["C"]) <= max_acceptable_errors
+            ), f"Test failed with {len(errors['C'])} errors (max allowable: {max_acceptable_errors})"
