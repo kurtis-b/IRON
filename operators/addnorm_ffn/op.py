@@ -109,7 +109,6 @@ class AIEANFFN(AIEOperatorBase):
         emulate_bf16_mmul_with_bfp16 = self.anffn_args.get(
             "emulate_bf16_mmul_with_bfp16", True
         )
-        use_scalar = self.anffn_args.get("use_scalar", False)
         round_conv_even = self.anffn_args.get("round_conv_even", True)
         nA_tiles_distributed = self.anffn_args.get("nA_tiles_distributed", 1)
         nB_tiles_distributed = self.anffn_args.get("nB_tiles_distributed", 1)
@@ -198,7 +197,6 @@ class AIEANFFN(AIEOperatorBase):
                 "n_aie_cols": num_aie_columns,
                 "dtype_in_str": dtype_in,
                 "dtype_out_str": dtype_out,
-                "use_scalar": use_scalar,
                 "emulate_bf16_mmul_with_bfp16": emulate_bf16_mmul_with_bfp16,
                 "trace_size": 0,
                 "stage_only": stage_only,

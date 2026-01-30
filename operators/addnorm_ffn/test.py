@@ -21,8 +21,8 @@ def generate_test_params(extensive=False):
         params = [
             #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
             # GeLU fused with up projection
-            # baseline
-            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
+            # baselines
+            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),
             # # M scaled up from baseline
             # (64 * 4, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
             # # K scaled up from baseline
