@@ -103,7 +103,7 @@ class AIEAddAndNorm(AIEOperatorBase):
                                 )
                             ],
                             extra_flags=[
-                                "-DADD_NORM_LAYER",
+                                "-DBUILD_ADDNORM",
                             ],
                         ),
                     ],
