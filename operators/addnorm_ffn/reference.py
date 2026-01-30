@@ -52,8 +52,8 @@ def generate_golden_reference(
         ln2_weights = torch.zeros(K, dtype=dtype_torch)
     else:
         input_tensor = torch.rand(M, K, dtype=dtype_torch) * val_range
-        ln1_weights = torch.rand(K, dtype=dtype_torch) * val_range
-        ln2_weights = torch.rand(K, dtype=dtype_torch) * val_range
+        ln1_weights = torch.rand(K, dtype=dtype_torch)
+        ln2_weights = torch.rand(K, dtype=dtype_torch)
 
     layer_norm1_output = torch.nn.functional.layer_norm(
         input_tensor, normalized_shape=(K,), weight=ln1_weights, bias=None
@@ -71,7 +71,7 @@ def generate_golden_reference(
     if debug_mode:
         up_weight = torch.eye(K, N, dtype=dtype_torch)
     else:
-        up_weight = torch.rand(K, N, dtype=dtype_torch) * val_range
+        up_weight = torch.rand(K, N, dtype=dtype_torch)
 
     # Up-projection: (M, K) @ (K, N) = (M, N)
     up_proj_output = torch.matmul(add1_output, up_weight)
@@ -83,7 +83,7 @@ def generate_golden_reference(
     if debug_mode:
         down_weight = torch.eye(N, K, dtype=dtype_torch)
     else:
-        down_weight = torch.rand(N, K, dtype=dtype_torch) * val_range
+        down_weight = torch.rand(N, K, dtype=dtype_torch)
 
     # Down-projection: (M, N) @ (N, K) = (M, K)
     down_proj_output = torch.matmul(gelu_output, down_weight)

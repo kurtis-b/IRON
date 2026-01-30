@@ -26,6 +26,7 @@ from aie.iron.controlflow import range_
 import aie.dialects.index as index
 from aie.dialects.aiex import *
 
+from operators.common.utils import torch_dtype_map
 
 microkernel_mac_dim_map = {
     "npu": {
@@ -187,8 +188,8 @@ def my_matmul(
         logging.warning(
             "Layer norm weight files not provided; using default weights of all ones."
         )
-        static_ln1_weights = np.ones(K, dtype=np.float32)
-        static_ln2_weights = np.ones(K, dtype=np.float32)
+        static_ln1_weights = np.ones(K, dtype=bfloat16)
+        static_ln2_weights = np.ones(K, dtype=bfloat16)
     else:
         static_ln1_weights = np.load(ln1_weight_file)
         if static_ln1_weights.shape[0] != K:
@@ -472,6 +473,11 @@ def my_matmul(
         archive_name,
         [ln_processing_ty, ln_in_out_ty, np.int32, np.int32, np.int32, np.int32],
     )
+    ln1_copy_passthrough_kernel = Kernel(
+        "passThroughLine",
+        archive_name,
+        [ln_in_out_ty, ln_in_out_ty, np.int32],
+    )
     ln2_copy_in_kernel = Kernel(
         "ln_passThroughTile_in",
         archive_name,
@@ -591,7 +597,7 @@ def my_matmul(
                 ln_in_out_ty,
                 name=f"ln1_L1L1_{a_tile}_{ln_core}",
                 depth=fifo_depth,
-                dims_to_stream=(
+                dims_to_stream=(  # Placement moves upwards, so last objfifo will be stream to FFN cores
                     dims_to_stream_out if ln_core == ln_cores_per_nA - 1 else None
                 ),
             )
@@ -743,7 +749,8 @@ def my_matmul(
         of_out2,
         of_out_from_adj,
         fused_add_layer_norm,
-        copy,
+        copy_tiled,
+        copy_passthrough,
         stage_only,
     ):
         # Check if first add & norm stage is enabled, None means all stages are enabled
@@ -785,20 +792,22 @@ def my_matmul(
                 for col_idx in range_(K_div_k):
                     col_i32 = index.casts(T.i32(), col_idx)
                     elem_out1 = of_out1.acquire(1)
-                    copy(internal_out, elem_out1, K, k, ln_rows_to_process, col_i32)
+                    copy_tiled(
+                        internal_out, elem_out1, K, k, ln_rows_to_process, col_i32
+                    )
                     of_out1.release(1)
+                    # TODO: Maybe pass in a tile index to the fcn to create a for-loop in case there's more
+                    # than 2 layer norm cores per nA tile, which will require more iterations of the block
+                    # below
                     if (
                         of_out_from_adj
                     ):  # This is to send the next set of rows of the tile in the same column group for up projection
                         elem_out1 = of_out1.acquire(1)
                         elem_out_from_adj = of_out_from_adj.acquire(1)
-                        copy(
+                        copy_passthrough(
                             elem_out_from_adj,
                             elem_out1,
-                            K,
-                            k,
-                            ln_rows_to_process,
-                            col_i32,
+                            ln_rows_to_process * k,
                         )
                         of_out_from_adj.release(1)
                         of_out1.release(1)
@@ -831,7 +840,8 @@ def my_matmul(
                 for _ in range_(K_div_k):
                     elem_in_a = in_a.acquire(2)
                     elem_in_b = in_b.acquire(1)
-                    matmul(elem_in_a[0], elem_in_a[1], elem_in_b, elem_out_matmul)
+                    # NOTE: Which one is the first and second set of rows depends on the MT connections
+                    matmul(elem_in_a[1], elem_in_a[0], elem_in_b, elem_out_matmul)
                     in_a.release(2)
                     in_b.release(1)
                 if gelu:
@@ -934,9 +944,10 @@ def my_matmul(
         weights,
         internal_in,
         of_out1,
-        of_out_from_adj,
+        of_out_to_adj,
         fused_add_layer_norm,
-        copy,
+        copy_tiled,
+        copy_passthrough,
         stage_only,
     ):
         # Check if second add & norm stage is enabled, None means all stages are enabled
@@ -945,11 +956,11 @@ def my_matmul(
                 for col_idx in range_(K_div_k):
                     elem_out = of_in1.acquire(1)
                     of_in1.release(1)
-                    if of_out_from_adj:
+                    if of_out_to_adj:
                         for _ in range_(ln_cores_per_nA - 1):
                             elem_out = of_in1.acquire(1)
-                            elem_out_from_adj = of_out_from_adj.acquire(1)
-                            of_out_from_adj.release(1)
+                            elem_out_to_adj = of_out_to_adj.acquire(1)
+                            of_out_to_adj.release(1)
                             of_in1.release(1)
                 elem_out1 = of_out1.acquire(1)
                 elem_in2 = of_in2.acquire(1)
@@ -960,21 +971,18 @@ def my_matmul(
                 for col_idx in range_(K_div_k):
                     col_i32 = index.casts(T.i32(), col_idx)
                     elem_in = of_in1.acquire(1)
-                    copy(elem_in, internal_in, K, k, ln_rows_to_process, col_i32)
+                    copy_tiled(elem_in, internal_in, K, k, ln_rows_to_process, col_i32)
                     of_in1.release(1)
-                    if of_out_from_adj:
+                    if of_out_to_adj:
                         for _ in range_(ln_cores_per_nA - 1):
                             elem_in = of_in1.acquire(1)
-                            elem_out_from_adj = of_out_from_adj.acquire(1)
-                            copy(
+                            elem_out_to_adj = of_out_to_adj.acquire(1)
+                            copy_passthrough(
                                 elem_in,
-                                elem_out_from_adj,
-                                K,
-                                k,
-                                ln_rows_to_process,
-                                col_i32,
+                                elem_out_to_adj,
+                                ln_rows_to_process * k,
                             )
-                            of_out_from_adj.release(1)
+                            of_out_to_adj.release(1)
                             of_in1.release(1)
                 elem_out1 = of_out1.acquire(1)
                 elem_in2 = of_in2.acquire(1)
@@ -1036,11 +1044,12 @@ def my_matmul(
                                     ln1_l1l1_fifos[a_tile][
                                         ln_core - 1
                                     ].cons()  # TODO: Maybe it's ok to make depth=1 here?
-                                    if ln_core == ln_cores_per_nA - 1
+                                    if ln_core != 0
                                     else None
                                 ),
                                 ln1_fused_add_layer_norm_kernel,
                                 ln1_copy_out_kernel,
+                                ln1_copy_passthrough_kernel,
                                 stage_only,
                             ],
                             placement=Tile(ln1_tile_col, ln1_tile_row + ln_core),
@@ -1081,7 +1090,8 @@ def my_matmul(
                                     else None
                                 ),
                                 ln2_fused_add_layer_norm_kernel,
-                                ln1_copy_out_kernel,
+                                ln2_copy_in_kernel,
+                                ln1_copy_passthrough_kernel,
                                 stage_only,
                             ],
                             placement=Tile(

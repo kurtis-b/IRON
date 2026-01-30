@@ -198,6 +198,8 @@ class AIEANFFN(AIEOperatorBase):
                             ],
                             extra_flags=[
                                 "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+                                "-DBUILD_FFN",
+                                "-DBUILD_ADDNORM",
                                 f"-DDIM_M={tile_m}",
                                 f"-DDIM_K={tile_k}",
                                 f"-DDIM_N={tile_n}",

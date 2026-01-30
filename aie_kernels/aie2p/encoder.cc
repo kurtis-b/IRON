@@ -52,6 +52,7 @@ void matmul_vectorized_1x4_mmul(const T_in *__restrict pHalfA1,
 {
 
     using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
+    const int szA = MMUL::size_A / 2; // The tiles have half of the rows expected for mmul api
 
     event0();
 
@@ -68,16 +69,16 @@ void matmul_vectorized_1x4_mmul(const T_in *__restrict pHalfA1,
 #endif
             {
 
-                const T_in *__restrict pHA1 = pHalfA1 + (z * colA) * MMUL::size_A;
-                const T_in *__restrict pHA2 = pHalfA2 + (z * colA) * MMUL::size_A;
+                const T_in *__restrict pHA1 = pHalfA1 + (z * colA) * szA;
+                const T_in *__restrict pHA2 = pHalfA2 + (z * colA) * szA;
                 const T_in *__restrict pB1;
                 const T_in *__restrict pB2;
                 const T_in *__restrict pB3;
                 const T_in *__restrict pB4;
                 pB1 = pB + (j)*MMUL::size_B;
                 pB2 = pB + (j + 1) * MMUL::size_B;
-                aie::vector<T_in, MMUL::size_A / 2> HA10;
-                aie::vector<T_in, MMUL::size_A / 2> HA20;
+                aie::vector<T_in, szA> HA10;
+                aie::vector<T_in, szA> HA20;
                 aie::vector<T_in, MMUL::size_B> B0;
                 aie::vector<T_in, MMUL::size_B> B1;
                 aie::vector<T_in, MMUL::size_B> B2;
@@ -105,12 +106,11 @@ void matmul_vectorized_1x4_mmul(const T_in *__restrict pHalfA1,
                     AIE_LOOP_FLATTEN
 #endif
                     {
-                        HA10 = aie::load_v<MMUL::size_A / 2>(pHA1);
-                        pHA1 += MMUL::size_A;
-                        HA20 = aie::load_v<MMUL::size_A / 2>(pHA2);
-                        pHA2 += MMUL::size_A;
-                        auto A0 = HA10.template grow<MMUL::size_A>(0);
-                        A0.insert(1, HA20);
+                        HA10 = aie::load_v<szA>(pHA1);
+                        pHA1 += szA;
+                        HA20 = aie::load_v<szA>(pHA2);
+                        pHA2 += szA;
+                        auto A0 = ::aie::concat(HA10, HA20);
                         B0 = aie::load_v<MMUL::size_B>(pB1);
                         pB1 += MMUL::size_B * colB;
                         B1 = aie::load_v<MMUL::size_B>(pB2);
@@ -496,8 +496,7 @@ extern "C" {
 #define DIM_N 64
 #endif
 
-// TODO: Make another version with 1 input only for down projection
-
+#ifdef BUILD_FFN
 void zero_bf16_up_proj(bfloat16 *C)
 {
     zero_vectorized<bfloat16, DIM_M, DIM_N>(C);
@@ -546,9 +545,12 @@ void matmul_with_acc_bf16_bf16_down_proj(bfloat16 *A, bfloat16 *B, bfloat16 *pAc
 }
 void ffn_passThroughTile_out(bfloat16 *in, bfloat16 *out, int32_t cols, int32_t rows_to_process, int32_t row_offset)
 {
-    ffn_passThrough_aie<bfloat16, 32>(in, out, cols, rows_to_process, row_offset);
+    ffn_passThrough_aie<bfloat16, 32>(
+        in, out, cols, rows_to_process, row_offset); // Assumes input sz is larger than output sz
 }
+#endif
 
+#ifdef BUILD_ADDNORM
 void fused_add_layer_norm_1outs(bfloat16 *input,
                                 bfloat16 *residual,
                                 bfloat16 *weights,
@@ -588,4 +590,5 @@ void ln_passThroughTile_in(int16_t *in,
 {
     ln_passThrough_out_aie<int16_t, 32>(in, out, cols, cols_to_process, rows_to_process, col_offset);
 }
+#endif
 }

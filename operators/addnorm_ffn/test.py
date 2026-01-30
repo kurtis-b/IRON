@@ -27,7 +27,7 @@ def generate_test_params(extensive=False):
             (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 1, 0),  # Only up projection + GeLU
             (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 2, 0),  # Only down projection
             (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 3, 0),  # Only second add & layer norm
-            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),  # All compute executed
+            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),  # All compute executed
             # # M scaled up from baseline
             # (64 * 4, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
             # # K scaled up from baseline
