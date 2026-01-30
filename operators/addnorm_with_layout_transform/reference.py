@@ -19,7 +19,7 @@ def generate_golden_reference(
         weights = torch.ones(K, dtype=torch_dtype_map[dtype])
     else:
         input1_tensor = torch.rand(M, K, dtype=torch_dtype_map[dtype]) * val_range
-        input2_tensor = torch.zeros(M, K, dtype=torch_dtype_map[dtype]) * val_range
+        input2_tensor = torch.rand(M, K, dtype=torch_dtype_map[dtype]) * val_range
         weights = torch.rand(K, dtype=torch_dtype_map[dtype]) * val_range
 
     # Compute layer norm followed by addition
