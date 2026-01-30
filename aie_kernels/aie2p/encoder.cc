@@ -286,19 +286,19 @@ void matmul_with_acc_vectorized_1x4_mmul(const T_in *__restrict pA,
 }
 
 template <typename T, int N>
-void fused_add_layer_norm(const T *restrict input,
-                          const T *restrict residual,
-                          const T *restrict weight,
-                          T *restrict output,
-                          int32_t cols,
-                          int32_t rows_to_process)
+void fused_add_layer_norm_1(const T *restrict input,
+                            const T *restrict residual,
+                            const T *restrict weight,
+                            T *restrict output,
+                            int32_t cols,
+                            int32_t rows_to_process)
 {
     event0();
     constexpr float epsilon = 1e-5f;
     int vector_chunks = cols / N;
 
     AIE_PREPARE_FOR_PIPELINING
-    AIE_LOOP_MIN_ITERATION_COUNT(4)
+    // AIE_LOOP_MIN_ITERATION_COUNT(4)
     for (int row = 0; row < rows_to_process; row++) {
 
         ::aie::vector<T, N> sum_acc = ::aie::zeros<T, N>();
@@ -347,20 +347,20 @@ void fused_add_layer_norm(const T *restrict input,
     event1();
 }
 template <typename T, int N>
-void fused_add_layer_norm(const T *restrict input,
-                          const T *restrict residual,
-                          const T *restrict weight,
-                          T *restrict output1,
-                          T *restrict output2,
-                          int32_t cols,
-                          int32_t rows_to_process)
+void fused_add_layer_norm_2(const T *restrict input,
+                            const T *restrict residual,
+                            const T *restrict weight,
+                            T *restrict output1,
+                            T *restrict output2,
+                            int32_t cols,
+                            int32_t rows_to_process)
 {
     event0();
     constexpr float epsilon = 1e-5f;
     int vector_chunks = cols / N;
 
     AIE_PREPARE_FOR_PIPELINING
-    AIE_LOOP_MIN_ITERATION_COUNT(4)
+    // AIE_LOOP_MIN_ITERATION_COUNT(4)
     for (int row = 0; row < rows_to_process; row++) {
 
         ::aie::vector<T, N> sum_acc = ::aie::zeros<T, N>();
@@ -412,19 +412,14 @@ void fused_add_layer_norm(const T *restrict input,
 }
 
 template <typename T, int N>
-void ffn_passThrough_aie(T *restrict in,
-                         T *restrict out,
-                         int32_t m,
-                         int32_t k,
-                         int32_t rows_to_process,
-                         int32_t row_offset)
+void ffn_passThrough_aie(T *restrict in, T *restrict out, int32_t k, int32_t rows_to_process, int32_t row_offset)
 {
     event0();
 
     v64uint8 *restrict outPtr = (v64uint8 *)out;
 
     AIE_PREPARE_FOR_PIPELINING
-    AIE_LOOP_MIN_ITERATION_COUNT(4)
+    // AIE_LOOP_MIN_ITERATION_COUNT(4)
     for (unsigned row = 0; row < rows_to_process; row++) {
 
         v64uint8 *restrict inPtr = (v64uint8 *)(in + (row + row_offset) * k);
@@ -446,7 +441,7 @@ void ln_passThrough_in_aie(T *restrict in, T *restrict out, int32_t K, int32_t k
     v64uint8 *restrict outPtr = (v64uint8 *)out;
 
     AIE_PREPARE_FOR_PIPELINING
-    AIE_LOOP_MIN_ITERATION_COUNT(4)
+    // AIE_LOOP_MIN_ITERATION_COUNT(4)
     for (unsigned row = 0; row < m; row++) {
 
         v64uint8 *restrict inPtr = (v64uint8 *)(in + row * K + col_offset * k);
@@ -468,7 +463,7 @@ void ln_passThrough_out_aie(T *restrict in, T *restrict out, int32_t K, int32_t 
     v64uint8 *restrict inPtr = (v64uint8 *)in;
 
     AIE_PREPARE_FOR_PIPELINING
-    AIE_LOOP_MIN_ITERATION_COUNT(4)
+    // AIE_LOOP_MIN_ITERATION_COUNT(4)
     for (unsigned row = 0; row < m; row++) {
 
         v64uint8 *restrict outPtr = (v64uint8 *)(out + row * K + col_offset * k);
@@ -549,14 +544,9 @@ void matmul_with_acc_bf16_bf16_down_proj(bfloat16 *A, bfloat16 *B, bfloat16 *pAc
     matmul_with_acc_vectorized_1x4_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, s, t>(
         A, B, pAcc, C);
 }
-void ffn_passThroughTile_out(bfloat16 *in,
-                             bfloat16 *out,
-                             int32_t cols,
-                             int32_t rows,
-                             int32_t rows_to_process,
-                             int32_t row_offset)
+void ffn_passThroughTile_out(bfloat16 *in, bfloat16 *out, int32_t cols, int32_t rows_to_process, int32_t row_offset)
 {
-    ffn_passThrough_aie<bfloat16, 32>(in, out, rows, cols, rows_to_process, row_offset);
+    ffn_passThrough_aie<bfloat16, 32>(in, out, cols, rows_to_process, row_offset);
 }
 
 void fused_add_layer_norm_1outs(bfloat16 *input,
@@ -567,7 +557,7 @@ void fused_add_layer_norm_1outs(bfloat16 *input,
                                 int32_t rows_to_process)
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
-    fused_add_layer_norm<bfloat16, 32>(input, residual, weights, output, cols, rows_to_process);
+    fused_add_layer_norm_1<bfloat16, 32>(input, residual, weights, output, cols, rows_to_process);
 }
 void fused_add_layer_norm_2outs(bfloat16 *input,
                                 bfloat16 *residual,
@@ -578,7 +568,7 @@ void fused_add_layer_norm_2outs(bfloat16 *input,
                                 int32_t rows_to_process)
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
-    fused_add_layer_norm<bfloat16, 32>(input, residual, weights, output1, output2, cols, rows_to_process);
+    fused_add_layer_norm_2<bfloat16, 32>(input, residual, weights, output1, output2, cols, rows_to_process);
 }
 void ln_passThroughTile_out(int16_t *in,
                             int16_t *out,

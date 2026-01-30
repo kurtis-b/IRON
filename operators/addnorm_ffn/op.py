@@ -136,36 +136,6 @@ class AIEANFFN(AIEOperatorBase):
             f"{stage_only}_"
             f"{gelu_stage}_"
         )
-        kernel_flags_base = []
-        mm_up_proj_rename_symbols = {
-            "matmul_bf16_bf16": "matmul_bf16_bf16_up_proj",
-            "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_up_proj",
-            "zero_bf16": "zero_bf16_up_proj",
-            "zero_scalar_bf16": "zero_scalar_bf16_up_proj",
-        }
-        mm_down_proj_rename_symbols = {
-            "matmul_bf16_bf16": "matmul_bf16_bf16_down_proj",
-            "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_down_proj",
-            "matmul_with_acc_bf16_bf16": "matmul_with_acc_bf16_bf16_down_proj",
-            "zero_bf16": "zero_bf16_down_proj",
-            "zero_scalar_bf16": "zero_scalar_bf16_down_proj",
-        }
-        kernel_flags_base.append("-Dbf16_bf16_ONLY")
-        if round_conv_even:
-            kernel_flags_base.append("-DROUND_CONV_EVEN")
-        if emulate_bf16_mmul_with_bfp16:
-            kernel_flags_base.append("-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16")
-        kernel_flags_up_proj = kernel_flags_base + [
-            f"-DDIM_M={tile_m}",
-            f"-DDIM_K={tile_k}",
-            f"-DDIM_N={tile_n}",
-        ]
-        kernel_flags_down_proj = kernel_flags_base + [
-            f"-DDIM_M={tile_m}",
-            f"-DDIM_K={tile_n}",
-            f"-DDIM_N={tile_k}",
-            "-DGENERATE_MATMUL_WITH_ACC_KERNELS",
-        ]
 
         # Save the weight weights to a npy file so that the design.py can load it at compile time
         ln1_weight_file_name = (
@@ -228,6 +198,9 @@ class AIEANFFN(AIEOperatorBase):
                             ],
                             extra_flags=[
                                 "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+                                f"-DDIM_M={tile_m}",
+                                f"-DDIM_K={tile_k}",
+                                f"-DDIM_N={tile_n}",
                             ],
                         ),
                         KernelObjectArtifact.new(

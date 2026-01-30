@@ -86,12 +86,6 @@ def run_test(
     operator.context.compile_all()
     operator.context.prepare_runtime()
 
-    # TEST
-    print(
-        "NOTE: Skipping actually running the AIE operator since I want to test the compilation first."
-    )
-    return output_buffers, 0, 0
-
     # Run warmup iterations before writing to buffers (warmup iters might corrupt the buffers)
     for _ in range(warmup_iters):
         operator.run_runlist()  # warmup run to configure
