@@ -209,19 +209,19 @@ def my_matmul(
     shim_dma_ch_per_col = 2
     cores_per_col = 4
     ln_cores_per_nA = 2  # 2 cores will generate the ln outputs, which for the first stage will be broadcast to the up proj cores without using MT
-    num_pipeline_stages = 2  # Up projection and fused down projection-GeLU stages
+    num_ffn_stages = 2  # Up projection and fused down projection-GeLU stages
     n_aie_cores_needed = nA_tiles_distributed * (
-        ln_cores_per_nA + ln_cores_per_nA + num_pipeline_stages * nB_tiles_distributed
+        ln_cores_per_nA + ln_cores_per_nA + num_ffn_stages * nB_tiles_distributed
     )  # nA_tiles_distributed essentially duplicates the design, which has two add & norm blocks and an FFN block
     n_dup_shim_b_streams = (
         n_aie_cols * shim_dma_ch_per_col
         - nA_tiles_distributed * 2  # A and R input per A tile
     ) // (
-        nB_tiles_distributed * num_pipeline_stages
+        nB_tiles_distributed * num_ffn_stages
     )  # 1 means no duplication, 2 means each B stream is duplicated once through another shim DMA channel, etc.
     if n_dup_shim_b_streams < 1:
         raise AssertionError(
-            f"Not enough AIE columns to distribute the A and B tiles needed (2 shim DMA channel * {nA_tiles_distributed} for A and 1 shim DMA channel * {nB_tiles_distributed} * {num_pipeline_stages} for B per pipeline stage)"
+            f"Not enough AIE columns to distribute the A and B tiles needed (2 shim DMA channel * {nA_tiles_distributed} for A and 1 shim DMA channel * {nB_tiles_distributed} * {num_ffn_stages} for B per pipeline stage)"
         )
     elif n_dup_shim_b_streams > nA_tiles_distributed:
         n_dup_shim_b_streams = nA_tiles_distributed
@@ -556,7 +556,9 @@ def my_matmul(
                 names=[f"A_L2L1_{a_tile}_{i}" for i in range(ln_cores_per_nA)],
                 depths=[fifo_depth] * ln_cores_per_nA,
                 placement=(
-                    Tile(0, 1) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 1)
+                    Tile(0, 1)
+                    if nA_tiles_distributed < 3
+                    else Tile((a_tile * 2) % n_aie_cols, 1)
                 ),
             )
         )
@@ -569,7 +571,9 @@ def my_matmul(
                 names=[f"R_L2L1_{a_tile}_{i}" for i in range(ln_cores_per_nA)],
                 depths=[fifo_depth] * ln_cores_per_nA,
                 placement=(
-                    Tile(0, 1) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 1)
+                    Tile(1, 1)
+                    if nA_tiles_distributed < 3
+                    else Tile((a_tile * 2 + 1) % n_aie_cols, 1)
                 ),
             )
         )
@@ -594,8 +598,7 @@ def my_matmul(
                 .forward(
                     obj_type=ln_processing_ty,
                     name=f"ln1_L2L1_{a_tile}_{ln_core}",
-                    # TODO: May need to set placement
-                    # placement=Tile(a_tile * 2, 1),
+                    placement=Tile((a_tile + ln_core) % n_aie_cols, 1),
                     depth=fifo_depth,  # TODO: Try increasing fifo depth to check if this fifo causes the first Add & Norm core to stall
                 )
             )
@@ -614,7 +617,7 @@ def my_matmul(
                 name=f"B_up_proj_L2L1_{b_tile}",
                 dims_to_stream=dims_to_stream,
                 placement=Tile(
-                    b_tile * 2, 1
+                    (b_tile * 2) % n_aie_cols, 1
                 ),  # Switch between up and down proj B tile streams across shim tiles
             )
         )
@@ -633,7 +636,7 @@ def my_matmul(
                 name=f"B_down_proj_L2L1_{b_tile}",
                 dims_to_stream=dims_to_stream,
                 placement=Tile(
-                    b_tile * 2 + 1, 1
+                    (b_tile * 2 + 1) % n_aie_cols, 1
                 ),  # Switch between up and down proj B tile streams across shim tiles
             )
         )
@@ -651,9 +654,7 @@ def my_matmul(
     for a_tile in range(nA_tiles_distributed):
         for b_tile in range(nB_tiles_distributed):
             # Per MT, at most 2 of these objfifos can be connected considering other streams and that the max is 6 S2MM/MM2S per MT
-            logging.debug(
-                f"Placeing C_down_proj_part fifos at {(a_tile * nB_tiles_distributed + b_tile) // 2, 1}"
-            )
+            max_obfifos_per_mt = 2
             C_down_proj_part_l1l2_fifos[a_tile][b_tile] = ObjectFifo(
                 C_down_proj_l1_ty,
                 name=f"C_down_proj_part_L1L2_{a_tile}_{b_tile}",
@@ -667,10 +668,13 @@ def my_matmul(
                     name=f"C_down_proj_part_L2L1_{b_tile}_{a_tile}",
                     depth=down_proj_depth,
                     placement=Tile(
-                        (a_tile * nB_tiles_distributed + b_tile) // 2,
+                        (a_tile * nB_tiles_distributed + b_tile) // max_obfifos_per_mt,
                         1,
                     ),
                 )
+            )
+            logging.debug(
+                f"Placeing C_down_proj_part fifos at {(a_tile * nB_tiles_distributed + b_tile) // max_obfifos_per_mt, 1}"
             )
 
     # Down proj partial C for reduction
@@ -679,7 +683,7 @@ def my_matmul(
             C_down_proj_reduce_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
                 C_down_proj_l1_ty,
                 name=f"C_down_proj_out_L1L1_{a_tile}_{b_tile}",
-                depth=fifo_depth_out,
+                depth=fifo_depth,
             )
 
     # Down proj output C, m-by-k tiles
@@ -689,7 +693,7 @@ def my_matmul(
             C_down_proj_out_l1l1_fifos[a_tile][ln_core] = ObjectFifo(
                 ln_processing_ty,
                 name=f"C_down_proj_out_L1L1_{a_tile}_{ln_core}",
-                depth=1,
+                depth=fifo_depth,
                 dims_to_stream=dims_to_stream,
             )
 
@@ -710,9 +714,9 @@ def my_matmul(
                 names=[f"ln2_L1L2_{a_tile}_{i}" for i in range(ln_cores_per_nA)],
                 depths=[fifo_depth] * ln_cores_per_nA,
                 placement=(
-                    Tile(nB_tiles_distributed + 1, 1)
+                    Tile((nB_tiles_distributed + 1) % n_aie_cols, 1)
                     if nA_tiles_distributed < 3
-                    else Tile(a_tile * 2 + 1, 1)
+                    else Tile((a_tile * 2 + 1) % n_aie_cols, 1)
                 ),
             )
         )
@@ -930,9 +934,7 @@ def my_matmul(
                 # FFN cores will be placed horizontally, 2 cols (left and right adjacent cols) will be for Add & Norm cores
                 # The direction of reduction will be from left to right
                 # Add 1 to col index since the left adjacent col is for an Add & Norm core
-                tile_col, tile_row = core_tiles[a_tile * num_pipeline_stages][
-                    b_tile + 1
-                ]
+                tile_col, tile_row = core_tiles[a_tile * num_ffn_stages][b_tile + 1]
                 ln1_tile_col = tile_col - 1
                 ln1_tile_row = tile_row
                 ln2_tile_col = tile_col + 1
@@ -942,7 +944,7 @@ def my_matmul(
                 # The direction of reduction will be from up to down
                 # Bottom row will be for Add & Norm cores since nB_tiles_distributed can at most be 2 to get even partitioning of power of 2 workloads
                 tile_col, tile_row = core_tiles[b_tile + ln_cores_per_nA][
-                    a_tile * num_pipeline_stages
+                    a_tile * num_ffn_stages
                 ]
                 ln1_tile_col = tile_col
                 ln1_tile_row = core_tiles[0][0][1]  # Get the bottom-most row index
@@ -971,7 +973,9 @@ def my_matmul(
                                 ln1_l1l1_fifos[a_tile][ln_core].prod(),
                                 ln1_l1l2_fifos[a_tile][ln_core].prod(),
                                 (
-                                    ln1_l1l1_fifos[a_tile][ln_core - 1].cons(depth=1)
+                                    ln1_l1l1_fifos[a_tile][
+                                        ln_core - 1
+                                    ].cons()  # TODO: Maybe it's ok to make depth=1 here?
                                     if ln_core == ln_cores_per_nA - 1
                                     else None
                                 ),
@@ -1002,7 +1006,9 @@ def my_matmul(
                         Worker(
                             core_fn_add_norm2,
                             [
-                                C_down_proj_out_l1l1_fifos[a_tile][ln_core].cons(),
+                                C_down_proj_out_l1l1_fifos[a_tile][ln_core].cons(
+                                    depth=fifo_depth
+                                ),
                                 ln1_l2l1_fifos[a_tile][ln_core].cons(),
                                 ln2_weight_buffer,
                                 ln2_in_buffer,
@@ -1173,7 +1179,7 @@ def my_matmul(
                     b_tile_offset = duplicate_b_tile * nB_tiles_distributed
                     logging.debug(f"B tile offset: {b_tile_offset}")
                     for b_tile in range(nB_tiles_distributed):
-                        for stage in range(num_pipeline_stages):
+                        for stage in range(num_ffn_stages):
                             logging.debug(f"    B tile: {b_tile}, Stage: {stage}")
                             if stage == 0:
                                 # B_Up input transfer:
