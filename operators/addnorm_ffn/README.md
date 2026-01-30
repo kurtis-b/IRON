@@ -29,7 +29,7 @@ Interestingly enough, GeLU fused with down projection seems to give the better p
 - `ffn_512x768x3072_64x48x96_8cols_dprojdepth8_nA4_nB4_stageonly1_gelustage1`: 1618.8ms
 Based on the performance of the isolated stages, i.e. max of last two vs max of the 3rd and 4th points, GeLU being in the down projection stage is better. This warrants some thought as to why it happens--maybe due to the different data movement pattern, and how tiles across the output columns are stored in MTs for down projection?
 
-NOTE: `design_alternate.py` is a design implementing an alternate data movement pattern for GEMM. Part of the data movement here is what is executed for the down projection stage in `design_bert.py`. It's just kept here for reference as a first step towards the FFN design, and not used in the operator or tests.
+NOTE: `design_alternate.py` is a design implementing an alternate data movement pattern for GEMM. Part of the data movement here is what is executed for the down projection stage in `design.py`. It's just kept here for reference as a first step towards the FFN design, and not used in the operator or tests.
 
 ## Notes
 To generate visualization of the routing, a tool in the mlir-aie repo can be used. It's assumed that the tests have been run and the `build` directory is present in the project's root. 

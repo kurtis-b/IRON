@@ -176,7 +176,7 @@ class AIEFFN(AIEOperatorBase):
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_total_base}.mlir",
-            import_path=operator_dir / "design_bert.py",
+            import_path=operator_dir / "design.py",
             callback_fn="my_matmul",
             callback_kwargs={
                 "dev": device_str,

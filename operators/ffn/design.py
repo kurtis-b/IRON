@@ -123,7 +123,7 @@ def main():
         args.scalar,
         args.emulate_bf16_mmul_with_bfp16,
         args.trace_size,
-        arga.gelu_stage,
+        args.gelu_stage,
         args.stage_only,
         args.archive,
         args.generate_taps,
