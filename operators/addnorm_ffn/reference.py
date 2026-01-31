@@ -11,7 +11,7 @@ def generate_golden_reference(
     N: int,
     dtype="bf16",
     seed=42,
-    debug_mode=True,
+    debug_mode=-1,
 ):
     """
     Generate golden reference for BERT Add & Norm -> FFN -> Add & Norm. Using uniform distribution [0, 4) to populate tensors.
@@ -31,7 +31,10 @@ def generate_golden_reference(
         N: Intermediate size (typically 4*K for BERT)
         dtype: Data type for tensors
         seed: Random seed for reproducibility
-        debug_mode: If True, use row/col indices as input and identity matrices for weights
+        debug_mode:
+            - If 0, check indexes through layer norm path,
+            - if 1, check indexes through residual connection path,
+            - else, random data
 
     Returns:
         Dictionary containing:
@@ -46,7 +49,11 @@ def generate_golden_reference(
     dtype_torch = torch_dtype_map[dtype]
 
     # Generate input tensor (M, K)
-    if debug_mode:
+    if debug_mode == 0:
+        input_tensor = torch.arange(M * K, dtype=dtype_torch).reshape(M, K)
+        ln1_weights = torch.ones(K, dtype=dtype_torch)
+        ln2_weights = torch.ones(K, dtype=dtype_torch)
+    elif debug_mode == 1:
         input_tensor = torch.zeros(M, K, dtype=dtype_torch)
         ln1_weights = torch.ones(K, dtype=dtype_torch)
         ln2_weights = torch.ones(K, dtype=dtype_torch)
@@ -55,15 +62,19 @@ def generate_golden_reference(
         ln1_weights = torch.rand(K, dtype=dtype_torch) * val_range
         ln2_weights = torch.rand(K, dtype=dtype_torch) * val_range
 
-    layer_norm1_output = torch.nn.functional.layer_norm(
-        input_tensor, normalized_shape=(K,), weight=ln1_weights, bias=None
-    )
+    if debug_mode == 0:
+        layer_norm1_output = input_tensor.clone()
+    else:
+        layer_norm1_output = torch.nn.functional.layer_norm(
+            input_tensor, normalized_shape=(K,), weight=ln1_weights, bias=None
+        )
 
     # Generate input for residual addition (M, K)
-    if debug_mode:
+    if debug_mode == 0:
+        input_residual = torch.zeros(M, K, dtype=dtype_torch)
+    elif debug_mode == 1:
         # Use a range only across columns since the values get really large, which could affect the layer norm calculations
-        input_residual = torch.arange(K, dtype=dtype_torch)
-        input_residual = input_residual.repeat(M, 1)
+        input_residual = torch.arange(M * K, dtype=dtype_torch).reshape(M, K)
     else:
         input_residual = torch.rand(M, K, dtype=dtype_torch) * val_range
 
@@ -71,10 +82,8 @@ def generate_golden_reference(
     add1_output = layer_norm1_output + input_residual
 
     # Generate up-projection weight (K, N)
-    if debug_mode:
-        # Use a range to prevent the values to be the same across rows
-        up_weight = torch.arange(N, dtype=dtype_torch)
-        up_weight = up_weight.repeat(K, 1)
+    if debug_mode <= 1:
+        up_weight = torch.eye(K, N, dtype=dtype_torch)
     else:
         up_weight = torch.rand(K, N, dtype=dtype_torch) * val_range
 
@@ -82,13 +91,14 @@ def generate_golden_reference(
     up_proj_output = torch.matmul(add1_output, up_weight)
 
     # GeLU activation
-    gelu_output = torch.nn.functional.gelu(up_proj_output)
+    if debug_mode > 1:
+        gelu_output = torch.nn.functional.gelu(up_proj_output)
+    else:
+        gelu_output = up_proj_output.clone()
 
     # Generate down-projection weight (N, K)
-    if debug_mode:
-        # Use a range to prevent the values to be the same across rows
-        down_weight = torch.arange(K, dtype=dtype_torch)
-        down_weight = down_weight.repeat(N, 1)
+    if debug_mode <= 1:
+        down_weight = torch.eye(N, K, dtype=dtype_torch)
     else:
         down_weight = torch.rand(N, K, dtype=dtype_torch) * val_range
 
@@ -96,12 +106,16 @@ def generate_golden_reference(
     down_proj_output = torch.matmul(gelu_output, down_weight)
 
     # Final layer norm
-    layer_norm2_output = torch.nn.functional.layer_norm(
-        down_proj_output, normalized_shape=(K,), weight=ln2_weights, bias=None
-    )
-
-    # Final addition with residual
-    output = layer_norm2_output + add1_output
+    if debug_mode == 0:
+        # The kernel passes through the input only, so skip residual addition for this mode
+        layer_norm2_output = down_proj_output.clone()
+        output = layer_norm2_output.clone()
+    else:
+        layer_norm2_output = torch.nn.functional.layer_norm(
+            down_proj_output, normalized_shape=(K,), weight=ln2_weights, bias=None
+        )
+        # Final addition with residual
+        output = layer_norm2_output + add1_output
 
     return {
         "input": input_tensor,

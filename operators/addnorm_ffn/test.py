@@ -14,6 +14,19 @@ from operators.addnorm_ffn.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 TEST_BERT = True
+DEBUG_MODE = 0
+"""
+Debug mode 0: 
+    Input to first layer norm are indexes, first residual connection is set to 0's. 
+    GEMM weights are identity matrices. Layer norm weights are all 1's.
+    The fused layer norm add kernels will pass through inputs.
+Debug mode 1: 
+    Input to first layer norm is set to 0's, first residual connection are indexes. 
+    GEMM weights are identity matrices. Layer norm weights are all 1's.
+    The fused layer norm add kernels will pass through residual connections.
+Debug mode >1:
+    Random data for all inputs, normal operation
+"""
 
 
 def generate_test_params(extensive=False):
@@ -210,6 +223,7 @@ def test_ffn(
         M=M,
         K=K,
         N=N,
+        debug_mode=DEBUG_MODE,
     )
 
     aie_ffn_config = {
@@ -230,6 +244,7 @@ def test_ffn(
         num_aie_columns=num_aie_columns,
         ln1_weight=golden_ref["weight1"],
         ln2_weight=golden_ref["weight2"],
+        debug_mode=DEBUG_MODE,
         context=aie_context,
         **aie_ffn_config,
     )

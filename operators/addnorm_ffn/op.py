@@ -44,6 +44,7 @@ class AIEANFFN(AIEOperatorBase):
         num_aie_columns=2,
         ln1_weight=None,
         ln2_weight=None,
+        debug_mode=False,
         context=None,
         skip_add_to_list=False,
         **anffn_kwargs,
@@ -85,6 +86,7 @@ class AIEANFFN(AIEOperatorBase):
 
         self.ln1_weight = ln1_weight
         self.ln2_weight = ln2_weight
+        self.debug_mode = debug_mode
 
         AIEOperatorBase.__init__(
             self, context=context, skip_add_to_list=skip_add_to_list
@@ -178,6 +180,16 @@ class AIEANFFN(AIEOperatorBase):
             },
             requires_context=False,
         )
+        encoder_kernel_flags = [
+            "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+            "-DBUILD_FFN",
+            "-DBUILD_ADDNORM",
+            f"-DDIM_M={tile_m}",
+            f"-DDIM_K={tile_k}",
+            f"-DDIM_N={tile_n}",
+        ]
+        if self.debug_mode <= 1:
+            encoder_kernel_flags.append(f"-DDEBUG_AIE_KERNELS={self.debug_mode}")
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_total_base}.xclbin",
@@ -196,14 +208,7 @@ class AIEANFFN(AIEOperatorBase):
                                     / "encoder.cc"
                                 )
                             ],
-                            extra_flags=[
-                                "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
-                                "-DBUILD_FFN",
-                                "-DBUILD_ADDNORM",
-                                f"-DDIM_M={tile_m}",
-                                f"-DDIM_K={tile_k}",
-                                f"-DDIM_N={tile_n}",
-                            ],
+                            extra_flags=encoder_kernel_flags,
                         ),
                         KernelObjectArtifact.new(
                             f"passThrough_{tile_m}x{tile_k}x{tile_n}.o",

@@ -51,7 +51,7 @@ void matmul_vectorized_1x1_mmul(const T_in *__restrict pHalfA1,
                                 const T_in *__restrict pB,
                                 T_out *__restrict pC)
 {
-
+    // Don't change functionality with debug mode since the weight matrix is an identity matrix
     using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
     const int szA = MMUL::size_A / 2; // The tiles have half of the rows expected for mmul api
 
@@ -157,7 +157,7 @@ void matmul_with_acc_vectorized_1x1_mmul(const T_in *__restrict pA,
                                          const T_out *__restrict pAcc,
                                          T_out *__restrict pC)
 {
-
+    // Don't change functionality with debug mode since the weight matrix is an identity matrix
     using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
 
     event0();
@@ -260,7 +260,7 @@ void matmul_vectorized_1x4_mmul(const T_in *__restrict pHalfA1,
                                 const T_in *__restrict pB,
                                 T_out *__restrict pC)
 {
-
+    // Don't change functionality with debug mode since the weight matrix is an identity matrix
     using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
     const int szA = MMUL::size_A / 2; // The tiles have half of the rows expected for mmul api
 
@@ -399,7 +399,7 @@ void matmul_with_acc_vectorized_1x4_mmul(const T_in *__restrict pA,
                                          const T_out *__restrict pAcc,
                                          T_out *__restrict pC)
 {
-
+    // Don't change functionality with debug mode since the weight matrix is an identity matrix
     using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
 
     event0();
@@ -499,7 +499,7 @@ void matmul_with_acc_vectorized_1x4_mmul(const T_in *__restrict pA,
 
 void eltwise_vadd(bfloat16 *a, bfloat16 *b, bfloat16 *c, int size)
 {
-
+    // Don't change functionality with debug mode since this add is used for down projection accumulation
     constexpr int vec_factor = 32;
     event0();
     bfloat16 *__restrict pA1 = a;
@@ -529,6 +529,7 @@ void fused_add_layer_norm_1(const T *restrict input,
                             int32_t rows_to_process)
 {
     event0();
+#ifndef DEBUG_AIE_KERNELS
     constexpr float epsilon = 1e-5f;
     int vector_chunks = cols / N;
 
@@ -579,6 +580,31 @@ void fused_add_layer_norm_1(const T *restrict input,
         }
         weight -= cols;
     }
+#else
+#if DEBUG_AIE_KERNELS == 0
+    // In debug mode, just copy input to output
+    int total_elements = rows_to_process * cols;
+    AIE_PREPARE_FOR_PIPELINING
+    // AIE_LOOP_MIN_ITERATION_COUNT(4)
+    for (int i = 0; i < total_elements; i += N) {
+        ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input);
+        ::aie::store_v(output, reg_a);
+        input += N;
+        output += N;
+    }
+#elif DEBUG_AIE_KERNELS == 1
+    // In debug mode, just copy residual to output
+    int total_elements = rows_to_process * cols;
+    AIE_PREPARE_FOR_PIPELINING
+    // AIE_LOOP_MIN_ITERATION_COUNT(4)
+    for (int i = 0; i < total_elements; i += N) {
+        ::aie::vector<T, N> reg_a = ::aie::load_v<N>(residual);
+        ::aie::store_v(output, reg_a);
+        residual += N;
+        output += N;
+    }
+#endif
+#endif
     event1();
 }
 
@@ -592,6 +618,7 @@ void fused_add_layer_norm_2(const T *restrict input,
                             int32_t rows_to_process)
 {
     event0();
+#ifndef DEBUG_AIE_KERNELS
     constexpr float epsilon = 1e-5f;
     int vector_chunks = cols / N;
 
@@ -644,6 +671,35 @@ void fused_add_layer_norm_2(const T *restrict input,
         }
         weight -= cols;
     }
+#else
+#if DEBUG_AIE_KERNELS == 0
+    // In debug mode, just copy input to output
+    int total_elements = rows_to_process * cols;
+    AIE_PREPARE_FOR_PIPELINING
+    // AIE_LOOP_MIN_ITERATION_COUNT(4)
+    for (int i = 0; i < total_elements; i += N) {
+        ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input);
+        ::aie::store_v(output1, reg_a);
+        ::aie::store_v(output2, reg_a);
+        input += N;
+        output1 += N;
+        output2 += N;
+    }
+#elif DEBUG_AIE_KERNELS == 1
+    // In debug mode, just copy residual to output
+    int total_elements = rows_to_process * cols;
+    AIE_PREPARE_FOR_PIPELINING
+    // AIE_LOOP_MIN_ITERATION_COUNT(4)
+    for (int i = 0; i < total_elements; i += N) {
+        ::aie::vector<T, N> reg_a = ::aie::load_v<N>(residual);
+        ::aie::store_v(output1, reg_a);
+        ::aie::store_v(output2, reg_a);
+        residual += N;
+        output1 += N;
+        output2 += N;
+    }
+#endif
+#endif
     event1();
 }
 
@@ -826,7 +882,10 @@ void ffn_passThroughTile_out(bfloat16 *in, bfloat16 *out, int32_t cols, int32_t 
 void ffn_gelu_bf16(bfloat16 *restrict input, bfloat16 *restrict output, int input_size)
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
+    // Skip GeLU calculations in debug mode
+#ifndef DEBUG_AIE_KERNELS
     gelu_tanh_approx_bf16(input, output, input_size);
+#endif
 }
 
 void ffn_eltwise_add_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, int size)
