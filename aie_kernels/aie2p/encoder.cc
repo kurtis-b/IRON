@@ -709,17 +709,15 @@ void ffn_passThrough_aie(T *restrict in, T *restrict out, int32_t k, int32_t row
     event0();
 
     v64uint8 *restrict outPtr = (v64uint8 *)out;
+    v64uint8 *restrict inPtr = (v64uint8 *)(in + row_offset * 32); // rows to process * t = 32?
 
     AIE_PREPARE_FOR_PIPELINING
     // AIE_LOOP_MIN_ITERATION_COUNT(4)
-    for (unsigned row = 0; row < rows_to_process; row++) {
-
-        v64uint8 *restrict inPtr = (v64uint8 *)(in + (row + row_offset) * k);
-
-        for (int j = 0; j < k; j += N) { // Nx samples per loop
-
-            *outPtr++ = *inPtr++;
-        }
+    for (unsigned i = 0; i < rows_to_process * k; i += N) {
+        *outPtr++ = *inPtr++;
+        inPtr++; // The ++ increments by 32 bfloat16 elements, which is kind of lucky
+        // Increment by 32 since subtiles from gemm output are 8x8, and we want to skip the next 4x32 portion of that
+        // tile, which is for the next 4 rows?
     }
 
     event1();
