@@ -77,6 +77,8 @@ void matmul_vectorized_1x4_mmul(const T_in *__restrict pHalfA1,
                 const T_in *__restrict pB4;
                 pB1 = pB + (j)*MMUL::size_B;
                 pB2 = pB + (j + 1) * MMUL::size_B;
+                pB3 = pB + (j + 2) * MMUL::size_B;
+                pB4 = pB + (j + 3) * MMUL::size_B;
                 aie::vector<T_in, szA> HA10;
                 aie::vector<T_in, szA> HA20;
                 aie::vector<T_in, MMUL::size_B> B0;
@@ -110,7 +112,7 @@ void matmul_vectorized_1x4_mmul(const T_in *__restrict pHalfA1,
                         pHA1 += szA;
                         HA20 = aie::load_v<szA>(pHA2);
                         pHA2 += szA;
-                        auto A0 = ::aie::concat(HA10, HA20);
+                        auto A0 = ::aie::concat(HA10, HA20); // Expects HA10 to be the first rows and HA20 the next rows
                         B0 = aie::load_v<MMUL::size_B>(pB1);
                         pB1 += MMUL::size_B * colB;
                         B1 = aie::load_v<MMUL::size_B>(pB2);
@@ -346,6 +348,7 @@ void fused_add_layer_norm_1(const T *restrict input,
     }
     event1();
 }
+
 template <typename T, int N>
 void fused_add_layer_norm_2(const T *restrict input,
                             const T *restrict residual,
@@ -579,7 +582,7 @@ void ln_passThroughTile_out(int16_t *in,
                             int32_t rows_to_process,
                             int32_t col_offset)
 {
-    ln_passThrough_in_aie<int16_t, 32>(in, out, cols, cols_to_process, rows_to_process, col_offset);
+    ln_passThrough_out_aie<int16_t, 32>(in, out, cols, cols_to_process, rows_to_process, col_offset);
 }
 void ln_passThroughTile_in(int16_t *in,
                            int16_t *out,
@@ -588,7 +591,7 @@ void ln_passThroughTile_in(int16_t *in,
                            int32_t rows_to_process,
                            int32_t col_offset)
 {
-    ln_passThrough_out_aie<int16_t, 32>(in, out, cols, cols_to_process, rows_to_process, col_offset);
+    ln_passThrough_in_aie<int16_t, 32>(in, out, cols, cols_to_process, rows_to_process, col_offset);
 }
 #endif
 }

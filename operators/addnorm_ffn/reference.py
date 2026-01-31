@@ -11,7 +11,7 @@ def generate_golden_reference(
     N: int,
     dtype="bf16",
     seed=42,
-    debug_mode=False,
+    debug_mode=True,
 ):
     """
     Generate golden reference for BERT Add & Norm -> FFN -> Add & Norm. Using uniform distribution [0, 4) to populate tensors.
@@ -48,12 +48,12 @@ def generate_golden_reference(
     # Generate input tensor (M, K)
     if debug_mode:
         input_tensor = torch.zeros(M, K, dtype=dtype_torch)
-        ln1_weights = torch.zeros(K, dtype=dtype_torch)
-        ln2_weights = torch.zeros(K, dtype=dtype_torch)
+        ln1_weights = torch.ones(K, dtype=dtype_torch)
+        ln2_weights = torch.ones(K, dtype=dtype_torch)
     else:
         input_tensor = torch.rand(M, K, dtype=dtype_torch) * val_range
-        ln1_weights = torch.rand(K, dtype=dtype_torch)
-        ln2_weights = torch.rand(K, dtype=dtype_torch)
+        ln1_weights = torch.rand(K, dtype=dtype_torch) * val_range
+        ln2_weights = torch.rand(K, dtype=dtype_torch) * val_range
 
     layer_norm1_output = torch.nn.functional.layer_norm(
         input_tensor, normalized_shape=(K,), weight=ln1_weights, bias=None
@@ -61,17 +61,22 @@ def generate_golden_reference(
 
     # Generate input for residual addition (M, K)
     if debug_mode:
-        input_residual = torch.arange(M * K, dtype=dtype_torch).reshape(M, K)
+        # Use a range only across columns since the values get really large, which could affect the layer norm calculations
+        input_residual = torch.arange(K, dtype=dtype_torch)
+        input_residual = input_residual.repeat(M, 1)
     else:
         input_residual = torch.rand(M, K, dtype=dtype_torch) * val_range
 
+    # Up proj input is just input_residual in debug mode since layer norm of zeros is zeros
     add1_output = layer_norm1_output + input_residual
 
     # Generate up-projection weight (K, N)
     if debug_mode:
-        up_weight = torch.eye(K, N, dtype=dtype_torch)
+        # Use a range to prevent the values to be the same across rows
+        up_weight = torch.arange(N, dtype=dtype_torch)
+        up_weight = up_weight.repeat(K, 1)
     else:
-        up_weight = torch.rand(K, N, dtype=dtype_torch)
+        up_weight = torch.rand(K, N, dtype=dtype_torch) * val_range
 
     # Up-projection: (M, K) @ (K, N) = (M, N)
     up_proj_output = torch.matmul(add1_output, up_weight)
@@ -81,9 +86,11 @@ def generate_golden_reference(
 
     # Generate down-projection weight (N, K)
     if debug_mode:
-        down_weight = torch.eye(N, K, dtype=dtype_torch)
+        # Use a range to prevent the values to be the same across rows
+        down_weight = torch.arange(K, dtype=dtype_torch)
+        down_weight = down_weight.repeat(N, 1)
     else:
-        down_weight = torch.rand(N, K, dtype=dtype_torch)
+        down_weight = torch.rand(N, K, dtype=dtype_torch) * val_range
 
     # Down-projection: (M, N) @ (N, K) = (M, K)
     down_proj_output = torch.matmul(gelu_output, down_weight)
