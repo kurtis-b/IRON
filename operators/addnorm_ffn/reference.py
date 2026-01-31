@@ -65,6 +65,7 @@ def generate_golden_reference(
     if debug_mode == 0:
         layer_norm1_output = input_tensor.clone()
     else:
+        # input is 0's for deubg_mode 1, so layer norm output is also 0's
         layer_norm1_output = torch.nn.functional.layer_norm(
             input_tensor, normalized_shape=(K,), weight=ln1_weights, bias=None
         )
@@ -82,7 +83,7 @@ def generate_golden_reference(
     add1_output = layer_norm1_output + input_residual
 
     # Generate up-projection weight (K, N)
-    if debug_mode <= 1:
+    if debug_mode == 1 or debug_mode == 0:
         up_weight = torch.eye(K, N, dtype=dtype_torch)
     else:
         up_weight = torch.rand(K, N, dtype=dtype_torch) * val_range
@@ -91,13 +92,13 @@ def generate_golden_reference(
     up_proj_output = torch.matmul(add1_output, up_weight)
 
     # GeLU activation
-    if debug_mode > 1:
-        gelu_output = torch.nn.functional.gelu(up_proj_output)
-    else:
+    if debug_mode == 1 or debug_mode == 0:
         gelu_output = up_proj_output.clone()
+    else:
+        gelu_output = torch.nn.functional.gelu(up_proj_output)
 
     # Generate down-projection weight (N, K)
-    if debug_mode <= 1:
+    if debug_mode == 1 or debug_mode == 0:
         down_weight = torch.eye(N, K, dtype=dtype_torch)
     else:
         down_weight = torch.rand(N, K, dtype=dtype_torch) * val_range
@@ -107,9 +108,11 @@ def generate_golden_reference(
 
     # Final layer norm
     if debug_mode == 0:
-        # The kernel passes through the input only, so skip residual addition for this mode
-        layer_norm2_output = down_proj_output.clone()
-        output = layer_norm2_output.clone()
+        # The kernel passes through the input only, so skip layer norm and residual addition for this mode
+        output = down_proj_output.clone()
+    elif debug_mode == 1:
+        # The kernel passes through the residual only, so skip layer norm and add with down_proj_output
+        output = add1_output.clone()
     else:
         layer_norm2_output = torch.nn.functional.layer_norm(
             down_proj_output, normalized_shape=(K,), weight=ln2_weights, bias=None

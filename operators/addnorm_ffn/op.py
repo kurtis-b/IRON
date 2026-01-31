@@ -188,7 +188,7 @@ class AIEANFFN(AIEOperatorBase):
             f"-DDIM_K={tile_k}",
             f"-DDIM_N={tile_n}",
         ]
-        if self.debug_mode <= 1:
+        if self.debug_mode == 0 or self.debug_mode == 1:
             encoder_kernel_flags.append(f"-DDEBUG_AIE_KERNELS={self.debug_mode}")
 
         xclbin_artifact = XclbinArtifact.new(

@@ -14,7 +14,7 @@ from operators.addnorm_ffn.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 TEST_BERT = True
-DEBUG_MODE = 0
+DEBUG_MODE = -1
 """
 Debug mode 0: 
     Input to first layer norm are indexes, first residual connection is set to 0's. 
@@ -24,7 +24,7 @@ Debug mode 1:
     Input to first layer norm is set to 0's, first residual connection are indexes. 
     GEMM weights are identity matrices. Layer norm weights are all 1's.
     The fused layer norm add kernels will pass through residual connections.
-Debug mode >1:
+Debug mode < 0 or > 1:
     Random data for all inputs, normal operation
 """
 
