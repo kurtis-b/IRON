@@ -206,22 +206,6 @@ class AIEANFFN(AIEOperatorBase):
                             ],
                         ),
                         KernelObjectArtifact.new(
-                            f"add_{tile_m}x{tile_k}x{tile_n}.o",
-                            [
-                                SourceArtifact.new(
-                                    base_dir / "aie_kernels" / "generic" / "add.cc"
-                                )
-                            ],
-                        ),
-                        KernelObjectArtifact.new(
-                            f"gelu_{tile_m}x{tile_k}x{tile_n}.o",
-                            [
-                                SourceArtifact.new(
-                                    base_dir / "aie_kernels" / "aie2p" / "gelu.cc"
-                                )
-                            ],
-                        ),
-                        KernelObjectArtifact.new(
                             f"passThrough_{tile_m}x{tile_k}x{tile_n}.o",
                             extra_flags=[
                                 "-DBIT_WIDTH=16",

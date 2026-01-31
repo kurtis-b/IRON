@@ -411,7 +411,7 @@ def my_matmul(
         [ln_in_out_ty, ln_in_out_ty, B_up_proj_l1_ty, C_up_proj_l1_ty],
     )
     ffn_gelu_kernel = Kernel(
-        "gelu_bf16",
+        "ffn_gelu_bf16",
         archive_name,
         [C_up_proj_l1_ty, C_up_proj_l1_ty, np.int32],
     )
@@ -1221,7 +1221,7 @@ def my_matmul(
                         placement=Tile(a_tile * 2, 0),
                     )
                     logging.debug(
-                        f"    Placed C output {a_tile} transfer at ({a_tile * 2}, 0)"
+                        f"    Placed C output {a_tile} transfer at ({a_tile * 2}, 0) with offset {C_tile.offset}, sizes {C_tile.sizes}, strides {C_tile.strides}"
                     )
                     # A input transfer:
                     A_tile = ln_taps[a_tile]
@@ -1236,7 +1236,7 @@ def my_matmul(
                         ),
                     )
                     logging.debug(
-                        f"        Placed A input {a_tile} transfer at ({a_tile * 2}, 0)"
+                        f"        Placed A input {a_tile} transfer at ({a_tile * 2}, 0) with offset {A_tile.offset}, sizes {A_tile.sizes}, strides {A_tile.strides}"
                     )
                     # This line does not change MLIR output at all - it's just for recording data movement
                     A_taps.append(A_tile)
@@ -1253,7 +1253,7 @@ def my_matmul(
                         ),
                     )
                     logging.debug(
-                        f"        Placed R input {a_tile} transfer at ({a_tile * 2}, 0)"
+                        f"        Placed R input {a_tile} transfer at ({a_tile * 2}, 0) with offset {R_tile.offset}, sizes {R_tile.sizes}, strides {R_tile.strides}"
                     )
 
                 for duplicate_b_tile in range(n_dup_shim_b_streams):
@@ -1294,7 +1294,7 @@ def my_matmul(
                                     ),
                                 )
                                 logging.debug(
-                                    f"        Placed B_Up input {b_tile + b_tile_offset} transfer at ({a_tile * 2 + 1}, 0), offset: {B_up_proj_col_offset}, sizes: {B_up_proj_sizes}, strides: {B_up_proj_strides}"
+                                    f"        Placed B_Up input {b_tile + b_tile_offset} transfer at ({a_tile * 2 + 1}, 0) with offset {B_up_proj_tile.offset}, sizes {B_up_proj_tile.sizes}, strides {B_up_proj_tile.strides}"
                                 )
                                 # This line does not change MLIR output at all - it's just for recording data movement
                                 B_up_proj_taps.append(B_up_proj_tile)
@@ -1334,7 +1334,7 @@ def my_matmul(
                                     ),
                                 )
                                 logging.debug(
-                                    f"        Placed B_Down input {b_tile + b_tile_offset} transfer at ({a_tile * 2 + 1}, 0), offset: {B_down_proj_col_offset}, sizes: {B_down_proj_sizes}, strides: {B_down_proj_strides}"
+                                    f"        Placed B_Down input {b_tile + b_tile_offset} transfer at ({a_tile * 2 + 1}, 0) with offset {B_down_proj_tile.offset}, sizes {B_down_proj_tile.sizes}, strides {B_down_proj_tile.strides}"
                                 )
                                 # These lines do not change MLIR output at all - they are just for recording data movement
                                 B_down_proj_taps.append(B_down_proj_tile)
