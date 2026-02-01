@@ -242,7 +242,7 @@ def my_matmul(
     nC_row_tiles_per_core = M // m // nA_tiles_distributed
     nC_tiles_per_core = nC_up_col_tiles_per_core * nC_row_tiles_per_core
     ln_iters_per_core = (
-        M // nA_tiles_distributed // m
+        M // nA_tiles_distributed // (ln_cores_per_nA * ln_rows_to_process)
     )  # NOTE: m is the GEMM tile size across M dimension, which is then divided across the Add & Norm cores
 
     logging.debug(
@@ -841,9 +841,7 @@ def my_matmul(
                     elem_in_a = in_a.acquire(2)
                     elem_in_b = in_b.acquire(1)
                     # NOTE: Which one is the first and second set of rows depends on the MT connections
-                    matmul(
-                        elem_in_a[0], elem_in_a[1], elem_in_b, elem_out_matmul
-                    )  # TODO: If the indexes here are switched, the output becomes all NaNs for some reason
+                    matmul(elem_in_a[0], elem_in_a[1], elem_in_b, elem_out_matmul)
                     in_a.release(2)
                     in_b.release(1)
                 if gelu:

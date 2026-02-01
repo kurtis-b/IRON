@@ -69,6 +69,8 @@ def generate_golden_reference(
         layer_norm1_output = torch.nn.functional.layer_norm(
             input_tensor, normalized_shape=(K,), weight=ln1_weights, bias=None
         )
+        print(f"Layer Norm 1 Input: {input_tensor}")
+        print(f"Layer Norm 1 Output: {layer_norm1_output}")
 
     # Generate input for residual addition (M, K)
     if debug_mode == 0:
@@ -86,7 +88,7 @@ def generate_golden_reference(
     if debug_mode == 1 or debug_mode == 0:
         up_weight = torch.eye(K, N, dtype=dtype_torch)
     else:
-        up_weight = torch.rand(K, N, dtype=dtype_torch) * val_range
+        up_weight = torch.randn(K, N, dtype=dtype_torch) * val_range
 
     # Up-projection: (M, K) @ (K, N) = (M, N)
     up_proj_output = torch.matmul(add1_output, up_weight)
@@ -95,13 +97,14 @@ def generate_golden_reference(
     if debug_mode == 1 or debug_mode == 0:
         gelu_output = up_proj_output.clone()
     else:
+        print(f"Up Projection Output: {up_proj_output}")
         gelu_output = torch.nn.functional.gelu(up_proj_output)
 
     # Generate down-projection weight (N, K)
     if debug_mode == 1 or debug_mode == 0:
         down_weight = torch.eye(N, K, dtype=dtype_torch)
     else:
-        down_weight = torch.rand(N, K, dtype=dtype_torch) * val_range
+        down_weight = torch.randn(N, K, dtype=dtype_torch) * val_range
 
     # Down-projection: (M, N) @ (N, K) = (M, K)
     down_proj_output = torch.matmul(gelu_output, down_weight)
@@ -117,6 +120,8 @@ def generate_golden_reference(
         layer_norm2_output = torch.nn.functional.layer_norm(
             down_proj_output, normalized_shape=(K,), weight=ln2_weights, bias=None
         )
+        print(f"Layer Norm 2 Input: {down_proj_output}")
+        print(f"Layer Norm 2 Output: {layer_norm2_output}")
         # Final addition with residual
         output = layer_norm2_output + add1_output
 

@@ -248,7 +248,7 @@ template <typename T_in,
           bool c_row_maj = true>
 static inline void matmul_with_acc_vectorized_2x2_mmul(const T_in *__restrict pA,
                                                        const T_in *__restrict pB,
-                                                       const T_out *__restrict pAcc,
+                                                       T_out *__restrict pAcc,
                                                        T_out *__restrict pC)
 {
 
@@ -260,8 +260,8 @@ static inline void matmul_with_acc_vectorized_2x2_mmul(const T_in *__restrict pA
     AIE_LOOP_MIN_ITERATION_COUNT(1)
     for (unsigned z = 0; z < rowA; z += 2) {
 
-        const T_out *__restrict pAcc1;
-        const T_out *__restrict pAcc2;
+        T_out *__restrict pAcc1;
+        T_out *__restrict pAcc2;
         T_out *__restrict pC1;
         T_out *__restrict pC2;
         if constexpr (c_row_maj) {
@@ -594,7 +594,7 @@ matmul_vectorized_8x8x8_i8_i32(const int8 *__restrict pA, const int8 *__restrict
 template <unsigned m, unsigned k, unsigned n>
 static inline void matmul_with_acc_vectorized_4x4x8_i16_i16(const int16 *__restrict pA,
                                                             const int16 *__restrict pB,
-                                                            const int16 *__restrict pAcc,
+                                                            int16 *__restrict pAcc,
                                                             int16 *__restrict pC)
 {
     constexpr int r = 4;
@@ -620,7 +620,7 @@ static inline void matmul_with_acc_vectorized_4x4x8_i16_i16(const int16 *__restr
 template <unsigned m, unsigned k, unsigned n>
 static inline void matmul_with_acc_vectorized_4x4x8_i16_i32(const int16 *__restrict pA,
                                                             const int16 *__restrict pB,
-                                                            const int32 *__restrict pAcc,
+                                                            int32 *__restrict pAcc,
                                                             int32 *__restrict pC)
 {
     constexpr int r = 4;
@@ -646,7 +646,7 @@ static inline void matmul_with_acc_vectorized_4x4x8_i16_i32(const int16 *__restr
 template <unsigned m, unsigned k, unsigned n>
 static inline void matmul_with_acc_vectorized_4x8x8_bf16_bf16(const bfloat16 *__restrict pA,
                                                               const bfloat16 *__restrict pB,
-                                                              const bfloat16 *__restrict pAcc,
+                                                              bfloat16 *__restrict pAcc,
                                                               bfloat16 *__restrict pC)
 {
     constexpr int r = 4;
@@ -676,7 +676,7 @@ static inline void matmul_with_acc_vectorized_4x8x8_bf16_bf16(const bfloat16 *__
 template <unsigned m, unsigned k, unsigned n>
 static inline void matmul_with_acc_vectorized_8x8x8_bf16_bf16(const bfloat16 *__restrict pA,
                                                               const bfloat16 *__restrict pB,
-                                                              const bfloat16 *__restrict pAcc,
+                                                              bfloat16 *__restrict pAcc,
                                                               bfloat16 *__restrict pC)
 {
     constexpr int r = 8;
@@ -704,7 +704,7 @@ static inline void matmul_with_acc_vectorized_8x8x8_bf16_bf16(const bfloat16 *__
 template <unsigned m, unsigned k, unsigned n>
 static inline void matmul_with_acc_vectorized_4x8x8_bf16_f32(const bfloat16 *__restrict pA,
                                                              const bfloat16 *__restrict pB,
-                                                             const float *__restrict pAcc,
+                                                             float *__restrict pAcc,
                                                              float *__restrict pC)
 {
     constexpr int r = 4;
@@ -732,7 +732,7 @@ static inline void matmul_with_acc_vectorized_4x8x8_bf16_f32(const bfloat16 *__r
 template <unsigned m, unsigned k, unsigned n>
 static inline void matmul_with_acc_vectorized_8x8x8_bf16_f32(const bfloat16 *__restrict pA,
                                                              const bfloat16 *__restrict pB,
-                                                             const float *__restrict pAcc,
+                                                             float *__restrict pAcc,
                                                              float *__restrict pC)
 {
     constexpr int r = 8;
@@ -760,7 +760,7 @@ static inline void matmul_with_acc_vectorized_8x8x8_bf16_f32(const bfloat16 *__r
 template <unsigned m, unsigned k, unsigned n>
 static inline void matmul_with_acc_vectorized_8x8x8_i8_i8(const int8 *__restrict pA,
                                                           const int8 *__restrict pB,
-                                                          const int8 *__restrict pAcc,
+                                                          int8 *__restrict pAcc,
                                                           int8 *__restrict pC)
 {
     constexpr int r = 8;
@@ -786,7 +786,7 @@ static inline void matmul_with_acc_vectorized_8x8x8_i8_i8(const int8 *__restrict
 template <unsigned m, unsigned k, unsigned n>
 static inline void matmul_with_acc_vectorized_8x8x8_i8_i16(const int8 *__restrict pA,
                                                            const int8 *__restrict pB,
-                                                           const int8 *__restrict pAcc,
+                                                           int8 *__restrict pAcc,
                                                            int16 *__restrict pC)
 {
     constexpr int r = 8;
@@ -812,7 +812,7 @@ static inline void matmul_with_acc_vectorized_8x8x8_i8_i16(const int8 *__restric
 template <unsigned m, unsigned k, unsigned n>
 static inline void matmul_with_acc_vectorized_8x8x8_i8_i32(const int8 *__restrict pA,
                                                            const int8 *__restrict pB,
-                                                           const int32 *__restrict pAcc,
+                                                           int32 *__restrict pAcc,
                                                            int32 *__restrict pC)
 {
     constexpr int r = 8;
