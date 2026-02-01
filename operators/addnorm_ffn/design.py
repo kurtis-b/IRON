@@ -336,7 +336,7 @@ def my_matmul(
     # object FIFO depth based on the down_proj_depth parameter.
     assert (
         K == k * down_proj_depth * nB_tiles_distributed
-    ), """Partial C_Down must be tiled into (m, k * down_proj_depth)-sized blocks"""
+    ), """Partial C_Down must tile equally into (m, K) with (m, k * down_proj_depth * nB_tiles_distributed)-sized blocks"""
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
     assert (
@@ -707,7 +707,7 @@ def my_matmul(
                 (t, 1),
             ]
             C_down_proj_out_l1l1_fifos[a_tile][ln_core] = ObjectFifo(
-                ln_processing_ty,
+                ln_in_out_ty,
                 name=f"C_down_proj_out_L1L1_{a_tile}_{ln_core}",
                 depth=fifo_depth,
                 dims_to_stream=dims_to_stream if ln_core == 0 else None,
