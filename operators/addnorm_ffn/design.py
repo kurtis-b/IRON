@@ -239,18 +239,18 @@ def my_matmul(
     # Calculate loop bounds for the reduction loop and total C tiles
     K_div_k = K // k
     nC_up_col_tiles_per_core = N // mem_tile_n
-    nC_row_tiles_per_core = M // m // nA_tiles_distributed
-    nC_tiles_per_core = nC_up_col_tiles_per_core * nC_row_tiles_per_core
-    ln_iters_per_core = (
-        M // nA_tiles_distributed // (ln_cores_per_nA * ln_rows_to_process)
-    )  # NOTE: m is the GEMM tile size across M dimension, which is then divided across the Add & Norm cores
+    ln_iters_per_core = M // (
+        nA_tiles_distributed * ln_cores_per_nA * ln_rows_to_process
+    )
+    nC_tiles_per_core = nC_up_col_tiles_per_core * ln_iters_per_core
 
     logging.debug(
-        f"Up proj loop bounds: K_div_k={K_div_k}, nC_up_col_tiles_per_core={nC_up_col_tiles_per_core}, nC_row_tiles_per_core={nC_row_tiles_per_core}"
+        f"Up proj loop bounds: K_div_k={K_div_k}, nC_up_col_tiles_per_core={nC_up_col_tiles_per_core}, nC_tiles_per_core={nC_tiles_per_core}"
     )
     logging.debug(
         f"Down proj loop bounds: nC_up_col_tiles_per_core={nC_up_col_tiles_per_core}, down_proj_depth={down_proj_depth}"
     )
+    logging.debug(f"Add & Norm loop bounds: ln_iters_per_core={ln_iters_per_core}")
 
     assert np.issubdtype(dtype_in, np.integer) == np.issubdtype(
         dtype_out, np.integer
@@ -1178,16 +1178,6 @@ def my_matmul(
     # tb = transfer block; block of transfers before sync call
     tb_max_n_rows = 4
 
-    ln_taps = [
-        TensorAccessPattern(
-            (1, M * K),
-            ln_iters_per_core * m * K * a_tile,
-            [1, 1, 1, ln_iters_per_core * m * K],
-            [0, 0, 0, 1],
-        )
-        for a_tile in range(nA_tiles_distributed)
-    ]
-
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
     with rt.sequence(A_ty, A_ty, B_ty, B_ty, C_ty) as (A, R, B_Up, B_Down, C):
@@ -1195,15 +1185,24 @@ def my_matmul(
 
         # Task groups will be used to determine when to sync/await/free DMA runtime ops
         tg = rt.task_group()
-        for tb in range(ceildiv(nC_row_tiles_per_core, tb_max_n_rows)):
+        for tb in range(ceildiv(ln_iters_per_core, tb_max_n_rows)):
             for pingpong in [0, 1]:
                 row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
                 current_tb_n_rows = min(
-                    [tb_max_n_rows // 2, nC_row_tiles_per_core - row_base]
+                    [tb_max_n_rows // 2, ln_iters_per_core - row_base]
                 )
                 if current_tb_n_rows <= 0:
                     # For small input sizes, we may not even need a "pong" iteration
                     break
+                ln_taps = [
+                    TensorAccessPattern(
+                        (1, M * K),
+                        row_base * m * nA_tiles_distributed * K + a_tile * m * K,
+                        [1, 1, 1, current_tb_n_rows * m * K],
+                        [0, 0, 0, 1],
+                    )
+                    for a_tile in range(nA_tiles_distributed)
+                ]
                 for a_tile in range(nA_tiles_distributed):
                     logging.debug(f"TB: {tb}, PP: {pingpong}, A tile: {a_tile}")
                     C_tile = ln_taps[a_tile]
@@ -1254,88 +1253,91 @@ def my_matmul(
                         f"        Placed R input {a_tile} transfer at ({a_tile * 2}, 0) with offset {R_tile.offset}, sizes {R_tile.sizes}, strides {R_tile.strides}"
                     )
 
-                for duplicate_b_tile in range(n_dup_shim_b_streams):
-                    b_tile_offset = duplicate_b_tile * nB_tiles_distributed
-                    logging.debug(f"B tile offset: {b_tile_offset}")
-                    for b_tile in range(nB_tiles_distributed):
-                        for stage in range(num_ffn_stages):
-                            logging.debug(f"    B tile: {b_tile}, Stage: {stage}")
-                            if stage == 0:
-                                # B_Up input transfer:
-                                B_up_proj_col_offset = b_tile * n
-                                B_up_proj_sizes = [
-                                    nC_up_col_tiles_per_core,
-                                    K_div_k,
-                                    k,
-                                    n,
-                                ]
-                                B_up_proj_strides = [
-                                    mem_tile_n,
-                                    k * N,
-                                    N,
-                                    1,
-                                ]
-                                B_up_proj_tile = TensorAccessPattern(
-                                    (N, K),
-                                    offset=B_up_proj_col_offset,
-                                    sizes=B_up_proj_sizes,
-                                    strides=B_up_proj_strides,
-                                )
-                                rt.fill(
-                                    B_up_proj_l3l2_fifos[b_tile + b_tile_offset].prod(),
-                                    B_Up,
-                                    tap=B_up_proj_tile,
-                                    task_group=tg,
-                                    placement=Tile(
-                                        a_tile * 2 + 1,
-                                        0,
-                                    ),
-                                )
-                                logging.debug(
-                                    f"        Placed B_Up input {b_tile + b_tile_offset} transfer at ({a_tile * 2 + 1}, 0) with offset {B_up_proj_tile.offset}, sizes {B_up_proj_tile.sizes}, strides {B_up_proj_tile.strides}"
-                                )
-                                # This line does not change MLIR output at all - it's just for recording data movement
-                                B_up_proj_taps.append(B_up_proj_tile)
-                            elif stage == 1:
-                                # B_Down input transfer:
-                                B_down_proj_col_offset = b_tile * n * K
-                                # Notice how some of the sizes/strides are the same or similar
-                                # to the ones in B_Up, but with accounting for the swapped n and k dimensions
-                                B_down_proj_sizes = [
-                                    nC_up_col_tiles_per_core,
-                                    down_proj_depth,
-                                    n,
-                                    k,
-                                ]
-                                B_down_proj_strides = [
-                                    mem_tile_n * K,
-                                    k,
-                                    K,
-                                    1,
-                                ]
-                                B_down_proj_tile = TensorAccessPattern(
-                                    (K, N),
-                                    offset=B_down_proj_col_offset,
-                                    sizes=B_down_proj_sizes,
-                                    strides=B_down_proj_strides,
-                                )
-                                rt.fill(
-                                    B_down_proj_l3l2_fifos[
-                                        b_tile + b_tile_offset
-                                    ].prod(),
-                                    B_Down,
-                                    tap=B_down_proj_tile,
-                                    task_group=tg,
-                                    placement=Tile(
-                                        a_tile * 2 + 1,
-                                        0,
-                                    ),
-                                )
-                                logging.debug(
-                                    f"        Placed B_Down input {b_tile + b_tile_offset} transfer at ({a_tile * 2 + 1}, 0) with offset {B_down_proj_tile.offset}, sizes {B_down_proj_tile.sizes}, strides {B_down_proj_tile.strides}"
-                                )
-                                # These lines do not change MLIR output at all - they are just for recording data movement
-                                B_down_proj_taps.append(B_down_proj_tile)
+                for tile_row in range(current_tb_n_rows):
+                    for duplicate_b_tile in range(n_dup_shim_b_streams):
+                        b_tile_offset = duplicate_b_tile * nB_tiles_distributed
+                        logging.debug(f"B tile offset: {b_tile_offset}")
+                        for b_tile in range(nB_tiles_distributed):
+                            for stage in range(num_ffn_stages):
+                                logging.debug(f"    B tile: {b_tile}, Stage: {stage}")
+                                if stage == 0:
+                                    # B_Up input transfer:
+                                    B_up_proj_col_offset = b_tile * n
+                                    B_up_proj_sizes = [
+                                        nC_up_col_tiles_per_core,
+                                        K_div_k,
+                                        k,
+                                        n,
+                                    ]
+                                    B_up_proj_strides = [
+                                        mem_tile_n,
+                                        k * N,
+                                        N,
+                                        1,
+                                    ]
+                                    B_up_proj_tile = TensorAccessPattern(
+                                        (N, K),
+                                        offset=B_up_proj_col_offset,
+                                        sizes=B_up_proj_sizes,
+                                        strides=B_up_proj_strides,
+                                    )
+                                    rt.fill(
+                                        B_up_proj_l3l2_fifos[
+                                            b_tile + b_tile_offset
+                                        ].prod(),
+                                        B_Up,
+                                        tap=B_up_proj_tile,
+                                        task_group=tg,
+                                        placement=Tile(
+                                            a_tile * 2 + 1,
+                                            0,
+                                        ),
+                                    )
+                                    logging.debug(
+                                        f"        Placed B_Up input {b_tile + b_tile_offset} transfer at ({a_tile * 2 + 1}, 0) with offset {B_up_proj_tile.offset}, sizes {B_up_proj_tile.sizes}, strides {B_up_proj_tile.strides}"
+                                    )
+                                    # This line does not change MLIR output at all - it's just for recording data movement
+                                    B_up_proj_taps.append(B_up_proj_tile)
+                                elif stage == 1:
+                                    # B_Down input transfer:
+                                    B_down_proj_col_offset = b_tile * n * K
+                                    # Notice how some of the sizes/strides are the same or similar
+                                    # to the ones in B_Up, but with accounting for the swapped n and k dimensions
+                                    B_down_proj_sizes = [
+                                        nC_up_col_tiles_per_core,
+                                        down_proj_depth,
+                                        n,
+                                        k,
+                                    ]
+                                    B_down_proj_strides = [
+                                        mem_tile_n * K,
+                                        k,
+                                        K,
+                                        1,
+                                    ]
+                                    B_down_proj_tile = TensorAccessPattern(
+                                        (K, N),
+                                        offset=B_down_proj_col_offset,
+                                        sizes=B_down_proj_sizes,
+                                        strides=B_down_proj_strides,
+                                    )
+                                    rt.fill(
+                                        B_down_proj_l3l2_fifos[
+                                            b_tile + b_tile_offset
+                                        ].prod(),
+                                        B_Down,
+                                        tap=B_down_proj_tile,
+                                        task_group=tg,
+                                        placement=Tile(
+                                            a_tile * 2 + 1,
+                                            0,
+                                        ),
+                                    )
+                                    logging.debug(
+                                        f"        Placed B_Down input {b_tile + b_tile_offset} transfer at ({a_tile * 2 + 1}, 0) with offset {B_down_proj_tile.offset}, sizes {B_down_proj_tile.sizes}, strides {B_down_proj_tile.strides}"
+                                    )
+                                    # These lines do not change MLIR output at all - they are just for recording data movement
+                                    B_down_proj_taps.append(B_down_proj_tile)
                 if tb > 0 or (tb == 0 and pingpong > 0):
                     rt.finish_task_group(tg)
                     tg = rt.task_group()
