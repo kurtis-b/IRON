@@ -474,7 +474,7 @@ void fused_add_layer_norm_1(const T *restrict input,
     int vector_chunks = cols / N;
 
     AIE_PREPARE_FOR_PIPELINING
-    // AIE_LOOP_MIN_ITERATION_COUNT(4)
+    AIE_LOOP_MIN_ITERATION_COUNT(4)
     for (int row = 0; row < rows_to_process; row++) {
 
         ::aie::vector<T, N> sum_acc = ::aie::zeros<T, N>();
@@ -569,8 +569,8 @@ void fused_add_layer_norm_2(const T *restrict input,
     constexpr float epsilon = 1e-5f;
     int vector_chunks = cols / N;
 
-    // AIE_PREPARE_FOR_PIPELINING
-    // AIE_LOOP_MIN_ITERATION_COUNT(4)
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(4)
     for (int row = 0; row < rows_to_process; row++) {
 
         ::aie::vector<T, N> sum_acc = ::aie::zeros<T, N>();
@@ -668,7 +668,7 @@ void ffn_passThrough_aie(const T *restrict in, T *restrict out, int32_t k, int32
 
     T *__restrict pOut = out;
     AIE_PREPARE_FOR_PIPELINING
-    // AIE_LOOP_MIN_ITERATION_COUNT(4)
+    AIE_LOOP_MIN_ITERATION_COUNT(4)
     for (unsigned row = 0; row < rows_to_process; row++) {
         // t = 8, r * t = m * 8 = num LN cores * rows per LN core * 8 = 8 * 8
         const T *__restrict pIn = in + row_offset * rows_to_process * 8 + row * (k / N) * (2 * rows_to_process) * 8;
@@ -696,7 +696,7 @@ void ln_passThrough_in_aie(const T *restrict in,
     v64uint8 *restrict outPtr = (v64uint8 *)out;
 
     AIE_PREPARE_FOR_PIPELINING
-    // AIE_LOOP_MIN_ITERATION_COUNT(4)
+    AIE_LOOP_MIN_ITERATION_COUNT(4)
     for (unsigned row = 0; row < rows_to_process; row++) {
 
         v64uint8 *restrict inPtr = (v64uint8 *)(in + row * K + col_offset * k);
@@ -723,7 +723,7 @@ void ln_passThrough_out_aie(T *restrict in,
     T *__restrict pIn = in;
 
     AIE_PREPARE_FOR_PIPELINING
-    // AIE_LOOP_MIN_ITERATION_COUNT(4)
+    AIE_LOOP_MIN_ITERATION_COUNT(4)
     for (unsigned row = 0; row < rows_to_process; row++) {
 
         T *__restrict pOut = out + row * K + col_offset * k;
