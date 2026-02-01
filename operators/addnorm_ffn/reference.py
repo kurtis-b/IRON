@@ -69,8 +69,8 @@ def generate_golden_reference(
         layer_norm1_output = torch.nn.functional.layer_norm(
             input_tensor, normalized_shape=(K,), weight=ln1_weights, bias=None
         )
-        print(f"Layer Norm 1 Input: {input_tensor}")
-        print(f"Layer Norm 1 Output: {layer_norm1_output}")
+        # print(f"Layer Norm 1 Input: {input_tensor}")
+        # print(f"Layer Norm 1 Output: {layer_norm1_output}")
 
     # Generate input for residual addition (M, K)
     if debug_mode == 0:
@@ -97,7 +97,7 @@ def generate_golden_reference(
     if debug_mode == 1 or debug_mode == 0:
         gelu_output = up_proj_output.clone()
     else:
-        print(f"Up Projection Output: {up_proj_output}")
+        # print(f"Up Projection Output: {up_proj_output}")
         gelu_output = torch.nn.functional.gelu(up_proj_output)
 
     # Generate down-projection weight (N, K)
@@ -120,8 +120,8 @@ def generate_golden_reference(
         layer_norm2_output = torch.nn.functional.layer_norm(
             down_proj_output, normalized_shape=(K,), weight=ln2_weights, bias=None
         )
-        print(f"Layer Norm 2 Input: {down_proj_output}")
-        print(f"Layer Norm 2 Output: {layer_norm2_output}")
+        # print(f"Layer Norm 2 Input: {down_proj_output}")
+        # print(f"Layer Norm 2 Output: {layer_norm2_output}")
         # Final addition with residual
         output = layer_norm2_output + add1_output
 

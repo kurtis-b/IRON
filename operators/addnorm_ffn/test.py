@@ -45,8 +45,8 @@ def generate_test_params(extensive=False):
             (8 * 8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),
             # K scaled up from baseline
             (8, 96 * 8, 96, 2, 8, 96, 96, 0, 8, 1, 1, None, 0),
-            # # N scaled up from baseline
-            # (64, 48, 96 * 4, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
+            # N scaled up from baseline
+            (8, 96, 96 * 8, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),
             # # K scaled up with matching scaling with down_proj_depth (affects MT utilization)
             # (64, 48 * 4, 96, 2, 64, 48, 96, 0, 4, 1, 1, None, 0),
             # # M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)

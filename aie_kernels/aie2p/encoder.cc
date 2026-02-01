@@ -405,12 +405,12 @@ void matmul_with_acc_vectorized_1x4_mmul(const T_in *__restrict pA,
                 // zero.cc function handles the zeroing of data when a new
                 // accumulation is needed (after the 'K' reduction dimension)
                 aie::vector<T_out, MMUL::size_C> acc_C00 = aie::load_v<MMUL::size_C>(pAcc1);
+                pAcc1 += MMUL::size_C;
                 aie::vector<T_out, MMUL::size_C> acc_C01 = aie::load_v<MMUL::size_C>(pAcc1);
+                pAcc1 += MMUL::size_C;
                 aie::vector<T_out, MMUL::size_C> acc_C02 = aie::load_v<MMUL::size_C>(pAcc1);
+                pAcc1 += MMUL::size_C;
                 aie::vector<T_out, MMUL::size_C> acc_C03 = aie::load_v<MMUL::size_C>(pAcc1);
-                pAcc1 += MMUL::size_C;
-                pAcc1 += MMUL::size_C;
-                pAcc1 += MMUL::size_C;
                 pAcc1 += MMUL::size_C;
 
                 MMUL C00(acc_C00);
@@ -693,17 +693,20 @@ void ln_passThrough_in_aie(const T *restrict in,
 {
     event0();
 
-    v64uint8 *restrict outPtr = (v64uint8 *)out;
+    T *__restrict pOut = out;
 
     AIE_PREPARE_FOR_PIPELINING
     AIE_LOOP_MIN_ITERATION_COUNT(4)
     for (unsigned row = 0; row < rows_to_process; row++) {
 
-        v64uint8 *restrict inPtr = (v64uint8 *)(in + row * K + col_offset * k);
+        const T *__restrict pIn = in + row * K + col_offset * k;
 
         for (int j = 0; j < k; j += N) { // Nx samples per loop
 
-            *outPtr++ = *inPtr++;
+            ::aie::vector<T, N> reg_a = ::aie::load_v<N>(pIn);
+            ::aie::store_v(pOut, reg_a);
+            pOut += N;
+            pIn += N;
         }
     }
 

@@ -250,7 +250,9 @@ def my_matmul(
     logging.debug(
         f"Down proj loop bounds: nC_up_col_tiles_per_core={nC_up_col_tiles_per_core}, down_proj_depth={down_proj_depth}"
     )
-    logging.debug(f"Add & Norm loop bounds: ln_iters_per_core={ln_iters_per_core}")
+    logging.debug(
+        f"Add & Norm loop bounds: ln_iters_per_core={ln_iters_per_core}, nC_tiles_per_core={nC_tiles_per_core}"
+    )
 
     assert np.issubdtype(dtype_in, np.integer) == np.issubdtype(
         dtype_out, np.integer
@@ -762,16 +764,17 @@ def my_matmul(
                 of_in1.release(1)
                 of_in2.release(1)
                 of_out2.release(1)
-                for col_idx in range_(K_div_k):
-                    if (
-                        of_out_from_adj
-                    ):  # This is to send the next set of rows of the tile in the same column group for up projection
+                for _ in range_(nC_up_col_tiles_per_core):
+                    for col_idx in range_(K_div_k):
+                        if (
+                            of_out_from_adj
+                        ):  # This is to send the next set of rows of the tile in the same column group for up projection
+                            elem_out = of_out1.acquire(1)
+                            elem_out_from_adj = of_out_from_adj.acquire(1)
+                            of_out_from_adj.release(1)
+                            of_out1.release(1)
                         elem_out = of_out1.acquire(1)
-                        elem_out_from_adj = of_out_from_adj.acquire(1)
-                        of_out_from_adj.release(1)
                         of_out1.release(1)
-                    elem_out = of_out1.acquire(1)
-                    of_out1.release(1)
         else:
             for row_idx in range_(ln_iters_per_core):
                 elem_in1 = of_in1.acquire(1)
@@ -789,28 +792,29 @@ def my_matmul(
                 of_in1.release(1)
                 of_in2.release(1)
                 of_out2.release(1)
-                for col_idx in range_(K_div_k):
-                    # TODO: Maybe pass in a tile index to the fcn to create a for-loop in case there's more
-                    # than 2 layer norm cores per nA tile, which will require more iterations of the block
-                    # below
-                    if (
-                        of_out_from_adj
-                    ):  # This is to send the next set of rows of the tile in the same column group for up projection
+                for _ in range_(nC_up_col_tiles_per_core):
+                    for col_idx in range_(K_div_k):
+                        # TODO: Maybe pass in a tile index to the fcn to create a for-loop in case there's more
+                        # than 2 layer norm cores per nA tile, which will require more iterations of the block
+                        # below
+                        if (
+                            of_out_from_adj
+                        ):  # This is to send the next set of rows of the tile in the same column group for up projection
+                            elem_out1 = of_out1.acquire(1)
+                            elem_out_from_adj = of_out_from_adj.acquire(1)
+                            copy_passthrough(
+                                elem_out_from_adj,
+                                elem_out1,
+                                ln_rows_to_process * k,
+                            )
+                            of_out_from_adj.release(1)
+                            of_out1.release(1)
+                        col_i32 = index.casts(T.i32(), col_idx)
                         elem_out1 = of_out1.acquire(1)
-                        elem_out_from_adj = of_out_from_adj.acquire(1)
-                        copy_passthrough(
-                            elem_out_from_adj,
-                            elem_out1,
-                            ln_rows_to_process * k,
+                        copy_tiled(
+                            internal_out, elem_out1, K, k, ln_rows_to_process, col_i32
                         )
-                        of_out_from_adj.release(1)
                         of_out1.release(1)
-                    col_i32 = index.casts(T.i32(), col_idx)
-                    elem_out1 = of_out1.acquire(1)
-                    copy_tiled(
-                        internal_out, elem_out1, K, k, ln_rows_to_process, col_i32
-                    )
-                    of_out1.release(1)
 
     def core_fn_up_proj(
         in_a,
