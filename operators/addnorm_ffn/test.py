@@ -56,7 +56,7 @@ def generate_test_params(extensive=False):
             (512, 768, 3072, 2, 8, 128, 96, 0, 6, 1, 1, None, 0),
             # # Scaling within 4 columns (total cores utilized vary)
             # Scaling within 8 columns (total cores utilized vary)
-            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, None, 0),
+            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, None, 0),
             (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, None, 0),
             # GeLU fused with down projection
         ]

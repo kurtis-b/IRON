@@ -754,7 +754,7 @@ def my_matmul(
                 names=[f"ln2_L1L2_{a_tile}_{i}" for i in range(ln_cores_per_nA)],
                 depths=[fifo_depth] * ln_cores_per_nA,
                 placement=(
-                    Tile(n_aie_cols - 1, 1)
+                    Tile(n_aie_cols - 1 - a_tile, 1)
                     if nA_tiles_distributed < 3
                     else Tile((a_tile * nB_tiles_distributed + 1) % n_aie_cols, 1)
                 ),
@@ -1023,7 +1023,7 @@ def my_matmul(
     for a_tile in range(nA_tiles_distributed):
         for b_tile in range(nB_tiles_distributed):
             # Calculate the tile placement (indexing by core_tiles[row][col])
-            if nA_tiles_distributed < 3 and nB_tiles_distributed < n_aie_cols - 2:
+            if nA_tiles_distributed < 3:
                 # FFN cores will be placed horizontally, 2 cols (left and right adjacent cols) will be for Add & Norm cores
                 # The direction of reduction will be from left to right
                 # Add 1 to col index since the left adjacent col is for an Add & Norm core
