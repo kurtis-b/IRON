@@ -43,14 +43,13 @@ def generate_test_params(extensive=False):
             (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),  # All compute executed
             # M scaled up from baseline
             (8 * 8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),
-            # K scaled up from baseline
+            # K scaled up from baseline, for now down_proj_depth is required to be scaled so that the full K is processed
             (8, 96 * 8, 96, 2, 8, 96, 96, 0, 8, 1, 1, None, 0),
             # N scaled up from baseline
             (8, 96, 96 * 8, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),
-            # # K scaled up with matching scaling with down_proj_depth (affects MT utilization)
-            # (64, 48 * 4, 96, 2, 64, 48, 96, 0, 4, 1, 1, None, 0),
-            # # M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
-            # (64 * 4, 48, 96, 4, 64, 48, 96, 0, 1, 4, 1, None, 0),
+            # M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
+            (8 * 8, 96, 96, 4, 8, 96, 96, 0, 1, 2, 1, None, 0),
+            # (8 * 8, 96, 96, 4, 8, 96, 96, 0, 1, 4, 1, None, 0),
             # # N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
             # (64, 48, 96 * 4, 8, 64, 48, 96, 0, 1, 1, 4, None, 0),
             # # BERT workload

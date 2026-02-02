@@ -215,26 +215,12 @@ def my_matmul(
     n_aie_cores_needed = nA_tiles_distributed * (
         ln_cores_per_nA + ln_cores_per_nA + num_ffn_stages * nB_tiles_distributed
     )  # nA_tiles_distributed essentially duplicates the design, which has two add & norm blocks and an FFN block
-    n_dup_shim_b_streams = (
-        n_aie_cols * shim_dma_ch_per_col
-        - nA_tiles_distributed * 2  # A and R input per A tile
-    ) // (
-        nB_tiles_distributed * num_ffn_stages
-    )  # 1 means no duplication, 2 means each B stream is duplicated once through another shim DMA channel, etc.
-    if n_dup_shim_b_streams < 1:
-        raise AssertionError(
-            f"Not enough AIE columns to distribute the A and B tiles needed (2 shim DMA channel * {nA_tiles_distributed} for A and 1 shim DMA channel * {nB_tiles_distributed} * {num_ffn_stages} for B per pipeline stage)"
-        )
-    elif n_dup_shim_b_streams > nA_tiles_distributed:
-        n_dup_shim_b_streams = nA_tiles_distributed
 
     dtype_in = str_to_dtype(dtype_in_str)
     dtype_out = str_to_dtype(dtype_out_str)
 
     mem_tile_n = n * nB_tiles_distributed
-    logging.debug(
-        f"n_aie_cores_needed:{n_aie_cores_needed}, n_dup_shim_b_streams:{n_dup_shim_b_streams}, mem_tile_n:{mem_tile_n}"
-    )
+    logging.debug(f"n_aie_cores_needed:{n_aie_cores_needed}, mem_tile_n:{mem_tile_n}")
 
     # Calculate loop bounds for the reduction loop and total C tiles
     K_div_k = K // k
@@ -510,10 +496,10 @@ def my_matmul(
 
     # FFN streams
     # The same data may be sent through different shim tiles depending on the num aie cols available and num b tiles to distribute to reduce routing distance
-    B_up_proj_l3l2_fifos = [None] * (nB_tiles_distributed * n_dup_shim_b_streams)
-    B_up_proj_l2l1_fifos = [None] * (nB_tiles_distributed * n_dup_shim_b_streams)
-    B_down_proj_l3l2_fifos = [None] * (nB_tiles_distributed * n_dup_shim_b_streams)
-    B_down_proj_l2l1_fifos = [None] * (nB_tiles_distributed * n_dup_shim_b_streams)
+    B_up_proj_l3l2_fifos = [None] * (nB_tiles_distributed)
+    B_up_proj_l2l1_fifos = [None] * (nB_tiles_distributed)
+    B_down_proj_l3l2_fifos = [None] * (nB_tiles_distributed)
+    B_down_proj_l2l1_fifos = [None] * (nB_tiles_distributed)
     logging.debug(
         f"Len B_up_proj_l3l2_fifos: {len(B_up_proj_l3l2_fifos)}, Len B_up_proj_l2l1_fifos: {len(B_up_proj_l2l1_fifos)}, len B_up_proj_l3l2_fifos: {len(B_up_proj_l3l2_fifos)}, len B_down_proj_l2l1_fifos: {len(B_down_proj_l2l1_fifos)},"
     )
@@ -567,11 +553,7 @@ def my_matmul(
                 obj_types=[ln_processing_ty] * ln_cores_per_nA,
                 names=[f"A_L2L1_{a_tile}_{i}" for i in range(ln_cores_per_nA)],
                 depths=[fifo_depth] * ln_cores_per_nA,
-                placement=(
-                    Tile(0, 1)
-                    if nA_tiles_distributed < 3
-                    else Tile((a_tile * 2) % n_aie_cols, 1)
-                ),
+                placement=(Tile((a_tile * 2) % n_aie_cols, 1)),
             )
         )
         r_tmp_fifos = (
@@ -582,11 +564,7 @@ def my_matmul(
                 obj_types=[ln_processing_ty] * ln_cores_per_nA,
                 names=[f"R_L2L1_{a_tile}_{i}" for i in range(ln_cores_per_nA)],
                 depths=[fifo_depth] * ln_cores_per_nA,
-                placement=(
-                    Tile(1, 1)
-                    if nA_tiles_distributed < 3
-                    else Tile((a_tile * 2 + 1) % n_aie_cols, 1)
-                ),
+                placement=(Tile((a_tile * 2) % n_aie_cols, 1)),
             )
         )
         for ln_core in range(ln_cores_per_nA):
@@ -603,6 +581,7 @@ def my_matmul(
                     dims_to_stream_out if ln_core == ln_cores_per_nA - 1 else None
                 ),
             )
+            # Residual connection to cores for second Add & Norm
             ln1_l1l2_fifos[a_tile][ln_core] = ObjectFifo(
                 ln_processing_ty, name=f"ln1_L1L2_{a_tile}_{ln_core}", depth=fifo_depth
             )
@@ -612,13 +591,17 @@ def my_matmul(
                 .forward(
                     obj_type=ln_processing_ty,
                     name=f"ln1_L2L1_{a_tile}_{ln_core}",
-                    placement=Tile((a_tile + ln_core) % n_aie_cols, 1),
+                    placement=(
+                        Tile((a_tile + 1) % n_aie_cols, 1)
+                        if nA_tiles_distributed < 3
+                        else Tile((a_tile * 2 + 1) % n_aie_cols, 1)
+                    ),  # Place second Add & Norm cores further to reduce routing congestion
                     depth=fifo_depth,  # TODO: Try increasing fifo depth to check if this fifo causes the first Add & Norm core to stall
                 )
             )
 
     # Input B_Up
-    for b_tile in range(nB_tiles_distributed * n_dup_shim_b_streams):
+    for b_tile in range(nB_tiles_distributed):
         B_up_proj_l3l2_fifos[b_tile] = ObjectFifo(
             B_l2_ty, name=f"B_up_proj_L3L2_{b_tile}", depth=fifo_depth
         )
@@ -630,14 +613,16 @@ def my_matmul(
                 obj_type=B_up_proj_l1_ty,
                 name=f"B_up_proj_L2L1_{b_tile}",
                 dims_to_stream=dims_to_stream,
-                placement=Tile(
-                    (b_tile * 2) % n_aie_cols, 1
+                placement=(
+                    Tile((b_tile + 1) % n_aie_cols, 1)
+                    if nA_tiles_distributed < 3
+                    else Tile((b_tile * 2) % n_aie_cols, 1)
                 ),  # Switch between up and down proj B tile streams across shim tiles
             )
         )
 
     # Input B_Down: n and k are swapped compared to B_Up
-    for b_tile in range(nB_tiles_distributed * n_dup_shim_b_streams):
+    for b_tile in range(nB_tiles_distributed):
         B_down_proj_l3l2_fifos[b_tile] = ObjectFifo(
             B_l2_ty, name=f"B_down_proj_L3L2_{b_tile}", depth=fifo_depth
         )
@@ -649,8 +634,10 @@ def my_matmul(
                 obj_type=B_down_proj_l1_ty,
                 name=f"B_down_proj_L2L1_{b_tile}",
                 dims_to_stream=dims_to_stream,
-                placement=Tile(
-                    (b_tile * 2 + 1) % n_aie_cols, 1
+                placement=(
+                    Tile((b_tile + 1) % n_aie_cols, 1)
+                    if nA_tiles_distributed < 3
+                    else Tile((b_tile * 2 + 1) % n_aie_cols, 1)
                 ),  # Switch between up and down proj B tile streams across shim tiles
             )
         )
@@ -682,13 +669,14 @@ def my_matmul(
                     name=f"C_down_proj_part_L2L1_{b_tile}_{a_tile}",
                     depth=down_proj_depth,
                     placement=Tile(
-                        (a_tile * nB_tiles_distributed + b_tile) // max_obfifos_per_mt,
+                        (a_tile * nB_tiles_distributed + b_tile + 1)
+                        // max_obfifos_per_mt,
                         1,
                     ),
                 )
             )
             logging.debug(
-                f"Placeing C_down_proj_part fifos at {(a_tile * nB_tiles_distributed + b_tile) // max_obfifos_per_mt, 1}"
+                f"Placing C_down_proj_part fifos at {(a_tile * nB_tiles_distributed + b_tile + 1) // max_obfifos_per_mt, 1}"
             )
 
     # Down proj partial C for reduction
@@ -732,7 +720,7 @@ def my_matmul(
                 names=[f"ln2_L1L2_{a_tile}_{i}" for i in range(ln_cores_per_nA)],
                 depths=[fifo_depth] * ln_cores_per_nA,
                 placement=(
-                    Tile((nB_tiles_distributed + 1) % n_aie_cols, 1)
+                    Tile(n_aie_cols - 1, 1)
                     if nA_tiles_distributed < 3
                     else Tile((a_tile * 2 + 1) % n_aie_cols, 1)
                 ),
@@ -999,7 +987,6 @@ def my_matmul(
     # Set up compute tiles
     workers = []
     for a_tile in range(nA_tiles_distributed):
-        b_tile_offset = a_tile // n_dup_shim_b_streams
         for b_tile in range(nB_tiles_distributed):
             # Calculate the tile placement (indexing by core_tiles[row][col])
             if nA_tiles_distributed < 3 and nB_tiles_distributed < n_aie_cols - 2:
@@ -1007,9 +994,9 @@ def my_matmul(
                 # The direction of reduction will be from left to right
                 # Add 1 to col index since the left adjacent col is for an Add & Norm core
                 tile_col, tile_row = core_tiles[a_tile * num_ffn_stages][b_tile + 1]
-                ln1_tile_col = tile_col - 1
+                ln1_tile_col = nB_tiles_distributed - 1
                 ln1_tile_row = tile_row
-                ln2_tile_col = tile_col + 1
+                ln2_tile_col = nB_tiles_distributed + 1
                 ln2_tile_row = tile_row
             else:
                 # FFN cores will be placed vertically
@@ -1116,24 +1103,28 @@ def my_matmul(
                         # Need two buffers to create the full left mtx tile for GEMM, since each Add & Norm core only outputs half the tile
                         # TODO: The index here is hardcoded to -1, maybe there's a way to avoid having to hardcode to -1
                         ln1_l1l1_fifos[a_tile][-1].cons(
-                            depth=fifo_depth * ln_cores_per_nA
+                            # depth=fifo_depth * ln_cores_per_nA
+                            # TODO: this is commented out for now since it allows to compile when nA_tiles_distributed > 1,
+                            # but should be possible to use above line?
+                            depth=fifo_depth
                         ),
-                        B_up_proj_l2l1_fifos[
-                            b_tile_offset // nB_tiles_distributed * nB_tiles_distributed
-                            + b_tile
-                        ].cons(),
+                        B_up_proj_l2l1_fifos[b_tile].cons(),
                         C_up_proj_l1l1_fifos[a_tile][b_tile].prod(),
                         ffn_zero_kernel_up_proj,
                         ffn_matmul_kernel_up_proj,
                         ffn_gelu_kernel if gelu_stage == 0 else None,
                         stage_only,
                     ],
-                    placement=Tile(tile_col, tile_row),
+                    placement=(
+                        Tile(tile_col, tile_row + 1)
+                        if nA_tiles_distributed < 3
+                        else Tile(tile_col, tile_row)
+                    ),
                     stack_size=0xF00,
                 )
             )
             logging.debug(
-                f"Placing up projection worker based on a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at {workers[-1]._tile}"
+                f"Placing up projection worker based on a_tile {a_tile} b_tile {b_tile} at {workers[-1]._tile}"
             )
             # Down projection stage
             workers.append(
@@ -1141,10 +1132,7 @@ def my_matmul(
                     core_fn_down_proj,
                     [
                         C_up_proj_l1l1_fifos[a_tile][b_tile].cons(),
-                        B_down_proj_l2l1_fifos[
-                            b_tile_offset // nB_tiles_distributed * nB_tiles_distributed
-                            + b_tile
-                        ].cons(),
+                        B_down_proj_l2l1_fifos[b_tile].cons(),
                         C_down_proj_part_l2l1_fifos[a_tile][b_tile].cons(depth=1),
                         C_down_proj_part_l1l2_fifos[a_tile][b_tile].prod(),
                         (
@@ -1169,12 +1157,16 @@ def my_matmul(
                         ),
                         stage_only,
                     ],
-                    placement=Tile(tile_col + 1, tile_row),
+                    placement=(
+                        Tile(tile_col, tile_row)
+                        if nA_tiles_distributed < 3
+                        else Tile(tile_col + 1, tile_row)
+                    ),
                     stack_size=0xF00,
                 )
             )
             logging.debug(
-                f"Placing down projection worker based on a_tile {a_tile} b_tile {b_tile} b_tile_offset {b_tile_offset} at {workers[-1]._tile}"
+                f"Placing down projection worker based on a_tile {a_tile} b_tile {b_tile} at {workers[-1]._tile}"
             )
 
     # We are limited in the number of BDs. After synchronizing, we can reuse BDs.
@@ -1201,14 +1193,17 @@ def my_matmul(
                 ln_taps = [
                     TensorAccessPattern(
                         (1, M * K),
-                        row_base * m * nA_tiles_distributed * K + a_tile * m * K,
+                        row_base * m * nA_tiles_distributed * K
+                        + a_tile * current_tb_n_rows * m * K,
                         [1, 1, 1, current_tb_n_rows * m * K],
                         [0, 0, 0, 1],
                     )
                     for a_tile in range(nA_tiles_distributed)
                 ]
                 for a_tile in range(nA_tiles_distributed):
-                    logging.debug(f"TB: {tb}, PP: {pingpong}, A tile: {a_tile}")
+                    logging.debug(
+                        f"TB: {tb}, PP: {pingpong}, row_base: {row_base}, current_tb_n_rows: {current_tb_n_rows}, A tile: {a_tile}"
+                    )
                     C_tile = ln_taps[a_tile]
                     # This line does not change MLIR output at all - it's just for recording data movement
                     C_taps.append(C_tile)
@@ -1237,7 +1232,7 @@ def my_matmul(
                         ),
                     )
                     logging.debug(
-                        f"        Placed A input {a_tile} transfer at ({a_tile * 2}, 0) with offset {A_tile.offset}, sizes {A_tile.sizes}, strides {A_tile.strides}"
+                        f"    Placed A input {a_tile} transfer at ({a_tile * 2}, 0) with offset {A_tile.offset}, sizes {A_tile.sizes}, strides {A_tile.strides}"
                     )
                     # This line does not change MLIR output at all - it's just for recording data movement
                     A_taps.append(A_tile)
@@ -1254,94 +1249,89 @@ def my_matmul(
                         ),
                     )
                     logging.debug(
-                        f"        Placed R input {a_tile} transfer at ({a_tile * 2}, 0) with offset {R_tile.offset}, sizes {R_tile.sizes}, strides {R_tile.strides}"
+                        f"    Placed R input {a_tile} transfer at ({a_tile * 2}, 0) with offset {R_tile.offset}, sizes {R_tile.sizes}, strides {R_tile.strides}"
                     )
 
                 for tile_row in range(current_tb_n_rows):
-                    for duplicate_b_tile in range(n_dup_shim_b_streams):
-                        b_tile_offset = duplicate_b_tile * nB_tiles_distributed
-                        logging.debug(f"B tile offset: {b_tile_offset}")
-                        for b_tile in range(nB_tiles_distributed):
-                            for stage in range(num_ffn_stages):
-                                logging.debug(f"    B tile: {b_tile}, Stage: {stage}")
-                                if stage == 0:
-                                    # B_Up input transfer:
-                                    B_up_proj_col_offset = b_tile * n
-                                    B_up_proj_sizes = [
-                                        nC_up_col_tiles_per_core,
-                                        K_div_k,
-                                        k,
-                                        n,
-                                    ]
-                                    B_up_proj_strides = [
-                                        mem_tile_n,
-                                        k * N,
-                                        N,
-                                        1,
-                                    ]
-                                    B_up_proj_tile = TensorAccessPattern(
-                                        (N, K),
-                                        offset=B_up_proj_col_offset,
-                                        sizes=B_up_proj_sizes,
-                                        strides=B_up_proj_strides,
-                                    )
-                                    rt.fill(
-                                        B_up_proj_l3l2_fifos[
-                                            b_tile + b_tile_offset
-                                        ].prod(),
-                                        B_Up,
-                                        tap=B_up_proj_tile,
-                                        task_group=tg,
-                                        placement=Tile(
-                                            a_tile * 2 + 1,
-                                            0,
-                                        ),
-                                    )
-                                    logging.debug(
-                                        f"        Placed B_Up input {b_tile + b_tile_offset} transfer at ({a_tile * 2 + 1}, 0) with offset {B_up_proj_tile.offset}, sizes {B_up_proj_tile.sizes}, strides {B_up_proj_tile.strides}"
-                                    )
-                                    # This line does not change MLIR output at all - it's just for recording data movement
-                                    B_up_proj_taps.append(B_up_proj_tile)
-                                elif stage == 1:
-                                    # B_Down input transfer:
-                                    B_down_proj_col_offset = b_tile * n * K
-                                    # Notice how some of the sizes/strides are the same or similar
-                                    # to the ones in B_Up, but with accounting for the swapped n and k dimensions
-                                    B_down_proj_sizes = [
-                                        nC_up_col_tiles_per_core,
-                                        down_proj_depth,
-                                        n,
-                                        k,
-                                    ]
-                                    B_down_proj_strides = [
-                                        mem_tile_n * K,
-                                        k,
-                                        K,
-                                        1,
-                                    ]
-                                    B_down_proj_tile = TensorAccessPattern(
-                                        (K, N),
-                                        offset=B_down_proj_col_offset,
-                                        sizes=B_down_proj_sizes,
-                                        strides=B_down_proj_strides,
-                                    )
-                                    rt.fill(
-                                        B_down_proj_l3l2_fifos[
-                                            b_tile + b_tile_offset
-                                        ].prod(),
-                                        B_Down,
-                                        tap=B_down_proj_tile,
-                                        task_group=tg,
-                                        placement=Tile(
-                                            a_tile * 2 + 1,
-                                            0,
-                                        ),
-                                    )
-                                    logging.debug(
-                                        f"        Placed B_Down input {b_tile + b_tile_offset} transfer at ({a_tile * 2 + 1}, 0) with offset {B_down_proj_tile.offset}, sizes {B_down_proj_tile.sizes}, strides {B_down_proj_tile.strides}"
-                                    )
-                                    # These lines do not change MLIR output at all - they are just for recording data movement
-                                    B_down_proj_taps.append(B_down_proj_tile)
+                    for b_tile in range(nB_tiles_distributed):
+                        for stage in range(num_ffn_stages):
+                            logging.debug(
+                                f"    B tile: {b_tile}, Stage: {stage}, tile_row: {tile_row}"
+                            )
+                            if stage == 0:
+                                # B_Up input transfer:
+                                B_up_proj_col_offset = b_tile * n
+                                B_up_proj_sizes = [
+                                    nC_up_col_tiles_per_core,
+                                    K_div_k,
+                                    k,
+                                    n,
+                                ]
+                                B_up_proj_strides = [
+                                    mem_tile_n,
+                                    k * N,
+                                    N,
+                                    1,
+                                ]
+                                B_up_proj_tile = TensorAccessPattern(
+                                    (N, K),
+                                    offset=B_up_proj_col_offset,
+                                    sizes=B_up_proj_sizes,
+                                    strides=B_up_proj_strides,
+                                )
+                                rt.fill(
+                                    B_up_proj_l3l2_fifos[b_tile].prod(),
+                                    B_Up,
+                                    tap=B_up_proj_tile,
+                                    task_group=tg,
+                                    placement=Tile(
+                                        a_tile * 2 + 1,
+                                        0,
+                                    ),
+                                )
+                                logging.debug(
+                                    f"        Placed B_Up input {b_tile} transfer at ({a_tile * 2 + 1}, 0) with offset {B_up_proj_tile.offset}, sizes {B_up_proj_tile.sizes}, strides {B_up_proj_tile.strides}"
+                                )
+                                # This line does not change MLIR output at all - it's just for recording data movement
+                                B_up_proj_taps.append(B_up_proj_tile)
+                            elif stage == 1:
+                                # B_Down input transfer:
+                                B_down_proj_col_offset = b_tile * n * K
+                                # Notice how some of the sizes/strides are the same or similar
+                                # to the ones in B_Up, but with accounting for the swapped n and k dimensions
+                                B_down_proj_sizes = [
+                                    nC_up_col_tiles_per_core,
+                                    down_proj_depth,
+                                    n,
+                                    k,
+                                ]
+                                B_down_proj_strides = [
+                                    mem_tile_n * K,
+                                    k,
+                                    K,
+                                    1,
+                                ]
+                                B_down_proj_tile = TensorAccessPattern(
+                                    (K, N),
+                                    offset=B_down_proj_col_offset,
+                                    sizes=B_down_proj_sizes,
+                                    strides=B_down_proj_strides,
+                                )
+                                rt.fill(
+                                    B_down_proj_l3l2_fifos[b_tile].prod(),
+                                    B_Down,
+                                    tap=B_down_proj_tile,
+                                    task_group=tg,
+                                    placement=Tile(
+                                        a_tile * 2 + 1,
+                                        0,
+                                    ),
+                                )
+                                logging.debug(
+                                    f"        Placed B_Down input {b_tile} transfer at ({a_tile * 2 + 1}, 0) with offset {B_down_proj_tile.offset}, sizes {B_down_proj_tile.sizes}, strides {B_down_proj_tile.strides}"
+                                )
+                                # These lines do not change MLIR output at all - they are just for recording data movement
+                                B_down_proj_taps.append(B_down_proj_tile)
                 if tb > 0 or (tb == 0 and pingpong > 0):
                     rt.finish_task_group(tg)
                     tg = rt.task_group()
