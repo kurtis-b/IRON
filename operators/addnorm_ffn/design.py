@@ -220,7 +220,9 @@ def my_matmul(
     dtype_out = str_to_dtype(dtype_out_str)
 
     mem_tile_n = n * nB_tiles_distributed
-    logging.debug(f"n_aie_cores_needed:{n_aie_cores_needed}, mem_tile_n:{mem_tile_n}")
+    logging.debug(
+        f"n_aie_cores_needed:{n_aie_cores_needed}, mem_tile_n:{mem_tile_n}, ln_rows_to_process:{ln_rows_to_process}"
+    )
 
     # Calculate loop bounds for the reduction loop and total C tiles
     K_div_k = K // k
@@ -330,9 +332,7 @@ def my_matmul(
     ), """Partial C_Down must tile equally into (m, K) with (m, k * down_proj_depth)-sized blocks"""
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
-    assert (
-        m == r
-    )  # These have to match since the add & norm cores output m/2, i.e. m/ln_cores_per_nA, rows each and two cores make up the full m rows
+    assert m % r == 0
     assert k % s == 0
     assert n % t == 0
 
@@ -426,7 +426,7 @@ def my_matmul(
     ffn_mem_copy_halves_fcn = Kernel(  # Will write to add & norm, sending half of the output tile in a loop (since there's 2 cores per nA tile)
         "ffn_passThroughTile_out",
         archive_name,
-        [C_down_proj_l1_ty, ln_in_out_ty, np.int32, np.int32, np.int32],
+        [C_down_proj_l1_ty, ln_in_out_ty, np.int32],
     )
     ffn_eltwise_add_vector = Kernel(
         "eltwise_add_bf16_vector",
@@ -485,9 +485,10 @@ def my_matmul(
     A_l2l1_fifos = [[None] * ln_cores_per_nA for _ in range(nA_tiles_distributed)]
     R_l3l2_fifos = [None] * nA_tiles_distributed
     R_l2l1_fifos = [[None] * ln_cores_per_nA for _ in range(nA_tiles_distributed)]
-    ln1_l1l1_fifos = [
-        [None] * ln_cores_per_nA for _ in range(nA_tiles_distributed)
-    ]  # One as input to FFN, another neighboring mem access for next input to FFN
+    ln1_l1l1_pass_fifos = [
+        [None] * (ln_cores_per_nA - 1) for _ in range(nA_tiles_distributed)
+    ]  # Neighboring mem access for next input to FFN
+    ln1_l1l1_out_fifos = [None] * nA_tiles_distributed  # Input to FFN
     # TODO: If there's not enough MT channels, just make the objfifo from AN core to next AN core a direct stream instead of through a link in memtile
     ln1_l1l2_fifos = [[None] * ln_cores_per_nA for _ in range(nA_tiles_distributed)]
     ln1_l2l1_fifos = [
@@ -582,16 +583,6 @@ def my_matmul(
             # Input A and R to first Add & Norm cores
             A_l2l1_fifos[a_tile][ln_core] = a_tmp_fifos[ln_core]
             R_l2l1_fifos[a_tile][ln_core] = r_tmp_fifos[ln_core]
-            # Output of first Add & Norm cores
-            dims_to_stream_out = [(k // s, s), (ln_rows_to_process, k), (s, 1)]
-            ln1_l1l1_fifos[a_tile][ln_core] = ObjectFifo(
-                ln_in_out_ty,
-                name=f"ln1_L1L1_{a_tile}_{ln_core}",
-                depth=fifo_depth,
-                dims_to_stream=(  # Placement moves upwards, so last objfifo will be stream to FFN cores
-                    dims_to_stream_out if ln_core == ln_cores_per_nA - 1 else None
-                ),
-            )
             # Residual connection to cores for second Add & Norm
             ln1_l1l2_fifos[a_tile][ln_core] = ObjectFifo(
                 ln_processing_ty, name=f"ln1_L1L2_{a_tile}_{ln_core}", depth=fifo_depth
@@ -612,11 +603,25 @@ def my_matmul(
                     depth=fifo_depth,  # TODO: Try increasing fifo depth to check if this fifo causes the first Add & Norm core to stall
                 )
             )
+        for ln_core in range(ln_cores_per_nA - 1):
+            # Output of first Add & Norm cores
+            ln1_l1l1_pass_fifos[a_tile][ln_core] = ObjectFifo(
+                ln_in_out_ty,
+                name=f"ln1_L1L1_pass_{a_tile}_{ln_core}",
+                depth=fifo_depth,
+            )
+        dims_to_stream_out = [(k // s, s), (ln_rows_to_process, k), (s, 1)]
+        ln1_l1l1_out_fifos[a_tile] = ObjectFifo(
+            ln_in_out_ty,
+            name=f"ln1_L1L1_out_{a_tile}_{ln_core}",
+            depth=fifo_depth,
+            dims_to_stream=(dims_to_stream_out),
+        )
 
     # Input B_Up
     for b_tile in range(nB_tiles_distributed):
         B_up_proj_l3l2_fifos[b_tile] = ObjectFifo(
-            B_l2_ty, name=f"B_up_proj_L3L2_{b_tile}", depth=fifo_depth
+            B_l2_ty, name=f"B_up_L3L2_{b_tile}", depth=fifo_depth
         )
         dims_to_stream = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
         B_up_proj_l2l1_fifos[b_tile] = (
@@ -624,7 +629,7 @@ def my_matmul(
             .cons()
             .forward(
                 obj_type=B_up_proj_l1_ty,
-                name=f"B_up_proj_L2L1_{b_tile}",
+                name=f"B_up_L2L1_{b_tile}",
                 dims_to_stream=dims_to_stream,
                 placement=(
                     Tile((b_tile + 2) % n_aie_cols, 1)
@@ -644,7 +649,7 @@ def my_matmul(
     # Input B_Down: n and k are swapped compared to B_Up
     for b_tile in range(nB_tiles_distributed):
         B_down_proj_l3l2_fifos[b_tile] = ObjectFifo(
-            B_l2_ty, name=f"B_down_proj_L3L2_{b_tile}", depth=fifo_depth
+            B_l2_ty, name=f"B_down_L3L2_{b_tile}", depth=fifo_depth
         )
         dims_to_stream = [(n // s, s * k), (k // t, t), (s, k), (t, 1)]
         B_down_proj_l2l1_fifos[b_tile] = (
@@ -652,7 +657,7 @@ def my_matmul(
             .cons()
             .forward(
                 obj_type=B_down_proj_l1_ty,
-                name=f"B_down_proj_L2L1_{b_tile}",
+                name=f"B_down_L2L1_{b_tile}",
                 dims_to_stream=dims_to_stream,
                 placement=(
                     Tile((b_tile + 2) % n_aie_cols, 1)
@@ -675,7 +680,7 @@ def my_matmul(
         for b_tile in range(nB_tiles_distributed):
             C_up_proj_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
                 C_up_proj_l1_ty,
-                name=f"C_up_proj_L1L1_{a_tile}_{b_tile}",
+                name=f"C_up_L1L1_{a_tile}_{b_tile}",
                 depth=fifo_depth,
             )
 
@@ -686,7 +691,7 @@ def my_matmul(
             max_obfifos_per_mt = 2
             C_down_proj_part_l1l2_fifos[a_tile][b_tile] = ObjectFifo(
                 C_down_proj_l1_ty,
-                name=f"C_down_proj_part_L1L2_{a_tile}_{b_tile}",
+                name=f"C_down_L1L2_{a_tile}_{b_tile}",
                 depth=1,
             )
             C_down_proj_part_l2l1_fifos[a_tile][b_tile] = (
@@ -694,7 +699,7 @@ def my_matmul(
                 .cons(depth=down_proj_depth)
                 .forward(
                     obj_type=C_down_proj_l1_ty,
-                    name=f"C_down_proj_part_L2L1_{b_tile}_{a_tile}",
+                    name=f"C_down_L2L1_{b_tile}_{a_tile}",
                     depth=down_proj_depth,
                     placement=(
                         Tile(
@@ -718,7 +723,7 @@ def my_matmul(
         for b_tile in range(nB_tiles_distributed - 1):
             C_down_proj_reduce_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
                 C_down_proj_l1_ty,
-                name=f"C_down_proj_reduce_L1L1_{a_tile}_{b_tile}",
+                name=f"C_down_L1L1_{a_tile}_{b_tile}",
                 depth=fifo_depth,
             )
 
@@ -732,7 +737,7 @@ def my_matmul(
             ]
             C_down_proj_out_l1l1_fifos[a_tile][ln_core] = ObjectFifo(
                 ln_in_out_ty,
-                name=f"C_down_proj_out_L1L1_{a_tile}_{ln_core}",
+                name=f"C_out_L1L1_{a_tile}_{ln_core}",
                 depth=fifo_depth,
                 dims_to_stream=dims_to_stream if ln_core == 0 else None,
             )
@@ -953,8 +958,6 @@ def my_matmul(
                         copy(
                             elem_out_internal,
                             elem_out_acc_c,
-                            k,
-                            ln_rows_to_process,
                             row_i32,
                         )
                         out_acc_c.release(1)
@@ -1059,16 +1062,30 @@ def my_matmul(
                         Worker(
                             core_fn_add_norm1,
                             [
-                                A_l2l1_fifos[a_tile][ln_core].cons(),
-                                R_l2l1_fifos[a_tile][ln_core].cons(),
+                                A_l2l1_fifos[a_tile][ln_core].cons(
+                                    depth=1 if m > 8 else fifo_depth
+                                ),
+                                R_l2l1_fifos[a_tile][ln_core].cons(
+                                    depth=1 if m > 8 else fifo_depth
+                                ),
                                 ln1_weight_buffer,
                                 ln1_out_buffer,
-                                ln1_l1l1_fifos[a_tile][ln_core].prod(),
-                                ln1_l1l2_fifos[a_tile][ln_core].prod(),
                                 (
-                                    ln1_l1l1_fifos[a_tile][
-                                        ln_core - 1
-                                    ].cons()  # TODO: Maybe it's ok to make depth=1 here?
+                                    ln1_l1l1_pass_fifos[a_tile][ln_core].prod(
+                                        depth=1 if m > 8 else fifo_depth
+                                    )
+                                    if ln_core != ln_cores_per_nA - 1
+                                    else ln1_l1l1_out_fifos[a_tile].prod(
+                                        depth=1 if m > 8 else fifo_depth
+                                    )
+                                ),
+                                ln1_l1l2_fifos[a_tile][ln_core].prod(
+                                    depth=1 if m > 8 else fifo_depth
+                                ),
+                                (
+                                    ln1_l1l1_pass_fifos[a_tile][ln_core - 1].cons(
+                                        depth=1 if m > 8 else fifo_depth
+                                    )
                                     if ln_core != 0
                                     else None
                                 ),
@@ -1101,16 +1118,20 @@ def my_matmul(
                             core_fn_add_norm2,
                             [
                                 C_down_proj_out_l1l1_fifos[a_tile][ln_core].cons(
-                                    depth=fifo_depth
+                                    depth=1 if m > 8 else fifo_depth
                                 ),
-                                ln1_l2l1_fifos[a_tile][ln_core].cons(),
+                                ln1_l2l1_fifos[a_tile][ln_core].cons(
+                                    depth=1 if m > 8 else fifo_depth
+                                ),
                                 ln2_weight_buffer,
                                 ln2_in_buffer,
-                                ln2_l1l2_fifos[a_tile][ln_core].prod(),
+                                ln2_l1l2_fifos[a_tile][ln_core].prod(
+                                    depth=1 if m > 8 else fifo_depth
+                                ),
                                 (
                                     C_down_proj_out_l1l1_fifos[a_tile][
                                         ln_core + 1
-                                    ].prod()
+                                    ].prod(depth=1 if m > 8 else fifo_depth)
                                     if ln_core == 0
                                     else None
                                 ),
@@ -1135,12 +1156,12 @@ def my_matmul(
                     core_fn_up_proj,
                     [
                         # Need two buffers to create the full left mtx tile for GEMM, since each Add & Norm core only outputs half the tile
-                        # TODO: The index here is hardcoded to -1, maybe there's a way to avoid having to hardcode to -1
-                        ln1_l1l1_fifos[a_tile][-1].cons(
+                        ln1_l1l1_out_fifos[a_tile].cons(
                             # depth=fifo_depth * ln_cores_per_nA
                             # TODO: this is commented out for now since it allows to compile when nA_tiles_distributed > 1,
                             # but should be possible to use above line?
                             depth=fifo_depth
+                            + 1
                         ),
                         B_up_proj_l2l1_fifos[b_tile].cons(),
                         C_up_proj_l1l1_fifos[a_tile][b_tile].prod(),
@@ -1172,11 +1193,13 @@ def my_matmul(
                         (
                             # TODO: The index here is hardcoded to 0, so the rest of the objfifos will be used for the add & norm stage
                             # Maybe there's a way to avoid having to hardcode to 0
-                            C_down_proj_out_l1l1_fifos[a_tile][0].prod()
+                            C_down_proj_out_l1l1_fifos[a_tile][0].prod(
+                                depth=1 if m > 8 else fifo_depth
+                            )
                             if b_tile == 0
-                            else C_down_proj_reduce_l1l1_fifos[a_tile][
-                                b_tile - 1
-                            ].prod()
+                            else C_down_proj_reduce_l1l1_fifos[a_tile][b_tile - 1].prod(
+                                depth=1 if m > 8 else fifo_depth
+                            )
                         ),
                         ffn_zero_kernel_down_proj,
                         ffn_matmul_kernel_down_proj,

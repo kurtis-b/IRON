@@ -34,80 +34,84 @@ def generate_test_params(extensive=False):
         params = [
             #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
             # GeLU fused with up projection
-            # baselines
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, -1, 0),  # No compute
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 0, 0),  # Only first add & layer norm
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 1, 0),  # Only up projection + GeLU
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 2, 0),  # Only down projection
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 3, 0),  # Only second add & layer norm
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),  # All compute executed
-            # M scaled up from baseline
-            (8 * 8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),
-            # K scaled up from baseline, for now down_proj_depth is required to be scaled so that the full K is processed
-            (8, 96 * 8, 96, 2, 8, 128, 96, 0, 6, 1, 1, None, 0),
-            # N scaled up from baseline
-            (8, 96, 96 * 8, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),
-            # M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
-            (8 * 8, 96, 96, 4, 8, 96, 96, 0, 1, 2, 1, None, 0),
-            (8 * 8, 96, 96, 8, 8, 96, 96, 0, 1, 4, 1, None, 0),
-            # N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
-            (8, 96, 96 * 8, 8, 8, 96, 96, 0, 1, 1, 4, None, 0),
-            # BERT workload
-            (512, 768, 3072, 2, 8, 128, 96, 0, 6, 1, 1, None, 0),
-            # # Scaling within 4 columns (total cores utilized vary)
-            # Scaling within 8 columns (total cores utilized vary)
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, None, 0),
             (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, None, 0),
-            # Bottleneck testing
-            # Only first add & layer norm
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 0, 0),
-            (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 0, 0),
-            # Only up projection + GeLU
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 1, 0),
-            (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 1, 0),
-            # Only down projection
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 2, 0),
-            (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 2, 0),
-            # Only second add & layer norm
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 3, 0),
-            (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 3, 0),
-            # GeLU fused with down projection
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, -1, 1),  # No compute
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 0, 1),  # Only first add & layer norm
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 1, 1),  # Only up projection + GeLU
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 2, 1),  # Only down projection
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 3, 1),  # Only second add & layer norm
-            (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 1),  # All compute executed
-            # M scaled up from baseline
-            (8 * 8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 1),
-            # K scaled up from baseline, for now down_proj_depth is required to be scaled so that the full K is processed
-            (8, 96 * 8, 96, 2, 8, 128, 96, 0, 6, 1, 1, None, 1),
-            # N scaled up from baseline
-            (8, 96, 96 * 8, 2, 8, 96, 96, 0, 1, 1, 1, None, 1),
-            # M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
-            (8 * 8, 96, 96, 4, 8, 96, 96, 0, 1, 2, 1, None, 1),
-            (8 * 8, 96, 96, 8, 8, 96, 96, 0, 1, 4, 1, None, 1),
-            # N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
-            (8, 96, 96 * 8, 8, 8, 96, 96, 0, 1, 1, 4, None, 1),
-            # BERT workload
-            (512, 768, 3072, 2, 8, 128, 96, 0, 6, 1, 1, None, 1),
-            # # Scaling within 4 columns (total cores utilized vary)
-            # Scaling within 8 columns (total cores utilized vary)
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, None, 1),
-            (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, None, 1),
-            # Bottleneck testing
-            # Only first add & layer norm
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 0, 1),
-            (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 0, 1),
-            # Only up projection + GeLU
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 1, 1),
-            (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 1, 1),
-            # Only down projection
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 2, 1),
-            (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 2, 1),
-            # Only second add & layer norm
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 3, 1),
-            (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 3, 1),
+            (512, 768, 3072, 8, 16, 128, 96, 0, 6, 4, 2, None, 0),
+            (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, None, 0),  # All compute executed
+            (16, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),  # All compute executed
+            # # baselines
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, -1, 0),  # No compute
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 0, 0),  # Only first add & layer norm
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 1, 0),  # Only up projection + GeLU
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 2, 0),  # Only down projection
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 3, 0),  # Only second add & layer norm
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),  # All compute executed
+            # # M scaled up from baseline
+            # (8 * 8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),
+            # # K scaled up from baseline, for now down_proj_depth is required to be scaled so that the full K is processed
+            # (8, 96 * 8, 96, 2, 8, 128, 96, 0, 6, 1, 1, None, 0),
+            # # N scaled up from baseline
+            # (8, 96, 96 * 8, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),
+            # # M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
+            # (8 * 8, 96, 96, 4, 8, 96, 96, 0, 1, 2, 1, None, 0),
+            # (8 * 8, 96, 96, 8, 8, 96, 96, 0, 1, 4, 1, None, 0),
+            # # N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
+            # (8, 96, 96 * 8, 8, 8, 96, 96, 0, 1, 1, 4, None, 0),
+            # # BERT workload
+            # (512, 768, 3072, 2, 8, 128, 96, 0, 6, 1, 1, None, 0),
+            # # # Scaling within 4 columns (total cores utilized vary)
+            # # Scaling within 8 columns (total cores utilized vary)
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, None, 0),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, None, 0),
+            # # Bottleneck testing
+            # # Only first add & layer norm
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 0, 0),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 0, 0),
+            # # Only up projection + GeLU
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 1, 0),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 1, 0),
+            # # Only down projection
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 2, 0),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 2, 0),
+            # # Only second add & layer norm
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 3, 0),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 3, 0),
+            # # GeLU fused with down projection
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, -1, 1),  # No compute
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 0, 1),  # Only first add & layer norm
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 1, 1),  # Only up projection + GeLU
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 2, 1),  # Only down projection
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, 3, 1),  # Only second add & layer norm
+            # (8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 1),  # All compute executed
+            # # M scaled up from baseline
+            # (8 * 8, 96, 96, 2, 8, 96, 96, 0, 1, 1, 1, None, 1),
+            # # K scaled up from baseline, for now down_proj_depth is required to be scaled so that the full K is processed
+            # (8, 96 * 8, 96, 2, 8, 128, 96, 0, 6, 1, 1, None, 1),
+            # # N scaled up from baseline
+            # (8, 96, 96 * 8, 2, 8, 96, 96, 0, 1, 1, 1, None, 1),
+            # # M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
+            # (8 * 8, 96, 96, 4, 8, 96, 96, 0, 1, 2, 1, None, 1),
+            # (8 * 8, 96, 96, 8, 8, 96, 96, 0, 1, 4, 1, None, 1),
+            # # N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
+            # (8, 96, 96 * 8, 8, 8, 96, 96, 0, 1, 1, 4, None, 1),
+            # # BERT workload
+            # (512, 768, 3072, 2, 8, 128, 96, 0, 6, 1, 1, None, 1),
+            # # # Scaling within 4 columns (total cores utilized vary)
+            # # Scaling within 8 columns (total cores utilized vary)
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, None, 1),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, None, 1),
+            # # Bottleneck testing
+            # # Only first add & layer norm
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 0, 1),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 0, 1),
+            # # Only up projection + GeLU
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 1, 1),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 1, 1),
+            # # Only down projection
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 2, 1),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 2, 1),
+            # # Only second add & layer norm
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, 3, 1),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, 3, 1),
         ]
         extensive_params = []
     else:
@@ -133,7 +137,7 @@ def generate_test_params(extensive=False):
         stage_only,
         gelu_stage,
     ) in params:
-        name = f"ffn_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
+        name = f"an_ffn_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
         if trace_size > 0:
             name += f"_{trace_size}trace"
         name += f"_dprojdepth{down_proj_depth}_nA{nA_tiles_distributed}_nB{nB_tiles_distributed}"
