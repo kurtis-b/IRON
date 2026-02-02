@@ -559,7 +559,7 @@ def my_matmul(
                 placement=(
                     Tile(0, 1)
                     if nA_tiles_distributed < 3
-                    else Tile((a_tile * 2) % n_aie_cols, 1)
+                    else Tile((a_tile * ln_cores_per_nA) % n_aie_cols, 1)
                 ),
             )
         )
@@ -574,7 +574,7 @@ def my_matmul(
                 placement=(
                     Tile(1, 1)
                     if nA_tiles_distributed < 3
-                    else Tile((a_tile * 2) % n_aie_cols, 1)
+                    else Tile((a_tile * ln_cores_per_nA + 1) % n_aie_cols, 1)
                 ),
             )
         )
@@ -603,9 +603,11 @@ def my_matmul(
                     obj_type=ln_processing_ty,
                     name=f"ln1_L2L1_{a_tile}_{ln_core}",
                     placement=(
-                        Tile((a_tile + 2) % n_aie_cols, 1)
+                        Tile((a_tile + 2 + ln_core) % n_aie_cols, 1)
                         if nA_tiles_distributed < 3
-                        else Tile((a_tile * 2 + 1) % n_aie_cols, 1)
+                        else Tile(
+                            (a_tile * ln_cores_per_nA + ln_core + 1) % n_aie_cols, 1
+                        )
                     ),  # Place second Add & Norm cores further to reduce routing congestion
                     depth=fifo_depth,  # TODO: Try increasing fifo depth to check if this fifo causes the first Add & Norm core to stall
                 )
@@ -627,7 +629,14 @@ def my_matmul(
                 placement=(
                     Tile((b_tile + 2) % n_aie_cols, 1)
                     if nA_tiles_distributed < 3
-                    else Tile((b_tile * 2) % n_aie_cols, 1)
+                    else Tile(
+                        (
+                            b_tile * nB_tiles_distributed
+                            + n_aie_cols // nB_tiles_distributed
+                        )
+                        % n_aie_cols,
+                        1,
+                    )
                 ),  # Switch between up and down proj B tile streams across shim tiles
             )
         )
@@ -648,7 +657,15 @@ def my_matmul(
                 placement=(
                     Tile((b_tile + 2) % n_aie_cols, 1)
                     if nA_tiles_distributed < 3
-                    else Tile((b_tile * 2 + 1) % n_aie_cols, 1)
+                    else Tile(
+                        (
+                            b_tile * nB_tiles_distributed
+                            + n_aie_cols // nB_tiles_distributed
+                            + 1
+                        )
+                        % n_aie_cols,
+                        1,
+                    )
                 ),  # Switch between up and down proj B tile streams across shim tiles
             )
         )
@@ -681,19 +698,19 @@ def my_matmul(
                     depth=down_proj_depth,
                     placement=(
                         Tile(
-                            (b_tile + 1) % n_aie_cols,
+                            (a_tile * nB_tiles_distributed + b_tile + 1) % n_aie_cols,
                             1,
                         )
                         if nA_tiles_distributed < 3
                         else Tile(
-                            (a_tile * 2 + 1) % n_aie_cols,
+                            (a_tile * nB_tiles_distributed + b_tile) % n_aie_cols,
                             1,
                         )
                     ),
                 )
             )
             logging.debug(
-                f"Placing C_down_proj_part fifos at {((b_tile + 1) % n_aie_cols, 1) if nA_tiles_distributed < 3 else ((a_tile * 2 + 1) % n_aie_cols, 1)}"
+                f"Placing C_down_proj_part fifos at {((b_tile + 1) % n_aie_cols, 1) if nA_tiles_distributed < 3 else ((a_tile * 2 + b_tile) % n_aie_cols, 1)}"
             )
 
     # Down proj partial C for reduction
@@ -739,7 +756,7 @@ def my_matmul(
                 placement=(
                     Tile(n_aie_cols - 1, 1)
                     if nA_tiles_distributed < 3
-                    else Tile((a_tile * 2 + 1) % n_aie_cols, 1)
+                    else Tile((a_tile * nB_tiles_distributed + 1) % n_aie_cols, 1)
                 ),
             )
         )
@@ -1231,10 +1248,10 @@ def my_matmul(
                         tap=C_tile,
                         wait=True,
                         task_group=tg,
-                        placement=Tile(a_tile * 2, 0),
+                        placement=Tile((a_tile * nB_tiles_distributed) % n_aie_cols, 0),
                     )
                     logging.debug(
-                        f"    Placed C output {a_tile} transfer at ({a_tile * 2}, 0) with offset {C_tile.offset}, sizes {C_tile.sizes}, strides {C_tile.strides}"
+                        f"    Placed C output {a_tile} transfer at ({(a_tile * nB_tiles_distributed) % n_aie_cols}, 0) with offset {C_tile.offset}, sizes {C_tile.sizes}, strides {C_tile.strides}"
                     )
                     # A input transfer:
                     A_tile = ln_taps[a_tile]
@@ -1243,10 +1260,10 @@ def my_matmul(
                         A,
                         tap=A_tile,
                         task_group=tg,
-                        placement=Tile(a_tile * 2, 0),
+                        placement=Tile((a_tile * nB_tiles_distributed) % n_aie_cols, 0),
                     )
                     logging.debug(
-                        f"    Placed A input {a_tile} transfer at ({a_tile * 2}, 0) with offset {A_tile.offset}, sizes {A_tile.sizes}, strides {A_tile.strides}"
+                        f"    Placed A input {a_tile} transfer at ({(a_tile * nB_tiles_distributed) % n_aie_cols}, 0) with offset {A_tile.offset}, sizes {A_tile.sizes}, strides {A_tile.strides}"
                     )
                     # This line does not change MLIR output at all - it's just for recording data movement
                     A_taps.append(A_tile)
@@ -1257,10 +1274,10 @@ def my_matmul(
                         R,
                         tap=R_tile,
                         task_group=tg,
-                        placement=Tile(a_tile * 2, 0),
+                        placement=Tile((a_tile * nB_tiles_distributed) % n_aie_cols, 0),
                     )
                     logging.debug(
-                        f"    Placed R input {a_tile} transfer at ({a_tile * 2}, 0) with offset {R_tile.offset}, sizes {R_tile.sizes}, strides {R_tile.strides}"
+                        f"    Placed R input {a_tile} transfer at ({(a_tile * nB_tiles_distributed) % n_aie_cols}, 0) with offset {R_tile.offset}, sizes {R_tile.sizes}, strides {R_tile.strides}"
                     )
 
                 for tile_row in range(current_tb_n_rows):
@@ -1296,12 +1313,14 @@ def my_matmul(
                                     tap=B_up_proj_tile,
                                     task_group=tg,
                                     placement=Tile(
-                                        (a_tile * 2 + 1 + b_tile) % n_aie_cols,
+                                        (a_tile * nB_tiles_distributed + b_tile)
+                                        % (n_aie_cols - 1)
+                                        + 1,
                                         0,
                                     ),
                                 )
                                 logging.debug(
-                                    f"        Placed B_Up input {b_tile} transfer at ({(a_tile * 2 + 1 + b_tile) % n_aie_cols}, 0) with offset {B_up_proj_tile.offset}, sizes {B_up_proj_tile.sizes}, strides {B_up_proj_tile.strides}"
+                                    f"        Placed B_Up input {b_tile} transfer at ({(a_tile * nB_tiles_distributed + b_tile) % (n_aie_cols - 1) + 1}, 0) with offset {B_up_proj_tile.offset}, sizes {B_up_proj_tile.sizes}, strides {B_up_proj_tile.strides}"
                                 )
                                 # This line does not change MLIR output at all - it's just for recording data movement
                                 B_up_proj_taps.append(B_up_proj_tile)
@@ -1334,12 +1353,14 @@ def my_matmul(
                                     tap=B_down_proj_tile,
                                     task_group=tg,
                                     placement=Tile(
-                                        (a_tile * 2 + 1 + b_tile) % n_aie_cols,
+                                        (a_tile * nB_tiles_distributed + b_tile)
+                                        % (n_aie_cols - 1)
+                                        + 1,
                                         0,
                                     ),
                                 )
                                 logging.debug(
-                                    f"        Placed B_Down input {b_tile} transfer at ({(a_tile * 2 + 1 + b_tile) % n_aie_cols}, 0) with offset {B_down_proj_tile.offset}, sizes {B_down_proj_tile.sizes}, strides {B_down_proj_tile.strides}"
+                                    f"        Placed B_Down input {b_tile} transfer at ({(a_tile * nB_tiles_distributed + b_tile) % (n_aie_cols - 1) + 1}, 0) with offset {B_down_proj_tile.offset}, sizes {B_down_proj_tile.sizes}, strides {B_down_proj_tile.strides}"
                                 )
                                 # These lines do not change MLIR output at all - they are just for recording data movement
                                 B_down_proj_taps.append(B_down_proj_tile)
