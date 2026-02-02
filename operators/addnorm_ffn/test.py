@@ -49,7 +49,7 @@ def generate_test_params(extensive=False):
             (8, 96, 96 * 8, 2, 8, 96, 96, 0, 1, 1, 1, None, 0),
             # M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
             (8 * 8, 96, 96, 4, 8, 96, 96, 0, 1, 2, 1, None, 0),
-            # (8 * 8, 96, 96, 4, 8, 96, 96, 0, 1, 4, 1, None, 0),
+            (8 * 8, 96, 96, 8, 8, 96, 96, 0, 1, 4, 1, None, 0),
             # # N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
             # (64, 48, 96 * 4, 8, 64, 48, 96, 0, 1, 1, 4, None, 0),
             # # BERT workload

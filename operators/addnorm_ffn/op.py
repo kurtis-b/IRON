@@ -227,7 +227,10 @@ class AIEANFFN(AIEOperatorBase):
                     ],
                 ),
             ],
-            extra_flags=["--dynamic-objFifos"],
+            extra_flags=[
+                "--dynamic-objFifos",
+                # "--profile"
+            ],
         )
 
         insts_artifact = InstsBinArtifact.new(

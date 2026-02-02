@@ -261,7 +261,7 @@ def my_matmul(
         raise AssertionError("Invalid configuration: NPU (Phoenix/Hawk) has 16 cores")
     if dev == "npu" and n_aie_cores_needed > n_aie_cols * 4:
         raise AssertionError(
-            "Invalid configuration: NPU (Phoenix/Hawk) has 4 rows per column"
+            f"Invalid configuration: NPU (Phoenix/Hawk) has 4 rows per column, configuring for {n_aie_cores_needed} cores with {n_aie_cols} columns"
         )
     # npu2 is a 4 row x 8 col array
     if dev == "npu2" and n_aie_cols > 8:
@@ -274,7 +274,7 @@ def my_matmul(
         )
     if dev == "npu2" and n_aie_cores_needed > n_aie_cols * 4:
         raise AssertionError(
-            "Invalid configuration: NPU2 (Strix/Strix Halo/Krackan) has 4 rows per column"
+            f"Invalid configuration: NPU2 (Strix/Strix Halo/Krackan) has 4 rows per column, configuring for {n_aie_cores_needed} cores with {n_aie_cols} columns"
         )
 
     # Add & Norm checks:
@@ -553,7 +553,11 @@ def my_matmul(
                 obj_types=[ln_processing_ty] * ln_cores_per_nA,
                 names=[f"A_L2L1_{a_tile}_{i}" for i in range(ln_cores_per_nA)],
                 depths=[fifo_depth] * ln_cores_per_nA,
-                placement=(Tile((a_tile * 2) % n_aie_cols, 1)),
+                placement=(
+                    Tile(0, 1)
+                    if nA_tiles_distributed < 3
+                    else Tile((a_tile * 2) % n_aie_cols, 1)
+                ),
             )
         )
         r_tmp_fifos = (
@@ -564,7 +568,11 @@ def my_matmul(
                 obj_types=[ln_processing_ty] * ln_cores_per_nA,
                 names=[f"R_L2L1_{a_tile}_{i}" for i in range(ln_cores_per_nA)],
                 depths=[fifo_depth] * ln_cores_per_nA,
-                placement=(Tile((a_tile * 2) % n_aie_cols, 1)),
+                placement=(
+                    Tile(1, 1)
+                    if nA_tiles_distributed < 3
+                    else Tile((a_tile * 2) % n_aie_cols, 1)
+                ),
             )
         )
         for ln_core in range(ln_cores_per_nA):
@@ -592,7 +600,7 @@ def my_matmul(
                     obj_type=ln_processing_ty,
                     name=f"ln1_L2L1_{a_tile}_{ln_core}",
                     placement=(
-                        Tile((a_tile + 1) % n_aie_cols, 1)
+                        Tile((a_tile + 2) % n_aie_cols, 1)
                         if nA_tiles_distributed < 3
                         else Tile((a_tile * 2 + 1) % n_aie_cols, 1)
                     ),  # Place second Add & Norm cores further to reduce routing congestion
@@ -614,7 +622,7 @@ def my_matmul(
                 name=f"B_up_proj_L2L1_{b_tile}",
                 dims_to_stream=dims_to_stream,
                 placement=(
-                    Tile((b_tile + 1) % n_aie_cols, 1)
+                    Tile((b_tile + 2) % n_aie_cols, 1)
                     if nA_tiles_distributed < 3
                     else Tile((b_tile * 2) % n_aie_cols, 1)
                 ),  # Switch between up and down proj B tile streams across shim tiles
@@ -635,7 +643,7 @@ def my_matmul(
                 name=f"B_down_proj_L2L1_{b_tile}",
                 dims_to_stream=dims_to_stream,
                 placement=(
-                    Tile((b_tile + 1) % n_aie_cols, 1)
+                    Tile((b_tile + 2) % n_aie_cols, 1)
                     if nA_tiles_distributed < 3
                     else Tile((b_tile * 2 + 1) % n_aie_cols, 1)
                 ),  # Switch between up and down proj B tile streams across shim tiles
@@ -668,15 +676,21 @@ def my_matmul(
                     obj_type=C_down_proj_l1_ty,
                     name=f"C_down_proj_part_L2L1_{b_tile}_{a_tile}",
                     depth=down_proj_depth,
-                    placement=Tile(
-                        (a_tile * nB_tiles_distributed + b_tile + 1)
-                        // max_obfifos_per_mt,
-                        1,
+                    placement=(
+                        Tile(
+                            (b_tile + 1) % n_aie_cols,
+                            1,
+                        )
+                        if nA_tiles_distributed < 3
+                        else Tile(
+                            (a_tile * 2 + 1) % n_aie_cols,
+                            1,
+                        )
                     ),
                 )
             )
             logging.debug(
-                f"Placing C_down_proj_part fifos at {(a_tile * nB_tiles_distributed + b_tile + 1) // max_obfifos_per_mt, 1}"
+                f"Placing C_down_proj_part fifos at {((b_tile + 1) % n_aie_cols, 1) if nA_tiles_distributed < 3 else ((a_tile * 2 + 1) % n_aie_cols, 1)}"
             )
 
     # Down proj partial C for reduction
@@ -1226,10 +1240,7 @@ def my_matmul(
                         A,
                         tap=A_tile,
                         task_group=tg,
-                        placement=Tile(
-                            a_tile * 2,
-                            0,
-                        ),
+                        placement=Tile(a_tile * 2, 0),
                     )
                     logging.debug(
                         f"    Placed A input {a_tile} transfer at ({a_tile * 2}, 0) with offset {A_tile.offset}, sizes {A_tile.sizes}, strides {A_tile.strides}"
@@ -1243,10 +1254,7 @@ def my_matmul(
                         R,
                         tap=R_tile,
                         task_group=tg,
-                        placement=Tile(
-                            a_tile * 2,
-                            0,
-                        ),
+                        placement=Tile(a_tile * 2, 0),
                     )
                     logging.debug(
                         f"    Placed R input {a_tile} transfer at ({a_tile * 2}, 0) with offset {R_tile.offset}, sizes {R_tile.sizes}, strides {R_tile.strides}"
