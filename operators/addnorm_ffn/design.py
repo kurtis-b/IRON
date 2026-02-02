@@ -321,10 +321,13 @@ def my_matmul(
     # Intermediate C_Down
     # Conceptually, we divide the C_Down matrix into (m, k * down_proj_depth)-sized blocks.
     # The partial accumulations of C_Down are stored in the Memory tiles with the
-    # object FIFO depth based on the down_proj_depth parameter.
+    # object FIFO depth based on the down_proj_depth parameter. The nB_tiles_distributed
+    # parameter changes how much of the portion of down projection accumulation is done
+    # at each of the cores doing the compute. It also decides how many reduction steps
+    # have to be taken across these cores to get the final C_Down output.
     assert (
-        K == k * down_proj_depth * nB_tiles_distributed
-    ), """Partial C_Down must tile equally into (m, K) with (m, k * down_proj_depth * nB_tiles_distributed)-sized blocks"""
+        K == k * down_proj_depth
+    ), """Partial C_Down must tile equally into (m, K) with (m, k * down_proj_depth)-sized blocks"""
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
     assert (
@@ -416,7 +419,7 @@ def my_matmul(
         [C_up_proj_l1_ty, B_down_proj_l1_ty, C_down_proj_l1_ty, C_down_proj_l1_ty],
     )
     ffn_mem_copy_fcn = Kernel(  # Copy fcn for reduction across down proj cores
-        "passThroughLine",
+        "ffn_passThroughLine",
         archive_name,
         [C_down_proj_l1_ty, C_down_proj_l1_ty, np.int32],
     )
@@ -462,7 +465,7 @@ def my_matmul(
         [ln_processing_ty, ln_in_out_ty, np.int32, np.int32, np.int32, np.int32],
     )
     ln1_copy_passthrough_kernel = Kernel(
-        "passThroughLine",
+        "ln_passThroughLine",
         archive_name,
         [ln_in_out_ty, ln_in_out_ty, np.int32],
     )
@@ -1008,7 +1011,7 @@ def my_matmul(
                 # The direction of reduction will be from left to right
                 # Add 1 to col index since the left adjacent col is for an Add & Norm core
                 tile_col, tile_row = core_tiles[a_tile * num_ffn_stages][b_tile + 1]
-                ln1_tile_col = nB_tiles_distributed - 1
+                ln1_tile_col = 0
                 ln1_tile_row = tile_row
                 ln2_tile_col = nB_tiles_distributed + 1
                 ln2_tile_row = tile_row
@@ -1293,12 +1296,12 @@ def my_matmul(
                                     tap=B_up_proj_tile,
                                     task_group=tg,
                                     placement=Tile(
-                                        a_tile * 2 + 1,
+                                        (a_tile * 2 + 1 + b_tile) % n_aie_cols,
                                         0,
                                     ),
                                 )
                                 logging.debug(
-                                    f"        Placed B_Up input {b_tile} transfer at ({a_tile * 2 + 1}, 0) with offset {B_up_proj_tile.offset}, sizes {B_up_proj_tile.sizes}, strides {B_up_proj_tile.strides}"
+                                    f"        Placed B_Up input {b_tile} transfer at ({(a_tile * 2 + 1 + b_tile) % n_aie_cols}, 0) with offset {B_up_proj_tile.offset}, sizes {B_up_proj_tile.sizes}, strides {B_up_proj_tile.strides}"
                                 )
                                 # This line does not change MLIR output at all - it's just for recording data movement
                                 B_up_proj_taps.append(B_up_proj_tile)
@@ -1331,12 +1334,12 @@ def my_matmul(
                                     tap=B_down_proj_tile,
                                     task_group=tg,
                                     placement=Tile(
-                                        a_tile * 2 + 1,
+                                        (a_tile * 2 + 1 + b_tile) % n_aie_cols,
                                         0,
                                     ),
                                 )
                                 logging.debug(
-                                    f"        Placed B_Down input {b_tile} transfer at ({a_tile * 2 + 1}, 0) with offset {B_down_proj_tile.offset}, sizes {B_down_proj_tile.sizes}, strides {B_down_proj_tile.strides}"
+                                    f"        Placed B_Down input {b_tile} transfer at ({(a_tile * 2 + 1 + b_tile) % n_aie_cols}, 0) with offset {B_down_proj_tile.offset}, sizes {B_down_proj_tile.sizes}, strides {B_down_proj_tile.strides}"
                                 )
                                 # These lines do not change MLIR output at all - they are just for recording data movement
                                 B_down_proj_taps.append(B_down_proj_tile)

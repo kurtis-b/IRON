@@ -211,7 +211,7 @@ class AIEANFFN(AIEOperatorBase):
                             extra_flags=encoder_kernel_flags,
                         ),
                         KernelObjectArtifact.new(
-                            f"passThrough_{tile_m}x{tile_k}x{tile_n}.o",
+                            f"ffn_passThrough_{tile_m}x{tile_k}x{tile_n}.o",
                             extra_flags=[
                                 "-DBIT_WIDTH=16",
                             ],
@@ -223,6 +223,28 @@ class AIEANFFN(AIEOperatorBase):
                                     / "passThrough.cc"
                                 )
                             ],
+                            rename_symbols={
+                                "passThroughLine": "ffn_passThroughLine",
+                                "passThroughTile": "ffn_passThroughTile",
+                            },
+                        ),
+                        KernelObjectArtifact.new(
+                            f"ln_passThrough_{tile_m}x{tile_k}x{tile_n}.o",
+                            extra_flags=[
+                                "-DBIT_WIDTH=16",
+                            ],
+                            depends=[
+                                SourceArtifact.new(
+                                    base_dir
+                                    / "aie_kernels"
+                                    / "generic"
+                                    / "passThrough.cc"
+                                )
+                            ],
+                            rename_symbols={
+                                "passThroughLine": "ln_passThroughLine",
+                                "passThroughTile": "ln_passThroughTile",
+                            },
                         ),
                     ],
                 ),
