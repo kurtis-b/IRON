@@ -1158,10 +1158,9 @@ def my_matmul(
                         # Need two buffers to create the full left mtx tile for GEMM, since each Add & Norm core only outputs half the tile
                         ln1_l1l1_out_fifos[a_tile].cons(
                             # depth=fifo_depth * ln_cores_per_nA
-                            # TODO: this is commented out for now since it allows to compile when nA_tiles_distributed > 1,
+                            # TODO: above is commented out for now since it allows to compile when nA_tiles_distributed > 1,
                             # but should be possible to use above line?
-                            depth=fifo_depth
-                            + 1
+                            depth=fifo_depth,
                         ),
                         B_up_proj_l2l1_fifos[b_tile].cons(),
                         C_up_proj_l1l1_fifos[a_tile][b_tile].prod(),
