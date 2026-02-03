@@ -18,3 +18,4 @@ pytest operators/softmax/ --csv-output operators_softmax_results.csv --iteration
 pytest operators/transpose/ --csv-output operators_transpose_results.csv --iterations 1
 pytest operators/addnorm_ffn/ --csv-output operators_addnorm_ffn_results.csv --iterations 1
 cat operators*.csv > bert_operators_results.csv
+pytest applications/bert/ --csv-output bert_application_results.csv --iterations 1
