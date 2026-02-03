@@ -5,41 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Pipelined Add & Norm -> FFN -> Add & Norm Example for Ryzen NPU
 
-For the large BERT workloads, the expected performance is essentially the maximum between two stages: up projection stage and fused down projection + GeLU stage. Keep in mind that by pipelining these operations, each stage has only half of the total AIE cores to work with compared to having all resources available if each operation is executed sequentially. Therefore, the expected performance should be the maximum across all stages, with the latency of each stage based on the latency of an individual operation executing with the total resources used for that operation, and adding latencies together for fused operations. It's easiest to use the measurements from other tests for these calculations.
+Noting that we could try to reduce the number of cores for the Add & Norm blocks to 1 instead of 2, which would free up 1 core each for increasing the parallelism across the N dimension (so that nA=4 and nB=3 is possible instead of nB=2). 
 
-To calculate theoretical performance for `ffn_512x768x3072_64x48x96_8cols_dprojdepth8_nA4_nB4_gelustage1` as an example:
+However, by only having one core send two tiles' worth of data, the add & layer norm calculation would have to be repeated to get each tile across the columns of Up Projection's left mtx for each block of input rows with the core executing Add & Norm. This is because there's not enough space in Data Memory to store both blocks of inputs to Up Projection within the core, so the calculation would need to be repeated. E.g. if Up projection expects a 16x96 tile (two 8x96 tiles across the row dimension), and the core running Add & Norm works with 8x768 data to send the two 8x96 tiles over, if two 8x768 output data from the add & norm calculation can't be stored in Data Memory, then the add & norm calculation needs to be repeated on two 8x768 activation and two 8x768 residual data. The current design avoids this by having two cores generate the 8x768 add & norm output in parallel, and streaming the input tiles for Up projection through one core. 
 
-- Get the performance of `gemm_512x768x3072_64x48x96_4cols_prioaccFalse_emubf16True_batch1_stridedims000`
-- Get the performance of `gelu_8_cols_2_channels_1572864_tile_6144`
-- Get the performance of `gemm_512x3072x768_64x96x48_4cols_prioaccFalse_emubf16True_batch1_stridedims000`
-
-Performance measurements show:
-- `gemm_512x768x3072_64x48x96_4cols_prioaccFalse_emubf16True_batch1_stridedims000`: ~782ms
-- `gelu_8_cols_2_channels_1572864_tile_6144`: ~348ms
-- `gemm_512x3072x768_64x96x48_4cols_prioaccFalse_emubf16True_batch1_stridedims000`: ~1171ms
-
-GeLU fused with up projection gives theoretical performance of `max(782+348,1171)=1171ms`.
-GeLU fused with down projection gives theoretical performance of `max(782,1171+348)=1519ms`.
-Interestingly enough, GeLU fused with down projection seems to give the better performance. Below are the data for the current design point that gives the best performance:
-- `ffn_512x768x3072_64x48x96_8cols_dprojdepth8_nA4_nB4_gelustage0`: 2027ms
-- `ffn_512x768x3072_64x48x96_8cols_dprojdepth8_nA4_nB4_gelustage1`: 1397.9ms
-- `ffn_512x768x3072_64x48x96_8cols_dprojdepth8_nA4_nB4_stageonly0_gelustage0`: 2074.9ms
-- `ffn_512x768x3072_64x48x96_8cols_dprojdepth8_nA4_nB4_stageonly1_gelustage0`: 1379.1ms
-- `ffn_512x768x3072_64x48x96_8cols_dprojdepth8_nA4_nB4_stageonly0_gelustage1`: 1364.3ms
-- `ffn_512x768x3072_64x48x96_8cols_dprojdepth8_nA4_nB4_stageonly1_gelustage1`: 1618.8ms
-Based on the performance of the isolated stages, i.e. max of last two vs max of the 3rd and 4th points, GeLU being in the down projection stage is better. This warrants some thought as to why it happens--maybe due to the different data movement pattern, and how tiles across the output columns are stored in MTs for down projection?
-
-NOTE: `design_alternate.py` is a design implementing an alternate data movement pattern for GEMM. Part of the data movement here is what is executed for the down projection stage in `design.py`. It's just kept here for reference as a first step towards the FFN design, and not used in the operator or tests.
-
-## Notes
-To generate visualization of the routing, a tool in the mlir-aie repo can be used. It's assumed that the tests have been run and the `build` directory is present in the project's root. 
-
-As an example example, generating the routes for design `ffn_512x768x3072_64x48x96_8cols_dprojdepth8_nA4_nB4_gelustage1` can be done as below:
-```
-mkdir routes && cd routes
-aie-opt --aie-create-pathfinder-flows --aie-find-flows <iron-dir>/build/ffn_512x768x3072_64x48x96_8cols_dprojdepth8_nA4_nB4_gelustage1.mlir.prj/input_with_addresses.mlir | aie-translate --aie-flows-to-json > example.json
-```
-From there, run:
-```
-python3 <mlir-aie-dir>/tools/aie-routing-command-line/visualize.py -j example.json
-```
+Considering the objfifo depths were set to 1 in the Add & Norm cores in order to get the current best performance (using depth of 1 in those cores allowed for increasing the m tile dimension for the GEMMs), it's likely that changing the design so that it re-executes fused Add & Norm for each block of input rows (instead of just keeping them in Data Memory and copying repeatedly as in the current design) would lead to worse performance. Using the Mem Tile to route store that data and send back to the core executing Add & Norm isn't possible since two DMA channels are already used for the activation data and residual data (for eltwise add).
