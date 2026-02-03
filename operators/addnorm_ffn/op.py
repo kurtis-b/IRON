@@ -44,7 +44,7 @@ class AIEANFFN(AIEOperatorBase):
         num_aie_columns=2,
         ln1_weight=None,
         ln2_weight=None,
-        debug_mode=False,
+        debug_mode=-1,
         context=None,
         skip_add_to_list=False,
         **anffn_kwargs,

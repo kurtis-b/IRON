@@ -57,7 +57,7 @@ def generate_golden_reference(
     )
 
     # Layer norm 1 weights
-    ln1_weight = torch.ones(hidden_size, dtype=dtype_torch)
+    ln1_weight = torch.rand(hidden_size, dtype=dtype_torch)
     ln1_bias = torch.zeros(hidden_size, dtype=dtype_torch)
 
     # FFN weights
@@ -69,7 +69,7 @@ def generate_golden_reference(
     )
 
     # Layer norm 2 weights
-    ln2_weight = torch.ones(hidden_size, dtype=dtype_torch)
+    ln2_weight = torch.rand(hidden_size, dtype=dtype_torch)
     ln2_bias = torch.zeros(hidden_size, dtype=dtype_torch)
 
     # Forward pass simulation

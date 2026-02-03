@@ -25,3 +25,4 @@ from .transpose.op import AIETranspose
 from .encoder.op import AIEBERTEncoder
 from .ffn.op import AIEFFN
 from .addnorm.op import AIEAddAndNorm
+from .addnorm_ffn.op import AIEANFFN
