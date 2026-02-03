@@ -29,6 +29,7 @@ from operators import AIEElementwiseAdd
 from operators import AIELayerNorm
 from operators import AIEAddAndNorm
 from operators import AIEANFFN
+from operators import AIEMHA
 
 
 class BertSelfAttention(nn.Module):
@@ -95,35 +96,44 @@ class BertSelfAttention(nn.Module):
                 config.model_config.hidden_size,
                 dtype=config.aie_config.dtype,
             )
-        if config.aie_config.use_aie_gemm:
-            aie_gemm_config = {
-                "num_aie_columns": 8,
-                "tile_m": 64,
-                "tile_k": 64,
-                "tile_n": 64,
-                "use_static_weight": False,  # Attention score calculations don't use weights
-                "emulate_bf16_mmul_with_bfp16": True,
-                "prio_accuracy": False,
-            }
-            self.attn_weights = AIEGEMM(
-                M=seq_len, K=self.attention_head_size, N=seq_len, **aie_gemm_config
-            )
-            aie_gemm_config["tile_n"] = 16  # min tile for n is 2t in kernel
-            aie_gemm_config["num_aie_columns"] = 4  # Can only use 4 since N=64
-            self.attn_score = AIEGEMM(
-                M=seq_len, K=seq_len, N=self.attention_head_size, **aie_gemm_config
-            )
-        self.use_aie_gemm = config.aie_config.use_aie_gemm
-
-        if self.config.aie_config.use_aie_softmax:
-            self.softmax = AIESoftmax(
-                num_aie_columns=8,
-                num_channels=2,
-                rows=seq_len,
-                cols=seq_len,
+        if config.aie_config.use_aie_mha:
+            self.aie_mha = AIEMHA(
+                num_heads=config.model_config.num_attention_heads,
+                seq_len=seq_len,
+                d=self.attention_head_size,
+                num_KV_heads=0,  # Regular MHA since we feed repeated K/V
+                num_of_pipelines=8,
             )
         else:
-            self.softmax = nn.Softmax(dim=-1)
+            if config.aie_config.use_aie_gemm:
+                aie_gemm_config = {
+                    "num_aie_columns": 8,
+                    "tile_m": 64,
+                    "tile_k": 64,
+                    "tile_n": 64,
+                    "use_static_weight": False,  # Attention score calculations don't use weights
+                    "emulate_bf16_mmul_with_bfp16": True,
+                    "prio_accuracy": False,
+                }
+                self.attn_weights = AIEGEMM(
+                    M=seq_len, K=self.attention_head_size, N=seq_len, **aie_gemm_config
+                )
+                aie_gemm_config["tile_n"] = 16  # min tile for n is 2t in kernel
+                aie_gemm_config["num_aie_columns"] = 4  # Can only use 4 since N=64
+                self.attn_score = AIEGEMM(
+                    M=seq_len, K=seq_len, N=self.attention_head_size, **aie_gemm_config
+                )
+            if self.config.aie_config.use_aie_softmax:
+                self.softmax = AIESoftmax(
+                    num_aie_columns=8,
+                    num_channels=2,
+                    rows=seq_len,
+                    cols=seq_len,
+                )
+            else:
+                self.softmax = nn.Softmax(dim=-1)
+        self.use_aie_mha = config.aie_config.use_aie_mha
+        self.use_aie_gemm = config.aie_config.use_aie_gemm
 
     def forward(self, hidden_states, attention_mask):
         input_shape = hidden_states.shape[:-1]
@@ -134,53 +144,65 @@ class BertSelfAttention(nn.Module):
         key_layer = self.key(hidden_states).view(*hidden_shape).transpose(1, 2)
         value_layer = self.value(hidden_states).view(*hidden_shape).transpose(1, 2)
 
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        if self.use_aie_gemm:
-            attn_weights = []
-            for i in range(self.num_attention_heads):
-                attn_weights.append(
-                    self.attn_weights(
-                        query_layer[:, i, :, :].squeeze(0),
-                        key_layer[:, i, :, :].squeeze(0).transpose(0, 1),
-                    )
-                )
-            attn_weights = torch.stack(attn_weights, dim=0)
-            attn_weights = attn_weights * self.scaling
+        if self.use_aie_mha:
+            attn_output = self.aie_mha(
+                query_layer, key_layer, value_layer
+            )  # Shape: (num_heads, num_tokens, head_dim)
+
+            # Reshape context_vec to prepare for output projection
+            attn_output = attn_output.transpose(0, 1).contiguous()
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_weights = None  # AIE MHA does not provide attention weights
         else:
-            attn_weights = (
-                torch.matmul(query_layer, key_layer.transpose(2, 3)) * self.scaling
-            )
-
-        if attention_mask is not None:
-            attention_mask = (
-                (attention_mask > 0)
-                .unsqueeze(1)
-                .repeat(1, attention_mask.size(1), 1)
-                .unsqueeze(1)
-            )
-            attn_weights = attn_weights.masked_fill(attention_mask == 0, float("-inf"))
-
-        # TODO: Handle the attention masking in softmax--currently in "-inf" can lead to
-        # NaNs in the result
-        attn_weights = self.softmax(attn_weights)
-        attn_weights = nn.functional.dropout(attn_weights, p=0.0)
-
-        if self.use_aie_gemm:
-            # Compute attention score for each head separately using AIE GEMM
-            attn_output = []
-            for i in range(self.num_attention_heads):
-                attn_output.append(
-                    self.attn_score(
-                        attn_weights[:, i, :, :].squeeze(0),
-                        value_layer[:, i, :, :].squeeze(0),
+            # Take the dot product between "query" and "key" to get the raw attention scores.
+            if self.use_aie_gemm:
+                attn_weights = []
+                for i in range(self.num_attention_heads):
+                    attn_weights.append(
+                        self.attn_weights(
+                            query_layer[:, i, :, :].squeeze(0),
+                            key_layer[:, i, :, :].squeeze(0).transpose(0, 1),
+                        )
                     )
+                attn_weights = torch.stack(attn_weights, dim=0)
+                attn_weights = attn_weights * self.scaling
+            else:
+                attn_weights = (
+                    torch.matmul(query_layer, key_layer.transpose(2, 3)) * self.scaling
                 )
-            attn_output = torch.stack(attn_output, dim=0)
-        else:
-            attn_output = torch.matmul(attn_weights, value_layer)
-        attn_output = attn_output.transpose(1, 2).contiguous()
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            if attention_mask is not None:
+                attention_mask = (
+                    (attention_mask > 0)
+                    .unsqueeze(1)
+                    .repeat(1, attention_mask.size(1), 1)
+                    .unsqueeze(1)
+                )
+                attn_weights = attn_weights.masked_fill(
+                    attention_mask == 0, float("-inf")
+                )
+
+            # TODO: Handle the attention masking in softmax--currently in "-inf" can lead to
+            # NaNs in the result
+            attn_weights = self.softmax(attn_weights)
+            attn_weights = nn.functional.dropout(attn_weights, p=0.0)
+
+            if self.use_aie_gemm:
+                # Compute attention score for each head separately using AIE GEMM
+                attn_output = []
+                for i in range(self.num_attention_heads):
+                    attn_output.append(
+                        self.attn_score(
+                            attn_weights[:, i, :, :].squeeze(0),
+                            value_layer[:, i, :, :].squeeze(0),
+                        )
+                    )
+                attn_output = torch.stack(attn_output, dim=0)
+            else:
+                attn_output = torch.matmul(attn_weights, value_layer)
+            attn_output = attn_output.transpose(1, 2).contiguous()
+
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         return attn_output, attn_weights
 
     def assign_weights(self, l, query_w, query_b, key_w, key_b, value_w, value_b):

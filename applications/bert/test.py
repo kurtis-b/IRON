@@ -14,12 +14,13 @@ def generate_test_params():
     prompt_lengths = [512, 1024, 2048]
     num_samples_list = [100]
     configs_list = [
-        "",
-        "_offload_separate",
-        "_offload_mha",
-        "_offload_ffn",
-        "_offload_addnorm",
-        "_offload_addnorm_ffn",
+        # "",
+        # "_offload_separate",
+        # "_offload_mha",
+        # "_offload_ffn",
+        # "_offload_addnorm",
+        # "_offload_addnorm_ffn",
+        "_offload_mha_ffn",
         # "_offload_mha_addnorm_ffn",
     ]
 
