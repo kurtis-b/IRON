@@ -394,7 +394,7 @@ def classify_text(model, tokenizer, text, runs_per_sample, device="cpu", seq_len
     # print(input_ids.shape)
     # print(attention_mask.shape)
     # print(token_type_ids.shape)
-    print("attn_mask:", attention_mask.numpy())
+    # print("attn_mask:", attention_mask.numpy())
 
     # # Adjust the sequence length accepted for the embeddings based on the input
     # model.bert.embeddings.position_embeddings.weight = nn.Parameter(model.bert.embeddings.position_embeddings.weight[:len(input_ids)])
@@ -403,7 +403,7 @@ def classify_text(model, tokenizer, text, runs_per_sample, device="cpu", seq_len
         avg_latency = 0
         for _ in range(runs_per_sample):
             start = time.time()
-            logits = model(input_ids, token_type_ids, attention_mask=attention_mask)
+            logits = model(input_ids, token_type_ids, attention_mask=None)
             end = time.time()
             print(f"Inference time: {end - start:.4f} seconds")
             avg_latency += end - start

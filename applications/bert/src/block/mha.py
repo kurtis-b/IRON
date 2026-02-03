@@ -182,8 +182,7 @@ class BertSelfAttention(nn.Module):
                     attention_mask == 0, float("-inf")
                 )
 
-            # TODO: Handle the attention masking in softmax--currently in "-inf" can lead to
-            # NaNs in the result
+            # "-inf" in attn_weights can lead to NaNs in the result from AIE-offloaded softmax
             attn_weights = self.softmax(attn_weights)
             attn_weights = nn.functional.dropout(attn_weights, p=0.0)
 

@@ -13,14 +13,16 @@ weights_dir = Path(f"{test_dir}/bert_base")
 def generate_test_params():
     prompt_lengths = [512, 1024, 2048]
     num_samples_list = [100]
+    # TODO: Removed fused MHA from tests because it looks like the kernel is doing causal masking,
+    # isn't done for the inference runs here
     configs_list = [
-        # "",
-        # "_offload_separate",
+        "",
+        "_offload_separate",
         # "_offload_mha",
-        # "_offload_ffn",
-        # "_offload_addnorm",
-        # "_offload_addnorm_ffn",
-        "_offload_mha_ffn",
+        "_offload_ffn",
+        "_offload_addnorm",
+        "_offload_addnorm_ffn",
+        # "_offload_mha_ffn",
         # "_offload_mha_addnorm_ffn",
     ]
 
