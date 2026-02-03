@@ -28,6 +28,7 @@ from operators import AIESoftmax
 from operators import AIEElementwiseAdd
 from operators import AIELayerNorm
 from operators import AIEAddAndNorm
+from operators import AIEANFFN
 
 
 class BertSelfAttention(nn.Module):
@@ -245,57 +246,98 @@ class BertSelfOutput(nn.Module):
                 config.model_config.hidden_size,
                 dtype=config.aie_config.dtype,
             )
-        if config.aie_config.use_aie_addandnorm:
-            self.aie_addnorm = AIEAddAndNorm(
-                size=seq_len * config.model_config.hidden_size,
+        if config.aie_config.use_aie_addnorm_ffn:
+
+            aie_anffn_config = {
+                "emulate_bf16_mmul_with_bfp16": True,
+                "nA_tiles_distributed": 4,
+                "nB_tiles_distributed": 2,
+                "stage_only": None,
+                "gelu_stage": 1,
+            }
+            # Second Layer normalization kernel
+            self.anffn = AIEANFFN(
+                M=seq_len,
+                K=config.model_config.hidden_size,
+                N=config.model_config.intermediate_size,
+                tile_m=16,
+                tile_k=128,
+                tile_n=96,
+                down_proj_depth=6,
                 num_aie_columns=8,
-                tile_size=config.model_config.hidden_size,
+                debug_mode=-1,
+                **aie_anffn_config,
             )
         else:
-            if config.aie_config.use_aie_layernorm:
-                self.LayerNorm = AIELayerNorm(
+            if config.aie_config.use_aie_addandnorm:
+                self.aie_addnorm = AIEAddAndNorm(
                     size=seq_len * config.model_config.hidden_size,
-                    # eps=config.model_config.layer_norm_eps,
                     num_aie_columns=8,
-                    num_channels=2,
                     tile_size=config.model_config.hidden_size,
-                    weights=torch.ones(config.model_config.hidden_size),
                 )
             else:
-                self.LayerNorm = nn.LayerNorm(
-                    config.model_config.hidden_size,
-                    eps=config.model_config.layer_norm_eps,
-                    dtype=config.aie_config.dtype,
-                )
-            self.use_aie_elementwise_add = config.aie_config.use_aie_elementwise_add
-            if self.use_aie_elementwise_add:
-                eltwise_add_tile_size = (
-                    seq_len * config.model_config.hidden_size
-                ) // 16
-                self.aie_elementwise_add = AIEElementwiseAdd(
-                    size=seq_len * config.model_config.hidden_size,
-                    num_aie_columns=8,
-                    num_channels=2,
-                    tile_size=min(
-                        math.gcd(4096, eltwise_add_tile_size), eltwise_add_tile_size
-                    ),
-                )
+                if config.aie_config.use_aie_layernorm:
+                    self.LayerNorm = AIELayerNorm(
+                        size=seq_len * config.model_config.hidden_size,
+                        # eps=config.model_config.layer_norm_eps,
+                        num_aie_columns=8,
+                        num_channels=2,
+                        tile_size=config.model_config.hidden_size,
+                        weights=torch.ones(config.model_config.hidden_size),
+                    )
+                else:
+                    self.LayerNorm = nn.LayerNorm(
+                        config.model_config.hidden_size,
+                        eps=config.model_config.layer_norm_eps,
+                        dtype=config.aie_config.dtype,
+                    )
+                self.use_aie_elementwise_add = config.aie_config.use_aie_elementwise_add
+                if self.use_aie_elementwise_add:
+                    eltwise_add_tile_size = (
+                        seq_len * config.model_config.hidden_size
+                    ) // 16
+                    self.aie_elementwise_add = AIEElementwiseAdd(
+                        size=seq_len * config.model_config.hidden_size,
+                        num_aie_columns=8,
+                        num_channels=2,
+                        tile_size=min(
+                            math.gcd(4096, eltwise_add_tile_size), eltwise_add_tile_size
+                        ),
+                    )
         self.dropout = nn.Dropout(config.model_config.hidden_dropout_prob)
 
     def forward(self, hidden_states, input_tensor):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        if self.config.aie_config.use_aie_addandnorm:
-            hidden_states = self.aie_addnorm(hidden_states, input_tensor)
+        if self.config.aie_config.use_aie_addnorm_ffn:
+            hidden_states = self.anffn(hidden_states, input_tensor)
         else:
-            hidden_states = self.LayerNorm(hidden_states)
-            if self.use_aie_elementwise_add:
-                hidden_states = self.aie_elementwise_add(hidden_states, input_tensor)
+            if self.config.aie_config.use_aie_addandnorm:
+                hidden_states = self.aie_addnorm(hidden_states, input_tensor)
             else:
-                hidden_states = hidden_states + input_tensor
+                hidden_states = self.LayerNorm(hidden_states)
+                if self.use_aie_elementwise_add:
+                    hidden_states = self.aie_elementwise_add(
+                        hidden_states, input_tensor
+                    )
+                else:
+                    hidden_states = hidden_states + input_tensor
         return hidden_states
 
-    def assign_weights(self, l, dense_w, dense_b, layernorm_w, layernorm_b):
+    def assign_weights(
+        self,
+        l,
+        dense_w,
+        dense_b,
+        dense_up_w,
+        dense_up_b,
+        dense_down_w,
+        dense_down_b,
+        layernorm1_w,
+        layernorm1_b,
+        layernorm2_w,
+        layernorm2_b,
+    ):
         if self.config.aie_config.use_aie_gemm:
             self.dense.weight = dense_w
             # TODO: Need to implement bias assignment
@@ -310,24 +352,30 @@ class BertSelfOutput(nn.Module):
                 dense_b,
                 f"bert.encoder.layer.{l}.attention.output.dense.bias",
             )
-        if self.config.aie_config.use_aie_addandnorm:
-            self.aie_addnorm.weight = layernorm_w
-            # TODO: Need to implement bias assignment
+        if self.config.aie_config.use_aie_addnorm_ffn:
+            self.anffn.weight_up_proj = dense_up_w
+            self.anffn.weight_down_proj = dense_down_w
+            self.anffn.ln1_weight = layernorm1_w
+            self.anffn.ln2_weight = layernorm2_w
         else:
-            if self.config.aie_config.use_aie_layernorm:
-                self.LayerNorm.weight = layernorm_w
+            if self.config.aie_config.use_aie_addandnorm:
+                self.aie_addnorm.weight = layernorm1_w
                 # TODO: Need to implement bias assignment
             else:
-                assign(
-                    self.LayerNorm.weight,
-                    layernorm_w,
-                    f"bert.encoder.layer.{l}.attention.output.LayerNorm.gamma",
-                )
-                assign(
-                    self.LayerNorm.bias,
-                    layernorm_b,
-                    f"bert.encoder.layer.{l}.attention.output.LayerNorm.beta",
-                )
+                if self.config.aie_config.use_aie_layernorm:
+                    self.LayerNorm.weight = layernorm1_w
+                    # TODO: Need to implement bias assignment
+                else:
+                    assign(
+                        self.LayerNorm.weight,
+                        layernorm1_w,
+                        f"bert.encoder.layer.{l}.attention.output.LayerNorm.gamma",
+                    )
+                    assign(
+                        self.LayerNorm.bias,
+                        layernorm1_b,
+                        f"bert.encoder.layer.{l}.attention.output.LayerNorm.beta",
+                    )
 
 
 class BertAttention(nn.Module):

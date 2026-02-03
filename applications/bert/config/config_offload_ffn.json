@@ -25,7 +25,7 @@
     "use_aie_elementwise_mul": false,
     "use_aie_transpose": false,
     "use_aie_bert_encoder": false,
-    "use_aie_ffn": false,
+    "use_aie_ffn": true,
     "use_aie_addandnorm": false,
     "use_aie_mha": false,
     "use_aie_addnorm_ffn": false

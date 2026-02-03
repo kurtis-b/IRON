@@ -315,6 +315,8 @@ class AIEANFFN(AIEOperatorBase):
         # Remove batch dimension, if any
         if len(A.shape) > 2:
             A = A.view(-1, A.shape[-1])
+        if len(R.shape) > 2:
+            R = R.view(-1, R.shape[-1])
         if B_Up is not None and len(B_Up.shape) > 2:
             B_Up = B_Up.view(-1, B_Up_shape[-1])
         if B_Down is not None and len(B_Down.shape) > 2:

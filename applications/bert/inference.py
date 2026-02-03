@@ -950,9 +950,9 @@ def main():
         )
         print(f"\nModel Accuracy: {accuracy * 100:.2f}%")
 
-        average_inference_time = total_inference_time / num_samples_to_test
+        average_inference_time = total_inference_time / num_samples_to_test * 1000
         print(
-            f"Average Inference Time per Sample: {average_inference_time:.4f} seconds"
+            f"Average Inference Time per Sample: {average_inference_time:.4f} milliseconds"
         )
 
         # Clean the dataset cache after the run

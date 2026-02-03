@@ -149,12 +149,34 @@ class BertEncoder(nn.Module):
                         f"bert.encoder.layer.{l}.attention.output.dense.bias"
                     ].to(self.config.aie_config.dtype),
                     combined_weights[
+                        f"bert.encoder.layer.{l}.intermediate.dense.weight"
+                    ].to(self.config.aie_config.dtype),
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.intermediate.dense.bias"
+                    ].to(self.config.aie_config.dtype),
+                    combined_weights[f"bert.encoder.layer.{l}.output.dense.weight"].to(
+                        self.config.aie_config.dtype
+                    ),
+                    combined_weights[f"bert.encoder.layer.{l}.output.dense.bias"].to(
+                        self.config.aie_config.dtype
+                    ),
+                    combined_weights[
                         f"bert.encoder.layer.{l}.attention.output.LayerNorm.gamma"
                     ].to(
                         self.config.aie_config.dtype
                     ),  # weight
                     combined_weights[
                         f"bert.encoder.layer.{l}.attention.output.LayerNorm.beta"
+                    ].to(
+                        self.config.aie_config.dtype
+                    ),  # bias
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.output.LayerNorm.gamma"
+                    ].to(
+                        self.config.aie_config.dtype
+                    ),  # weight
+                    combined_weights[
+                        f"bert.encoder.layer.{l}.output.LayerNorm.beta"
                     ].to(
                         self.config.aie_config.dtype
                     ),  # bias
