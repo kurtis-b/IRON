@@ -18,10 +18,11 @@ def generate_test_params():
     configs_list = [
         "",
         "_offload_separate",
-        # "_offload_mha",
         "_offload_ffn",
         "_offload_addnorm",
         "_offload_addnorm_ffn",
+        "_offload_encoder",
+        # "_offload_mha",
         # "_offload_mha_ffn",
         # "_offload_mha_addnorm_ffn",
     ]

@@ -60,7 +60,7 @@ class AIEBERTEncoder(AIEOperatorBase):
         num_aie_columns=8,
         use_pip_ffn=False,
         use_pip_addnorm=False,
-        use_pip_mha=True,
+        use_pip_mha=False,
         use_pip_an_ffn=True,
         ln1_weight=None,
         ln2_weight=None,
