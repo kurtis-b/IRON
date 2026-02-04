@@ -31,6 +31,8 @@ def generate_test_params(extensive=False):
             (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 0),
             (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 0),
             (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 0),
+            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 0),
+            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 0),
             (1024, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 0),
             (1024, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 0),
             (1024, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 0),
@@ -39,6 +41,8 @@ def generate_test_params(extensive=False):
             (1024, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 0),
             (1024, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 0),
             (1024, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 0),
+            (1024, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 0),
+            (1024, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 0),
             (2048, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 0),
             (2048, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 0),
             (2048, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 0),
@@ -47,6 +51,8 @@ def generate_test_params(extensive=False):
             (2048, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 0),
             (2048, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 0),
             (2048, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 0),
+            (2048, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 0),
+            (2048, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 0),
             # GeLU fused with down projection
             # Scaling within 8 columns (total cores utilized vary)
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 1),
@@ -57,6 +63,8 @@ def generate_test_params(extensive=False):
             (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 1),
             (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 1),
             (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 1),
+            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 1),
+            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 1),
             (1024, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 1),
             (1024, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 1),
             (1024, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 1),
@@ -65,6 +73,8 @@ def generate_test_params(extensive=False):
             (1024, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 1),
             (1024, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 1),
             (1024, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 1),
+            (1024, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 1),
+            (1024, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 1),
             (2048, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 1),
             (2048, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 1),
             (2048, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 1),
@@ -73,6 +83,8 @@ def generate_test_params(extensive=False):
             (2048, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 1),
             (2048, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 1),
             (2048, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 1),
+            (2048, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 1),
+            (2048, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 1),
         ]
         if INCLUDE_SIMPLE_TESTS:
             params += [
