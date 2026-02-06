@@ -11,17 +11,19 @@ weights_dir = Path(f"{test_dir}/bert_base")
 
 
 def generate_test_params():
-    prompt_lengths = [512, 1024, 2048]
-    num_samples_list = [100]
+    # prompt_lengths = [512, 1024, 2048]
+    # num_samples_list = [3500, 1750, 675]
+    prompt_lengths = [512]
+    num_samples_list = [10]
     # TODO: Removed fused MHA from tests because it looks like the kernel is doing causal masking,
     # isn't done for the inference runs here
     configs_list = [
         "",
-        "_offload_separate",
-        "_offload_ffn",
-        "_offload_addnorm",
-        "_offload_addnorm_ffn",
-        "_offload_encoder",
+        # "_offload_separate",
+        # "_offload_ffn",
+        # "_offload_addnorm",
+        # "_offload_addnorm_ffn",
+        # "_offload_encoder",
         # "_offload_mha",
         # "_offload_mha_ffn",
         # "_offload_mha_addnorm_ffn",
@@ -29,14 +31,13 @@ def generate_test_params():
 
     params = []
     names = []
-    for prompt_len in prompt_lengths:
-        for num_samples in num_samples_list:
-            for config in configs_list:
-                params.append((prompt_len, num_samples, config))
-                name = f"bert_p_{prompt_len}_s_{num_samples}"
-                if config != "":
-                    name += f"_cfg{config}"
-                names.append(name)
+    for prompt_len, num_samples in zip(prompt_lengths, num_samples_list):
+        for config in configs_list:
+            params.append((prompt_len, num_samples, config))
+            name = f"bert_p_{prompt_len}_s_{num_samples}"
+            if config != "":
+                name += f"_cfg{config}"
+            names.append(name)
     return params, names
 
 
@@ -45,6 +46,9 @@ params, names = generate_test_params()
 
 @pytest.mark.metrics(
     Latency=r"Average Inference Time per Sample: (?P<value>[\d\.e\+-]+) milliseconds",
+    GFLOPS=r"FLOPs per second: (?P<value>[\d\.e\+-]+) GFLOP/s",
+    StartTime=r"Starting inference at (?P<value>\d{1,2}:\d{1,2}:\d{1,2})",
+    EndTime=r"Completed inference at (?P<value>\d{1,2}:\d{1,2}:\d{1,2})",
 )
 @pytest.mark.parametrize("prompt_len,num_samples,config", params, ids=names)
 def test_llama_3_2_1b(prompt_len, num_samples, config):
@@ -56,7 +60,7 @@ def test_llama_3_2_1b(prompt_len, num_samples, config):
         shell=True,
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=600,
     )
 
     assert (

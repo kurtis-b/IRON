@@ -385,27 +385,24 @@ def classify_text(model, tokenizer, text, runs_per_sample, device="cpu", seq_len
     attention_mask = encoded["attention_mask"].to(device)
     token_type_ids = encoded["token_type_ids"].to(device)
 
-    # Print the tokens with special strings included
+    # logging.info the tokens with special strings included
     # tokens = tokenizer.convert_ids_to_tokens(input_ids[0].tolist())
-    # print("Tokens with special strings:", tokens)
+    # logging.info("Tokens with special strings:", tokens)
 
-    # Print about the tokens
-    # print(input_ids[input_ids != 0].float().mean())
-    # print(input_ids.shape)
-    # print(attention_mask.shape)
-    # print(token_type_ids.shape)
-    # print("attn_mask:", attention_mask.numpy())
+    # logging.info about the tokens
+    # logging.info(input_ids[input_ids != 0].float().mean())
+    # logging.info(input_ids.shape)
+    # logging.info(attention_mask.shape)
+    # logging.info(token_type_ids.shape)
+    # logging.info("attn_mask:", attention_mask.numpy())
 
-    # # Adjust the sequence length accepted for the embeddings based on the input
-    # model.bert.embeddings.position_embeddings.weight = nn.Parameter(model.bert.embeddings.position_embeddings.weight[:len(input_ids)])
-    # model.bert.embeddings.position_ids = model.bert.embeddings.position_ids[:, :len(input_ids)]
     with torch.no_grad():
         avg_latency = 0
         for _ in range(runs_per_sample):
             start = time.time()
             logits = model(input_ids, token_type_ids, attention_mask=None)
             end = time.time()
-            print(f"Inference time: {end - start:.4f} seconds")
+            logging.info(f"Inference time: {end - start:.4f} seconds")
             avg_latency += end - start
 
     # Calculate the softmax of the logits
@@ -443,19 +440,21 @@ def fine_tune_model(
     - batch_size: Batch size for training
     - learning_rate: Learning rate for optimizer
     """
-    print(f"\n{'='*50}")
-    print(f"Starting Fine-Tuning on SST-2 Training Dataset")
-    print(f"{'='*50}")
-    print(f"Epochs: {epochs}, Batch Size: {batch_size}, Learning Rate: {learning_rate}")
-    print(f"Training samples: {len(train_dataset)}\n")
+    logging.info(f"\n{'='*50}")
+    logging.info(f"Starting Fine-Tuning on SST-2 Training Dataset")
+    logging.info(f"{'='*50}")
+    logging.info(
+        f"Epochs: {epochs}, Batch Size: {batch_size}, Learning Rate: {learning_rate}"
+    )
+    logging.info(f"Training samples: {len(train_dataset)}\n")
 
     # Calculate mean and standard deviation of seq_relationship weights
     seq_relationship_weights = model.classifier.weight.data
     mean = seq_relationship_weights.mean().item()
     stddev = seq_relationship_weights.std().item()
 
-    print(f"Prev Mean of seq_relationship weights: {mean:.4f}")
-    print(f"Prev Standard deviation of seq_relationship weights: {stddev:.4f}")
+    logging.info(f"Prev Mean of seq_relationship weights: {mean:.4f}")
+    logging.info(f"Prev Standard deviation of seq_relationship weights: {stddev:.4f}")
 
     model.train()
 
@@ -495,7 +494,7 @@ def fine_tune_model(
         correct = 0
         total = 0
 
-        print(f"Epoch {epoch + 1}/{epochs}")
+        logging.info(f"Epoch {epoch + 1}/{epochs}")
 
         for batch_idx, batch in enumerate(train_loader):
             optimizer.zero_grad()
@@ -518,28 +517,28 @@ def fine_tune_model(
             correct += (predictions == batch["labels"]).sum().item()
             total += batch["labels"].size(0)
 
-            # Print progress every 1/4 batches
+            # logging.info progress every 1/4 batches
             if (batch_idx + 1) % (total_batches // 4) == 0 or (
                 batch_idx + 1
             ) == total_batches:
                 avg_loss = total_loss / (batch_idx + 1)
                 accuracy = 100 * correct / total
-                print(
+                logging.info(
                     f"  Batch {batch_idx + 1}/{total_batches} - Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%"
                 )
 
         epoch_loss = total_loss / len(train_loader)
         epoch_acc = 100 * correct / total
-        print(
+        logging.info(
             f"Epoch {epoch + 1}/{epochs} Complete - Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%\n"
         )
 
-    print(f"\n{'='*50}")
-    print(f"Fine-Tuning Completed!")
-    print(f"{'='*50}\n")
+    logging.info(f"\n{'='*50}")
+    logging.info(f"Fine-Tuning Completed!")
+    logging.info(f"{'='*50}\n")
 
     # Save the fine-tuned model weights
-    print("Saving fine-tuned model weights...")
+    logging.info("Saving fine-tuned model weights...")
     finetuned_weights = {}
 
     # Save embeddings
@@ -620,12 +619,12 @@ def fine_tune_model(
     mean = seq_relationship_weights.mean().item()
     stddev = seq_relationship_weights.std().item()
 
-    print(f"New Mean of seq_relationship weights: {mean:.4f}")
-    print(f"New Standard deviation of seq_relationship weights: {stddev:.4f}")
+    logging.info(f"New Mean of seq_relationship weights: {mean:.4f}")
+    logging.info(f"New Standard deviation of seq_relationship weights: {stddev:.4f}")
 
     # Save to file
     save_file(finetuned_weights, "model_finetuned.safetensors")
-    print("Fine-tuned model weights saved to 'model_finetuned.safetensors'")
+    logging.info("Fine-tuned model weights saved to 'model_finetuned.safetensors'")
 
     model.eval()
     return model
@@ -729,50 +728,6 @@ def main():
 
         # Load the weights
         combined_weights = load_file(args.weights_file_path)
-        # for key in sorted(combined_weights.keys()):
-        #     val = combined_weights[key]
-        #     print(key, ":", val.shape)
-        # print("\n\nEmbedding weights:")
-        # combined_weights_1 = load_file("model.safetensors")
-        # combined_weights_2 = load_file("model_finetuned.safetensors")
-        # print(combined_weights_1["bert.embeddings.word_embeddings.weight"].mean())
-        # print(combined_weights_1["bert.embeddings.word_embeddings.weight"].std())
-        # print(combined_weights_1["bert.embeddings.position_embeddings.weight"].mean())
-        # print(combined_weights_1["bert.embeddings.position_embeddings.weight"].std())
-        # print(combined_weights_1["bert.embeddings.token_type_embeddings.weight"].mean())
-        # print(combined_weights_1["bert.embeddings.token_type_embeddings.weight"].std())
-        # print(combined_weights_1["bert.embeddings.LayerNorm.beta"].mean())
-        # print(combined_weights_1["bert.embeddings.LayerNorm.beta"].std())
-        # print(combined_weights_1["bert.embeddings.LayerNorm.gamma"].mean())
-        # print(combined_weights_1["bert.embeddings.LayerNorm.gamma"].std())
-        # print(combined_weights_1["cls.seq_relationship.weight"].mean())
-        # print(combined_weights_1["cls.seq_relationship.weight"].std())
-        # print(combined_weights_1["cls.seq_relationship.bias"].mean())
-        # print(combined_weights_1["cls.seq_relationship.bias"].std())
-        # print(combined_weights_1["bert.pooler.dense.weight"].mean())
-        # print(combined_weights_1["bert.pooler.dense.weight"].std())
-        # print(combined_weights_1["bert.pooler.dense.bias"].mean())
-        # print(combined_weights_1["bert.pooler.dense.bias"].std())
-
-        # print(combined_weights_2["bert.embeddings.word_embeddings.weight"].mean())
-        # print(combined_weights_2["bert.embeddings.word_embeddings.weight"].std())
-        # print(combined_weights_2["bert.embeddings.position_embeddings.weight"].mean())
-        # print(combined_weights_2["bert.embeddings.position_embeddings.weight"].std())
-        # print(combined_weights_2["bert.embeddings.token_type_embeddings.weight"].mean())
-        # print(combined_weights_2["bert.embeddings.token_type_embeddings.weight"].std())
-        # print(combined_weights_2["bert.embeddings.LayerNorm.beta"].mean())
-        # print(combined_weights_2["bert.embeddings.LayerNorm.beta"].std())
-        # print(combined_weights_2["bert.embeddings.LayerNorm.gamma"].mean())
-        # print(combined_weights_2["bert.embeddings.LayerNorm.gamma"].std())
-        # print(combined_weights_2["cls.seq_relationship.weight"].mean())
-        # print(combined_weights_2["cls.seq_relationship.weight"].std())
-        # print(combined_weights_2["cls.seq_relationship.bias"].mean())
-        # print(combined_weights_2["cls.seq_relationship.bias"].std())
-        # print(combined_weights_2["bert.pooler.dense.weight"].mean())
-        # print(combined_weights_2["bert.pooler.dense.weight"].std())
-        # print(combined_weights_2["bert.pooler.dense.bias"].mean())
-        # print(combined_weights_2["bert.pooler.dense.bias"].std())
-        # print("\n\n")
 
         # Extend embeddings to 1024 rows
         for key in [
@@ -843,7 +798,7 @@ def main():
         # Fine-tune the model if requested
         if args.fine_tune:
             # Load SST-2 training dataset for fine-tuning
-            print("Loading SST-2 training dataset...")
+            logging.info("Loading SST-2 training dataset...")
             full_train_dataset = load_dataset("sst2", split="train")
 
             # Use only a small subset for fine-tuning (e.g., 1000 samples)
@@ -851,7 +806,7 @@ def main():
             train_dataset = full_train_dataset.select(
                 range(min(num_train_samples, len(full_train_dataset)))
             )
-            print(
+            logging.info(
                 f"Using {len(train_dataset)} samples for fine-tuning (subset of {len(full_train_dataset)} total)"
             )
 
@@ -868,7 +823,7 @@ def main():
                 seq_len=seq_len,
             )
         else:
-            print("Skipping fine-tuning (use --fine-tune flag to enable)")
+            logging.info("Skipping fine-tuning (use --fine-tune flag to enable)")
 
         # Important: Set the seed again after initialization of the model. Each
         # call that initializes an nn.Linear layer updates the RNG state, because
@@ -886,14 +841,18 @@ def main():
         logging.info("AIE operator preparation completed.")
 
         # Load validation dataset for evaluation
-        print("Loading SST-2 validation dataset for evaluation...")
+        logging.info("Loading SST-2 validation dataset for evaluation...")
         num_samples_to_test = args.num_samples
         if num_samples_to_test == 1:
-            # NOTE: Using text that generates at least 512 tokens so that there's no attention masking
+            # NOTE: Using text that generates at least 512 tokens
             texts_to_classify = [SAMPLE_TEXT]
             true_labels = [0]  # Negative
         else:
-            dataset = load_dataset("sst2", split="validation")
+            # dataset = load_dataset("sst2", split="validation")
+            weight_path_dir = os.path.dirname(args.weights_file_path)
+            dataset = load_dataset(
+                "parquet", data_files=f"{weight_path_dir}/train-sst2.parquet"
+            )["train"]
 
             # Half of dataset should be positive and other half negative
             sorted_dataset = dataset.sort("label")
@@ -902,9 +861,11 @@ def main():
                 texts_to_classify + dataset["sentence"][-num_samples_to_test // 2 :]
             )
             true_labels = dataset["label"][: num_samples_to_test // 2]
-            print(true_labels[:5])
+            logging.info(true_labels[:5])
             true_labels = true_labels + dataset["label"][-num_samples_to_test // 2 :]
-            print(true_labels[num_samples_to_test // 2 : num_samples_to_test // 2 + 5])
+            logging.info(
+                true_labels[num_samples_to_test // 2 : num_samples_to_test // 2 + 5]
+            )
 
         correct_predictions = []
         wrong_predictions = []
@@ -912,47 +873,80 @@ def main():
         iteration_count = 0
         # Process each text individually
         total_inference_time = 0.0
+        logging.info(f"Starting inference at {time.strftime('%H:%M:%S')}")
+        print(f"Starting inference at {time.strftime('%H:%M:%S')}")
         for test_text, true_class in zip(texts_to_classify, true_labels):
             iteration_count = iteration_count + 1
             probabilities, logits, inference_time = classify_text(
                 model, tokenizer, test_text, args.runs_per_sample, device, seq_len
             )
             total_inference_time += inference_time
-            predicted_class = probabilities.argmax().item()
-            print(probabilities, logits)
-            print(
-                f"Iteration {iteration_count}: Text: Predicted Class: {classes[predicted_class]} | True Class: {classes[true_class]}"
-            )
+            # predicted_class = probabilities.argmax().item()
+            # logging.info(f"Probabilities: {probabilities}, Logits: {logits}")
+            # logging.info(
+            #     f"Iteration {iteration_count}: Text: Predicted Class: {classes[predicted_class]} | True Class: {classes[true_class]}"
+            # )
 
-            if predicted_class == true_class:
-                if len(correct_predictions) < 5:
-                    correct_predictions.append((test_text, predicted_class))
-            else:
-                if len(wrong_predictions) < 5:
-                    wrong_predictions.append((test_text, predicted_class, true_class))
+            # if predicted_class == true_class:
+            #     if len(correct_predictions) < 5:
+            #         correct_predictions.append((test_text, predicted_class))
+            # else:
+            #     if len(wrong_predictions) < 5:
+            #         wrong_predictions.append((test_text, predicted_class, true_class))
 
-            # print("Output:", probabilities, logits)
-            # print(test_text, "Classified as", classes[predicted_class])
+            # logging.info("Output:", probabilities, logits)
+            # logging.info(test_text, "Classified as", classes[predicted_class])
+        logging.info(f"Completed inference at {time.strftime('%H:%M:%S')}")
+        print(f"Completed inference at {time.strftime('%H:%M:%S')}")
 
-        print("\nCorrect Predictions:")
-        for text, pred in correct_predictions:
-            print(f"Text: {text} | Predicted Class: {classes[pred]}")
+        # logging.info("\nCorrect Predictions:")
+        # for text, pred in correct_predictions:
+        #     logging.info(f"Text: {text} | Predicted Class: {classes[pred]}")
 
-        print("\nWrong Predictions:")
-        for text, pred, true in wrong_predictions:
-            print(
-                f"Text: {text} | Predicted Class: {classes[pred]} | True Class: {classes[true]}"
-            )
+        # logging.info("\nWrong Predictions:")
+        # for text, pred, true in wrong_predictions:
+        #     logging.info(
+        #         f"Text: {text} | Predicted Class: {classes[pred]} | True Class: {classes[true]}"
+        #     )
 
-        total_predictions = len(correct_predictions) + len(wrong_predictions)
-        accuracy = (
-            len(correct_predictions) / total_predictions if total_predictions > 0 else 0
-        )
-        print(f"\nModel Accuracy: {accuracy * 100:.2f}%")
+        # total_predictions = len(correct_predictions) + len(wrong_predictions)
+        # accuracy = (
+        #     len(correct_predictions) / total_predictions if total_predictions > 0 else 0
+        # )
+        # logging.info(f"\nModel Accuracy: {accuracy * 100:.2f}%")
 
         average_inference_time = total_inference_time / num_samples_to_test * 1000
+        logging.info(
+            f"Average Inference Time per Sample: {average_inference_time:.4f} milliseconds"
+        )
         print(
             f"Average Inference Time per Sample: {average_inference_time:.4f} milliseconds"
+        )
+
+        head_dim = (
+            config.model_config.hidden_size // config.model_config.num_attention_heads
+        )
+        qkvo_proj_macs = (
+            config.model_config.hidden_size
+            * config.model_config.hidden_size
+            * seq_len
+            * 4
+        )
+        attn_macs = (
+            config.model_config.num_attention_heads * head_dim * seq_len * seq_len * 2
+        )
+        ffn_macs = (
+            2
+            * config.model_config.hidden_size
+            * config.model_config.intermediate_size
+            * seq_len
+        )
+        total_gflops = ((qkvo_proj_macs + attn_macs + ffn_macs) * 2) / 1e9
+        logging.info(
+            f"FLOPs per second: {(total_gflops / (average_inference_time / 1000)):.2f} GFLOP/s"
+        )
+        print(
+            f"FLOPs per second: {(total_gflops / (average_inference_time / 1000)):.2f} GFLOP/s"
         )
 
         # Clean the dataset cache after the run

@@ -66,7 +66,11 @@ class CSVReporter:
             match = re.search(pattern, captured_output)
             if not match:
                 continue
-            value = float(match.group("value"))
+            value = (
+                float(match.group("value"))
+                if ":" not in match.group("value")
+                else match.group("value")
+            )
             self.test_metrics[test_name].setdefault(metric_name, []).append(value)
 
     def finalize_results(self):
@@ -81,7 +85,7 @@ class CSVReporter:
             for metric_name, values in data.items():
                 if metric_name == "passed":
                     continue
-                if values:
+                if values and ":" not in str(values[0]):  # Numeric metrics
                     row[f"{metric_name} (mean)"] = statistics.mean(values)
                     row[f"{metric_name} (median)"] = statistics.median(values)
                     row[f"{metric_name} (min)"] = min(values)
@@ -89,6 +93,8 @@ class CSVReporter:
                     row[f"{metric_name} (stddev)"] = (
                         statistics.stdev(values) if len(values) > 1 else 0.0
                     )
+                else:  # Non-numeric metrics (e.g., timestamps)
+                    row[f"{metric_name}"] = values[0]  # Just take the first value
             self.results.append(row)
 
     def write_csv(self):
