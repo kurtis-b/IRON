@@ -14,7 +14,6 @@ from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.helpers.dialects.ext.scf import _for as range_
 from ml_dtypes import bfloat16
 
-
 """
 Rotary Positional Encoding (RoPE) design
 

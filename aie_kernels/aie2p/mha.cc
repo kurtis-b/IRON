@@ -12,6 +12,11 @@
 #define ROUNDING_MODE aie::rounding_mode::conv_even
 
 extern "C" {
+
+#ifndef IS_CAUSAL
+#define IS_CAUSAL 1
+#endif
+
 void matmul_scalar_bf16_bf16(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out);
 void matmul_bf16_bf16(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out);
 void matmul_bf16_bf16_rowmaj(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out);
@@ -30,9 +35,11 @@ void matmul_bf16_bf16_wrapper(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, i
 
     ::aie::set_rounding(ROUNDING_MODE);
 
+#if IS_CAUSAL
     if (idx_buffer[0] > idx_buffer[1]) {
         return;
     }
+#endif
 
     matmul_bf16_bf16(a_in, b_in, c_out);
 }
@@ -55,9 +62,11 @@ void matmul_PV(bfloat16 *Q,
 
     ::aie::set_rounding(ROUNDING_MODE);
 
+#if IS_CAUSAL
     if (idx_buffer[0] > idx_buffer[1]) {
         return;
     }
+#endif
 
     // 64 emul: O dims = [(8, 512), (8, 8), (8, 64), (8, 1)]
     // VJUNG: Scale O_{i-1} by 1/exp(m_{i-1} - m_{i}) store in scale_buffer[3*B_q:3*B_q + B_q]
@@ -140,10 +149,12 @@ void partial_softmax(bfloat16 *A,
     int32_t kv_block_idx = idx_buffer[0];
 
     // Causal full mask: skip blocks strictly above diagonal
+#if IS_CAUSAL
     if (kv_block_idx > q_block_idx) {
         zero_bf16(P);
         return;
     }
+#endif
 
     // Compute valid extents within this block for padded tails
     int32_t valid_q_rows = S_q_eff - q_block_idx * B_q;
@@ -192,6 +203,7 @@ void partial_softmax(bfloat16 *A,
         }
     }
 
+#if IS_CAUSAL
     // Diagonal small causal mask only within valid region (vectorized)
     if (kv_block_idx == q_block_idx) {
         using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
@@ -210,6 +222,7 @@ void partial_softmax(bfloat16 *A,
             }
         }
     }
+#endif
 
     using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
     int32_t i = 0;

@@ -25,7 +25,6 @@ from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccess
 from aie.iron.controlflow import range_
 from aie.helpers.dialects.ext.scf import if_, else_
 
-
 microkernel_mac_dim_map = {
     "npu": {
         "bf16": (4, 8, 4),

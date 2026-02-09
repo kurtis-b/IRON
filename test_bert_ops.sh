@@ -4,7 +4,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 rm -r build/
-pytest operators/add_and_norm/ --csv-output operators_add_and_norm_results.csv --iterations 1
+pytest operators/addnorm/ --csv-output operators_addnorm_results.csv --iterations 1
+pytest operators/addnorm_with_layout_transform/ --csv-output operators_addnorm_with_layout_transform_results.csv --iterations 1
 pytest operators/elementwise_add/ --csv-output operators_elementwise_add_results.csv --iterations 1
 pytest operators/elementwise_mul/ --csv-output operators_elementwise_mul_results.csv --iterations 1
 pytest operators/encoder/ --csv-output operators_encoder_results.csv --iterations 1
@@ -15,4 +16,6 @@ pytest operators/layer_norm/ --csv-output operators_layer_norm_results.csv --ite
 pytest operators/mha/ --csv-output operators_mha_results.csv --iterations 1
 pytest operators/softmax/ --csv-output operators_softmax_results.csv --iterations 1
 pytest operators/transpose/ --csv-output operators_transpose_results.csv --iterations 1
+pytest operators/addnorm_ffn/ --csv-output operators_addnorm_ffn_results.csv --iterations 1
 cat operators*.csv > bert_operators_results.csv
+pytest applications/bert/ --csv-output bert_application_results.csv --iterations 1

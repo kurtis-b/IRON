@@ -29,6 +29,7 @@ class AIEMHA(AIEOperatorBase):
         d: int,
         num_KV_heads: int,
         num_of_pipelines: int = 1,
+        is_causal: bool = False,
         context=None,
         skip_add_to_list=False,
     ):
@@ -39,6 +40,7 @@ class AIEMHA(AIEOperatorBase):
         self.B_kv = 64
         self.num_KV_heads = num_KV_heads
         self.num_of_pipelines = num_of_pipelines
+        self.is_causal = is_causal
         assert d == 64, "Only d=64 is supported in this version"
 
         # Artifacts created by set_up_artifacts()
@@ -55,7 +57,7 @@ class AIEMHA(AIEOperatorBase):
         operator_dir = Path(__file__).parent
 
         kv_heads = self.num_KV_heads if self.num_KV_heads > 0 else self.num_heads
-        file_name_base = f"mha_{self.num_heads}h_{kv_heads}kv_{self.seq_len}s_{self.d}d_{self.num_of_pipelines}p"
+        file_name_base = f"mha_{self.num_heads}h_{kv_heads}kv_{self.seq_len}s_{self.d}d_{self.num_of_pipelines}p_{int(self.is_causal)}"
 
         # Define source files
         mm_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mm.cc")
@@ -86,9 +88,7 @@ class AIEMHA(AIEOperatorBase):
             "zero_scalar_bf16": "zero_scalar_bf16_rowmaj",
         }
 
-        kernel_archive = (
-            f"mha_kernels_{self.num_heads}h_{kv_heads}kv_{self.seq_len}s_{self.d}d.a"
-        )
+        kernel_archive = f"mha_kernels_{self.num_heads}h_{kv_heads}kv_{self.seq_len}s_{self.d}d_{int(self.is_causal)}.a"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -104,6 +104,7 @@ class AIEMHA(AIEOperatorBase):
                 "num_KV_heads": self.num_KV_heads,
                 "number_of_pipelines": self.num_of_pipelines,
                 "emulate_bf16_mmul_with_bfp16": True,
+                "is_causal": self.is_causal,
                 "kernel_archive": kernel_archive,
                 "trace_size": 0,
                 "verbose": False,
@@ -133,8 +134,9 @@ class AIEMHA(AIEOperatorBase):
                             depends=[SourceArtifact.new(softmax_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_mha_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv.o",
+                            f"mha_mha_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv_{int(self.is_causal)}.o",
                             depends=[SourceArtifact.new(mha_source)],
+                            extra_flags=[f"-DIS_CAUSAL={int(self.is_causal)}"],
                         ),
                         KernelObjectArtifact.new(
                             f"mha_passThrough_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv.o",
