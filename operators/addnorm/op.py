@@ -135,12 +135,12 @@ class AIEAddAndNorm(AIEOperatorBase):
         self.add_buffer("input2", self.size)
         self.add_buffer("output", self.size)
         self.add_kernel(
-            "add_and_norm",
+            "addnorm",
             self.xclbin_artifact,
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_to_runlist("add_and_norm", "input1", "input2", "output")
+        self.add_to_runlist("addnorm", "input1", "input2", "output")
 
     def forward(self, x, y):
         """Forward pass for element-wise addition"""

@@ -13,59 +13,51 @@ from aie.iron.device import NPU1, NPU2, Tile
 from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 from aie.helpers.util import np_ndarray_type_get_shape
+import aie.dialects.index as index
+from aie.dialects.aiex import *
 
-
-DATA_MEM_SIZE = 65536  # L1 size in bytes
-
-
-def get_rows_to_process(num_elements, weight_length):
-    # Determine per-tile elements based on weight_length
-    for i in range(1, num_elements // weight_length):
-        per_tile_elements = weight_length * i
-        # 2 input + 1 output + weight vector for second stage, bf16, double buffering
-        if (per_tile_elements * 3 + weight_length) * 2 * 2 > DATA_MEM_SIZE:
-            return i - 1
-    return num_elements // weight_length
+"""
+This design computes weighted layer norm + eltwise add on AIE cores.
+The data movement is written in such a way that the outputs can be used
+to feed directly to a GEMM core. The s parameter is the microkernel
+col dim layout parameter for the GEMM core that would consume the output of 
+this design. It's ASSUMED that m == r of the microkernel row dim layout
+for GEMM. The output stream through shim DMA is organized in tiles
+of size (m x k), where within each tile the data is contiguously laid
+out in the (m x s) subtiles required for the mmul API call for the AIE.
+"""
 
 
 def my_weighted_layer_norm(
     dev,
-    num_elements,
+    M,
+    K,
+    m,
+    k,
+    s,
     num_columns,
-    weight_length,
     weight_file_path,
     kernel_archive_path,
     trace_size,
 ):
     static_weights = np.load(weight_file_path)
-    if static_weights.shape[0] != weight_length:
+    if static_weights.shape[0] != K:
         raise ValueError(
             "Static weights length does not match the specified weight length"
         )
-    per_tile_elements = weight_length
-    rows_to_process = get_rows_to_process(num_elements, weight_length)
-    # Find a tile size multiple that divides num_elements
-    input_tile_size = per_tile_elements * rows_to_process
-    for _ in range(rows_to_process, 0, -1):
-        n = input_tile_size * num_columns
-        if num_elements % n == 0:
-            break
-        input_tile_size -= per_tile_elements
-        rows_to_process -= 1
-    if input_tile_size == 0:
-        raise ValueError(
-            f"Couldn't find tile size multiple for number of elements ({num_elements})"
-        )
-    N_div_n = num_elements // n
-    chunk = num_elements // num_columns
+    assert M % (num_columns * m) == 0, "M must be multiple of num_columns * m"
+    assert K % k == 0, "K must be multiple of k"
+    assert k % s == 0, "k must be multiple of s"
+    M_div_m = M // m
+    K_div_k = K // k  # Will be used as the obj fifo depth
+    iters_per_core = M_div_m // num_columns
     dtype = bfloat16
     # Define tensor types
-    tensor_ty = np.ndarray[(num_elements,), np.dtype[dtype]]
-    weights_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
-    tile_ty = np.ndarray[(input_tile_size,), np.dtype[dtype]]
-
-    # Set fifodepth based on weight_length
-    fifodepth = 1 if weight_length > 4096 else 2
+    tensor_ty = np.ndarray[(M * K,), np.dtype[dtype]]
+    weights_ty = np.ndarray[(K,), np.dtype[dtype]]
+    tile_ty = np.ndarray[(m * K,), np.dtype[dtype]]
+    out_ty = np.ndarray[(m * k,), np.dtype[dtype]]
+    fifodepth = 2  # For double buffering
 
     # AIE-array data movement with object fifos
     of_in1s = [
@@ -76,51 +68,55 @@ def my_weighted_layer_norm(
         ObjectFifo(tile_ty, name=f"in2_{i}", depth=fifodepth)
         for i in range(num_columns)
     ]
-    of_out1s = [
-        ObjectFifo(tile_ty, name=f"out1_{i}", depth=fifodepth)
-        for i in range(num_columns)
-    ]
-    of_out2s = [
-        ObjectFifo(tile_ty, name=f"out2_{i}", depth=fifodepth)
-        for i in range(num_columns)
-    ]
+
+    of_out1s_l1l2 = [None] * num_columns
+    of_out1s_l2l3 = [None] * num_columns
+    for i in range(num_columns):
+        dims_to_stream_out = [(k // s, s), (m, k), (s, 1)]
+        of_out1s_l1l2[i] = ObjectFifo(
+            out_ty,
+            name=f"outl1l2_{i}",
+            depth=1,
+        )
+        of_out1s_l2l3[i] = (
+            of_out1s_l1l2[i]
+            .cons(depth=fifodepth)
+            .forward(
+                obj_type=out_ty,
+                depth=fifodepth,
+                name=f"outl2l3_{i}",
+                dims_to_stream=dims_to_stream_out,
+            )
+        )
 
     # AIE Core Function declaration
-    layer_norm_kernel = Kernel(
-        "layer_norm", kernel_archive_path, [tile_ty, tile_ty, np.int32, np.int32]
-    )
-    eltwise_mul_kernel = Kernel(
-        "eltwise_mul_bf16_vector",
+    fused_add_layer_norm_kernel = Kernel(
+        "fused_add_layer_norm_1outs",
         kernel_archive_path,
-        [tile_ty, weights_ty, tile_ty, np.int32, np.int32],
+        [tile_ty, tile_ty, weights_ty, tile_ty, np.int32, np.int32],
     )
-    eltwise_add_kernel = Kernel(
-        "eltwise_add_bf16_vector",
+    mem_copy_kernel = Kernel(
+        "ln_passThroughTile_in",
         kernel_archive_path,
-        [tile_ty, tile_ty, tile_ty, np.int32],
+        [tile_ty, out_ty, np.int32, np.int32, np.int32, np.int32],
     )
 
     # Define a task that will run on a compute tile
-    def core_body_stg1(of_in1, of_out1, layer_norm):
+    def core_body(
+        of_in1, of_in2, weights, internal_out, of_out1, fused_add_layer_norm, copy
+    ):
         # Number of sub-vector "tile" iterations
-        for _ in range_(N_div_n):
+        for row_idx in range_(iters_per_core):
             elem_in1 = of_in1.acquire(1)
-            elem_out = of_out1.acquire(1)
-            layer_norm(elem_in1, elem_out, per_tile_elements, rows_to_process)
-            of_in1.release(1)
-            of_out1.release(1)
-
-    def core_body_stg2(of_in1, of_in2, weights, of_out2, eltwise_mul, add):
-        # Number of sub-vector "tile" iterations
-        for _ in range_(N_div_n):
-            elem_in1 = of_in1.acquire(1)
-            elem_out = of_out2.acquire(1)
-            eltwise_mul(elem_in1, weights, elem_out, per_tile_elements, rows_to_process)
-            of_in1.release(1)
             elem_in2 = of_in2.acquire(1)
-            add(elem_out, elem_in2, elem_out, per_tile_elements * rows_to_process)
+            fused_add_layer_norm(elem_in1, elem_in2, weights, internal_out, K, m)
+            of_in1.release(1)
             of_in2.release(1)
-            of_out2.release(1)
+            for col_idx in range_(K_div_k):
+                col_i32 = index.casts(T.i32(), col_idx)
+                elem_out = of_out1.acquire(1)
+                copy(internal_out, elem_out, K, k, m, col_i32)
+                of_out1.release(1)
 
     # Create workers to run the task on compute tiles,
     # one core for layer norm and another pipelined to do eltwise mul
@@ -131,27 +127,23 @@ def my_weighted_layer_norm(
             initial_value=static_weights,
             name=f"weights_buffer_{i}",
         )
-        my_workers.append(
-            Worker(
-                core_body_stg1,
-                [
-                    of_in1s[i].cons(),
-                    of_out1s[i].prod(),
-                    layer_norm_kernel,
-                ],
-            )
+        out_buffer = Buffer(
+            type=tile_ty,
+            name=f"internal_out_buffer_{i}",
         )
         my_workers.append(
             Worker(
-                core_body_stg2,
+                core_body,
                 [
-                    of_out1s[i].cons(),
+                    of_in1s[i].cons(),
                     of_in2s[i].cons(),
                     weights_buffer,
-                    of_out2s[i].prod(),
-                    eltwise_mul_kernel,
-                    eltwise_add_kernel,
+                    out_buffer,
+                    of_out1s_l1l2[i].prod(),
+                    fused_add_layer_norm_kernel,
+                    mem_copy_kernel,
                 ],
+                stack_size=0xF00,
             )
         )
 
@@ -161,9 +153,9 @@ def my_weighted_layer_norm(
     # and moves them in parallel across the cores.
     taps = [
         TensorAccessPattern(
-            (1, num_elements),
-            chunk * i,
-            [1, 1, 1, chunk],
+            (1, M * K),
+            iters_per_core * m * K * i,
+            [1, 1, 1, iters_per_core * m * K],
             [0, 0, 0, 1],
         )
         for i in range(num_columns)
@@ -194,7 +186,7 @@ def my_weighted_layer_norm(
         # Drain the output objectFIFOs with data
         for i in range(num_columns):
             rt.drain(
-                of_out2s[i].cons(),
+                of_out1s_l2l3[i].cons(),
                 C,
                 taps[i],
                 wait=True,
@@ -228,27 +220,47 @@ if __name__ == "__main__":
         help="AIE Device",
         type=str_to_device,
     )
-    # Transfer size is required to define the size of the data to be transferred
-    # It must be a multiple of 1024 and divisible by the number of columns
-    p.add_argument("-l", "--length", required=True, dest="length", help="Transfer size")
+    p.add_argument(
+        "-M",
+        required=True,
+        dest="M",
+        help="Number of rows",
+    )
+    p.add_argument(
+        "-K",
+        required=True,
+        dest="K",
+        help="Number of cols, also the weight vector length",
+    )
+    p.add_argument(
+        "-m",
+        required=True,
+        dest="m",
+        help="Number of tile rows",
+    )
+    p.add_argument(
+        "-k",
+        required=True,
+        dest="k",
+        help="Number of tile cols",
+    )
+    p.add_argument(
+        "-s",
+        required=True,
+        dest="s",
+        help="Number of subtile cols",
+    )
     # Number of columns is required to define the number of columns to be used
     # It must be less than or equal to 4 for npu and 8 for npu2
     p.add_argument(
         "-co", "--columns", required=True, dest="cols", help="Number of columns"
-    )
-    # Weight length
-    p.add_argument(
-        "-wl",
-        "--weight-length",
-        required=True,
-        dest="weight_length",
-        help="Weight vector length",
     )
     # Static weights
     p.add_argument(
         "-wf",
         "--weight-file",
         required=True,
+        default=None,
         dest="weight_file",
         help="Static weight values are expected to be saved in a numpy .npy file so they can be preloaded to buffers at compile time",
     )
@@ -273,7 +285,11 @@ if __name__ == "__main__":
 
     opts = p.parse_args(sys.argv[1:])
 
-    length = int(opts.length)
+    M = int(opts.M)
+    K = int(opts.K)
+    m = int(opts.m)
+    k = int(opts.k)
+    s = int(opts.s)
     columns = int(opts.cols)
     dev = opts.device  # Now this is already a device object!
 
@@ -283,14 +299,13 @@ if __name__ == "__main__":
     elif isinstance(dev, NPU2) and columns > 8:
         raise ValueError("[ERROR] NPU2 device cannot allocate more than 8 columns")
 
-    weight_length = int(opts.weight_length)
     # For add and norm: cores = columns * 2 (2 cores are used per set of inputs, one for each stage in pipeline)
-    if (length % (weight_length * columns)) != 0:
+    if (M % columns) != 0:
         print(
-            "transfer size ("
-            + str(length)
-            + ") must be a multiple of weight_length * columns ("
-            + str(weight_length * columns)
+            "transfer rows ("
+            + str(M)
+            + ") must be a multiple of columns ("
+            + str(columns)
             + ")"
         )
         raise ValueError
@@ -300,9 +315,12 @@ if __name__ == "__main__":
 
     module = my_weighted_layer_norm(
         dev,
-        length,
+        M,
+        K,
+        m,
+        k,
+        s,
         columns,
-        weight_length,
         weight_file_path,
         opts.kernel_archive,
         trace_size,

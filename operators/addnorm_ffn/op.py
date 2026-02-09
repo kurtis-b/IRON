@@ -21,13 +21,14 @@ from operators.common import (
 from operators.common.utils import torch_to_numpy, numpy_to_torch
 
 
-class AIEFFN(AIEOperatorBase):
+class AIEANFFN(AIEOperatorBase):
     """
-    AIE-accelerated FFN block for BERT, which has an up-projection and down-projection with a GeLU in between.
-    The FFN block computes: C = GeLU(A @ B_Up) @ B_Down
-    where A is of shape (M, K), B_Up is of shape (K, N), B_Down is of shape (N, K), and C is of shape (M, K).
-    The operator supports static weights for B_Up and B_Down
-    The up-projection is fused with GeLU, and the output of this stage is pipelined to the down-projection.
+    AIE-accelerated ANFFN block for BERT, which has an add & norm, up-projection and down-projection with a GeLU in between, then another add & norm.
+    The ANFFN block computes: R2 = LN(A) + R, C = LN(GeLU(R2 @ B_Up) @ B_Down) + R2
+    where A and R are of shape (M, K), B_Up is of shape (K, N), B_Down is of shape (N, K), and C is of shape (M, K).
+    The operator supports static weights for B_Up, B_Down, and the two layer norm weights.
+    The add & norm stage is pipelined to the up-projection, and the output of that is pipelined to down-projection fused with GeLU, which is then
+    pipelined to the final add & norm stage.
     """
 
     def __init__(
@@ -41,9 +42,12 @@ class AIEFFN(AIEOperatorBase):
         tile_n=64,
         down_proj_depth=1,
         num_aie_columns=2,
+        ln1_weight=None,
+        ln2_weight=None,
+        debug_mode=-1,
         context=None,
         skip_add_to_list=False,
-        **ffn_kwargs,
+        **anffn_kwargs,
     ):
 
         self.tile_m = tile_m
@@ -52,7 +56,7 @@ class AIEFFN(AIEOperatorBase):
         self.down_proj_depth = down_proj_depth
         self.num_aie_columns = num_aie_columns
         self.n_aie_rows = 2
-        self.ffn_args = ffn_kwargs
+        self.anffn_args = anffn_kwargs
         self.weight_up_proj = (
             None
             if not use_static_weight
@@ -80,11 +84,15 @@ class AIEFFN(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
+        self.ln1_weight = ln1_weight
+        self.ln2_weight = ln2_weight
+        self.debug_mode = debug_mode
+
         AIEOperatorBase.__init__(
             self, context=context, skip_add_to_list=skip_add_to_list
         )
 
-    def get_artifacts(self, prefix="ffn_"):
+    def get_artifacts(self, prefix="anffn_"):
         # Get parameters from self
         operator_dir = Path(__file__).parent
         tile_m = self.tile_m
@@ -98,21 +106,18 @@ class AIEFFN(AIEOperatorBase):
         base_dir = self.context.base_dir
         device_str = self.context.device_manager.device_str()
 
-        b_col_maj = self.ffn_args.get("b_col_maj", False)
-        c_col_maj = self.ffn_args.get("c_col_maj", False)
-        dtype_in = self.ffn_args.get("dtype_in", "bf16")
-        dtype_out = self.ffn_args.get("dtype_out", "bf16")
-        emulate_bf16_mmul_with_bfp16 = self.ffn_args.get(
+        dtype_in = self.anffn_args.get("dtype_in", "bf16")
+        dtype_out = self.anffn_args.get("dtype_out", "bf16")
+        emulate_bf16_mmul_with_bfp16 = self.anffn_args.get(
             "emulate_bf16_mmul_with_bfp16", True
         )
-        use_scalar = self.ffn_args.get("use_scalar", False)
-        round_conv_even = self.ffn_args.get("round_conv_even", True)
-        n_a_tiles_distributed = self.ffn_args.get("n_a_tiles_distributed", 1)
-        n_b_tiles_distributed = self.ffn_args.get("n_b_tiles_distributed", 1)
-        stage_only = self.ffn_args.get(
+        round_conv_even = self.anffn_args.get("round_conv_even", True)
+        nA_tiles_distributed = self.anffn_args.get("nA_tiles_distributed", 1)
+        nB_tiles_distributed = self.anffn_args.get("nB_tiles_distributed", 1)
+        stage_only = self.anffn_args.get(
             "stage_only", None
         )  # 0: up_proj only, 1: down_proj only, None: all
-        gelu_stage = self.ffn_args.get(
+        gelu_stage = self.anffn_args.get(
             "gelu_stage", 1
         )  # 0: after up_proj, 1: after down_proj
 
@@ -128,51 +133,23 @@ class AIEFFN(AIEOperatorBase):
             f"{prefix}{M}x{K}x{N}_"
             f"{tile_m}x{tile_k}x{tile_n}_"
             f"{down_proj_depth}_"
-            f"{n_a_tiles_distributed}_"
-            f"{n_b_tiles_distributed}_"
+            f"{nA_tiles_distributed}_"
+            f"{nB_tiles_distributed}_"
             f"{stage_only}_"
             f"{gelu_stage}_"
-            f"{int(b_col_maj)}_"
-            f"{int(c_col_maj)}"
         )
-        kernel_flags_base = []
-        mm_up_proj_rename_symbols = {
-            "matmul_bf16_bf16": "matmul_bf16_bf16_up_proj",
-            "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_up_proj",
-            "zero_bf16": "zero_bf16_up_proj",
-            "zero_scalar_bf16": "zero_scalar_bf16_up_proj",
-        }
-        mm_down_proj_rename_symbols = {
-            "matmul_bf16_bf16": "matmul_bf16_bf16_down_proj",
-            "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_down_proj",
-            "matmul_with_acc_bf16_bf16": "matmul_with_acc_bf16_bf16_down_proj",
-            "zero_bf16": "zero_bf16_down_proj",
-            "zero_scalar_bf16": "zero_scalar_bf16_down_proj",
-        }
-        kernel_flags_base.append("-Dbf16_bf16_ONLY")
-        if round_conv_even:
-            kernel_flags_base.append("-DROUND_CONV_EVEN")
-        if emulate_bf16_mmul_with_bfp16:
-            kernel_flags_base.append("-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16")
-        if b_col_maj:
-            kernel_flags_base.append("-DB_COL_MAJ")
-        if c_col_maj:
-            kernel_flags_base.append("-DC_COL_MAJ")
-        kernel_flags_up_proj = kernel_flags_base + [
-            f"-DDIM_M={tile_m}",
-            f"-DDIM_K={tile_k}",
-            f"-DDIM_N={tile_n}",
-        ]
-        kernel_flags_down_proj = kernel_flags_base + [
-            f"-DDIM_M={tile_m}",
-            f"-DDIM_K={tile_n}",
-            f"-DDIM_N={tile_k}",
-            "-DGENERATE_MATMUL_WITH_ACC_KERNELS",
-        ]
 
-        kernel_archive = (
-            f"ffn_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.a"
+        # Save the weight weights to a npy file so that the design.py can load it at compile time
+        ln1_weight_file_name = (
+            self.context.build_dir / f"{file_name_total_base}_ln1_weight_{self.K}.npy"
         )
+        np.save(ln1_weight_file_name, torch_to_numpy(self.ln1_weight))
+        ln2_weight_file_name = (
+            self.context.build_dir / f"{file_name_total_base}_ln2_weight_{self.K}.npy"
+        )
+        np.save(ln2_weight_file_name, torch_to_numpy(self.ln2_weight))
+
+        kernel_archive = f"anffn_{tile_m}x{tile_k}x{tile_n}.a"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_total_base}.mlir",
@@ -187,23 +164,32 @@ class AIEFFN(AIEOperatorBase):
                 "k": tile_k,
                 "n": tile_n,
                 "down_proj_depth": down_proj_depth,
-                "n_a_tiles_distributed": n_a_tiles_distributed,
-                "n_b_tiles_distributed": n_b_tiles_distributed,
+                "nA_tiles_distributed": nA_tiles_distributed,
+                "nB_tiles_distributed": nB_tiles_distributed,
                 "n_aie_cols": num_aie_columns,
                 "dtype_in_str": dtype_in,
                 "dtype_out_str": dtype_out,
-                "b_col_maj": int(b_col_maj),
-                "c_col_maj": int(c_col_maj),
-                "use_scalar": use_scalar,
                 "emulate_bf16_mmul_with_bfp16": emulate_bf16_mmul_with_bfp16,
                 "trace_size": 0,
                 "stage_only": stage_only,
                 "gelu_stage": gelu_stage,
                 "archive": kernel_archive,
+                "ln1_weight_file": ln1_weight_file_name,
+                "ln2_weight_file": ln2_weight_file_name,
                 "generate_taps": False,
             },
             requires_context=False,
         )
+        encoder_kernel_flags = [
+            "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+            "-DBUILD_FFN",
+            "-DBUILD_ADDNORM",
+            f"-DDIM_M={tile_m}",
+            f"-DDIM_K={tile_k}",
+            f"-DDIM_N={tile_n}",
+        ]
+        if self.debug_mode == 0 or self.debug_mode == 1:
+            encoder_kernel_flags.append(f"-DDEBUG_AIE_KERNELS={self.debug_mode}")
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_total_base}.xclbin",
@@ -213,43 +199,19 @@ class AIEFFN(AIEOperatorBase):
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"up_proj_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.o",
-                            extra_flags=kernel_flags_up_proj,
+                            f"fused_encoder_{tile_m}x{tile_k}x{tile_n}.o",
                             depends=[
                                 SourceArtifact.new(
-                                    base_dir / "aie_kernels" / "aie2p" / "mm.cc"
+                                    self.context.base_dir
+                                    / "aie_kernels"
+                                    / "aie2p"
+                                    / "encoder.cc"
                                 )
                             ],
-                            rename_symbols=mm_up_proj_rename_symbols,
+                            extra_flags=encoder_kernel_flags,
                         ),
                         KernelObjectArtifact.new(
-                            f"down_proj_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.o",
-                            extra_flags=kernel_flags_down_proj,
-                            depends=[
-                                SourceArtifact.new(
-                                    base_dir / "aie_kernels" / "aie2p" / "mm.cc"
-                                )
-                            ],
-                            rename_symbols=mm_down_proj_rename_symbols,
-                        ),
-                        KernelObjectArtifact.new(
-                            f"add_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.o",
-                            [
-                                SourceArtifact.new(
-                                    base_dir / "aie_kernels" / "generic" / "add.cc"
-                                )
-                            ],
-                        ),
-                        KernelObjectArtifact.new(
-                            f"gelu_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.o",
-                            [
-                                SourceArtifact.new(
-                                    base_dir / "aie_kernels" / "aie2p" / "gelu.cc"
-                                )
-                            ],
-                        ),
-                        KernelObjectArtifact.new(
-                            f"passThrough_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.o",
+                            f"ffn_passThrough_{tile_m}x{tile_k}x{tile_n}.o",
                             extra_flags=[
                                 "-DBIT_WIDTH=16",
                             ],
@@ -261,11 +223,36 @@ class AIEFFN(AIEOperatorBase):
                                     / "passThrough.cc"
                                 )
                             ],
+                            rename_symbols={
+                                "passThroughLine": "ffn_passThroughLine",
+                                "passThroughTile": "ffn_passThroughTile",
+                            },
+                        ),
+                        KernelObjectArtifact.new(
+                            f"ln_passThrough_{tile_m}x{tile_k}x{tile_n}.o",
+                            extra_flags=[
+                                "-DBIT_WIDTH=16",
+                            ],
+                            depends=[
+                                SourceArtifact.new(
+                                    base_dir
+                                    / "aie_kernels"
+                                    / "generic"
+                                    / "passThrough.cc"
+                                )
+                            ],
+                            rename_symbols={
+                                "passThroughLine": "ln_passThroughLine",
+                                "passThroughTile": "ln_passThroughTile",
+                            },
                         ),
                     ],
                 ),
             ],
-            extra_flags=["--dynamic-objFifos"],
+            extra_flags=[
+                "--dynamic-objFifos",
+                # "--profile"
+            ],
         )
 
         insts_artifact = InstsBinArtifact.new(
@@ -301,28 +288,35 @@ class AIEFFN(AIEOperatorBase):
             if isinstance(static_weights_down_proj, torch.Tensor):
                 static_weights_down_proj = torch_to_numpy(static_weights_down_proj)
         self.add_kernel(
-            "ffn",
+            "anffn",
             self.xclbin_artifact,
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
         self.add_buffer("A", self.M * self.K)
+        self.add_buffer("R", self.M * self.K)
         self.add_buffer("B_Up", self.K * self.N, static_data=static_weights_up_proj)
         self.add_buffer("B_Down", self.K * self.N, static_data=static_weights_down_proj)
         self.add_buffer("C", self.M * self.K)
-        self.add_to_runlist("ffn", "A", "B_Up", "B_Down", "C")
+        self.add_to_runlist("anffn", "A", "R", "B_Up", "B_Down", "C")
 
-    def forward(self, A, B_Up=None, B_Down=None):
-        """Forward pass through FFN block: C = GeLU(A @ B_Up) @ B_Down"""
+    def forward(self, A, R, B_Up=None, B_Down=None):
+        """Forward pass through ANFFN block: R2 = LN(A) + R, C = LN(GeLU(R2 @ B_Up) @ B_Down) + R2"""
         B_Up_shape = B_Up.shape if B_Up is not None else self.weight_up_proj.T.shape
         B_Down_shape = (
             B_Down.shape if B_Down is not None else self.weight_down_proj.T.shape
         )
         expected_output_shape = A.shape
+        if expected_output_shape != R.shape:
+            raise AIEOperatorConstraintError(
+                "AIEANFFN: input A and residual R must have the same shape"
+            )
 
-        # Remove down_proj_depth dimension, if any
+        # Remove batch dimension, if any
         if len(A.shape) > 2:
             A = A.view(-1, A.shape[-1])
+        if len(R.shape) > 2:
+            R = R.view(-1, R.shape[-1])
         if B_Up is not None and len(B_Up.shape) > 2:
             B_Up = B_Up.view(-1, B_Up_shape[-1])
         if B_Down is not None and len(B_Down.shape) > 2:
@@ -336,14 +330,15 @@ class AIEFFN(AIEOperatorBase):
             K == K2
             and K == K3
             and N == N2
-            and (M <= self.M or not self.c_col_maj)
+            and (M <= self.M)
             and K <= self.K
             and N <= self.N
         )
         if not applicable:
-            raise AIEOperatorConstraintError("AIEFFN: incompatible tensor shape(s)")
+            raise AIEOperatorConstraintError("AIEANFFN: incompatible tensor shape(s)")
 
         A_padded = self._pad_A(torch_to_numpy(A))
+        R_padded = self._pad_A(torch_to_numpy(R))
         if B_Up is not None:
             B_Up_padded = self._pad_B(torch_to_numpy(B_Up), b_col_maj=False)
         else:
@@ -356,19 +351,20 @@ class AIEFFN(AIEOperatorBase):
             B_Down_padded = None
 
         logging.debug(
-            f"Executing BERT FFN for dimensions M={M}, K={K}, N={N} using NPU operator with M={self.M}, K={self.N}, N={self.N}"
+            f"Executing BERT ANFFN for dimensions M={M}, K={K}, N={N} using NPU operator with M={self.M}, K={self.N}, N={self.N}"
         )
 
         result_padded = np.zeros((M, self.K), dtype=A_padded.dtype)
         for M_lo in range(0, M, self.M):
             A_part = A_padded[M_lo : M_lo + self.M, :]
+            R_part = R_padded[M_lo : M_lo + self.M, :]
             result_part = self._execute_aie_operation(
-                A_part, B_Up_padded, B_Down_padded
+                A_part, R_part, B_Up_padded, B_Down_padded
             )
             max_M = min(M_lo + self.M, M)
             result_padded[M_lo:max_M, :] = result_part[:max_M, :]
 
-        # FFN produces 2D result, reshape to expected output shape
+        # ANFFN produces 2D result, reshape to expected output shape
         result = numpy_to_torch(result_padded[:M, :K])
         result = result.view(expected_output_shape)
 
@@ -416,8 +412,8 @@ class AIEFFN(AIEOperatorBase):
             B_padded[:dim1_end, :dim2_end] = B_np
         return B_padded
 
-    def _execute_aie_operation(self, A_np, B_Up_np=None, B_Down_np=None):
-        """Execute FFN operation on AIE hardware"""
+    def _execute_aie_operation(self, A_np, R_np, B_Up_np=None, B_Down_np=None):
+        """Execute ANFFN operation on AIE hardware"""
         M, K = A_np.shape
         K2, N = B_Up_np.shape if B_Up_np is not None else self.weight_up_proj.T.shape
         N2, K3 = (
@@ -432,6 +428,7 @@ class AIEFFN(AIEOperatorBase):
         assert N == N2 and N == self.N
 
         self.write_buffer("A", A_np)
+        self.write_buffer("R", R_np)
         if B_Up_np is not None:
             self.write_buffer("B_Up", B_Up_np)
         if B_Down_np is not None:

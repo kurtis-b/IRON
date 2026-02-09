@@ -155,6 +155,11 @@ Example to run GEMM tests with debug-level logging enabled and for only 1 iterat
 pytest operators/gemm/ --iterations 1 --log-cli-level=DEBUG
 ```
 
+Example to run GEMM tests to remove pytest capturing outputs to stdout and stderr so that prints will show up in console. However, this will result in no data being stored in the .csv files:
+``` bash
+pytest operators/gemm/ -s --iterations 1
+```
+
 Use `--co` to generate only the test names, i.e. the tests won't run. 
 
 ### Git Hooks (Optional but Recommended)

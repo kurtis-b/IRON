@@ -125,8 +125,8 @@ class AIESoftmax(AIEOperatorBase):
 
         # Reshape for processing
         # Split x into a list of H tensors of size [S_q, S_kv]
-        heads = x.shape[1]
-        x_list = [x[0, h, :, :] for h in range(heads)]
+        heads = x.shape[0]
+        x_list = [x[h, :, :] for h in range(heads)]
         results = []
         for i in range(heads):
             x_iter = x_list[i]

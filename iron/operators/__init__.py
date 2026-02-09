@@ -24,4 +24,5 @@ from .tanh.op import AIETanh
 from .transpose.op import AIETranspose
 from .encoder.op import AIEBERTEncoder
 from .ffn.op import AIEFFN
-from .add_and_norm.op import AIEAddAndNorm
+from .addnorm.op import AIEAddAndNorm
+from .addnorm_ffn.op import AIEANFFN

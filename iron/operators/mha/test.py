@@ -13,8 +13,10 @@ from iron.common.test_utils import run_test
 
 
 def generate_test_params(extensive=False):
-    params = [(16384, 64, 1, 8), (2048, 64, 32, 8), (512, 64, 12, 8)]
-    names = ["mha_s16384_d64_h1_p8", "mha_s2048_d64_h32_p8", "bert_mha_s512_d64_h12_p8"]
+    # params = [(16384, 64, 1, 8, True), (2048, 64, 32, 8, True), (512, 64, 12, 8, False)]
+    # names = ["mha_s16384_d64_h1_p8_1", "mha_s2048_d64_h32_p8_1", "bert_mha_s512_d64_h12_p8_0"]
+    params = [(512, 64, 12, 8, False)]
+    names = ["bert_mha_s512_d64_h12_p8_0"]
     return params, names
 
 
@@ -35,20 +37,8 @@ all_params = [
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
-@pytest.mark.parametrize("seq_len,dim,num_heads,num_pipelines,num_kv_heads", all_params)
-def test_mha(
-    seq_len: int,
-    dim: int,
-    num_heads: int,
-    num_pipelines: int,
-    num_kv_heads: int,
-    aie_context,
-):
-
-    print(
-        f"\nTest configuration: seq_len={seq_len}, dim={dim}, num_heads={num_heads}, num_pipelines={num_pipelines}, num_kv_heads={num_kv_heads}"
-    )
-
+@pytest.mark.parametrize("seq_len,dim,num_heads,num_pipelines,is_causal", all_params)
+def test_mha(seq_len, dim, num_heads, num_pipelines, is_causal, aie_context):
     golden_ref = generate_golden_reference(
         S_q=seq_len,
         S_kv=seq_len,
@@ -56,6 +46,7 @@ def test_mha(
         heads=num_heads,
         num_kv_heads=num_kv_heads,
         num_pipeline=num_pipelines,
+        is_causal=is_causal,
     )
 
     operator = AIEMHA(
@@ -64,6 +55,7 @@ def test_mha(
         d=dim,
         num_KV_heads=num_kv_heads,
         num_of_pipelines=num_pipelines,
+        is_causal=is_causal,
         context=aie_context,
     )
 

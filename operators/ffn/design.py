@@ -24,7 +24,6 @@ from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
 
-
 microkernel_mac_dim_map = {
     "npu": {
         "bf16": (4, 8, 4),
@@ -123,7 +122,7 @@ def main():
         args.scalar,
         args.emulate_bf16_mmul_with_bfp16,
         args.trace_size,
-        arga.gelu_stage,
+        args.gelu_stage,
         args.stage_only,
         args.archive,
         args.generate_taps,
@@ -548,7 +547,7 @@ def my_matmul(
             C_down_proj_out_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
                 C_down_proj_l1_ty,
                 name=f"C_down_proj_out_L1L1_{a_tile}_{b_tile}",
-                depth=fifo_depth_out,
+                depth=1,
             )
 
     # Down proj output C, m-by-k tiles
@@ -560,7 +559,7 @@ def my_matmul(
         C_down_proj_out_l1l2_fifos[a_tile] = ObjectFifo(
             C_down_proj_l1_ty,
             name=f"C_down_proj_out_L1L2_{a_tile}",
-            depth=fifo_depth,
+            depth=1,
         )
         C_down_proj_out_l2l3_fifos[a_tile] = (
             C_down_proj_out_l1l2_fifos[a_tile]
@@ -651,11 +650,11 @@ def my_matmul(
                     curr_acc_c.release(1)
                 in_a.release(1)
             for _ in range_(rtp_down_proj_depth):
-                elem_out_acc_c = out_acc_c.acquire(1)
                 elem_final_acc_c = curr_acc_c.acquire(1)
                 if buffer_to_reduce:
                     partial_acc_c = buffer_to_reduce.acquire(1)
                     buffer_to_reduce.release(1)
+                elem_out_acc_c = out_acc_c.acquire(1)
                 curr_acc_c.release(1)
                 out_acc_c.release(1)
         else:  # Perform down projection stage computation
@@ -669,8 +668,8 @@ def my_matmul(
                 if gelu:
                     gelu(elem_in_a, elem_in_a, m * n)
                 for _ in range_(rtp_down_proj_depth):
-                    elem_in_b = in_b.acquire(1)
                     elem_out_internal = curr_acc_c.acquire(1)
+                    elem_in_b = in_b.acquire(1)
                     elem_new_acc_c = new_acc_c.acquire(1)
                     matmul(elem_in_a, elem_in_b, elem_out_internal, elem_new_acc_c)
                     new_acc_c.release(1)
@@ -680,7 +679,6 @@ def my_matmul(
             for _ in range_(rtp_down_proj_depth):
                 # Acquire what's in L2, which is the final accumulated result for the tile
                 elem_out_internal = curr_acc_c.acquire(1)
-                elem_out_acc_c = out_acc_c.acquire(1)
                 if buffer_to_reduce:
                     # Don't send any new data to MT, i.e. new_acc_c, because that will affect
                     # the data in the subsequent tiles. It's sufficient to just use
@@ -688,6 +686,7 @@ def my_matmul(
                     partial_acc_c = buffer_to_reduce.acquire(1)
                     add(partial_acc_c, elem_out_internal, elem_out_internal, m * k)
                     buffer_to_reduce.release(1)
+                elem_out_acc_c = out_acc_c.acquire(1)
                 copy(elem_out_internal, elem_out_acc_c, m * k)
                 curr_acc_c.release(1)
                 out_acc_c.release(1)
