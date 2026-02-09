@@ -29,6 +29,7 @@ def generate_golden_reference(
     d=256,
     num_kv_heads=2,
     num_pipeline=1,
+    is_causal=True,
     seed=42,
 ):
     """
@@ -41,6 +42,7 @@ def generate_golden_reference(
         d: Embedding dimension per head
         num_kv_heads: Number of heads for Key-Value pairs (0 means same as heads)
         num_pipeline: Number of pipelines for padding calculation
+        is_causal: Whether to apply causal masking
         seed: Random seed
 
     Returns:
@@ -69,7 +71,7 @@ def generate_golden_reference(
         K.to(torch.bfloat16),
         V.to(torch.bfloat16),
         dropout_p=0.0,
-        is_causal=True,
+        is_causal=is_causal,
         scale=inv_scale,
     )
 
