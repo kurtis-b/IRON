@@ -14,7 +14,6 @@ from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 from aie.helpers.util import np_ndarray_type_get_shape
 
-
 DATA_MEM_SIZE = 65536  # L1 size in bytes
 
 

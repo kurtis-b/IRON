@@ -34,6 +34,38 @@ def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
             #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
+            ### No compute
+            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, -1, 0),
+            ### Only first add & layer norm
+            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, 0, 0),
+            ### Only up projection + GeLU
+            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, 1, 0),
+            ### Only down projection
+            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, 2, 0),
+            ### Only second add & layer norm
+            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, 3, 0),
+            ### All compute executed
+            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
+            ## M scaled up from baseline
+            (64 * 4, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
+            ## K scaled up from baseline
+            (64, 48 * 4, 96, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
+            ## N scaled up from baseline
+            (64, 48, 96 * 4, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
+            ## K scaled up with matching scaling with down_proj_depth (affects MT utilization)
+            (64, 48 * 4, 96, 2, 64, 48, 96, 0, 4, 1, 1, None, 0),
+            ## M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
+            (64 * 4, 48, 96, 4, 64, 48, 96, 0, 1, 2, 1, None, 0),
+            (64 * 4, 48, 96, 8, 64, 48, 96, 0, 1, 4, 1, None, 0),
+            ## N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
+            (64, 48, 96 * 4, 8, 64, 48, 96, 0, 1, 1, 4, None, 0),
+            # BERT workload
+            (512, 768, 3072, 2, 64, 48, 96, 0, 6, 1, 1, None, 0),
+        ]
+
+        # NOTE: Below was for old design
+        params_old = [
+            #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
             # TESTS WITH DIM_M > r (mmul api dim) BELOW
             # GeLU fused with up projection
             (512, 768, 3072, 8, 16, 96, 128, 0, 8, 2, 6, None, 0),
@@ -50,7 +82,7 @@ def generate_test_params(extensive=False):
             (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, None, 1),
         ]
         if INCLUDE_SIMPLE_TESTS:
-            params += [
+            params_old += [
                 #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
                 # TESTS WITH DIM_M > r (mmul api dim) BELOW
                 # GeLU fused with up projection

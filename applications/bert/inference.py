@@ -702,6 +702,11 @@ def main():
         help="Sequence length for BERT input",
     )
     parser.add_argument(
+        "--use-igpu",
+        action="store_true",
+        help="Use integrated GPU (iGPU) if available (default: False)",
+    )
+    parser.add_argument(
         "-v",
         action="count",
         default=0,
@@ -719,13 +724,16 @@ def main():
     try:
         # Load configuration from config.json
         config = load_bert_config(args.config_file_path)
-        device = "cpu"
+        if args.use_igpu and torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
         seq_len = args.seq_len
 
         # Set the max sequence length in the model config and model for compilation of operations offloaded to the AIE
         config.model_config.max_position_embeddings = seq_len
         model = BertForSequenceClassification(config, seq_len=seq_len)
-
+        model.to(device)
         # Load the weights
         combined_weights = load_file(args.weights_file_path)
 

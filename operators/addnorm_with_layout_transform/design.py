@@ -16,7 +16,6 @@ from aie.helpers.util import np_ndarray_type_get_shape
 import aie.dialects.index as index
 from aie.dialects.aiex import *
 
-
 """
 This design computes weighted layer norm + eltwise add on AIE cores.
 The data movement is written in such a way that the outputs can be used
