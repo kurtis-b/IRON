@@ -53,25 +53,12 @@ def main():
         description="Emits MLIR code for a matrix multiplication design of the given input size",
     )
     argparser.add_argument("--heads", type=int, default=1)
-    argparser.add_argument("--S_q", type=int, default=256)
-    argparser.add_argument("--S_kv", type=int, default=256)
+    argparser.add_argument("--seq-len", type=int, default=256)
     argparser.add_argument("-d", type=int, default=64)
-    argparser.add_argument("--B_q", type=int, default=64)
-    argparser.add_argument("--B_kv", type=int, default=64)
-    argparser.add_argument(
-        "--num_KV_heads",
-        type=int,
-        default=2,
-        help="Number of heads for Key-Value pairs",
-    )
-    argparser.add_argument("--number-of-pipeline", type=int, default=1)
-    argparser.add_argument("--emulate-bf16-mmul-with-bfp16", type=bool, default=False)
-    argparser.add_argument(
-        "--is-causal",
-        action="store_true",
-        default=False,
-        help="Whether to apply causal masking",
-    )
+    argparser.add_argument("--seq-tile", type=int, default=64)
+    argparser.add_argument("--parallel-seqs", type=int, default=1)
+    argparser.add_argument("--parallel-heads", type=int, default=1)
+    argparser.add_argument("--emulate-bf16-mmul-with-bfp16", type=bool, default=True)
     argparser.add_argument("--trace_size", type=int, default=0)
     argparser.add_argument("--kernel-archive", type=str, default="mha_kernels.a")
     argparser.add_argument(
@@ -89,15 +76,12 @@ def main():
 
     maybe_module = fused_mha(
         heads=args.heads,
-        S_q=args.S_q,
-        S_kv=args.S_kv,
+        seq_len=args.seq_len,
         d=args.d,
-        B_q=args.B_q,
-        B_kv=args.B_kv,
-        number_of_pipelines=args.number_of_pipeline,
-        num_KV_heads=args.num_KV_heads,
+        seq_tile=args.seq_tile,
+        parallel_seqs=args.parallel_seqs,
+        parallel_heads=args.parallel_heads,
         emulate_bf16_mmul_with_bfp16=args.emulate_bf16_mmul_with_bfp16,
-        is_causal=args.is_causal,
         kernel_archive=args.kernel_archive,
         trace_size=args.trace_size,
         verbose=args.verbose,
@@ -114,19 +98,17 @@ def main():
 
 def fused_mha(
     heads: int,
-    S_q: int,
-    S_kv: int,
+    seq_len: int,
     d: int,
-    B_q: int,
-    B_kv: int,
-    number_of_pipelines: int,
-    num_KV_heads: int,
+    seq_tile: int,
+    parallel_seqs: int,
+    parallel_heads: int,
     emulate_bf16_mmul_with_bfp16: bool,
-    is_causal: bool,
     kernel_archive: str,
     trace_size: int = 0,
     verbose: bool = False,
 ):
+    embed_dim = d * heads
 
     of_depth = 2
     vectorized = True
@@ -134,28 +116,13 @@ def fused_mha(
     dtype_str = "bf16"
     dev = "npu2"
 
-    if number_of_pipelines > 6:
-        number_of_pipelines_join_distribute = number_of_pipelines // 2
+    if parallel_seqs > 6:
+        parallel_seqs_join_distribute = parallel_seqs // 2
     else:
-        number_of_pipelines_join_distribute = number_of_pipelines
+        parallel_seqs_join_distribute = parallel_seqs
 
-    S_q_eff = S_q
-    S_kv_eff = S_kv
-    S_q_pad = (
-        (S_q_eff + (B_q * number_of_pipelines - 1)) // (B_q * number_of_pipelines)
-    ) * (B_q * number_of_pipelines)
-    S_kv_pad = (
-        (S_kv_eff + (B_kv * number_of_pipelines - 1)) // (B_kv * number_of_pipelines)
-    ) * (B_kv * number_of_pipelines)
-    num_q_blocks = S_q_pad // B_q
-    num_kv_blocks = S_kv_pad // B_kv
-    num_q_block_per_pipeline = num_q_blocks // number_of_pipelines
-
-    # VJUNG: When the number of KV head is 0 we do a regular MHA, otherwise we do GQA.
-    if num_KV_heads == 0:
-        num_KV_heads = heads
-
-    emulate_bf16_mmul_with_bfp16 = True
+    num_qkv_blocks = seq_len // seq_tile
+    num_q_block_per_parallel_seq = num_qkv_blocks // parallel_seqs
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
     mac_dims = microkernel_mac_dim_map[dev][dtype_str]
@@ -164,55 +131,58 @@ def fused_mha(
     if verbose:
         print(f"Device: {dev}")
         print(f"Number of heads: {heads}")
-        print(f"MHA Dimensions: S_q={S_q}, S_kv={S_kv}, d={d}, B_q={B_q}, B_kv={B_kv}")
-        print(f"Padded Dimensions: S_q_pad={S_q_pad}, S_kv_pad={S_kv_pad}")
+        print(f"MHA Dimensions: seq_len={seq_len}, d={d}, seq_tile={seq_tile}")
         print(f"Data type: {dtype_str}")
         print(f"Microkernel MAC dimensions: r={r}, s={s}, t={t}")
         print(f"Vectorized: {vectorized}")
         print(f"Enable tracing: {enable_tracing}")
 
-    assert num_KV_heads > 0, "Number of KV heads must be greater than 0"
     assert heads > 0, "Number of heads must be greater than 0"
-    assert (
-        num_KV_heads <= heads
-    ), "Number of KV heads must be less than or equal to number of heads"
-    assert (
-        heads % num_KV_heads == 0
-    ), f"Number of KV heads ({num_KV_heads}) must be divisible by number of heads ({heads})"
 
-    assert B_q % r == 0, f"B_q must be divisible by r ({B_q} % {r} != 0)"
-    assert B_kv % t == 0, f"B_kv must be divisible by t ({B_kv} % {t} != 0)"
+    assert seq_tile % r == 0, f"seq_tile must be divisible by r ({seq_tile} % {r} != 0)"
+    assert seq_tile % t == 0, f"seq_tile must be divisible by t ({seq_tile} % {t} != 0)"
     assert d % s == 0, f"d must be divisible by s ({d} % {s} != 0)"
 
-    assert S_q_pad % B_q == 0, "Padded S_q must be divisible by B_q"
-    assert S_kv_pad % B_kv == 0, "Padded S_kv must be divisible by B_kv"
+    assert seq_len % seq_tile == 0, "seq_len must be divisible by seq_tile"
 
     dtype = dtype_map[dtype_str]
 
     inv_scale = (1 / np.sqrt(d)) * 1.4453125
 
     # Tensors living in DRAM
+    R_ty = np.ndarray[
+        (seq_len, embed_dim),
+        np.dtype[dtype],
+    ]
+    W_O_ty = np.ndarray[
+        (embed_dim, embed_dim),
+        np.dtype[dtype],
+    ]
     Q_ty = np.ndarray[
         (
             heads,
-            S_q_pad,
+            seq_len,
             d,
         ),
         np.dtype[dtype],
     ]
     KV_ty = np.ndarray[
         (
-            num_KV_heads,
-            S_kv_pad * d,
+            heads,
+            seq_len * d,
         ),
+        np.dtype[dtype],
+    ]
+    O_ty = np.ndarray[
+        (seq_len, embed_dim),
         np.dtype[dtype],
     ]
 
     # Tensors living on the AIE-array
-    q_ty = np.ndarray[(B_q, d), np.dtype[dtype]]
-    k_ty = np.ndarray[(d, B_kv), np.dtype[dtype]]
-    qk_ty = np.ndarray[(B_q, B_kv), np.dtype[dtype]]
-    s_ty = np.ndarray[(4 * B_q,), np.dtype[dtype]]
+    q_ty = np.ndarray[(seq_tile, d), np.dtype[dtype]]
+    k_ty = np.ndarray[(d, seq_tile), np.dtype[dtype]]
+    qk_ty = np.ndarray[(seq_tile, seq_tile), np.dtype[dtype]]
+    s_ty = np.ndarray[(4 * seq_tile,), np.dtype[dtype]]
 
     # AIE kernel declarations
     func_type = "" if vectorized else "_scalar"
@@ -269,33 +239,33 @@ def fused_mha(
     # AIE-array data movement with object fifos
     q_dims = None
     if vectorized:
-        q_dims = [(B_q // r, r * d), (d // s, s), (r, d), (s, 1)]
+        q_dims = [(seq_tile // r, r * d), (d // s, s), (r, d), (s, 1)]
 
     inQ = ObjectFifo(
-        np.ndarray[(number_of_pipelines_join_distribute * B_q, d), np.dtype[dtype]],
+        np.ndarray[(parallel_seqs_join_distribute * seq_tile, d), np.dtype[dtype]],
         name="inQ",
     )
     memQ = inQ.cons().split(
-        offsets=[B_q * d * i for i in range(number_of_pipelines_join_distribute)],
-        obj_types=[q_ty] * number_of_pipelines_join_distribute,
-        names=[f"memQ{i}" for i in range(number_of_pipelines_join_distribute)],
-        dims_to_stream=[q_dims] * number_of_pipelines_join_distribute,
-        depths=[of_depth] * number_of_pipelines_join_distribute,
+        offsets=[seq_tile * d * i for i in range(parallel_seqs_join_distribute)],
+        obj_types=[q_ty] * parallel_seqs_join_distribute,
+        names=[f"memQ{i}" for i in range(parallel_seqs_join_distribute)],
+        dims_to_stream=[q_dims] * parallel_seqs_join_distribute,
+        depths=[of_depth] * parallel_seqs_join_distribute,
         placement=Tile(col=6, row=1),
-    )  # Split between N pipelines
-    if number_of_pipelines > 6:
+    )  # Split between N parallel blocks of sequences
+    if parallel_seqs > 6:
         inQ2 = ObjectFifo(
-            np.ndarray[(number_of_pipelines_join_distribute * B_q, d), np.dtype[dtype]],
+            np.ndarray[(parallel_seqs_join_distribute * seq_tile, d), np.dtype[dtype]],
             name="inQ2",
         )
         memQ += inQ2.cons().split(
-            offsets=[B_q * d * i for i in range(number_of_pipelines_join_distribute)],
-            obj_types=[q_ty] * number_of_pipelines_join_distribute,
-            names=[f"memQ2{i}" for i in range(number_of_pipelines_join_distribute)],
-            dims_to_stream=[q_dims] * number_of_pipelines_join_distribute,
-            depths=[of_depth] * number_of_pipelines_join_distribute,
+            offsets=[seq_tile * d * i for i in range(parallel_seqs_join_distribute)],
+            obj_types=[q_ty] * parallel_seqs_join_distribute,
+            names=[f"memQ2{i}" for i in range(parallel_seqs_join_distribute)],
+            dims_to_stream=[q_dims] * parallel_seqs_join_distribute,
+            depths=[of_depth] * parallel_seqs_join_distribute,
             placement=Tile(col=7, row=1),
-        )  # Split between N pipelines
+        )  # Split between N parallel blocks of sequences
 
     # VJUNG: The SequentialPlacer will place all of these on the same MemTile if Placement is specified. We would need a list of placement in case of one-many or many-one.
     # I think the Sequential Placer will fail if we do a split/join with more than 6 I/Os cuz it tries to place them all on the same tile.
@@ -303,7 +273,7 @@ def fused_mha(
     # K is stored in column-major order
     k_dims = None
     if vectorized:
-        k_dims = [(B_kv // t, t * d), (d // s, s), (t, d), (s, 1)]
+        k_dims = [(seq_tile // t, t * d), (d // s, s), (t, d), (s, 1)]
     inK = ObjectFifo(
         k_ty,
         name="inK",
@@ -314,11 +284,16 @@ def fused_mha(
         dims_to_stream=k_dims,
         placement=Tile(col=3, row=1),
         depth=of_depth,
-    )  # Broadcast, give this handle to N pipelines
+    )  # Broadcast, give this handle to N parallel blocks of sequences
 
     v_dims = None
     if vectorized:
-        v_dims = [(B_kv // s, s * B_kv), (B_kv // t, t), (s, B_kv), (t, 1)]
+        v_dims = [
+            (seq_tile // s, s * seq_tile),
+            (seq_tile // t, t),
+            (s, seq_tile),
+            (t, 1),
+        ]
 
     inV = ObjectFifo(
         k_ty,
@@ -330,14 +305,14 @@ def fused_mha(
         dims_to_stream=v_dims,
         placement=Tile(col=4, row=1),
         depth=of_depth,
-    )  # Broadcast, give this handle to N pipelines
+    )  # Broadcast, give this handle to N parallel blocks of sequences
 
     a_dims = None
     if vectorized:
-        a_dims = [(B_q // r, r * B_kv), (r, t), (B_kv // t, r * t), (t, 1)]
+        a_dims = [(seq_tile // r, r * seq_tile), (r, t), (seq_tile // t, r * t), (t, 1)]
     memA = []
     outA = []
-    for i in range(number_of_pipelines):
+    for i in range(parallel_seqs):
         memA.append(ObjectFifo(qk_ty, depth=of_depth, name=f"memA{i}"))
         outA.append(
             memA[i]
@@ -348,11 +323,11 @@ def fused_mha(
                 depth=of_depth,
                 # placement=Tile(col=i, row=1))
             )
-        )  # Local to 1 pipeline
+        )  # Local to 1 parallel block of sequences
 
     memP = []
     outP = []
-    for i in range(number_of_pipelines):
+    for i in range(parallel_seqs):
         memP.append(ObjectFifo(qk_ty, depth=of_depth, name=f"memP{i}"))
         outP.append(
             memP[i]
@@ -363,41 +338,41 @@ def fused_mha(
                 depth=of_depth,
                 # placement=Tile(col=i, row=1)
             )
-        )  # Local to 1 pipeline
+        )  # Local to 1 parallel block of sequences
 
     # Scale buffer for partial softmax
     scaleOF = []
-    for i in range(number_of_pipelines):
+    for i in range(parallel_seqs):
         scaleOF.append(
             ObjectFifo(s_ty, depth=of_depth, name=f"scaleOF{i}")
-        )  # Local to 1 pipeline
+        )  # Local to 1 parallel block of sequences
 
     o_dims = None
     if vectorized:
-        o_dims = [(B_q // r, r * B_kv), (r, t), (B_kv // t, r * t), (t, 1)]
+        o_dims = [(seq_tile // r, r * seq_tile), (r, t), (seq_tile // t, r * t), (t, 1)]
     memO = ObjectFifo(
-        np.ndarray[(number_of_pipelines_join_distribute * B_q, d), np.dtype[dtype]],
+        np.ndarray[(parallel_seqs_join_distribute * seq_tile, d), np.dtype[dtype]],
         name="memO",
         dims_to_stream=o_dims,
     )
     outO = memO.prod().join(
-        offsets=[B_q * d * i for i in range(number_of_pipelines_join_distribute)],
-        obj_types=[q_ty] * number_of_pipelines_join_distribute,
-        names=[f"outO{i}" for i in range(number_of_pipelines_join_distribute)],
-        depths=[of_depth] * number_of_pipelines_join_distribute,
+        offsets=[seq_tile * d * i for i in range(parallel_seqs_join_distribute)],
+        obj_types=[q_ty] * parallel_seqs_join_distribute,
+        names=[f"outO{i}" for i in range(parallel_seqs_join_distribute)],
+        depths=[of_depth] * parallel_seqs_join_distribute,
         placement=Tile(col=6, row=1),
     )  # Join onto the output OF
-    if number_of_pipelines > 6:
+    if parallel_seqs > 6:
         memO2 = ObjectFifo(
-            np.ndarray[(number_of_pipelines_join_distribute * B_q, d), np.dtype[dtype]],
+            np.ndarray[(parallel_seqs_join_distribute * seq_tile, d), np.dtype[dtype]],
             name="memO2",
             dims_to_stream=o_dims,
         )
         outO += memO2.prod().join(
-            offsets=[B_q * d * i for i in range(number_of_pipelines_join_distribute)],
-            obj_types=[q_ty] * number_of_pipelines_join_distribute,
-            names=[f"outO2{i}" for i in range(number_of_pipelines_join_distribute)],
-            depths=[of_depth] * number_of_pipelines_join_distribute,
+            offsets=[seq_tile * d * i for i in range(parallel_seqs_join_distribute)],
+            obj_types=[q_ty] * parallel_seqs_join_distribute,
+            names=[f"outO2{i}" for i in range(parallel_seqs_join_distribute)],
+            depths=[of_depth] * parallel_seqs_join_distribute,
             placement=Tile(col=7, row=1),
         )
 
@@ -440,7 +415,7 @@ def fused_mha(
 
                     idx_buffer[0] += 1
                 idx_buffer[0] = 0
-                idx_buffer[1] += number_of_pipelines
+                idx_buffer[1] += parallel_seqs
 
                 of_q.release(1)
 
@@ -466,8 +441,7 @@ def fused_mha(
         loop_idx_q = mha_rtps[0]
         loop_idx_kv = mha_rtps[1]
 
-        S_q_effective = mha_rtps[2]
-        S_kv_effective = mha_rtps[3]
+        S_qkv_effective = mha_rtps[2]
 
         for _ in range_(sys.maxsize):
 
@@ -477,7 +451,7 @@ def fused_mha(
 
             for _ in range_(loop_idx_q):
 
-                init_scale_buffer(scale_buffer, B_q)
+                init_scale_buffer(scale_buffer, seq_tile)
 
                 for _ in range_(loop_idx_kv):
 
@@ -491,12 +465,12 @@ def fused_mha(
                         scale_buffer,
                         idx_buffer,
                         inv_scale,
-                        B_q,
-                        B_kv,
-                        S_q_effective,
-                        S_kv_effective,
+                        seq_tile,
+                        seq_tile,
+                        S_qkv_effective,
+                        S_qkv_effective,
                     )
-                    memcopy_kernel_scale(scale_buffer, elt_of_out_scale, 4 * B_q)
+                    memcopy_kernel_scale(scale_buffer, elt_of_out_scale, 4 * seq_tile)
 
                     of_in_a.release(1)
                     of_out_p.release(1)
@@ -504,7 +478,7 @@ def fused_mha(
 
                     idx_buffer[0] += 1
                 idx_buffer[0] = 0
-                idx_buffer[1] += number_of_pipelines
+                idx_buffer[1] += parallel_seqs
 
     def batched_matmul_pv(
         of_p,
@@ -547,7 +521,7 @@ def fused_mha(
                     elem_in_v,
                     elem_o_out,
                     elt_of_out_scale,
-                    B_q,
+                    seq_tile,
                     0,
                     idx_buffer,
                 )
@@ -570,7 +544,7 @@ def fused_mha(
                             elem_in_v,
                             elem_o_out,
                             elt_of_out_scale2,
-                            B_q,
+                            seq_tile,
                             1,
                             idx_buffer,
                         )
@@ -592,11 +566,11 @@ def fused_mha(
                         elem_in_v,
                         elem_o_out,
                         elt_of_out_scale3,
-                        B_q,
+                        seq_tile,
                         1,
                         idx_buffer,
                     )
-                    rescale_O(elem_o_out, elt_of_out_scale3, B_q, idx_buffer)
+                    rescale_O(elem_o_out, elt_of_out_scale3, seq_tile, idx_buffer)
 
                     of_p.release(1)
                     of_v.release(1)
@@ -605,12 +579,12 @@ def fused_mha(
                     idx_buffer[0] += 1
                 # else:
                 with else_(if_op):
-                    rescale_O(elem_o_out, elt_of_out_scale, B_q, idx_buffer)
+                    rescale_O(elem_o_out, elt_of_out_scale, seq_tile, idx_buffer)
                     idx_buffer[0] += 1
                 ###
 
                 idx_buffer[0] = 0
-                idx_buffer[1] += number_of_pipelines
+                idx_buffer[1] += parallel_seqs
 
                 of_o_out.release(1)
 
@@ -624,13 +598,13 @@ def fused_mha(
                 initial_value=None,
                 use_write_rtp=True,
             )
-            for i in range(number_of_pipelines)
+            for i in range(parallel_seqs)
         ]
         for j in range(3)
     ]
 
     worker_barrier_list = [
-        [WorkerRuntimeBarrier(initial_value=0) for i in range(number_of_pipelines)]
+        [WorkerRuntimeBarrier(initial_value=0) for i in range(parallel_seqs)]
         for j in range(3)
     ]
 
@@ -638,7 +612,7 @@ def fused_mha(
     matmul_workers = []
     softmax_workers = []
     matmul_pv_workers = []
-    for i in range(number_of_pipelines):
+    for i in range(parallel_seqs):
         idx_buffer_qk = Buffer(
             initial_value=np.zeros(shape=(2,), dtype=np.int32),
             name=f"idx_buffer_qk_{i}",
@@ -667,7 +641,7 @@ def fused_mha(
             name=f"idx_buffer_softmax_{i}",
         )
         scale_buffer_softmax = Buffer(
-            initial_value=np.zeros(shape=(4 * B_q,), dtype=dtype),
+            initial_value=np.zeros(shape=(4 * seq_tile,), dtype=dtype),
             name=f"scale_buffer_softmax_{i}",
         )
         softmax_workers.append(
@@ -720,15 +694,15 @@ def fused_mha(
     # Define tensor access patterns for inputs/outputs
     # A and B are tiled across M and N respectively, while C is tiled across M and N
     Q_tiles = TensorTiler2D.group_tiler(
-        (heads * S_q_pad, d), (number_of_pipelines_join_distribute * B_q, d), (1, 1)
+        (heads * seq_len, d), (parallel_seqs_join_distribute * seq_tile, d), (1, 1)
     )
 
-    K_tiles = TensorTiler2D.group_tiler((heads * S_kv_pad, d), (S_kv_pad, d), (1, 1))
+    K_tiles = TensorTiler2D.group_tiler((heads * seq_len, d), (seq_len, d), (1, 1))
 
-    V_tiles = TensorTiler2D.group_tiler((heads * S_kv_pad, d), (S_kv_pad, d), (1, 1))
+    V_tiles = TensorTiler2D.group_tiler((heads * seq_len, d), (seq_len, d), (1, 1))
 
     O_tiles = TensorTiler2D.group_tiler(
-        (heads * S_q_pad, d), (number_of_pipelines_join_distribute * B_q, d), (1, 1)
+        (heads * seq_len, d), (parallel_seqs_join_distribute * seq_tile, d), (1, 1)
     )
 
     def print_tap_seq_info(tap_seq, name):
@@ -769,47 +743,47 @@ def fused_mha(
 
     if verbose:
         print(f"DMA Transfer Configuration: DRAM <-> Mem tile")
-        # print_tap_seq_info(Q_tiles, "Q")
-        # print_tap_seq_info(K_tiles, "K")
-        # print_tap_seq_info(V_tiles, "V")
+        print_tap_seq_info(Q_tiles, "Q")
+        print_tap_seq_info(K_tiles, "K")
+        print_tap_seq_info(V_tiles, "V")
         print_tap_seq_info(O_tiles, "O")
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
-    with rt.sequence(Q_ty, KV_ty, KV_ty, Q_ty) as (Q, K, V, O):
+    with rt.sequence(W_O_ty, Q_ty, KV_ty, KV_ty, O_ty) as (W_O, Q, K, V, O):
 
         def set_mha_rtps():
-            for j in range(3):
-                for i in range(number_of_pipelines):
-                    mha_rtps_list[j][i][0] = num_q_block_per_pipeline
-                    mha_rtps_list[j][i][1] = num_kv_blocks
-                    mha_rtps_list[j][i][2] = S_q_eff
-                    mha_rtps_list[j][i][3] = S_kv_eff
+            for j in range(3):  # Number of stages
+                for i in range(parallel_seqs):
+                    mha_rtps_list[j][i][0] = num_q_block_per_parallel_seq
+                    mha_rtps_list[j][i][1] = num_qkv_blocks
+                    mha_rtps_list[j][i][2] = seq_len
 
         rt.inline_ops(set_mha_rtps, ())
 
         for j in range(3):
-            for i in range(number_of_pipelines):
+            for i in range(parallel_seqs):
                 rt.set_barrier(worker_barrier_list[j][i], 1)
 
-        for i in range(number_of_pipelines):
+        for i in range(parallel_seqs):
             rt.start(matmul_workers[i])
             rt.start(softmax_workers[i])
             rt.start(matmul_pv_workers[i])
 
         for head_idx in range(heads):
 
-            for q_block_idx in range(num_q_block_per_pipeline):
+            for q_block_idx in range(num_q_block_per_parallel_seq):
 
                 # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
                 tg = rt.task_group()
 
-                if number_of_pipelines > 6:
+                if parallel_seqs > 6:
                     rt.fill(
                         inQ.prod(),
                         Q,
                         tap=Q_tiles[
-                            2 * head_idx * num_q_block_per_pipeline + q_block_idx * 2
+                            2 * head_idx * num_q_block_per_parallel_seq
+                            + q_block_idx * 2
                         ],
                         placement=Tile(col=4, row=0),
                         task_group=tg,
@@ -818,7 +792,7 @@ def fused_mha(
                         inQ2.prod(),
                         Q,
                         tap=Q_tiles[
-                            2 * head_idx * num_q_block_per_pipeline
+                            2 * head_idx * num_q_block_per_parallel_seq
                             + q_block_idx * 2
                             + 1
                         ],
@@ -829,7 +803,9 @@ def fused_mha(
                     rt.fill(
                         inQ.prod(),
                         Q,
-                        tap=Q_tiles[head_idx * num_q_block_per_pipeline + q_block_idx],
+                        tap=Q_tiles[
+                            head_idx * num_q_block_per_parallel_seq + q_block_idx
+                        ],
                         placement=Tile(col=4, row=0),
                         task_group=tg,
                     )
@@ -850,12 +826,13 @@ def fused_mha(
                     task_group=tg,
                 )
 
-                if number_of_pipelines > 6:
+                if parallel_seqs > 6:
                     rt.drain(
                         memO.cons(),
                         O,
                         tap=O_tiles[
-                            2 * head_idx * num_q_block_per_pipeline + q_block_idx * 2
+                            2 * head_idx * num_q_block_per_parallel_seq
+                            + q_block_idx * 2
                         ],
                         wait=True,
                         placement=Tile(col=7, row=0),
@@ -865,7 +842,7 @@ def fused_mha(
                         memO2.cons(),
                         O,
                         tap=O_tiles[
-                            2 * head_idx * num_q_block_per_pipeline
+                            2 * head_idx * num_q_block_per_parallel_seq
                             + q_block_idx * 2
                             + 1
                         ],
@@ -877,7 +854,9 @@ def fused_mha(
                     rt.drain(
                         memO.cons(),
                         O,
-                        tap=O_tiles[head_idx * num_q_block_per_pipeline + q_block_idx],
+                        tap=O_tiles[
+                            head_idx * num_q_block_per_parallel_seq + q_block_idx
+                        ],
                         wait=True,
                         placement=Tile(col=7, row=0),
                         task_group=tg,

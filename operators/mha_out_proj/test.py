@@ -8,16 +8,32 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from operators.mha.op import AIEMHA
-from operators.mha.reference import generate_golden_reference
+from operators.mha_out_proj.op import AIEMHAOutProj
+from operators.mha_out_proj.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 
 def generate_test_params(extensive=False):
-    # params = [(16384, 64, 1, 8, True), (2048, 64, 32, 8, True), (512, 64, 12, 8, False)]
-    # names = ["mha_s16384_d64_h1_p8_1", "mha_s2048_d64_h32_p8_1", "bert_mha_s512_d64_h12_p8_0"]
-    params = [(512, 64, 12, 8, False)]
-    names = ["bert_mha_s512_d64_h12_p8_0"]
+    params = [
+        # seq_len, dim, num_heads, parallel_seqs, parallel_heads
+        (512, 64, 12, 8, 1),
+    ]
+    extensive_params = []
+
+    if extensive:
+        params = extensive_params
+
+    names = []
+    for (
+        seq_len,
+        dim,
+        num_heads,
+        parallel_seqs,
+        parallel_heads,
+    ) in params:
+        name = f"mha_{num_heads}heads_{seq_len}seq_{dim}dim_{parallel_seqs}seqs_{parallel_heads}heads"
+        names.append(name)
+
     return params, names
 
 
@@ -38,25 +54,22 @@ all_params = [
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
-@pytest.mark.parametrize("seq_len,dim,num_heads,num_pipelines,is_causal", all_params)
-def test_mha(seq_len, dim, num_heads, num_pipelines, is_causal, aie_context):
+@pytest.mark.parametrize(
+    "seq_len,dim,num_heads,parallel_seqs,parallel_heads", all_params
+)
+def test_mha(seq_len, dim, num_heads, parallel_seqs, parallel_heads, aie_context):
     golden_ref = generate_golden_reference(
-        S_q=seq_len,
-        S_kv=seq_len,
+        seq_len=seq_len,
         d=dim,
         heads=num_heads,
-        num_kv_heads=num_heads,
-        num_pipeline=num_pipelines,
-        is_causal=is_causal,
     )
 
-    operator = AIEMHA(
+    operator = AIEMHAOutProj(
         num_heads=num_heads,
         seq_len=seq_len,
         d=dim,
-        num_KV_heads=num_heads,
-        num_of_pipelines=num_pipelines,
-        is_causal=is_causal,
+        parallel_seqs=parallel_seqs,
+        parallel_heads=parallel_heads,
         context=aie_context,
     )
 
@@ -64,6 +77,7 @@ def test_mha(seq_len, dim, num_heads, num_pipelines, is_causal, aie_context):
         "Q": golden_ref["Q"].flatten(),
         "K": golden_ref["K"].flatten(),
         "V": golden_ref["V"].flatten(),
+        "W_O": golden_ref["W_O"].flatten(),
     }
     output_buffers = {"O": golden_ref["O"].flatten()}
 

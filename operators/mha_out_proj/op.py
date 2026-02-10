@@ -20,28 +20,34 @@ from operators.common import (
 from operators.common.utils import torch_to_numpy, numpy_to_torch
 
 
-class AIEMHA(AIEOperatorBase):
+class AIEMHAOutProj(AIEOperatorBase):
 
     def __init__(
         self,
         num_heads: int,
         seq_len: int,
         d: int,
-        num_KV_heads: int,
-        num_of_pipelines: int = 1,
-        is_causal: bool = False,
+        parallel_seqs: int = 1,
+        parallel_heads: int = 1,
+        static_weights: bool = False,
         context=None,
         skip_add_to_list=False,
     ):
         self.num_heads = num_heads
         self.seq_len = seq_len
         self.d = d
-        self.B_q = 64
-        self.B_kv = 64
-        self.num_KV_heads = num_KV_heads
-        self.num_of_pipelines = num_of_pipelines
-        self.is_causal = is_causal
+        self.seq_tile = 64
+        self.parallel_seqs = parallel_seqs
+        self.parallel_heads = parallel_heads
+        self.embed_dim = d * num_heads
         assert d == 64, "Only d=64 is supported in this version"
+
+        # Allocate static weights before inference
+        self.w_o_proj = None
+        if static_weights:
+            self.w_o_proj = torch.zeros(
+                (self.embed_dim, self.embed_dim), dtype=torch.bfloat16
+            ).T
 
         # Artifacts created by set_up_artifacts()
         self.xclbin_artifact = None
@@ -51,13 +57,12 @@ class AIEMHA(AIEOperatorBase):
             self, context=context, skip_add_to_list=skip_add_to_list
         )
 
-    def get_artifacts(self, prefix="mha_"):
+    def get_artifacts(self, prefix="mha_o_proj"):
         # Set up compilation artifacts
         # ---
         operator_dir = Path(__file__).parent
 
-        kv_heads = self.num_KV_heads if self.num_KV_heads > 0 else self.num_heads
-        file_name_base = f"mha_{self.num_heads}h_{kv_heads}kv_{self.seq_len}s_{self.d}d_{self.num_of_pipelines}p_{int(self.is_causal)}"
+        file_name_base = f"mha_o_proj_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.parallel_seqs}ps_{self.parallel_heads}ph"
 
         # Define source files
         mm_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mm.cc")
@@ -72,9 +77,9 @@ class AIEMHA(AIEOperatorBase):
         # Compile mm.cc (col-major)
         mm_defines_rowmaj = [
             "-Dbf16_bf16_ONLY",
-            f"-DDIM_M={self.B_q}",
+            f"-DDIM_M={self.seq_tile}",
             f"-DDIM_K={self.d}",
-            f"-DDIM_N={self.B_kv}",
+            f"-DDIM_N={self.seq_tile}",
             "-DROUND_CONV_EVEN",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ]
@@ -88,7 +93,9 @@ class AIEMHA(AIEOperatorBase):
             "zero_scalar_bf16": "zero_scalar_bf16_rowmaj",
         }
 
-        kernel_archive = f"mha_kernels_{self.num_heads}h_{kv_heads}kv_{self.seq_len}s_{self.d}d_{int(self.is_causal)}.a"
+        kernel_archive = (
+            f"mha_o_proj_kernels_{self.num_heads}h_{self.seq_len}s_{self.d}d.a"
+        )
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -96,18 +103,15 @@ class AIEMHA(AIEOperatorBase):
             callback_fn="fused_mha",
             callback_kwargs={
                 "heads": self.num_heads,
-                "S_q": self.seq_len,
-                "S_kv": self.seq_len,
+                "seq_len": self.seq_len,
                 "d": self.d,
-                "B_q": self.B_q,
-                "B_kv": self.B_kv,
-                "num_KV_heads": self.num_KV_heads,
-                "number_of_pipelines": self.num_of_pipelines,
+                "seq_tile": self.seq_tile,
+                "parallel_seqs": self.parallel_seqs,
+                "parallel_heads": self.parallel_heads,
                 "emulate_bf16_mmul_with_bfp16": True,
-                "is_causal": self.is_causal,
                 "kernel_archive": kernel_archive,
                 "trace_size": 0,
-                "verbose": False,
+                "verbose": True,
             },
         )
 
@@ -119,27 +123,27 @@ class AIEMHA(AIEOperatorBase):
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"mha_mm_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv.o",
+                            f"mha_o_proj_mm_{self.seq_len}s_{self.seq_tile}t_{self.d}d.o",
                             extra_flags=mm_defines_colmaj,
                             depends=[SourceArtifact.new(mm_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_mm_rowmaj_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv.o",
+                            f"mha_o_proj_mm_rowmaj_{self.seq_len}s_{self.seq_tile}t_{self.d}d.o",
                             extra_flags=mm_defines_rowmaj,
                             depends=[SourceArtifact.new(mm_source)],
                             rename_symbols=mm_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_softmax_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv.o",
+                            f"mha_o_proj_softmax_{self.seq_len}s_{self.seq_tile}t_{self.d}d.o",
                             depends=[SourceArtifact.new(softmax_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_mha_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv_{int(self.is_causal)}.o",
+                            f"mha_o_proj_mha_{self.seq_len}s_{self.seq_tile}t_{self.d}d_causal0.o",
                             depends=[SourceArtifact.new(mha_source)],
-                            extra_flags=[f"-DIS_CAUSAL={int(self.is_causal)}"],
+                            extra_flags=[f"-DIS_CAUSAL=0"],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_passThrough_{self.seq_len}s_{self.B_q}bq_{self.d}d_{self.B_kv}bkv.o",
+                            f"mha_o_proj_passThrough_{self.seq_len}s_{self.seq_tile}t_{self.d}d.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[SourceArtifact.new(passthrough_source)],
                         ),
@@ -176,70 +180,42 @@ class AIEMHA(AIEOperatorBase):
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
+        static_w_o_proj = None
+        if self.w_o_proj is not None:
+            static_w_o_proj = self.w_o_proj.T
+            if isinstance(static_w_o_proj, torch.Tensor):
+                static_w_o_proj = torch_to_numpy(static_w_o_proj)
+        self.add_buffer(
+            "W_O",
+            self.embed_dim * self.embed_dim,
+            static_data=static_w_o_proj,
+        )
         self.add_buffer(
             "Q",
-            self.num_heads
-            * self.d
-            * self._calculate_seq_padding(self.seq_len, self.num_of_pipelines),
+            self.embed_dim * self.seq_len,
         )
         self.add_buffer(
             "K",
-            self.num_heads
-            * self.d
-            * self._calculate_seq_padding(self.seq_len, self.num_of_pipelines),
+            self.embed_dim * self.seq_len,
         )
         self.add_buffer(
             "V",
-            self.num_heads
-            * self.d
-            * self._calculate_seq_padding(self.seq_len, self.num_of_pipelines),
+            self.embed_dim * self.seq_len,
         )
         self.add_buffer(
             "O",
-            self.num_heads
-            * self.d
-            * self._calculate_seq_padding(self.seq_len, self.num_of_pipelines),
+            self.embed_dim * self.seq_len,
         )
-        self.add_to_runlist("mha", "Q", "K", "V", "O")
+        self.add_to_runlist("mha", "W_O", "Q", "K", "V", "O")
 
-    def _calculate_seq_padding(self, seq_len, num_pipeline=1):
-        return ((seq_len + 63 * num_pipeline) // (64 * num_pipeline)) * (
-            64 * num_pipeline
-        )
-
-    def _pad_to_multiple_of_64(self, tensor, seq_dim, num_pipeline=1):
-        seq_len = tensor.shape[seq_dim]
-        padded_seq_len = _calculate_seq_padding(seq_len, num_pipeline)
-        if padded_seq_len == seq_len:
-            return tensor
-
-        pad_size = padded_seq_len - seq_len
-        pad_dims = [0] * (2 * tensor.ndim)
-        pad_dims[2 * (tensor.ndim - 1 - seq_dim) + 1] = pad_size
-
-        return torch.nn.functional.pad(tensor, pad_dims)
-
-    def _pack_compact_to_padded(
-        self, src: np.ndarray, H: int, S: int, S_pad: int, D: int
-    ) -> np.ndarray:
-        """Pack compact tensor into padded format."""
-        dst = src
-        if S != S_pad:
-            dst = np.zeros((H, S_pad, D), dtype=src.dtype)
-            dst[:H, :S, :D] = src
-        return dst
-
-    def _unpack_padded_to_compact(
-        self, src: np.ndarray, H: int, S: int, S_pad: int, D: int
-    ) -> np.ndarray:
-        """Unpack padded tensor back to compact format."""
-        dst = src
-        if S < S_pad:
-            dst = np.zeros((H, S, D), dtype=src.dtype)
-            dst = src[:H, :S, :D]
-        return dst
-
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    # TODO: Update forward and execute functions
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        w_o: torch.Tensor = None,
+    ):
         applicable = (
             q.shape[-1] == self.d
             and k.shape[-1] == self.d
@@ -254,47 +230,37 @@ class AIEMHA(AIEOperatorBase):
                 "AIEElementwiseAdd: incompatible tensor shape(s)"
             )
 
-        ret = self._execute_aie_operation(q, k, v)
+        ret = self._execute_aie_operation(q, k, v, w_o)
         return ret
 
-    def _execute_aie_operation(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    def _execute_aie_operation(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        w_o: torch.Tensor = None,
+    ):
         # Convert to numpy
         q_np = torch_to_numpy(q)
         k_np = torch_to_numpy(k)
         v_np = torch_to_numpy(v)
 
-        # Calculate padded sequence length
-        S_pad = self._calculate_seq_padding(self.seq_len, self.num_of_pipelines)
-
-        # Pack compact inputs to padded format
-        q_padded = self._pack_compact_to_padded(
-            q_np, self.num_heads, self.seq_len, S_pad, self.d
-        )
-        k_padded = self._pack_compact_to_padded(
-            k_np, self.num_heads, self.seq_len, S_pad, self.d
-        )
-        v_padded = self._pack_compact_to_padded(
-            v_np, self.num_heads, self.seq_len, S_pad, self.d
-        )
-
         # Write padded buffers
-        self.write_buffer("Q", q_padded)
-        self.write_buffer("K", k_padded)
-        self.write_buffer("V", v_padded)
+        self.write_buffer("Q", q_np)
+        self.write_buffer("K", k_np)
+        self.write_buffer("V", v_np)
+        if w_o is not None:
+            w_o_np = torch_to_numpy(w_o)
+            self.write_buffer("W_O", w_o_np)
 
         # Execute
         self.run_runlist()
 
         # Read padded output
-        o_padded = self.read_buffer(
-            "O", shape=(self.num_heads, S_pad, self.d), dtype=bfloat16
-        )
-
-        # Unpack padded output to compact format
-        o_compact = self._unpack_padded_to_compact(
-            o_padded, self.num_heads, self.seq_len, S_pad, self.d
+        o_np = self.read_buffer(
+            "O", shape=(self.seq_len, self.embed_dim), dtype=bfloat16
         )
 
         # Convert back to torch with correct shape
-        result = numpy_to_torch(o_compact)
+        result = numpy_to_torch(o_np)
         return result
