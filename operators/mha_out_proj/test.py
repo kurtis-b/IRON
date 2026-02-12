@@ -17,7 +17,7 @@ from operators.common.test_utils import run_test
 def generate_test_params(extensive=False):
     params = [
         # seq_len, head_dim, num_heads, seq_tile, emb_tile, parallel_heads, o_proj_acc_depth
-        (64, 64, 3, 64, 96, 1, 1),
+        (64, 64, 3, 64, 64, 1, 1),
         # (512, 64, 12, 64, 96, 1, 1),
         # (512, 64, 12, 64, 96, 2, 1),
         # (512, 64, 12, 64, 96, 1, 2),

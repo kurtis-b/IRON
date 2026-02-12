@@ -500,26 +500,19 @@ def fused_mha(
         zero,
         matmul_QK,
         q_block_bias,
-        mha_rtps,
-        barrier,
         idx_buffer,
     ):
-
-        barrier.wait_for_value(1)
-
-        loop_idx_q = mha_rtps[0]
-        loop_idx_kv = mha_rtps[1]
 
         for _ in range_(sys.maxsize):
 
             idx_buffer[0] = 0
             idx_buffer[1] = q_block_bias
 
-            for _ in range_(loop_idx_q):
+            for _ in range_(num_qkv_seq_blocks):
 
                 elem_in_q = of_q.acquire(1)
 
-                for _ in range_(loop_idx_kv):
+                for _ in range_(num_qkv_seq_blocks):
 
                     elem_in_k = of_k.acquire(1)
                     elem_a_out = of_a_out.acquire(1)
@@ -544,8 +537,6 @@ def fused_mha(
         init_scale_buffer,
         memcopy_kernel_scale,
         q_block_bias,
-        mha_rtps,
-        barrier,
         idx_buffer,
         scale_buffer,
     ):
@@ -553,24 +544,17 @@ def fused_mha(
         # VJUNG: The index buffer count how many Q and KV block this worker has processed
         # From this info we can infer the position in A and P
 
-        barrier.wait_for_value(1)
-
-        loop_idx_q = mha_rtps[0]
-        loop_idx_kv = mha_rtps[1]
-
-        S_qkv_effective = mha_rtps[2]
-
         for _ in range_(sys.maxsize):
 
             # VJUNG: Required otherwise the buffer is maintained when doing warmup!
             idx_buffer[0] = 0
             idx_buffer[1] = q_block_bias
 
-            for _ in range_(loop_idx_q):
+            for _ in range_(num_qkv_seq_blocks):
 
                 init_scale_buffer(scale_buffer, seq_tile)
 
-                for _ in range_(loop_idx_kv):
+                for _ in range_(num_qkv_seq_blocks):
 
                     elt_of_out_p = of_out_p.acquire(1)
                     elt_of_in_a = of_in_a.acquire(1)
@@ -584,8 +568,8 @@ def fused_mha(
                         inv_scale,
                         seq_tile,
                         seq_tile,
-                        S_qkv_effective,
-                        S_qkv_effective,
+                        seq_len,
+                        seq_len,
                     )
                     memcopy_kernel_scale(scale_buffer, elt_of_out_scale, 4 * seq_tile)
 
@@ -606,15 +590,8 @@ def fused_mha(
         matmul_PV,
         rescale_O,
         q_block_bias,
-        mha_rtps,
-        barrier,
         idx_buffer,
     ):
-
-        barrier.wait_for_value(1)
-
-        loop_idx_q = mha_rtps[0]
-        loop_idx_kv = mha_rtps[1]
 
         for _ in range_(sys.maxsize):
 
@@ -622,7 +599,7 @@ def fused_mha(
             idx_buffer[0] = 0
             idx_buffer[1] = q_block_bias
 
-            for _ in range_(loop_idx_q):
+            for _ in range_(num_qkv_seq_blocks):
 
                 elem_o_out = of_o_out.acquire(1)
 
@@ -650,8 +627,8 @@ def fused_mha(
                 idx_buffer[0] += 1
                 ###
 
-                with if_(loop_idx_kv > 2) as if_op:
-                    for _ in range_(loop_idx_kv - 2):
+                if num_qkv_seq_blocks > 2:
+                    for _ in range_(num_qkv_seq_blocks - 2):
                         elem_in_p = of_p.acquire(1)
                         elem_in_v = of_v.acquire(1)
                         elt_of_out_scale2 = of_scale.acquire(1)
@@ -673,7 +650,7 @@ def fused_mha(
                         idx_buffer[0] += 1
 
                 ### Last iteration, final rescaling
-                with if_(loop_idx_kv > 1) as if_op:
+                if num_qkv_seq_blocks > 1:
                     elem_in_p = of_p.acquire(1)
                     elem_in_v = of_v.acquire(1)
                     elt_of_out_scale3 = of_scale.acquire(1)
@@ -695,7 +672,7 @@ def fused_mha(
 
                     idx_buffer[0] += 1
                 # else:
-                with else_(if_op):
+                else:
                     rescale_O(elem_o_out, elt_of_out_scale, seq_tile, idx_buffer)
                     idx_buffer[0] += 1
                 ###
@@ -716,8 +693,6 @@ def fused_mha(
         matmul,
         add,
         copy,
-        mha_rtps,
-        barrier,
     ):
         """
         Amount of work for prev stages to generate its ouptut to next stage for one head:
@@ -735,23 +710,19 @@ def fused_mha(
         The output from PV can be reused to partially accumulate output tiles:
             O: seq_tile * d * emb_tile * (embed_dim // emb_tile)
         """
-        barrier.wait_for_value(1)
-
-        loop_idx_heads = mha_rtps[0]
-        loop_idx_acc_depth = mha_rtps[1]
 
         # First iteration just passes the partial C tile through
-        for _ in range_(loop_idx_acc_depth):
+        for _ in range_(o_proj_acc_depth):
 
             elem_out_o_acc = of_o_acc_out.acquire(1)
             zero(elem_out_o_acc)
             of_o_acc_out.release(1)
 
-        for _ in range_(loop_idx_heads):
+        for _ in range_(num_qkv_head_block_per_parallel_head):
 
             elem_in_o = of_o_in.acquire(1)
 
-            for _ in range_(loop_idx_acc_depth):
+            for _ in range_(o_proj_acc_depth):
 
                 elem_in_o_acc = of_o_acc_in.acquire(1)
                 elem_in_ow = of_ow_in.acquire(1)
@@ -763,7 +734,7 @@ def fused_mha(
 
             of_o_in.release(1)
 
-        for _ in range_(loop_idx_acc_depth):
+        for _ in range_(o_proj_acc_depth):
 
             # Acquire what's in L2, which is the final accumulated result for the tile
             elem_in_o_acc = of_o_acc_in.acquire(1)
@@ -781,26 +752,6 @@ def fused_mha(
             copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
             of_o_acc_in.release(1)
             of_o_out.release(1)
-
-    # Runtime parameter for workers loop index
-    # VJUNG: We need one Buffer per worker since they need to be placed
-    mha_rtps_list = [
-        [
-            Buffer(
-                np.ndarray[(4,), np.dtype[np.int32]],
-                name=f"mha_rtps_{i}_stage{j}",
-                initial_value=None,
-                use_write_rtp=True,
-            )
-            for i in range(parallel_heads)
-        ]
-        for j in range(4)
-    ]
-
-    worker_barrier_list = [
-        [WorkerRuntimeBarrier(initial_value=0) for i in range(parallel_heads)]
-        for j in range(4)
-    ]
 
     # Create worker from task
     matmul_workers = []
@@ -822,8 +773,6 @@ def fused_mha(
                     zero_kernel,
                     matmul_QK,
                     i,
-                    mha_rtps_list[0][i],
-                    worker_barrier_list[0][i],
                     idx_buffer_qk,
                 ],
                 stack_size=0xD00,
@@ -850,8 +799,6 @@ def fused_mha(
                     scale_buffer_init_kernel,
                     memcopy_kernel_scale,
                     i,
-                    mha_rtps_list[1][i],
-                    worker_barrier_list[1][i],
                     idx_buffer_softmax,
                     scale_buffer_softmax,
                 ],
@@ -876,8 +823,6 @@ def fused_mha(
                     matmul_PV,
                     rescale_O,
                     i,
-                    mha_rtps_list[2][i],
-                    worker_barrier_list[2][i],
                     idx_buffer_pv,
                 ],
                 stack_size=0xD00,
@@ -900,8 +845,6 @@ def fused_mha(
                     matmul_kernel_o_proj,
                     eltwise_add_vector,
                     mem_copy_o_proj,
-                    mha_rtps_list[3][i],
-                    worker_barrier_list[3][i],
                 ],
                 stack_size=0xD00,
                 placement=Tile(col=i, row=5),
@@ -980,22 +923,6 @@ def fused_mha(
     rt = Runtime()
     with rt.sequence(W_O_ty, Q_ty, KV_ty, KV_ty, O_ty) as (W_O, Q, K, V, O):
 
-        def set_mha_rtps():
-            for j in range(3):
-                for i in range(parallel_heads):  # QK, softmax, PV stages
-                    mha_rtps_list[j][i][0] = num_qkv_seq_blocks
-                    mha_rtps_list[j][i][1] = num_qkv_seq_blocks
-                    mha_rtps_list[j][i][2] = seq_len
-            for i in range(parallel_heads):  # O projection stage
-                mha_rtps_list[3][i][0] = num_qkv_head_block_per_parallel_head
-                mha_rtps_list[3][i][1] = o_proj_acc_depth
-
-        rt.inline_ops(set_mha_rtps, ())
-
-        for j in range(4):
-            for i in range(parallel_heads):
-                rt.set_barrier(worker_barrier_list[j][i], 1)
-
         for i in range(parallel_heads):
             rt.start(matmul_workers[i])
             rt.start(softmax_workers[i])
@@ -1040,9 +967,22 @@ def fused_mha(
                     rt.fill(
                         inOW.prod(),
                         W_O,
-                        tap=WO_tiles[head_idx],
+                        tap=WO_tiles[
+                            head_idx * num_qkv_head_block_per_parallel_head + col_group
+                        ],
                         placement=Tile(col=3, row=0),
                         task_group=tg,
+                    )
+                    logging.debug(
+                        f"    Scheduled fills for head {head_idx} of parallel block {col_group} for Q, K, V, and W_O"
+                    )
+                    logging.debug(
+                        f"    Q tap: {Q_tiles[q_block_idx * num_qkv_head_block_per_parallel_head + head_idx]}"
+                    )
+                    logging.debug(f"    K tap: {K_tiles[head_idx]}")
+                    logging.debug(f"    V tap: {V_tiles[head_idx]}")
+                    logging.debug(
+                        f"    W_O tap: {WO_tiles[head_idx * num_qkv_head_block_per_parallel_head + col_group]}"
                     )
 
                 rt.drain(
@@ -1052,6 +992,9 @@ def fused_mha(
                     wait=True,
                     placement=Tile(col=7, row=0),
                     task_group=tg,
+                )
+                logging.debug(
+                    f"  Scheduled drain for output tile with tap: {O_tiles[q_block_idx * (num_o_col_groups) + col_group]}"
                 )
 
                 rt.finish_task_group(tg)

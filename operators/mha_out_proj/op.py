@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
@@ -92,23 +93,25 @@ class AIEMHAOutProj(AIEOperatorBase):
         mm_rename_symbols = {
             "matmul_bf16_bf16": "matmul_bf16_bf16_rowmaj",
             "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_rowmaj",
+            "matmul_with_acc_bf16_bf16": "matmul_with_acc_bf16_bf16_rowmaj",
             "zero_bf16": "zero_bf16_rowmaj",
             "zero_scalar_bf16": "zero_scalar_bf16_rowmaj",
         }
-        mm_oproj_defines = [
+        mm_o_proj_defines = [
             "-Dbf16_bf16_ONLY",
             f"-DDIM_M={self.seq_tile}",
             f"-DDIM_K={self.d}",
             f"-DDIM_N={self.emb_tile}",
             "-DROUND_CONV_EVEN",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+            "-DGENERATE_MATMUL_WITH_ACC_KERNELS",  # NOTE: Matmul with accumulation won't be included in compilation unless this is passed in
         ]
-        mm_oproj_rename_symbols = {
-            "matmul_bf16_bf16": "matmul_bf16_bf16_oproj",
-            "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_oproj",
+        mm_o_proj_rename_symbols = {
+            "matmul_bf16_bf16": "matmul_bf16_bf16_o_proj",
+            "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_o_proj",
             "matmul_with_acc_bf16_bf16": "matmul_with_acc_bf16_bf16_o_proj",
-            "zero_bf16": "zero_bf16_oproj",
-            "zero_scalar_bf16": "zero_scalar_bf16_oproj",
+            "zero_bf16": "zero_bf16_o_proj",
+            "zero_scalar_bf16": "zero_scalar_bf16_o_proj",
         }
 
         kernel_archive = (
@@ -153,10 +156,10 @@ class AIEMHAOutProj(AIEOperatorBase):
                             rename_symbols=mm_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mm_oproj_{self.seq_tile}m_{self.emb_tile}n_{self.d}k.o",
-                            extra_flags=mm_oproj_defines,
+                            f"mha_o_proj_mm_o_{self.seq_tile}m_{self.emb_tile}n_{self.d}k.o",
+                            extra_flags=mm_o_proj_defines,
                             depends=[SourceArtifact.new(mm_source)],
-                            rename_symbols=mm_oproj_rename_symbols,
+                            rename_symbols=mm_o_proj_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
                             f"mha_o_proj_softmax_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
@@ -171,8 +174,14 @@ class AIEMHAOutProj(AIEOperatorBase):
                             f"mha_o_proj_passThrough_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[SourceArtifact.new(passthrough_source)],
+                        ),
+                        KernelObjectArtifact.new(
+                            f"mha_o_proj_passThrough_o_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
+                            extra_flags=["-DBIT_WIDTH=16"],
+                            depends=[SourceArtifact.new(passthrough_source)],
                             rename_symbols={
                                 "passThroughLine": "passThroughLine_o_proj",
+                                "passThroughTile": "passThroughTile_o_proj",
                             },
                         ),
                     ],
