@@ -42,7 +42,7 @@ def main():
         results[pattern_name] = xy_counts
 
     # Write results to a text file
-    output_file = Path.cwd() / "dma_utilizations.txt"
+    output_file = Path.cwd() / "dma_utilizations.log"
 
     with open(output_file, "w") as f:
         f.write("Pattern Analysis Results\n")
