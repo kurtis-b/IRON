@@ -25,6 +25,12 @@ def main():
         "(%mem_tile_X_Y": r"\(%mem_tile_\d+_\d+",
         "{%shim_noc_tile_X_Y}": r"\{%shim_noc_tile_\d+_\d+\}",
     }
+    pattern_descriptions = {
+        "{%mem_tile_X_Y}": "Mem tile channels in",
+        "(%shim_noc_tile_X_Y": "Shim NOC tile channels out",
+        "(%mem_tile_X_Y": "Mem tile channels out",
+        "{%shim_noc_tile_X_Y}": "Shim NOC tile channels in",
+    }
 
     # Count occurrences for each unique X, Y value for each pattern
     from collections import defaultdict
@@ -53,7 +59,9 @@ def main():
 
         total_matches = 0
         for pattern_name, xy_counts in results.items():
-            f.write(f"Pattern: {pattern_name}\n")
+            f.write(
+                f"Pattern: {pattern_name}, Description: {pattern_descriptions.get(pattern_name, 'N/A')}\n"
+            )
             f.write(f"Unique X, Y values: {len(xy_counts)}\n")
             f.write(f"Total count: {sum(xy_counts.values())}\n")
             f.write("X, Y value counts:\n")
@@ -74,7 +82,9 @@ def main():
     print("\nPattern Analysis Results:")
     print("=" * 50)
     for pattern_name, xy_counts in results.items():
-        print(f"Pattern: {pattern_name}")
+        print(
+            f"Pattern: {pattern_name}, Description: {pattern_descriptions.get(pattern_name, 'N/A')}"
+        )
         print(f"Unique X, Y values: {len(xy_counts)}")
         print(f"Total count: {sum(xy_counts.values())}")
         print("X, Y value counts:")
