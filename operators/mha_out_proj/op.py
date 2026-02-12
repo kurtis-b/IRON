@@ -27,8 +27,10 @@ class AIEMHAOutProj(AIEOperatorBase):
         num_heads: int,
         seq_len: int,
         d: int,
-        parallel_seqs: int = 1,
+        seq_tile: int = 64,
+        emb_tile: int = 96,
         parallel_heads: int = 1,
+        o_proj_acc_depth: int = 1,
         static_weights: bool = False,
         context=None,
         skip_add_to_list=False,
@@ -36,17 +38,18 @@ class AIEMHAOutProj(AIEOperatorBase):
         self.num_heads = num_heads
         self.seq_len = seq_len
         self.d = d
-        self.seq_tile = 64
-        self.parallel_seqs = parallel_seqs
+        self.seq_tile = seq_tile
+        self.emb_tile = emb_tile
         self.parallel_heads = parallel_heads
-        self.embed_dim = d * num_heads
+        self.o_proj_acc_depth = o_proj_acc_depth
+        self.embed_sz = d * num_heads
         assert d == 64, "Only d=64 is supported in this version"
 
         # Allocate static weights before inference
         self.w_o_proj = None
         if static_weights:
             self.w_o_proj = torch.zeros(
-                (self.embed_dim, self.embed_dim), dtype=torch.bfloat16
+                (self.embed_sz, self.embed_sz), dtype=torch.bfloat16
             ).T
 
         # Artifacts created by set_up_artifacts()
@@ -62,7 +65,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         # ---
         operator_dir = Path(__file__).parent
 
-        file_name_base = f"mha_o_proj_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.parallel_seqs}ps_{self.parallel_heads}ph"
+        file_name_base = f"mha_o_proj_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}t_{self.emb_tile}e_{self.parallel_heads}ph_{self.o_proj_acc_depth}acc"
 
         # Define source files
         mm_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mm.cc")
@@ -92,6 +95,21 @@ class AIEMHAOutProj(AIEOperatorBase):
             "zero_bf16": "zero_bf16_rowmaj",
             "zero_scalar_bf16": "zero_scalar_bf16_rowmaj",
         }
+        mm_oproj_defines = [
+            "-Dbf16_bf16_ONLY",
+            f"-DDIM_M={self.seq_tile}",
+            f"-DDIM_K={self.d}",
+            f"-DDIM_N={self.emb_tile}",
+            "-DROUND_CONV_EVEN",
+            "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+        ]
+        mm_oproj_rename_symbols = {
+            "matmul_bf16_bf16": "matmul_bf16_bf16_oproj",
+            "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_oproj",
+            "matmul_with_acc_bf16_bf16": "matmul_with_acc_bf16_bf16_o_proj",
+            "zero_bf16": "zero_bf16_oproj",
+            "zero_scalar_bf16": "zero_scalar_bf16_oproj",
+        }
 
         kernel_archive = (
             f"mha_o_proj_kernels_{self.num_heads}h_{self.seq_len}s_{self.d}d.a"
@@ -106,7 +124,8 @@ class AIEMHAOutProj(AIEOperatorBase):
                 "seq_len": self.seq_len,
                 "d": self.d,
                 "seq_tile": self.seq_tile,
-                "parallel_seqs": self.parallel_seqs,
+                "emb_tile": self.emb_tile,
+                "o_proj_acc_depth": self.o_proj_acc_depth,
                 "parallel_heads": self.parallel_heads,
                 "emulate_bf16_mmul_with_bfp16": True,
                 "kernel_archive": kernel_archive,
@@ -123,29 +142,38 @@ class AIEMHAOutProj(AIEOperatorBase):
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mm_{self.seq_len}s_{self.seq_tile}t_{self.d}d.o",
+                            f"mha_o_proj_mm_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
                             extra_flags=mm_defines_colmaj,
                             depends=[SourceArtifact.new(mm_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mm_rowmaj_{self.seq_len}s_{self.seq_tile}t_{self.d}d.o",
+                            f"mha_o_proj_mm_rowmaj_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
                             extra_flags=mm_defines_rowmaj,
                             depends=[SourceArtifact.new(mm_source)],
                             rename_symbols=mm_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_softmax_{self.seq_len}s_{self.seq_tile}t_{self.d}d.o",
+                            f"mha_o_proj_mm_oproj_{self.seq_tile}m_{self.emb_tile}n_{self.d}k.o",
+                            extra_flags=mm_oproj_defines,
+                            depends=[SourceArtifact.new(mm_source)],
+                            rename_symbols=mm_oproj_rename_symbols,
+                        ),
+                        KernelObjectArtifact.new(
+                            f"mha_o_proj_softmax_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
                             depends=[SourceArtifact.new(softmax_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mha_{self.seq_len}s_{self.seq_tile}t_{self.d}d_causal0.o",
+                            f"mha_o_proj_mha_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_causal0.o",
                             depends=[SourceArtifact.new(mha_source)],
                             extra_flags=[f"-DIS_CAUSAL=0"],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_passThrough_{self.seq_len}s_{self.seq_tile}t_{self.d}d.o",
+                            f"mha_o_proj_passThrough_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[SourceArtifact.new(passthrough_source)],
+                            rename_symbols={
+                                "passThroughLine": "passThroughLine_o_proj",
+                            },
                         ),
                     ],
                 ),
@@ -187,24 +215,24 @@ class AIEMHAOutProj(AIEOperatorBase):
                 static_w_o_proj = torch_to_numpy(static_w_o_proj)
         self.add_buffer(
             "W_O",
-            self.embed_dim * self.embed_dim,
+            self.embed_sz * self.embed_sz,
             static_data=static_w_o_proj,
         )
         self.add_buffer(
             "Q",
-            self.embed_dim * self.seq_len,
+            self.embed_sz * self.seq_len,
         )
         self.add_buffer(
             "K",
-            self.embed_dim * self.seq_len,
+            self.embed_sz * self.seq_len,
         )
         self.add_buffer(
             "V",
-            self.embed_dim * self.seq_len,
+            self.embed_sz * self.seq_len,
         )
         self.add_buffer(
             "O",
-            self.embed_dim * self.seq_len,
+            self.embed_sz * self.seq_len,
         )
         self.add_to_runlist("mha", "W_O", "Q", "K", "V", "O")
 
@@ -258,7 +286,7 @@ class AIEMHAOutProj(AIEOperatorBase):
 
         # Read padded output
         o_np = self.read_buffer(
-            "O", shape=(self.seq_len, self.embed_dim), dtype=bfloat16
+            "O", shape=(self.seq_len, self.embed_sz), dtype=bfloat16
         )
 
         # Convert back to torch with correct shape

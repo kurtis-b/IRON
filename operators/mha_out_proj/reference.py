@@ -31,10 +31,8 @@ def generate_golden_reference(
 
     val_range = 4
 
-    embed_dim = d * heads
-    out_proj_weights = (
-        torch.randn(embed_dim, embed_dim, dtype=torch.bfloat16) * val_range
-    )
+    embed_sz = d * heads
+    out_proj_weights = torch.randn(embed_sz, embed_sz, dtype=torch.bfloat16) * val_range
 
     Q = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
     K = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
@@ -52,8 +50,12 @@ def generate_golden_reference(
     )
 
     # Apply output projection
-    attn_output = O.transpose(0, 1).contiguous().view(seq_len, embed_dim)
-    # O = torch.matmul(attn_output, out_proj_weights)
+    attn_output = O.transpose(0, 1).contiguous().view(seq_len, embed_sz)
+    O = torch.matmul(attn_output, out_proj_weights)
+
+    Q = Q.transpose(0, 1).contiguous().view(seq_len, embed_sz)
+    K = K.transpose(0, 1).contiguous().view(seq_len, embed_sz)
+    V = V.transpose(0, 1).contiguous().view(seq_len, embed_sz)
 
     # Log shapes for debugging
     logging.debug(

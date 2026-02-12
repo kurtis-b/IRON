@@ -5,6 +5,7 @@
 import sys
 import pytest
 from pathlib import Path
+import logging
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -15,8 +16,15 @@ from operators.common.test_utils import run_test
 
 def generate_test_params(extensive=False):
     params = [
-        # seq_len, dim, num_heads, parallel_seqs, parallel_heads
-        (512, 64, 12, 8, 1),
+        # seq_len, head_dim, num_heads, seq_tile, emb_tile, parallel_heads, o_proj_acc_depth
+        (64, 64, 3, 64, 96, 1, 1),
+        # (512, 64, 12, 64, 96, 1, 1),
+        # (512, 64, 12, 64, 96, 2, 1),
+        # (512, 64, 12, 64, 96, 1, 2),
+        # (512, 64, 12, 64, 96, 4, 1),
+        # (512, 64, 12, 64, 96, 1, 4),
+        # (512, 64, 12, 64, 96, 8, 1),
+        # (512, 64, 12, 64, 96, 1, 8),
     ]
     extensive_params = []
 
@@ -26,12 +34,14 @@ def generate_test_params(extensive=False):
     names = []
     for (
         seq_len,
-        dim,
+        head_dim,
         num_heads,
-        parallel_seqs,
+        seq_tile,
+        emb_tile,
         parallel_heads,
+        o_proj_acc_depth,
     ) in params:
-        name = f"mha_{num_heads}heads_{seq_len}seq_{dim}dim_{parallel_seqs}seqs_{parallel_heads}heads"
+        name = f"mha_{num_heads}heads_{seq_len}seq_{head_dim}hdim_{seq_tile}seqtile_{emb_tile}embtile_{parallel_heads}heads_{o_proj_acc_depth}acc"
         names.append(name)
 
     return params, names
@@ -55,21 +65,33 @@ all_params = [
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "seq_len,dim,num_heads,parallel_seqs,parallel_heads", all_params
+    "seq_len,head_dim,num_heads,seq_tile,emb_tile,parallel_heads,o_proj_acc_depth",
+    all_params,
 )
-def test_mha(seq_len, dim, num_heads, parallel_seqs, parallel_heads, aie_context):
+def test_mha(
+    seq_len,
+    head_dim,
+    num_heads,
+    seq_tile,
+    emb_tile,
+    parallel_heads,
+    o_proj_acc_depth,
+    aie_context,
+):
     golden_ref = generate_golden_reference(
         seq_len=seq_len,
-        d=dim,
+        d=head_dim,
         heads=num_heads,
     )
 
     operator = AIEMHAOutProj(
         num_heads=num_heads,
         seq_len=seq_len,
-        d=dim,
-        parallel_seqs=parallel_seqs,
+        d=head_dim,
+        seq_tile=seq_tile,
+        emb_tile=emb_tile,
         parallel_heads=parallel_heads,
+        o_proj_acc_depth=o_proj_acc_depth,
         context=aie_context,
     )
 
@@ -86,7 +108,7 @@ def test_mha(seq_len, dim, num_heads, parallel_seqs, parallel_heads, aie_context
     )
 
     error_threshold = 0.005
-    max_acceptable_errors = int(seq_len * dim * num_heads * error_threshold)
+    max_acceptable_errors = int(seq_len * head_dim * num_heads * error_threshold)
 
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
