@@ -711,47 +711,51 @@ def fused_mha(
             O: seq_tile * d * emb_tile * (embed_dim // emb_tile)
         """
 
-        # First iteration just passes the partial C tile through
-        for _ in range_(o_proj_acc_depth):
+        for _ in range_(sys.maxsize):
 
-            elem_out_o_acc = of_o_acc_out.acquire(1)
-            zero(elem_out_o_acc)
-            of_o_acc_out.release(1)
+            # First iteration just passes the partial C tile through
+            for _ in range_(o_proj_acc_depth):
 
-        for _ in range_(num_qkv_head_block_per_parallel_head):
+                elem_out_o_acc = of_o_acc_out.acquire(1)
+                zero(elem_out_o_acc)
+                of_o_acc_out.release(1)
 
-            elem_in_o = of_o_in.acquire(1)
+            for _ in range_(num_qkv_head_block_per_parallel_head):
+
+                elem_in_o = of_o_in.acquire(1)
+
+                for _ in range_(o_proj_acc_depth):
+
+                    elem_in_o_acc = of_o_acc_in.acquire(1)
+                    elem_in_ow = of_ow_in.acquire(1)
+                    elem_out_o_acc = of_o_acc_out.acquire(1)
+                    matmul(elem_in_o, elem_in_ow, elem_in_o_acc, elem_out_o_acc)
+                    of_o_acc_out.release(1)
+                    of_ow_in.release(1)
+                    of_o_acc_in.release(1)
+
+                of_o_in.release(1)
 
             for _ in range_(o_proj_acc_depth):
 
+                # Acquire what's in L2, which is the final accumulated result for the tile
                 elem_in_o_acc = of_o_acc_in.acquire(1)
-                elem_in_ow = of_ow_in.acquire(1)
-                elem_out_o_acc = of_o_acc_out.acquire(1)
-                matmul(elem_in_o, elem_in_ow, elem_in_o_acc, elem_out_o_acc)
-                of_o_acc_out.release(1)
-                of_ow_in.release(1)
+
+                if buffer_to_reduce:
+
+                    # Don't send any new data to MT, i.e. of_o_acc_out, because that will affect
+                    # the data in the subsequent tiles. It's sufficient to just use
+                    # the internal buffer as input and output
+                    partial_o_acc = buffer_to_reduce.acquire(1)
+                    add(
+                        partial_o_acc, elem_in_o_acc, elem_in_o_acc, seq_tile * emb_tile
+                    )
+                    buffer_to_reduce.release(1)
+
+                elem_out_o = of_o_out.acquire(1)
+                copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
                 of_o_acc_in.release(1)
-
-            of_o_in.release(1)
-
-        for _ in range_(o_proj_acc_depth):
-
-            # Acquire what's in L2, which is the final accumulated result for the tile
-            elem_in_o_acc = of_o_acc_in.acquire(1)
-
-            if buffer_to_reduce:
-
-                # Don't send any new data to MT, i.e. of_o_acc_out, because that will affect
-                # the data in the subsequent tiles. It's sufficient to just use
-                # the internal buffer as input and output
-                partial_o_acc = buffer_to_reduce.acquire(1)
-                add(partial_o_acc, elem_in_o_acc, elem_in_o_acc, seq_tile * emb_tile)
-                buffer_to_reduce.release(1)
-
-            elem_out_o = of_o_out.acquire(1)
-            copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
-            of_o_acc_in.release(1)
-            of_o_out.release(1)
+                of_o_out.release(1)
 
     # Create worker from task
     matmul_workers = []
