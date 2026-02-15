@@ -70,9 +70,6 @@ def main():
         default=base_dir / "build" / f"my_mha.mlir",
         help="Output file path for the generated MLIR module",
     )
-    argparser.add_argument(
-        "--verbose", action="store_true", help="Enable verbose output"
-    )
 
     args = argparser.parse_args()
 
@@ -87,7 +84,6 @@ def main():
         emulate_bf16_mmul_with_bfp16=args.emulate_bf16_mmul_with_bfp16,
         kernel_archive=args.kernel_archive,
         trace_size=args.trace_size,
-        verbose=args.verbose,
     )
 
     output_file_path = Path(args.output_file_path)
@@ -95,8 +91,7 @@ def main():
     with open(output_file_path, "w") as f:
         f.write(str(maybe_module))
 
-    if args.verbose:
-        logging.info(f"MLIR module written to {output_file_path}")
+    logging.info(f"MLIR module written to {output_file_path}")
 
 
 # TODO: Add back parallel sequence blocks?
@@ -113,7 +108,6 @@ def fused_mha(
     emulate_bf16_mmul_with_bfp16: bool,
     kernel_archive: str,
     trace_size: int = 0,
-    verbose: bool = False,
 ):
     embed_sz = heads * d
 
@@ -136,16 +130,15 @@ def fused_mha(
     mac_dims = microkernel_mac_dim_map[dev][dtype_str]
     r, s, t = mac_dims[emulate_bf16_mmul_with_bfp16]
 
-    if verbose:
-        logging.info(f"Device: {dev}")
-        logging.info(f"Number of heads: {heads}")
-        logging.info(
-            f"MHA Dimensions: seq_len={seq_len}, d={d}, seq_tile={seq_tile}, emb_tile={emb_tile}, o_proj_acc_depth={o_proj_acc_depth}, parallel_heads={parallel_heads}"
-        )
-        logging.info(f"Data type: {dtype_str}")
-        logging.info(f"Microkernel MAC dimensions: r={r}, s={s}, t={t}")
-        logging.info(f"Vectorized: {vectorized}")
-        logging.info(f"Enable tracing: {enable_tracing}")
+    logging.info(f"Device: {dev}")
+    logging.info(f"Number of heads: {heads}")
+    logging.info(
+        f"MHA Dimensions: seq_len={seq_len}, d={d}, seq_tile={seq_tile}, emb_tile={emb_tile}, o_proj_acc_depth={o_proj_acc_depth}, parallel_heads={parallel_heads}"
+    )
+    logging.info(f"Data type: {dtype_str}")
+    logging.info(f"Microkernel MAC dimensions: r={r}, s={s}, t={t}")
+    logging.info(f"Vectorized: {vectorized}")
+    logging.info(f"Enable tracing: {enable_tracing}")
 
     assert heads > 0, "Number of heads must be greater than 0"
     assert (
@@ -338,7 +331,7 @@ def fused_mha(
     if vectorized:
         v_dims = [
             (seq_tile // s, s * seq_tile),
-            (seq_tile // t, t),
+            (d // t, t),
             (s, seq_tile),
             (t, 1),
         ]
@@ -418,14 +411,14 @@ def fused_mha(
     ow_dims = None
     if vectorized:
         ow_dims = [
-            (emb_tile // s, s * emb_tile),
+            (d // s, s * emb_tile),
             (emb_tile // t, t),
             (s, emb_tile),
             (t, 1),
         ]
 
     inOW = ObjectFifo(
-        np.ndarray[(d * parallel_heads_distribute, embed_sz), np.dtype[dtype]],
+        np.ndarray[(d * parallel_heads_distribute, emb_tile), np.dtype[dtype]],
         name="inOW",
         depth=of_depth,
     )
@@ -439,7 +432,7 @@ def fused_mha(
     )  # Split between N parallel blocks of heads
     if parallel_heads > 6:
         inOW2 = ObjectFifo(
-            np.ndarray[(d * parallel_heads_distribute, embed_sz), np.dtype[dtype]],
+            np.ndarray[(d * parallel_heads_distribute, emb_tile), np.dtype[dtype]],
             name="inOW2",
             depth=of_depth,
         )
@@ -913,16 +906,12 @@ def fused_mha(
         for tap in tas:
             tap = legalize_tap(tap, max_dim_size)
 
+    legalize_tas(Q_tiles)
     legalize_tas(K_tiles)
     legalize_tas(V_tiles)
+    legalize_tas(WO_tiles)
+    legalize_tas(O_tiles)
 
-    if verbose:
-        logging.info(f"DMA Transfer Configuration: DRAM <-> Mem tile")
-        print_tap_seq_info(Q_tiles, "Q")
-        print_tap_seq_info(K_tiles, "K")
-        print_tap_seq_info(V_tiles, "V")
-        print_tap_seq_info(O_tiles, "O")
-        print_tap_seq_info(WO_tiles, "WO")
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
     with rt.sequence(W_O_ty, Q_ty, KV_ty, KV_ty, O_ty) as (W_O, Q, K, V, O):
@@ -967,7 +956,6 @@ def fused_mha(
                         placement=Tile(col=6, row=0),
                         task_group=tg,
                     )
-
                     rt.fill(
                         inOW.prod(),
                         W_O,
@@ -978,7 +966,7 @@ def fused_mha(
                         task_group=tg,
                     )
                     logging.debug(
-                        f"    Scheduled fills for head {head_idx} of parallel block {col_group} for Q, K, V, and W_O"
+                        f"  Scheduled fills for head {head_idx} of parallel block {col_group} for Q, K, V, and W_O"
                     )
                     logging.debug(
                         f"    Q tap: {Q_tiles[q_block_idx * num_qkv_head_block_per_parallel_head + head_idx]}"

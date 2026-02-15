@@ -13,6 +13,12 @@ from operators.mha_out_proj.op import AIEMHAOutProj
 from operators.mha_out_proj.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
+# Debug mode controls which parts of the reference implementation are executed with random data vs. fixed data:
+# 0: No debug, all random data (full reference implementation)
+# 1: Debug self attention, ones for output projection weights
+# 2: Debug MHA output projection, ones for input and range for weights, and skip softmax computation
+DEBUG_MODE = 0
+
 
 def generate_test_params(extensive=False):
     params = [
@@ -82,6 +88,7 @@ def test_mha(
         seq_len=seq_len,
         d=head_dim,
         heads=num_heads,
+        debug=DEBUG_MODE,
     )
 
     operator = AIEMHAOutProj(
@@ -92,6 +99,7 @@ def test_mha(
         emb_tile=emb_tile,
         parallel_heads=parallel_heads,
         o_proj_acc_depth=o_proj_acc_depth,
+        debug=DEBUG_MODE,
         context=aie_context,
     )
 
@@ -112,12 +120,12 @@ def test_mha(
 
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
-    print(
-        "({} errors out of {} max allowable)".format(
-            len(errors["O"]), max_acceptable_errors
+    if errors:
+        print(
+            "({} errors out of {} max allowable)".format(
+                len(errors["O"]), max_acceptable_errors
+            )
         )
-    )
-
-    assert (
-        len(errors["O"]) <= max_acceptable_errors
-    ), f"Test failed with {len(errors['O'])} errors (max allowable: {max_acceptable_errors})"
+        assert (
+            len(errors["O"]) <= max_acceptable_errors
+        ), f"Test failed with {len(errors['O'])} errors (max allowable: {max_acceptable_errors})"

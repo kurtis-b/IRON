@@ -33,6 +33,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         parallel_heads: int = 1,
         o_proj_acc_depth: int = 1,
         static_weights: bool = False,
+        debug: int = 0,
         context=None,
         skip_add_to_list=False,
     ):
@@ -43,6 +44,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         self.emb_tile = emb_tile
         self.parallel_heads = parallel_heads
         self.o_proj_acc_depth = o_proj_acc_depth
+        self.debug = debug
         self.embed_sz = d * num_heads
         assert d == 64, "Only d=64 is supported in this version"
 
@@ -133,7 +135,6 @@ class AIEMHAOutProj(AIEOperatorBase):
                 "emulate_bf16_mmul_with_bfp16": True,
                 "kernel_archive": kernel_archive,
                 "trace_size": 0,
-                "verbose": True,
             },
         )
 
@@ -145,38 +146,38 @@ class AIEMHAOutProj(AIEOperatorBase):
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mm_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
+                            f"mha_o_proj_mm_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_{self.debug}.o",
                             extra_flags=mm_defines_colmaj,
                             depends=[SourceArtifact.new(mm_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mm_rowmaj_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
+                            f"mha_o_proj_mm_rowmaj_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_{self.debug}.o",
                             extra_flags=mm_defines_rowmaj,
                             depends=[SourceArtifact.new(mm_source)],
                             rename_symbols=mm_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mm_o_{self.seq_tile}m_{self.emb_tile}n_{self.d}k.o",
+                            f"mha_o_proj_mm_o_{self.seq_tile}m_{self.emb_tile}n_{self.d}k_{self.debug}.o",
                             extra_flags=mm_o_proj_defines,
                             depends=[SourceArtifact.new(mm_source)],
                             rename_symbols=mm_o_proj_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_softmax_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
+                            f"mha_o_proj_softmax_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_{self.debug}.o",
                             depends=[SourceArtifact.new(softmax_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mha_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_causal0.o",
+                            f"mha_o_proj_mha_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_causal0_{self.debug}.o",
                             depends=[SourceArtifact.new(mha_source)],
-                            extra_flags=[f"-DIS_CAUSAL=0"],
+                            extra_flags=["-DIS_CAUSAL=0", f"-DDEBUG={self.debug}"],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_passThrough_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
+                            f"mha_o_proj_passThrough_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_{self.debug}.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[SourceArtifact.new(passthrough_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_passThrough_o_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
+                            f"mha_o_proj_passThrough_o_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_{self.debug}.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[SourceArtifact.new(passthrough_source)],
                             rename_symbols={
