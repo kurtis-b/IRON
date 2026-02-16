@@ -882,14 +882,23 @@ def fused_mha(
         (1, heads // parallel_heads_distribute),
     )
 
+    # NOTE: Dividing by num_o_col_groups to get the correct number of tiles expected
+    # in the runtime seequence. Also not including o_proj_acc_depth in the tile col
+    # dim because the WO buffers operate on tiles with size emb_tile. If we
+    # use a tile col dim of emb_tile * o_proj_acc_depth, then the (d, emb_tile)
+    # used for WO will be wrong as the data is written contiguously based on the
+    # access pattern, i.e. written contiguously as rows of size emb_tile * o_proj_acc_depth,
+    # when it should be rows of size emb_tile
     WO_tiles = TensorTiler2D.group_tiler(
         (embed_sz, embed_sz),
-        (d * parallel_heads_distribute, emb_tile * o_proj_acc_depth),
-        (heads // parallel_heads_distribute, 1),
+        (d * parallel_heads_distribute, emb_tile),
+        (heads // parallel_heads_distribute, embed_sz // emb_tile // num_o_col_groups),
     )
 
     O_tiles = TensorTiler2D.group_tiler(
-        (seq_len, embed_sz), (seq_tile, emb_tile * o_proj_acc_depth), (1, 1)
+        (seq_len, embed_sz),
+        (seq_tile, emb_tile),
+        (1, embed_sz // emb_tile // num_o_col_groups),
     )
 
     def print_tap_seq_info(tap_seq, name):
