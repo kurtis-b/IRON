@@ -135,6 +135,9 @@ def fused_mha(
     logging.info(
         f"MHA Dimensions: seq_len={seq_len}, d={d}, seq_tile={seq_tile}, emb_tile={emb_tile}, o_proj_acc_depth={o_proj_acc_depth}, parallel_heads={parallel_heads}"
     )
+    logging.info(
+        f"num_qkv_seq_blocks: {num_qkv_seq_blocks}, num_qkv_head_block_per_parallel_head: {num_qkv_head_block_per_parallel_head}, num_o_col_groups: {num_o_col_groups}"
+    )
     logging.info(f"Data type: {dtype_str}")
     logging.info(f"Microkernel MAC dimensions: r={r}, s={s}, t={t}")
     logging.info(f"Vectorized: {vectorized}")
@@ -162,16 +165,17 @@ def fused_mha(
     ]
     Q_ty = np.ndarray[
         (
-            heads,
             seq_len,
+            heads,
             d,
         ),
         np.dtype[dtype],
     ]
     KV_ty = np.ndarray[
         (
+            seq_len,
             heads,
-            seq_len * d,
+            d,
         ),
         np.dtype[dtype],
     ]
@@ -852,21 +856,25 @@ def fused_mha(
     # Define tensor access patterns for inputs/outputs
     # A and B are tiled across M and N respectively, while C is tiled across M and N
     Q_tiles = TensorTiler2D.group_tiler(
-        (seq_len, embed_sz), (seq_tile, d * parallel_heads_distribute), (1, 1)
+        (seq_len, embed_sz), (seq_tile, embed_sz), (1, 1)
     )
 
     K_tiles = TensorTiler2D.group_tiler(
-        (seq_len, embed_sz), (seq_tile, d * parallel_heads_distribute), (1, 1)
+        (seq_len, embed_sz),
+        (seq_len, d * parallel_heads_distribute),
+        (1, heads // parallel_heads_distribute),
     )
 
     V_tiles = TensorTiler2D.group_tiler(
-        (seq_len, embed_sz), (seq_tile, d * parallel_heads_distribute), (1, 1)
+        (seq_len, embed_sz),
+        (seq_len, d * parallel_heads_distribute),
+        (1, heads // parallel_heads_distribute),
     )
 
     WO_tiles = TensorTiler2D.group_tiler(
         (embed_sz, embed_sz),
         (d * parallel_heads_distribute, emb_tile * o_proj_acc_depth),
-        (1, 1),
+        (heads // parallel_heads_distribute, 1),
     )
 
     O_tiles = TensorTiler2D.group_tiler(
@@ -888,14 +896,33 @@ def fused_mha(
         if all(size <= max_dim_size for size in sizes):
             return tap
 
+        # Divide oversized dimensions and propagate to preceding elements
+        new_sizes = copy.deepcopy(tap._sizes)
+        sz_partition = (max_dim_size + 1) // 2
+        for i in range(len(new_sizes) - 1, -1, -1):
+            if new_sizes[i] > max_dim_size:
+                # Divide this dimension and move the quotient to the previous dimension
+                quotient = (
+                    new_sizes[i] + sz_partition - 1
+                ) // sz_partition  # Ceiling division
+                new_sizes[i - 1] *= quotient
+                new_sizes[i] = (
+                    new_sizes[i] + quotient - 1
+                ) // quotient  # Divide, rounding up
+
+        tap._sizes = new_sizes
+        # Update strides accordingly - maintain contiguous stride pattern
+        tap._strides = [0] * len(new_sizes)
+        tap._strides[-1] = 1
+        for i in range(len(new_sizes) - 2, -1, -1):
+            if new_sizes[i] > 1:
+                tap._strides[i] = new_sizes[i + 1]
+
         # Check that the transfer is continuous
         for idx, stride in enumerate(tap._strides[:-1]):
             if stride != 0 and stride != tap._sizes[idx + 1]:
                 raise ValueError(f"Cannot legalize DMA non-contiguous DMA transfer")
         assert tap._strides[-1] == 1, f"Cannot legalize DMA non-contiguous DMA transfer"
-
-        tap._sizes = [1, 1, 1, math.prod(sizes)]
-        tap._strides = [0, 0, 0, 1]
 
         return tap
 
@@ -911,6 +938,12 @@ def fused_mha(
     legalize_tas(V_tiles)
     legalize_tas(WO_tiles)
     legalize_tas(O_tiles)
+
+    print_tap_seq_info(Q_tiles, "Q")
+    print_tap_seq_info(K_tiles, "K")
+    print_tap_seq_info(V_tiles, "V")
+    print_tap_seq_info(WO_tiles, "W_O")
+    print_tap_seq_info(O_tiles, "O")
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
@@ -928,54 +961,35 @@ def fused_mha(
                 # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
                 tg = rt.task_group()
 
-                for head_idx in range(num_qkv_head_block_per_parallel_head):
-
-                    rt.fill(
-                        inQ.prod(),
-                        Q,
-                        tap=Q_tiles[
-                            q_block_idx * num_qkv_head_block_per_parallel_head
-                            + head_idx
-                        ],
-                        placement=Tile(col=4, row=0),
-                        task_group=tg,
-                    )
-
-                    # Thow on bd containing the full K and V in the object fifo, then does it transfer cunks of inKV size at the time?
-                    rt.fill(
-                        inK.prod(),
-                        K,
-                        tap=K_tiles[head_idx],
-                        placement=Tile(col=5, row=0),
-                        task_group=tg,
-                    )
-                    rt.fill(
-                        inV.prod(),
-                        V,
-                        tap=V_tiles[head_idx],
-                        placement=Tile(col=6, row=0),
-                        task_group=tg,
-                    )
-                    rt.fill(
-                        inOW.prod(),
-                        W_O,
-                        tap=WO_tiles[
-                            head_idx * num_qkv_head_block_per_parallel_head + col_group
-                        ],
-                        placement=Tile(col=3, row=0),
-                        task_group=tg,
-                    )
-                    logging.debug(
-                        f"  Scheduled fills for head {head_idx} of parallel block {col_group} for Q, K, V, and W_O"
-                    )
-                    logging.debug(
-                        f"    Q tap: {Q_tiles[q_block_idx * num_qkv_head_block_per_parallel_head + head_idx]}"
-                    )
-                    logging.debug(f"    K tap: {K_tiles[head_idx]}")
-                    logging.debug(f"    V tap: {V_tiles[head_idx]}")
-                    logging.debug(
-                        f"    W_O tap: {WO_tiles[head_idx * num_qkv_head_block_per_parallel_head + col_group]}"
-                    )
+                rt.fill(
+                    inQ.prod(),
+                    Q,
+                    tap=Q_tiles[q_block_idx],
+                    placement=Tile(col=4, row=0),
+                    task_group=tg,
+                )
+                # TODO: For larger sequence lengths, will probably have to split up tiles into multiple DMA transfers
+                rt.fill(
+                    inK.prod(),
+                    K,
+                    tap=K_tiles[0],
+                    placement=Tile(col=5, row=0),
+                    task_group=tg,
+                )
+                rt.fill(
+                    inV.prod(),
+                    V,
+                    tap=V_tiles[0],
+                    placement=Tile(col=6, row=0),
+                    task_group=tg,
+                )
+                rt.fill(
+                    inOW.prod(),
+                    W_O,
+                    tap=WO_tiles[col_group],
+                    placement=Tile(col=3, row=0),
+                    task_group=tg,
+                )
 
                 rt.drain(
                     memO.cons(),
@@ -986,7 +1000,14 @@ def fused_mha(
                     task_group=tg,
                 )
                 logging.debug(
-                    f"  Scheduled drain for output tile with tap: {O_tiles[q_block_idx * (num_o_col_groups) + col_group]}"
+                    f"Scheduled fills for q block {q_block_idx}, col group {col_group} for Q, K, V, W_O, and O"
+                )
+                logging.debug(f"  Q tap: {Q_tiles[q_block_idx]}")
+                logging.debug(f"  K tap: {K_tiles[0]}")
+                logging.debug(f"  V tap: {V_tiles[0]}")
+                logging.debug(f"  W_O tap: {WO_tiles[col_group]}")
+                logging.debug(
+                    f"  O tap: {O_tiles[q_block_idx * (num_o_col_groups) + col_group]}"
                 )
 
                 rt.finish_task_group(tg)

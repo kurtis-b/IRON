@@ -22,8 +22,21 @@ DEBUG_MODE = 0
 
 def generate_test_params(extensive=False):
     params = [
+        # NOTE: Currently only head_dim=64 is supported by the implementation.
         # seq_len, head_dim, num_heads, seq_tile, emb_tile, parallel_heads, o_proj_acc_depth
+        # Base test
         (64, 64, 3, 64, 64, 1, 1),
+        # Scale seq length from base test
+        (128, 64, 3, 64, 64, 1, 1),
+        (512, 64, 3, 64, 64, 1, 1),
+        (2048, 64, 3, 64, 64, 1, 1),
+        # Scale number of heads from base test
+        (64, 64, 12, 64, 64, 1, 1),
+        # # Scale o_proj_acc_depth from base test
+        # (64, 64, 3, 64, 64, 1, 3),
+        # (64, 64, 8, 64, 64, 1, 8),
+        # Scale parallel_heads from base test
+        # BERT tests
         # (512, 64, 12, 64, 96, 1, 1),
         # (512, 64, 12, 64, 96, 2, 1),
         # (512, 64, 12, 64, 96, 1, 2),
