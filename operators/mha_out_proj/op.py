@@ -68,7 +68,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         # ---
         operator_dir = Path(__file__).parent
 
-        file_name_base = f"mha_o_proj_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}t_{self.emb_tile}e_{self.parallel_heads}ph_{self.o_proj_acc_depth}acc_{self.debug}debug"
+        file_name_base = f"mha_o_proj_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}t_{self.emb_tile}e_{self.parallel_heads}ph_{self.o_proj_acc_depth}acc"
 
         # Define source files
         mm_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mm.cc")
@@ -79,6 +79,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         passthrough_source = str(
             self.context.base_dir / "aie_kernels" / "generic" / "passThrough.cc"
         )
+        add_source = str(self.context.base_dir / "aie_kernels" / "generic" / "add.cc")
 
         # Compile mm.cc (col-major)
         mm_defines_rowmaj = [
@@ -144,24 +145,24 @@ class AIEMHAOutProj(AIEOperatorBase):
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mm_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_{self.debug}.o",
+                            f"mha_o_proj_mm_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
                             extra_flags=mm_defines_colmaj,
                             depends=[SourceArtifact.new(mm_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mm_rowmaj_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_{self.debug}.o",
+                            f"mha_o_proj_mm_rowmaj_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
                             extra_flags=mm_defines_rowmaj,
                             depends=[SourceArtifact.new(mm_source)],
                             rename_symbols=mm_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mm_o_{self.seq_tile}m_{self.emb_tile}n_{self.d}k_{self.debug}.o",
+                            f"mha_o_proj_mm_o_{self.seq_tile}m_{self.emb_tile}n_{self.d}k.o",
                             extra_flags=mm_o_proj_defines,
                             depends=[SourceArtifact.new(mm_source)],
                             rename_symbols=mm_o_proj_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_softmax_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_{self.debug}.o",
+                            f"mha_o_proj_softmax_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
                             depends=[SourceArtifact.new(softmax_source)],
                         ),
                         KernelObjectArtifact.new(
@@ -170,17 +171,26 @@ class AIEMHAOutProj(AIEOperatorBase):
                             extra_flags=["-DIS_CAUSAL=0", f"-DDEBUG={self.debug}"],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_passThrough_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_{self.debug}.o",
+                            f"mha_o_proj_passThrough_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[SourceArtifact.new(passthrough_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_passThrough_o_{self.seq_tile}m_{self.seq_tile}n_{self.d}k_{self.debug}.o",
+                            f"mha_o_proj_passThrough_o_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[SourceArtifact.new(passthrough_source)],
                             rename_symbols={
                                 "passThroughLine": "passThroughLine_o_proj",
                                 "passThroughTile": "passThroughTile_o_proj",
+                            },
+                        ),
+                        KernelObjectArtifact.new(
+                            f"mha_add_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
+                            depends=[SourceArtifact.new(add_source)],
+                            rename_symbols={
+                                "eltwise_add_bf16_scalar": "eltwise_add_bf16_scalar_o_proj",
+                                "eltwise_add_bf16_vector": "eltwise_add_bf16_vector_o_proj",
+                                "eltwise_add_f32_vector": "eltwise_add_f32_vector_o_proj",
                             },
                         ),
                     ],

@@ -117,10 +117,10 @@ def fused_mha(
     dtype_str = "bf16"
     dev = "npu2"
 
-    if parallel_heads > 6:
-        parallel_heads_distribute = parallel_heads // 2
-    else:
-        parallel_heads_distribute = parallel_heads
+    # NOTE: We don't split up the parallel_heads into two like how it's done in MHA operator
+    # with parallel sequence blocks. This is because this design will be used for the pipelined
+    # encoder, which will likely not require more than 6 parallel heads in order to have space
+    # for the the two Add & Norm blocks and FFN block.
 
     num_qkv_seq_blocks = seq_len // seq_tile
     num_qkv_head_block_per_parallel_head = heads // parallel_heads
@@ -260,7 +260,7 @@ def fused_mha(
         [o_ty, o_ty, np.int32],
     )
     eltwise_add_vector = Kernel(
-        "eltwise_add_bf16_vector",
+        "eltwise_add_bf16_vector_o_proj",
         bin_name,
         [o_ty, o_ty, o_ty, np.int32],
     )
@@ -271,30 +271,18 @@ def fused_mha(
         q_dims = [(seq_tile // r, r * d), (d // s, s), (r, d), (s, 1)]
 
     inQ = ObjectFifo(
-        np.ndarray[(seq_tile, d * parallel_heads_distribute), np.dtype[dtype]],
+        np.ndarray[(seq_tile, d * parallel_heads), np.dtype[dtype]],
         name="inQ",
+        depth=of_depth,
     )
     memQ = inQ.cons().split(
-        offsets=[seq_tile * d * i for i in range(parallel_heads_distribute)],
-        obj_types=[q_ty] * parallel_heads_distribute,
-        names=[f"memQ{i}" for i in range(parallel_heads_distribute)],
-        dims_to_stream=[q_dims] * parallel_heads_distribute,
-        depths=[of_depth] * parallel_heads_distribute,
-        placement=Tile(col=6, row=1),
+        offsets=[seq_tile * d * i for i in range(parallel_heads)],
+        obj_types=[q_ty] * parallel_heads,
+        names=[f"memQ{i}" for i in range(parallel_heads)],
+        dims_to_stream=[q_dims] * parallel_heads,
+        depths=[of_depth] * parallel_heads,
+        placement=Tile(col=0, row=1),
     )  # Split between N parallel blocks of sequences
-    if parallel_heads > 6:
-        inQ2 = ObjectFifo(
-            np.ndarray[(seq_tile, d * parallel_heads_distribute), np.dtype[dtype]],
-            name="inQ2",
-        )
-        memQ += inQ2.cons().split(
-            offsets=[seq_tile * d * i for i in range(parallel_heads_distribute)],
-            obj_types=[q_ty] * parallel_heads_distribute,
-            names=[f"memQ2{i}" for i in range(parallel_heads_distribute)],
-            dims_to_stream=[q_dims] * parallel_heads_distribute,
-            depths=[of_depth] * parallel_heads_distribute,
-            placement=Tile(col=7, row=1),
-        )  # Split between N parallel blocks of sequences
 
     # VJUNG: The SequentialPlacer will place all of these on the same MemTile if Placement is specified. We would need a list of placement in case of one-many or many-one.
     # I think the Sequential Placer will fail if we do a split/join with more than 6 I/Os cuz it tries to place them all on the same tile.
@@ -304,32 +292,18 @@ def fused_mha(
     if vectorized:
         k_dims = [(seq_tile // t, t * d), (d // s, s), (t, d), (s, 1)]
     inK = ObjectFifo(
-        np.ndarray[(seq_tile, d * parallel_heads_distribute), np.dtype[dtype]],
+        np.ndarray[(seq_tile, d * parallel_heads), np.dtype[dtype]],
         name="inK",
         depth=of_depth,
     )
     memK = inK.cons().split(
-        offsets=[seq_tile * d * i for i in range(parallel_heads_distribute)],
-        obj_types=[k_ty] * parallel_heads_distribute,
-        names=[f"memK{i}" for i in range(parallel_heads_distribute)],
-        dims_to_stream=[k_dims] * parallel_heads_distribute,
-        depths=[of_depth] * parallel_heads_distribute,
-        placement=Tile(col=2, row=1),
+        offsets=[seq_tile * d * i for i in range(parallel_heads)],
+        obj_types=[k_ty] * parallel_heads,
+        names=[f"memK{i}" for i in range(parallel_heads)],
+        dims_to_stream=[k_dims] * parallel_heads,
+        depths=[of_depth] * parallel_heads,
+        placement=Tile(col=1, row=1),
     )  # Split between N parallel blocks of heads
-    if parallel_heads > 6:
-        inK2 = ObjectFifo(
-            np.ndarray[(seq_tile, d * parallel_heads_distribute), np.dtype[dtype]],
-            name="inK2",
-            depth=of_depth,
-        )
-        memK += inK2.cons().split(
-            offsets=[seq_tile * d * i for i in range(parallel_heads_distribute)],
-            obj_types=[k_ty] * parallel_heads_distribute,
-            names=[f"memK2{i}" for i in range(parallel_heads_distribute)],
-            dims_to_stream=[k_dims] * parallel_heads_distribute,
-            depths=[of_depth] * parallel_heads_distribute,
-            placement=Tile(col=3, row=1),
-        )  # Split between N parallel blocks of heads
 
     v_dims = None
     if vectorized:
@@ -341,35 +315,18 @@ def fused_mha(
         ]
 
     inV = ObjectFifo(
-        np.ndarray[(seq_tile, d * parallel_heads_distribute), np.dtype[dtype]],
+        np.ndarray[(seq_tile, d * parallel_heads), np.dtype[dtype]],
         name="inV",
         depth=of_depth,
     )
     memV = inV.cons().split(
-        offsets=[seq_tile * d * i for i in range(parallel_heads_distribute)],
-        obj_types=[
-            np.ndarray[(seq_tile, d * parallel_heads_distribute), np.dtype[dtype]]
-        ]
-        * parallel_heads_distribute,
-        names=[f"memV{i}" for i in range(parallel_heads_distribute)],
-        dims_to_stream=[v_dims] * parallel_heads_distribute,
-        depths=[of_depth] * parallel_heads_distribute,
-        placement=Tile(col=4, row=1),
+        offsets=[seq_tile * d * i for i in range(parallel_heads)],
+        obj_types=[q_ty] * parallel_heads,
+        names=[f"memV{i}" for i in range(parallel_heads)],
+        dims_to_stream=[v_dims] * parallel_heads,
+        depths=[of_depth] * parallel_heads,
+        placement=Tile(col=2, row=1),
     )  # Split between N parallel blocks of heads
-    if parallel_heads > 6:
-        inV2 = ObjectFifo(
-            np.ndarray[(seq_tile, d * parallel_heads_distribute), np.dtype[dtype]],
-            name="inV2",
-            depth=of_depth,
-        )
-        memV += inV2.cons().split(
-            offsets=[seq_tile * d * i for i in range(parallel_heads_distribute)],
-            obj_types=[k_ty] * parallel_heads_distribute,
-            names=[f"memV2{i}" for i in range(parallel_heads_distribute)],
-            dims_to_stream=[v_dims] * parallel_heads_distribute,
-            depths=[of_depth] * parallel_heads_distribute,
-            placement=Tile(col=5, row=1),
-        )  # Split between N parallel blocks of heads
 
     a_dims = None
     if vectorized:
@@ -385,7 +342,7 @@ def fused_mha(
                 name=f"outA{i}",
                 dims_to_stream=a_dims,
                 depth=of_depth,
-                # placement=Tile(col=i, row=1))
+                placement=Tile(col=4, row=1),
             )
         )  # Local to 1 parallel block of sequences
 
@@ -400,7 +357,7 @@ def fused_mha(
                 name=f"outP{i}",
                 dims_to_stream=q_dims,
                 depth=of_depth,
-                # placement=Tile(col=i, row=1)
+                placement=Tile(col=5, row=1),
             )
         )  # Local to 1 parallel block of sequences
 
@@ -422,32 +379,18 @@ def fused_mha(
         ]
 
     inOW = ObjectFifo(
-        np.ndarray[(d * parallel_heads_distribute, emb_tile), np.dtype[dtype]],
+        np.ndarray[(d * parallel_heads, emb_tile), np.dtype[dtype]],
         name="inOW",
         depth=of_depth,
     )
     memOW = inOW.cons().split(
-        offsets=[d * emb_tile * i for i in range(parallel_heads_distribute)],
-        obj_types=[wo_ty] * parallel_heads_distribute,
-        names=[f"memOW{i}" for i in range(parallel_heads_distribute)],
-        dims_to_stream=[ow_dims] * parallel_heads_distribute,
-        depths=[of_depth] * parallel_heads_distribute,
-        placement=Tile(col=0, row=1),
+        offsets=[d * emb_tile * i for i in range(parallel_heads)],
+        obj_types=[wo_ty] * parallel_heads,
+        names=[f"memOW{i}" for i in range(parallel_heads)],
+        dims_to_stream=[ow_dims] * parallel_heads,
+        depths=[of_depth] * parallel_heads,
+        placement=Tile(col=3, row=1),
     )  # Split between N parallel blocks of heads
-    if parallel_heads > 6:
-        inOW2 = ObjectFifo(
-            np.ndarray[(d * parallel_heads_distribute, emb_tile), np.dtype[dtype]],
-            name="inOW2",
-            depth=of_depth,
-        )
-        memOW += inOW2.cons().split(
-            offsets=[d * emb_tile * i for i in range(parallel_heads_distribute)],
-            obj_types=[wo_ty] * parallel_heads_distribute,
-            names=[f"memOW2{i}" for i in range(parallel_heads_distribute)],
-            dims_to_stream=[ow_dims] * parallel_heads_distribute,
-            depths=[of_depth] * parallel_heads_distribute,
-            placement=Tile(col=1, row=1),
-        )  # Split between N parallel blocks of heads
 
     # Partial out proj tiles to store accumulations in MTs
     outOProj = []
@@ -464,7 +407,7 @@ def fused_mha(
             .forward(
                 name=f"outOProjAccumIn{i}",
                 depth=o_proj_acc_depth,
-                # placement=Tile(col=i, row=1),
+                placement=Tile(col=6 + (i % 2), row=1),
             )
         )  # Local to 1 parallel block of heads
 
@@ -487,7 +430,7 @@ def fused_mha(
         obj_types=[o_ty],
         names=[f"outO{i}"],
         depths=[of_depth],
-        placement=Tile(col=6, row=1),
+        placement=Tile(col=7, row=1),
     )  # Join onto the output OF
 
     def batched_matmul_qk(
@@ -866,20 +809,20 @@ def fused_mha(
     # K/v need to have the full sequence length passed for each head.
     Q_tiles = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
-        (seq_tile, d * parallel_heads_distribute),
-        (1, heads // parallel_heads_distribute),
+        (seq_tile, d),
+        (1, heads),
     )
 
     K_tiles = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
-        (seq_len, d * parallel_heads_distribute),
-        (1, heads // parallel_heads_distribute),
+        (seq_tile, d),
+        (num_qkv_seq_blocks, parallel_heads),
     )
 
     V_tiles = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
-        (seq_len, d * parallel_heads_distribute),
-        (1, heads // parallel_heads_distribute),
+        (seq_tile, d),
+        (num_qkv_seq_blocks, parallel_heads),
     )
 
     # NOTE: Dividing by num_o_col_groups to get the correct number of tiles expected
@@ -891,8 +834,8 @@ def fused_mha(
     # when it should be rows of size emb_tile
     WO_tiles = TensorTiler2D.group_tiler(
         (embed_sz, embed_sz),
-        (d * parallel_heads_distribute, emb_tile),
-        (heads // parallel_heads_distribute, embed_sz // emb_tile // num_o_col_groups),
+        (d, emb_tile),
+        (parallel_heads, embed_sz // emb_tile // num_o_col_groups),
     )
 
     O_tiles = TensorTiler2D.group_tiler(
@@ -996,31 +939,43 @@ def fused_mha(
                     inQ.prod(),
                     Q,
                     tap=Q_tiles[q_block_idx],
-                    placement=Tile(col=4, row=0),
+                    placement=Tile(col=0, row=0),
                     task_group=tg,
                 )
-                # TODO: For larger sequence lengths, will probably have to split up tiles into multiple DMA transfers
-                rt.fill(
-                    inK.prod(),
-                    K,
-                    tap=K_tiles[0],
-                    placement=Tile(col=5, row=0),
-                    task_group=tg,
+                logging.debug(
+                    f"Scheduling fills for q block {q_block_idx}, col group {col_group} for Q, K, V, W_O, and O"
                 )
-                rt.fill(
-                    inV.prod(),
-                    V,
-                    tap=V_tiles[0],
-                    placement=Tile(col=6, row=0),
-                    task_group=tg,
-                )
-                rt.fill(
-                    inOW.prod(),
-                    W_O,
-                    tap=WO_tiles[col_group],
-                    placement=Tile(col=3, row=0),
-                    task_group=tg,
-                )
+                logging.debug(f"  Q tap: {Q_tiles[q_block_idx]}")
+                for head_idx in range(heads // parallel_heads):
+                    tg_head = rt.task_group()
+                    rt.fill(
+                        inK.prod(),
+                        K,
+                        tap=K_tiles[head_idx],
+                        placement=Tile(col=1, row=0),
+                        task_group=tg_head,
+                    )
+                    rt.fill(
+                        inV.prod(),
+                        V,
+                        tap=V_tiles[head_idx],
+                        placement=Tile(col=2, row=0),
+                        task_group=tg_head,
+                    )
+                    rt.fill(
+                        inOW.prod(),
+                        W_O,
+                        tap=WO_tiles[head_idx * num_o_col_groups + col_group],
+                        placement=Tile(col=3, row=0),
+                        task_group=tg_head,
+                        wait=True,
+                    )
+                    rt.finish_task_group(tg_head)
+                    logging.debug(f"    K tap: {K_tiles[head_idx]}")
+                    logging.debug(f"    V tap: {V_tiles[head_idx]}")
+                    logging.debug(
+                        f"    W_O tap: {WO_tiles[head_idx * num_o_col_groups + col_group]}"
+                    )
 
                 rt.drain(
                     memO.cons(),
@@ -1030,13 +985,6 @@ def fused_mha(
                     placement=Tile(col=7, row=0),
                     task_group=tg,
                 )
-                logging.debug(
-                    f"Scheduled fills for q block {q_block_idx}, col group {col_group} for Q, K, V, W_O, and O"
-                )
-                logging.debug(f"  Q tap: {Q_tiles[q_block_idx]}")
-                logging.debug(f"  K tap: {K_tiles[0]}")
-                logging.debug(f"  V tap: {V_tiles[0]}")
-                logging.debug(f"  W_O tap: {WO_tiles[col_group]}")
                 logging.debug(
                     f"  O tap: {O_tiles[q_block_idx * (num_o_col_groups) + col_group]}"
                 )
