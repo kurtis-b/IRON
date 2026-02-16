@@ -502,10 +502,15 @@ def fused_mha(
 
         for _ in range_(sys.maxsize):
 
+            # NOTE: Second element in idx_buffer used to be set to q_block_bias, which
+            # seems to be used for causal masking and for when
+            # attention is parallelized across the sequence dimension. For this
+            # design, it shouldn't be getting used since we parallelize across heads.
+            # Since it affects the computations, we set the value to 0.
             idx_buffer[0] = 0
-            idx_buffer[1] = q_block_bias
+            idx_buffer[1] = 0
 
-            for _ in range_(num_qkv_seq_blocks):
+            for _ in range_(num_qkv_head_block_per_parallel_head):
 
                 elem_in_q = of_q.acquire(1)
 
@@ -520,9 +525,9 @@ def fused_mha(
                     of_k.release(1)
                     of_a_out.release(1)
 
-                    idx_buffer[0] += 1
+                    idx_buffer[0] += 0
                 idx_buffer[0] = 0
-                idx_buffer[1] += 1
+                idx_buffer[1] += 0
 
                 of_q.release(1)
 
@@ -545,9 +550,9 @@ def fused_mha(
 
             # VJUNG: Required otherwise the buffer is maintained when doing warmup!
             idx_buffer[0] = 0
-            idx_buffer[1] = q_block_bias
+            idx_buffer[1] = 0
 
-            for _ in range_(num_qkv_seq_blocks):
+            for _ in range_(num_qkv_head_block_per_parallel_head):
 
                 init_scale_buffer(scale_buffer, seq_tile)
 
@@ -574,9 +579,9 @@ def fused_mha(
                     of_out_p.release(1)
                     of_out_scale.release(1)
 
-                    idx_buffer[0] += 1
+                    idx_buffer[0] += 0
                 idx_buffer[0] = 0
-                idx_buffer[1] += 1  # Used to be parameter for seq block parallelism
+                idx_buffer[1] += 0  # Used to be parameter for seq block parallelism
 
     def batched_matmul_pv(
         of_p,
@@ -594,7 +599,7 @@ def fused_mha(
 
             # VJUNG: Required otherwise the buffer is maintained when doing warmup!
             idx_buffer[0] = 0
-            idx_buffer[1] = q_block_bias
+            idx_buffer[1] = 0
 
             for _ in range_(num_qkv_seq_blocks):
 
@@ -621,7 +626,7 @@ def fused_mha(
                 of_v.release(1)
                 of_scale.release(1)
 
-                idx_buffer[0] += 1
+                idx_buffer[0] += 0
                 ###
 
                 if num_qkv_seq_blocks > 2:
@@ -644,7 +649,7 @@ def fused_mha(
                         of_v.release(1)
                         of_scale.release(1)
 
-                        idx_buffer[0] += 1
+                        idx_buffer[0] += 0
 
                 ### Last iteration, final rescaling
                 if num_qkv_seq_blocks > 1:
@@ -667,15 +672,15 @@ def fused_mha(
                     of_v.release(1)
                     of_scale.release(1)
 
-                    idx_buffer[0] += 1
+                    idx_buffer[0] += 0
                 # else:
                 else:
                     rescale_O(elem_o_out, elt_of_out_scale, seq_tile, idx_buffer)
-                    idx_buffer[0] += 1
+                    idx_buffer[0] += 0
                 ###
 
                 idx_buffer[0] = 0
-                idx_buffer[1] += 1  # Used to be parameter for seq block parallelism
+                idx_buffer[1] += 0  # Used to be parameter for seq block parallelism
 
                 of_o_out.release(1)
 
@@ -837,7 +842,7 @@ def fused_mha(
                 fn_args=[
                     outOProj[i].cons(),
                     memOW[i].cons(),
-                    outOProjAccumIn[i].cons(),
+                    outOProjAccumIn[i].cons(depth=1),
                     outOProjAccumOut[i].prod(),
                     # Last head writes to the output OF directly, others write to partial accumulation tiles
                     outOPart[i].prod() if i < parallel_heads - 1 else outO[0].prod(),
@@ -855,8 +860,14 @@ def fused_mha(
 
     # Define tensor access patterns for inputs/outputs
     # A and B are tiled across M and N respectively, while C is tiled across M and N
+    # NOTE: It's important that the tiling of Q/K/V are such that the subsequent tiles
+    # across the heads, not the sequence length (i.e. how it's done in the MHA operator),
+    # because the cores execute on each head. However, we have to keep in mind that
+    # K/v need to have the full sequence length passed for each head.
     Q_tiles = TensorTiler2D.group_tiler(
-        (seq_len, embed_sz), (seq_tile, embed_sz), (1, 1)
+        (seq_len, embed_sz),
+        (seq_tile, d * parallel_heads_distribute),
+        (1, heads // parallel_heads_distribute),
     )
 
     K_tiles = TensorTiler2D.group_tiler(
@@ -890,39 +901,50 @@ def fused_mha(
 
     def legalize_tap(tap: TensorAccessPattern, max_dim_size: int):
 
-        sizes = copy.deepcopy(tap._sizes)
+        sizes = list(tap._sizes)
+        strides = list(tap._strides)
 
-        # Skip is no need to legalize
+        # Skip if no need to legalize
         if all(size <= max_dim_size for size in sizes):
             return tap
 
-        # Divide oversized dimensions and propagate to preceding elements
-        new_sizes = copy.deepcopy(tap._sizes)
-        sz_partition = (max_dim_size + 1) // 2
-        for i in range(len(new_sizes) - 1, -1, -1):
-            if new_sizes[i] > max_dim_size:
-                # Divide this dimension and move the quotient to the previous dimension
-                quotient = (
-                    new_sizes[i] + sz_partition - 1
-                ) // sz_partition  # Ceiling division
-                new_sizes[i - 1] *= quotient
-                new_sizes[i] = (
-                    new_sizes[i] + quotient - 1
-                ) // quotient  # Divide, rounding up
+        # Split oversized dimensions (working backwards to preserve indices)
+        i = len(sizes) - 1
+        while i >= 0:
+            if sizes[i] > max_dim_size:
+                # Calculate quotient and remainder for splitting
+                multiplier = 1
+                while sizes[i] > max_dim_size:
+                    sizes[i] //= 2
+                    multiplier *= 2
+                quotient = multiplier
+                remainder = sizes[i]
 
-        tap._sizes = new_sizes
-        # Update strides accordingly - maintain contiguous stride pattern
-        tap._strides = [0] * len(new_sizes)
-        tap._strides[-1] = 1
-        for i in range(len(new_sizes) - 2, -1, -1):
-            if new_sizes[i] > 1:
-                tap._strides[i] = new_sizes[i + 1]
+                # Insert new outer dimension before this one
+                sizes.insert(i, quotient)
+                strides.insert(i, strides[i] * remainder)
 
-        # Check that the transfer is continuous
-        for idx, stride in enumerate(tap._strides[:-1]):
-            if stride != 0 and stride != tap._sizes[idx + 1]:
-                raise ValueError(f"Cannot legalize DMA non-contiguous DMA transfer")
-        assert tap._strides[-1] == 1, f"Cannot legalize DMA non-contiguous DMA transfer"
+                # Update the inner dimension
+                sizes[i + 1] = remainder
+                # stride[i + 1] stays the same
+
+                i -= 1  # Skip the newly inserted dimension
+            i -= 1
+
+        # Remove leading dimensions with size 1
+        while sizes and sizes[0] == 1:
+            sizes.pop(0)
+            strides.pop(0)
+
+        # Check that the number of dimensions does not exceed hardware limit
+        if len(sizes) > 4:
+            raise ValueError(
+                f"Cannot legalize: resulting dimensions {len(sizes)} exceed maximum of 4 "
+                f"supported by hardware (sizes: {sizes}, strides: {strides})"
+            )
+
+        tap._sizes = sizes
+        tap._strides = strides
 
         return tap
 

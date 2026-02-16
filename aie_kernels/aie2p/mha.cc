@@ -72,6 +72,7 @@ void matmul_PV(bfloat16 *Q,
     }
 #endif
 
+#if DEBUG == 0 || DEBUG == 1
     // 64 emul: O dims = [(8, 512), (8, 8), (8, 64), (8, 1)]
     // VJUNG: Scale O_{i-1} by 1/exp(m_{i-1} - m_{i}) store in scale_buffer[3*B_q:3*B_q + B_q]
     // VJUNG: Skip this for the first iteration as 1/exp(m_{i-1} - m_{i}) degenerates to inf due to m intizalized to
@@ -95,6 +96,7 @@ void matmul_PV(bfloat16 *Q,
             }
         }
     }
+#endif
 
     matmul_bf16_bf16_rowmaj(Q, K, out);
 }

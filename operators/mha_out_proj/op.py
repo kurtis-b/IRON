@@ -68,7 +68,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         # ---
         operator_dir = Path(__file__).parent
 
-        file_name_base = f"mha_o_proj_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}t_{self.emb_tile}e_{self.parallel_heads}ph_{self.o_proj_acc_depth}acc"
+        file_name_base = f"mha_o_proj_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}t_{self.emb_tile}e_{self.parallel_heads}ph_{self.o_proj_acc_depth}acc_{self.debug}debug"
 
         # Define source files
         mm_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mm.cc")
@@ -116,9 +116,7 @@ class AIEMHAOutProj(AIEOperatorBase):
             "zero_scalar_bf16": "zero_scalar_bf16_o_proj",
         }
 
-        kernel_archive = (
-            f"mha_o_proj_kernels_{self.num_heads}h_{self.seq_len}s_{self.d}d.a"
-        )
+        kernel_archive = f"mha_o_proj_kernels_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.debug}debug.a"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",

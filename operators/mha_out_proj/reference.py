@@ -77,10 +77,8 @@ def generate_golden_reference(
 
     if debug not in (0, 1):
         # Skip softmax computation when not debugging self attention
-        attn_output = torch.eye(
-            max(seq_len, embed_sz), max(seq_len, embed_sz), dtype=torch.bfloat16
-        )
-        attn_output = attn_output[:seq_len, :embed_sz]
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1))
+        O = torch.matmul(attn_scores, V)
     else:
         # MHA from PyTorch
         inv_scale = 1 / np.sqrt(K.shape[-1])
@@ -92,9 +90,9 @@ def generate_golden_reference(
             is_causal=False,
             scale=inv_scale,
         )
-        attn_output = O.transpose(0, 1).contiguous().view(seq_len, embed_sz)
 
     # Apply output projection
+    attn_output = O.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     O = torch.matmul(attn_output, out_proj_weights)
 
     # Reshape for NPU format
