@@ -114,7 +114,6 @@ def fused_mha(
     embed_sz = heads * d
 
     of_depth = 2
-    vectorized = True
     enable_tracing = True if trace_size > 0 else False
     dtype_str = "bf16"
     dev = "npu2"
@@ -142,7 +141,6 @@ def fused_mha(
     )
     logging.info(f"Data type: {dtype_str}")
     logging.info(f"Microkernel MAC dimensions: r={r}, s={s}, t={t}")
-    logging.info(f"Vectorized: {vectorized}")
     logging.info(f"Enable tracing: {enable_tracing}")
 
     assert heads > 0, "Number of heads must be greater than 0"
@@ -187,7 +185,6 @@ def fused_mha(
     o_ty = np.ndarray[(seq_tile, emb_tile), np.dtype[dtype]]
 
     # AIE kernel declarations
-    func_type = "" if vectorized else "_scalar"
     bin_name = kernel_archive
 
     zero_kernel = Kernel(f"zero_{dtype_str}", bin_name, [qk_ty])
@@ -213,7 +210,7 @@ def fused_mha(
     )
 
     matmul_QK = Kernel(
-        f"matmul_bf16_bf16_wrapper{func_type}",
+        f"matmul_bf16_bf16_wrapper",
         bin_name,
         [q_ty, k_ty, qk_ty, np.ndarray[(2,), np.dtype[np.int32]]],
     )
@@ -260,9 +257,7 @@ def fused_mha(
     )
 
     # AIE-array data movement with object fifos
-    q_dims = None
-    if vectorized:
-        q_dims = [(seq_tile // r, r * d), (d // s, s), (r, d), (s, 1)]
+    q_dims = [(seq_tile // r, r * d), (d // s, s), (r, d), (s, 1)]
 
     inQ = ObjectFifo(
         np.ndarray[(seq_tile, d * parallel_heads), np.dtype[dtype]],
@@ -282,9 +277,7 @@ def fused_mha(
     # I think the Sequential Placer will fail if we do a split/join with more than 6 I/Os cuz it tries to place them all on the same tile.
 
     # K is stored in column-major order
-    k_dims = None
-    if vectorized:
-        k_dims = [(seq_tile // t, t * d), (d // s, s), (t, d), (s, 1)]
+    k_dims = [(seq_tile // t, t * d), (d // s, s), (t, d), (s, 1)]
     inK = ObjectFifo(
         np.ndarray[(seq_tile, d * parallel_heads), np.dtype[dtype]],
         name="inK",
@@ -299,14 +292,12 @@ def fused_mha(
         placement=Tile(col=1, row=1),
     )  # Split between N parallel blocks of heads
 
-    v_dims = None
-    if vectorized:
-        v_dims = [
-            (seq_tile // s, s * seq_tile),
-            (d // t, t),
-            (s, seq_tile),
-            (t, 1),
-        ]
+    v_dims = [
+        (seq_tile // s, s * seq_tile),
+        (d // t, t),
+        (s, seq_tile),
+        (t, 1),
+    ]
 
     inV = ObjectFifo(
         np.ndarray[(seq_tile, d * parallel_heads), np.dtype[dtype]],
@@ -322,23 +313,22 @@ def fused_mha(
         placement=Tile(col=2, row=1),
     )  # Split between N parallel blocks of heads
 
-    a_dims = None
-    if vectorized:
-        a_dims = [(seq_tile // r, r * seq_tile), (r, t), (seq_tile // t, r * t), (t, 1)]
     memA = []
-    outA = []
+    a_dims = [(seq_tile // r, r * seq_tile), (r, t), (seq_tile // t, r * t), (t, 1)]
+    # First send microkernel tiles across the sequence dimension of the output,
+    # then place those microkernel tiles in the correct locations with another DMA
+    a_dims_out = [(seq_tile // s, s), (seq_tile, r * s), (s, 1)]
+    a_dims_in = [(seq_tile // s, s), (seq_tile // s, seq_tile), (s, 1)]
     for i in range(parallel_heads):
-        memA.append(ObjectFifo(qk_ty, depth=of_depth, name=f"memA{i}"))
-        outA.append(
-            memA[i]
-            .cons()
-            .forward(
-                name=f"outA{i}",
-                dims_to_stream=a_dims,
+        memA.append(
+            ObjectFifo(
+                qk_ty,
                 depth=of_depth,
-                placement=Tile(col=4, row=1),
+                name=f"memA{i}",
+                dims_to_stream=a_dims_out,
+                dims_from_stream_per_cons=a_dims_in,
             )
-        )  # Local to 1 parallel block of sequences
+        )  # Local to 1 parallel block of heads
 
     memP = []
     # First send microkernel tiles across the sequence dimension of the output,
@@ -364,14 +354,12 @@ def fused_mha(
         )  # Local to 1 parallel block of sequences
 
     # Output projection weights
-    ow_dims = None
-    if vectorized:
-        ow_dims = [
-            (d // s, s * emb_tile),
-            (emb_tile // t, t),
-            (s, emb_tile),
-            (t, 1),
-        ]
+    ow_dims = [
+        (d // s, s * emb_tile),
+        (emb_tile // t, t),
+        (s, emb_tile),
+        (t, 1),
+    ]
 
     inOW = ObjectFifo(
         np.ndarray[(d * parallel_heads, emb_tile), np.dtype[dtype]],
@@ -412,9 +400,7 @@ def fused_mha(
             ObjectFifo(o_ty, depth=of_depth, name=f"outOPart{i}")
         )  # Local to 1 parallel block of heads
 
-    o_dims = None
-    if vectorized:
-        o_dims = [(seq_tile // r, r * emb_tile), (r, t), (emb_tile // t, r * t), (t, 1)]
+    o_dims = [(seq_tile // r, r * emb_tile), (r, t), (emb_tile // t, r * t), (t, 1)]
     memO = ObjectFifo(
         np.ndarray[(seq_tile, emb_tile), np.dtype[dtype]],
         name="memO",
@@ -736,7 +722,7 @@ def fused_mha(
             Worker(
                 softmax,
                 fn_args=[
-                    outA[i].cons(),
+                    memA[i].cons(),
                     memP[i].prod(),
                     scaleOF[i].prod(),
                     partial_softmax_kernel,
