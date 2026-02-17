@@ -7,7 +7,7 @@ from ml_dtypes import bfloat16
 from pathlib import Path
 from typing import Dict, List
 
-from iron.common import (
+from operators.common import (
     AIEOperatorBase,
     AIEOperatorConstraintError,
     XclbinArtifact,
@@ -17,7 +17,7 @@ from iron.common import (
     SourceArtifact,
     PythonGeneratedMLIRArtifact,
 )
-from iron.common.utils import torch_to_numpy, numpy_to_torch
+from operators.common.utils import torch_to_numpy, numpy_to_torch
 
 
 class AIEMHA(AIEOperatorBase):
@@ -104,9 +104,10 @@ class AIEMHA(AIEOperatorBase):
                 "num_KV_heads": self.num_KV_heads,
                 "number_of_pipelines": self.num_of_pipelines,
                 "emulate_bf16_mmul_with_bfp16": True,
+                "is_causal": self.is_causal,
                 "kernel_archive": kernel_archive,
                 "trace_size": 0,
-                "verbose": mlir_verbose,
+                "verbose": False,
             },
         )
 

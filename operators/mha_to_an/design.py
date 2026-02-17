@@ -24,7 +24,7 @@ from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1Col1, NPU2, Tile
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
-from aie.helpers.dialects.scf import if_, else_
+from aie.helpers.dialects.ext.scf import if_, else_
 
 base_dir = Path(__file__).parent
 
@@ -66,6 +66,12 @@ def main():
     )
     argparser.add_argument("--number-of-pipeline", type=int, default=1)
     argparser.add_argument("--emulate-bf16-mmul-with-bfp16", type=bool, default=False)
+    argparser.add_argument(
+        "--is-causal",
+        action="store_true",
+        default=False,
+        help="Whether to apply causal masking",
+    )
     argparser.add_argument("--trace_size", type=int, default=0)
     argparser.add_argument("--kernel-archive", type=str, default="mha_kernels.a")
     argparser.add_argument(
@@ -91,6 +97,7 @@ def main():
         number_of_pipelines=args.number_of_pipeline,
         num_KV_heads=args.num_KV_heads,
         emulate_bf16_mmul_with_bfp16=args.emulate_bf16_mmul_with_bfp16,
+        is_causal=args.is_causal,
         kernel_archive=args.kernel_archive,
         trace_size=args.trace_size,
         verbose=args.verbose,
@@ -115,6 +122,7 @@ def fused_mha(
     number_of_pipelines: int,
     num_KV_heads: int,
     emulate_bf16_mmul_with_bfp16: bool,
+    is_causal: bool,
     kernel_archive: str,
     trace_size: int = 0,
     verbose: bool = False,
@@ -715,13 +723,9 @@ def fused_mha(
         (heads * S_q_pad, d), (number_of_pipelines_join_distribute * B_q, d), (1, 1)
     )
 
-    K_tiles = TensorTiler2D.group_tiler(
-        (num_KV_heads * S_kv_pad, d), (S_kv_pad, d), (1, 1)
-    )
+    K_tiles = TensorTiler2D.group_tiler((heads * S_kv_pad, d), (S_kv_pad, d), (1, 1))
 
-    V_tiles = TensorTiler2D.group_tiler(
-        (num_KV_heads * S_kv_pad, d), (S_kv_pad, d), (1, 1)
-    )
+    V_tiles = TensorTiler2D.group_tiler((heads * S_kv_pad, d), (S_kv_pad, d), (1, 1))
 
     O_tiles = TensorTiler2D.group_tiler(
         (heads * S_q_pad, d), (number_of_pipelines_join_distribute * B_q, d), (1, 1)
@@ -766,9 +770,9 @@ def fused_mha(
     if verbose:
         print(f"DMA Transfer Configuration: DRAM <-> Mem tile")
         # print_tap_seq_info(Q_tiles, "Q")
-        print_tap_seq_info(K_tiles, "K")
-        print_tap_seq_info(V_tiles, "V")
-        # print_tap_seq_info(O_tiles, "O")
+        # print_tap_seq_info(K_tiles, "K")
+        # print_tap_seq_info(V_tiles, "V")
+        print_tap_seq_info(O_tiles, "O")
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
@@ -794,8 +798,6 @@ def fused_mha(
             rt.start(matmul_pv_workers[i])
 
         for head_idx in range(heads):
-
-            kv_head_idx = head_idx // (heads // num_KV_heads)
 
             for q_block_idx in range(num_q_block_per_pipeline):
 
@@ -836,14 +838,14 @@ def fused_mha(
                 rt.fill(
                     inK.prod(),
                     K,
-                    tap=K_tiles[kv_head_idx],
+                    tap=K_tiles[head_idx],
                     placement=Tile(col=5, row=0),
                     task_group=tg,
                 )
                 rt.fill(
                     inV.prod(),
                     V,
-                    tap=V_tiles[kv_head_idx],
+                    tap=V_tiles[head_idx],
                     placement=Tile(col=6, row=0),
                     task_group=tg,
                 )
