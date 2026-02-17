@@ -26,6 +26,8 @@ from aie.iron.device import NPU1Col1, NPU2, Tile
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
 from aie.helpers.dialects.ext.scf import if_, else_
+import aie.dialects.index as index
+from aie.dialects.aiex import *
 
 base_dir = Path(__file__).parent
 
@@ -339,19 +341,20 @@ def fused_mha(
         )  # Local to 1 parallel block of sequences
 
     memP = []
-    outP = []
+    # First send microkernel tiles across the sequence dimension of the output,
+    # then place those microkernel tiles in the correct locations with another DMA
+    p_dims_out = [(seq_tile // s, s), (seq_tile, seq_tile), (s, 1)]
+    p_dims_in = [(seq_tile // s, r * s), (seq_tile // r, seq_tile * r), (r * s, 1)]
     for i in range(parallel_heads):
-        memP.append(ObjectFifo(qk_ty, depth=of_depth, name=f"memP{i}"))
-        outP.append(
-            memP[i]
-            .cons()
-            .forward(
-                name=f"outP{i}",
-                dims_to_stream=q_dims,
+        memP.append(
+            ObjectFifo(
+                qk_ty,
                 depth=of_depth,
-                placement=Tile(col=5, row=1),
+                name=f"memP{i}",
+                dims_to_stream=p_dims_out,
+                dims_from_stream_per_cons=p_dims_in,
             )
-        )  # Local to 1 parallel block of sequences
+        )  # Local to 1 parallel block of heads
 
     # Scale buffer for partial softmax
     scaleOF = []
@@ -756,7 +759,7 @@ def fused_mha(
             Worker(
                 batched_matmul_pv,
                 fn_args=[
-                    outP[i].cons(),
+                    memP[i].cons(),
                     memV[i].cons(),
                     scaleOF[i].cons(),
                     outOProj[i].prod(),
