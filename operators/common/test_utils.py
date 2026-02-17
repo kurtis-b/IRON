@@ -41,6 +41,7 @@ def verify_buffer(operator, buf_name, reference, rel_tol=0.04, abs_tol=1e-6):
         )
         errors.extend(i for i in range(abs(len(output) - len(expected_np))))
     compare_len = min(len(output), len(expected_np))
+    num_nans = 0
     for i in range(compare_len):
         if not nearly_equal(float(output[i]), float(expected_np[i]), rel_tol, abs_tol):
             errors.append(i)
@@ -49,7 +50,8 @@ def verify_buffer(operator, buf_name, reference, rel_tol=0.04, abs_tol=1e-6):
                     f"Mismatch in {buf_name}[{i}]: expected {float(expected_np[i]):.6f}, got {float(output[i]):.6f}"
                 )
             if np.isnan(float(output[i])):
-                print(f"NaN detected in {buf_name}[{i}]")
+                num_nans += 1
+    print(f"Found {num_nans} NaNs in {buf_name}")
     return errors
 
 

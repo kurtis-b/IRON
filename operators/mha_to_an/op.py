@@ -104,6 +104,7 @@ class AIEMHA(AIEOperatorBase):
                 "num_KV_heads": self.num_KV_heads,
                 "number_of_pipelines": self.num_of_pipelines,
                 "emulate_bf16_mmul_with_bfp16": True,
+                "is_causal": self.is_causal,
                 "kernel_archive": kernel_archive,
                 "trace_size": 0,
                 "verbose": False,
