@@ -62,6 +62,10 @@ def generate_golden_reference(
         Q = Q[:seq_len, :embed_sz].view(seq_len, heads, d).transpose(0, 1).contiguous()
         K = K[:seq_len, :embed_sz].view(seq_len, heads, d).transpose(0, 1).contiguous()
         V = V[:seq_len, :embed_sz].view(seq_len, heads, d).transpose(0, 1).contiguous()
+
+        # Skip softmax computation when not debugging self attention
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1))
+        O = torch.matmul(attn_scores, V)
     else:
         if debug == 1:
             # Q = torch.ones(heads, seq_len, d, dtype=torch.bfloat16) * val_range
@@ -74,12 +78,6 @@ def generate_golden_reference(
             Q = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
             K = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
             V = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-
-    if debug not in (0, 1):
-        # Skip softmax computation when not debugging self attention
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1))
-        O = torch.matmul(attn_scores, V)
-    else:
         # MHA from PyTorch
         inv_scale = 1 / np.sqrt(K.shape[-1])
         O = torch.nn.functional.scaled_dot_product_attention(

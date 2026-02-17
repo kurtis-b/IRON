@@ -164,19 +164,11 @@ def fused_mha(
         np.dtype[dtype],
     ]
     Q_ty = np.ndarray[
-        (
-            seq_len,
-            heads,
-            d,
-        ),
+        (seq_len, embed_sz),
         np.dtype[dtype],
     ]
     KV_ty = np.ndarray[
-        (
-            seq_len,
-            heads,
-            d,
-        ),
+        (seq_len, embed_sz),
         np.dtype[dtype],
     ]
     O_ty = np.ndarray[
@@ -837,6 +829,16 @@ def fused_mha(
         (d, emb_tile),
         (parallel_heads, embed_sz // emb_tile // num_o_col_groups),
     )
+    # Flip the first two dimensions of WO so that the 3rd dimension iterates over rows for splitting
+    # to FIFOs and 4th dimension iterates over columns for partial accumulations
+    for tile in WO_tiles:
+        tile._sizes = [tile._sizes[1], tile._sizes[0], tile._sizes[2], tile._sizes[3]]
+        tile._strides = [
+            tile._strides[1],
+            tile._strides[0],
+            tile._strides[2],
+            tile._strides[3],
+        ]
 
     O_tiles = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
@@ -954,6 +956,7 @@ def fused_mha(
                         tap=K_tiles[head_idx],
                         placement=Tile(col=1, row=0),
                         task_group=tg_head,
+                        wait=True,
                     )
                     rt.fill(
                         inV.prod(),
@@ -961,6 +964,7 @@ def fused_mha(
                         tap=V_tiles[head_idx],
                         placement=Tile(col=2, row=0),
                         task_group=tg_head,
+                        wait=True,
                     )
                     rt.fill(
                         inOW.prod(),
