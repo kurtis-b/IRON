@@ -42,7 +42,6 @@ class AIEANFFN(AIEOperatorBase):
         tile_n=64,
         down_proj_depth=1,
         num_aie_columns=2,
-        ln1_weight=None,
         ln2_weight=None,
         debug_mode=-1,
         context=None,
@@ -84,7 +83,6 @@ class AIEANFFN(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        self.ln1_weight = ln1_weight
         self.ln2_weight = ln2_weight
         self.debug_mode = debug_mode
 
@@ -140,10 +138,6 @@ class AIEANFFN(AIEOperatorBase):
         )
 
         # Save the weight weights to a npy file so that the design.py can load it at compile time
-        ln1_weight_file_name = (
-            self.context.build_dir / f"{file_name_total_base}_ln1_weight_{self.K}.npy"
-        )
-        np.save(ln1_weight_file_name, torch_to_numpy(self.ln1_weight))
         ln2_weight_file_name = (
             self.context.build_dir / f"{file_name_total_base}_ln2_weight_{self.K}.npy"
         )
@@ -174,7 +168,6 @@ class AIEANFFN(AIEOperatorBase):
                 "stage_only": stage_only,
                 "gelu_stage": gelu_stage,
                 "archive": kernel_archive,
-                "ln1_weight_file": ln1_weight_file_name,
                 "ln2_weight_file": ln2_weight_file_name,
                 "generate_taps": False,
             },

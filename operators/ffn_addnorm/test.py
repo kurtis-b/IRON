@@ -352,7 +352,6 @@ def test_ffn(
         tile_n=n,
         down_proj_depth=down_proj_depth,
         num_aie_columns=num_aie_columns,
-        ln1_weight=golden_ref["weight1"],
         ln2_weight=golden_ref["weight2"],
         debug_mode=DEBUG_MODE,
         context=aie_context,
