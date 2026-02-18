@@ -407,13 +407,9 @@ void matmul_vectorized_1x4_mmul(const T_in *__restrict pA, const T_in *__restric
                 // zero.cc function handles the zeroing of data when a new
                 // accumulation is needed (after the 'K' reduction dimension)
                 aie::vector<T_out, MMUL::size_C> acc_C00 = aie::load_v<MMUL::size_C>(pC1);
-                pC1 += MMUL::size_C;
-                aie::vector<T_out, MMUL::size_C> acc_C01 = aie::load_v<MMUL::size_C>(pC1);
-                pC1 += MMUL::size_C;
-                aie::vector<T_out, MMUL::size_C> acc_C02 = aie::load_v<MMUL::size_C>(pC1);
-                pC1 += MMUL::size_C;
-                aie::vector<T_out, MMUL::size_C> acc_C03 = aie::load_v<MMUL::size_C>(pC1);
-                pC1 += MMUL::size_C;
+                aie::vector<T_out, MMUL::size_C> acc_C01 = aie::load_v<MMUL::size_C>(pC1 + MMUL::size_C);
+                aie::vector<T_out, MMUL::size_C> acc_C02 = aie::load_v<MMUL::size_C>(pC1 + 2 * MMUL::size_C);
+                aie::vector<T_out, MMUL::size_C> acc_C03 = aie::load_v<MMUL::size_C>(pC1 + 3 * MMUL::size_C);
 
                 MMUL C00(acc_C00);
                 MMUL C01(acc_C01);
