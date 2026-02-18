@@ -97,9 +97,9 @@ def main():
     argparser.add_argument(
         "--stage-only",
         type=int,
-        choices=[-1, 1, 2, 3],
+        choices=[-1, 0, 1, 2],
         default=None,
-        help="Compute enabled for 1: up_proj only, 2: down_proj only, 3: final add & norm only, None: all, -1: No compute",
+        help="Compute enabled for 0: up_proj only, 1: down_proj only, 2: final add & norm only, None: all, -1: No compute",
     )
     argparser.add_argument(
         "--generate-taps",
@@ -374,9 +374,9 @@ def my_matmul(
     # we only need the zero and matmul kernels
     fifo_depth_out = fifo_depth
     # Up projection
-    matmul_func_name = f"matmul_{dtype_in_str}_{dtype_out_str}"
+    matmul_func_name = f"ffn_matmul_{dtype_in_str}_{dtype_out_str}"
     ffn_zero_kernel_up_proj = Kernel(
-        f"zero_{dtype_out_str}_up_proj",
+        f"ffn_zero_{dtype_out_str}_up_proj",
         archive_name,
         [C_up_proj_l1_ty],
     )
@@ -391,9 +391,9 @@ def my_matmul(
         [C_up_proj_l1_ty, C_up_proj_l1_ty, np.int32],
     )
     # Down projection
-    matmul_func_name = f"matmul_with_acc_{dtype_in_str}_{dtype_out_str}"
+    matmul_func_name = f"ffn_matmul_with_acc_{dtype_in_str}_{dtype_out_str}"
     ffn_zero_kernel_down_proj = Kernel(
-        f"zero_{dtype_out_str}_down_proj",
+        f"ffn_zero_{dtype_out_str}_down_proj",
         archive_name,
         [C_down_proj_l1_ty],
     )
@@ -1074,9 +1074,8 @@ def my_matmul(
                     for a_tile in range(nA_tiles_distributed):
                         # A input transfer (tiled k-chunks with stride-0 reuse across N output tiles, like ffn/design.py):
                         A_offset = (
-                            (row_base + tile_row) * nA_tiles_distributed * m * K
-                            + a_tile * m * K
-                        )
+                            row_base + tile_row
+                        ) * nA_tiles_distributed * m * K + a_tile * m * K
                         A_sizes = [nC_up_col_tiles_per_core, K_div_k, m, k]
                         A_strides = [0, k, K, 1]
                         A_tile = TensorAccessPattern(

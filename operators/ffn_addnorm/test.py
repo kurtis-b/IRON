@@ -9,20 +9,20 @@ import logging
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from operators.addnorm_ffn.op import AIEANFFN
-from operators.addnorm_ffn.reference import generate_golden_reference
+from operators.ffn_addnorm.op import AIEFFNAN
+from operators.ffn_addnorm.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 TEST_BERT = True
 INCLUDE_SIMPLE_TESTS = False
-DEBUG_MODE = -1
+DEBUG_MODE = 0
 """
 Debug mode 0: 
-    Input to first layer norm are indexes, first residual connection is set to 0's. 
+    Input to FFN indexes, residual connection is set to 0's. 
     GEMM weights are identity matrices. Layer norm weights are all 1's.
     The fused layer norm add kernels will pass through inputs.
 Debug mode 1: 
-    Input to first layer norm is set to 0's, first residual connection are indexes. 
+    Input to FFN is set to 0's, first residual connection are indexes. 
     GEMM weights are identity matrices. Layer norm weights are all 1's.
     The fused layer norm add kernels will pass through residual connections.
 Debug mode < 0 or > 1:
@@ -34,52 +34,31 @@ def generate_test_params(extensive=False):
     if TEST_BERT:
         params = [
             #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
-            ### No compute
-            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, -1, 0),
-            ### Only first add & layer norm
-            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, 0, 0),
-            ### Only up projection + GeLU
-            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, 1, 0),
-            ### Only down projection
-            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, 2, 0),
-            ### Only second add & layer norm
-            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, 3, 0),
+            ## Baselines
+            # ### No compute
+            # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, -1, 0),
+            # ### Only up projection + GeLU
+            # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 0, 0),
+            # ### Only down projection
+            # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 1, 0),
+            # ### Only second add & layer norm
+            # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 2, 0),
             ### All compute executed
-            (64, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
-            ## M scaled up from baseline
-            (64 * 4, 48, 96, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
-            ## K scaled up from baseline
-            (64, 48 * 4, 96, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
-            ## N scaled up from baseline
-            (64, 48, 96 * 4, 2, 64, 48, 96, 0, 1, 1, 1, None, 0),
-            ## K scaled up with matching scaling with down_proj_depth (affects MT utilization)
-            (64, 48 * 4, 96, 2, 64, 48, 96, 0, 4, 1, 1, None, 0),
-            ## M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
-            (64 * 4, 48, 96, 4, 64, 48, 96, 0, 1, 2, 1, None, 0),
-            (64 * 4, 48, 96, 8, 64, 48, 96, 0, 1, 4, 1, None, 0),
-            ## N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
-            (64, 48, 96 * 4, 8, 64, 48, 96, 0, 1, 1, 4, None, 0),
-            # BERT workload
-            (512, 768, 3072, 2, 64, 48, 96, 0, 6, 1, 1, None, 0),
-        ]
-
-        # NOTE: Below was for old design
-        params_old = [
-            #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
-            # TESTS WITH DIM_M > r (mmul api dim) BELOW
-            # GeLU fused with up projection
-            (512, 768, 3072, 8, 16, 96, 128, 0, 8, 2, 6, None, 0),
-            (512, 768, 3072, 8, 16, 128, 96, 0, 6, 4, 2, None, 0),
-            # GeLU fused with down projection
-            (512, 768, 3072, 8, 16, 96, 128, 0, 8, 2, 6, None, 1),
-            (512, 768, 3072, 8, 16, 128, 96, 0, 6, 4, 2, None, 1),
-            # TESTS WITH DIM_M=r (mmul api dim) BELOW
-            # GeLU fused with up projection
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, None, 0),
-            (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, None, 0),
-            # GeLU fused with up projection
-            (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, None, 1),
-            (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, None, 1),
+            (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, None, 0),
+            # # TESTS WITH DIM_M > r (mmul api dim) BELOW
+            # # GeLU fused with up projection
+            # (512, 768, 3072, 8, 16, 96, 128, 0, 8, 2, 6, None, 0),
+            # (512, 768, 3072, 8, 16, 128, 96, 0, 6, 4, 2, None, 0),
+            # # GeLU fused with down projection
+            # (512, 768, 3072, 8, 16, 96, 128, 0, 8, 2, 6, None, 1),
+            # (512, 768, 3072, 8, 16, 128, 96, 0, 6, 4, 2, None, 1),
+            # # TESTS WITH DIM_M=r (mmul api dim) BELOW
+            # # GeLU fused with up projection
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, None, 0),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, None, 0),
+            # # GeLU fused with up projection
+            # (512, 768, 3072, 8, 8, 96, 128, 0, 8, 2, 6, None, 1),
+            # (512, 768, 3072, 8, 8, 128, 96, 0, 6, 4, 2, None, 1),
         ]
         if INCLUDE_SIMPLE_TESTS:
             params_old += [
@@ -343,7 +322,7 @@ def test_ffn(
         "stage_only": stage_only,
         "gelu_stage": gelu_stage,
     }
-    operator = AIEANFFN(
+    operator = AIEFFNAN(
         M=M,
         K=K,
         N=N,

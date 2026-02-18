@@ -21,7 +21,7 @@ from operators.common import (
 from operators.common.utils import torch_to_numpy, numpy_to_torch
 
 
-class AIEANFFN(AIEOperatorBase):
+class AIEFFNAN(AIEOperatorBase):
     """
     AIE-accelerated ANFFN block for BERT, which has an add & norm, up-projection and down-projection with a GeLU in between, then another add & norm.
     The ANFFN block computes: R2 = LN(A) + R, C = LN(GeLU(R2 @ B_Up) @ B_Down) + R2
@@ -302,7 +302,7 @@ class AIEANFFN(AIEOperatorBase):
         expected_output_shape = A.shape
         if expected_output_shape != R.shape:
             raise AIEOperatorConstraintError(
-                "AIEANFFN: input A and residual R must have the same shape"
+                "AIEFFNAN: input A and residual R must have the same shape"
             )
 
         # Remove batch dimension, if any
@@ -328,7 +328,7 @@ class AIEANFFN(AIEOperatorBase):
             and N <= self.N
         )
         if not applicable:
-            raise AIEOperatorConstraintError("AIEANFFN: incompatible tensor shape(s)")
+            raise AIEOperatorConstraintError("AIEFFNAN: incompatible tensor shape(s)")
 
         A_padded = self._pad_A(torch_to_numpy(A))
         R_padded = self._pad_A(torch_to_numpy(R))

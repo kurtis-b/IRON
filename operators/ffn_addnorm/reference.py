@@ -32,14 +32,14 @@ def generate_golden_reference(
         dtype: Data type for tensors
         seed: Random seed for reproducibility
         debug_mode:
-            - If 0, check indexes through layer norm path,
+            - If 0, check indexes through FFN path,
             - if 1, check indexes through residual connection path,
             - else, random data
 
     Returns:
         Dictionary containing:
-            - input: Input tensor for first layer norm (M, K)
-            - input_residual: Input tensor for first residual addition (M, K)
+            - input: Input tensor for FFN (M, K)
+            - input_residual: Input tensor for residual addition (M, K)
             - input_b_up: Up-projection weight (K, N)
             - input_b_down: Down-projection weight (N, K)
             - output: Final output after FFN block (M, K)
