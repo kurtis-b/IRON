@@ -15,7 +15,7 @@ from operators.common.test_utils import run_test
 
 TEST_BERT = True
 INCLUDE_SIMPLE_TESTS = False
-DEBUG_MODE = 0
+DEBUG_MODE = -1
 """
 Debug mode 0: 
     Input to FFN indexes, residual connection is set to 0's. 
@@ -121,10 +121,10 @@ def generate_test_params(extensive=False):
             # TESTS WITH DIM_M > r (mmul api dim) BELOW
             # GeLU fused with up projection
             (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, None, 0),
-            # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, None, 0),
+            (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, None, 0),
             # GeLU fused with down projection
             (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, None, 1),
-            # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, None, 1),
+            (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, None, 1),
         ]
         extensive_params = []
     else:
