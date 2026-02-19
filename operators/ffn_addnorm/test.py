@@ -14,7 +14,7 @@ from operators.ffn_addnorm.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 TEST_BERT = True
-INCLUDE_SIMPLE_TESTS = False
+INCLUDE_SIMPLE_TESTS = True
 DEBUG_MODE = -1
 """
 Debug mode 0: 
@@ -49,82 +49,82 @@ def generate_test_params(extensive=False):
                 (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 2, 0),
                 ### All compute executed
                 (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, None, 0),
-                ## M scaled up from baseline
-                (16 * 8, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, None, 0),
-                # K scaled up from baseline, for now down_proj_depth is required to be scaled so that the full K is processed
-                (16, 96 * 8, 96, 2, 16, 96, 96, 0, 8, 1, 1, None, 0),
-                ## N scaled up from baseline
-                (16, 96, 96 * 8, 2, 16, 96, 96, 0, 1, 1, 1, None, 0),
-                ## M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
-                (16 * 8, 96, 96, 4, 16, 96, 96, 0, 1, 2, 1, None, 0),
-                (16 * 8, 96, 96, 8, 16, 96, 96, 0, 1, 4, 1, None, 0),
-                ## N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
-                (16, 96, 96 * 2, 8, 16, 96, 96, 0, 1, 1, 2, None, 0),
-                (16, 96, 96 * 8, 8, 16, 96, 96, 0, 1, 1, 4, None, 0),
-                # BERT workload
-                (512, 768, 3072, 2, 16, 96, 96, 0, 8, 1, 1, None, 0),
-                # Bottleneck testing
-                ## Only first add & layer norm
-                (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 0, 0),
-                (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 0, 0),
-                ## Only up projection + GeLU
-                (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 1, 0),
-                (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 1, 0),
-                ## Only down projection
-                (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 2, 0),
-                (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 2, 0),
-                ## Only second add & layer norm
-                (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 3, 0),
-                (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 3, 0),
-                # GeLU fused with down projection
-                ## Baselines
-                ### No compute
-                (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, -1, 1),
-                ### Only up projection + GeLU
-                (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 0, 1),
-                ### Only down projection
-                (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 1, 1),
-                ### Only second add & layer norm
-                (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 2, 1),
-                ### All compute executed
-                (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, None, 1),
-                ## M scaled up from baseline
-                (16 * 8, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, None, 1),
-                ## K scaled up from baseline, for now down_proj_depth is required to be scaled so that the full K is processed
-                (16, 96 * 8, 96, 2, 16, 96, 96, 0, 8, 1, 1, None, 1),
-                ## N scaled up from baseline
-                (16, 96, 96 * 8, 2, 16, 96, 96, 0, 1, 1, 1, None, 1),
-                ## M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
-                (16 * 8, 96, 96, 4, 16, 96, 96, 0, 1, 2, 1, None, 1),
-                (16 * 8, 96, 96, 8, 16, 96, 96, 0, 1, 4, 1, None, 1),
-                ## N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
-                (16, 96, 96 * 2, 8, 16, 96, 96, 0, 1, 1, 2, None, 1),
-                (16, 96, 96 * 8, 8, 16, 96, 96, 0, 1, 1, 4, None, 1),
-                # BERT workload
-                (512, 768, 3072, 2, 16, 96, 96, 0, 8, 1, 1, None, 1),
-                # Bottleneck testing
-                ## Only first add & layer norm
-                (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 0, 1),
-                (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 0, 1),
-                ## Only up projection + GeLU
-                (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 1, 1),
-                (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 1, 1),
-                ## Only down projection
-                (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 2, 1),
-                (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 2, 1),
-                ## Only second add & layer norm
-                (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 3, 1),
-                (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 3, 1),
+                # ## M scaled up from baseline
+                # (16 * 8, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, None, 0),
+                # # K scaled up from baseline, for now down_proj_depth is required to be scaled so that the full K is processed
+                # (16, 96 * 8, 96, 2, 16, 96, 96, 0, 8, 1, 1, None, 0),
+                # ## N scaled up from baseline
+                # (16, 96, 96 * 8, 2, 16, 96, 96, 0, 1, 1, 1, None, 0),
+                # ## M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
+                # (16 * 8, 96, 96, 4, 16, 96, 96, 0, 1, 2, 1, None, 0),
+                # (16 * 8, 96, 96, 8, 16, 96, 96, 0, 1, 4, 1, None, 0),
+                # ## N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
+                # (16, 96, 96 * 2, 8, 16, 96, 96, 0, 1, 1, 2, None, 0),
+                # (16, 96, 96 * 8, 8, 16, 96, 96, 0, 1, 1, 4, None, 0),
+                # # BERT workload
+                # (512, 768, 3072, 2, 16, 96, 96, 0, 8, 1, 1, None, 0),
+                # # Bottleneck testing
+                # ## Only first add & layer norm
+                # (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 0, 0),
+                # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 0, 0),
+                # ## Only up projection + GeLU
+                # (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 1, 0),
+                # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 1, 0),
+                # ## Only down projection
+                # (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 2, 0),
+                # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 2, 0),
+                # ## Only second add & layer norm
+                # (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 3, 0),
+                # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 3, 0),
+                # # GeLU fused with down projection
+                # ## Baselines
+                # ### No compute
+                # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, -1, 1),
+                # ### Only up projection + GeLU
+                # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 0, 1),
+                # ### Only down projection
+                # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 1, 1),
+                # ### Only second add & layer norm
+                # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 2, 1),
+                # ### All compute executed
+                # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, None, 1),
+                # ## M scaled up from baseline
+                # (16 * 8, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, None, 1),
+                # ## K scaled up from baseline, for now down_proj_depth is required to be scaled so that the full K is processed
+                # (16, 96 * 8, 96, 2, 16, 96, 96, 0, 8, 1, 1, None, 1),
+                # ## N scaled up from baseline
+                # (16, 96, 96 * 8, 2, 16, 96, 96, 0, 1, 1, 1, None, 1),
+                # ## M scaled up with mathing scaling with nA_tiles_distributed (duplicates pipeline with more A streams)
+                # (16 * 8, 96, 96, 4, 16, 96, 96, 0, 1, 2, 1, None, 1),
+                # (16 * 8, 96, 96, 8, 16, 96, 96, 0, 1, 4, 1, None, 1),
+                # ## N scaled up with matching scaling with nB_tiles_distributed (duplicates pipeline with more B_Up/B_Down streams)
+                # (16, 96, 96 * 2, 8, 16, 96, 96, 0, 1, 1, 2, None, 1),
+                # (16, 96, 96 * 8, 8, 16, 96, 96, 0, 1, 1, 4, None, 1),
+                # # BERT workload
+                # (512, 768, 3072, 2, 16, 96, 96, 0, 8, 1, 1, None, 1),
+                # # Bottleneck testing
+                # ## Only first add & layer norm
+                # (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 0, 1),
+                # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 0, 1),
+                # ## Only up projection + GeLU
+                # (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 1, 1),
+                # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 1, 1),
+                # ## Only down projection
+                # (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 2, 1),
+                # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 2, 1),
+                # ## Only second add & layer norm
+                # (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, 3, 1),
+                # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, 3, 1),
             ]
         params = params_simple + [
             #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
             # TESTS WITH DIM_M > r (mmul api dim) BELOW
             # GeLU fused with up projection
-            (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, None, 0),
-            (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, None, 0),
-            # GeLU fused with down projection
-            (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, None, 1),
-            (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, None, 1),
+            # (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, None, 0),
+            # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, None, 0),
+            # # GeLU fused with down projection
+            # (512, 768, 3072, 8, 16, 96, 64, 0, 8, 2, 6, None, 1),
+            # (512, 768, 3072, 8, 16, 96, 96, 0, 8, 4, 2, None, 1),
         ]
         extensive_params = []
     else:

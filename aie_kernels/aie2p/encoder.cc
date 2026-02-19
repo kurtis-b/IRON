@@ -188,12 +188,8 @@ void matmul_with_acc_vectorized_1x4_mmul(const T_in *__restrict pA,
         T_out *__restrict pC1 = pC + (z * colB) * MMUL::size_C;
 
         // Per-row accumulators for sum and sum-squared across all column tiles
-        ::aie::vector<T_out, t> sum_acc[r];
-        ::aie::vector<float, t> sumsq_acc[r];
-        for (unsigned ri = 0; ri < r; ri++) {
-            sum_acc[ri] = ::aie::zeros<T_out, t>();
-            sumsq_acc[ri] = ::aie::zeros<float, t>();
-        }
+        ::aie::vector<float, r> sum_acc = ::aie::zeros<float, r>();
+        ::aie::vector<float, r> sumsq_acc = ::aie::zeros<float, r>();
 
         for (unsigned j = 0; j < colB; j += 4)
 #ifdef OPT_PERF_ENABLED
@@ -272,32 +268,23 @@ void matmul_with_acc_vectorized_1x4_mmul(const T_in *__restrict pA,
                 pC1 += MMUL::size_C;
 
                 // For each row within this microtile, accumulate sum and sum-squared
-                // over vectors of size t across the 4 column tiles (v00..v03)
+                // across the 4 column tiles
                 for (unsigned ri = 0; ri < r; ri++) {
-                    ::aie::vector<T_out, t> row_v00 = v00.template extract<t>(ri);
-                    ::aie::vector<T_out, t> row_v01 = v01.template extract<t>(ri);
-                    ::aie::vector<T_out, t> row_v02 = v02.template extract<t>(ri);
-                    ::aie::vector<T_out, t> row_v03 = v03.template extract<t>(ri);
-
-                    sum_acc[ri] = ::aie::add(sum_acc[ri], row_v00);
-                    sum_acc[ri] = ::aie::add(sum_acc[ri], row_v01);
-                    sum_acc[ri] = ::aie::add(sum_acc[ri], row_v02);
-                    sum_acc[ri] = ::aie::add(sum_acc[ri], row_v03);
-
-                    sumsq_acc[ri] = ::aie::add(sumsq_acc[ri], ::aie::mul(row_v00, row_v00));
-                    sumsq_acc[ri] = ::aie::add(sumsq_acc[ri], ::aie::mul(row_v01, row_v01));
-                    sumsq_acc[ri] = ::aie::add(sumsq_acc[ri], ::aie::mul(row_v02, row_v02));
-                    sumsq_acc[ri] = ::aie::add(sumsq_acc[ri], ::aie::mul(row_v03, row_v03));
+                    aie::vector<bfloat16, 4 * t> row_v = aie::concat(v00.template extract<t>(ri),
+                                                                     v01.template extract<t>(ri),
+                                                                     v02.template extract<t>(ri),
+                                                                     v03.template extract<t>(ri));
+                    aie::vector<bfloat16, 4 * t> row_v_sq = aie::mul(row_v, row_v);
+                    auto row_v_sum = ::aie::reduce_add(row_v);
+                    auto row_v_sum_sq = ::aie::reduce_add(row_v_sq);
+                    sum_acc[ri] = sum_acc[ri] + row_v_sum;
+                    sumsq_acc[ri] = sumsq_acc[ri] + row_v_sum_sq;
                 }
             }
 
-        // Reduce each row's vector accumulator to a scalar and write to output buffers
-        float *__restrict pSum1 = pSum + z * r;
-        float *__restrict pSumSq1 = pSumSq + z * r;
-        for (unsigned ri = 0; ri < r; ri++) {
-            pSum1[ri] = ::aie::reduce_add(sum_acc[ri]);
-            pSumSq1[ri] = ::aie::reduce_add(sumsq_acc[ri]);
-        }
+        // Store the final accumulated sums and sum-squared results for r rows
+        aie::store_v(pSum + z * r, sum_acc);
+        aie::store_v(pSumSq + z * r, sumsq_acc);
     }
 
     event1();
