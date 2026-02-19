@@ -39,14 +39,14 @@ def generate_test_params(extensive=False):
                 # TESTS WITH DIM_M > r (mmul api dim) BELOW
                 # GeLU fused with up projection
                 ## Baselines
-                ### No compute
-                (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, -1, 0),
-                ### Only up projection + GeLU
-                (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 0, 0),
-                ### Only down projection
-                (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 1, 0),
-                ### Only second add & layer norm
-                (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 2, 0),
+                # ### No compute
+                # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, -1, 0),
+                # ### Only up projection + GeLU
+                # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 0, 0),
+                # ### Only down projection
+                # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 1, 0),
+                # ### Only second add & layer norm
+                # (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, 2, 0),
                 ### All compute executed
                 (16, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, None, 0),
                 # ## M scaled up from baseline

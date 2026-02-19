@@ -26,8 +26,6 @@ from aie.iron.controlflow import range_
 import aie.dialects.index as index
 from aie.dialects.aiex import *
 
-from operators.common.utils import torch_dtype_map
-
 microkernel_mac_dim_map = {
     "npu": {
         "bf16": (4, 8, 4),
@@ -48,17 +46,17 @@ def main():
         description="Emits MLIR code for a matrix multiplication design of the given input size",
     )
     argparser.add_argument("--dev", type=str, choices=["npu", "npu2"], default="npu2")
-    argparser.add_argument("-M", type=int, default=8, help="Left matrix rows")
-    argparser.add_argument("-K", type=int, default=96, help="Inner dimension")
-    argparser.add_argument("-N", type=int, default=96, help="Right matrix columns")
+    argparser.add_argument("-M", type=int, default=64, help="Left matrix rows")
+    argparser.add_argument("-K", type=int, default=64, help="Inner dimension")
+    argparser.add_argument("-N", type=int, default=64, help="Right matrix columns")
     argparser.add_argument(
-        "-m", type=int, default=8, help="GEMM tile size across M dimension"
+        "-m", type=int, default=64, help="GEMM tile size across M dimension"
     )
     argparser.add_argument(
-        "-k", type=int, default=96, help="GEMM tile size across K dimension"
+        "-k", type=int, default=64, help="GEMM tile size across K dimension"
     )
     argparser.add_argument(
-        "-n", type=int, default=96, help="GEMM tile size across N dimension"
+        "-n", type=int, default=64, help="GEMM tile size across N dimension"
     )
     argparser.add_argument("--down-proj-depth", type=int, default=1)
     argparser.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=2)
@@ -352,6 +350,7 @@ def my_matmul(
     B_up_proj_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
     B_down_proj_l1_ty = np.ndarray[(n, k), np.dtype[dtype_in]]
     C_up_proj_l1_ty = np.ndarray[(m, n), np.dtype[dtype_in]]
+    sum_l1_ty = np.ndarray[(m,), np.dtype[str_to_dtype("f32")]]
 
     # AIE Core Function declarations
     archive_name = f"ffn_{m}x{k}x{n}_archive.a" if archive is None else archive
@@ -395,11 +394,21 @@ def my_matmul(
         )
     )
     ffn_eltwise_add_vector = Kernel(
-        "eltwise_add_bf16_vector",
+        "ffn_eltwise_add_bf16_vector",
         archive_name,
         [A_l1_ty, A_l1_ty, A_l1_ty, np.int32],
     )
     # Add & Norm
+    ln2_zero_kernel = Kernel(
+        "ln_zero",
+        archive_name,
+        [sum_l1_ty, np.int32],
+    )
+    ln2_calc_sum_sumsq_kernel = Kernel(
+        "ln_calc_sum_sumsq",
+        archive_name,
+        [A_l1_ty, sum_l1_ty, sum_l1_ty],
+    )
     ln2_fused_add_layer_norm_kernel = Kernel(
         "fused_add_layer_norm_1outs",
         archive_name,
@@ -407,6 +416,8 @@ def my_matmul(
             A_l1_ty,
             A_l1_ty,
             ln_weights_ty,
+            sum_l1_ty,
+            sum_l1_ty,
             A_l1_ty,
             np.int32,
             np.int32,
@@ -463,6 +474,8 @@ def my_matmul(
     )
 
     # Output tiles for second Add & Norm
+    ln2_copy_out = [None] * nA_tiles_distributed
+    ln2_copy_in = [None] * nA_tiles_distributed
     ln2_l1l2_fifos = [None] * nA_tiles_distributed
     ln2_l2l3_fifos = [None] * nA_tiles_distributed
 
@@ -621,6 +634,34 @@ def my_matmul(
             depth=fifo_depth,
         )
 
+    # Down proj buffering in MT
+    for a_tile in range(nA_tiles_distributed):
+        ln2_copy_out[a_tile] = ObjectFifo(
+            A_l1_ty,
+            name=f"ln2_copy_out_{a_tile}",
+            depth=1,
+        )
+        ln2_copy_in[a_tile] = (
+            ln2_copy_out[a_tile]
+            .cons(depth=down_proj_depth)
+            .forward(
+                obj_type=A_l1_ty,
+                name=f"ln2_copy_in_{a_tile}",
+                depth=down_proj_depth,
+                placement=(
+                    Tile(
+                        (a_tile * nB_tiles_distributed + 1) % n_aie_cols,
+                        1,
+                    )
+                    if nA_tiles_distributed < 3
+                    else Tile(
+                        (a_tile * nB_tiles_distributed) % n_aie_cols,
+                        1,
+                    )
+                ),
+            )
+        )
+
     # Second Add & Norm output streams
     for a_tile in range(nA_tiles_distributed):
         dims_to_stream = [(m // r, r * k), (r, t), (k // t, r * t), (t, 1)]
@@ -753,30 +794,56 @@ def my_matmul(
 
     def core_fn_add_norm2(
         of_in1,
+        of_in1_copy,
         of_in2,
+        sum_buf,
+        sumsq_buf,
         weights,
         of_out1,
+        of_out1_copy,
         fused_add_layer_norm,
+        calc_sum_sumsq,
+        copy,
+        zero,
         stage_only,
     ):
         # Check if second add & norm stage is enabled, None means all stages are enabled
         if stage_only not in [2, None]:  # Skip computation for second add & norm stage
-            for row_idx in range_(ln_iters_per_core):
+            for _ in range_(down_proj_depth):
                 elem_in1 = of_in1.acquire(1)
+                elem_out1_copy = of_out1_copy.acquire(1)
+                of_out1_copy.release(1)
                 of_in1.release(1)
-                elem_out1 = of_out1.acquire(1)
+            for _ in range_(down_proj_depth):
+                elem_in1 = of_in1_copy.acquire(1)
                 elem_in2 = of_in2.acquire(1)
+                elem_out1 = of_out1.acquire(1)
                 of_out1.release(1)
+                of_in1_copy.release(1)
                 of_in2.release(1)
         else:
-            for row_idx in range_(ln_iters_per_core):
+            # TODO: Add another loop to take into account cases where the full rows aren't streamed in one go
+            # First calculate the sum_buf and sum_buf of squares of the inputs as they come
+            for _ in range_(down_proj_depth):
                 elem_in1 = of_in1.acquire(1)
+                elem_out1_copy = of_out1_copy.acquire(1)
+                calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
+                copy(elem_in1, elem_out1_copy, m * k)
+                of_out1_copy.release(1)
+                of_in1.release(1)
+            # Execute fused layer norm and add operations to output, with input from buffer in MT
+            for _ in range_(down_proj_depth):
+                elem_in1 = of_in1_copy.acquire(1)
                 elem_in2 = of_in2.acquire(1)
                 elem_out1 = of_out1.acquire(1)
-                fused_add_layer_norm(elem_in1, elem_in2, weights, elem_out1, K, m)
-                of_in1.release(1)
-                of_in2.release(1)
+                fused_add_layer_norm(
+                    elem_in1, elem_in2, weights, sum_buf, sumsq_buf, elem_out1, K, m
+                )
                 of_out1.release(1)
+                of_in1_copy.release(1)
+                of_in2.release(1)
+            zero(sum_buf, m)
+            zero(sumsq_buf, m)
 
     # Set up compute tiles
     workers = []
@@ -797,26 +864,38 @@ def my_matmul(
                 tile_col, tile_row = core_tiles[b_tile][a_tile * num_ffn_stages]
                 ln2_tile_col = tile_col + 1
                 ln2_tile_row = core_tiles[0][0][1]  # Get the bottom-most row index
-            if b_tile == nB_tiles_distributed - 1:
+            stream_to_ln = b_tile == nB_tiles_distributed - 1
+            if stream_to_ln:
                 # Second Add & Norm stage
                 ln2_weight_buffer = Buffer(
                     type=ln_weights_ty,
                     initial_value=static_ln2_weights,
                     name=f"static_ln2_weights_{a_tile}",
                 )
+                sum_buffer = Buffer(
+                    type=sum_l1_ty,
+                    name=f"sum_buffer_{a_tile}",
+                )
+                sumsq_buffer = Buffer(
+                    type=sum_l1_ty,
+                    name=f"sumsq_buffer_{a_tile}",
+                )
                 workers.append(
                     Worker(
                         core_fn_add_norm2,
                         [
-                            C_down_proj_out_l1l1_fifos[a_tile].cons(
-                                depth=1 if m > 8 else fifo_depth
-                            ),
-                            R_l2l1_fifos[a_tile].cons(depth=1 if m > 8 else fifo_depth),
+                            C_down_proj_out_l1l1_fifos[a_tile].cons(),
+                            ln2_copy_in[a_tile].cons(),
+                            R_l2l1_fifos[a_tile].cons(),
+                            sum_buffer,
+                            sumsq_buffer,
                             ln2_weight_buffer,
-                            ln2_l1l2_fifos[a_tile].prod(
-                                depth=1 if m > 8 else fifo_depth
-                            ),
+                            ln2_l1l2_fifos[a_tile].prod(),
+                            ln2_copy_out[a_tile].prod(),
                             ln2_fused_add_layer_norm_kernel,
+                            ln2_calc_sum_sumsq_kernel,
+                            ffn_mem_copy_fcn,
+                            ln2_zero_kernel,
                             stage_only,
                         ],
                         placement=Tile(
@@ -865,14 +944,10 @@ def my_matmul(
                         C_down_proj_part_l2l1_fifos[a_tile][b_tile].cons(depth=1),
                         C_down_proj_part_l1l2_fifos[a_tile][b_tile].prod(),
                         (
-                            # TODO: The index here is hardcoded to 0, so the rest of the objfifos will be used for the add & norm stage
-                            # Maybe there's a way to avoid having to hardcode to 0
-                            C_down_proj_out_l1l1_fifos[a_tile].prod(
-                                depth=1 if m > 8 else fifo_depth
-                            )
-                            if b_tile == nB_tiles_distributed - 1
+                            C_down_proj_out_l1l1_fifos[a_tile].prod(fifo_depth)
+                            if stream_to_ln
                             else C_down_proj_reduce_l1l1_fifos[a_tile][b_tile].prod(
-                                depth=1 if m > 8 else fifo_depth
+                                fifo_depth
                             )
                         ),
                         ffn_zero_kernel_down_proj,
@@ -959,8 +1034,14 @@ def my_matmul(
                         )
                         # This line does not change MLIR output at all - it's just for recording data movement
                         A_taps.append(A_tile)
-                        C_taps.append(A_tile)
 
+                        C_sizes = [1, K_div_k, m, k]
+                        C_tile = TensorAccessPattern(
+                            (M, K),
+                            offset=A_offset,
+                            sizes=C_sizes,
+                            strides=A_strides,
+                        )
                         place = (
                             Tile(nB_tiles_distributed + 1, 0)
                             if nA_tiles_distributed < 3
@@ -969,13 +1050,13 @@ def my_matmul(
                         rt.drain(
                             ln2_l2l3_fifos[a_tile].cons(),
                             C,
-                            tap=A_tile,
+                            tap=C_tile,
                             wait=True,
                             task_group=tg,
                             placement=place,
                         )
                         logging.debug(
-                            f"    Placed C output {a_tile} transfer at {place} with offset {A_tile.offset}, sizes {A_tile.sizes}, strides {A_tile.strides}"
+                            f"    Placed C output {a_tile} transfer at {place} with offset {C_tile.offset}, sizes {C_tile.sizes}, strides {C_tile.strides}"
                         )
                         # R input transfer:
                         place = (
@@ -986,13 +1067,17 @@ def my_matmul(
                         rt.fill(
                             R_l3l2_fifos[a_tile].prod(),
                             R,
-                            tap=A_tile,
+                            tap=C_tile,
                             task_group=tg,
                             placement=place,
                         )
                         logging.debug(
-                            f"    Placed R input {a_tile} transfer at {place} with offset {A_tile.offset}, sizes {A_tile.sizes}, strides {A_tile.strides}"
+                            f"    Placed R input {a_tile} transfer at {place} with offset {C_tile.offset}, sizes {C_tile.sizes}, strides {C_tile.strides}"
                         )
+                        # This line does not change MLIR output at all - it's just for recording data movement
+                        R_taps.append(C_tile)
+                        C_taps.append(C_tile)
+
                     for b_tile in range(nB_tiles_distributed):
                         for stage in range(num_ffn_stages):
                             logging.debug(
