@@ -350,7 +350,7 @@ def my_matmul(
     B_up_proj_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
     B_down_proj_l1_ty = np.ndarray[(n, k), np.dtype[dtype_in]]
     C_up_proj_l1_ty = np.ndarray[(m, n), np.dtype[dtype_in]]
-    sum_l1_ty = np.ndarray[(m,), np.dtype[str_to_dtype("f32")]]
+    sum_l1_ty = np.ndarray[(m,), np.dtype[dtype_out]]
 
     # AIE Core Function declarations
     archive_name = f"ffn_{m}x{k}x{n}_archive.a" if archive is None else archive
@@ -400,7 +400,7 @@ def my_matmul(
     )
     # Add & Norm
     ln2_zero_kernel = Kernel(
-        "ln_zero",
+        "ln_zero_bf16",
         archive_name,
         [sum_l1_ty, np.int32],
     )
@@ -419,7 +419,6 @@ def my_matmul(
             sum_l1_ty,
             sum_l1_ty,
             A_l1_ty,
-            np.int32,
             np.int32,
         ],
     )
@@ -627,6 +626,9 @@ def my_matmul(
             )
 
     # Down proj output C, m-by-k tiles
+    # NOTE: Can't undo the microtiles like with softmax in MHA output projection
+    # pipeline because it would use a DMA channel, and one is needed for residual
+    # connection, and another for the stream from MT back to core
     for a_tile in range(nA_tiles_distributed):
         C_down_proj_out_l1l1_fifos[a_tile] = ObjectFifo(
             A_l1_ty,
@@ -664,7 +666,7 @@ def my_matmul(
 
     # Second Add & Norm output streams
     for a_tile in range(nA_tiles_distributed):
-        dims_to_stream = [(m // r, r * k), (r, t), (k // t, r * t), (t, 1)]
+        dims_to_stream = [(m // r, r * k), (r, s), (k // s, r * s), (s, 1)]
         ln2_l1l2_fifos[a_tile] = ObjectFifo(
             A_l1_ty,
             name=f"ln2_L1L2_{a_tile}",
@@ -823,6 +825,9 @@ def my_matmul(
                 of_in2.release(1)
         else:
             # TODO: Add another loop to take into account cases where the full rows aren't streamed in one go
+            # Zero the buffers before accumulation
+            zero(sum_buf, m)
+            zero(sumsq_buf, m)
             # First calculate the sum_buf and sum_buf of squares of the inputs as they come
             for _ in range_(down_proj_depth):
                 elem_in1 = of_in1.acquire(1)
@@ -837,13 +842,11 @@ def my_matmul(
                 elem_in2 = of_in2.acquire(1)
                 elem_out1 = of_out1.acquire(1)
                 fused_add_layer_norm(
-                    elem_in1, elem_in2, weights, sum_buf, sumsq_buf, elem_out1, K, m
+                    elem_in1, elem_in2, weights, sum_buf, sumsq_buf, elem_out1, K
                 )
                 of_out1.release(1)
                 of_in1_copy.release(1)
                 of_in2.release(1)
-            zero(sum_buf, m)
-            zero(sumsq_buf, m)
 
     # Set up compute tiles
     workers = []
@@ -1035,7 +1038,7 @@ def my_matmul(
                         # This line does not change MLIR output at all - it's just for recording data movement
                         A_taps.append(A_tile)
 
-                        C_sizes = [1, K_div_k, m, k]
+                        C_sizes = [1, down_proj_depth, m, k]
                         C_tile = TensorAccessPattern(
                             (M, K),
                             offset=A_offset,

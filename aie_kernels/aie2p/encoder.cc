@@ -261,84 +261,116 @@ void matmul_with_acc_vectorized_1x4_mmul(const T_in *__restrict pA,
     event1();
 }
 
-template <typename T, int N>
+template <typename T, unsigned rowA, unsigned colA, unsigned r, unsigned s>
 void fused_add_layer_norm_1(const T *restrict input,
                             const T *restrict residual,
                             const T *restrict weight,
-                            const float *restrict sum,
-                            const float *restrict sumsq,
+                            const T *restrict sum,
+                            const T *restrict sumsq,
                             T *restrict output,
-                            const int32_t cols,
-                            const int32_t rows_to_process)
+                            const int32_t cols)
 {
     event0();
 #ifndef DEBUG_AIE_KERNELS
+
     constexpr float epsilon = 1e-5f;
-    int vector_chunks = cols / N;
+    constexpr unsigned mmul_c_size = r * s; // This is the number of elements in each C tile (microtile)
 
     AIE_PREPARE_FOR_PIPELINING
-    AIE_LOOP_MIN_ITERATION_COUNT(4)
-    for (int row = 0; row < rows_to_process; row++) {
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
 
-        int input_idx = row * cols;
+        const T *__restrict pA1 = input + (z * colA) * mmul_c_size;
+        const T *__restrict pR1 = residual + (z * colA) * mmul_c_size;
+        T *__restrict pC1 = output + (z * colA) * mmul_c_size;
 
-        float sum_of_vals = sum[row];
-        float sum_of_sq_vals = sumsq[row];
+        for (unsigned j = 0; j < colA; j += 1)
+#ifdef OPT_PERF_ENABLED
+            AIE_LOOP_FLATTEN
+#endif
+            {
+                aie::vector<T, s> weight_v = ::aie::load_v<s>(weight + j * s);
 
-        float mean = sum_of_vals / float(cols);
-        float mean_sq = mean * mean;
-        float variance = (sum_of_sq_vals / float(cols)) - mean_sq;
-        float inv_std = aie::invsqrt(variance + epsilon);
+                // Load four r x s result tiles from down projection
+                aie::vector<T, mmul_c_size> A0 = aie::load_v<mmul_c_size>(pA1);
+                pA1 += mmul_c_size;
 
-        ::aie::vector<T, N> mean_v = ::aie::broadcast<T, N>(mean);
-        ::aie::vector<T, N> inv_std_v = ::aie::broadcast<T, N>(inv_std);
+                // Load four r x s residual connection tiles
+                aie::vector<T, mmul_c_size> R0 = aie::load_v<mmul_c_size>(pR1);
+                pR1 += mmul_c_size;
 
-        const T *__restrict pW = weight;
-        const T *__restrict pRes = residual + row * cols;
-        T *__restrict pOut = output + row * cols;
-        for (int i = 0; i < vector_chunks; i++) {
+                // For each row within this microtile, apply layer norm and add residual
+                for (unsigned ri = 0; ri < r; ri++) {
+                    // Processing 1 x 4s vectors
+                    T sum_of_vals = sum[z * r + ri];
+                    T sum_of_sq_vals = sumsq[z * r + ri];
 
-            ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_idx);
-            ::aie::vector<T, N> reg_weight = ::aie::load_v<N>(pW);
-            ::aie::vector<T, N> reg_res = ::aie::load_v<N>(pRes);
-            ::aie::vector<T, N> diff_v = ::aie::sub(reg_a, mean_v);
-            ::aie::vector<T, N> norm_v = ::aie::mul(diff_v, inv_std_v);
-            ::aie::vector<T, N> scaled_v = aie::mul(norm_v, reg_weight);
-            // ::aie::vector<T, N> out_v = ::aie::add(scaled_v, beta_v);
-            ::aie::vector<T, N> out_v = ::aie::add(scaled_v, reg_res);
-            ::aie::store_v(pOut, out_v);
-            input_idx += N;
-            pW += N;
-            pRes += N;
-            pOut += N;
-        }
+                    float mean = aie::div(sum_of_vals, aie::to_float(cols));
+                    float mean_sq = mean * mean;
+                    float variance = (sum_of_sq_vals / aie::to_float(cols)) - mean_sq;
+                    float inv_std = aie::invsqrt(variance + epsilon);
+
+                    aie::accum<accfloat, s> a_acc;
+                    a_acc.from_vector(A0.template extract<s>(ri));
+                    aie::accum<accfloat, s> diff_acc = ::aie::sub(a_acc, mean);
+                    aie::accum<accfloat, s> norm_acc = ::aie::mul(diff_acc.template to_vector<float>(), inv_std);
+                    aie::accum<accfloat, s> scaled_acc = aie::mul(norm_acc.template to_vector<T>(), weight_v);
+                    // aie::accum<accfloat, s> out_v = ::aie::add(scaled_v, beta_v);
+                    aie::accum<accfloat, s> out_acc = ::aie::add(scaled_acc, R0.template extract<s>(ri));
+
+                    // Write s elements to one row of four r x s tiles in output
+                    ::aie::store_v(pC1 + ri * s, out_acc.template to_vector<T>(0));
+
+                    // Input values are indexed correctly
+                    // ::aie::store_v(pC1 + ri * s, A0.template extract<s>(ri));
+
+                    // Residual values are indexed correctly
+                    // ::aie::store_v(pC1 + ri * s, R0.template extract<s>(ri));
+
+                    // Weight values seem reasonable
+                    // ::aie::store_v(pC1 + ri * s, weight_v);
+
+                    // Sum seem reasonable
+                    // ::aie::store_v(pC1 + ri * s, ::aie::broadcast<T, s>(sum_of_vals));
+
+                    // Sum and sumsq values seem reasonable
+                    // auto sumsq_v = ::aie::broadcast<float, s>(sum_of_sq_vals);
+                    // aie::accum<accfloat, s> sumsq_acc;
+                    // sumsq_acc.from_vector(sumsq_v);
+                    // ::aie::store_v(pC1 + ri * s, sumsq_acc.template to_vector<T>(0));
+
+                    // Confirmed row indexing is correct with below
+                    // ::aie::store_v(pC1 + ri * s, ::aie::broadcast<T, s>(z * r + ri));
+                }
+                pC1 += mmul_c_size;
+            }
     }
 #else
+// NOTE: Keep in mind that the input to this kernel is tiled in mmul format,
+// which is fine since the stream to MT to shim will do a data layout transformation
 #if DEBUG_AIE_KERNELS == 0
     // In debug mode, just copy input to output
-    int total_elements = rows_to_process * cols;
     const T *__restrict pIn = input;
     T *__restrict pOut = output;
     AIE_PREPARE_FOR_PIPELINING
     // AIE_LOOP_MIN_ITERATION_COUNT(4)
-    for (int i = 0; i < total_elements; i += N) {
-        ::aie::vector<T, N> reg_a = ::aie::load_v<N>(pIn);
-        ::aie::store_v(pOut, reg_a);
-        pIn += N;
-        pOut += N;
+    for (int i = 0; i < rowA; i++) {
+        for (int j = 0; j < colA; j++) {
+            ::aie::vector<T, r * s> reg_a = ::aie::load_v<r * s>(pIn + (i * colA + j) * r * s);
+            ::aie::store_v(pOut + (i * colA + j) * r * s, reg_a);
+        }
     }
 #elif DEBUG_AIE_KERNELS == 1
     // In debug mode, just copy residual to output
-    int total_elements = rows_to_process * cols;
     const T *__restrict pRes = residual;
     T *__restrict pOut = output;
     AIE_PREPARE_FOR_PIPELINING
     // AIE_LOOP_MIN_ITERATION_COUNT(4)
-    for (int i = 0; i < total_elements; i += N) {
-        ::aie::vector<T, N> reg_a = ::aie::load_v<N>(pRes);
-        ::aie::store_v(pOut, reg_a);
-        pRes += N;
-        pOut += N;
+    for (int i = 0; i < rowA; i++) {
+        for (int j = 0; j < colA; j++) {
+            ::aie::vector<T, r * s> reg_a = ::aie::load_v<r * s>(pRes + (i * colA + j) * r * s);
+            ::aie::store_v(pOut + (i * colA + j) * r * s, reg_a);
+        }
     }
 #endif
 #endif
@@ -455,20 +487,21 @@ template <typename T, int N> void ln_zero_vectorized(T *__restrict c, int size)
 {
     event0();
 
-    v64uint8 *restrict outPtr = (v64uint8 *)c;
+    T *__restrict pOut1 = c;
+    auto zero_v = ::aie::zeros<T, N>();
 
     AIE_PREPARE_FOR_PIPELINING
     AIE_LOOP_MIN_ITERATION_COUNT(1)
-    for (int j = 0; j < size; j += N) // Nx samples per loop
-    {
-        *outPtr++ = aie::zeros<T, N>();
+    for (int j = 0; j < size; j += N) {
+        ::aie::store_v(pOut1, zero_v);
+        pOut1 += N;
     }
 
     event1();
 }
 
 template <typename T, unsigned rowA, unsigned colA, unsigned r, unsigned s>
-void ln_calc_sum_sumsq_vectorized(const T *__restrict pA, float *__restrict pSum, float *__restrict pSumSq)
+void ln_calc_sum_sumsq_vectorized(const T *__restrict pA, T *__restrict pSum, bfloat16 *__restrict pSumSq)
 {
     event0();
 
@@ -477,48 +510,32 @@ void ln_calc_sum_sumsq_vectorized(const T *__restrict pA, float *__restrict pSum
     AIE_PREPARE_FOR_PIPELINING
     AIE_LOOP_MIN_ITERATION_COUNT(1)
     for (unsigned z = 0; z < rowA; z += 1) {
-
         const T *__restrict pA1 = pA + (z * colA) * mmul_c_size;
 
         // Per-row accumulators for sum and sum-squared across all column tiles
-        ::aie::vector<float, r> sum_acc = ::aie::zeros<float, r>();
-        ::aie::vector<float, r> sumsq_acc = ::aie::zeros<float, r>();
-
-        for (unsigned j = 0; j < colA; j += 4)
-#ifdef OPT_PERF_ENABLED
-            AIE_LOOP_FLATTEN
-#endif
-            {
-                // Load partial results from C buffer for accumulation in-place. The
-                // zero.cc function handles the zeroing of data when a new
-                // accumulation is needed (after the 'K' reduction dimension)
-                aie::vector<T, mmul_c_size> A00 = aie::load_v<mmul_c_size>(pA1);
-                pA1 += mmul_c_size;
-                aie::vector<T, mmul_c_size> A01 = aie::load_v<mmul_c_size>(pA1);
-                pA1 += mmul_c_size;
-                aie::vector<T, mmul_c_size> A02 = aie::load_v<mmul_c_size>(pA1);
-                pA1 += mmul_c_size;
-                aie::vector<T, mmul_c_size> A03 = aie::load_v<mmul_c_size>(pA1);
-                pA1 += mmul_c_size;
-
-                // For each row within this microtile, accumulate sum and sum-squared
-                // across the 4 column tiles
-                for (unsigned ri = 0; ri < r; ri++) {
-                    aie::vector<T, 4 * s> row_v = aie::concat(A00.template extract<s>(ri),
-                                                              A01.template extract<s>(ri),
-                                                              A02.template extract<s>(ri),
-                                                              A03.template extract<s>(ri));
-                    aie::vector<T, 4 * s> row_v_sq = aie::mul(row_v, row_v);
-                    auto row_v_sum = ::aie::reduce_add(row_v);
-                    auto row_v_sum_sq = ::aie::reduce_add(row_v_sq);
-                    sum_acc[ri] = sum_acc[ri] + row_v_sum;
-                    sumsq_acc[ri] = sumsq_acc[ri] + row_v_sum_sq;
-                }
+        for (unsigned i = 0; i < r; i++) {
+            aie::accum<accfloat, s> running_total;
+            aie::accum<accfloat, s> running_sq_total;
+            running_total.from_vector(aie::zeros<bfloat16, s>(), 0);
+            running_sq_total.from_vector(aie::zeros<bfloat16, s>(), 0);
+            bfloat16 sum = 0;
+            bfloat16 sumsq = 0;
+            for (unsigned j = 0; j < colA; j += 1) {
+                aie::vector<bfloat16, s> A0 = aie::load_v<s>(pA1 + i * s + j * mmul_c_size);
+                aie::accum<accfloat, s> a_acc;
+                a_acc.from_vector(A0, 0);
+                running_total = aie::add(running_total, a_acc.template to_vector<bfloat16>(0));
+                auto sumsq_v = aie::mul(a_acc.template to_vector<bfloat16>(0), a_acc.template to_vector<bfloat16>(0));
+                running_sq_total = aie::add(running_sq_total, sumsq_v.template to_vector<bfloat16>(0));
             }
+            sum += aie::reduce_add(running_total.template to_vector<bfloat16>(0));
+            sumsq += aie::reduce_add(running_sq_total.template to_vector<bfloat16>(0));
 
-        // Store the final accumulated sums and sum-squared results for r rows
-        aie::store_v(pSum + z * r, sum_acc);
-        aie::store_v(pSumSq + z * r, sumsq_acc);
+            *pSum = sum;
+            *pSumSq = sumsq;
+            pSum++;
+            pSumSq++;
+        }
     }
 
     event1();
@@ -616,14 +633,20 @@ void ffn_eltwise_add_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out
 void fused_add_layer_norm_1outs(const bfloat16 *input,
                                 const bfloat16 *residual,
                                 const bfloat16 *weights,
-                                const float *sum,
-                                const float *sumsq,
+                                const bfloat16 *sum,
+                                const bfloat16 *sumsq,
                                 bfloat16 *output,
-                                const int32_t cols,
-                                const int32_t rows_to_process)
+                                const int32_t cols)
 {
+    constexpr int r = 8;
+    constexpr int s = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_K % s == 0);
+
     ::aie::set_rounding(aie::rounding_mode::conv_even);
-    fused_add_layer_norm_1<bfloat16, 32>(input, residual, weights, sum, sumsq, output, cols, rows_to_process);
+    fused_add_layer_norm_1<bfloat16, (DIM_M / r), (DIM_K / s), r, s>(
+        input, residual, weights, sum, sumsq, output, cols);
 }
 
 void fused_add_layer_norm_2outs(const bfloat16 *input,
@@ -638,13 +661,19 @@ void fused_add_layer_norm_2outs(const bfloat16 *input,
     fused_add_layer_norm_2<bfloat16, 32>(input, residual, weights, output1, output2, cols, rows_to_process);
 }
 
-void ln_zero(bfloat16 *C, int size)
+void ln_zero_bf16(bfloat16 *C, int size)
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
-    ln_zero_vectorized<bfloat16, 32>(C, size);
+    ln_zero_vectorized<bfloat16, 16>(C, size);
 }
 
-void ln_calc_sum_sumsq(const bfloat16 *A, float *pSum, float *pSumSq)
+void ln_zero_float(float *C, int size)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    ln_zero_vectorized<float, 8>(C, size);
+}
+
+void ln_calc_sum_sumsq(const bfloat16 *A, bfloat16 *pSum, bfloat16 *pSumSq)
 {
     constexpr int r = 8;
     constexpr int s = 8;
