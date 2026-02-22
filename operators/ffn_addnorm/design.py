@@ -855,17 +855,17 @@ def my_matmul(
             if nA_tiles_distributed < 3:
                 # FFN cores will be placed horizontally, adjacent col will be for Add & Norm core
                 # The direction of reduction will be from left to right
-                # Add 1 to col index since the left adjacent col is for an Add & Norm core
-                tile_col, tile_row = core_tiles[a_tile * num_ffn_stages][b_tile + 1]
+                tile_col, tile_row = core_tiles[a_tile * num_ffn_stages][b_tile]
                 ln2_tile_col = nB_tiles_distributed + 1
                 ln2_tile_row = tile_row
             else:
                 # FFN cores will be placed vertically
                 # The direction of reduction will be from up to down
-                # Bottom row will be for Add & Norm core since nB_tiles_distributed can at most be 2 to get even partitioning of power of 2 workloads
-                tile_col, tile_row = core_tiles[b_tile][a_tile * num_ffn_stages]
+                tile_col, tile_row = core_tiles[-1 * (b_tile + 1)][
+                    a_tile * num_ffn_stages
+                ]
                 ln2_tile_col = tile_col + 1
-                ln2_tile_row = core_tiles[0][0][1]  # Get the bottom-most row index
+                ln2_tile_row = tile_row - 1
             stream_to_ln = b_tile == nB_tiles_distributed - 1
             if stream_to_ln:
                 # Second Add & Norm stage
