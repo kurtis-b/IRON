@@ -26,7 +26,7 @@ from operators.transpose.op import AIETranspose
 from operators.ffn.op import AIEFFN
 from operators.addnorm.op import AIEAddAndNorm
 from operators.mha.op import AIEMHA
-from operators.addnorm_ffn.op import AIEANFFN
+from operators.ffn_addnorm.op import AIEFFNAN
 from operators.common.utils import torch_to_numpy
 
 
@@ -346,7 +346,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 "gelu_stage": 1,
             }
             # Second Layer normalization kernel
-            self.anffn_xclbin, self.anffn_insts = AIEANFFN(
+            self.anffn_xclbin, self.anffn_insts = AIEFFNAN(
                 M=self.seq_len,
                 K=self.hidden_size,
                 N=self.intermediate_size,
