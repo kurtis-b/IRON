@@ -350,7 +350,7 @@ def my_matmul(
     B_up_proj_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
     B_down_proj_l1_ty = np.ndarray[(n, k), np.dtype[dtype_in]]
     C_up_proj_l1_ty = np.ndarray[(m, n), np.dtype[dtype_in]]
-    sum_l1_ty = np.ndarray[(m,), np.dtype[dtype_out]]
+    sum_l1_ty = np.ndarray[(m,), np.dtype[str_to_dtype("f32")]]
 
     # AIE Core Function declarations
     archive_name = f"ffn_{m}x{k}x{n}_archive.a" if archive is None else archive
@@ -399,8 +399,8 @@ def my_matmul(
         [A_l1_ty, A_l1_ty, A_l1_ty, np.int32],
     )
     # Add & Norm
-    ln2_zero_kernel = Kernel(
-        "ln_zero_bf16",
+    ln2_zero_f32_kernel = Kernel(
+        "ln_zero_f32",
         archive_name,
         [sum_l1_ty, np.int32],
     )
@@ -636,34 +636,6 @@ def my_matmul(
             depth=fifo_depth,
         )
 
-    # Down proj buffering in MT
-    for a_tile in range(nA_tiles_distributed):
-        ln2_copy_out[a_tile] = ObjectFifo(
-            A_l1_ty,
-            name=f"ln2_copy_out_{a_tile}",
-            depth=1,
-        )
-        ln2_copy_in[a_tile] = (
-            ln2_copy_out[a_tile]
-            .cons(depth=down_proj_depth)
-            .forward(
-                obj_type=A_l1_ty,
-                name=f"ln2_copy_in_{a_tile}",
-                depth=down_proj_depth,
-                placement=(
-                    Tile(
-                        (a_tile * nB_tiles_distributed + 1) % n_aie_cols,
-                        1,
-                    )
-                    if nA_tiles_distributed < 3
-                    else Tile(
-                        (a_tile * nB_tiles_distributed) % n_aie_cols,
-                        1,
-                    )
-                ),
-            )
-        )
-
     # Second Add & Norm output streams
     for a_tile in range(nA_tiles_distributed):
         dims_to_stream = [(m // r, r * k), (r, s), (k // s, r * s), (s, 1)]
@@ -735,6 +707,7 @@ def my_matmul(
         copy,
         gelu,
         buffer_to_reduce,
+        is_end_of_down_proj,
         stage_only,
     ):
         # Check if down projection stage is enabled, None means all stages are enabled
@@ -753,13 +726,24 @@ def my_matmul(
                     curr_acc_c.release(1)
                 in_a.release(1)
             for _ in range_(down_proj_depth):
-                elem_final_acc_c = curr_acc_c.acquire(1)
+                elem_out_internal = curr_acc_c.acquire(1)
                 if buffer_to_reduce:
                     partial_acc_c = buffer_to_reduce.acquire(1)
                     buffer_to_reduce.release(1)
                 elem_out_acc_c = out_acc_c.acquire(1)
                 out_acc_c.release(1)
+                # Below is executed a second time due to the subsequent layer norm needing to process
+                # Only do this with the core that's sending the fully accumulated tile to the LN core
+                if is_end_of_down_proj:
+                    elem_new_acc_c = new_acc_c.acquire(1)
+                    new_acc_c.release(1)
                 curr_acc_c.release(1)
+            if is_end_of_down_proj:
+                for _ in range_(down_proj_depth):
+                    elem_out_internal = curr_acc_c.acquire(1)
+                    elem_out_acc_c = out_acc_c.acquire(1)
+                    out_acc_c.release(1)
+                    curr_acc_c.release(1)
         else:  # Perform down projection stage computation
             # First iteration just passes the partial C tile through
             for _ in range_(down_proj_depth):
@@ -782,6 +766,7 @@ def my_matmul(
             for _ in range_(down_proj_depth):
                 # Acquire what's in L2, which is the final accumulated result for the tile
                 elem_out_internal = curr_acc_c.acquire(1)
+                elem_out_acc_c = out_acc_c.acquire(1)
                 if buffer_to_reduce:
                     # Don't send any new data to MT, i.e. new_acc_c, because that will affect
                     # the data in the subsequent tiles. It's sufficient to just use
@@ -789,63 +774,68 @@ def my_matmul(
                     partial_acc_c = buffer_to_reduce.acquire(1)
                     add(partial_acc_c, elem_out_internal, elem_out_internal, m * k)
                     buffer_to_reduce.release(1)
-                elem_out_acc_c = out_acc_c.acquire(1)
                 copy(elem_out_internal, elem_out_acc_c, m * k)
+                # Below is executed a second time due to the subsequent layer norm needing to process
+                # Only do this with the core that's sending the fully accumulated tile to the LN core
+                if is_end_of_down_proj:
+                    elem_new_acc_c = new_acc_c.acquire(1)
+                    # Make sure to copy the final accumulated C tile
+                    copy(elem_out_acc_c, elem_new_acc_c, m * k)
+                    new_acc_c.release(1)
                 out_acc_c.release(1)
                 curr_acc_c.release(1)
+            if is_end_of_down_proj:
+                for _ in range_(down_proj_depth):
+                    elem_out_internal = curr_acc_c.acquire(1)
+                    elem_out_acc_c = out_acc_c.acquire(1)
+                    copy(elem_out_internal, elem_out_acc_c, m * k)
+                    out_acc_c.release(1)
+                    curr_acc_c.release(1)
 
     def core_fn_add_norm2(
         of_in1,
-        of_in1_copy,
         of_in2,
         sum_buf,
         sumsq_buf,
         weights,
         of_out1,
-        of_out1_copy,
         fused_add_layer_norm,
         calc_sum_sumsq,
-        copy,
-        zero,
+        zero_f32,
         stage_only,
     ):
         # Check if second add & norm stage is enabled, None means all stages are enabled
         if stage_only not in [2, None]:  # Skip computation for second add & norm stage
             for _ in range_(down_proj_depth):
                 elem_in1 = of_in1.acquire(1)
-                elem_out1_copy = of_out1_copy.acquire(1)
-                of_out1_copy.release(1)
                 of_in1.release(1)
             for _ in range_(down_proj_depth):
-                elem_in1 = of_in1_copy.acquire(1)
+                elem_in1 = of_in1.acquire(1)
                 elem_in2 = of_in2.acquire(1)
                 elem_out1 = of_out1.acquire(1)
                 of_out1.release(1)
-                of_in1_copy.release(1)
+                of_in1.release(1)
                 of_in2.release(1)
         else:
             # TODO: Add another loop to take into account cases where the full rows aren't streamed in one go
             # Zero the buffers before accumulation
-            zero(sum_buf, m)
-            zero(sumsq_buf, m)
+            zero_f32(sum_buf, m)
+            zero_f32(sumsq_buf, m)
             # First calculate the sum_buf and sum_buf of squares of the inputs as they come
             for _ in range_(down_proj_depth):
                 elem_in1 = of_in1.acquire(1)
-                elem_out1_copy = of_out1_copy.acquire(1)
                 calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
-                copy(elem_in1, elem_out1_copy, m * k)
-                of_out1_copy.release(1)
                 of_in1.release(1)
             # Execute fused layer norm and add operations to output, with input from buffer in MT
             for _ in range_(down_proj_depth):
-                elem_in1 = of_in1_copy.acquire(1)
+                elem_in1 = of_in1.acquire(1)
                 elem_in2 = of_in2.acquire(1)
                 elem_out1 = of_out1.acquire(1)
                 fused_add_layer_norm(
                     elem_in1, elem_in2, weights, sum_buf, sumsq_buf, elem_out1, K
                 )
                 of_out1.release(1)
-                of_in1_copy.release(1)
+                of_in1.release(1)
                 of_in2.release(1)
 
     # Set up compute tiles
@@ -888,17 +878,14 @@ def my_matmul(
                         core_fn_add_norm2,
                         [
                             C_down_proj_out_l1l1_fifos[a_tile].cons(),
-                            ln2_copy_in[a_tile].cons(),
                             R_l2l1_fifos[a_tile].cons(),
                             sum_buffer,
                             sumsq_buffer,
                             ln2_weight_buffer,
                             ln2_l1l2_fifos[a_tile].prod(),
-                            ln2_copy_out[a_tile].prod(),
                             ln2_fused_add_layer_norm_kernel,
                             ln2_calc_sum_sumsq_kernel,
-                            ffn_mem_copy_fcn,
-                            ln2_zero_kernel,
+                            ln2_zero_f32_kernel,
                             stage_only,
                         ],
                         placement=Tile(
@@ -965,6 +952,7 @@ def my_matmul(
                                 b_tile - 1
                             ].cons()
                         ),
+                        stream_to_ln,
                         stage_only,
                     ],
                     placement=(

@@ -104,6 +104,11 @@ def generate_golden_reference(
         layer_norm2_output = torch.nn.functional.layer_norm(
             down_proj_output, normalized_shape=(K,), weight=ln2_weights, bias=None
         )
+        for i in range(M):
+            print(f"Layer Norm 2 Output - Row {i} sum: {layer_norm2_output[i].sum()}")
+            print(
+                f"Layer Norm 2 Output - Row {i} sum of squares: {(layer_norm2_output[i] ** 2).sum()}"
+            )
         # print(f"Layer Norm 2 Input: {down_proj_output}")
         # print(f"Layer Norm 2 Output: {layer_norm2_output}")
         # Final addition with residual

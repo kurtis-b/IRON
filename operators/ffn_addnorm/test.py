@@ -52,6 +52,7 @@ def generate_test_params(extensive=False):
                 ## M scaled up from baseline
                 (16 * 8, 96, 96, 2, 16, 96, 96, 0, 1, 1, 1, None, 0),
                 # K scaled up from baseline, for now down_proj_depth is required to be scaled so that the full K is processed
+                (16, 96 * 2, 96, 2, 16, 96, 96, 0, 2, 1, 1, None, 0),
                 (16, 96 * 8, 96, 2, 16, 96, 96, 0, 8, 1, 1, None, 0),
                 ## N scaled up from baseline
                 (16, 96, 96 * 8, 2, 16, 96, 96, 0, 1, 1, 1, None, 0),
