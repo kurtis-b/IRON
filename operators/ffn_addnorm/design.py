@@ -420,6 +420,7 @@ def my_matmul(
             sum_l1_ty,
             A_l1_ty,
             np.int32,
+            np.int32,
         ],
     )
 
@@ -827,12 +828,20 @@ def my_matmul(
                 calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
                 of_in1.release(1)
             # Execute fused layer norm and add operations to output, with input from buffer in MT
-            for _ in range_(down_proj_depth):
+            for col_idx in range_(down_proj_depth):
+                col_i32 = index.casts(T.i32(), col_idx)
                 elem_in1 = of_in1.acquire(1)
                 elem_in2 = of_in2.acquire(1)
                 elem_out1 = of_out1.acquire(1)
                 fused_add_layer_norm(
-                    elem_in1, elem_in2, weights, sum_buf, sumsq_buf, elem_out1, K
+                    elem_in1,
+                    elem_in2,
+                    weights,
+                    sum_buf,
+                    sumsq_buf,
+                    elem_out1,
+                    K,
+                    col_i32,
                 )
                 of_out1.release(1)
                 of_in1.release(1)
