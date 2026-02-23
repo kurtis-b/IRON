@@ -32,14 +32,14 @@ def generate_golden_reference(
         dtype: Data type for tensors
         seed: Random seed for reproducibility
         debug_mode:
-            - If 0, check indexes through layer norm path,
+            - If 0, check indexes through FFN path,
             - if 1, check indexes through residual connection path,
             - else, random data
 
     Returns:
         Dictionary containing:
-            - input: Input tensor for first layer norm (M, K)
-            - input_residual: Input tensor for first residual addition (M, K)
+            - input: Input tensor for FFN (M, K)
+            - input_residual: Input tensor for residual addition (M, K)
             - input_b_up: Up-projection weight (K, N)
             - input_b_down: Down-projection weight (N, K)
             - output: Final output after FFN block (M, K)
@@ -51,26 +51,13 @@ def generate_golden_reference(
     # Generate input tensor (M, K)
     if debug_mode == 0:
         input_tensor = torch.arange(M * K, dtype=dtype_torch).reshape(M, K)
-        ln1_weights = torch.ones(K, dtype=dtype_torch)
         ln2_weights = torch.ones(K, dtype=dtype_torch)
     elif debug_mode == 1:
         input_tensor = torch.zeros(M, K, dtype=dtype_torch)
-        ln1_weights = torch.ones(K, dtype=dtype_torch)
         ln2_weights = torch.ones(K, dtype=dtype_torch)
     else:
         input_tensor = torch.rand(M, K, dtype=dtype_torch) * val_range
-        ln1_weights = torch.rand(K, dtype=dtype_torch) * val_range
         ln2_weights = torch.rand(K, dtype=dtype_torch) * val_range
-
-    if debug_mode == 0:
-        layer_norm1_output = input_tensor.clone()
-    else:
-        # input is 0's for deubg_mode 1, so layer norm output is also 0's
-        layer_norm1_output = torch.nn.functional.layer_norm(
-            input_tensor, normalized_shape=(K,), weight=ln1_weights, bias=None
-        )
-        # print(f"Layer Norm 1 Input: {input_tensor}")
-        # print(f"Layer Norm 1 Output: {layer_norm1_output}")
 
     # Generate input for residual addition (M, K)
     if debug_mode == 0:
@@ -81,9 +68,6 @@ def generate_golden_reference(
     else:
         input_residual = torch.rand(M, K, dtype=dtype_torch) * val_range
 
-    # Up proj input is just input_residual in debug mode since layer norm of zeros is zeros
-    add1_output = layer_norm1_output + input_residual
-
     # Generate up-projection weight (K, N)
     if debug_mode == 1 or debug_mode == 0:
         up_weight = torch.eye(K, N, dtype=dtype_torch)
@@ -91,7 +75,7 @@ def generate_golden_reference(
         up_weight = torch.randn(K, N, dtype=dtype_torch) * val_range
 
     # Up-projection: (M, K) @ (K, N) = (M, N)
-    up_proj_output = torch.matmul(add1_output, up_weight)
+    up_proj_output = torch.matmul(input_tensor, up_weight)
 
     # GeLU activation
     if debug_mode == 1 or debug_mode == 0:
@@ -115,22 +99,26 @@ def generate_golden_reference(
         output = down_proj_output.clone()
     elif debug_mode == 1:
         # The kernel passes through the residual only, so skip layer norm and add with down_proj_output
-        output = add1_output.clone()
+        output = input_residual.clone()
     else:
         layer_norm2_output = torch.nn.functional.layer_norm(
             down_proj_output, normalized_shape=(K,), weight=ln2_weights, bias=None
         )
+        # for i in range(M):
+        #     print(f"Layer Norm 2 Output - Row {i} sum: {layer_norm2_output[i].sum()}")
+        #     print(
+        #         f"Layer Norm 2 Output - Row {i} sum of squares: {(layer_norm2_output[i] ** 2).sum()}"
+        #     )
         # print(f"Layer Norm 2 Input: {down_proj_output}")
         # print(f"Layer Norm 2 Output: {layer_norm2_output}")
         # Final addition with residual
-        output = layer_norm2_output + add1_output
+        output = layer_norm2_output + input_residual
 
     return {
         "input": input_tensor,
         "input_residual": input_residual,
         "input_b_up": up_weight,
         "input_b_down": down_weight,
-        "weight1": ln1_weights,
         "weight2": ln2_weights,
         "output": output,
     }

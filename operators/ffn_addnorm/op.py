@@ -21,7 +21,7 @@ from operators.common import (
 from operators.common.utils import torch_to_numpy, numpy_to_torch
 
 
-class AIEANFFN(AIEOperatorBase):
+class AIEFFNAN(AIEOperatorBase):
     """
     AIE-accelerated ANFFN block for BERT, which has an add & norm, up-projection and down-projection with a GeLU in between, then another add & norm.
     The ANFFN block computes: R2 = LN(A) + R, C = LN(GeLU(R2 @ B_Up) @ B_Down) + R2
@@ -42,7 +42,6 @@ class AIEANFFN(AIEOperatorBase):
         tile_n=64,
         down_proj_depth=1,
         num_aie_columns=2,
-        ln1_weight=None,
         ln2_weight=None,
         debug_mode=-1,
         context=None,
@@ -84,7 +83,6 @@ class AIEANFFN(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        self.ln1_weight = ln1_weight
         self.ln2_weight = ln2_weight
         self.debug_mode = debug_mode
 
@@ -136,14 +134,10 @@ class AIEANFFN(AIEOperatorBase):
             f"{nA_tiles_distributed}_"
             f"{nB_tiles_distributed}_"
             f"{stage_only}_"
-            f"{gelu_stage}_"
+            f"{gelu_stage}"
         )
 
         # Save the weight weights to a npy file so that the design.py can load it at compile time
-        ln1_weight_file_name = (
-            self.context.build_dir / f"{file_name_total_base}_ln1_weight_{self.K}.npy"
-        )
-        np.save(ln1_weight_file_name, torch_to_numpy(self.ln1_weight))
         ln2_weight_file_name = (
             self.context.build_dir / f"{file_name_total_base}_ln2_weight_{self.K}.npy"
         )
@@ -174,7 +168,6 @@ class AIEANFFN(AIEOperatorBase):
                 "stage_only": stage_only,
                 "gelu_stage": gelu_stage,
                 "archive": kernel_archive,
-                "ln1_weight_file": ln1_weight_file_name,
                 "ln2_weight_file": ln2_weight_file_name,
                 "generate_taps": False,
             },
@@ -251,14 +244,21 @@ class AIEANFFN(AIEOperatorBase):
             ],
             extra_flags=[
                 "--dynamic-objFifos",
-                # "--profile"
+                "--profile",
+                "-v",
+                "--progress",
             ],
         )
 
         insts_artifact = InstsBinArtifact.new(
             f"{file_name_total_base}.bin",
             depends=[mlir_artifact],
-            extra_flags=["--dynamic-objFifos"],
+            extra_flags=[
+                "--dynamic-objFifos",
+                "--profile",
+                "-v",
+                "--progress",
+            ],
         )
 
         return (xclbin_artifact, insts_artifact)
@@ -309,7 +309,7 @@ class AIEANFFN(AIEOperatorBase):
         expected_output_shape = A.shape
         if expected_output_shape != R.shape:
             raise AIEOperatorConstraintError(
-                "AIEANFFN: input A and residual R must have the same shape"
+                "AIEFFNAN: input A and residual R must have the same shape"
             )
 
         # Remove batch dimension, if any
@@ -335,7 +335,7 @@ class AIEANFFN(AIEOperatorBase):
             and N <= self.N
         )
         if not applicable:
-            raise AIEOperatorConstraintError("AIEANFFN: incompatible tensor shape(s)")
+            raise AIEOperatorConstraintError("AIEFFNAN: incompatible tensor shape(s)")
 
         A_padded = self._pad_A(torch_to_numpy(A))
         R_padded = self._pad_A(torch_to_numpy(R))
