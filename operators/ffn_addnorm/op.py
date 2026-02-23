@@ -134,7 +134,7 @@ class AIEFFNAN(AIEOperatorBase):
             f"{nA_tiles_distributed}_"
             f"{nB_tiles_distributed}_"
             f"{stage_only}_"
-            f"{gelu_stage}_"
+            f"{gelu_stage}"
         )
 
         # Save the weight weights to a npy file so that the design.py can load it at compile time

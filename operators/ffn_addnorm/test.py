@@ -36,7 +36,6 @@ def generate_test_params(extensive=False):
         if INCLUDE_SIMPLE_TESTS:
             params_simple = [
                 #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
-                # TESTS WITH DIM_M > r (mmul api dim) BELOW
                 # GeLU fused with up projection
                 ## Baselines
                 ### No compute
@@ -113,7 +112,6 @@ def generate_test_params(extensive=False):
             ]
         params = params_simple + [
             #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
-            # TESTS WITH DIM_M > r (mmul api dim) BELOW
             # GeLU fused with up projection
             (512, 768, 3072, 8, 32, 96, 64, 0, 8, 2, 6, None, 0),
             (512, 768, 3072, 8, 32, 96, 64, 0, 8, 4, 3, None, 0),

@@ -329,24 +329,6 @@ void fused_add_layer_norm_1(const T *restrict input,
                 aie::store_v(pC1, R0);
 #endif
 #endif
-                // Weight values seem reasonable
-                // aie::store_v(pC1, weight_v);
-
-                // Sum seem reasonable
-                // auto sum_v = aie::broadcast<float, s>(*pSum1);
-                // aie::accum<accfloat, s> sum_acc;
-                // sum_acc.from_vector(sum_v);
-                // aie::store_v(pC1, sum_acc.template to_vector<T>(0));
-
-                // Sumsq values seem reasonable
-                // auto sumsq_v = aie::broadcast<float, s>(*pSumSq1);
-                // aie::accum<accfloat, s> sumsq_acc;
-                // sumsq_acc.from_vector(sumsq_v);
-                // aie::store_v(pC1, sumsq_acc.template to_vector<T>(0));
-
-                // Confirmed row indexing is correct with below
-                // aie::store_v(pC1, aie::broadcast<T, s>(z * r + ri));
-
                 pC1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
             }
 
@@ -570,7 +552,7 @@ void ffn_matmul_bf16_bf16_up_proj(const bfloat16 *A, const bfloat16 *B, bfloat16
 
     // NOTE: K and N, s and t are swapped here compared to the up projection since up projection
     // computes MxK with KxN, while down projection computes MxN with NxK
-    matmul_vectorized_1x4_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, t, s>(A, B, C);
+    matmul_vectorized_1x4_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, t, s>(A, B, C);
 }
 
 void ffn_matmul_with_acc_bf16_bf16_down_proj(const bfloat16 *A, const bfloat16 *B, bfloat16 *pAcc, bfloat16 *C)
