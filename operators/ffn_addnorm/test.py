@@ -29,6 +29,16 @@ Debug mode < 0 or > 1:
     Random data for all inputs, normal operation
 """
 
+"""
+TODO:
+- Handle cases where the full rows aren't streamed in one go by adding another loop to the core functions. 
+    This will require modifying the runtime sequence (and possibly adding waits for input synchronization) so
+    that the correct data is re-sent at the correct sequence. How the layer norm executes the sum/sumsq computation
+    and then applies the norm + add may need a bit of thought.
+- Modify the matmul and LN kernels so that they do 1x3 expansion, and possibly do 2x3 and 2x2 expansiosn as well
+    There should be a way to decide which expansion to do based on the tiling parameters.
+"""
+
 
 def generate_test_params(extensive=False):
     if TEST_BERT:
@@ -118,6 +128,13 @@ def generate_test_params(extensive=False):
             # GeLU fused with down projection
             (512, 768, 3072, 8, 32, 96, 64, 0, 8, 2, 6, None, 1),
             (512, 768, 3072, 8, 32, 96, 64, 0, 8, 4, 3, None, 1),
+            # Scale sequence length
+            (1024, 768, 3072, 8, 32, 96, 64, 0, 8, 4, 3, None, 1),
+            (2048, 768, 3072, 8, 32, 96, 64, 0, 8, 4, 3, None, 1),
+            # Scale hidden size (with matching scaling of down_proj_depth)
+            (512, 1024, 4096, 8, 32, 128, 32, 0, 8, 4, 2, None, 1),
+            (1024, 1024, 4096, 8, 32, 128, 32, 0, 8, 4, 2, None, 1),
+            (2048, 1024, 4096, 8, 32, 128, 32, 0, 8, 4, 2, None, 1),
         ]
         extensive_params = []
     else:

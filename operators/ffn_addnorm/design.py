@@ -826,7 +826,6 @@ def my_matmul(
                 of_in1.release(1)
                 of_in2.release(1)
         else:
-            # TODO: Add another loop to take into account cases where the full rows aren't streamed in one go
             # Zero the buffers before accumulation
             zero_f32(sum_buf, m)
             zero_f32(sumsq_buf, m)

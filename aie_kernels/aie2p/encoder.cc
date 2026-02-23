@@ -112,12 +112,6 @@ void matmul_vectorized_1x4_mmul(const T_in *__restrict pA, const T_in *__restric
                         C03.mac(A0, B3);
                     }
 
-                // TODO make shift right here to keep most significat bits
-                // when lowering the output
-                // example below shows how to shift right 10 bits
-                // #define SHIFT 10
-                // aie::store_v(pC1, C00.template to_vector<T_out>(SHIFT));
-
                 aie::store_v(pC1, C00.template to_vector<T_out>());
                 pC1 += MMUL::size_C;
                 aie::store_v(pC1, C01.template to_vector<T_out>());
@@ -240,12 +234,6 @@ void matmul_with_acc_vectorized_1x4_mmul(const T_in *__restrict pA,
                         C02.mac(A0, B2);
                         C03.mac(A0, B3);
                     }
-
-                // TODO make shift right here to keep most significat bits
-                // when lowering the output
-                // example below shows how to shift right 10 bits
-                // #define SHIFT 10
-                // aie::store_v(pC1, C00.template to_vector<T_out>(SHIFT));
 
                 aie::store_v(pC1, C00.template to_vector<T_out>());
                 pC1 += MMUL::size_C;
