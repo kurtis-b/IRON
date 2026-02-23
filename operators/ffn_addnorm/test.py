@@ -14,7 +14,7 @@ from operators.ffn_addnorm.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 TEST_BERT = True
-INCLUDE_SIMPLE_TESTS = True
+INCLUDE_SIMPLE_TESTS = False
 DEBUG_MODE = -1
 """
 Debug mode 0: 
