@@ -5,19 +5,65 @@
 import sys
 import pytest
 from pathlib import Path
+import logging
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from operators.mha.op import AIEMHA
-from operators.mha.reference import generate_golden_reference
+from operators.mha_out_proj.op import AIEMHAOutProj
+from operators.mha_out_proj.reference import generate_golden_reference
 from operators.common.test_utils import run_test
+
+# Debug mode controls which parts of the reference implementation are executed with random data vs. fixed data:
+# 0: No debug, all random data (full reference implementation)
+# 1: Debug self attention, ones for output projection weights
+# 2: Debug MHA output projection, ones for input and range for weights, and skip softmax computation
+DEBUG_MODE = 0
 
 
 def generate_test_params(extensive=False):
-    # params = [(16384, 64, 1, 8, True), (2048, 64, 32, 8, True), (512, 64, 12, 8, False)]
-    # names = ["mha_s16384_d64_h1_p8_1", "mha_s2048_d64_h32_p8_1", "bert_mha_s512_d64_h12_p8_0"]
-    params = [(512, 64, 12, 8, False)]
-    names = ["bert_mha_s512_d64_h12_p8_0"]
+    params = [
+        # NOTE: Currently only head_dim=64 is supported by the implementation.
+        # seq_len, head_dim, num_heads, seq_tile, emb_tile, parallel_heads, o_proj_acc_depth
+        # Base test
+        (64, 64, 3, 64, 64, 1, 1),
+        # Scale number of heads from base test
+        (64, 64, 12, 64, 64, 1, 1),
+        # Scale seq length from base test
+        (128, 64, 12, 64, 64, 1, 1),
+        (512, 64, 12, 64, 64, 1, 1),
+        (2048, 64, 12, 64, 64, 1, 1),
+        # Scale o_proj_acc_depth from base test
+        (64, 64, 8, 64, 64, 1, 8),
+        (64, 64, 12, 64, 64, 1, 6),
+        (512, 64, 12, 64, 64, 1, 6),
+        (2048, 64, 12, 64, 64, 1, 6),
+        # Scale parallel_heads from base test
+        (64, 64, 3, 64, 64, 3, 1),
+        (64, 64, 12, 64, 64, 6, 1),
+        (512, 64, 12, 64, 64, 6, 1),
+        (2048, 64, 12, 64, 64, 6, 1),
+        # BERT tests
+        (512, 64, 12, 64, 64, 6, 6),
+        (2048, 64, 12, 64, 64, 6, 6),
+    ]
+    extensive_params = []
+
+    if extensive:
+        params = extensive_params
+
+    names = []
+    for (
+        seq_len,
+        head_dim,
+        num_heads,
+        seq_tile,
+        emb_tile,
+        parallel_heads,
+        o_proj_acc_depth,
+    ) in params:
+        name = f"mha_{num_heads}heads_{seq_len}seq_{head_dim}hdim_{seq_tile}seqtile_{emb_tile}embtile_{parallel_heads}heads_{o_proj_acc_depth}acc"
+        names.append(name)
+
     return params, names
 
 
@@ -38,25 +84,36 @@ all_params = [
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
-@pytest.mark.parametrize("seq_len,dim,num_heads,num_pipelines,is_causal", all_params)
-def test_mha(seq_len, dim, num_heads, num_pipelines, is_causal, aie_context):
+@pytest.mark.parametrize(
+    "seq_len,head_dim,num_heads,seq_tile,emb_tile,parallel_heads,o_proj_acc_depth",
+    all_params,
+)
+def test_mha(
+    seq_len,
+    head_dim,
+    num_heads,
+    seq_tile,
+    emb_tile,
+    parallel_heads,
+    o_proj_acc_depth,
+    aie_context,
+):
     golden_ref = generate_golden_reference(
-        S_q=seq_len,
-        S_kv=seq_len,
-        d=dim,
+        seq_len=seq_len,
+        d=head_dim,
         heads=num_heads,
-        num_kv_heads=num_heads,
-        num_pipeline=num_pipelines,
-        is_causal=is_causal,
+        debug=DEBUG_MODE,
     )
 
-    operator = AIEMHA(
+    operator = AIEMHAOutProj(
         num_heads=num_heads,
         seq_len=seq_len,
-        d=dim,
-        num_KV_heads=num_heads,
-        num_of_pipelines=num_pipelines,
-        is_causal=is_causal,
+        d=head_dim,
+        seq_tile=seq_tile,
+        emb_tile=emb_tile,
+        parallel_heads=parallel_heads,
+        o_proj_acc_depth=o_proj_acc_depth,
+        debug=DEBUG_MODE,
         context=aie_context,
     )
 
@@ -64,6 +121,7 @@ def test_mha(seq_len, dim, num_heads, num_pipelines, is_causal, aie_context):
         "Q": golden_ref["Q"].flatten(),
         "K": golden_ref["K"].flatten(),
         "V": golden_ref["V"].flatten(),
+        "W_O": golden_ref["W_O"].flatten(),
     }
     output_buffers = {"O": golden_ref["O"].flatten()}
 
@@ -72,16 +130,16 @@ def test_mha(seq_len, dim, num_heads, num_pipelines, is_causal, aie_context):
     )
 
     error_threshold = 0.005
-    max_acceptable_errors = int(seq_len * dim * num_heads * error_threshold)
+    max_acceptable_errors = int(seq_len * head_dim * num_heads * error_threshold)
 
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
-    print(
-        "({} errors out of {} max allowable)".format(
-            len(errors["O"]), max_acceptable_errors
+    if errors:
+        print(
+            "({} errors out of {} max allowable)".format(
+                len(errors["O"]), max_acceptable_errors
+            )
         )
-    )
-
-    assert (
-        len(errors["O"]) <= max_acceptable_errors
-    ), f"Test failed with {len(errors['O'])} errors (max allowable: {max_acceptable_errors})"
+        assert (
+            len(errors["O"]) <= max_acceptable_errors
+        ), f"Test failed with {len(errors['O'])} errors (max allowable: {max_acceptable_errors})"
