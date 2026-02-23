@@ -294,7 +294,7 @@ void fused_add_layer_norm_1(const T *restrict input,
 
             const T *__restrict pW = weight + (col_idx * colA * s);
 
-            for (unsigned j = 0; j < colA; j += 1) {
+            for (unsigned j = 0; j < colA; j += 2) {
 
                 // Processing vectors of size s
                 float mean = aie::div(*pSum1, aie::to_float(cols));
@@ -304,29 +304,41 @@ void fused_add_layer_norm_1(const T *restrict input,
 
                 aie::vector<T, s> A0 = aie::load_v<s>(pA1);
                 pA1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
+                aie::vector<T, s> A1 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
+                auto A01 = aie::concat(A0, A1);
                 aie::vector<T, s> R0 = aie::load_v<s>(pR1);
                 pR1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
+                aie::vector<T, s> R1 = aie::load_v<s>(pR1);
+                pR1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
+                auto R01 = aie::concat(R0, R1);
 
-                aie::accum<accfloat, s> a_acc;
-                a_acc.from_vector(A0);
-                aie::accum<accfloat, s> diff_acc = aie::sub(a_acc, mean);
-                aie::accum<accfloat, s> norm_acc = aie::mul(diff_acc.template to_vector<float>(), inv_std);
-                aie::vector<T, s> weight_v = aie::load_v<s>(pW);
-                pW += s; // Move weight pointer to the columns
-                aie::vector<T, s> scaled_acc = aie::mul(norm_acc.template to_vector<T>(), weight_v);
-                // aie::accum<accfloat, s> out_v = aie::add(scaled_v, beta_v);
-                aie::vector<T, s> out_acc = aie::add(scaled_acc, R0);
+                aie::accum<accfloat, 2 * s> a_acc;
+                a_acc.from_vector(A01);
+                aie::accum<accfloat, 2 * s> diff_acc = aie::sub(a_acc, mean);
+                aie::accum<accfloat, 2 * s> norm_acc = aie::mul(diff_acc.template to_vector<float>(), inv_std);
+                aie::vector<T, 2 * s> weight_v = aie::load_v<2 * s>(pW);
+                pW += 2 * s; // Move weight pointer to the columns
+                aie::vector<T, 2 * s> scaled_acc = aie::mul(norm_acc.template to_vector<T>(), weight_v);
+                // aie::accum<accfloat, 2 * s> out_v = aie::add(scaled_v, beta_v);
+                aie::vector<T, 2 * s> out_acc = aie::add(scaled_acc, R01);
 
 #ifndef DEBUG_AIE_KERNELS
                 // Write s elements to one row of four r x s tiles in output
-                aie::store_v(pC1, out_acc);
+                aie::store_v(pC1, out_acc.template extract<s>(0));
+                pC1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
+                aie::store_v(pC1, out_acc.template extract<s>(1));
 #else
 #if DEBUG_AIE_KERNELS == 0
                 // Input values
                 aie::store_v(pC1, A0);
+                pC1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
+                aie::store_v(pC1, A1);
 #elif DEBUG_AIE_KERNELS == 1
                 // Residual values
                 aie::store_v(pC1, R0);
+                pC1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
+                aie::store_v(pC1, R1);
 #endif
 #endif
                 pC1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
@@ -486,13 +498,21 @@ void ln_calc_sum_sumsq_vectorized(const T *__restrict pA, float *__restrict pSum
 
         // Per-row accumulators for sum and sum-squared across all column tiles
         for (unsigned i = 0; i < r; i++) {
-            for (unsigned j = 0; j < colA; j += 1) {
+            for (unsigned j = 0; j < colA; j += 2) {
                 aie::vector<T, s> A0 = aie::load_v<s>(pA1);
                 pA1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
-                float sum = aie::reduce_add(A0);
-                aie::vector<float, s> a_acc_sq = aie::mul(A0, A0);
-                float sumsq = aie::reduce_add(a_acc_sq);
+                aie::vector<T, s> A1 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
+
+                aie::vector<T, s> A_sum = aie::add(A0, A1);
+                float sum = aie::reduce_add(A_sum);
                 *pSum1 += sum;
+
+                aie::vector<float, s> a_acc_sq0 = aie::mul(A0, A0);
+                float sumsq = aie::reduce_add(a_acc_sq0);
+                *pSumSq1 += sumsq;
+                aie::vector<float, s> a_acc_sq1 = aie::mul(A1, A1);
+                sumsq = aie::reduce_add(a_acc_sq1);
                 *pSumSq1 += sumsq;
             }
             pSum1++;
