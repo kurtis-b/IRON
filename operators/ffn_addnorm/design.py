@@ -96,7 +96,7 @@ def main():
         "--stage-only",
         type=int,
         choices=[-1, 0, 1, 2],
-        default=None,
+        default=-1,
         help="Compute enabled for 0: up_proj only, 1: down_proj only, 2: final add & norm only, None: all, -1: No compute",
     )
     argparser.add_argument(
@@ -497,7 +497,11 @@ def my_matmul(
                 obj_type=A_l1_ty,
                 name=f"A_L2L1_{a_tile}",
                 dims_to_stream=dims_to_stream_a,
-                placement=Tile(a_tile % n_aie_cols, 1),
+                placement=(
+                    Tile(a_tile % n_aie_cols, 1)
+                    if nA_tiles_distributed < 3
+                    else Tile((a_tile * 2) % n_aie_cols, 1)
+                ),
             )
         )
         # Input R (residual directly to second Add & Norm)
@@ -513,7 +517,11 @@ def my_matmul(
                 obj_type=A_l1_ty,
                 name=f"R_L2L1_{a_tile}",
                 dims_to_stream=dims_to_stream_a,
-                placement=Tile(a_tile % n_aie_cols, 1),
+                placement=(
+                    Tile(a_tile % n_aie_cols, 1)
+                    if nA_tiles_distributed < 3
+                    else Tile((a_tile * 2 + 1) % n_aie_cols, 1)
+                ),
             )
         )
 
@@ -607,7 +615,7 @@ def my_matmul(
                         )
                         if nA_tiles_distributed < 3
                         else Tile(
-                            (a_tile * nB_tiles_distributed + b_tile) % n_aie_cols,
+                            ((b_tile % 2) + (a_tile * 2)) % n_aie_cols,
                             1,
                         )
                     ),

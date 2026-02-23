@@ -244,14 +244,21 @@ class AIEFFNAN(AIEOperatorBase):
             ],
             extra_flags=[
                 "--dynamic-objFifos",
-                # "--profile"
+                "--profile",
+                "-v",
+                "--progress",
             ],
         )
 
         insts_artifact = InstsBinArtifact.new(
             f"{file_name_total_base}.bin",
             depends=[mlir_artifact],
-            extra_flags=["--dynamic-objFifos"],
+            extra_flags=[
+                "--dynamic-objFifos",
+                "--profile",
+                "-v",
+                "--progress",
+            ],
         )
 
         return (xclbin_artifact, insts_artifact)
