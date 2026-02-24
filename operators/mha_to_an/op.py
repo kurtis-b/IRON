@@ -34,6 +34,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         o_proj_acc_depth: int = 1,
         static_weights: bool = False,
         debug: int = 0,
+        ln_weight=None,
         context=None,
         skip_add_to_list=False,
     ):
@@ -59,6 +60,8 @@ class AIEMHAOutProj(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
+        self.ln_weight = ln_weight
+
         AIEOperatorBase.__init__(
             self, context=context, skip_add_to_list=skip_add_to_list
         )
@@ -69,6 +72,16 @@ class AIEMHAOutProj(AIEOperatorBase):
         operator_dir = Path(__file__).parent
 
         file_name_base = f"mha_o_proj_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}t_{self.emb_tile}e_{self.parallel_heads}ph_{self.o_proj_acc_depth}acc"
+
+        # Save layer norm weights to .npy for use at compile time
+        ln_weight_file_name = (
+            self.context.build_dir
+            / f"{file_name_base}_ln_weight_{self.embed_sz}.npy"
+        )
+        if self.ln_weight is not None:
+            np.save(ln_weight_file_name, torch_to_numpy(self.ln_weight))
+        else:
+            np.save(ln_weight_file_name, np.ones(self.embed_sz, dtype=bfloat16))
 
         # Define source files
         mm_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mm.cc")
@@ -117,7 +130,7 @@ class AIEMHAOutProj(AIEOperatorBase):
             "zero_scalar_bf16": "zero_scalar_bf16_o_proj",
         }
 
-        kernel_archive = f"mha_o_proj_kernels_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.debug}debug.a"
+        kernel_archive = f"mha_to_an_kernels_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.debug}debug.a"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -134,6 +147,7 @@ class AIEMHAOutProj(AIEOperatorBase):
                 "emulate_bf16_mmul_with_bfp16": True,
                 "kernel_archive": kernel_archive,
                 "trace_size": 0,
+                "ln_weight_file": ln_weight_file_name,
             },
         )
 
@@ -193,6 +207,24 @@ class AIEMHAOutProj(AIEOperatorBase):
                                 "eltwise_add_f32_vector": "eltwise_add_f32_vector_o_proj",
                             },
                         ),
+                        KernelObjectArtifact.new(
+                            f"mha_to_an_encoder_{self.seq_tile}x{self.emb_tile}.o",
+                            depends=[
+                                SourceArtifact.new(
+                                    self.context.base_dir
+                                    / "aie_kernels"
+                                    / "aie2p"
+                                    / "encoder.cc"
+                                )
+                            ],
+                            extra_flags=[
+                                "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+                                "-DBUILD_ADDNORM",
+                                f"-DDIM_M={self.seq_tile}",
+                                f"-DDIM_K={self.embed_sz}",
+                                f"-DDIM_N={self.emb_tile}",
+                            ],
+                        ),
                     ],
                 ),
             ],
@@ -249,17 +281,21 @@ class AIEMHAOutProj(AIEOperatorBase):
             self.embed_sz * self.seq_len,
         )
         self.add_buffer(
+            "R",
+            self.embed_sz * self.seq_len,
+        )
+        self.add_buffer(
             "O",
             self.embed_sz * self.seq_len,
         )
-        self.add_to_runlist("mha", "W_O", "Q", "K", "V", "O")
+        self.add_to_runlist("mha", "W_O", "Q", "K", "V", "R", "O")
 
-    # TODO: Update forward and execute functions
     def forward(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        r: torch.Tensor = None,
         w_o: torch.Tensor = None,
     ):
         applicable = (
@@ -276,7 +312,7 @@ class AIEMHAOutProj(AIEOperatorBase):
                 "AIEElementwiseAdd: incompatible tensor shape(s)"
             )
 
-        ret = self._execute_aie_operation(q, k, v, w_o)
+        ret = self._execute_aie_operation(q, k, v, r, w_o)
         return ret
 
     def _execute_aie_operation(
@@ -284,6 +320,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        r: torch.Tensor = None,
         w_o: torch.Tensor = None,
     ):
         # Convert to numpy
@@ -295,6 +332,9 @@ class AIEMHAOutProj(AIEOperatorBase):
         self.write_buffer("Q", q_np)
         self.write_buffer("K", k_np)
         self.write_buffer("V", v_np)
+        if r is not None:
+            r_np = torch_to_numpy(r)
+            self.write_buffer("R", r_np)
         if w_o is not None:
             w_o_np = torch_to_numpy(w_o)
             self.write_buffer("W_O", w_o_np)

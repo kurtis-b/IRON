@@ -86,6 +86,7 @@ def main():
         emulate_bf16_mmul_with_bfp16=args.emulate_bf16_mmul_with_bfp16,
         kernel_archive=args.kernel_archive,
         trace_size=args.trace_size,
+        ln_weight_file=None,
     )
 
     output_file_path = Path(args.output_file_path)
@@ -110,8 +111,18 @@ def fused_mha(
     emulate_bf16_mmul_with_bfp16: bool,
     kernel_archive: str,
     trace_size: int = 0,
+    ln_weight_file=None,
 ):
     embed_sz = heads * d
+
+    # Load static layer norm weights for Add & Norm stage
+    if ln_weight_file is None:
+        static_ln_weights = np.ones(embed_sz, dtype=bfloat16)
+    else:
+        static_ln_weights = np.load(ln_weight_file)
+
+    # Number of emb_tile-wide column tiles per full embedding row (used by LN core)
+    an_depth = embed_sz // emb_tile
 
     of_depth = 2
     enable_tracing = True if trace_size > 0 else False
@@ -172,6 +183,10 @@ def fused_mha(
         np.dtype[dtype],
     ]
     O_ty = np.ndarray[
+        (seq_len, embed_sz),
+        np.dtype[dtype],
+    ]
+    R_ty = np.ndarray[
         (seq_len, embed_sz),
         np.dtype[dtype],
     ]
@@ -254,6 +269,26 @@ def fused_mha(
         "eltwise_add_bf16_vector_o_proj",
         bin_name,
         [o_ty, o_ty, o_ty, np.int32],
+    )
+
+    # Layer norm (Add & Norm stage) kernel declarations
+    ln_weights_ty = np.ndarray[(embed_sz,), np.dtype[dtype]]
+    sum_l1_ty = np.ndarray[(seq_tile,), np.dtype[np.float32]]
+
+    ln_zero_f32_kernel = Kernel(
+        "ln_zero_f32",
+        bin_name,
+        [sum_l1_ty, np.int32],
+    )
+    ln_calc_sum_sumsq_kernel = Kernel(
+        "ln_calc_sum_sumsq",
+        bin_name,
+        [o_ty, sum_l1_ty, sum_l1_ty],
+    )
+    ln_fused_add_layer_norm_kernel = Kernel(
+        "fused_add_layer_norm_1outs",
+        bin_name,
+        [o_ty, o_ty, ln_weights_ty, sum_l1_ty, sum_l1_ty, o_ty, np.int32, np.int32],
     )
 
     # AIE-array data movement with object fifos
@@ -401,18 +436,36 @@ def fused_mha(
         )  # Local to 1 parallel block of heads
 
     o_dims = [(seq_tile // r, r * emb_tile), (r, t), (emb_tile // t, r * t), (t, 1)]
-    memO = ObjectFifo(
+
+    # Intermediate FIFO from last o_proj core to LN core (via MemTile join)
+    outOToLN = ObjectFifo(
         np.ndarray[(seq_tile, emb_tile), np.dtype[dtype]],
-        name="memO",
+        name="outOToLN",
         dims_to_stream=o_dims,
     )
-    outO = memO.prod().join(  # TODO: Check if this becomes a forward operation--or might give an error
+    outO = outOToLN.prod().join(
         offsets=[seq_tile * emb_tile],
         obj_types=[o_ty],
         names=[f"outO{i}"],
         depths=[of_depth],
         placement=Tile(col=7, row=1),
-    )  # Join onto the output OF
+    )  # Join onto the LN input FIFO
+
+    # Residual R: DRAM → MemTile → LN core
+    inR = ObjectFifo(
+        np.ndarray[(seq_tile, emb_tile), np.dtype[dtype]],
+        name="inR",
+        depth=of_depth,
+    )
+    memR = inR.cons().forward(
+        obj_type=o_ty,
+        name="memR",
+        dims_to_stream=o_dims,
+        placement=Tile(col=7, row=1),
+    )
+
+    # LN output: LN core → DRAM
+    outLN = ObjectFifo(o_ty, name="outLN", depth=of_depth)
 
     def batched_matmul_qk(
         of_q,
@@ -619,6 +672,7 @@ def fused_mha(
         matmul,
         add,
         copy,
+        is_last_o_proj_worker,
     ):
         """
         Amount of work for prev stages to generate its ouptut to next stage for one head:
@@ -680,8 +734,54 @@ def fused_mha(
 
                 elem_out_o = of_o_out.acquire(1)
                 copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                # Double-send: copy first-pass tile back to accumulator for the LN second pass
+                if is_last_o_proj_worker:
+                    elem_new_acc = of_o_acc_out.acquire(1)
+                    copy(elem_out_o, elem_new_acc, seq_tile * emb_tile)
+                    of_o_acc_out.release(1)
                 of_o_acc_in.release(1)
                 of_o_out.release(1)
+
+            # Second output loop: send tiles again for LN+add pass
+            if is_last_o_proj_worker:
+                for _ in range_(o_proj_acc_depth):
+                    elem_in_o_acc = of_o_acc_in.acquire(1)
+                    elem_out_o = of_o_out.acquire(1)
+                    copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                    of_o_acc_in.release(1)
+                    of_o_out.release(1)
+
+    def core_fn_add_norm(
+        of_in1,
+        of_in2,
+        sum_buf,
+        sumsq_buf,
+        weights,
+        of_out1,
+        fused_add_layer_norm,
+        calc_sum_sumsq,
+        zero_f32,
+    ):
+        for _ in range_(sys.maxsize):
+            zero_f32(sum_buf, seq_tile)
+            zero_f32(sumsq_buf, seq_tile)
+            # First pass: accumulate sum/sumsq from an_depth tiles
+            for _ in range_(an_depth):
+                elem_in1 = of_in1.acquire(1)
+                calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
+                of_in1.release(1)
+            # Second pass: apply fused layer norm + add
+            for col_idx in range_(an_depth):
+                col_i32 = index.casts(T.i32(), col_idx)
+                elem_in1 = of_in1.acquire(1)
+                elem_in2 = of_in2.acquire(1)
+                elem_out1 = of_out1.acquire(1)
+                fused_add_layer_norm(
+                    elem_in1, elem_in2, weights, sum_buf, sumsq_buf, elem_out1, embed_sz, col_i32
+                )
+                of_out1.release(1)
+                of_in1.release(1)
+                of_in2.release(1)
 
     # Create worker from task
     matmul_workers = []
@@ -768,19 +868,45 @@ def fused_mha(
                     memOW[i].cons(),
                     outOProjAccumIn[i].cons(depth=1),
                     outOProjAccumOut[i].prod(),
-                    # Last head writes to the output OF directly, others write to partial accumulation tiles
+                    # Last head writes to the LN input FIFO directly, others write to partial accumulation tiles
                     outOPart[i].prod() if i < parallel_heads - 1 else outO[0].prod(),
                     outOPart[i - 1].cons() if i > 0 else None,
                     zero_kernel_o_proj,
                     matmul_kernel_o_proj,
                     eltwise_add_vector,
                     mem_copy_o_proj,
+                    i == parallel_heads - 1,  # is_last_o_proj_worker
                 ],
                 stack_size=0xD00,
                 placement=Tile(col=i, row=5),
                 while_true=False,
             )
         )
+
+    # Create LN worker
+    ln_weight_buffer = Buffer(
+        type=ln_weights_ty,
+        initial_value=static_ln_weights,
+        name="static_ln_weights",
+    )
+    sum_buffer = Buffer(type=sum_l1_ty, name="sum_buffer")
+    sumsq_buffer = Buffer(type=sum_l1_ty, name="sumsq_buffer")
+    ln_worker = Worker(
+        core_fn_add_norm,
+        fn_args=[
+            outOToLN.cons(),
+            memR.cons(),
+            sum_buffer,
+            sumsq_buffer,
+            ln_weight_buffer,
+            outLN.prod(),
+            ln_fused_add_layer_norm_kernel,
+            ln_calc_sum_sumsq_kernel,
+            ln_zero_f32_kernel,
+        ],
+        placement=Tile(col=7, row=2),
+        while_true=False,
+    )
 
     # Define tensor access patterns for inputs/outputs
     # A and B are tiled across M and N respectively, while C is tiled across M and N
@@ -830,6 +956,12 @@ def fused_mha(
         ]
 
     O_tiles = TensorTiler2D.group_tiler(
+        (seq_len, embed_sz),
+        (seq_tile, emb_tile),
+        (1, embed_sz // emb_tile // num_o_col_groups),
+    )
+
+    R_tiles = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
         (seq_tile, emb_tile),
         (1, embed_sz // emb_tile // num_o_col_groups),
@@ -903,17 +1035,20 @@ def fused_mha(
     legalize_tas(V_tiles)
     legalize_tas(WO_tiles)
     legalize_tas(O_tiles)
+    legalize_tas(R_tiles)
 
     print_tap_seq_info(Q_tiles, "Q")
     print_tap_seq_info(K_tiles, "K")
     print_tap_seq_info(V_tiles, "V")
     print_tap_seq_info(WO_tiles, "W_O")
     print_tap_seq_info(O_tiles, "O")
+    print_tap_seq_info(R_tiles, "R")
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
-    with rt.sequence(W_O_ty, Q_ty, KV_ty, KV_ty, O_ty) as (W_O, Q, K, V, O):
+    with rt.sequence(W_O_ty, Q_ty, KV_ty, KV_ty, R_ty, O_ty) as (W_O, Q, K, V, R, O):
 
+        rt.start(ln_worker)
         for i in range(parallel_heads):
             rt.start(matmul_workers[i])
             rt.start(softmax_workers[i])
@@ -970,8 +1105,15 @@ def fused_mha(
                         f"    W_O tap: {WO_tiles[head_idx * num_o_col_groups + col_group]}"
                     )
 
+                rt.fill(
+                    inR.prod(),
+                    R,
+                    tap=R_tiles[q_block_idx * (num_o_col_groups) + col_group],
+                    placement=Tile(col=7, row=0),
+                    task_group=tg,
+                )
                 rt.drain(
-                    memO.cons(),
+                    outLN.cons(),
                     O,
                     tap=O_tiles[q_block_idx * (num_o_col_groups) + col_group],
                     wait=True,

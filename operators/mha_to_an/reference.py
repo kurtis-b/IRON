@@ -15,8 +15,9 @@ def generate_golden_reference(
     debug=0,
 ):
     """
-    Generate golden reference data for MHA (Multi-Head Attention). Note that this function generates data without
-    causal masking, as the implementation is for a BERT encoder.
+    Generate golden reference data for MHA (Multi-Head Attention) + Add & Norm.
+    Note that this function generates data without causal masking, as the
+    implementation is for a BERT encoder.
 
     Parameters:
         heads: Number of query heads
@@ -28,7 +29,8 @@ def generate_golden_reference(
             - 1: Self attention (QK^T, softmax, AV)
             - 2: MHA output projection
     Returns:
-        dict: Contains 'W_O' (output projection weights), 'Q' (query), 'K' (key), 'V' (value), 'O' (output)
+        dict: Contains 'W_O' (output projection weights), 'Q' (query), 'K' (key),
+              'V' (value), 'ln_weight' (layer norm weights), 'R' (residual), 'O' (output)
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -93,6 +95,20 @@ def generate_golden_reference(
     attn_output = O.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     O = torch.matmul(attn_output, out_proj_weights)
 
+    # Generate layer norm weights and residual for Add & Norm stage
+    if debug != 0:
+        ln_weight = torch.ones(embed_sz, dtype=torch.bfloat16)
+        R = torch.zeros(seq_len, embed_sz, dtype=torch.bfloat16)
+    else:
+        ln_weight = torch.rand(embed_sz, dtype=torch.bfloat16)
+        R = torch.rand(seq_len, embed_sz, dtype=torch.bfloat16)
+
+    # Apply layer norm + residual add
+    layer_norm_output = torch.nn.functional.layer_norm(
+        O, normalized_shape=(embed_sz,), weight=ln_weight, bias=None
+    )
+    O = layer_norm_output + R
+
     # Reshape for NPU format
     Q = Q.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     K = K.transpose(0, 1).contiguous().view(seq_len, embed_sz)
@@ -108,5 +124,7 @@ def generate_golden_reference(
         "Q": Q,
         "K": K,
         "V": V,
+        "ln_weight": ln_weight,
+        "R": R,
         "O": O,
     }

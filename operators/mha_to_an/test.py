@@ -9,8 +9,8 @@ import logging
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from operators.mha_out_proj.op import AIEMHAOutProj
-from operators.mha_out_proj.reference import generate_golden_reference
+from operators.mha_to_an.op import AIEMHAOutProj
+from operators.mha_to_an.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 # Debug mode controls which parts of the reference implementation are executed with random data vs. fixed data:
@@ -114,6 +114,7 @@ def test_mha(
         parallel_heads=parallel_heads,
         o_proj_acc_depth=o_proj_acc_depth,
         debug=DEBUG_MODE,
+        ln_weight=golden_ref["ln_weight"],
         context=aie_context,
     )
 
@@ -122,6 +123,7 @@ def test_mha(
         "K": golden_ref["K"].flatten(),
         "V": golden_ref["V"].flatten(),
         "W_O": golden_ref["W_O"].flatten(),
+        "R": golden_ref["R"].flatten(),
     }
     output_buffers = {"O": golden_ref["O"].flatten()}
 
