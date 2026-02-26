@@ -73,13 +73,13 @@ void matmul_PV(bfloat16 *Q,
 #endif
 
 #if DEBUG == 0 || DEBUG == 1
-    // 64 emul: O dims = [(8, 512), (8, 8), (8, 64), (8, 1)]
+    // 64 emul: O dims = [(4, 512), (8, 8), (8, 64), (8, 1)]
     // VJUNG: Scale O_{i-1} by 1/exp(m_{i-1} - m_{i}) store in scale_buffer[3*B_q:3*B_q + B_q]
     // VJUNG: Skip this for the first iteration as 1/exp(m_{i-1} - m_{i}) degenerates to inf due to m intizalized to
     // -inf
     using Vec8bf16 = aie::vector<bfloat16, 8>;
     if (first_iter != 0) {
-        for (int32_t l = 0; l < 8; l++) {
+        for (int32_t l = 0; l < 4; l++) {
             // Load 8 scale values at once for the current l iteration
             Vec8bf16 scale_row = aie::load_v<8>(scale_buffer + 3 * B_q + l * 8);
 
@@ -119,7 +119,7 @@ void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_bu
     // VJUNG: Need to scale depending on the data layout at the output of GEMM
     // VJUNG: Scale O_{i} by 1/l_{i}
     using Vec8bf16 = aie::vector<bfloat16, 8>;
-    for (int32_t l = 0; l < 8; l++) {
+    for (int32_t l = 0; l < 4; l++) {
         // Load 8 scale values at once for the current l iteration
         using Vec8bf16 = aie::vector<bfloat16, 8>;
         Vec8bf16 scale_row = aie::load_v<8>(scale_buffer + 2 * B_q + l * 8);
@@ -139,7 +139,7 @@ void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_bu
 #else
     // In debug mode, just copy input to output
     using Vec8bf16 = aie::vector<bfloat16, 8>;
-    for (int32_t l = 0; l < 8; l++) {
+    for (int32_t l = 0; l < 4; l++) {
         for (int32_t k = 0; k < 8; k++) {
             for (int32_t j = 0; j < 8; j++) {
                 Vec8bf16 o_vec = aie::load_v<8>(O + j * 64 + k * 8 + l * 512);
