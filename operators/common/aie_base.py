@@ -37,6 +37,7 @@ class AIEOperatorBase(ABC):
         self.kernels = {}  # Name -> (xclbin_path, xclbin_kernel_name, insts_path)
         self.buffers = {}  # Name -> required buffer size in bytes
         self.buffer_static_data = {}
+        self.buffer_aliases = {}  # Alias name -> target buffer name
         self.runlist = (
             []
         )  # List of (kernel_name, buffers_name, buffer_name...), will be executed in sequence

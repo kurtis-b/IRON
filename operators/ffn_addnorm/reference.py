@@ -40,6 +40,7 @@ def generate_golden_reference(
         Dictionary containing:
             - input: Input tensor for FFN (M, K)
             - input_residual: Input tensor for residual addition (M, K)
+            - input_and_residual: Combined input buffer [input; input_residual] (2M, K)
             - input_b_up: Up-projection weight (K, N)
             - input_b_down: Down-projection weight (N, K)
             - output: Final output after FFN block (M, K)
@@ -114,9 +115,12 @@ def generate_golden_reference(
         # Final addition with residual
         output = layer_norm2_output + input_residual
 
+    input_and_residual = torch.cat((input_tensor, input_residual), dim=0)
+
     return {
         "input": input_tensor,
         "input_residual": input_residual,
+        "input_and_residual": input_and_residual,
         "input_b_up": up_weight,
         "input_b_down": down_weight,
         "weight2": ln2_weights,

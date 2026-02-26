@@ -250,22 +250,14 @@ class AIEMHAOutProj(AIEOperatorBase):
             static_data=static_w_o_proj,
         )
         self.add_buffer(
-            "Q",
-            self.embed_sz * self.seq_len,
-        )
-        self.add_buffer(
-            "K",
-            self.embed_sz * self.seq_len,
-        )
-        self.add_buffer(
-            "V",
-            self.embed_sz * self.seq_len,
+            "QKV",
+            3 * self.embed_sz * self.seq_len,
         )
         self.add_buffer(
             "O",
             self.embed_sz * self.seq_len,
         )
-        self.add_to_runlist("mha", "W_O", "Q", "K", "V", "O")
+        self.add_to_runlist("mha", "W_O", "QKV", "O")
 
     # TODO: Update forward and execute functions
     def forward(
@@ -303,11 +295,10 @@ class AIEMHAOutProj(AIEOperatorBase):
         q_np = torch_to_numpy(q)
         k_np = torch_to_numpy(k)
         v_np = torch_to_numpy(v)
+        qkv_np = np.concatenate((q_np, k_np, v_np), axis=0)
 
         # Write padded buffers
-        self.write_buffer("Q", q_np)
-        self.write_buffer("K", k_np)
-        self.write_buffer("V", v_np)
+        self.write_buffer("QKV", qkv_np)
         if w_o is not None:
             w_o_np = torch_to_numpy(w_o)
             self.write_buffer("W_O", w_o_np)

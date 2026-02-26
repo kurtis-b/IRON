@@ -122,9 +122,7 @@ def test_mha(
     )
 
     input_buffers = {
-        "Q": golden_ref["Q"].flatten(),
-        "K": golden_ref["K"].flatten(),
-        "V": golden_ref["V"].flatten(),
+        "QKV": golden_ref["QKV"].flatten(),
         "W_O": golden_ref["W_O"].flatten(),
     }
     output_buffers = {"O": golden_ref["O"].flatten()}

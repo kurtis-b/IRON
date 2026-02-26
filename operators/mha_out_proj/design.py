@@ -171,12 +171,8 @@ def fused_mha(
         (embed_sz, embed_sz),
         np.dtype[dtype],
     ]
-    Q_ty = np.ndarray[
-        (seq_len, embed_sz),
-        np.dtype[dtype],
-    ]
-    KV_ty = np.ndarray[
-        (seq_len, embed_sz),
+    QKV_ty = np.ndarray[
+        (3 * seq_len, embed_sz),
         np.dtype[dtype],
     ]
     O_ty = np.ndarray[
@@ -809,22 +805,44 @@ def fused_mha(
     # across the heads, not the sequence length (i.e. how it's done in the MHA operator),
     # because the cores execute on each head. However, we have to keep in mind that
     # K/v need to have the full sequence length passed for each head.
-    Q_tiles = TensorTiler2D.group_tiler(
+    q_tiles_base = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
         (q_seq_tile, d),
         (1, heads),
     )
 
-    K_tiles = TensorTiler2D.group_tiler(
+    k_tiles_base = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
         (kv_seq_tile, d),
         (num_kv_seq_blocks, parallel_heads),
     )
 
-    V_tiles = TensorTiler2D.group_tiler(
+    v_tiles_base = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
         (kv_seq_tile, d),
         (num_kv_seq_blocks, parallel_heads),
+    )
+
+    def retarget_tas(base_tas, tensor_shape, offset_delta=0):
+        return TensorAccessSequence.from_taps(
+            [
+                TensorAccessPattern(
+                    tensor_shape,
+                    offset=tap.offset + offset_delta,
+                    sizes=tap.sizes,
+                    strides=tap.strides,
+                )
+                for tap in base_tas
+            ]
+        )
+
+    qkv_tensor_shape = (3 * seq_len, embed_sz)
+    Q_tiles = retarget_tas(q_tiles_base, qkv_tensor_shape, offset_delta=0)
+    K_tiles = retarget_tas(
+        k_tiles_base, qkv_tensor_shape, offset_delta=seq_len * embed_sz
+    )
+    V_tiles = retarget_tas(
+        v_tiles_base, qkv_tensor_shape, offset_delta=2 * seq_len * embed_sz
     )
 
     # NOTE: Dividing by num_o_col_groups to get the correct number of tiles expected
@@ -933,7 +951,7 @@ def fused_mha(
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
-    with rt.sequence(W_O_ty, Q_ty, KV_ty, KV_ty, O_ty) as (W_O, Q, K, V, O):
+    with rt.sequence(W_O_ty, QKV_ty, O_ty) as (W_O, QKV, O):
 
         for i in range(parallel_heads):
             rt.start(matmul_workers[i])
@@ -949,20 +967,20 @@ def fused_mha(
 
                 rt.fill(
                     inQ.prod(),
-                    Q,
+                    QKV,
                     tap=Q_tiles[q_block_idx],
                     placement=Tile(col=0, row=0),
                     task_group=tg,
                 )
                 logging.debug(
-                    f"Scheduling fills for q block {q_block_idx}, col group {col_group} for Q, K, V, W_O, and O"
+                    f"Scheduling fills for q block {q_block_idx}, col group {col_group} for QKV, W_O, and O"
                 )
                 logging.debug(f"  Q tap: {Q_tiles[q_block_idx]}")
                 for head_idx in range(heads // parallel_heads):
                     tg_head = rt.task_group()
                     rt.fill(
                         inK.prod(),
-                        K,
+                        QKV,
                         tap=K_tiles[head_idx],
                         placement=Tile(col=1, row=0),
                         task_group=tg_head,
@@ -970,7 +988,7 @@ def fused_mha(
                     )
                     rt.fill(
                         inV.prod(),
-                        V,
+                        QKV,
                         tap=V_tiles[head_idx],
                         placement=Tile(col=2, row=0),
                         task_group=tg_head,

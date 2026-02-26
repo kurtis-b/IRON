@@ -28,7 +28,8 @@ def generate_golden_reference(
             - 1: Self attention (QK^T, softmax, AV)
             - 2: MHA output projection
     Returns:
-        dict: Contains 'W_O' (output projection weights), 'Q' (query), 'K' (key), 'V' (value), 'O' (output)
+        dict: Contains 'W_O' (output projection weights), 'QKV' (stacked query/key/value),
+              and 'O' (output)
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -98,15 +99,16 @@ def generate_golden_reference(
     K = K.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     V = V.transpose(0, 1).contiguous().view(seq_len, embed_sz)
 
+    # Combine Q/K/V into one DRAM buffer: [Q; K; V] along the sequence axis.
+    QKV = torch.cat([Q, K, V], dim=0)
+
     # Log shapes for debugging
     logging.debug(
-        f"Q shape: {Q.shape}, K shape: {K.shape}, V shape: {V.shape}, O shape: {O.shape}"
+        f"Q shape: {Q.shape}, K shape: {K.shape}, V shape: {V.shape}, QKV shape: {QKV.shape}, O shape: {O.shape}"
     )
 
     return {
         "W_O": out_proj_weights,
-        "Q": Q,
-        "K": K,
-        "V": V,
+        "QKV": QKV,
         "O": O,
     }

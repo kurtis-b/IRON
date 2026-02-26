@@ -248,8 +248,7 @@ def test_ffn(
     )
 
     input_buffers = {
-        "A": golden_ref["input"].flatten(),
-        "R": golden_ref["input_residual"].flatten(),
+        "AR": golden_ref["input_and_residual"].flatten(),
         "B_Up": golden_ref["input_b_up"].flatten(),
         "B_Down": golden_ref["input_b_down"].flatten(),
     }

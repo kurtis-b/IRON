@@ -293,12 +293,11 @@ class AIEFFNAN(AIEOperatorBase):
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_buffer("A", self.M * self.K)
-        self.add_buffer("R", self.M * self.K)
+        self.add_buffer("AR", 2 * self.M * self.K)
         self.add_buffer("B_Up", self.K * self.N, static_data=static_weights_up_proj)
         self.add_buffer("B_Down", self.K * self.N, static_data=static_weights_down_proj)
         self.add_buffer("C", self.M * self.K)
-        self.add_to_runlist("anffn", "A", "R", "B_Up", "B_Down", "C")
+        self.add_to_runlist("anffn", "AR", "B_Up", "B_Down", "C")
 
     def forward(self, A, R, B_Up=None, B_Down=None):
         """Forward pass through ANFFN block: R2 = LN(A) + R, C = LN(GeLU(R2 @ B_Up) @ B_Down) + R2"""
@@ -427,8 +426,8 @@ class AIEFFNAN(AIEOperatorBase):
         assert K == K2 and K == K3 and K == self.K
         assert N == N2 and N == self.N
 
-        self.write_buffer("A", A_np)
-        self.write_buffer("R", R_np)
+        ar_np = np.concatenate((A_np, R_np), axis=0)
+        self.write_buffer("AR", ar_np)
         if B_Up_np is not None:
             self.write_buffer("B_Up", B_Up_np)
         if B_Down_np is not None:
