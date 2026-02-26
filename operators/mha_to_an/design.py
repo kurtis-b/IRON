@@ -121,9 +121,6 @@ def fused_mha(
     else:
         static_ln_weights = np.load(ln_weight_file)
 
-    # Number of emb_tile-wide column tiles per full embedding row (used by LN core)
-    an_depth = embed_sz // emb_tile
-
     of_depth = 2
     enable_tracing = True if trace_size > 0 else False
     dtype_str = "bf16"
@@ -435,37 +432,38 @@ def fused_mha(
             ObjectFifo(o_ty, depth=of_depth, name=f"outOPart{i}")
         )  # Local to 1 parallel block of heads
 
-    o_dims = [(seq_tile // r, r * emb_tile), (r, t), (emb_tile // t, r * t), (t, 1)]
-
-    # Intermediate FIFO from last o_proj core to LN core (via MemTile join)
-    outOToLN = ObjectFifo(
-        np.ndarray[(seq_tile, emb_tile), np.dtype[dtype]],
-        name="outOToLN",
-        dims_to_stream=o_dims,
+    # Intermediate FIFO from last o_proj core to LN core
+    outO = ObjectFifo(
+        o_ty,
+        name="outO",
+        depth=of_depth,
     )
-    outO = outOToLN.prod().join(
-        offsets=[seq_tile * emb_tile],
-        obj_types=[o_ty],
-        names=[f"outO{i}"],
-        depths=[of_depth],
-        placement=Tile(col=7, row=1),
-    )  # Join onto the LN input FIFO
 
-    # Residual R: DRAM → MemTile → LN core
+    r_dims = [
+        (seq_tile // r, r * emb_tile),
+        (emb_tile // s, s),
+        (r, emb_tile),
+        (s, 1),
+    ]
+    # Residual R
     inR = ObjectFifo(
-        np.ndarray[(seq_tile, emb_tile), np.dtype[dtype]],
+        o_ty,
         name="inR",
         depth=of_depth,
     )
     memR = inR.cons().forward(
         obj_type=o_ty,
         name="memR",
-        dims_to_stream=o_dims,
+        dims_to_stream=r_dims,
         placement=Tile(col=7, row=1),
     )
 
-    # LN output: LN core → DRAM
+    # LN output
+    o_dims = [(seq_tile // r, r * emb_tile), (r, s), (emb_tile // s, r * s), (s, 1)]
     outLN = ObjectFifo(o_ty, name="outLN", depth=of_depth)
+    memLN = outLN.cons().forward(
+        obj_type=o_ty, name="memLN", dims_to_stream=o_dims, placement=Tile(col=7, row=1)
+    )
 
     def batched_matmul_qk(
         of_q,
@@ -496,8 +494,8 @@ def fused_mha(
                     elem_in_k = of_k.acquire(1)
                     elem_a_out = of_a_out.acquire(1)
 
-                    zero(elem_a_out)
-                    matmul_QK(elem_in_q, elem_in_k, elem_a_out, idx_buffer)
+                    # zero(elem_a_out)
+                    # matmul_QK(elem_in_q, elem_in_k, elem_a_out, idx_buffer)
 
                     of_k.release(1)
                     of_a_out.release(1)
@@ -531,7 +529,7 @@ def fused_mha(
 
             for _ in range_(num_qkv_head_block_per_parallel_head):
 
-                init_scale_buffer(scale_buffer, seq_tile)
+                # init_scale_buffer(scale_buffer, seq_tile)
 
                 for _ in range_(num_qkv_seq_blocks):
 
@@ -539,18 +537,18 @@ def fused_mha(
                     elt_of_in_a = of_in_a.acquire(1)
                     elt_of_out_scale = of_out_scale.acquire(1)
 
-                    partial_softmax(
-                        elt_of_in_a,
-                        elt_of_out_p,
-                        scale_buffer,
-                        idx_buffer,
-                        inv_scale,
-                        seq_tile,
-                        seq_tile,
-                        seq_len,
-                        seq_len,
-                    )
-                    memcopy_kernel_scale(scale_buffer, elt_of_out_scale, 4 * seq_tile)
+                    # partial_softmax(
+                    #     elt_of_in_a,
+                    #     elt_of_out_p,
+                    #     scale_buffer,
+                    #     idx_buffer,
+                    #     inv_scale,
+                    #     seq_tile,
+                    #     seq_tile,
+                    #     seq_len,
+                    #     seq_len,
+                    # )
+                    # memcopy_kernel_scale(scale_buffer, elt_of_out_scale, 4 * seq_tile)
 
                     of_in_a.release(1)
                     of_out_p.release(1)
@@ -582,22 +580,22 @@ def fused_mha(
 
                 elem_o_out = of_o_out.acquire(1)
 
-                zero(elem_o_out)
+                # zero(elem_o_out)
 
                 ### First iteration, don't rescale O_{i-1}
                 elem_in_p = of_p.acquire(1)
                 elem_in_v = of_v.acquire(1)
                 elt_of_out_scale = of_scale.acquire(1)
 
-                matmul_PV(
-                    elem_in_p,
-                    elem_in_v,
-                    elem_o_out,
-                    elt_of_out_scale,
-                    seq_tile,
-                    0,
-                    idx_buffer,
-                )
+                # matmul_PV(
+                #     elem_in_p,
+                #     elem_in_v,
+                #     elem_o_out,
+                #     elt_of_out_scale,
+                #     seq_tile,
+                #     0,
+                #     idx_buffer,
+                # )
 
                 of_p.release(1)
                 of_v.release(1)
@@ -612,15 +610,15 @@ def fused_mha(
                         elem_in_v = of_v.acquire(1)
                         elt_of_out_scale2 = of_scale.acquire(1)
 
-                        matmul_PV(
-                            elem_in_p,
-                            elem_in_v,
-                            elem_o_out,
-                            elt_of_out_scale2,
-                            seq_tile,
-                            1,
-                            idx_buffer,
-                        )
+                        # matmul_PV(
+                        #     elem_in_p,
+                        #     elem_in_v,
+                        #     elem_o_out,
+                        #     elt_of_out_scale2,
+                        #     seq_tile,
+                        #     1,
+                        #     idx_buffer,
+                        # )
 
                         of_p.release(1)
                         of_v.release(1)
@@ -634,16 +632,16 @@ def fused_mha(
                     elem_in_v = of_v.acquire(1)
                     elt_of_out_scale3 = of_scale.acquire(1)
 
-                    matmul_PV(
-                        elem_in_p,
-                        elem_in_v,
-                        elem_o_out,
-                        elt_of_out_scale3,
-                        seq_tile,
-                        1,
-                        idx_buffer,
-                    )
-                    rescale_O(elem_o_out, elt_of_out_scale3, seq_tile, idx_buffer)
+                    # matmul_PV(
+                    #     elem_in_p,
+                    #     elem_in_v,
+                    #     elem_o_out,
+                    #     elt_of_out_scale3,
+                    #     seq_tile,
+                    #     1,
+                    #     idx_buffer,
+                    # )
+                    # rescale_O(elem_o_out, elt_of_out_scale3, seq_tile, idx_buffer)
 
                     of_p.release(1)
                     of_v.release(1)
@@ -652,7 +650,7 @@ def fused_mha(
                     idx_buffer[0] += 0
                 # else:
                 else:
-                    rescale_O(elem_o_out, elt_of_out_scale, seq_tile, idx_buffer)
+                    # rescale_O(elem_o_out, elt_of_out_scale, seq_tile, idx_buffer)
                     idx_buffer[0] += 0
                 ###
 
@@ -697,7 +695,7 @@ def fused_mha(
             for _ in range_(o_proj_acc_depth):
 
                 elem_out_o_acc = of_o_acc_out.acquire(1)
-                zero(elem_out_o_acc)
+                # zero(elem_out_o_acc)
                 of_o_acc_out.release(1)
 
             for _ in range_(num_qkv_head_block_per_parallel_head):
@@ -709,7 +707,7 @@ def fused_mha(
                     elem_in_o_acc = of_o_acc_in.acquire(1)
                     elem_in_ow = of_ow_in.acquire(1)
                     elem_out_o_acc = of_o_acc_out.acquire(1)
-                    matmul(elem_in_o, elem_in_ow, elem_in_o_acc, elem_out_o_acc)
+                    # matmul(elem_in_o, elem_in_ow, elem_in_o_acc, elem_out_o_acc)
                     of_o_acc_out.release(1)
                     of_ow_in.release(1)
                     of_o_acc_in.release(1)
@@ -727,17 +725,17 @@ def fused_mha(
                     # the data in the subsequent tiles. It's sufficient to just use
                     # the internal buffer as input and output
                     partial_o_acc = buffer_to_reduce.acquire(1)
-                    add(
-                        partial_o_acc, elem_in_o_acc, elem_in_o_acc, seq_tile * emb_tile
-                    )
+                    # add(
+                    #     partial_o_acc, elem_in_o_acc, elem_in_o_acc, seq_tile * emb_tile
+                    # )
                     buffer_to_reduce.release(1)
 
                 elem_out_o = of_o_out.acquire(1)
-                copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                # copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
                 # Double-send: copy first-pass tile back to accumulator for the LN second pass
                 if is_last_o_proj_worker:
                     elem_new_acc = of_o_acc_out.acquire(1)
-                    copy(elem_out_o, elem_new_acc, seq_tile * emb_tile)
+                    # copy(elem_out_o, elem_new_acc, seq_tile * emb_tile)
                     of_o_acc_out.release(1)
                 of_o_acc_in.release(1)
                 of_o_out.release(1)
@@ -747,7 +745,7 @@ def fused_mha(
                 for _ in range_(o_proj_acc_depth):
                     elem_in_o_acc = of_o_acc_in.acquire(1)
                     elem_out_o = of_o_out.acquire(1)
-                    copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                    # copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
                     of_o_acc_in.release(1)
                     of_o_out.release(1)
 
@@ -763,22 +761,29 @@ def fused_mha(
         zero_f32,
     ):
         for _ in range_(sys.maxsize):
-            zero_f32(sum_buf, seq_tile)
-            zero_f32(sumsq_buf, seq_tile)
-            # First pass: accumulate sum/sumsq from an_depth tiles
-            for _ in range_(an_depth):
+            # zero_f32(sum_buf, seq_tile)
+            # zero_f32(sumsq_buf, seq_tile)
+            # First pass: accumulate sum/sumsq from o_proj_acc_depth tiles
+            for _ in range_(o_proj_acc_depth):
                 elem_in1 = of_in1.acquire(1)
-                calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
+                # calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
                 of_in1.release(1)
             # Second pass: apply fused layer norm + add
-            for col_idx in range_(an_depth):
+            for col_idx in range_(o_proj_acc_depth):
                 col_i32 = index.casts(T.i32(), col_idx)
                 elem_in1 = of_in1.acquire(1)
                 elem_in2 = of_in2.acquire(1)
                 elem_out1 = of_out1.acquire(1)
-                fused_add_layer_norm(
-                    elem_in1, elem_in2, weights, sum_buf, sumsq_buf, elem_out1, embed_sz, col_i32
-                )
+                # fused_add_layer_norm(
+                #     elem_in1,
+                #     elem_in2,
+                #     weights,
+                #     sum_buf,
+                #     sumsq_buf,
+                #     elem_out1,
+                #     embed_sz,
+                #     col_i32,
+                # )
                 of_out1.release(1)
                 of_in1.release(1)
                 of_in2.release(1)
@@ -869,7 +874,7 @@ def fused_mha(
                     outOProjAccumIn[i].cons(depth=1),
                     outOProjAccumOut[i].prod(),
                     # Last head writes to the LN input FIFO directly, others write to partial accumulation tiles
-                    outOPart[i].prod() if i < parallel_heads - 1 else outO[0].prod(),
+                    outOPart[i].prod() if i < parallel_heads - 1 else outO.prod(),
                     outOPart[i - 1].cons() if i > 0 else None,
                     zero_kernel_o_proj,
                     matmul_kernel_o_proj,
@@ -894,7 +899,7 @@ def fused_mha(
     ln_worker = Worker(
         core_fn_add_norm,
         fn_args=[
-            outOToLN.cons(),
+            outO.cons(),
             memR.cons(),
             sum_buffer,
             sumsq_buffer,
@@ -904,7 +909,7 @@ def fused_mha(
             ln_calc_sum_sumsq_kernel,
             ln_zero_f32_kernel,
         ],
-        placement=Tile(col=7, row=2),
+        placement=Tile(col=parallel_heads, row=5),
         while_true=False,
     )
 
@@ -1048,12 +1053,12 @@ def fused_mha(
     rt = Runtime()
     with rt.sequence(W_O_ty, Q_ty, KV_ty, KV_ty, R_ty, O_ty) as (W_O, Q, K, V, R, O):
 
-        rt.start(ln_worker)
         for i in range(parallel_heads):
             rt.start(matmul_workers[i])
             rt.start(softmax_workers[i])
             rt.start(matmul_pv_workers[i])
             rt.start(o_proj_workers[i])
+        rt.start(ln_worker)
 
         for q_block_idx in range(num_qkv_seq_blocks):
 
@@ -1113,7 +1118,7 @@ def fused_mha(
                     task_group=tg,
                 )
                 rt.drain(
-                    outLN.cons(),
+                    memLN.cons(),
                     O,
                     tap=O_tiles[q_block_idx * (num_o_col_groups) + col_group],
                     wait=True,
