@@ -23,28 +23,28 @@ DEBUG_MODE = 0
 def generate_test_params(extensive=False):
     params = [
         # NOTE: Currently only head_dim=64 is supported by the implementation.
-        # seq_len, head_dim, num_heads, seq_tile, emb_tile, ffn_tile, parallel_heads, o_proj_acc_depth
+        # seq_len, head_dim, num_heads, seq_tile, emb_tile, parallel_heads, o_proj_acc_depth
         # Base test
-        (64, 64, 3, 64, 64, 96, 1, 1),
-        # # Scale number of heads from base test
-        # (64, 64, 12, 64, 64, 1, 1),
-        # # Scale seq length from base test
-        # (128, 64, 12, 64, 64, 1, 1),
-        # (512, 64, 12, 64, 64, 1, 1),
-        # (2048, 64, 12, 64, 64, 1, 1),
-        # # Scale o_proj_acc_depth from base test
-        # (64, 64, 8, 64, 64, 1, 8),
-        # (64, 64, 12, 64, 64, 1, 6),
-        # (512, 64, 12, 64, 64, 1, 6),
-        # (2048, 64, 12, 64, 64, 1, 6),
-        # # Scale parallel_heads from base test
-        # (64, 64, 3, 64, 64, 3, 1),
-        # (64, 64, 12, 64, 64, 6, 1),
-        # (512, 64, 12, 64, 64, 6, 1),
-        # (2048, 64, 12, 64, 64, 6, 1),
-        # # BERT tests
-        # (512, 64, 12, 64, 64, 6, 6),
-        # (2048, 64, 12, 64, 64, 6, 6),
+        (64, 64, 3, 32, 64, 1, 3),
+        # Scale number of heads from base test
+        (64, 64, 12, 32, 64, 1, 1),
+        # Scale seq length from base test
+        (128, 64, 12, 32, 64, 1, 1),
+        (512, 64, 12, 32, 64, 1, 1),
+        (2048, 64, 12, 32, 64, 1, 1),
+        # Scale o_proj_acc_depth from base test
+        (64, 64, 8, 32, 64, 1, 8),
+        (64, 64, 12, 32, 64, 1, 6),
+        (512, 64, 12, 32, 64, 1, 6),
+        (2048, 64, 12, 32, 64, 1, 6),
+        # Scale parallel_heads from base test
+        (64, 64, 3, 32, 64, 3, 1),
+        (64, 64, 12, 32, 64, 6, 1),
+        (512, 64, 12, 32, 64, 6, 1),
+        (2048, 64, 12, 32, 64, 6, 1),
+        # BERT tests
+        (512, 64, 12, 32, 64, 6, 6),
+        (2048, 64, 12, 32, 64, 6, 6),
     ]
     extensive_params = []
 
@@ -119,11 +119,9 @@ def test_mha(
     )
 
     input_buffers = {
-        "Q": golden_ref["Q"].flatten(),
-        "K": golden_ref["K"].flatten(),
-        "V": golden_ref["V"].flatten(),
+        "QKV": golden_ref["QKV"].flatten(),
         "W_O": golden_ref["W_O"].flatten(),
-        "R": golden_ref["R"].flatten(),
+        "OR": golden_ref["OR"].flatten(),
     }
     output_buffers = {"O": golden_ref["O"].flatten()}
 

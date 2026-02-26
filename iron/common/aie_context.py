@@ -136,7 +136,11 @@ class AIEContext:
 
             # Allocate buffers
             buffer_allocations = {}
+            alias_map = op.buffer_aliases
             for buffer_name, buffer_min_size in op.buffers.items():
+                if buffer_name in alias_map:
+                    # Alias BOs are resolved after target buffers are allocated.
+                    continue
                 if buffer_name in op.buffer_static_data:
                     static_data = op.buffer_static_data[buffer_name]
                     op.buffer_bos[buffer_name] = self.static_data_pool[static_data]
@@ -162,6 +166,14 @@ class AIEContext:
 
                 buffer_allocations[buffer_name] = (alloc_pool, alloc_idx)
                 op.buffer_bos[buffer_name] = bo_pools[alloc_pool][alloc_idx]
+
+            # Resolve alias BOs after concrete allocations.
+            for alias_name, target_name in alias_map.items():
+                if target_name not in op.buffer_bos:
+                    raise RuntimeError(
+                        f"Alias target buffer '{target_name}' not allocated for alias '{alias_name}'."
+                    )
+                op.buffer_bos[alias_name] = op.buffer_bos[target_name]
 
             # Setup runlist
             _, (first_xclbin, first_xclbin_kernel_name, first_insts) = next(
