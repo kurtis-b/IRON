@@ -7,7 +7,9 @@
 #include <stdlib.h>
 #include <type_traits>
 
+#ifndef VECTOR_LENGTH
 #define VECTOR_LENGTH 64
+#endif
 
 #define ROUNDING_MODE aie::rounding_mode::conv_even
 

@@ -171,7 +171,11 @@ class AIEMHAOutProj(AIEOperatorBase):
                         KernelObjectArtifact.new(
                             f"mha_o_proj_mha_{self.q_seq_tile}m_{self.d}k_{self.kv_seq_tile}n_causal0_{self.debug}.o",
                             depends=[SourceArtifact.new(mha_source)],
-                            extra_flags=["-DIS_CAUSAL=0", f"-DDEBUG={self.debug}"],
+                            extra_flags=[
+                                "-DIS_CAUSAL=0",
+                                f"-DDEBUG={self.debug}",
+                                "-DVECTOR_LENGTH=32",
+                            ],
                         ),
                         KernelObjectArtifact.new(
                             f"mha_o_proj_passThrough_{self.q_seq_tile}m_{self.emb_tile}n.o",
