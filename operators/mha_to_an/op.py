@@ -75,13 +75,9 @@ class AIEMHAOutProj(AIEOperatorBase):
 
         # Save layer norm weights to .npy for use at compile time
         ln_weight_file_name = (
-            self.context.build_dir
-            / f"{file_name_base}_ln_weight_{self.embed_sz}.npy"
+            self.context.build_dir / f"{file_name_base}_ln_weight_{self.embed_sz}.npy"
         )
-        if self.ln_weight is not None:
-            np.save(ln_weight_file_name, torch_to_numpy(self.ln_weight))
-        else:
-            np.save(ln_weight_file_name, np.ones(self.embed_sz, dtype=bfloat16))
+        np.save(ln_weight_file_name, torch_to_numpy(self.ln_weight))
 
         # Define source files
         mm_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mm.cc")
@@ -221,8 +217,10 @@ class AIEMHAOutProj(AIEOperatorBase):
                                 "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
                                 "-DBUILD_ADDNORM",
                                 f"-DDIM_M={self.seq_tile}",
-                                f"-DDIM_K={self.embed_sz}",
-                                f"-DDIM_N={self.emb_tile}",
+                                f"-DDIM_K={self.emb_tile}",
+                                f"-DDIM_N={self.emb_tile}",  # Unused for layer norm but required for compilation, set to emb_tile for simplicity
+                                # TODO: Need to think about how debug mode should work here
+                                # f"-DDEBUG_AIE_KERNELS={self.debug_mode}",
                             ],
                         ),
                     ],
