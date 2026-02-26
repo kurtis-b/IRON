@@ -23,28 +23,29 @@ DEBUG_MODE = 0
 def generate_test_params(extensive=False):
     params = [
         # NOTE: Currently only head_dim=64 is supported by the implementation.
-        # seq_len, head_dim, num_heads, seq_tile, emb_tile, parallel_heads, o_proj_acc_depth
+        # seq_len, head_dim, num_heads, q_seq_tile, kv_seq_tile, emb_tile, parallel_heads, o_proj_acc_depth
         # Base test
-        (64, 64, 3, 64, 64, 1, 1),
+        (64, 64, 3, 32, 64, 64, 1, 1),
+        (128, 64, 3, 32, 64, 64, 1, 1),
         # Scale number of heads from base test
-        (64, 64, 12, 64, 64, 1, 1),
+        (64, 64, 12, 32, 64, 64, 1, 1),
         # Scale seq length from base test
-        (128, 64, 12, 64, 64, 1, 1),
-        (512, 64, 12, 64, 64, 1, 1),
-        (2048, 64, 12, 64, 64, 1, 1),
+        (128, 64, 12, 32, 64, 64, 1, 1),
+        (512, 64, 12, 32, 64, 64, 1, 1),
+        (2048, 64, 12, 32, 64, 64, 1, 1),
         # Scale o_proj_acc_depth from base test
-        (64, 64, 8, 64, 64, 1, 8),
-        (64, 64, 12, 64, 64, 1, 6),
-        (512, 64, 12, 64, 64, 1, 6),
-        (2048, 64, 12, 64, 64, 1, 6),
+        (64, 64, 8, 32, 64, 64, 1, 8),
+        (64, 64, 12, 32, 64, 64, 1, 6),
+        (512, 64, 12, 32, 64, 64, 1, 6),
+        (2048, 64, 12, 32, 64, 64, 1, 6),
         # Scale parallel_heads from base test
-        (64, 64, 3, 64, 64, 3, 1),
-        (64, 64, 12, 64, 64, 6, 1),
-        (512, 64, 12, 64, 64, 6, 1),
-        (2048, 64, 12, 64, 64, 6, 1),
+        (64, 64, 3, 32, 64, 64, 3, 1),
+        (64, 64, 12, 32, 64, 64, 6, 1),
+        (512, 64, 12, 32, 64, 64, 6, 1),
+        (2048, 64, 12, 32, 64, 64, 6, 1),
         # BERT tests
-        (512, 64, 12, 64, 64, 6, 6),
-        (2048, 64, 12, 64, 64, 6, 6),
+        (512, 64, 12, 32, 64, 64, 6, 6),
+        (2048, 64, 12, 32, 64, 64, 6, 6),
     ]
     extensive_params = []
 
@@ -56,12 +57,13 @@ def generate_test_params(extensive=False):
         seq_len,
         head_dim,
         num_heads,
-        seq_tile,
+        q_seq_tile,
+        kv_seq_tile,
         emb_tile,
         parallel_heads,
         o_proj_acc_depth,
     ) in params:
-        name = f"mha_{num_heads}heads_{seq_len}seq_{head_dim}hdim_{seq_tile}seqtile_{emb_tile}embtile_{parallel_heads}heads_{o_proj_acc_depth}acc"
+        name = f"mha_{num_heads}heads_{seq_len}seq_{head_dim}hdim_{q_seq_tile}qseqtile_{kv_seq_tile}kvseqtile_{emb_tile}embtile_{parallel_heads}heads_{o_proj_acc_depth}acc"
         names.append(name)
 
     return params, names
@@ -85,14 +87,15 @@ all_params = [
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "seq_len,head_dim,num_heads,seq_tile,emb_tile,parallel_heads,o_proj_acc_depth",
+    "seq_len,head_dim,num_heads,q_seq_tile,kv_seq_tile,emb_tile,parallel_heads,o_proj_acc_depth",
     all_params,
 )
 def test_mha(
     seq_len,
     head_dim,
     num_heads,
-    seq_tile,
+    q_seq_tile,
+    kv_seq_tile,
     emb_tile,
     parallel_heads,
     o_proj_acc_depth,
@@ -109,7 +112,8 @@ def test_mha(
         num_heads=num_heads,
         seq_len=seq_len,
         d=head_dim,
-        seq_tile=seq_tile,
+        q_seq_tile=q_seq_tile,
+        kv_seq_tile=kv_seq_tile,
         emb_tile=emb_tile,
         parallel_heads=parallel_heads,
         o_proj_acc_depth=o_proj_acc_depth,
