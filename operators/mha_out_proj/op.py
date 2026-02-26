@@ -92,7 +92,13 @@ class AIEMHAOutProj(AIEOperatorBase):
             "-DROUND_CONV_EVEN",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ]
-        mm_defines_colmaj = mm_defines_rowmaj + [
+        mm_defines_colmaj = [
+            "-Dbf16_bf16_ONLY",
+            f"-DDIM_M={self.q_seq_tile}",
+            f"-DDIM_K={self.kv_seq_tile}",
+            f"-DDIM_N={self.d}",
+            "-DROUND_CONV_EVEN",
+            "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
             "-DB_COL_MAJ",
         ]
         mm_rename_symbols = {
