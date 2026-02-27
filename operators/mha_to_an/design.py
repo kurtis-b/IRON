@@ -58,7 +58,7 @@ def main():
     argparser.add_argument("--heads", type=int, default=1)
     argparser.add_argument("--seq-len", type=int, default=256)
     argparser.add_argument("-d", type=int, default=64)
-    argparser.add_argument("--seq-tile", type=int, default=64)
+    argparser.add_argument("--seq-tile", type=int, default=32)
     argparser.add_argument("--kv-seq-tile", type=int, default=64)
     argparser.add_argument("--emb-tile", type=int, default=96)
     argparser.add_argument("--o-proj-acc-depth", type=int, default=1)
@@ -137,6 +137,9 @@ def fused_mha(
     num_q_seq_blocks = seq_len // seq_tile
     num_kv_seq_blocks = seq_len // kv_seq_tile
     num_qkv_head_block_per_parallel_head = heads // parallel_heads
+    assert (
+        embed_sz == emb_tile * o_proj_acc_depth
+    ), "o_proj_acc_depth must satisfy emb_tile * o_proj_acc_depth == embed_sz"
     num_o_col_groups = embed_sz // (emb_tile * o_proj_acc_depth)
     ln_tiles_per_q_block = num_o_col_groups * o_proj_acc_depth
 
@@ -444,7 +447,6 @@ def fused_mha(
         name="outO",
         depth=of_depth,
     )
-
     r_dims = [
         (seq_tile // r, r * emb_tile),
         (emb_tile // s, s),
@@ -477,9 +479,6 @@ def fused_mha(
         depth=ln_fifo_depth,
         placement=Tile(col=7, row=1),
     )
-    # LN replay FIFO stores interleaved second-pass tiles (one q-block worth)
-    # so LN can run pass1 on all columns before pass2.
-    lnReplay = ObjectFifo(o_ty, name="lnReplay", depth=ln_tiles_per_q_block)
 
     def batched_matmul_qk(
         of_q,
@@ -706,7 +705,6 @@ def fused_mha(
         """
 
         for _ in range_(sys.maxsize):
-
             # First iteration just passes the partial C tile through
             for _ in range_(o_proj_acc_depth):
 
@@ -768,13 +766,10 @@ def fused_mha(
     def core_fn_add_norm(
         of_in1,
         of_in2,
-        of_replay_out,
-        of_replay_in,
         sum_buf,
         sumsq_buf,
         weights,
         of_out1,
-        copy_tile,
         fused_add_layer_norm,
         calc_sum_sumsq,
         zero_f32,
@@ -782,22 +777,16 @@ def fused_mha(
         for _ in range_(sys.maxsize):
             zero_f32(sum_buf, seq_tile)
             zero_f32(sumsq_buf, seq_tile)
-            # First pass: consume interleaved [pass1, pass2] tiles and stage pass2.
+            # First pass: accumulate row-wise statistics from first-pass tiles.
             for _ in range_(ln_tiles_per_q_block):
-                elem_pass1 = of_in1.acquire(1)
-                calc_sum_sumsq(elem_pass1, sum_buf, sumsq_buf)
-                of_in1.release(1)
-
-                elem_pass2 = of_in1.acquire(1)
-                elem_replay = of_replay_out.acquire(1)
-                copy_tile(elem_pass2, elem_replay, seq_tile * emb_tile)
-                of_replay_out.release(1)
+                elem_in1 = of_in1.acquire(1)
+                calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
                 of_in1.release(1)
 
             # Second pass: apply fused layer norm + add
             for col_idx in range_(ln_tiles_per_q_block):
                 col_i32 = index.casts(T.i32(), col_idx)
-                elem_in1 = of_replay_in.acquire(1)
+                elem_in1 = of_in1.acquire(1)
                 elem_in2 = of_in2.acquire(1)
                 elem_out1 = of_out1.acquire(1)
                 fused_add_layer_norm(
@@ -811,7 +800,7 @@ def fused_mha(
                     col_i32,
                 )
                 of_out1.release(1)
-                of_replay_in.release(1)
+                of_in1.release(1)
                 of_in2.release(1)
 
     # Create worker from task
@@ -913,6 +902,15 @@ def fused_mha(
                 while_true=False,
             )
         )
+        logging.debug(
+            "Configured o_proj worker %d with acc_depth=%d (is_last=%s): "
+            "per q-block emit order is pass1[acc=0..%d] then pass2[acc=0..%d]",
+            i,
+            o_proj_acc_depth,
+            i == parallel_heads - 1,
+            o_proj_acc_depth - 1,
+            o_proj_acc_depth - 1,
+        )
 
     # Create LN worker
     ln_weight_buffer = Buffer(
@@ -927,13 +925,10 @@ def fused_mha(
         fn_args=[
             outO.cons(),
             memR.cons(),
-            lnReplay.prod(),
-            lnReplay.cons(),
             sum_buffer,
             sumsq_buffer,
             ln_weight_buffer,
             outLN.prod(),
-            mem_copy_o_proj,
             ln_fused_add_layer_norm_kernel,
             ln_calc_sum_sumsq_kernel,
             ln_zero_f32_kernel,
@@ -1035,6 +1030,32 @@ def fused_mha(
             logging.info(f"  Sizes: {tap.sizes}")
             logging.info(f"  Strides: {tap.strides}")
 
+    def enumerate_outer_object_offsets(tap: TensorAccessPattern, inner_rank: int = 2):
+        """
+        Enumerate object start offsets represented by a TAP.
+        For O/R/WO taps, the object rank is 2 (tile rows x tile cols),
+        so the leading dimensions enumerate distinct objects.
+        """
+
+        sizes = list(tap.sizes)
+        strides = list(tap.strides)
+        if len(sizes) <= inner_rank:
+            return [tap.offset]
+
+        outer_sizes = sizes[:-inner_rank]
+        outer_strides = strides[:-inner_rank]
+        offsets = []
+
+        def walk(dim: int, running_offset: int):
+            if dim == len(outer_sizes):
+                offsets.append(tap.offset + running_offset)
+                return
+            for idx in range(outer_sizes[dim]):
+                walk(dim + 1, running_offset + idx * outer_strides[dim])
+
+        walk(0, 0)
+        return offsets
+
     def legalize_tap(tap: TensorAccessPattern, max_dim_size: int):
 
         sizes = list(tap._sizes)
@@ -1134,6 +1155,36 @@ def fused_mha(
                     f"Scheduling fills for q block {q_block_idx}, col group {col_group} for QKV, W_O, and OR"
                 )
                 logging.debug(f"  Q tap: {Q_tiles[q_block_idx]}")
+                tap_idx = q_block_idx * num_o_col_groups + col_group
+                o_offsets = enumerate_outer_object_offsets(
+                    O_tiles[tap_idx], inner_rank=2
+                )
+                r_offsets = enumerate_outer_object_offsets(
+                    R_tiles[tap_idx], inner_rank=2
+                )
+                logging.debug(
+                    "  O/R tap mapping for q_block=%d col_group=%d tap_idx=%d: "
+                    "O_outer_offsets=%s R_outer_offsets=%s",
+                    q_block_idx,
+                    col_group,
+                    tap_idx,
+                    o_offsets,
+                    r_offsets,
+                )
+                for pass_idx in range(2):
+                    for acc_idx in range(o_proj_acc_depth):
+                        logical_col_idx = col_group * o_proj_acc_depth + acc_idx
+                        o_off = o_offsets[acc_idx] if acc_idx < len(o_offsets) else None
+                        r_off = r_offsets[acc_idx] if acc_idx < len(r_offsets) else None
+                        logging.debug(
+                            "    Expected O-proj emit: pass=%d acc_idx=%d logical_col=%d "
+                            "-> O_offset=%s R_offset=%s",
+                            pass_idx + 1,
+                            acc_idx,
+                            logical_col_idx,
+                            o_off,
+                            r_off,
+                        )
                 for head_idx in range(heads // parallel_heads):
                     tg_head = rt.task_group()
                     rt.fill(
@@ -1166,6 +1217,16 @@ def fused_mha(
                     logging.debug(
                         f"    W_O tap: {WO_tiles[head_idx * num_o_col_groups + col_group]}"
                     )
+                    wo_offsets = enumerate_outer_object_offsets(
+                        WO_tiles[head_idx * num_o_col_groups + col_group], inner_rank=2
+                    )
+                    logging.debug(
+                        "    W_O outer offsets (head_idx=%d, q_block=%d, col_group=%d): %s",
+                        head_idx,
+                        q_block_idx,
+                        col_group,
+                        wo_offsets,
+                    )
 
                 rt.fill(
                     inR.prod(),
@@ -1181,6 +1242,7 @@ def fused_mha(
                     memLN.cons(),
                     OR,
                     tap=O_tiles[q_block_idx * (num_o_col_groups) + col_group],
+                    wait=True,
                     placement=Tile(col=7, row=0),
                     task_group=tg_out,
                 )
