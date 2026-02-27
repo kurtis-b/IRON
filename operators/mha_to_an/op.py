@@ -28,7 +28,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         num_heads: int,
         seq_len: int,
         d: int,
-        seq_tile: int = 64,
+        seq_tile: int = 32,
         kv_seq_tile: int = 64,
         emb_tile: int = 96,
         parallel_heads: int = 1,
@@ -50,6 +50,11 @@ class AIEMHAOutProj(AIEOperatorBase):
         self.debug = debug
         self.embed_sz = d * num_heads
         assert d == 64, "Only d=64 is supported in this version"
+        if self.embed_sz != self.emb_tile * self.o_proj_acc_depth:
+            raise AIEOperatorConstraintError(
+                "mha_to_an requires emb_tile * o_proj_acc_depth == embed_sz "
+                f"({self.emb_tile} * {self.o_proj_acc_depth} != {self.embed_sz})"
+            )
 
         # Allocate static weights before inference
         self.w_o_proj = None
