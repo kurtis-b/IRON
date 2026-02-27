@@ -420,7 +420,11 @@ def fused_mha(
     outOProj = []
     outOProjAccumIn = []
     outOProjAccumOut = []
+    # Keep LN/residual traffic isolated on mem tile col 7. Spread deep O-proj
+    # accumulation FIFOs across other mem tiles to avoid memtile DMA BD pressure.
+    acc_mem_tile_cols = [4, 5, 6]
     for i in range(parallel_heads):
+        acc_mem_tile_col = acc_mem_tile_cols[i % len(acc_mem_tile_cols)]
         outOProj.append(
             ObjectFifo(q_ty, depth=of_depth, name=f"outOProj{i}")
         )  # Local to 1 parallel block of heads
@@ -431,9 +435,15 @@ def fused_mha(
             .forward(
                 name=f"outOProjAccumIn{i}",
                 depth=o_proj_acc_depth,
-                placement=Tile(col=6 + (i % 2), row=1),
+                placement=Tile(col=acc_mem_tile_col, row=1),
             )
         )  # Local to 1 parallel block of heads
+        logging.debug(
+            "Placed outOProjAccum[%d] on mem tile (%d,1) with acc_depth=%d",
+            i,
+            acc_mem_tile_col,
+            o_proj_acc_depth,
+        )
 
     outOPart = []
     for i in range(parallel_heads - 1):
