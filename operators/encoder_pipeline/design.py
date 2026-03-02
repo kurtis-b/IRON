@@ -568,13 +568,12 @@ def fused_mha(
         (s, emb_tile),
         (t, 1),
     ]
-    b_up_fifo_depth = 1
-    inBUp = ObjectFifo(ffn_b_ty, name="inBUp", depth=b_up_fifo_depth)
+    inBUp = ObjectFifo(ffn_b_ty, name="inBUp", depth=of_depth)
     memBUp = inBUp.cons().forward(
         obj_type=ffn_b_ty,
         name="memBUp",
         dims_to_stream=b_dims,
-        depth=b_up_fifo_depth,
+        depth=of_depth,
         placement=Tile(col=4, row=1),
     )
     inBDown = ObjectFifo(ffn_b_ty, name="inBDown", depth=of_depth)
