@@ -67,16 +67,18 @@ def generate_golden_reference(
             .to(torch.bfloat16)
         )
     elif is_full_debug:
+        # Match ffn_addnorm-style normal-path data generation: random normal
+        # weights keep projected activations centered before LayerNorm.
         out_proj_weights = (
-            torch.rand(embed_sz, embed_sz, dtype=torch.bfloat16) * val_range
+            torch.randn(embed_sz, embed_sz, dtype=torch.bfloat16) * val_range
         )
     else:
         out_proj_weights = torch.eye(embed_sz, embed_sz, dtype=torch.bfloat16)
 
     if run_reference_self_attention:
-        Q = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-        K = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-        V = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
+        Q = torch.randn(heads, seq_len, d, dtype=torch.bfloat16) * val_range
+        K = torch.randn(heads, seq_len, d, dtype=torch.bfloat16) * val_range
+        V = torch.randn(heads, seq_len, d, dtype=torch.bfloat16) * val_range
 
         inv_scale = 1 / np.sqrt(K.shape[-1])
         O = torch.nn.functional.scaled_dot_product_attention(

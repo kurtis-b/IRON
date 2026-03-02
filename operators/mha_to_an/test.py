@@ -18,7 +18,7 @@ from operators.common.test_utils import run_test
 # 1: Debug self attention, ones for output projection weights
 # 2: Debug MHA output projection, ones for input and range for weights, and skip softmax computation
 # AddNorm debug behavior is controlled separately by ADDNORM_DEBUG_MODE.
-DEBUG_MODE = 2
+DEBUG_MODE = 0
 ADDNORM_DEBUG_MODE = -1
 
 
