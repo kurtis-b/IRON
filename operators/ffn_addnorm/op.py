@@ -21,6 +21,12 @@ from operators.common import (
 from operators.common.utils import torch_to_numpy, numpy_to_torch
 
 
+def _append_addnorm_debug_flag(extra_flags: list[str], debug_mode: int | None):
+    if debug_mode in (0, 1):
+        extra_flags.append(f"-DDEBUG_AIE_KERNELS={debug_mode}")
+        return
+
+
 class AIEFFNAN(AIEOperatorBase):
     """
     AIE-accelerated ANFFN block for BERT, which has an add & norm, up-projection and down-projection with a GeLU in between, then another add & norm.
@@ -181,8 +187,7 @@ class AIEFFNAN(AIEOperatorBase):
             f"-DDIM_K={tile_k}",
             f"-DDIM_N={tile_n}",
         ]
-        if self.debug_mode == 0 or self.debug_mode == 1:
-            encoder_kernel_flags.append(f"-DDEBUG_AIE_KERNELS={self.debug_mode}")
+        _append_addnorm_debug_flag(encoder_kernel_flags, self.debug_mode)
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_total_base}.xclbin",
