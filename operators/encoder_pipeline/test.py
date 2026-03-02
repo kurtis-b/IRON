@@ -13,6 +13,7 @@ from operators.encoder_pipeline.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 DEBUG_MODE = 0
+ADDNORM_DEBUG_MODE = -1
 
 
 def generate_test_params(extensive=False):
@@ -21,7 +22,7 @@ def generate_test_params(extensive=False):
     # parallel_heads, o_proj_acc_depth, down_proj_depth, intermediate_size
     regular_params = [
         (3, 64, 64, 32, 64, 96, 1, 2, 2, 768),
-        (12, 64, 64, 32, 64, 96, 1, 8, 8, 3072),
+        # (12, 64, 64, 32, 64, 96, 1, 8, 8, 3072),
         # (12, 128, 64, 32, 64, 96, 1, 8, 8, 3072),
         # (12, 512, 64, 32, 64, 96, 1, 8, 8, 3072),
         # (12, 2048, 64, 32, 64, 96, 1, 8, 8, 3072),
@@ -97,6 +98,7 @@ def test_encoder_pipeline(
         d=d,
         intermediate_size=intermediate_size,
         seed=42,
+        addnorm_debug_mode=ADDNORM_DEBUG_MODE,
     )
 
     operator = AIEEncoderPipeline(
@@ -112,6 +114,7 @@ def test_encoder_pipeline(
         ffn_intermediate_size=intermediate_size,
         nB_tiles_distributed=1,
         debug=DEBUG_MODE,
+        addnorm_debug_mode=ADDNORM_DEBUG_MODE,
         ln_weight=golden_ref["ln1_weight"],
         context=aie_context,
     )

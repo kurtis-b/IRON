@@ -22,6 +22,12 @@ from operators.common import (
 from operators.common.utils import torch_to_numpy, numpy_to_torch
 
 
+def _append_addnorm_debug_flag(extra_flags: list[str], addnorm_debug_mode: int | None):
+    if addnorm_debug_mode in (0, 1):
+        extra_flags.append(f"-DDEBUG_AIE_KERNELS={addnorm_debug_mode}")
+        return
+
+
 class AIEEncoderPipeline(AIEOperatorBase):
     """Encoder pipeline operator entrypoint.
 
@@ -44,6 +50,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         ffn_intermediate_size: int | None = None,
         static_weights: bool = False,
         debug: int = 0,
+        addnorm_debug_mode: int = -1,
         ln_weight=None,
         context=None,
         skip_add_to_list=False,
@@ -58,6 +65,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.o_proj_acc_depth = o_proj_acc_depth
         self.nB_tiles_distributed = nB_tiles_distributed
         self.debug = debug
+        self.addnorm_debug_mode = addnorm_debug_mode
         self.embed_sz = d * num_heads
         self.ffn_intermediate_size = (
             ffn_intermediate_size
@@ -130,7 +138,8 @@ class AIEEncoderPipeline(AIEOperatorBase):
             f"{prefix}_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}qt_"
             f"{self.kv_seq_tile}kvt_{self.emb_tile}e_{self.parallel_heads}ph_"
             f"{self.o_proj_acc_depth}acc_{self.down_proj_depth}dproj_"
-            f"{self.nB_tiles_distributed}nbdist_{self.ffn_intermediate_size}ffn_lnstage"
+            f"{self.nB_tiles_distributed}nbdist_{self.ffn_intermediate_size}ffn_"
+            f"an{self.addnorm_debug_mode}_lnstage"
         )
 
         ln_weight_file_name = (
@@ -191,8 +200,17 @@ class AIEEncoderPipeline(AIEOperatorBase):
 
         kernel_archive = (
             f"{prefix}_kernels_{self.num_heads}h_{self.seq_len}s_{self.d}d_"
-            f"{self.debug}debug_lnstage.a"
+            f"{self.debug}debug_an{self.addnorm_debug_mode}_lnstage.a"
         )
+        encoder_kernel_flags = [
+            "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+            "-DBUILD_FFN",
+            "-DBUILD_ADDNORM",
+            f"-DDIM_M={self.seq_tile}",
+            f"-DDIM_K={self.emb_tile}",
+            f"-DDIM_N={self.emb_tile}",
+        ]
+        _append_addnorm_debug_flag(encoder_kernel_flags, self.addnorm_debug_mode)
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -287,15 +305,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
                                     / "encoder.cc"
                                 )
                             ],
-                            extra_flags=[
-                                "-Dbf16_bf16_ONLY",
-                                "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
-                                "-DBUILD_FFN",
-                                "-DBUILD_ADDNORM",
-                                f"-DDIM_M={self.seq_tile}",
-                                f"-DDIM_K={self.emb_tile}",
-                                f"-DDIM_N={self.emb_tile}",
-                            ],
+                            extra_flags=encoder_kernel_flags,
                         ),
                     ],
                 ),
