@@ -21,6 +21,12 @@ from operators.common import (
 from operators.common.utils import torch_to_numpy, numpy_to_torch
 
 
+def _append_addnorm_debug_flag(extra_flags: list[str], addnorm_debug_mode: int | None):
+    if addnorm_debug_mode in (0, 1):
+        extra_flags.append(f"-DDEBUG_AIE_KERNELS={addnorm_debug_mode}")
+        return
+
+
 class AIEMHAOutProj(AIEOperatorBase):
 
     def __init__(
@@ -38,6 +44,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         ln_weight=None,
         context=None,
         skip_add_to_list=False,
+        addnorm_debug_mode: int = -1,
     ):
         self.num_heads = num_heads
         self.seq_len = seq_len
@@ -48,6 +55,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         self.parallel_heads = parallel_heads
         self.o_proj_acc_depth = o_proj_acc_depth
         self.debug = debug
+        self.addnorm_debug_mode = addnorm_debug_mode
         self.embed_sz = d * num_heads
         assert d == 64, "Only d=64 is supported in this version"
         if self.embed_sz != self.emb_tile * self.o_proj_acc_depth:
@@ -78,7 +86,12 @@ class AIEMHAOutProj(AIEOperatorBase):
         # ---
         operator_dir = Path(__file__).parent
 
-        file_name_base = f"mha_to_an_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}qt_{self.kv_seq_tile}kvt_{self.emb_tile}e_{self.parallel_heads}ph_{self.o_proj_acc_depth}acc_lnstage"
+        file_name_base = (
+            f"mha_to_an_{self.num_heads}h_{self.seq_len}s_{self.d}d_"
+            f"{self.seq_tile}qt_{self.kv_seq_tile}kvt_{self.emb_tile}e_"
+            f"{self.parallel_heads}ph_{self.o_proj_acc_depth}acc_"
+            f"lnstage_an{self.addnorm_debug_mode}"
+        )
 
         # Save layer norm weights to .npy for use at compile time
         ln_weight_file_name = (
@@ -139,7 +152,19 @@ class AIEMHAOutProj(AIEOperatorBase):
             "zero_scalar_bf16": "zero_scalar_bf16_o_proj",
         }
 
-        kernel_archive = f"mha_to_an_kernels_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.debug}debug_lnstage.a"
+        kernel_archive = (
+            f"mha_to_an_kernels_{self.num_heads}h_{self.seq_len}s_"
+            f"{self.d}d_{self.debug}debug_an{self.addnorm_debug_mode}_lnstage.a"
+        )
+        encoder_kernel_flags = [
+            "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+            "-DBUILD_ADDNORM",
+            f"-DDIM_M={self.seq_tile}",
+            f"-DDIM_K={self.emb_tile}",
+            # Unused for layer norm but required for compilation, set to emb_tile.
+            f"-DDIM_N={self.emb_tile}",
+        ]
+        _append_addnorm_debug_flag(encoder_kernel_flags, self.addnorm_debug_mode)
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -231,15 +256,7 @@ class AIEMHAOutProj(AIEOperatorBase):
                                     / "encoder.cc"
                                 )
                             ],
-                            extra_flags=[
-                                "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
-                                "-DBUILD_ADDNORM",
-                                f"-DDIM_M={self.seq_tile}",
-                                f"-DDIM_K={self.emb_tile}",
-                                f"-DDIM_N={self.emb_tile}",  # Unused for layer norm but required for compilation, set to emb_tile for simplicity
-                                # TODO: Need to think about how debug mode should work here
-                                # f"-DDEBUG_AIE_KERNELS={self.debug_mode}",
-                            ],
+                            extra_flags=encoder_kernel_flags,
                         ),
                     ],
                 ),

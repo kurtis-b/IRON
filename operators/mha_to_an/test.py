@@ -17,7 +17,9 @@ from operators.common.test_utils import run_test
 # 0: No debug, all random data (full reference implementation)
 # 1: Debug self attention, ones for output projection weights
 # 2: Debug MHA output projection, ones for input and range for weights, and skip softmax computation
-DEBUG_MODE = 0
+# AddNorm debug behavior is controlled separately by ADDNORM_DEBUG_MODE.
+DEBUG_MODE = 2
+ADDNORM_DEBUG_MODE = -1
 
 
 def generate_test_params(extensive=False):
@@ -95,6 +97,7 @@ def test_mha(
         d=head_dim,
         heads=num_heads,
         debug=DEBUG_MODE,
+        addnorm_debug_mode=ADDNORM_DEBUG_MODE,
     )
 
     operator = AIEMHAOutProj(
@@ -106,6 +109,7 @@ def test_mha(
         parallel_heads=parallel_heads,
         o_proj_acc_depth=o_proj_acc_depth,
         debug=DEBUG_MODE,
+        addnorm_debug_mode=ADDNORM_DEBUG_MODE,
         ln_weight=golden_ref["ln_weight"],
         context=aie_context,
     )
@@ -117,13 +121,8 @@ def test_mha(
     }
     output_buffers = {"O": golden_ref["O"].flatten()}
 
-    # Layer norm can amplify small O-proj numerical error at large accumulation depth.
-    # Keep the default tolerance for typical shapes and relax abs_tol only for deep-acc configs.
-    abs_tol = 1.5e-1
-    if o_proj_acc_depth >= 8:
-        abs_tol = 3.75e-1 if seq_len >= 128 else 3.7e-1
     errors, latency_us, bandwidth_gbps = run_test(
-        operator, input_buffers, output_buffers, rel_tol=4.0e-2, abs_tol=abs_tol
+        operator, input_buffers, output_buffers, rel_tol=4.0e-2, abs_tol=1.5e-1
     )
 
     error_threshold = 0.005

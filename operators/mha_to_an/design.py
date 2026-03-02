@@ -1148,8 +1148,6 @@ def fused_mha(
         rt.start(ln_worker)
 
         for q_block_idx in range(num_q_seq_blocks):
-            tg_out = rt.task_group()
-
             for col_group in range(num_o_col_groups):
                 # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
                 tg = rt.task_group()
@@ -1165,36 +1163,6 @@ def fused_mha(
                     f"Scheduling fills for q block {q_block_idx}, col group {col_group} for QKV, W_O, and OR"
                 )
                 logging.debug(f"  Q tap: {Q_tiles[q_block_idx]}")
-                tap_idx = q_block_idx * num_o_col_groups + col_group
-                o_offsets = enumerate_outer_object_offsets(
-                    O_tiles[tap_idx], inner_rank=2
-                )
-                r_offsets = enumerate_outer_object_offsets(
-                    R_tiles[tap_idx], inner_rank=2
-                )
-                logging.debug(
-                    "  O/R tap mapping for q_block=%d col_group=%d tap_idx=%d: "
-                    "O_outer_offsets=%s R_outer_offsets=%s",
-                    q_block_idx,
-                    col_group,
-                    tap_idx,
-                    o_offsets,
-                    r_offsets,
-                )
-                for pass_idx in range(2):
-                    for acc_idx in range(o_proj_acc_depth):
-                        logical_col_idx = col_group * o_proj_acc_depth + acc_idx
-                        o_off = o_offsets[acc_idx] if acc_idx < len(o_offsets) else None
-                        r_off = r_offsets[acc_idx] if acc_idx < len(r_offsets) else None
-                        logging.debug(
-                            "    Expected O-proj emit: pass=%d acc_idx=%d logical_col=%d "
-                            "-> O_offset=%s R_offset=%s",
-                            pass_idx + 1,
-                            acc_idx,
-                            logical_col_idx,
-                            o_off,
-                            r_off,
-                        )
                 for head_idx in range(heads // parallel_heads):
                     tg_head = rt.task_group()
                     rt.fill(
@@ -1227,16 +1195,6 @@ def fused_mha(
                     logging.debug(
                         f"    W_O tap: {WO_tiles[head_idx * num_o_col_groups + col_group]}"
                     )
-                    wo_offsets = enumerate_outer_object_offsets(
-                        WO_tiles[head_idx * num_o_col_groups + col_group], inner_rank=2
-                    )
-                    logging.debug(
-                        "    W_O outer offsets (head_idx=%d, q_block=%d, col_group=%d): %s",
-                        head_idx,
-                        q_block_idx,
-                        col_group,
-                        wo_offsets,
-                    )
 
                 rt.fill(
                     inR.prod(),
@@ -1246,21 +1204,18 @@ def fused_mha(
                     task_group=tg,
                     wait=True,
                 )
-                rt.finish_task_group(tg)
-
                 rt.drain(
                     memLN.cons(),
                     OR,
                     tap=O_tiles[q_block_idx * (num_o_col_groups) + col_group],
                     wait=True,
                     placement=Tile(col=7, row=0),
-                    task_group=tg_out,
+                    task_group=tg,
                 )
                 logging.debug(
                     f"  O tap: {O_tiles[q_block_idx * (num_o_col_groups) + col_group]}"
                 )
-
-            rt.finish_task_group(tg_out)
+                rt.finish_task_group(tg)
 
     # Create the program from the device type and runtime
     if dev == "npu":

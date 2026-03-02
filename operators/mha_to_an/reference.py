@@ -3,8 +3,15 @@
 
 import torch
 import numpy as np
-from ml_dtypes import bfloat16
 import logging
+
+ADDNORM_DEBUG_DISABLED = -1
+ADDNORM_DEBUG_INPUT = 0
+ADDNORM_DEBUG_RESIDUAL = 1
+
+DEBUG_FULL = 0
+DEBUG_SELF_ATTN = 1
+DEBUG_O_PROJ = 2
 
 
 def generate_golden_reference(
@@ -13,6 +20,7 @@ def generate_golden_reference(
     d=256,
     seed=42,
     debug=0,
+    addnorm_debug_mode=ADDNORM_DEBUG_DISABLED,
 ):
     """
     Generate golden reference data for MHA (Multi-Head Attention) + Add & Norm.
@@ -28,6 +36,10 @@ def generate_golden_reference(
             - 0: No debug
             - 1: Self attention (QK^T, softmax, AV)
             - 2: MHA output projection
+        addnorm_debug_mode: Debug mode for AddNorm kernel behavior
+            - -1: normal AddNorm (layer norm + residual add)
+            - 0: pass through AddNorm input
+            - 1: pass through residual input
     Returns:
         dict: Contains:
               - 'W_O' (output projection weights)
@@ -42,20 +54,40 @@ def generate_golden_reference(
     val_range = 4
 
     embed_sz = d * heads
-    # Need to adjust inputs for debugging NPU execution
-    if debug not in (0, 2):
-        out_proj_weights = torch.eye(embed_sz, embed_sz, dtype=torch.bfloat16)
-    else:
-        if debug == 2:
-            out_proj_weights = torch.arange(
-                embed_sz * embed_sz, dtype=torch.bfloat16
-            ).reshape(embed_sz, embed_sz)
-        else:
-            out_proj_weights = (
-                torch.rand(embed_sz, embed_sz, dtype=torch.bfloat16) * val_range
-            )
+    is_full_debug = debug == DEBUG_FULL
+    run_reference_self_attention = debug in (DEBUG_FULL, DEBUG_SELF_ATTN)
 
-    if debug not in (0, 1):
+    # Need to adjust inputs for debugging NPU execution.
+    if debug == DEBUG_O_PROJ:
+        # Keep debug weights deterministic but bounded to avoid extreme
+        # block-floating quantization artifacts in the isolated O-proj path.
+        out_proj_weights = (
+            ((torch.arange(embed_sz * embed_sz, dtype=torch.float32) % 256.0) - 128.0)
+            .reshape(embed_sz, embed_sz)
+            .to(torch.bfloat16)
+        )
+    elif is_full_debug:
+        out_proj_weights = (
+            torch.rand(embed_sz, embed_sz, dtype=torch.bfloat16) * val_range
+        )
+    else:
+        out_proj_weights = torch.eye(embed_sz, embed_sz, dtype=torch.bfloat16)
+
+    if run_reference_self_attention:
+        Q = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
+        K = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
+        V = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
+
+        inv_scale = 1 / np.sqrt(K.shape[-1])
+        O = torch.nn.functional.scaled_dot_product_attention(
+            Q.to(torch.bfloat16),
+            K.to(torch.bfloat16),
+            V.to(torch.bfloat16),
+            dropout_p=0.0,
+            is_causal=False,
+            scale=inv_scale,
+        )
+    else:
         Q = torch.eye(
             max(seq_len, embed_sz), max(seq_len, embed_sz), dtype=torch.bfloat16
         )
@@ -69,49 +101,39 @@ def generate_golden_reference(
         K = K[:seq_len, :embed_sz].view(seq_len, heads, d).transpose(0, 1).contiguous()
         V = V[:seq_len, :embed_sz].view(seq_len, heads, d).transpose(0, 1).contiguous()
 
-        # Skip softmax computation when not debugging self attention
+        # Skip softmax computation when not debugging self attention.
         attn_scores = torch.matmul(Q, K.transpose(-2, -1))
         O = torch.matmul(attn_scores, V)
-    else:
-        if debug == 1:
-            # Q = torch.ones(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-            # K = torch.ones(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-            # V = torch.ones(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-            Q = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-            K = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-            V = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-        else:
-            Q = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-            K = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-            V = torch.rand(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-        # MHA from PyTorch
-        inv_scale = 1 / np.sqrt(K.shape[-1])
-        O = torch.nn.functional.scaled_dot_product_attention(
-            Q.to(torch.bfloat16),
-            K.to(torch.bfloat16),
-            V.to(torch.bfloat16),
-            dropout_p=0.0,
-            is_causal=False,
-            scale=inv_scale,
-        )
 
     # Apply output projection
     attn_output = O.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     O = torch.matmul(attn_output, out_proj_weights)
 
     # Generate layer norm weights and residual for Add & Norm stage
-    if debug != 0:
+    if not is_full_debug:
         ln_weight = torch.ones(embed_sz, dtype=torch.bfloat16)
         R = torch.zeros(seq_len, embed_sz, dtype=torch.bfloat16)
     else:
         ln_weight = torch.rand(embed_sz, dtype=torch.bfloat16)
         R = torch.rand(seq_len, embed_sz, dtype=torch.bfloat16)
 
-    # Apply layer norm + residual add
-    layer_norm_output = torch.nn.functional.layer_norm(
-        O, normalized_shape=(embed_sz,), weight=ln_weight, bias=None
-    )
-    O = layer_norm_output + R
+    # Apply layer norm + residual add, or AddNorm debug passthrough behavior.
+    if addnorm_debug_mode == ADDNORM_DEBUG_INPUT:
+        # DEBUG_AIE_KERNELS=0 path in encoder.cc: pass through AddNorm input.
+        O = O.clone()
+    elif addnorm_debug_mode == ADDNORM_DEBUG_RESIDUAL:
+        # DEBUG_AIE_KERNELS=1 path in encoder.cc: pass through residual input.
+        O = R.clone()
+    elif addnorm_debug_mode in (None, ADDNORM_DEBUG_DISABLED):
+        layer_norm_output = torch.nn.functional.layer_norm(
+            O, normalized_shape=(embed_sz,), weight=ln_weight, bias=None
+        )
+        O = layer_norm_output + R
+    else:
+        raise ValueError(
+            "Invalid addnorm_debug_mode. Expected one of {-1, 0, 1}, "
+            f"got {addnorm_debug_mode}."
+        )
 
     # Reshape for NPU format
     Q = Q.transpose(0, 1).contiguous().view(seq_len, embed_sz)
@@ -132,10 +154,6 @@ def generate_golden_reference(
         "W_O": out_proj_weights,
         "QKV": QKV,
         "OR": OR,
-        "Q": Q,
-        "K": K,
-        "V": V,
         "ln_weight": ln_weight,
-        "R": R,
         "O": O,
     }
