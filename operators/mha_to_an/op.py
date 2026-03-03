@@ -21,10 +21,26 @@ from operators.common import (
 from operators.common.utils import torch_to_numpy, numpy_to_torch
 
 
-def _append_addnorm_debug_flag(extra_flags: list[str], addnorm_debug_mode: int | None):
-    if addnorm_debug_mode in (0, 1):
-        extra_flags.append(f"-DDEBUG_AIE_KERNELS={addnorm_debug_mode}")
-        return
+def _append_addnorm_bypass_flag(extra_flags: list[str], debug: int):
+    # Debug modes 0/1 bypass AddNorm via input pass-through.
+    if debug in (0, 1):
+        extra_flags.append("-DDEBUG_AIE_KERNELS=0")
+    # Debug mode 2 bypasses AddNorm via residual pass-through.
+    elif debug == 2:
+        extra_flags.append("-DDEBUG_AIE_KERNELS=1")
+
+
+def _resolve_mha_debug(debug: int) -> int:
+    # Top-level debug:
+    #   0: self-attn debug
+    #   1: MHA-input path debug (maps to MHA kernel bypass/debug path)
+    #   2: residual debug (uses MHA kernel bypass/debug path)
+    #  else: disabled/full
+    if debug == 0:
+        return 1
+    if debug in (1, 2):
+        return -1
+    return 0
 
 
 class AIEMHAOutProj(AIEOperatorBase):
@@ -40,11 +56,10 @@ class AIEMHAOutProj(AIEOperatorBase):
         parallel_heads: int = 1,
         o_proj_acc_depth: int = 1,
         static_weights: bool = False,
-        debug: int = 0,
+        debug: int = -1,
         ln_weight=None,
         context=None,
         skip_add_to_list=False,
-        addnorm_debug_mode: int = -1,
     ):
         self.num_heads = num_heads
         self.seq_len = seq_len
@@ -55,7 +70,11 @@ class AIEMHAOutProj(AIEOperatorBase):
         self.parallel_heads = parallel_heads
         self.o_proj_acc_depth = o_proj_acc_depth
         self.debug = debug
-        self.addnorm_debug_mode = addnorm_debug_mode
+        if self.debug not in (-1, 0, 1, 2):
+            raise AIEOperatorConstraintError(
+                f"mha_to_an debug must be one of {{-1, 0, 1, 2}} (got {self.debug})"
+            )
+        self.mha_debug = _resolve_mha_debug(self.debug)
         self.embed_sz = d * num_heads
         assert d == 64, "Only d=64 is supported in this version"
         if self.embed_sz != self.emb_tile * self.o_proj_acc_depth:
@@ -90,7 +109,7 @@ class AIEMHAOutProj(AIEOperatorBase):
             f"mha_to_an_{self.num_heads}h_{self.seq_len}s_{self.d}d_"
             f"{self.seq_tile}qt_{self.kv_seq_tile}kvt_{self.emb_tile}e_"
             f"{self.parallel_heads}ph_{self.o_proj_acc_depth}acc_"
-            f"lnstage_an{self.addnorm_debug_mode}"
+            f"{self.debug}debug_lnstage"
         )
 
         # Save layer norm weights to .npy for use at compile time
@@ -154,7 +173,7 @@ class AIEMHAOutProj(AIEOperatorBase):
 
         kernel_archive = (
             f"mha_to_an_kernels_{self.num_heads}h_{self.seq_len}s_"
-            f"{self.d}d_{self.debug}debug_an{self.addnorm_debug_mode}_lnstage.a"
+            f"{self.d}d_{self.debug}debug_lnstage.a"
         )
         encoder_kernel_flags = [
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
@@ -164,7 +183,7 @@ class AIEMHAOutProj(AIEOperatorBase):
             # Unused for layer norm but required for compilation, set to emb_tile.
             f"-DDIM_N={self.emb_tile}",
         ]
-        _append_addnorm_debug_flag(encoder_kernel_flags, self.addnorm_debug_mode)
+        _append_addnorm_bypass_flag(encoder_kernel_flags, self.debug)
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -215,11 +234,11 @@ class AIEMHAOutProj(AIEOperatorBase):
                             depends=[SourceArtifact.new(softmax_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"mha_o_proj_mha_{self.seq_tile}m_{self.kv_seq_tile}n_{self.d}k_causal0_{self.debug}.o",
+                            f"mha_o_proj_mha_{self.seq_tile}m_{self.kv_seq_tile}n_{self.d}k_causal0_{self.mha_debug}.o",
                             depends=[SourceArtifact.new(mha_source)],
                             extra_flags=[
                                 "-DIS_CAUSAL=0",
-                                f"-DDEBUG={self.debug}",
+                                f"-DDEBUG={self.mha_debug}",
                                 f"-DVECTOR_LENGTH={self.seq_tile}",
                             ],
                         ),

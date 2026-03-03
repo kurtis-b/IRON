@@ -5,7 +5,6 @@
 import sys
 import pytest
 from pathlib import Path
-import logging
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -14,12 +13,11 @@ from operators.mha_to_an.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
 # Debug mode controls which parts of the reference implementation are executed with random data vs. fixed data:
-# 0: No debug, all random data (full reference implementation)
-# 1: Debug self attention, ones for output projection weights
-# 2: Debug MHA output projection, ones for input and range for weights, and skip softmax computation
-# AddNorm debug behavior is controlled separately by ADDNORM_DEBUG_MODE.
-DEBUG_MODE = 0
-ADDNORM_DEBUG_MODE = -1
+# -1: Debug disabled (full reference implementation)
+# 0: Debug self-attention path
+# 1: Debug MHA-input path
+# 2: Debug residual path (AddNorm residual pass-through)
+DEBUG_MODE = -1
 
 
 def generate_test_params(extensive=False):
@@ -97,7 +95,6 @@ def test_mha(
         d=head_dim,
         heads=num_heads,
         debug=DEBUG_MODE,
-        addnorm_debug_mode=ADDNORM_DEBUG_MODE,
     )
 
     operator = AIEMHAOutProj(
@@ -109,7 +106,6 @@ def test_mha(
         parallel_heads=parallel_heads,
         o_proj_acc_depth=o_proj_acc_depth,
         debug=DEBUG_MODE,
-        addnorm_debug_mode=ADDNORM_DEBUG_MODE,
         ln_weight=golden_ref["ln_weight"],
         context=aie_context,
     )
