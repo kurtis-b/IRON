@@ -200,6 +200,15 @@ def fused_mha(
     # encoder, which will likely not require more than 6 parallel heads in order to have space
     # for the the two Add & Norm blocks and FFN block.
 
+    # Fused encoder_pipeline currently requires conservative internal
+    # decomposition for reliable resource fit across FFN/AddNorm stages.
+    if parallel_heads > 1:
+        logging.warning(
+            "Remapping parallel_heads from %d to 1 for encoder_pipeline resource fit",
+            parallel_heads,
+        )
+        parallel_heads = 1
+
     num_q_seq_blocks = seq_len // seq_tile
     num_kv_seq_blocks = seq_len // kv_seq_tile
     num_qkv_head_block_per_parallel_head = heads // parallel_heads
@@ -554,17 +563,20 @@ def fused_mha(
         (t, 1),
     ]
 
+    # Large emb_tile (e.g. 128) with depth=2 can overflow o-proj core L1 on
+    # larger models; keep a single buffered WO tile in that case.
+    ow_fifo_depth = 1 if emb_tile >= 128 else of_depth
     inOW = ObjectFifo(
         np.ndarray[(d * parallel_heads, emb_tile), np.dtype[dtype]],
         name="inOW",
-        depth=of_depth,
+        depth=ow_fifo_depth,
     )
     memOW = inOW.cons().split(
         offsets=[d * emb_tile * i for i in range(parallel_heads)],
         obj_types=[wo_ty] * parallel_heads,
         names=[f"memOW{i}" for i in range(parallel_heads)],
         dims_to_stream=[ow_dims] * parallel_heads,
-        depths=[of_depth] * parallel_heads,
+        depths=[ow_fifo_depth] * parallel_heads,
         placement=Tile(col=3, row=1),
     )  # Split between N parallel blocks of heads
 
@@ -572,11 +584,16 @@ def fused_mha(
     outOProj = []
     outOProjAccumIn = []
     outOProjAccumOut = []
-    # Keep LN/residual traffic isolated on mem tile col 7. Spread deep O-proj
-    # accumulation FIFOs across other mem tiles to avoid memtile DMA BD pressure.
+    # Keep LN/residual traffic on mem tile col 7. For high parallel-head
+    # configs, spill only the last O-proj accumulator to col 7 and keep the
+    # rest on cols 4/5/6 to reduce BD pressure on col 6.
     acc_mem_tile_cols = [4, 5, 6]
+    if parallel_heads > 3:
+        for i in range(3, parallel_heads):
+            acc_mem_tile_cols.append(4 if ((i - 3) % 2 == 0) else 5)
+        acc_mem_tile_cols[-1] = 7
     for i in range(parallel_heads):
-        acc_mem_tile_col = acc_mem_tile_cols[i % len(acc_mem_tile_cols)]
+        acc_mem_tile_col = acc_mem_tile_cols[i]
         outOProj.append(
             ObjectFifo(q_ty, depth=of_depth, name=f"outOProj{i}")
         )  # Local to 1 parallel block of heads
@@ -589,7 +606,7 @@ def fused_mha(
                 depth=o_proj_acc_depth,
                 placement=Tile(col=acc_mem_tile_col, row=1),
             )
-        )  # Local to 1 parallel block of heads
+        )
         logging.debug(
             "Placed outOProjAccum[%d] on mem tile (%d,1) with acc_depth=%d",
             i,
@@ -620,9 +637,10 @@ def fused_mha(
     # AddNorm-2 consumes residual only on its second pass. Keep enough depth
     # for one full output tile-group to avoid backpressure deadlock on LN1.
     ffn_residual_depth = o_proj_acc_depth
-    # FFN-up replay worker stores K-tiles in local buffers; keep its input FIFO
-    # depth at 1 to stay within L1 limits for larger o_proj_acc_depth.
+    # FFN-up replay worker input FIFO depth.
     ffn_up_input_depth = 1
+    use_mtile_ffn_replay = emb_tile >= 128
+    ln_mem_tile_col = 7
     # Residual R
     inR = ObjectFifo(
         o_ty,
@@ -634,24 +652,29 @@ def fused_mha(
         name="memR",
         dims_to_stream=r_dims,
         depth=ln_fifo_depth,
-        placement=Tile(col=7, row=1),
+        placement=Tile(col=ln_mem_tile_col, row=1),
     )
 
     # LN output
     o_dims = [(seq_tile // r, r * emb_tile), (r, s), (emb_tile // s, r * s), (s, 1)]
     outLN = ObjectFifo(o_ty, name="outLN", depth=ffn_up_input_depth)
     # FFN residual path for AddNorm-2.
-    # Route through a mem tile to realize true queue depth for acc>2 cases.
-    # A direct core-to-core FIFO is effectively ping-pong buffered and can
-    # deadlock LN1 before FFN-up/down produce LN2 inputs.
-    ffnROut = ObjectFifo(o_ty, name="ffnROut", depth=1)
-    ffn_residual_mem_tile_col = 3
-    ffnRIn = ffnROut.cons(depth=ffn_residual_depth).forward(
-        obj_type=o_ty,
-        name="ffnRIn",
-        depth=ffn_residual_depth,
-        placement=Tile(col=ffn_residual_mem_tile_col, row=1),
-    )
+    # For 1-way head parallelism, keep the memtile-backed queue to avoid
+    # backpressure between LN1 and FFN-up/down at higher accumulation depths.
+    # For higher head parallelism, use a direct FIFO to avoid memtile BD
+    # pressure from another deep residual queue.
+    if parallel_heads == 1:
+        ffnROut = ObjectFifo(o_ty, name="ffnROut", depth=1)
+        ffnRIn = ffnROut.cons(depth=ffn_residual_depth).forward(
+            obj_type=o_ty,
+            name="ffnRIn",
+            depth=ffn_residual_depth,
+            placement=Tile(col=3, row=1),
+        )
+        ffn_residual_prod = ffnROut.prod()
+    else:
+        ffnRIn = ObjectFifo(o_ty, name="ffnRIn", depth=ln_fifo_depth)
+        ffn_residual_prod = ffnRIn.prod()
 
     # FFN weights (Up/Down projections)
     b_dims = [
@@ -681,10 +704,24 @@ def fused_mha(
 
     # FFN internal pipelines and final encoder output
     ffnUpReplay = ObjectFifo(o_ty, name="ffnUpReplay", depth=1)
+    if use_mtile_ffn_replay:
+        # For large emb_tile (e.g., 128), replay staging in core L1 overflows.
+        # Stage/replay through a memtile ring instead.
+        ffnUpStagePart = ObjectFifo(o_ty, name="ffnUpStagePart", depth=1)
+        ffnUpStageAccum = ffnUpStagePart.cons(depth=o_proj_acc_depth).forward(
+            obj_type=o_ty,
+            name="ffnUpStageAccum",
+            depth=o_proj_acc_depth,
+            placement=Tile(col=ffn_col, row=1),
+        )
+    else:
+        ffnUpStagePart = None
+        ffnUpStageAccum = None
     ffnUpOut = ObjectFifo(o_ty, name="ffnUpOut", depth=1)
     # Keep FFN-down accumulation in a mem tile FIFO so down-proj core L1 stays
     # within limits while replaying for LN2's two-pass consumption.
     ffnDownPart = ObjectFifo(o_ty, name="ffnDownPart", depth=1)
+    # Keep FFN-down accumulation on its dedicated memtile column.
     ffn_down_acc_mem_tile_col = 6
     ffnDownAccum = ffnDownPart.cons(depth=o_proj_acc_depth).forward(
         obj_type=o_ty,
@@ -692,14 +729,15 @@ def fused_mha(
         depth=o_proj_acc_depth,
         placement=Tile(col=ffn_down_acc_mem_tile_col, row=1),
     )
-    ffnDownOut = ObjectFifo(o_ty, name="ffnDownOut", depth=ln_fifo_depth)
+    ffn_down_out_depth = 1 if emb_tile >= 128 else ln_fifo_depth
+    ffnDownOut = ObjectFifo(o_ty, name="ffnDownOut", depth=ffn_down_out_depth)
     outLN2 = ObjectFifo(o_ty, name="outLN2", depth=ln_fifo_depth)
     memLN2 = outLN2.cons().forward(
         obj_type=o_ty,
         name="memLN2",
         dims_to_stream=o_dims,
         depth=ln_fifo_depth,
-        placement=Tile(col=7, row=1),
+        placement=Tile(col=ln_mem_tile_col, row=1),
     )
 
     def batched_matmul_qk(
@@ -1077,6 +1115,42 @@ def fused_mha(
                     copy(stage_bufs[k_idx], elem_out, seq_tile * emb_tile)
                     of_out_replay.release(1)
 
+    def core_fn_ffn_up_replay_mtile(
+        of_in_a,
+        of_stage_in,
+        of_stage_out,
+        of_out_replay,
+        copy,
+    ):
+        for _ in range_(sys.maxsize):
+            # Seed replay ring with one full AddNorm-1 output tile group.
+            for _ in range_(o_proj_acc_depth):
+                elem_in_a = of_in_a.acquire(1)
+                elem_stage = of_stage_out.acquire(1)
+                copy(elem_in_a, elem_stage, seq_tile * emb_tile)
+                of_stage_out.release(1)
+                of_in_a.release(1)
+
+            # Replay for all but the final FFN column group, feeding back to ring.
+            for _ in range_(ffn_col_groups - 1):
+                for _ in range_(o_proj_acc_depth):
+                    elem_stage_in = of_stage_in.acquire(1)
+                    elem_out = of_out_replay.acquire(1)
+                    copy(elem_stage_in, elem_out, seq_tile * emb_tile)
+                    elem_stage_back = of_stage_out.acquire(1)
+                    copy(elem_stage_in, elem_stage_back, seq_tile * emb_tile)
+                    of_stage_out.release(1)
+                    of_out_replay.release(1)
+                    of_stage_in.release(1)
+
+            # Final replay pass drains ring without feeding back.
+            for _ in range_(o_proj_acc_depth):
+                elem_stage_in = of_stage_in.acquire(1)
+                elem_out = of_out_replay.acquire(1)
+                copy(elem_stage_in, elem_out, seq_tile * emb_tile)
+                of_out_replay.release(1)
+                of_stage_in.release(1)
+
     def core_fn_ffn_up_proj(
         of_in_a_replay,
         of_in_b,
@@ -1360,7 +1434,7 @@ def fused_mha(
             sumsq_buffer,
             ln1_weight_buffer,
             outLN.prod(ffn_up_input_depth),
-            ffnROut.prod(),
+            ffn_residual_prod,
             ln_fused_add_layer_norm_kernel,
             ln_calc_sum_sumsq_kernel,
             ln_zero_f32_kernel,
@@ -1371,21 +1445,37 @@ def fused_mha(
         while_true=False,
     )
 
-    ffn_up_stage_bufs = [
-        Buffer(type=o_ty, name=f"ffn_up_stage_buf{i}") for i in range(o_proj_acc_depth)
-    ]
-    ffn_up_replay_worker = Worker(
-        core_fn_ffn_up_replay,
-        fn_args=[
-            outLN.cons(),
-            ffnUpReplay.prod(),
-            *ffn_up_stage_bufs,
-            mem_copy_o_proj,
-        ],
-        placement=Tile(col=ffn_col, row=4),
-        stack_size=0xF00,
-        while_true=False,
-    )
+    if use_mtile_ffn_replay:
+        ffn_up_replay_worker = Worker(
+            core_fn_ffn_up_replay_mtile,
+            fn_args=[
+                outLN.cons(),
+                ffnUpStageAccum.cons(depth=1),
+                ffnUpStagePart.prod(),
+                ffnUpReplay.prod(),
+                mem_copy_o_proj,
+            ],
+            placement=Tile(col=ffn_col, row=4),
+            stack_size=0xF00,
+            while_true=False,
+        )
+    else:
+        ffn_up_stage_bufs = [
+            Buffer(type=o_ty, name=f"ffn_up_stage_buf{i}")
+            for i in range(o_proj_acc_depth)
+        ]
+        ffn_up_replay_worker = Worker(
+            core_fn_ffn_up_replay,
+            fn_args=[
+                outLN.cons(),
+                ffnUpReplay.prod(),
+                *ffn_up_stage_bufs,
+                mem_copy_o_proj,
+            ],
+            placement=Tile(col=ffn_col, row=4),
+            stack_size=0xF00,
+            while_true=False,
+        )
     ffn_up_worker = Worker(
         core_fn_ffn_up_proj,
         fn_args=[
@@ -1409,7 +1499,7 @@ def fused_mha(
             memBDown.cons(),
             ffnDownAccum.cons(depth=1),
             ffnDownPart.prod(),
-            ffnDownOut.prod(ln_fifo_depth),
+            ffnDownOut.prod(ffn_down_out_depth),
             ffn_zero_kernel_down_proj,
             ffn_matmul_kernel_down_proj,
             mem_copy_o_proj,
@@ -1873,9 +1963,8 @@ def fused_mha(
                     inR.prod(),
                     OR,
                     tap=R_tiles[q_block_idx * (num_o_col_groups) + col_group],
-                    placement=Tile(col=7, row=0),
+                    placement=Tile(col=ln_mem_tile_col, row=0),
                     task_group=tg,
-                    wait=True,
                 )
 
                 rt.fill(
@@ -1898,7 +1987,7 @@ def fused_mha(
                     OR,
                     tap=O_tiles[q_block_idx * (num_o_col_groups) + col_group],
                     wait=True,
-                    placement=Tile(col=7, row=0),
+                    placement=Tile(col=ln_mem_tile_col, row=0),
                     task_group=tg,
                 )
                 logging.debug(
