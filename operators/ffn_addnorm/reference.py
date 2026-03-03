@@ -4,8 +4,8 @@
 import torch
 from operators.common.utils import torch_dtype_map
 
-DEBUG_FFN_INPUT = 0
-DEBUG_RESIDUAL_INPUT = 1
+DEBUG_FFN_PATH = 0
+DEBUG_RESIDUAL_PATH = 1
 
 
 def generate_golden_reference(
@@ -51,18 +51,18 @@ def generate_golden_reference(
     torch.manual_seed(seed)
     val_range = 4
     dtype_torch = torch_dtype_map[dtype]
-    is_debug_mode = debug_mode in (DEBUG_FFN_INPUT, DEBUG_RESIDUAL_INPUT)
+    is_debug_mode = debug_mode in (DEBUG_FFN_PATH, DEBUG_RESIDUAL_PATH)
 
-    if debug_mode == DEBUG_FFN_INPUT:
+    if debug_mode == DEBUG_FFN_PATH:
         input_tensor = torch.arange(M * K, dtype=dtype_torch).reshape(M, K)
-    elif debug_mode == DEBUG_RESIDUAL_INPUT:
+    elif debug_mode == DEBUG_RESIDUAL_PATH:
         input_tensor = torch.zeros(M, K, dtype=dtype_torch)
     else:
         input_tensor = torch.rand(M, K, dtype=dtype_torch) * val_range
 
-    if debug_mode == DEBUG_FFN_INPUT:
+    if debug_mode == DEBUG_FFN_PATH:
         input_residual = torch.zeros(M, K, dtype=dtype_torch)
-    elif debug_mode == DEBUG_RESIDUAL_INPUT:
+    elif debug_mode == DEBUG_RESIDUAL_PATH:
         # Use a range so index flow through the residual path is easy to validate.
         input_residual = torch.arange(M * K, dtype=dtype_torch).reshape(M, K)
     else:
@@ -92,10 +92,10 @@ def generate_golden_reference(
     )
     down_proj_output = torch.matmul(gelu_output, down_weight)
 
-    if debug_mode == DEBUG_FFN_INPUT:
+    if debug_mode == DEBUG_FFN_PATH:
         # Kernel pass-through mode for AddNorm input.
         output = down_proj_output.clone()
-    elif debug_mode == DEBUG_RESIDUAL_INPUT:
+    elif debug_mode == DEBUG_RESIDUAL_PATH:
         # Kernel pass-through mode for AddNorm residual input.
         output = input_residual.clone()
     else:
