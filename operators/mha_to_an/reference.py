@@ -76,9 +76,12 @@ def generate_golden_reference(
         out_proj_weights = torch.eye(embed_sz, embed_sz, dtype=torch.bfloat16)
 
     if run_reference_self_attention:
-        Q = torch.randn(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-        K = torch.randn(heads, seq_len, d, dtype=torch.bfloat16) * val_range
-        V = torch.randn(heads, seq_len, d, dtype=torch.bfloat16) * val_range
+        # Keep self-attention debug inputs bounded so softmax numerics in the
+        # hardware pipeline remain comparable to PyTorch reference.
+        self_attn_range = 0.5 if debug == DEBUG_SELF_ATTN else val_range
+        Q = torch.randn(heads, seq_len, d, dtype=torch.bfloat16) * self_attn_range
+        K = torch.randn(heads, seq_len, d, dtype=torch.bfloat16) * self_attn_range
+        V = torch.randn(heads, seq_len, d, dtype=torch.bfloat16) * self_attn_range
 
         inv_scale = 1 / np.sqrt(K.shape[-1])
         O = torch.nn.functional.scaled_dot_product_attention(

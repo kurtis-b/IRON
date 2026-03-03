@@ -9,11 +9,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from operators.encoder_pipeline.op import AIEEncoderPipeline
+from operators.encoder_pipeline.constants import (
+    DEBUG_FULL,
+    ADDNORM_DEBUG_DISABLED,
+)
 from operators.encoder_pipeline.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
-DEBUG_MODE = 0
-ADDNORM_DEBUG_MODE = -1
+DEBUG_MODE = DEBUG_FULL
+ADDNORM_DEBUG_MODE = ADDNORM_DEBUG_DISABLED
+ADDNORM1_DEBUG_MODE = None
+ADDNORM2_DEBUG_MODE = None
 
 
 def generate_test_params(extensive=False):
@@ -22,18 +28,18 @@ def generate_test_params(extensive=False):
     # parallel_heads, o_proj_acc_depth, down_proj_depth, intermediate_size
     regular_params = [
         (3, 64, 64, 32, 64, 96, 1, 2, 2, 768),
-        # (12, 64, 64, 32, 64, 96, 1, 8, 8, 3072),
-        # (12, 128, 64, 32, 64, 96, 1, 8, 8, 3072),
-        # (12, 512, 64, 32, 64, 96, 1, 8, 8, 3072),
-        # (12, 2048, 64, 32, 64, 96, 1, 8, 8, 3072),
-        # (3, 64, 64, 32, 64, 96, 3, 2, 2, 768),
-        # (12, 64, 64, 32, 64, 96, 6, 8, 8, 3072),
-        # (12, 512, 64, 32, 64, 96, 6, 8, 8, 3072),
-        # (12, 2048, 64, 32, 64, 96, 6, 8, 8, 3072),
-        # (12, 1024, 64, 32, 64, 96, 1, 8, 8, 3072),
-        # (16, 512, 64, 32, 64, 128, 1, 8, 8, 4096),
-        # (16, 1024, 64, 32, 64, 128, 1, 8, 8, 4096),
-        # (16, 2048, 64, 32, 64, 128, 1, 8, 8, 4096),
+        (12, 64, 64, 32, 64, 96, 1, 8, 8, 3072),
+        (12, 128, 64, 32, 64, 96, 1, 8, 8, 3072),
+        (12, 512, 64, 32, 64, 96, 1, 8, 8, 3072),
+        (12, 2048, 64, 32, 64, 96, 1, 8, 8, 3072),
+        (3, 64, 64, 32, 64, 96, 3, 2, 2, 768),
+        (12, 64, 64, 32, 64, 96, 6, 8, 8, 3072),
+        (12, 512, 64, 32, 64, 96, 6, 8, 8, 3072),
+        (12, 2048, 64, 32, 64, 96, 6, 8, 8, 3072),
+        (12, 1024, 64, 32, 64, 96, 1, 8, 8, 3072),
+        (16, 512, 64, 32, 64, 128, 1, 8, 8, 4096),
+        (16, 1024, 64, 32, 64, 128, 1, 8, 8, 4096),
+        (16, 2048, 64, 32, 64, 128, 1, 8, 8, 4096),
     ]
     extensive_params = []
 
@@ -98,7 +104,10 @@ def test_encoder_pipeline(
         d=d,
         intermediate_size=intermediate_size,
         seed=42,
+        debug=DEBUG_MODE,
         addnorm_debug_mode=ADDNORM_DEBUG_MODE,
+        addnorm1_debug_mode=ADDNORM1_DEBUG_MODE,
+        addnorm2_debug_mode=ADDNORM2_DEBUG_MODE,
     )
 
     operator = AIEEncoderPipeline(
@@ -115,7 +124,10 @@ def test_encoder_pipeline(
         nB_tiles_distributed=1,
         debug=DEBUG_MODE,
         addnorm_debug_mode=ADDNORM_DEBUG_MODE,
-        ln_weight=golden_ref["ln1_weight"],
+        addnorm1_debug_mode=ADDNORM1_DEBUG_MODE,
+        addnorm2_debug_mode=ADDNORM2_DEBUG_MODE,
+        ln1_weight=golden_ref["ln1_weight"],
+        ln2_weight=golden_ref["ln2_weight"],
         context=aie_context,
     )
 

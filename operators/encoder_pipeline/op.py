@@ -20,19 +20,18 @@ from operators.common import (
     PythonGeneratedMLIRArtifact,
 )
 from operators.common.utils import torch_to_numpy, numpy_to_torch
-
-
-def _append_addnorm_debug_flag(extra_flags: list[str], addnorm_debug_mode: int | None):
-    if addnorm_debug_mode in (0, 1):
-        extra_flags.append(f"-DDEBUG_AIE_KERNELS={addnorm_debug_mode}")
-        return
+from operators.encoder_pipeline.constants import (
+    resolve_addnorm_modes,
+    resolve_ffn_stage_only,
+    resolve_mha_debug_mode,
+)
 
 
 class AIEEncoderPipeline(AIEOperatorBase):
     """Encoder pipeline operator entrypoint.
 
-    Current implementation reuses the `mha_to_an` hardware graph and enforces
-    FFN-compatible depth constraints (`down_proj_depth`) during setup.
+    Implements a fused MHA + AddNorm1 + FFN + AddNorm2 pipeline and enforces
+    shape/depth constraints required by the current hardware graph.
     """
 
     def __init__(
@@ -51,6 +50,10 @@ class AIEEncoderPipeline(AIEOperatorBase):
         static_weights: bool = False,
         debug: int = 0,
         addnorm_debug_mode: int = -1,
+        addnorm1_debug_mode: int | None = None,
+        addnorm2_debug_mode: int | None = None,
+        ln1_weight=None,
+        ln2_weight=None,
         ln_weight=None,
         context=None,
         skip_add_to_list=False,
@@ -65,7 +68,20 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.o_proj_acc_depth = o_proj_acc_depth
         self.nB_tiles_distributed = nB_tiles_distributed
         self.debug = debug
-        self.addnorm_debug_mode = addnorm_debug_mode
+        try:
+            self.mha_debug = resolve_mha_debug_mode(debug)
+            self.ffn_stage_only = resolve_ffn_stage_only(debug)
+            (
+                self.addnorm_debug_mode,
+                self.addnorm1_debug_mode,
+                self.addnorm2_debug_mode,
+            ) = resolve_addnorm_modes(
+                addnorm_debug_mode,
+                addnorm1_debug_mode,
+                addnorm2_debug_mode,
+            )
+        except ValueError as exc:
+            raise AIEOperatorConstraintError(str(exc)) from exc
         self.embed_sz = d * num_heads
         self.ffn_intermediate_size = (
             ffn_intermediate_size
@@ -121,9 +137,20 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        self.ln_weight = (
-            ln_weight
-            if ln_weight is not None
+        # Backward-compatible fallback: ln_weight applies to both stages.
+        if ln_weight is not None:
+            if ln1_weight is None:
+                ln1_weight = ln_weight
+            if ln2_weight is None:
+                ln2_weight = ln_weight
+        self.ln1_weight = (
+            ln1_weight
+            if ln1_weight is not None
+            else torch.ones(self.embed_sz, dtype=torch.bfloat16)
+        )
+        self.ln2_weight = (
+            ln2_weight
+            if ln2_weight is not None
             else torch.ones(self.embed_sz, dtype=torch.bfloat16)
         )
 
@@ -131,21 +158,33 @@ class AIEEncoderPipeline(AIEOperatorBase):
             self, context=context, skip_add_to_list=skip_add_to_list
         )
 
+    def _debug_suffix(self) -> str:
+        ffn_stage = self.ffn_stage_only if self.ffn_stage_only is not None else "all"
+        return (
+            f"{self.debug}debug_mha{self.mha_debug}_ffnstg{ffn_stage}_"
+            f"an1{self.addnorm1_debug_mode}_an2{self.addnorm2_debug_mode}_lnstage"
+        )
+
     def get_artifacts(self, prefix="encoder_pipeline"):
         operator_dir = Path(__file__).parent
+        debug_suffix = self._debug_suffix()
 
         file_name_base = (
             f"{prefix}_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}qt_"
             f"{self.kv_seq_tile}kvt_{self.emb_tile}e_{self.parallel_heads}ph_"
             f"{self.o_proj_acc_depth}acc_{self.down_proj_depth}dproj_"
             f"{self.nB_tiles_distributed}nbdist_{self.ffn_intermediate_size}ffn_"
-            f"an{self.addnorm_debug_mode}_lnstage"
+            f"{debug_suffix}"
         )
 
-        ln_weight_file_name = (
-            self.context.build_dir / f"{file_name_base}_ln_weight_{self.embed_sz}.npy"
+        ln1_weight_file_name = (
+            self.context.build_dir / f"{file_name_base}_ln1_weight_{self.embed_sz}.npy"
         )
-        np.save(ln_weight_file_name, torch_to_numpy(self.ln_weight))
+        ln2_weight_file_name = (
+            self.context.build_dir / f"{file_name_base}_ln2_weight_{self.embed_sz}.npy"
+        )
+        np.save(ln1_weight_file_name, torch_to_numpy(self.ln1_weight))
+        np.save(ln2_weight_file_name, torch_to_numpy(self.ln2_weight))
 
         mm_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mm.cc")
         softmax_source = str(
@@ -200,7 +239,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
 
         kernel_archive = (
             f"{prefix}_kernels_{self.num_heads}h_{self.seq_len}s_{self.d}d_"
-            f"{self.debug}debug_an{self.addnorm_debug_mode}_lnstage.a"
+            f"{debug_suffix}.a"
         )
         encoder_kernel_flags = [
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
@@ -210,7 +249,6 @@ class AIEEncoderPipeline(AIEOperatorBase):
             f"-DDIM_K={self.emb_tile}",
             f"-DDIM_N={self.emb_tile}",
         ]
-        _append_addnorm_debug_flag(encoder_kernel_flags, self.addnorm_debug_mode)
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -228,10 +266,14 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "emulate_bf16_mmul_with_bfp16": True,
                 "kernel_archive": kernel_archive,
                 "trace_size": 0,
-                "ln_weight_file": ln_weight_file_name,
+                "ln1_weight_file": ln1_weight_file_name,
+                "ln2_weight_file": ln2_weight_file_name,
                 "down_proj_depth": self.down_proj_depth,
                 "nB_tiles_distributed": self.nB_tiles_distributed,
                 "ffn_intermediate_size": self.ffn_intermediate_size,
+                "ffn_stage_only": self.ffn_stage_only,
+                "addnorm1_debug_mode": self.addnorm1_debug_mode,
+                "addnorm2_debug_mode": self.addnorm2_debug_mode,
             },
         )
 
@@ -264,11 +306,12 @@ class AIEEncoderPipeline(AIEOperatorBase):
                             depends=[SourceArtifact.new(softmax_source)],
                         ),
                         KernelObjectArtifact.new(
-                            f"{prefix}_mha_{self.seq_tile}m_{self.kv_seq_tile}n_{self.d}k_causal0_{self.debug}.o",
+                            f"{prefix}_mha_{self.seq_tile}m_{self.kv_seq_tile}n_"
+                            f"{self.d}k_causal0_{self.mha_debug}.o",
                             depends=[SourceArtifact.new(mha_source)],
                             extra_flags=[
                                 "-DIS_CAUSAL=0",
-                                f"-DDEBUG={self.debug}",
+                                f"-DDEBUG={self.mha_debug}",
                                 f"-DVECTOR_LENGTH={self.seq_tile}",
                             ],
                         ),

@@ -3,7 +3,6 @@
 
 import sys
 import math
-import copy
 import argparse
 from pathlib import Path
 import logging
@@ -18,14 +17,12 @@ from aie.iron import (
     Runtime,
     Worker,
     Buffer,
-    Buffer,
     WorkerRuntimeBarrier,
 )
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1Col1, NPU2, Tile
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
-from aie.helpers.dialects.ext.scf import if_, else_
 import aie.dialects.index as index
 from aie.dialects.aiex import *
 
@@ -49,6 +46,9 @@ microkernel_mac_dim_map = {
     },
 }
 
+FFN_STAGE_ONLY_CHOICES = (-1, 0, 1, 2)
+ADDNORM_DEBUG_CHOICES = (-1, 0, 1)
+
 
 def main():
     argparser = argparse.ArgumentParser(
@@ -71,7 +71,38 @@ def main():
     argparser.add_argument(
         "--kernel-archive", type=str, default="encoder_pipeline_kernels.a"
     )
-    argparser.add_argument("--ln-weight-file", type=str, default=None)
+    argparser.add_argument(
+        "--ln-weight-file",
+        type=str,
+        default=None,
+        help="Fallback LN weight file applied to both AddNorm stages if stage-specific files are not provided.",
+    )
+    argparser.add_argument("--ln1-weight-file", type=str, default=None)
+    argparser.add_argument("--ln2-weight-file", type=str, default=None)
+    argparser.add_argument(
+        "--ffn-stage-only",
+        type=int,
+        choices=list(FFN_STAGE_ONLY_CHOICES),
+        default=-1,
+        help=(
+            "FFN stage isolation: 0=up-proj only, 1=down-proj only, "
+            "2=AddNorm2 only, -1=all FFN stages"
+        ),
+    )
+    argparser.add_argument(
+        "--addnorm1-debug-mode",
+        type=int,
+        choices=list(ADDNORM_DEBUG_CHOICES),
+        default=-1,
+        help="-1=normal, 0=pass AddNorm1 input, 1=pass AddNorm1 residual",
+    )
+    argparser.add_argument(
+        "--addnorm2-debug-mode",
+        type=int,
+        choices=list(ADDNORM_DEBUG_CHOICES),
+        default=-1,
+        help="-1=normal, 0=pass AddNorm2 input, 1=pass AddNorm2 residual",
+    )
     argparser.add_argument(
         "--output-file-path",
         "-o",
@@ -82,7 +113,7 @@ def main():
 
     args = argparser.parse_args()
 
-    maybe_module = fused_mha(
+    module = fused_mha(
         heads=args.heads,
         seq_len=args.seq_len,
         d=args.d,
@@ -94,16 +125,21 @@ def main():
         emulate_bf16_mmul_with_bfp16=args.emulate_bf16_mmul_with_bfp16,
         kernel_archive=args.kernel_archive,
         trace_size=args.trace_size,
+        ln1_weight_file=args.ln1_weight_file,
+        ln2_weight_file=args.ln2_weight_file,
         ln_weight_file=args.ln_weight_file,
         down_proj_depth=args.down_proj_depth,
         nB_tiles_distributed=args.nB_tiles_distributed,
         ffn_intermediate_size=args.ffn_intermediate_size,
+        ffn_stage_only=None if args.ffn_stage_only == -1 else args.ffn_stage_only,
+        addnorm1_debug_mode=args.addnorm1_debug_mode,
+        addnorm2_debug_mode=args.addnorm2_debug_mode,
     )
 
     output_file_path = Path(args.output_file_path)
 
     with open(output_file_path, "w") as f:
-        f.write(str(maybe_module))
+        f.write(str(module))
 
     logging.info(f"MLIR module written to {output_file_path}")
 
@@ -123,20 +159,36 @@ def fused_mha(
     emulate_bf16_mmul_with_bfp16: bool,
     kernel_archive: str,
     trace_size: int = 0,
+    ln1_weight_file=None,
+    ln2_weight_file=None,
     ln_weight_file=None,
     down_proj_depth: int | None = None,
     nB_tiles_distributed: int = 1,
     ffn_intermediate_size: int | None = None,
+    ffn_stage_only: int | None = None,
+    addnorm1_debug_mode: int = -1,
+    addnorm2_debug_mode: int = -1,
 ):
     embed_sz = heads * d
     if ffn_intermediate_size is None:
         ffn_intermediate_size = 4 * embed_sz
 
-    # Load static layer norm weights for Add & Norm stage
-    if ln_weight_file is None:
-        static_ln_weights = np.ones(embed_sz, dtype=bfloat16)
+    # Backward-compatible fallback: a single ln_weight_file applies to both stages.
+    if ln_weight_file is not None:
+        if ln1_weight_file is None:
+            ln1_weight_file = ln_weight_file
+        if ln2_weight_file is None:
+            ln2_weight_file = ln_weight_file
+
+    # Load static layer norm weights for AddNorm-1 and AddNorm-2.
+    if ln1_weight_file is None:
+        static_ln1_weights = np.ones(embed_sz, dtype=bfloat16)
     else:
-        static_ln_weights = np.load(ln_weight_file)
+        static_ln1_weights = np.load(ln1_weight_file)
+    if ln2_weight_file is None:
+        static_ln2_weights = np.ones(embed_sz, dtype=bfloat16)
+    else:
+        static_ln2_weights = np.load(ln2_weight_file)
 
     of_depth = 2
     enable_tracing = True if trace_size > 0 else False
@@ -171,9 +223,28 @@ def fused_mha(
             "ffn_intermediate_size must be divisible by emb_tile "
             f"({ffn_intermediate_size} % {emb_tile} != 0)"
         )
+    valid_ffn_stage_only = (None, *FFN_STAGE_ONLY_CHOICES[1:])
+    if ffn_stage_only not in valid_ffn_stage_only:
+        raise ValueError(
+            f"ffn_stage_only must be one of {{None, 0, 1, 2}} (got {ffn_stage_only})"
+        )
+    if addnorm1_debug_mode not in ADDNORM_DEBUG_CHOICES:
+        raise ValueError(
+            "addnorm1_debug_mode must be one of {-1, 0, 1} "
+            f"(got {addnorm1_debug_mode})"
+        )
+    if addnorm2_debug_mode not in ADDNORM_DEBUG_CHOICES:
+        raise ValueError(
+            "addnorm2_debug_mode must be one of {-1, 0, 1} "
+            f"(got {addnorm2_debug_mode})"
+        )
     ffn_col_groups = ffn_intermediate_size // emb_tile
     num_o_col_groups = embed_sz // (emb_tile * o_proj_acc_depth)
     ln_tiles_per_q_block = num_o_col_groups * o_proj_acc_depth
+    # FFN workers consume AddNorm-1 output directly. Place FFN one column to the
+    # right of the first AddNorm core to avoid local tile resource contention.
+    ffn_col = min(parallel_heads + 1, 6)
+    ffn_ln2_col = min(ffn_col + 1, 7)
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
     mac_dims = microkernel_mac_dim_map[dev][dtype_str]
@@ -188,6 +259,12 @@ def fused_mha(
         "Encoder pipeline parameters: down_proj_depth=%s, nB_tiles_distributed=%d",
         str(down_proj_depth) if down_proj_depth is not None else "auto",
         nB_tiles_distributed,
+    )
+    logging.info(
+        "Debug controls: ffn_stage_only=%s, addnorm1_debug_mode=%d, addnorm2_debug_mode=%d",
+        "all" if ffn_stage_only is None else ffn_stage_only,
+        addnorm1_debug_mode,
+        addnorm2_debug_mode,
     )
     logging.info(
         f"num_q_seq_blocks: {num_q_seq_blocks}, num_kv_seq_blocks: {num_kv_seq_blocks}, num_qkv_head_block_per_parallel_head: {num_qkv_head_block_per_parallel_head}, num_o_col_groups: {num_o_col_groups}"
@@ -227,12 +304,14 @@ def fused_mha(
         (2 * seq_len, embed_sz),
         np.dtype[dtype],
     ]
+    # Keep FFN weight tensors as flat L3 buffers, matching ffn_addnorm runtime
+    # transfer semantics. TensorAccessPattern provides the 2D logical views.
     B_Up_ty = np.ndarray[
-        (embed_sz, ffn_intermediate_size),
+        (embed_sz * ffn_intermediate_size,),
         np.dtype[dtype],
     ]
     B_Down_ty = np.ndarray[
-        (ffn_intermediate_size, embed_sz),
+        (ffn_intermediate_size * embed_sz,),
         np.dtype[dtype],
     ]
 
@@ -536,9 +615,14 @@ def fused_mha(
         (r, emb_tile),
         (s, 1),
     ]
-    # Keep non-accumulation FIFOs shallow, matching mha_to_an/ffn_addnorm behavior.
-    # Only memory-tile accumulation FIFOs should scale with acc depth.
+    # Keep non-accumulation FIFOs shallow to avoid L1 over-allocation on FFN-down.
     ln_fifo_depth = of_depth
+    # AddNorm-2 consumes residual only on its second pass. Keep enough depth
+    # for one full output tile-group to avoid backpressure deadlock on LN1.
+    ffn_residual_depth = o_proj_acc_depth
+    # FFN-up replay worker stores K-tiles in local buffers; keep its input FIFO
+    # depth at 1 to stay within L1 limits for larger o_proj_acc_depth.
+    ffn_up_input_depth = 1
     # Residual R
     inR = ObjectFifo(
         o_ty,
@@ -555,11 +639,19 @@ def fused_mha(
 
     # LN output
     o_dims = [(seq_tile // r, r * emb_tile), (r, s), (emb_tile // s, r * s), (s, 1)]
-    outLN = ObjectFifo(o_ty, name="outLN", depth=ln_fifo_depth)
+    outLN = ObjectFifo(o_ty, name="outLN", depth=ffn_up_input_depth)
     # FFN residual path for AddNorm-2.
-    # Produce this directly from AddNorm-1 so FFN-up does not need to carry
-    # extra output buffering for residual replay.
-    ffnRIn = ObjectFifo(o_ty, name="ffnRIn", depth=ln_fifo_depth)
+    # Route through a mem tile to realize true queue depth for acc>2 cases.
+    # A direct core-to-core FIFO is effectively ping-pong buffered and can
+    # deadlock LN1 before FFN-up/down produce LN2 inputs.
+    ffnROut = ObjectFifo(o_ty, name="ffnROut", depth=1)
+    ffn_residual_mem_tile_col = 3
+    ffnRIn = ffnROut.cons(depth=ffn_residual_depth).forward(
+        obj_type=o_ty,
+        name="ffnRIn",
+        depth=ffn_residual_depth,
+        placement=Tile(col=ffn_residual_mem_tile_col, row=1),
+    )
 
     # FFN weights (Up/Down projections)
     b_dims = [
@@ -568,35 +660,37 @@ def fused_mha(
         (s, emb_tile),
         (t, 1),
     ]
-    inBUp = ObjectFifo(ffn_b_ty, name="inBUp", depth=of_depth)
+    # Keep FFN weight FIFOs at depth 1 to reduce L1 pressure on FFN cores.
+    ffn_weight_fifo_depth = 1
+    inBUp = ObjectFifo(ffn_b_ty, name="inBUp", depth=ffn_weight_fifo_depth)
     memBUp = inBUp.cons().forward(
         obj_type=ffn_b_ty,
         name="memBUp",
         dims_to_stream=b_dims,
-        depth=of_depth,
+        depth=ffn_weight_fifo_depth,
         placement=Tile(col=4, row=1),
     )
-    inBDown = ObjectFifo(ffn_b_ty, name="inBDown", depth=of_depth)
+    inBDown = ObjectFifo(ffn_b_ty, name="inBDown", depth=ffn_weight_fifo_depth)
     memBDown = inBDown.cons().forward(
         obj_type=ffn_b_ty,
         name="memBDown",
         dims_to_stream=b_dims,
-        depth=of_depth,
+        depth=ffn_weight_fifo_depth,
         placement=Tile(col=5, row=1),
     )
 
     # FFN internal pipelines and final encoder output
+    ffnUpReplay = ObjectFifo(o_ty, name="ffnUpReplay", depth=1)
     ffnUpOut = ObjectFifo(o_ty, name="ffnUpOut", depth=1)
-    # Mirror ffn_addnorm down-projection buffering:
-    # keep partial accumulations in an L2 FIFO depth=o_proj_acc_depth so we can
-    # replay the same finalized tiles for LN2 second pass without adding a third
-    # input DMA stream into the LN2 core.
+    # Keep FFN-down accumulation in a mem tile FIFO so down-proj core L1 stays
+    # within limits while replaying for LN2's two-pass consumption.
     ffnDownPart = ObjectFifo(o_ty, name="ffnDownPart", depth=1)
+    ffn_down_acc_mem_tile_col = 6
     ffnDownAccum = ffnDownPart.cons(depth=o_proj_acc_depth).forward(
         obj_type=o_ty,
         name="ffnDownAccum",
         depth=o_proj_acc_depth,
-        placement=Tile(col=5, row=1),
+        placement=Tile(col=ffn_down_acc_mem_tile_col, row=1),
     )
     ffnDownOut = ObjectFifo(o_ty, name="ffnDownOut", depth=ln_fifo_depth)
     outLN2 = ObjectFifo(o_ty, name="outLN2", depth=ln_fifo_depth)
@@ -719,7 +813,9 @@ def fused_mha(
             idx_buffer[0] = 0
             idx_buffer[1] = 0
 
-            for _ in range_(num_kv_seq_blocks):
+            # One outer iteration per head-block chunk. The inner body already
+            # consumes all KV sequence blocks for that chunk.
+            for _ in range_(num_qkv_head_block_per_parallel_head):
 
                 elem_o_out = of_o_out.acquire(1)
 
@@ -897,14 +993,39 @@ def fused_mha(
         sum_buf,
         sumsq_buf,
         weights,
-        of_out1,
-        of_out2,
+        of_out_up,
+        of_out_residual,
         fused_add_layer_norm,
         calc_sum_sumsq,
         zero_f32,
         copy,
+        addnorm1_mode,
     ):
+        pass_input = addnorm1_mode == 0
+        pass_residual = addnorm1_mode == 1
+        passthrough = pass_input or pass_residual
         for _ in range_(sys.maxsize):
+            if passthrough:
+                # Consume first-pass tiles to keep FIFO ordering.
+                for _ in range_(ln_tiles_per_q_block):
+                    elem_in1 = of_in1.acquire(1)
+                    of_in1.release(1)
+
+                # Second pass: passthrough AddNorm input or residual.
+                for _ in range_(ln_tiles_per_q_block):
+                    elem_in1 = of_in1.acquire(1)
+                    elem_in2 = of_in2.acquire(1)
+                    src = elem_in1 if pass_input else elem_in2
+                    elem_out_up_tile = of_out_up.acquire(1)
+                    elem_out_res = of_out_residual.acquire(1)
+                    copy(src, elem_out_up_tile, seq_tile * emb_tile)
+                    copy(src, elem_out_res, seq_tile * emb_tile)
+                    of_out_residual.release(1)
+                    of_out_up.release(1)
+                    of_in1.release(1)
+                    of_in2.release(1)
+                continue
+
             zero_f32(sum_buf, seq_tile)
             zero_f32(sumsq_buf, seq_tile)
             # First pass: accumulate row-wise statistics from first-pass tiles.
@@ -918,51 +1039,68 @@ def fused_mha(
                 col_i32 = index.casts(T.i32(), col_idx)
                 elem_in1 = of_in1.acquire(1)
                 elem_in2 = of_in2.acquire(1)
-                elem_out1 = of_out1.acquire(1)
-                elem_out2 = of_out2.acquire(1)
+                elem_out_res = of_out_residual.acquire(1)
+                elem_out_up_tile = of_out_up.acquire(1)
                 fused_add_layer_norm(
                     elem_in1,
                     elem_in2,
                     weights,
                     sum_buf,
                     sumsq_buf,
-                    elem_out1,
+                    elem_out_up_tile,
                     embed_sz,
                     col_i32,
                 )
-                copy(elem_out1, elem_out2, seq_tile * emb_tile)
-                of_out2.release(1)
-                of_out1.release(1)
+                copy(elem_out_up_tile, elem_out_res, seq_tile * emb_tile)
+                of_out_residual.release(1)
+                of_out_up.release(1)
                 of_in1.release(1)
                 of_in2.release(1)
 
-    def core_fn_ffn_up_proj(
+    def core_fn_ffn_up_replay(
         of_in_a,
+        of_out_replay,
+        *stage_bufs_and_copy,
+    ):
+        *stage_bufs, copy = stage_bufs_and_copy
+        for _ in range_(sys.maxsize):
+            # Stage AddNorm-1 tiles once, then replay them in col-group-major
+            # order expected by FFN-up B_Up tile traversal.
+            for k_idx in range(o_proj_acc_depth):
+                elem_in_a = of_in_a.acquire(1)
+                copy(elem_in_a, stage_bufs[k_idx], seq_tile * emb_tile)
+                of_in_a.release(1)
+
+            for _ in range_(ffn_col_groups):
+                for k_idx in range(o_proj_acc_depth):
+                    elem_out = of_out_replay.acquire(1)
+                    copy(stage_bufs[k_idx], elem_out, seq_tile * emb_tile)
+                    of_out_replay.release(1)
+
+    def core_fn_ffn_up_proj(
+        of_in_a_replay,
         of_in_b,
         of_out_c,
         zero,
         matmul,
         gelu,
+        stage_only,
     ):
-        # Hold AddNorm-1 output tiles in acquired FIFO objects and reuse across
-        # FFN column groups.
+        run_up = stage_only in (0, None)
         for _ in range_(sys.maxsize):
-            held_in_a = []
-            for _ in range(o_proj_acc_depth):
-                held_in_a.append(of_in_a.acquire(1))
-
             for _ in range_(ffn_col_groups):
                 elem_out_c = of_out_c.acquire(1)
                 zero(elem_out_c)
-                for k_idx in range(o_proj_acc_depth):
+                for _ in range_(o_proj_acc_depth):
+                    elem_in_a = of_in_a_replay.acquire(1)
                     elem_in_b = of_in_b.acquire(1)
-                    matmul(held_in_a[k_idx], elem_in_b, elem_out_c)
+                    if run_up:
+                        matmul(elem_in_a, elem_in_b, elem_out_c)
                     of_in_b.release(1)
-                gelu(elem_out_c, elem_out_c, seq_tile * emb_tile)
+                    of_in_a_replay.release(1)
+                if run_up:
+                    gelu(elem_out_c, elem_out_c, seq_tile * emb_tile)
                 of_out_c.release(1)
-
-            for _ in range_(o_proj_acc_depth):
-                of_in_a.release(1)
 
     def core_fn_ffn_down_proj(
         of_in_a,
@@ -973,7 +1111,9 @@ def fused_mha(
         zero,
         matmul,
         copy,
+        stage_only,
     ):
+        run_down = stage_only in (1, None)
         for _ in range_(sys.maxsize):
             # Initialize accumulator queue for this output tile group.
             for _ in range_(o_proj_acc_depth):
@@ -988,10 +1128,13 @@ def fused_mha(
                     elem_in_b = of_in_b.acquire(1)
                     elem_curr_acc = of_curr_acc.acquire(1)
                     elem_new_acc = of_new_acc.acquire(1)
-                    matmul(elem_in_a, elem_in_b, elem_curr_acc, elem_new_acc)
+                    if not run_down:
+                        copy(elem_curr_acc, elem_new_acc, seq_tile * emb_tile)
+                    else:
+                        matmul(elem_in_a, elem_in_b, elem_curr_acc, elem_new_acc)
+                    of_in_b.release(1)
                     of_new_acc.release(1)
                     of_curr_acc.release(1)
-                    of_in_b.release(1)
                 of_in_a.release(1)
 
             # First pass to LN2: sum/sumsq accumulation tiles.
@@ -1024,8 +1167,47 @@ def fused_mha(
         fused_add_layer_norm,
         calc_sum_sumsq,
         zero_f32,
+        copy,
+        stage_only,
+        addnorm2_mode,
     ):
+        run_addnorm2 = stage_only in (2, None)
+        pass_input = addnorm2_mode == 0
+        pass_residual = addnorm2_mode == 1
+        passthrough = pass_input or pass_residual
         for _ in range_(sys.maxsize):
+            # Stage isolation mode: bypass LN2 and keep residual path visible.
+            if not run_addnorm2:
+                for _ in range_(o_proj_acc_depth):
+                    elem_in1 = of_in1.acquire(1)
+                    of_in1.release(1)
+
+                for _ in range_(o_proj_acc_depth):
+                    elem_in1 = of_in1.acquire(1)
+                    elem_in2 = of_in2.acquire(1)
+                    elem_out = of_out.acquire(1)
+                    copy(elem_in2, elem_out, seq_tile * emb_tile)
+                    of_out.release(1)
+                    of_in1.release(1)
+                    of_in2.release(1)
+                continue
+
+            if passthrough:
+                for _ in range_(o_proj_acc_depth):
+                    elem_in1 = of_in1.acquire(1)
+                    of_in1.release(1)
+
+                for _ in range_(o_proj_acc_depth):
+                    elem_in1 = of_in1.acquire(1)
+                    elem_in2 = of_in2.acquire(1)
+                    elem_out = of_out.acquire(1)
+                    src = elem_in1 if pass_input else elem_in2
+                    copy(src, elem_out, seq_tile * emb_tile)
+                    of_out.release(1)
+                    of_in1.release(1)
+                    of_in2.release(1)
+                continue
+
             zero_f32(sum_buf, seq_tile)
             zero_f32(sumsq_buf, seq_tile)
             for _ in range_(o_proj_acc_depth):
@@ -1162,10 +1344,10 @@ def fused_mha(
         )
 
     # Create LN worker
-    ln_weight_buffer = Buffer(
+    ln1_weight_buffer = Buffer(
         type=ln_weights_ty,
-        initial_value=static_ln_weights,
-        name="static_ln_weights",
+        initial_value=static_ln1_weights,
+        name="static_ln1_weights",
     )
     sum_buffer = Buffer(type=sum_l1_ty, name="sum_buffer")
     sumsq_buffer = Buffer(type=sum_l1_ty, name="sumsq_buffer")
@@ -1176,32 +1358,44 @@ def fused_mha(
             memR.cons(),
             sum_buffer,
             sumsq_buffer,
-            ln_weight_buffer,
-            outLN.prod(),
-            ffnRIn.prod(),
+            ln1_weight_buffer,
+            outLN.prod(ffn_up_input_depth),
+            ffnROut.prod(),
             ln_fused_add_layer_norm_kernel,
             ln_calc_sum_sumsq_kernel,
             ln_zero_f32_kernel,
             mem_copy_o_proj,
+            addnorm1_debug_mode,
         ],
         placement=Tile(col=parallel_heads, row=5),
         while_true=False,
     )
 
-    # FFN workers consume AddNorm-1 output directly. Place FFN one column to the
-    # right of the first AddNorm core to avoid local tile resource contention.
-    ffn_col = min(parallel_heads + 1, 6)
-    ffn_ln2_col = min(ffn_col + 1, 7)
-
+    ffn_up_stage_bufs = [
+        Buffer(type=o_ty, name=f"ffn_up_stage_buf{i}") for i in range(o_proj_acc_depth)
+    ]
+    ffn_up_replay_worker = Worker(
+        core_fn_ffn_up_replay,
+        fn_args=[
+            outLN.cons(),
+            ffnUpReplay.prod(),
+            *ffn_up_stage_bufs,
+            mem_copy_o_proj,
+        ],
+        placement=Tile(col=ffn_col, row=4),
+        stack_size=0xF00,
+        while_true=False,
+    )
     ffn_up_worker = Worker(
         core_fn_ffn_up_proj,
         fn_args=[
-            outLN.cons(),
+            ffnUpReplay.cons(),
             memBUp.cons(),
             ffnUpOut.prod(),
             ffn_zero_kernel_up_proj,
             ffn_matmul_kernel_up_proj,
             ffn_gelu_kernel,
+            ffn_stage_only,
         ],
         placement=Tile(col=ffn_col, row=3),
         stack_size=0xF00,
@@ -1215,10 +1409,11 @@ def fused_mha(
             memBDown.cons(),
             ffnDownAccum.cons(depth=1),
             ffnDownPart.prod(),
-            ffnDownOut.prod(),
+            ffnDownOut.prod(ln_fifo_depth),
             ffn_zero_kernel_down_proj,
             ffn_matmul_kernel_down_proj,
             mem_copy_o_proj,
+            ffn_stage_only,
         ],
         placement=Tile(col=ffn_col, row=2),
         stack_size=0xF00,
@@ -1227,7 +1422,7 @@ def fused_mha(
 
     ln2_weight_buffer = Buffer(
         type=ln_weights_ty,
-        initial_value=static_ln_weights,
+        initial_value=static_ln2_weights,
         name="static_ln2_weights",
     )
     ln2_sum_buffer = Buffer(type=sum_l1_ty, name="ln2_sum_buffer")
@@ -1244,6 +1439,9 @@ def fused_mha(
             ln_fused_add_layer_norm_kernel,
             ln_calc_sum_sumsq_kernel,
             ln_zero_f32_kernel,
+            mem_copy_o_proj,
+            ffn_stage_only,
+            addnorm2_debug_mode,
         ],
         placement=Tile(col=ffn_ln2_col, row=2),
         stack_size=0xF00,
@@ -1407,6 +1605,36 @@ def fused_mha(
         walk(0, 0)
         return offsets
 
+    def transfer_count_for_fifo_obj(
+        tap: TensorAccessPattern, obj_shape: tuple[int, ...]
+    ) -> int:
+        tap_elems = math.prod(int(s) for s in tap.sizes)
+        obj_elems = math.prod(int(d) for d in obj_shape)
+        if obj_elems <= 0:
+            raise ValueError(f"Invalid FIFO object shape {obj_shape}")
+        if tap_elems % obj_elems != 0:
+            raise ValueError(
+                "TAP element count is not a whole multiple of FIFO object size: "
+                f"tap_sizes={list(tap.sizes)} tap_elems={tap_elems} "
+                f"obj_shape={obj_shape} obj_elems={obj_elems}"
+            )
+        return tap_elems // obj_elems
+
+    def assert_all_taps_match_count(
+        taps: TensorAccessSequence,
+        obj_shape: tuple[int, ...],
+        expected_count: int,
+        name: str,
+    ):
+        for tap_idx, tap in enumerate(taps):
+            count = transfer_count_for_fifo_obj(tap, obj_shape)
+            if count != expected_count:
+                raise ValueError(
+                    f"{name}[{tap_idx}] transfers {count} objects but worker loops "
+                    f"expect {expected_count}. tap_sizes={list(tap.sizes)} "
+                    f"tap_strides={list(tap.strides)} obj_shape={obj_shape}"
+                )
+
     def legalize_tap(tap: TensorAccessPattern, max_dim_size: int):
 
         sizes = list(tap._sizes)
@@ -1472,6 +1700,56 @@ def fused_mha(
     legalize_tas(B_Up_tiles)
     legalize_tas(B_Down_tiles)
 
+    # Validate host transfer counts against per-iteration worker consumption.
+    assert_all_taps_match_count(
+        Q_tiles,
+        (seq_tile, d * parallel_heads),
+        num_qkv_head_block_per_parallel_head,
+        "Q",
+    )
+    assert_all_taps_match_count(
+        K_tiles,
+        (kv_seq_tile, d * parallel_heads),
+        num_kv_seq_blocks,
+        "K",
+    )
+    assert_all_taps_match_count(
+        V_tiles,
+        (kv_seq_tile, d * parallel_heads),
+        num_kv_seq_blocks,
+        "V",
+    )
+    assert_all_taps_match_count(
+        WO_tiles,
+        (d * parallel_heads, emb_tile),
+        o_proj_acc_depth,
+        "W_O",
+    )
+    assert_all_taps_match_count(
+        R_tiles,
+        (seq_tile, emb_tile),
+        o_proj_acc_depth,
+        "R",
+    )
+    assert_all_taps_match_count(
+        O_tiles,
+        (seq_tile, emb_tile),
+        o_proj_acc_depth,
+        "O",
+    )
+    assert_all_taps_match_count(
+        B_Up_tiles,
+        (emb_tile, emb_tile),
+        ffn_col_groups * o_proj_acc_depth,
+        "B_Up",
+    )
+    assert_all_taps_match_count(
+        B_Down_tiles,
+        (emb_tile, emb_tile),
+        ffn_col_groups * o_proj_acc_depth,
+        "B_Down",
+    )
+
     print_tap_seq_info(Q_tiles, "Q")
     print_tap_seq_info(K_tiles, "K")
     print_tap_seq_info(V_tiles, "V")
@@ -1497,13 +1775,12 @@ def fused_mha(
             rt.start(matmul_pv_workers[i])
             rt.start(o_proj_workers[i])
         rt.start(ln_worker)
+        rt.start(ffn_up_replay_worker)
         rt.start(ffn_up_worker)
         rt.start(ffn_down_worker)
         rt.start(ln2_worker)
 
         for q_block_idx in range(num_q_seq_blocks):
-            tg_out = rt.task_group()
-
             for col_group in range(num_o_col_groups):
                 # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
                 tg = rt.task_group()
@@ -1600,13 +1877,13 @@ def fused_mha(
                     task_group=tg,
                     wait=True,
                 )
+
                 rt.fill(
                     inBUp.prod(),
                     B_Up,
                     tap=B_Up_tiles[col_group],
                     placement=Tile(col=4, row=0),
                     task_group=tg,
-                    wait=True,
                 )
                 rt.fill(
                     inBDown.prod(),
@@ -1614,9 +1891,7 @@ def fused_mha(
                     tap=B_Down_tiles[col_group],
                     placement=Tile(col=5, row=0),
                     task_group=tg,
-                    wait=True,
                 )
-                rt.finish_task_group(tg)
 
                 rt.drain(
                     memLN2.cons(),
@@ -1624,13 +1899,12 @@ def fused_mha(
                     tap=O_tiles[q_block_idx * (num_o_col_groups) + col_group],
                     wait=True,
                     placement=Tile(col=7, row=0),
-                    task_group=tg_out,
+                    task_group=tg,
                 )
                 logging.debug(
                     f"  O tap: {O_tiles[q_block_idx * (num_o_col_groups) + col_group]}"
                 )
-
-            rt.finish_task_group(tg_out)
+                rt.finish_task_group(tg)
 
     # Create the program from the device type and runtime
     if dev == "npu":
