@@ -601,7 +601,9 @@ def fused_mha(
             idx_buffer[0] = 0
             idx_buffer[1] = 0
 
-            for _ in range_(num_kv_seq_blocks):
+            # One outer iteration per head-block chunk. The inner body already
+            # consumes all KV sequence blocks for that chunk.
+            for _ in range_(num_qkv_head_block_per_parallel_head):
 
                 elem_o_out = of_o_out.acquire(1)
 
