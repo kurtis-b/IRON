@@ -1053,61 +1053,59 @@ def fused_mha(
         copy,
         addnorm1_mode,
     ):
-        pass_input = addnorm1_mode == 0
-        pass_residual = addnorm1_mode == 1
-        passthrough = pass_input or pass_residual
         for _ in range_(sys.maxsize):
-            if passthrough:
-                # Consume first-pass tiles to keep FIFO ordering.
+            # Check if first add & norm stage is enabled.
+            if addnorm1_mode not in [-1]:
+                # Skip layer norm and pass through a selected source for both outputs.
                 for _ in range_(ln_tiles_per_q_block):
                     elem_in1 = of_in1.acquire(1)
                     of_in1.release(1)
-
-                # Second pass: passthrough AddNorm input or residual.
                 for _ in range_(ln_tiles_per_q_block):
                     elem_in1 = of_in1.acquire(1)
                     elem_in2 = of_in2.acquire(1)
-                    src = elem_in1 if pass_input else elem_in2
                     elem_out_up_tile = of_out_up.acquire(1)
                     elem_out_res = of_out_residual.acquire(1)
-                    copy(src, elem_out_up_tile, seq_tile * emb_tile)
-                    copy(src, elem_out_res, seq_tile * emb_tile)
+                    if addnorm1_mode == 0:
+                        copy(elem_in1, elem_out_up_tile, seq_tile * emb_tile)
+                        copy(elem_in1, elem_out_res, seq_tile * emb_tile)
+                    else:
+                        copy(elem_in2, elem_out_up_tile, seq_tile * emb_tile)
+                        copy(elem_in2, elem_out_res, seq_tile * emb_tile)
                     of_out_residual.release(1)
                     of_out_up.release(1)
                     of_in1.release(1)
                     of_in2.release(1)
-                continue
+            else:
+                zero_f32(sum_buf, seq_tile)
+                zero_f32(sumsq_buf, seq_tile)
+                # First pass: accumulate row-wise statistics from first-pass tiles.
+                for _ in range_(ln_tiles_per_q_block):
+                    elem_in1 = of_in1.acquire(1)
+                    calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
+                    of_in1.release(1)
 
-            zero_f32(sum_buf, seq_tile)
-            zero_f32(sumsq_buf, seq_tile)
-            # First pass: accumulate row-wise statistics from first-pass tiles.
-            for _ in range_(ln_tiles_per_q_block):
-                elem_in1 = of_in1.acquire(1)
-                calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
-                of_in1.release(1)
-
-            # Second pass: apply fused layer norm + add
-            for col_idx in range_(ln_tiles_per_q_block):
-                col_i32 = index.casts(T.i32(), col_idx)
-                elem_in1 = of_in1.acquire(1)
-                elem_in2 = of_in2.acquire(1)
-                elem_out_res = of_out_residual.acquire(1)
-                elem_out_up_tile = of_out_up.acquire(1)
-                fused_add_layer_norm(
-                    elem_in1,
-                    elem_in2,
-                    weights,
-                    sum_buf,
-                    sumsq_buf,
-                    elem_out_up_tile,
-                    embed_sz,
-                    col_i32,
-                )
-                copy(elem_out_up_tile, elem_out_res, seq_tile * emb_tile)
-                of_out_residual.release(1)
-                of_out_up.release(1)
-                of_in1.release(1)
-                of_in2.release(1)
+                # Second pass: apply fused layer norm + add
+                for col_idx in range_(ln_tiles_per_q_block):
+                    col_i32 = index.casts(T.i32(), col_idx)
+                    elem_in1 = of_in1.acquire(1)
+                    elem_in2 = of_in2.acquire(1)
+                    elem_out_res = of_out_residual.acquire(1)
+                    elem_out_up_tile = of_out_up.acquire(1)
+                    fused_add_layer_norm(
+                        elem_in1,
+                        elem_in2,
+                        weights,
+                        sum_buf,
+                        sumsq_buf,
+                        elem_out_up_tile,
+                        embed_sz,
+                        col_i32,
+                    )
+                    copy(elem_out_up_tile, elem_out_res, seq_tile * emb_tile)
+                    of_out_residual.release(1)
+                    of_out_up.release(1)
+                    of_in1.release(1)
+                    of_in2.release(1)
 
     def core_fn_ffn_up_replay(
         of_in_a,
@@ -1174,21 +1172,30 @@ def fused_mha(
         gelu,
         stage_only,
     ):
-        run_up = stage_only in (0, None)
         for _ in range_(sys.maxsize):
-            for _ in range_(ffn_col_groups):
-                elem_out_c = of_out_c.acquire(1)
-                zero(elem_out_c)
-                for _ in range_(o_proj_acc_depth):
-                    elem_in_a = of_in_a_replay.acquire(1)
-                    elem_in_b = of_in_b.acquire(1)
-                    if run_up:
-                        matmul(elem_in_a, elem_in_b, elem_out_c)
-                    of_in_b.release(1)
-                    of_in_a_replay.release(1)
-                if run_up:
-                    gelu(elem_out_c, elem_out_c, seq_tile * emb_tile)
-                of_out_c.release(1)
+            # Check if up projection stage is enabled, None means all stages are enabled.
+            if stage_only not in [0, None]:  # Skip computation for up projection stage
+                for _ in range_(ffn_col_groups):
+                    elem_out_matmul = of_out_c.acquire(1)
+                    for _ in range_(o_proj_acc_depth):
+                        elem_in_a = of_in_a_replay.acquire(1)
+                        elem_in_b = of_in_b.acquire(1)
+                        of_in_b.release(1)
+                        of_in_a_replay.release(1)
+                    of_out_c.release(1)
+            else:  # Perform up projection stage computation
+                for _ in range_(ffn_col_groups):
+                    elem_out_matmul = of_out_c.acquire(1)
+                    zero(elem_out_matmul)
+                    for _ in range_(o_proj_acc_depth):
+                        elem_in_a = of_in_a_replay.acquire(1)
+                        elem_in_b = of_in_b.acquire(1)
+                        matmul(elem_in_a, elem_in_b, elem_out_matmul)
+                        of_in_b.release(1)
+                        of_in_a_replay.release(1)
+                    if gelu:
+                        gelu(elem_out_matmul, elem_out_matmul, seq_tile * emb_tile)
+                    of_out_c.release(1)
 
     def core_fn_ffn_down_proj(
         of_in_a,
@@ -1201,49 +1208,71 @@ def fused_mha(
         copy,
         stage_only,
     ):
-        run_down = stage_only in (1, None)
         for _ in range_(sys.maxsize):
-            # Initialize accumulator queue for this output tile group.
-            for _ in range_(o_proj_acc_depth):
-                elem_acc = of_new_acc.acquire(1)
-                zero(elem_acc)
-                of_new_acc.release(1)
-
-            # Accumulate across all FFN intermediate column groups.
-            for _ in range_(ffn_col_groups):
-                elem_in_a = of_in_a.acquire(1)
+            # Check if down projection stage is enabled, None means all stages are enabled.
+            if stage_only not in [
+                1,
+                None,
+            ]:  # Skip computation for down projection stage
                 for _ in range_(o_proj_acc_depth):
-                    elem_in_b = of_in_b.acquire(1)
+                    elem_acc = of_new_acc.acquire(1)
+                    of_new_acc.release(1)
+                for _ in range_(ffn_col_groups):
+                    elem_in_a = of_in_a.acquire(1)
+                    for _ in range_(o_proj_acc_depth):
+                        elem_in_b = of_in_b.acquire(1)
+                        elem_curr_acc = of_curr_acc.acquire(1)
+                        elem_new_acc = of_new_acc.acquire(1)
+                        of_in_b.release(1)
+                        of_new_acc.release(1)
+                        of_curr_acc.release(1)
+                    of_in_a.release(1)
+                for _ in range_(o_proj_acc_depth):
                     elem_curr_acc = of_curr_acc.acquire(1)
+                    elem_out = of_out.acquire(1)
+                    of_out.release(1)
                     elem_new_acc = of_new_acc.acquire(1)
-                    if not run_down:
-                        copy(elem_curr_acc, elem_new_acc, seq_tile * emb_tile)
-                    else:
-                        matmul(elem_in_a, elem_in_b, elem_curr_acc, elem_new_acc)
-                    of_in_b.release(1)
                     of_new_acc.release(1)
                     of_curr_acc.release(1)
-                of_in_a.release(1)
-
-            # First pass to LN2: sum/sumsq accumulation tiles.
-            # Copy back into L2 accumulator queue for second-pass replay.
-            for _ in range_(o_proj_acc_depth):
-                elem_curr_acc = of_curr_acc.acquire(1)
-                elem_out = of_out.acquire(1)
-                copy(elem_curr_acc, elem_out, seq_tile * emb_tile)
-                elem_new_acc = of_new_acc.acquire(1)
-                copy(elem_out, elem_new_acc, seq_tile * emb_tile)
-                of_new_acc.release(1)
-                of_out.release(1)
-                of_curr_acc.release(1)
-
-            # Second pass to LN2: normalized apply tiles.
-            for _ in range_(o_proj_acc_depth):
-                elem_curr_acc = of_curr_acc.acquire(1)
-                elem_out = of_out.acquire(1)
-                copy(elem_curr_acc, elem_out, seq_tile * emb_tile)
-                of_out.release(1)
-                of_curr_acc.release(1)
+                for _ in range_(o_proj_acc_depth):
+                    elem_curr_acc = of_curr_acc.acquire(1)
+                    elem_out = of_out.acquire(1)
+                    of_out.release(1)
+                    of_curr_acc.release(1)
+            else:  # Perform down projection stage computation
+                # First iteration just passes the partial C tile through.
+                for _ in range_(o_proj_acc_depth):
+                    elem_acc = of_new_acc.acquire(1)
+                    zero(elem_acc)
+                    of_new_acc.release(1)
+                for _ in range_(ffn_col_groups):
+                    elem_in_a = of_in_a.acquire(1)
+                    for _ in range_(o_proj_acc_depth):
+                        elem_in_b = of_in_b.acquire(1)
+                        elem_curr_acc = of_curr_acc.acquire(1)
+                        elem_new_acc = of_new_acc.acquire(1)
+                        matmul(elem_in_a, elem_in_b, elem_curr_acc, elem_new_acc)
+                        of_in_b.release(1)
+                        of_new_acc.release(1)
+                        of_curr_acc.release(1)
+                    of_in_a.release(1)
+                for _ in range_(o_proj_acc_depth):
+                    # Acquire what's in L2, which is the final accumulated result for the tile.
+                    elem_curr_acc = of_curr_acc.acquire(1)
+                    elem_out = of_out.acquire(1)
+                    copy(elem_curr_acc, elem_out, seq_tile * emb_tile)
+                    elem_new_acc = of_new_acc.acquire(1)
+                    # Make sure to copy the final accumulated C tile for the LN second pass.
+                    copy(elem_out, elem_new_acc, seq_tile * emb_tile)
+                    of_new_acc.release(1)
+                    of_out.release(1)
+                    of_curr_acc.release(1)
+                for _ in range_(o_proj_acc_depth):
+                    elem_curr_acc = of_curr_acc.acquire(1)
+                    elem_out = of_out.acquire(1)
+                    copy(elem_curr_acc, elem_out, seq_tile * emb_tile)
+                    of_out.release(1)
+                    of_curr_acc.release(1)
 
     def core_fn_add_norm2(
         of_in1,
@@ -1259,68 +1288,65 @@ def fused_mha(
         stage_only,
         addnorm2_mode,
     ):
-        run_addnorm2 = stage_only in (2, None)
-        pass_input = addnorm2_mode == 0
-        pass_residual = addnorm2_mode == 1
-        passthrough = pass_input or pass_residual
         for _ in range_(sys.maxsize):
-            # Stage isolation mode: bypass LN2 and keep residual path visible.
-            if not run_addnorm2:
+            # Check if second add & norm stage is enabled, None means all stages are enabled.
+            if stage_only not in [
+                2,
+                None,
+            ]:  # Skip computation for second add & norm stage
                 for _ in range_(o_proj_acc_depth):
                     elem_in1 = of_in1.acquire(1)
                     of_in1.release(1)
-
                 for _ in range_(o_proj_acc_depth):
                     elem_in1 = of_in1.acquire(1)
                     elem_in2 = of_in2.acquire(1)
                     elem_out = of_out.acquire(1)
+                    # Preserve stage-isolation behavior by forwarding residual input.
                     copy(elem_in2, elem_out, seq_tile * emb_tile)
                     of_out.release(1)
                     of_in1.release(1)
                     of_in2.release(1)
-                continue
-
-            if passthrough:
+            elif addnorm2_mode not in [-1]:
                 for _ in range_(o_proj_acc_depth):
                     elem_in1 = of_in1.acquire(1)
                     of_in1.release(1)
-
                 for _ in range_(o_proj_acc_depth):
                     elem_in1 = of_in1.acquire(1)
                     elem_in2 = of_in2.acquire(1)
                     elem_out = of_out.acquire(1)
-                    src = elem_in1 if pass_input else elem_in2
-                    copy(src, elem_out, seq_tile * emb_tile)
+                    if addnorm2_mode == 0:
+                        copy(elem_in1, elem_out, seq_tile * emb_tile)
+                    else:
+                        copy(elem_in2, elem_out, seq_tile * emb_tile)
                     of_out.release(1)
                     of_in1.release(1)
                     of_in2.release(1)
-                continue
+            else:
+                zero_f32(sum_buf, seq_tile)
+                zero_f32(sumsq_buf, seq_tile)
+                for _ in range_(o_proj_acc_depth):
+                    elem_in1 = of_in1.acquire(1)
+                    calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
+                    of_in1.release(1)
 
-            zero_f32(sum_buf, seq_tile)
-            zero_f32(sumsq_buf, seq_tile)
-            for _ in range_(o_proj_acc_depth):
-                elem_in1 = of_in1.acquire(1)
-                calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
-                of_in1.release(1)
-
-            for col_idx in range_(o_proj_acc_depth):
-                col_i32 = index.casts(T.i32(), col_idx)
-                elem_in1 = of_in1.acquire(1)
-                elem_in2 = of_in2.acquire(1)
-                elem_out = of_out.acquire(1)
-                fused_add_layer_norm(
-                    elem_in1,
-                    elem_in2,
-                    weights,
-                    sum_buf,
-                    sumsq_buf,
-                    elem_out,
-                    embed_sz,
-                    col_i32,
-                )
-                of_out.release(1)
-                of_in1.release(1)
-                of_in2.release(1)
+                for col_idx in range_(o_proj_acc_depth):
+                    col_i32 = index.casts(T.i32(), col_idx)
+                    elem_in1 = of_in1.acquire(1)
+                    elem_in2 = of_in2.acquire(1)
+                    elem_out = of_out.acquire(1)
+                    fused_add_layer_norm(
+                        elem_in1,
+                        elem_in2,
+                        weights,
+                        sum_buf,
+                        sumsq_buf,
+                        elem_out,
+                        embed_sz,
+                        col_i32,
+                    )
+                    of_out.release(1)
+                    of_in1.release(1)
+                    of_in2.release(1)
 
     # Create worker from task
     matmul_workers = []
