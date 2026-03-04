@@ -348,6 +348,165 @@ void fused_add_layer_norm_1(const T *restrict input,
     event1();
 }
 
+template <typename T, unsigned rowA, unsigned colA, unsigned r, unsigned s>
+void fused_layer_norm_1(const T *restrict input,
+                        const float *restrict sum,
+                        const float *restrict sumsq,
+                        T *restrict output,
+                        const int32_t cols)
+{
+    event0();
+
+    constexpr float epsilon = 1e-5f;
+    constexpr unsigned mmul_c_size = r * s; // Number of elements in each C microtile
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
+        const T *__restrict pA1 = input + (z * colA) * mmul_c_size;
+        T *__restrict pC1 = output + (z * colA) * mmul_c_size;
+
+        const float *__restrict pSum1 = sum + z * r;
+        const float *__restrict pSumSq1 = sumsq + z * r;
+
+        // For each row within this microtile, apply layer norm (no weight/residual).
+        for (unsigned ri = 0; ri < r; ri++) {
+            for (unsigned j = 0; j < colA; j += 2) {
+                float mean = aie::div(*pSum1, aie::to_float(cols));
+                float mean_sq = mean * mean;
+                float variance = aie::div(*pSumSq1, aie::to_float(cols)) - mean_sq;
+                if (variance < 0.0f) {
+                    variance = 0.0f;
+                }
+                float inv_std = aie::invsqrt(variance + epsilon);
+
+                aie::vector<T, s> A0 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size;
+                aie::vector<T, s> A1 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size;
+                auto A01 = aie::concat(A0, A1);
+
+                aie::accum<accfloat, 2 * s> a_acc;
+                a_acc.from_vector(A01);
+                aie::accum<accfloat, 2 * s> diff_acc = aie::sub(a_acc, mean);
+                aie::accum<accfloat, 2 * s> norm_acc = aie::mul(diff_acc.template to_vector<float>(), inv_std);
+                aie::vector<T, 2 * s> out_acc = norm_acc.template to_vector<T>();
+
+                aie::store_v(pC1, out_acc.template extract<s>(0));
+                pC1 += mmul_c_size;
+                aie::store_v(pC1, out_acc.template extract<s>(1));
+                pC1 += mmul_c_size;
+            }
+
+            pSum1++;
+            pSumSq1++;
+            pA1 -= colA * mmul_c_size;
+            pA1 += s;
+            pC1 -= colA * mmul_c_size;
+            pC1 += s;
+        }
+    }
+    event1();
+}
+
+template <typename T, unsigned rowA, unsigned colA, unsigned r, unsigned s>
+void ln_mul_weights_1(const T *restrict input, const T *restrict weight, T *restrict output, const int32_t col_idx)
+{
+    event0();
+
+    constexpr unsigned mmul_c_size = r * s; // Number of elements in each C microtile
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
+        const T *__restrict pA1 = input + (z * colA) * mmul_c_size;
+        T *__restrict pC1 = output + (z * colA) * mmul_c_size;
+        const T *__restrict pW_row = weight + (col_idx * colA * s);
+
+        for (unsigned ri = 0; ri < r; ri++) {
+            const T *__restrict pW = pW_row;
+            for (unsigned j = 0; j < colA; j += 2) {
+                aie::vector<T, s> A0 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size;
+                aie::vector<T, s> A1 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size;
+                auto A01 = aie::concat(A0, A1);
+
+                aie::vector<T, 2 * s> weight_v = aie::load_v<2 * s>(pW);
+                pW += 2 * s;
+                aie::vector<T, 2 * s> out_acc = aie::mul(A01, weight_v);
+
+                aie::store_v(pC1, out_acc.template extract<s>(0));
+                pC1 += mmul_c_size;
+                aie::store_v(pC1, out_acc.template extract<s>(1));
+                pC1 += mmul_c_size;
+            }
+
+            pA1 -= colA * mmul_c_size;
+            pA1 += s;
+            pC1 -= colA * mmul_c_size;
+            pC1 += s;
+        }
+    }
+    event1();
+}
+
+template <typename T, unsigned rowA, unsigned colA, unsigned r, unsigned s>
+void ln_mul_add_1(const T *restrict input,
+                  const T *restrict residual,
+                  const T *restrict weight,
+                  T *restrict output,
+                  const int32_t col_idx)
+{
+    event0();
+
+    constexpr unsigned mmul_c_size = r * s; // Number of elements in each C microtile
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
+        const T *__restrict pA1 = input + (z * colA) * mmul_c_size;
+        const T *__restrict pR1 = residual + (z * colA) * mmul_c_size;
+        T *__restrict pC1 = output + (z * colA) * mmul_c_size;
+        const T *__restrict pW_row = weight + (col_idx * colA * s);
+
+        for (unsigned ri = 0; ri < r; ri++) {
+            const T *__restrict pW = pW_row;
+            for (unsigned j = 0; j < colA; j += 2) {
+                aie::vector<T, s> A0 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size;
+                aie::vector<T, s> A1 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size;
+                auto A01 = aie::concat(A0, A1);
+
+                aie::vector<T, s> R0 = aie::load_v<s>(pR1);
+                pR1 += mmul_c_size;
+                aie::vector<T, s> R1 = aie::load_v<s>(pR1);
+                pR1 += mmul_c_size;
+                auto R01 = aie::concat(R0, R1);
+
+                aie::vector<T, 2 * s> weight_v = aie::load_v<2 * s>(pW);
+                pW += 2 * s;
+                aie::vector<T, 2 * s> scaled = aie::mul(A01, weight_v);
+                aie::vector<T, 2 * s> out_acc = aie::add(scaled, R01);
+
+                aie::store_v(pC1, out_acc.template extract<s>(0));
+                pC1 += mmul_c_size;
+                aie::store_v(pC1, out_acc.template extract<s>(1));
+                pC1 += mmul_c_size;
+            }
+
+            pA1 -= colA * mmul_c_size;
+            pA1 += s;
+            pR1 -= colA * mmul_c_size;
+            pR1 += s;
+            pC1 -= colA * mmul_c_size;
+            pC1 += s;
+        }
+    }
+    event1();
+}
+
 template <typename T, int N>
 void fused_add_layer_norm_2(const T *restrict input,
                             const T *restrict residual,
@@ -628,6 +787,50 @@ void fused_add_layer_norm_1outs(const bfloat16 *input,
     ::aie::set_rounding(aie::rounding_mode::conv_even);
     fused_add_layer_norm_1<bfloat16, (DIM_M / r), (DIM_K / s), r, s>(
         input, residual, weights, sum, sumsq, output, cols, col_idx);
+}
+
+void fused_layer_norm_1outs(const bfloat16 *input,
+                            const float *sum,
+                            const float *sumsq,
+                            bfloat16 *output,
+                            const int32_t cols)
+{
+    constexpr int r = 8;
+    constexpr int s = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_K % s == 0);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    fused_layer_norm_1<bfloat16, (DIM_M / r), (DIM_K / s), r, s>(input, sum, sumsq, output, cols);
+}
+
+void ln_mul_weights_1outs(const bfloat16 *input, const bfloat16 *weights, bfloat16 *output, const int32_t col_idx)
+{
+    constexpr int r = 8;
+    constexpr int s = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_K % s == 0);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    ln_mul_weights_1<bfloat16, (DIM_M / r), (DIM_K / s), r, s>(input, weights, output, col_idx);
+}
+
+void ln_mul_add_1outs(const bfloat16 *input,
+                      const bfloat16 *residual,
+                      const bfloat16 *weights,
+                      bfloat16 *output,
+                      const int32_t col_idx)
+{
+    constexpr int r = 8;
+    constexpr int s = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_K % s == 0);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    ln_mul_add_1<bfloat16, (DIM_M / r), (DIM_K / s), r, s>(input, residual, weights, output, col_idx);
 }
 
 void fused_add_layer_norm_2outs(const bfloat16 *input,
