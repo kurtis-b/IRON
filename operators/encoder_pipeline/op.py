@@ -39,8 +39,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         kv_seq_tile: int = 64,
         emb_tile: int = 96,
         parallel_heads: int = 1,
-        o_proj_acc_depth: int = 1,
-        down_proj_depth: int | None = None,
+        proj_acc_depth: int = 1,
         nB_tiles_distributed: int = 1,
         ffn_intermediate_size: int | None = None,
         static_weights: bool = False,
@@ -58,7 +57,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.kv_seq_tile = kv_seq_tile
         self.emb_tile = emb_tile
         self.parallel_heads = parallel_heads
-        self.o_proj_acc_depth = o_proj_acc_depth
+        self.proj_acc_depth = proj_acc_depth
         self.nB_tiles_distributed = nB_tiles_distributed
         self.debug = debug
         try:
@@ -88,19 +87,10 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "encoder_pipeline requires emb_tile to divide embed_sz "
                 f"({self.embed_sz} % {self.emb_tile} != 0)"
             )
-        if self.o_proj_acc_depth != expected_depth:
+        if self.proj_acc_depth != expected_depth:
             raise AIEOperatorConstraintError(
-                "encoder_pipeline requires emb_tile * o_proj_acc_depth == embed_sz "
-                f"({self.emb_tile} * {self.o_proj_acc_depth} != {self.embed_sz})"
-            )
-        if down_proj_depth is None:
-            self.down_proj_depth = expected_depth
-        else:
-            self.down_proj_depth = down_proj_depth
-        if self.down_proj_depth != expected_depth:
-            raise AIEOperatorConstraintError(
-                "encoder_pipeline requires emb_tile * down_proj_depth == embed_sz "
-                f"({self.emb_tile} * {self.down_proj_depth} != {self.embed_sz})"
+                "encoder_pipeline requires emb_tile * proj_acc_depth == embed_sz "
+                f"({self.emb_tile} * {self.proj_acc_depth} != {self.embed_sz})"
             )
         if self.ffn_intermediate_size % self.emb_tile != 0:
             raise AIEOperatorConstraintError(
@@ -160,7 +150,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         file_name_base = (
             f"{prefix}_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}qt_"
             f"{self.kv_seq_tile}kvt_{self.emb_tile}e_{self.parallel_heads}ph_"
-            f"{self.o_proj_acc_depth}acc_{self.down_proj_depth}dproj_"
+            f"{self.proj_acc_depth}acc_"
             f"{self.nB_tiles_distributed}nbdist_{self.ffn_intermediate_size}ffn_"
             f"{debug_suffix}"
         )
@@ -249,14 +239,13 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "seq_tile": self.seq_tile,
                 "kv_seq_tile": self.kv_seq_tile,
                 "emb_tile": self.emb_tile,
-                "o_proj_acc_depth": self.o_proj_acc_depth,
+                "proj_acc_depth": self.proj_acc_depth,
                 "parallel_heads": self.parallel_heads,
                 "emulate_bf16_mmul_with_bfp16": True,
                 "kernel_archive": kernel_archive,
                 "trace_size": 0,
                 "ln1_weight_file": ln1_weight_file_name,
                 "ln2_weight_file": ln2_weight_file_name,
-                "down_proj_depth": self.down_proj_depth,
                 "nB_tiles_distributed": self.nB_tiles_distributed,
                 "ffn_intermediate_size": self.ffn_intermediate_size,
                 "ffn_stage_only": self.ffn_stage_only,
