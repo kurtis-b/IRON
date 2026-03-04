@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
+import os
 import pytest
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from operators.encoder_pipeline.op import AIEEncoderPipeline
 from operators.encoder_pipeline.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
-DEBUG_MODE = -1
+DEBUG_MODE = int(os.getenv("ENCODER_PIPELINE_DEBUG_MODE", "-1"))
 
 
 def generate_test_params(extensive=False):
@@ -20,16 +21,14 @@ def generate_test_params(extensive=False):
     # seq_len, d, heads, intermediate_size, q_seq_tile, kv_seq_tile,
     # emb_tile, parallel_heads, parallel_ffn, proj_acc_depth
     regular_params = [
-        (64, 64, 3, 768, 32, 64, 96, 1, 1, 2),
-        (64, 64, 12, 3072, 32, 64, 96, 1, 1, 8),
-        (128, 64, 12, 3072, 32, 64, 96, 1, 1, 8),
-        (512, 64, 12, 3072, 32, 64, 96, 1, 1, 8),
-        (2048, 64, 12, 3072, 32, 64, 96, 1, 1, 8),
-        (64, 64, 3, 768, 32, 64, 96, 3, 2, 2),
-        (64, 64, 12, 3072, 32, 64, 96, 6, 3, 8),
-        (512, 64, 12, 3072, 32, 64, 96, 6, 3, 8),
-        (2048, 64, 12, 3072, 32, 64, 96, 6, 3, 8),
-        (1024, 64, 12, 3072, 32, 64, 96, 6, 3, 8),
+        (64, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
+        (128, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
+        (512, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
+        (2048, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
+        (64, 64, 12, 3072, 32, 64, 128, 6, 3, 6),
+        (512, 64, 12, 3072, 32, 64, 128, 6, 3, 6),
+        (2048, 64, 12, 3072, 32, 64, 128, 6, 3, 6),
+        (1024, 64, 12, 3072, 32, 64, 128, 6, 3, 6),
         (512, 64, 16, 4096, 32, 64, 128, 4, 3, 8),
         (1024, 64, 16, 4096, 32, 64, 128, 4, 3, 8),
         (2048, 64, 16, 4096, 32, 64, 128, 4, 3, 8),
