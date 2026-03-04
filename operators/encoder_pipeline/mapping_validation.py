@@ -322,8 +322,17 @@ def validate_mlir_mapping_constraints(
     fifos = parse_simple_objectfifo_endpoints(mlir_path)
 
     out_o = fifos.get("outO")
+    out_ln_fifos = [
+        fifo
+        for name, fifo in sorted(fifos.items())
+        if name == "outLN" or name.startswith("outLNFfn")
+    ]
+    mem_out_ln_fifos = [
+        fifo
+        for name, fifo in sorted(fifos.items())
+        if name == "memOutLN" or name.startswith("memOutLNFfn")
+    ]
     out_ln = fifos.get("outLN")
-    mem_out_ln = fifos.get("memOutLN")
     out_ln2 = fifos.get("outLN2")
     ffn_up_fifos = [
         fifo for name, fifo in sorted(fifos.items()) if name.startswith("ffnUpOut")
@@ -353,20 +362,24 @@ def validate_mlir_mapping_constraints(
                 )
 
     if out_ln is None:
-        errors.append("Missing objectfifo `outLN` in MLIR.")
-    elif ln1_tile is not None:
-        out_ln_src = out_ln["source_tile"]
-        if out_ln_src != ln1_tile:
-            errors.append(
-                "LN1 mismatch between `outO` consumer and `outLN` producer: "
-                f"outO_ln1={ln1_tile}, outLN_src={out_ln_src}"
-            )
+        if not out_ln_fifos:
+            errors.append("Missing objectfifo `outLN*` in MLIR.")
+    elif out_ln["source_tile"] is None:
+        errors.append("`outLN` source is not a compute tile.")
+    for fifo in out_ln_fifos:
+        src = fifo["source_tile"]
+        if src is None:
+            errors.append(f"`{fifo['name']}` source is not a compute tile.")
 
-    # Prefer memOutLN (memtile->up) for realized up-core consumers.
-    if mem_out_ln is not None:
-        up_tiles = [t for t in mem_out_ln["destination_tiles"] if t is not None]
-    elif out_ln is not None:
-        up_tiles = [t for t in out_ln["destination_tiles"] if t is not None]
+    # Prefer memOutLN* (memtile->up) for realized up-core consumers.
+    if mem_out_ln_fifos:
+        up_tiles = []
+        for fifo in mem_out_ln_fifos:
+            up_tiles.extend([t for t in fifo["destination_tiles"] if t is not None])
+    elif out_ln_fifos:
+        up_tiles = []
+        for fifo in out_ln_fifos:
+            up_tiles.extend([t for t in fifo["destination_tiles"] if t is not None])
     else:
         up_tiles = []
     up_tiles = sorted(set(up_tiles))
