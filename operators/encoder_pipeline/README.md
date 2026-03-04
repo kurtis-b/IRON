@@ -63,12 +63,16 @@ Internally, `op.py` resolves `debug` into:
     - O-proj accumulates through mem-tile FIFOs (`outOProjAccum*`) and reduces across parallel-head workers (`outOPart*`) to `outO`.
   - AddNorm1 bridge:
     - `outO + R -> AddNorm1`
-    - emits two streams:
-      - `outLN` (FFN input)
-      - `ffnROut -> ffnRIn` (residual stream for AddNorm2, routed through a mem tile for queue depth).
+    - LN1 uses mem-tile replay buffering (`ln1ReplayPart -> ln1Replay`) so full-row statistics
+      are computed once and replayed across FFN column groups.
+    - residual stream for AddNorm2 is staged through `ffnROut -> ffnRIn`:
+      - single-branch FFN path: emitted by LN1 mul+add core.
+      - multi-branch FFN path: emitted by FFN-up branch 0.
   - FFN path:
     - `outLN + B_Up -> FFN up (with GeLU) -> ffnUpOut`
     - `ffnUpOut + B_Down -> FFN down`, with accumulation queue in `ffnDownAccum`.
+    - when multiple FFN branches are active, down-proj branches reduce in a chain
+      (`ffnDownReduce*`) into a final/root branch before AddNorm2.
   - Final norm:
     - `ffnDownOut + ffnRIn -> AddNorm2 -> outLN2 -> memLN2 -> drain to OR/O`.
 
@@ -80,6 +84,8 @@ Internally, `op.py` resolves `debug` into:
     - fill residual `R`
     - fill FFN weights `B_Up`, `B_Down` for the same col-group
     - drain final output tile from `memLN2` to `OR`/`O`.
+  - Tail-stage host IO is intentionally serialized (`serialize_tail_io=True`) for deterministic
+    replay/order behavior.
 
 - Two-pass behavior used for AddNorm stages:
   - O-proj/AddNorm1:
@@ -87,3 +93,16 @@ Internally, `op.py` resolves `debug` into:
     - pass 2 replays tiles for normalized output application.
   - FFN-down/AddNorm2 uses the same pattern:
     - FFN-down emits/replays accumulated tiles so AddNorm2 can do sum/sumsq then normalized apply.
+
+## Current effective-branch behavior (`nB_tiles_distributed`)
+
+`nB_tiles_distributed` is the requested FFN branch count. The generated design may reduce it at
+compile time when placement/channel limits are hit:
+
+1. Initial clamp to available mapped branch tiles.
+2. If no spare free tile remains for LN1-post worker placement, non-root branches are pruned.
+3. Direct LN1-post fanout currently limits active branches to at most 2.
+4. For `parallel_heads >= 4`, active FFN branches are currently reduced to 1 because the
+   down-root reduction topology exceeds input DMA-channel budget otherwise.
+
+The effective branch count is logged by `design.py` at compile time.

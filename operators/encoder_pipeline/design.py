@@ -25,7 +25,10 @@ from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
 import aie.dialects.index as index
 from aie.dialects.aiex import *
-from operators.encoder_pipeline.mapping_validation import find_ffn_layout
+from operators.encoder_pipeline.mapping_validation import (
+    find_ffn_layout,
+    manhattan_distance,
+)
 
 base_dir = Path(__file__).parent
 
@@ -216,17 +219,6 @@ def fused_mha(
             "nB_tiles_distributed must be <= ffn_col_groups "
             f"({nB_tiles_distributed} > {ffn_col_groups})"
         )
-    ffn_group_base = ffn_col_groups // nB_tiles_distributed
-    ffn_group_rem = ffn_col_groups % nB_tiles_distributed
-    ffn_col_group_counts = [
-        ffn_group_base + (1 if i < ffn_group_rem else 0)
-        for i in range(nB_tiles_distributed)
-    ]
-    ffn_col_group_offsets = []
-    running_group_offset = 0
-    for count in ffn_col_group_counts:
-        ffn_col_group_offsets.append(running_group_offset)
-        running_group_offset += count
 
     num_o_col_groups = embed_sz // (emb_tile * proj_acc_depth)
     ln_tiles_per_q_block = num_o_col_groups * proj_acc_depth
@@ -234,28 +226,140 @@ def fused_mha(
         parallel_heads=parallel_heads,
         max_non_neighbor_down_to_ln2=2,
     )
-    ln1_tile = ffn_layout["ln1_tile"]
-    ffn_up_tiles = ffn_layout["up_tiles"]
-    ffn_down_tiles = ffn_layout["down_tiles"]
-    ln2_tile = ffn_layout["ln2_tile"]
-    # Keep current single-up/single-down execution path aligned with the mapped
-    # down-proj reduction root while we evolve to full 3-way FFN compute.
-    active_branch_idx = ffn_down_tiles.index(ffn_layout["down_root_tile"])
-    active_up_tile = ffn_up_tiles[active_branch_idx]
-    active_down_tile = ffn_down_tiles[active_branch_idx]
-    ln1_post_candidates = [
-        tile
-        for tile in (ffn_up_tiles + ffn_down_tiles)
-        if tile not in {ln1_tile, ln2_tile, active_up_tile, active_down_tile}
-    ]
-    if not ln1_post_candidates:
-        raise ValueError("No free FFN tile available for LN1 post worker")
-    ln1_post_tile = ln1_post_candidates[0]
+    ln1_tile = tuple(ffn_layout["ln1_tile"])
+    all_ffn_up_tiles = [tuple(t) for t in ffn_layout["up_tiles"]]
+    all_ffn_down_tiles = [tuple(t) for t in ffn_layout["down_tiles"]]
+    ln2_tile = tuple(ffn_layout["ln2_tile"])
+    down_root_tile = tuple(ffn_layout["down_root_tile"])
+    max_ffn_branches = len(all_ffn_up_tiles)
+    if max_ffn_branches == 0:
+        raise ValueError("FFN layout did not provide any branch tiles")
 
-    # Current worker count:
+    requested_ffn_branches = min(nB_tiles_distributed, max_ffn_branches)
+    down_root_idx = all_ffn_down_tiles.index(down_root_tile)
+    non_root_indices = [i for i in range(max_ffn_branches) if i != down_root_idx]
+    selected_branch_indices = non_root_indices[: max(requested_ffn_branches - 1, 0)] + [
+        down_root_idx
+    ]
+    if max_ffn_branches > 3:
+        raise ValueError(
+            "encoder_pipeline supports at most 3 FFN branches "
+            f"(layout returned {max_ffn_branches})"
+        )
+
+    # Prefer placing LN1 post worker on a free tile outside active FFN branch tiles.
+    # If none are available (e.g. high MHA parallelism), drop one non-root FFN branch.
+    free_ffn_tiles = [tuple(t) for t in ffn_layout["free_tiles"]]
+    while True:
+        selected_up_tiles = [all_ffn_up_tiles[i] for i in selected_branch_indices]
+        selected_down_tiles = [all_ffn_down_tiles[i] for i in selected_branch_indices]
+        used_tiles = {ln1_tile, ln2_tile, *selected_up_tiles, *selected_down_tiles}
+        ln1_post_candidates = [
+            tile for tile in free_ffn_tiles if tile not in used_tiles
+        ]
+        if ln1_post_candidates:
+            ln1_post_tile = ln1_post_candidates[0]
+            break
+        if len(selected_branch_indices) <= 1:
+            raise ValueError(
+                "No free FFN tile available for LN1 post worker after branch selection"
+            )
+        non_root_selected = [i for i in selected_branch_indices if i != down_root_idx]
+        if not non_root_selected:
+            raise ValueError(
+                "Unable to prune FFN branches: only root branch is selectable"
+            )
+        dropped_idx = max(
+            non_root_selected,
+            key=lambda i: (
+                manhattan_distance(all_ffn_down_tiles[i], down_root_tile),
+                manhattan_distance(all_ffn_up_tiles[i], ln1_tile),
+                i,
+            ),
+        )
+        selected_branch_indices.remove(dropped_idx)
+        logging.warning(
+            "Reduced effective FFN branch count from %d to %d: no spare tile for LN1 post worker "
+            "(dropped branch idx=%d, up=%s, down=%s)",
+            len(selected_branch_indices) + 1,
+            len(selected_branch_indices),
+            dropped_idx,
+            all_ffn_up_tiles[dropped_idx],
+            all_ffn_down_tiles[dropped_idx],
+        )
+
+    # LN1 post worker directly fans out normalized tiles into per-branch streams.
+    # With the current direct-fanout path, >2 branch outputs exceed channel budget.
+    while len(selected_branch_indices) > 2:
+        non_root_selected = [i for i in selected_branch_indices if i != down_root_idx]
+        if not non_root_selected:
+            break
+        dropped_idx = max(
+            non_root_selected,
+            key=lambda i: (
+                manhattan_distance(all_ffn_down_tiles[i], down_root_tile),
+                manhattan_distance(all_ffn_up_tiles[i], ln1_tile),
+                i,
+            ),
+        )
+        selected_branch_indices.remove(dropped_idx)
+        selected_up_tiles = [all_ffn_up_tiles[i] for i in selected_branch_indices]
+        selected_down_tiles = [all_ffn_down_tiles[i] for i in selected_branch_indices]
+        logging.warning(
+            "Reduced effective FFN branch count from %d to %d due LN1-post output channel budget "
+            "(dropped branch idx=%d, up=%s, down=%s)",
+            len(selected_branch_indices) + 1,
+            len(selected_branch_indices),
+            dropped_idx,
+            all_ffn_up_tiles[dropped_idx],
+            all_ffn_down_tiles[dropped_idx],
+        )
+
+    # At high MHA parallelism, down-root currently runs out of input channels
+    # when combining multi-branch FFN reduction with its own up/down streams.
+    if parallel_heads >= 4 and len(selected_branch_indices) > 1:
+        logging.warning(
+            "Reduced effective FFN branch count from %d to 1 due down-root input channel budget "
+            "at parallel_heads=%d (kept root idx=%d, up=%s, down=%s)",
+            len(selected_branch_indices),
+            parallel_heads,
+            down_root_idx,
+            all_ffn_up_tiles[down_root_idx],
+            all_ffn_down_tiles[down_root_idx],
+        )
+        selected_branch_indices = [down_root_idx]
+        selected_up_tiles = [all_ffn_up_tiles[down_root_idx]]
+        selected_down_tiles = [all_ffn_down_tiles[down_root_idx]]
+
+    effective_ffn_branches = len(selected_branch_indices)
+    if effective_ffn_branches <= 0:
+        raise ValueError("No FFN branches selected")
+    if selected_branch_indices[-1] != down_root_idx:
+        raise ValueError(
+            "FFN branch ordering invariant violated: root branch must be final "
+            f"(selected={selected_branch_indices}, root_idx={down_root_idx})"
+        )
+
+    ffn_group_base = ffn_col_groups // effective_ffn_branches
+    ffn_group_rem = ffn_col_groups % effective_ffn_branches
+    ffn_col_group_counts = [
+        ffn_group_base + (1 if i < ffn_group_rem else 0)
+        for i in range(effective_ffn_branches)
+    ]
+    ffn_col_group_offsets = []
+    running_group_offset = 0
+    for count in ffn_col_group_counts:
+        ffn_col_group_offsets.append(running_group_offset)
+        running_group_offset += count
+    final_ffn_branch_idx = effective_ffn_branches - 1
+    # Reduction chain topology over active branches (one incoming reduction stream
+    # per down core): b0 -> b1 -> ... -> bN(final/root).
+    ffn_reduction_sources = list(range(final_ffn_branch_idx))
+
+    # Worker count:
     # - MHA path: 4 workers per parallel head
-    # - Encoder tail: LN1(norm) + LN1(mul+resadd) + FFN up + FFN down + AddNorm2
-    required_compute_tiles = parallel_heads * 4 + 5
+    # - Encoder tail: LN1(norm) + LN1(mul+resadd) + (FFN up/down)*branches + AddNorm2
+    required_compute_tiles = parallel_heads * 4 + 3 + 2 * effective_ffn_branches
     if required_compute_tiles > 32:
         raise ValueError(
             "Configuration exceeds NPU2 compute tile capacity (32): "
@@ -272,8 +376,9 @@ def fused_mha(
         f"MHA Dimensions: seq_len={seq_len}, d={d}, seq_tile={seq_tile}, kv_seq_tile={kv_seq_tile}, emb_tile={emb_tile}, proj_acc_depth={proj_acc_depth}, parallel_heads={parallel_heads}"
     )
     logging.info(
-        "Encoder pipeline parameters: nB_tiles_distributed=%d",
+        "Encoder pipeline parameters: nB_tiles_distributed(requested)=%d effective=%d",
         nB_tiles_distributed,
+        effective_ffn_branches,
     )
     logging.info(
         "Debug controls: ffn_stage_only=%s, addnorm1_debug_mode=%d, addnorm2_debug_mode=%d",
@@ -291,16 +396,25 @@ def fused_mha(
         ffn_col_group_offsets,
     )
     logging.info(
-        "FFN mapped placement: ln1_norm=%s ln1_post=%s up=%s down=%s ln2=%s down_root=%s down_reduction_edges=%s down_to_ln2=%s non_neighbor_down_to_ln2=%s",
+        "FFN mapped placement: ln1_norm=%s ln1_post=%s up(all)=%s down(all)=%s up(active)=%s down(active)=%s ln2=%s down_root=%s down_reduction_edges=%s down_to_ln2=%s non_neighbor_down_to_ln2=%s active_branch_indices=%s",
         ln1_tile,
         ln1_post_tile,
-        ffn_up_tiles,
-        ffn_down_tiles,
+        all_ffn_up_tiles,
+        all_ffn_down_tiles,
+        selected_up_tiles,
+        selected_down_tiles,
         ln2_tile,
-        ffn_layout["down_root_tile"],
+        down_root_tile,
         ffn_layout["down_reduction_edges"],
         ffn_layout["down_to_ln2_tiles"],
         ffn_layout["non_neighbor_down_to_ln2"],
+        selected_branch_indices,
+    )
+    logging.info(
+        "FFN reduction topology(active branch order): chain_edges=%s final_branch_idx=%d (down_tile=%s)",
+        [(i, i + 1) for i in range(final_ffn_branch_idx)],
+        final_ffn_branch_idx,
+        selected_down_tiles[final_ffn_branch_idx],
     )
     logging.info(f"Data type: {dtype_str}")
     logging.info(f"Microkernel MAC dimensions: r={r}, s={s}, t={t}")
@@ -668,8 +782,6 @@ def fused_mha(
     ln_fifo_depth = of_depth
     # FFN-up input FIFO depth (kept shallow to reduce FFN-up core L1 usage).
     ffn_up_input_depth = 1
-    # Stage FFN-up A-input stream on this mem tile.
-    ffn_a_stage_mem_tile_col = 6
     # Keep LN1 buffering shallow to stay within L1 budget on LN1 tiles.
     ln_input_depth = 1
     # O-proj stream into LN1 norm worker (no DMA layout transform).
@@ -715,21 +827,44 @@ def fused_mha(
 
     # LN output
     o_dims = [(seq_tile // r, r * emb_tile), (r, s), (emb_tile // s, r * s), (s, 1)]
-    outLN = ObjectFifo(
-        o_ty,
-        name="outLN",
-        depth=ffn_up_input_depth,
-    )
-    # Stage FFN-up A-input tiles in a mem tile before FFN-up consumption.
-    memOutLN = outLN.cons(depth=ffn_up_input_depth).forward(
-        obj_type=o_ty,
-        name="memOutLN",
-        depth=proj_acc_depth,
-        placement=Tile(col=ffn_a_stage_mem_tile_col, row=1),
-    )
+    # Keep FFN branch staging streams off LN replay (col 5) when MHA uses many
+    # heads; col 5 already carries LN1 full-row replay traffic.
+    if parallel_heads >= 6:
+        branch_stage_cols = [6, 4, 5]
+        branch_down_b_cols = [4, 6, 5]
+    else:
+        branch_stage_cols = [6, 5, 4]
+        branch_down_b_cols = [7, 5, 4]
+    if effective_ffn_branches > len(branch_stage_cols):
+        raise ValueError(
+            "Unsupported effective_ffn_branches for current memtile assignment "
+            f"({effective_ffn_branches} > {len(branch_stage_cols)})"
+        )
+    ffn_a_stage_mem_tile_cols = branch_stage_cols[:effective_ffn_branches]
+    outLN = []
+    memOutLN = []
+    for branch_idx in range(effective_ffn_branches):
+        outLN.append(
+            ObjectFifo(
+                o_ty,
+                name="outLN" if branch_idx == 0 else f"outLNFfn{branch_idx}",
+                depth=ffn_up_input_depth,
+            )
+        )
+        # Stage FFN-up A-input tiles in mem tile(s) before FFN-up consumption.
+        memOutLN.append(
+            outLN[branch_idx]
+            .cons(depth=ffn_up_input_depth)
+            .forward(
+                obj_type=o_ty,
+                name="memOutLN" if branch_idx == 0 else f"memOutLNFfn{branch_idx}",
+                depth=proj_acc_depth,
+                placement=Tile(col=ffn_a_stage_mem_tile_cols[branch_idx], row=1),
+            )
+        )
     # FFN residual path for AddNorm-2, staged through mem tile from LN1 post core.
     ffnROut = ObjectFifo(o_ty, name="ffnROut", depth=ffn_residual_depth)
-    ffnRIn = ffnROut.cons().forward(
+    ffnRIn = ffnROut.cons(depth=ffn_residual_depth).forward(
         obj_type=o_ty,
         name="ffnRIn",
         depth=ffn_residual_depth,
@@ -746,38 +881,93 @@ def fused_mha(
     ]
     # Keep FFN weight FIFOs at depth 1 to reduce L1 pressure on FFN cores.
     ffn_weight_fifo_depth = 1
-    ffn_bup_mem_tile_col = 6
-    ffn_bdown_mem_tile_col = 7
-    inBUp = ObjectFifo(ffn_b_ty, name="inBUp", depth=ffn_weight_fifo_depth)
-    memBUp = inBUp.cons().forward(
-        obj_type=ffn_b_ty,
-        name="memBUp",
-        dims_to_stream=b_dims,
-        depth=ffn_weight_fifo_depth,
-        placement=Tile(col=ffn_bup_mem_tile_col, row=1),
-    )
-    inBDown = ObjectFifo(ffn_b_ty, name="inBDown", depth=ffn_weight_fifo_depth)
-    memBDown = inBDown.cons().forward(
-        obj_type=ffn_b_ty,
-        name="memBDown",
-        dims_to_stream=b_dims,
-        depth=ffn_weight_fifo_depth,
-        placement=Tile(col=ffn_bdown_mem_tile_col, row=1),
-    )
+    ffn_bup_mem_tile_cols = branch_stage_cols[:effective_ffn_branches]
+    ffn_bdown_mem_tile_cols = branch_down_b_cols[:effective_ffn_branches]
+    inBUp = []
+    memBUp = []
+    inBDown = []
+    memBDown = []
+    for branch_idx in range(effective_ffn_branches):
+        inBUp.append(
+            ObjectFifo(
+                ffn_b_ty,
+                name="inBUp" if branch_idx == 0 else f"inBUp{branch_idx}",
+                depth=ffn_weight_fifo_depth,
+            )
+        )
+        memBUp.append(
+            inBUp[branch_idx]
+            .cons()
+            .forward(
+                obj_type=ffn_b_ty,
+                name="memBUp" if branch_idx == 0 else f"memBUp{branch_idx}",
+                dims_to_stream=b_dims,
+                depth=ffn_weight_fifo_depth,
+                placement=Tile(col=ffn_bup_mem_tile_cols[branch_idx], row=1),
+            )
+        )
+        inBDown.append(
+            ObjectFifo(
+                ffn_b_ty,
+                name="inBDown" if branch_idx == 0 else f"inBDown{branch_idx}",
+                depth=ffn_weight_fifo_depth,
+            )
+        )
+        memBDown.append(
+            inBDown[branch_idx]
+            .cons()
+            .forward(
+                obj_type=ffn_b_ty,
+                name="memBDown" if branch_idx == 0 else f"memBDown{branch_idx}",
+                dims_to_stream=b_dims,
+                depth=ffn_weight_fifo_depth,
+                placement=Tile(col=ffn_bdown_mem_tile_cols[branch_idx], row=1),
+            )
+        )
 
     # FFN internal pipelines and final encoder output
-    ffnUpOut = ObjectFifo(o_ty, name="ffnUpOut", depth=1)
-    # Keep FFN-down accumulation in a mem tile FIFO so down-proj core L1 stays
-    # within limits while replaying for LN2's two-pass consumption.
-    ffnDownPart = ObjectFifo(o_ty, name="ffnDownPart", depth=1)
-    # Keep FFN-down accumulation on its dedicated memtile column.
-    ffn_down_acc_mem_tile_col = 6
-    ffnDownAccum = ffnDownPart.cons(depth=proj_acc_depth).forward(
-        obj_type=o_ty,
-        name="ffnDownAccum",
-        depth=proj_acc_depth,
-        placement=Tile(col=ffn_down_acc_mem_tile_col, row=1),
-    )
+    ffnUpOut = []
+    ffnDownPart = []
+    ffnDownAccum = []
+    ffn_down_acc_mem_tile_cols = branch_stage_cols[:effective_ffn_branches]
+    for branch_idx in range(effective_ffn_branches):
+        ffnUpOut.append(
+            ObjectFifo(
+                o_ty,
+                name="ffnUpOut" if branch_idx == 0 else f"ffnUpOut{branch_idx}",
+                depth=1,
+            )
+        )
+        # Keep FFN-down accumulation in mem tile FIFO(s) so down-proj core L1 stays
+        # within limits while replaying for LN2's two-pass consumption.
+        ffnDownPart.append(
+            ObjectFifo(
+                o_ty,
+                name="ffnDownPart" if branch_idx == 0 else f"ffnDownPart{branch_idx}",
+                depth=1,
+            )
+        )
+        ffnDownAccum.append(
+            ffnDownPart[branch_idx]
+            .cons(depth=proj_acc_depth)
+            .forward(
+                obj_type=o_ty,
+                name=(
+                    "ffnDownAccum" if branch_idx == 0 else f"ffnDownAccum{branch_idx}"
+                ),
+                depth=proj_acc_depth,
+                placement=Tile(col=ffn_down_acc_mem_tile_cols[branch_idx], row=1),
+            )
+        )
+    ffnDownReduce = []
+    for src_branch_idx in ffn_reduction_sources:
+        ffnDownReduce.append(
+            ObjectFifo(
+                o_ty,
+                name=f"ffnDownReduce{src_branch_idx}",
+                depth=1,
+            )
+        )
     ffn_down_out_depth = 1 if emb_tile >= 128 else ln_fifo_depth
     ffnDownOut = ObjectFifo(
         o_ty,
@@ -1130,7 +1320,7 @@ def fused_mha(
                 of_out_norm.release(1)
                 of_replay_curr.release(1)
 
-    def core_fn_ln1_mul_add(
+    def core_fn_ln1_mul_add_single(
         of_in_norm,
         of_in_residual,
         weights,
@@ -1141,7 +1331,7 @@ def fused_mha(
         addnorm1_mode,
     ):
         for _ in range_(sys.maxsize):
-            # Group 0: emit FFN residual tiles (one per col) for AddNorm2.
+            # Group 0.
             for col_idx in range_(ln_tiles_per_q_block):
                 col_i32 = index.casts(T.i32(), col_idx)
                 elem_in1 = of_in_norm.acquire(1)
@@ -1159,9 +1349,10 @@ def fused_mha(
                         elem_out_up,
                         col_i32,
                     )
-                elem_out_res = of_out_residual.acquire(1)
-                copy(elem_out_up, elem_out_res, seq_tile * emb_tile)
-                of_out_residual.release(1)
+                if of_out_residual:
+                    elem_out_res = of_out_residual.acquire(1)
+                    copy(elem_out_up, elem_out_res, seq_tile * emb_tile)
+                    of_out_residual.release(1)
                 of_out_up.release(1)
                 of_in_norm.release(1)
                 of_in_residual.release(1)
@@ -1187,23 +1378,68 @@ def fused_mha(
                     of_in_norm.release(1)
                     of_in_residual.release(1)
 
-    def core_fn_ffn_up_proj(
+    def core_fn_ln1_mul_add_multi(
+        of_in_norm,
+        of_in_residual,
+        weights,
+        of_out_up_0,
+        of_out_up_1,
+        of_out_up_2,
+        ln_mul_add,
+        copy,
+        addnorm1_mode,
+    ):
+        of_out_up_list = [of_out_up_0, of_out_up_1, of_out_up_2]
+        for _ in range_(sys.maxsize):
+            # Emit FFN input in branch-major group order so each branch receives
+            # only its assigned ffn_col_group_count tiles.
+            for branch_idx in range(effective_ffn_branches):
+                of_out_up = of_out_up_list[branch_idx]
+                for branch_group_idx in range_(ffn_col_group_counts[branch_idx]):
+                    for col_idx in range_(ln_tiles_per_q_block):
+                        col_i32 = index.casts(T.i32(), col_idx)
+                        elem_in1 = of_in_norm.acquire(1)
+                        elem_in2 = of_in_residual.acquire(1)
+                        elem_out_up = of_out_up.acquire(1)
+                        if addnorm1_mode == 0:
+                            copy(elem_in1, elem_out_up, seq_tile * emb_tile)
+                        elif addnorm1_mode == 1:
+                            copy(elem_in2, elem_out_up, seq_tile * emb_tile)
+                        else:
+                            ln_mul_add(
+                                elem_in1,
+                                elem_in2,
+                                weights,
+                                elem_out_up,
+                                col_i32,
+                            )
+                        of_out_up.release(1)
+                        of_in_norm.release(1)
+                        of_in_residual.release(1)
+
+    def core_fn_ffn_up_proj_single(
         of_in_a_curr,
         of_in_b,
         of_out_c,
+        of_out_residual,
         zero,
         matmul,
         gelu,
+        copy,
         stage_only,
     ):
         for _ in range_(sys.maxsize):
-            for _ in range_(ffn_col_groups):
+            for group_idx in range_(ffn_col_groups):
                 elem_out_matmul = of_out_c.acquire(1)
                 # Keep stage-only paths deterministic: when FFN-up is disabled,
                 # still emit a zero tile so downstream consumers do not read stale data.
                 zero(elem_out_matmul)
                 for _ in range_(proj_acc_depth):
                     elem_in_a = of_in_a_curr.acquire(1)
+                    if of_out_residual and group_idx == 0:
+                        elem_out_res = of_out_residual.acquire(1)
+                        copy(elem_in_a, elem_out_res, seq_tile * emb_tile)
+                        of_out_residual.release(1)
                     elem_in_b = of_in_b.acquire(1)
                     if stage_only in [0, None]:
                         matmul(elem_in_a, elem_in_b, elem_out_matmul)
@@ -1213,7 +1449,40 @@ def fused_mha(
                     gelu(elem_out_matmul, elem_out_matmul, seq_tile * emb_tile)
                 of_out_c.release(1)
 
-    def core_fn_ffn_down_proj(
+    def core_fn_ffn_up_proj_multi(
+        of_in_a_curr,
+        of_in_b,
+        of_out_c,
+        of_out_residual,
+        zero,
+        matmul,
+        gelu,
+        copy,
+        group_count,
+        stage_only,
+    ):
+        for _ in range_(sys.maxsize):
+            for group_idx in range_(group_count):
+                elem_out_matmul = of_out_c.acquire(1)
+                # Keep stage-only paths deterministic: when FFN-up is disabled,
+                # still emit a zero tile so downstream consumers do not read stale data.
+                zero(elem_out_matmul)
+                for _ in range_(proj_acc_depth):
+                    elem_in_a = of_in_a_curr.acquire(1)
+                    if of_out_residual and group_idx == 0:
+                        elem_out_res = of_out_residual.acquire(1)
+                        copy(elem_in_a, elem_out_res, seq_tile * emb_tile)
+                        of_out_residual.release(1)
+                    elem_in_b = of_in_b.acquire(1)
+                    if stage_only in [0, None]:
+                        matmul(elem_in_a, elem_in_b, elem_out_matmul)
+                    of_in_b.release(1)
+                    of_in_a_curr.release(1)
+                if stage_only in [0, None] and gelu:
+                    gelu(elem_out_matmul, elem_out_matmul, seq_tile * emb_tile)
+                of_out_c.release(1)
+
+    def core_fn_ffn_down_proj_single(
         of_in_a,
         of_in_b,
         of_curr_acc,
@@ -1294,6 +1563,108 @@ def fused_mha(
                     copy(elem_curr_acc, elem_out, seq_tile * emb_tile)
                     of_out.release(1)
                     of_curr_acc.release(1)
+
+    def core_fn_ffn_down_proj_multi(
+        of_in_a,
+        of_in_b,
+        of_curr_acc,
+        of_new_acc,
+        of_out,
+        zero,
+        matmul,
+        add,
+        copy,
+        group_count,
+        buffer_to_reduce,
+        is_final_branch,
+        stage_only,
+    ):
+        for _ in range_(sys.maxsize):
+            # Check if down projection stage is enabled, None means all stages are enabled.
+            if stage_only not in [
+                1,
+                None,
+            ]:  # Skip computation for down projection stage
+                for _ in range_(proj_acc_depth):
+                    elem_acc = of_new_acc.acquire(1)
+                    zero(elem_acc)
+                    of_new_acc.release(1)
+                for _ in range_(group_count):
+                    elem_in_a = of_in_a.acquire(1)
+                    for _ in range_(proj_acc_depth):
+                        elem_in_b = of_in_b.acquire(1)
+                        elem_curr_acc = of_curr_acc.acquire(1)
+                        elem_new_acc = of_new_acc.acquire(1)
+                        zero(elem_new_acc)
+                        of_in_b.release(1)
+                        of_new_acc.release(1)
+                        of_curr_acc.release(1)
+                    of_in_a.release(1)
+                for _ in range_(proj_acc_depth):
+                    elem_curr_acc = of_curr_acc.acquire(1)
+                    if buffer_to_reduce:
+                        partial_acc = buffer_to_reduce.acquire(1)
+                        buffer_to_reduce.release(1)
+                    elem_out = of_out.acquire(1)
+                    zero(elem_out)
+                    of_curr_acc.release(1)
+                    if is_final_branch:
+                        elem_new_acc = of_new_acc.acquire(1)
+                        zero(elem_new_acc)
+                        of_new_acc.release(1)
+                    of_out.release(1)
+                if is_final_branch:
+                    for _ in range_(proj_acc_depth):
+                        elem_curr_acc = of_curr_acc.acquire(1)
+                        elem_out = of_out.acquire(1)
+                        zero(elem_out)
+                        of_out.release(1)
+                        of_curr_acc.release(1)
+            else:  # Perform down projection stage computation
+                # First iteration just passes the partial C tile through.
+                for _ in range_(proj_acc_depth):
+                    elem_acc = of_new_acc.acquire(1)
+                    zero(elem_acc)
+                    of_new_acc.release(1)
+                for _ in range_(group_count):
+                    elem_in_a = of_in_a.acquire(1)
+                    for _ in range_(proj_acc_depth):
+                        elem_in_b = of_in_b.acquire(1)
+                        elem_curr_acc = of_curr_acc.acquire(1)
+                        elem_new_acc = of_new_acc.acquire(1)
+                        matmul(elem_in_a, elem_in_b, elem_curr_acc, elem_new_acc)
+                        of_in_b.release(1)
+                        of_new_acc.release(1)
+                        of_curr_acc.release(1)
+                    of_in_a.release(1)
+                for _ in range_(proj_acc_depth):
+                    # Acquire what's in L2, which is the final accumulated result for the tile.
+                    elem_curr_acc = of_curr_acc.acquire(1)
+                    if buffer_to_reduce:
+                        partial_acc = buffer_to_reduce.acquire(1)
+                        add(
+                            partial_acc,
+                            elem_curr_acc,
+                            elem_curr_acc,
+                            seq_tile * emb_tile,
+                        )
+                        buffer_to_reduce.release(1)
+                    elem_out = of_out.acquire(1)
+                    copy(elem_curr_acc, elem_out, seq_tile * emb_tile)
+                    of_curr_acc.release(1)
+                    if is_final_branch:
+                        elem_new_acc = of_new_acc.acquire(1)
+                        # Make sure to copy the final accumulated C tile for the LN second pass.
+                        copy(elem_out, elem_new_acc, seq_tile * emb_tile)
+                        of_new_acc.release(1)
+                    of_out.release(1)
+                if is_final_branch:
+                    for _ in range_(proj_acc_depth):
+                        elem_curr_acc = of_curr_acc.acquire(1)
+                        elem_out = of_out.acquire(1)
+                        copy(elem_curr_acc, elem_out, seq_tile * emb_tile)
+                        of_out.release(1)
+                        of_curr_acc.release(1)
 
     def core_fn_add_norm2(
         of_in1,
@@ -1512,55 +1883,133 @@ def fused_mha(
         placement=Tile(col=ln1_tile[0], row=ln1_tile[1]),
         while_true=False,
     )
-    ln1_muladd_worker = Worker(
-        core_fn_ln1_mul_add,
-        fn_args=[
-            ln1Norm.cons(),
-            memR.cons(),
-            ln1_weight_buffer,
-            outLN.prod(),
-            ffn_residual_prod,
-            ln_mul_add_kernel,
-            mem_copy_o_proj,
-            addnorm1_debug_mode,
-        ],
-        placement=Tile(col=ln1_post_tile[0], row=ln1_post_tile[1]),
-        while_true=False,
-    )
+    if effective_ffn_branches == 1:
+        ln1_muladd_worker = Worker(
+            core_fn_ln1_mul_add_single,
+            fn_args=[
+                ln1Norm.cons(),
+                memR.cons(),
+                ln1_weight_buffer,
+                outLN[0].prod(),
+                ffn_residual_prod,
+                ln_mul_add_kernel,
+                mem_copy_o_proj,
+                addnorm1_debug_mode,
+            ],
+            placement=Tile(col=ln1_post_tile[0], row=ln1_post_tile[1]),
+            while_true=False,
+        )
+    else:
+        ln1_muladd_worker = Worker(
+            core_fn_ln1_mul_add_multi,
+            fn_args=[
+                ln1Norm.cons(),
+                memR.cons(),
+                ln1_weight_buffer,
+                outLN[0].prod() if effective_ffn_branches > 0 else None,
+                outLN[1].prod() if effective_ffn_branches > 1 else None,
+                outLN[2].prod() if effective_ffn_branches > 2 else None,
+                ln_mul_add_kernel,
+                mem_copy_o_proj,
+                addnorm1_debug_mode,
+            ],
+            placement=Tile(col=ln1_post_tile[0], row=ln1_post_tile[1]),
+            while_true=False,
+        )
 
-    ffn_up_worker = Worker(
-        core_fn_ffn_up_proj,
-        fn_args=[
-            memOutLN.cons(depth=1),
-            memBUp.cons(),
-            ffnUpOut.prod(),
-            ffn_zero_kernel_up_proj,
-            ffn_matmul_kernel_up_proj,
-            ffn_gelu_kernel,
-            ffn_stage_only,
-        ],
-        placement=Tile(col=active_up_tile[0], row=active_up_tile[1]),
-        stack_size=0xF00,
-        while_true=False,
-    )
+    ffn_up_workers = []
+    for branch_idx in range(effective_ffn_branches):
+        if effective_ffn_branches == 1:
+            ffn_up_worker_fn = core_fn_ffn_up_proj_single
+            ffn_up_worker_args = [
+                memOutLN[branch_idx].cons(depth=1),
+                memBUp[branch_idx].cons(),
+                ffnUpOut[branch_idx].prod(),
+                None,
+                ffn_zero_kernel_up_proj,
+                ffn_matmul_kernel_up_proj,
+                ffn_gelu_kernel,
+                mem_copy_o_proj,
+                ffn_stage_only,
+            ]
+        else:
+            ffn_up_worker_fn = core_fn_ffn_up_proj_multi
+            ffn_up_worker_args = [
+                memOutLN[branch_idx].cons(depth=1),
+                memBUp[branch_idx].cons(),
+                ffnUpOut[branch_idx].prod(),
+                ffn_residual_prod if branch_idx == 0 else None,
+                ffn_zero_kernel_up_proj,
+                ffn_matmul_kernel_up_proj,
+                ffn_gelu_kernel,
+                mem_copy_o_proj,
+                ffn_col_group_counts[branch_idx],
+                ffn_stage_only,
+            ]
+        ffn_up_workers.append(
+            Worker(
+                ffn_up_worker_fn,
+                fn_args=ffn_up_worker_args,
+                placement=Tile(
+                    col=selected_up_tiles[branch_idx][0],
+                    row=selected_up_tiles[branch_idx][1],
+                ),
+                stack_size=0x700,
+                while_true=False,
+            )
+        )
 
-    ffn_down_worker = Worker(
-        core_fn_ffn_down_proj,
-        fn_args=[
-            ffnUpOut.cons(),
-            memBDown.cons(),
-            ffnDownAccum.cons(depth=1),
-            ffnDownPart.prod(),
-            ffnDownOut.prod(ffn_down_out_depth),
-            ffn_zero_kernel_down_proj,
-            ffn_matmul_kernel_down_proj,
-            mem_copy_o_proj,
-            ffn_stage_only,
-        ],
-        placement=Tile(col=active_down_tile[0], row=active_down_tile[1]),
-        stack_size=0xF00,
-        while_true=False,
-    )
+    ffn_down_workers = []
+    for branch_idx in range(effective_ffn_branches):
+        is_final_branch = branch_idx == final_ffn_branch_idx
+        if effective_ffn_branches == 1:
+            ffn_down_worker_fn = core_fn_ffn_down_proj_single
+            ffn_down_worker_args = [
+                ffnUpOut[branch_idx].cons(),
+                memBDown[branch_idx].cons(),
+                ffnDownAccum[branch_idx].cons(depth=1),
+                ffnDownPart[branch_idx].prod(),
+                ffnDownOut.prod(ffn_down_out_depth),
+                ffn_zero_kernel_down_proj,
+                ffn_matmul_kernel_down_proj,
+                mem_copy_o_proj,
+                ffn_stage_only,
+            ]
+        else:
+            reduce_in = ffnDownReduce[branch_idx - 1].cons() if branch_idx > 0 else None
+            reduce_out = (
+                ffnDownOut.prod(ffn_down_out_depth)
+                if is_final_branch
+                else ffnDownReduce[branch_idx].prod()
+            )
+            ffn_down_worker_fn = core_fn_ffn_down_proj_multi
+            ffn_down_worker_args = [
+                ffnUpOut[branch_idx].cons(),
+                memBDown[branch_idx].cons(),
+                ffnDownAccum[branch_idx].cons(depth=1),
+                ffnDownPart[branch_idx].prod(),
+                reduce_out,
+                ffn_zero_kernel_down_proj,
+                ffn_matmul_kernel_down_proj,
+                eltwise_add_vector,
+                mem_copy_o_proj,
+                ffn_col_group_counts[branch_idx],
+                reduce_in,
+                is_final_branch,
+                ffn_stage_only,
+            ]
+        ffn_down_workers.append(
+            Worker(
+                ffn_down_worker_fn,
+                fn_args=ffn_down_worker_args,
+                placement=Tile(
+                    col=selected_down_tiles[branch_idx][0],
+                    row=selected_down_tiles[branch_idx][1],
+                ),
+                stack_size=0xF00,
+                while_true=False,
+            )
+        )
 
     ln2_weight_buffer = Buffer(
         type=ln_weights_ty,
@@ -1684,42 +2133,58 @@ def fused_mha(
         tile._sizes[0] = ffn_col_groups
         tile._strides[0] = 0
 
-    # FFN weight taps:
-    # - Up projection: [ffn_col_group, k_chunk, m_tile, n_tile]
-    # - Down projection: [ffn_col_group, out_chunk, m_tile, n_tile]
+    # FFN weight taps (per branch):
+    # - Up projection: [branch_col_group, k_chunk, m_tile, n_tile]
+    # - Down projection: [branch_col_group, out_chunk, m_tile, n_tile]
     # The outer dimensions enumerate objects consumed by acquire(1) in worker loops.
-    B_Up_tiles = TensorAccessSequence.from_taps(
-        [
-            TensorAccessPattern(
-                (embed_sz, ffn_intermediate_size),
-                offset=col_group * (proj_acc_depth * emb_tile * ffn_intermediate_size),
-                sizes=[ffn_col_groups, proj_acc_depth, emb_tile, emb_tile],
-                strides=[
-                    emb_tile,
-                    emb_tile * ffn_intermediate_size,
-                    ffn_intermediate_size,
-                    1,
-                ],
+    B_Up_tiles = []
+    B_Down_tiles = []
+    for branch_idx in range(effective_ffn_branches):
+        group_count = ffn_col_group_counts[branch_idx]
+        group_offset = ffn_col_group_offsets[branch_idx]
+        B_Up_tiles.append(
+            TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        (embed_sz, ffn_intermediate_size),
+                        offset=(
+                            col_group
+                            * (proj_acc_depth * emb_tile * ffn_intermediate_size)
+                            + group_offset * emb_tile
+                        ),
+                        sizes=[group_count, proj_acc_depth, emb_tile, emb_tile],
+                        strides=[
+                            emb_tile,
+                            emb_tile * ffn_intermediate_size,
+                            ffn_intermediate_size,
+                            1,
+                        ],
+                    )
+                    for col_group in range(num_o_col_groups)
+                ]
             )
-            for col_group in range(num_o_col_groups)
-        ]
-    )
-    B_Down_tiles = TensorAccessSequence.from_taps(
-        [
-            TensorAccessPattern(
-                (ffn_intermediate_size, embed_sz),
-                offset=col_group * (proj_acc_depth * emb_tile),
-                sizes=[ffn_col_groups, proj_acc_depth, emb_tile, emb_tile],
-                strides=[
-                    emb_tile * embed_sz,
-                    emb_tile,
-                    embed_sz,
-                    1,
-                ],
+        )
+        B_Down_tiles.append(
+            TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        (ffn_intermediate_size, embed_sz),
+                        offset=(
+                            col_group * (proj_acc_depth * emb_tile)
+                            + group_offset * emb_tile * embed_sz
+                        ),
+                        sizes=[group_count, proj_acc_depth, emb_tile, emb_tile],
+                        strides=[
+                            emb_tile * embed_sz,
+                            emb_tile,
+                            embed_sz,
+                            1,
+                        ],
+                    )
+                    for col_group in range(num_o_col_groups)
+                ]
             )
-            for col_group in range(num_o_col_groups)
-        ]
-    )
+        )
 
     def print_tap_seq_info(tap_seq, name):
         for idx, tap in enumerate(tap_seq):
@@ -1846,8 +2311,9 @@ def fused_mha(
     legalize_tas(WO_tiles)
     legalize_tas(O_tiles)
     legalize_tas(R_tiles)
-    legalize_tas(B_Up_tiles)
-    legalize_tas(B_Down_tiles)
+    for branch_idx in range(effective_ffn_branches):
+        legalize_tas(B_Up_tiles[branch_idx])
+        legalize_tas(B_Down_tiles[branch_idx])
 
     # Validate host transfer counts against per-iteration worker consumption.
     assert_all_taps_match_count(
@@ -1886,18 +2352,19 @@ def fused_mha(
         proj_acc_depth,
         "O",
     )
-    assert_all_taps_match_count(
-        B_Up_tiles,
-        (emb_tile, emb_tile),
-        ffn_col_groups * proj_acc_depth,
-        "B_Up",
-    )
-    assert_all_taps_match_count(
-        B_Down_tiles,
-        (emb_tile, emb_tile),
-        ffn_col_groups * proj_acc_depth,
-        "B_Down",
-    )
+    for branch_idx in range(effective_ffn_branches):
+        assert_all_taps_match_count(
+            B_Up_tiles[branch_idx],
+            (emb_tile, emb_tile),
+            ffn_col_group_counts[branch_idx] * proj_acc_depth,
+            f"B_Up[{branch_idx}]",
+        )
+        assert_all_taps_match_count(
+            B_Down_tiles[branch_idx],
+            (emb_tile, emb_tile),
+            ffn_col_group_counts[branch_idx] * proj_acc_depth,
+            f"B_Down[{branch_idx}]",
+        )
 
     print_tap_seq_info(Q_tiles, "Q")
     print_tap_seq_info(K_tiles, "K")
@@ -1905,8 +2372,9 @@ def fused_mha(
     print_tap_seq_info(WO_tiles, "W_O")
     print_tap_seq_info(O_tiles, "O")
     print_tap_seq_info(R_tiles, "R")
-    print_tap_seq_info(B_Up_tiles, "B_Up")
-    print_tap_seq_info(B_Down_tiles, "B_Down")
+    for branch_idx in range(effective_ffn_branches):
+        print_tap_seq_info(B_Up_tiles[branch_idx], f"B_Up[{branch_idx}]")
+        print_tap_seq_info(B_Down_tiles[branch_idx], f"B_Down[{branch_idx}]")
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
@@ -1927,8 +2395,9 @@ def fused_mha(
             rt.start(o_proj_workers[i])
         rt.start(ln1_norm_worker)
         rt.start(ln1_muladd_worker)
-        rt.start(ffn_up_worker)
-        rt.start(ffn_down_worker)
+        for branch_idx in range(effective_ffn_branches):
+            rt.start(ffn_up_workers[branch_idx])
+            rt.start(ffn_down_workers[branch_idx])
         rt.start(ln2_worker)
 
         for q_block_idx in range(num_q_seq_blocks):
@@ -2040,22 +2509,26 @@ def fused_mha(
                     wait=serialize_tail_io,
                 )
 
-                rt.fill(
-                    inBUp.prod(),
-                    B_Up,
-                    tap=B_Up_tiles[col_group],
-                    placement=Tile(col=ffn_bup_mem_tile_col, row=0),
-                    task_group=tg,
-                    wait=serialize_tail_io,
-                )
-                rt.fill(
-                    inBDown.prod(),
-                    B_Down,
-                    tap=B_Down_tiles[col_group],
-                    placement=Tile(col=ffn_bdown_mem_tile_col, row=0),
-                    task_group=tg,
-                    wait=serialize_tail_io,
-                )
+                for branch_idx in range(effective_ffn_branches):
+                    rt.fill(
+                        inBUp[branch_idx].prod(),
+                        B_Up,
+                        tap=B_Up_tiles[branch_idx][col_group],
+                        placement=Tile(col=ffn_bup_mem_tile_cols[branch_idx], row=0),
+                        task_group=tg,
+                        wait=serialize_tail_io,
+                    )
+                    rt.fill(
+                        inBDown[branch_idx].prod(),
+                        B_Down,
+                        tap=B_Down_tiles[branch_idx][col_group],
+                        placement=Tile(
+                            col=ffn_bdown_mem_tile_cols[branch_idx],
+                            row=0,
+                        ),
+                        task_group=tg,
+                        wait=serialize_tail_io,
+                    )
 
                 rt.drain(
                     memLN2.cons(),
