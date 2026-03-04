@@ -9,58 +9,50 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from operators.encoder_pipeline.op import AIEEncoderPipeline
-from operators.encoder_pipeline.constants import (
-    DEBUG_FULL,
-    ADDNORM_DEBUG_DISABLED,
-)
 from operators.encoder_pipeline.reference import generate_golden_reference
 from operators.common.test_utils import run_test
 
-DEBUG_MODE = DEBUG_FULL
-ADDNORM_DEBUG_MODE = ADDNORM_DEBUG_DISABLED
-ADDNORM1_DEBUG_MODE = None
-ADDNORM2_DEBUG_MODE = None
+DEBUG_MODE = -1
 
 
 def generate_test_params(extensive=False):
     # Unified tuple:
-    # heads, seq_len, d, seq_tile, kv_seq_tile, emb_tile,
-    # parallel_heads, o_proj_acc_depth, down_proj_depth, intermediate_size
+    # seq_len, d, heads, intermediate_size, q_seq_tile, kv_seq_tile,
+    # emb_tile, parallel_heads, parallel_ffn, proj_acc_depth
     regular_params = [
-        (3, 64, 64, 32, 64, 96, 1, 2, 2, 768),
-        (12, 64, 64, 32, 64, 96, 1, 8, 8, 3072),
-        (12, 128, 64, 32, 64, 96, 1, 8, 8, 3072),
-        (12, 512, 64, 32, 64, 96, 1, 8, 8, 3072),
-        (12, 2048, 64, 32, 64, 96, 1, 8, 8, 3072),
-        (3, 64, 64, 32, 64, 96, 3, 2, 2, 768),
-        (12, 64, 64, 32, 64, 96, 6, 8, 8, 3072),
-        (12, 512, 64, 32, 64, 96, 6, 8, 8, 3072),
-        (12, 2048, 64, 32, 64, 96, 6, 8, 8, 3072),
-        (12, 1024, 64, 32, 64, 96, 1, 8, 8, 3072),
-        (16, 512, 64, 32, 64, 128, 1, 8, 8, 4096),
-        (16, 1024, 64, 32, 64, 128, 1, 8, 8, 4096),
-        (16, 2048, 64, 32, 64, 128, 1, 8, 8, 4096),
+        (64, 64, 3, 768, 32, 64, 96, 1, 1, 2),
+        (64, 64, 12, 3072, 32, 64, 96, 1, 1, 8),
+        (128, 64, 12, 3072, 32, 64, 96, 1, 1, 8),
+        (512, 64, 12, 3072, 32, 64, 96, 1, 1, 8),
+        (2048, 64, 12, 3072, 32, 64, 96, 1, 1, 8),
+        (64, 64, 3, 768, 32, 64, 96, 3, 2, 2),
+        (64, 64, 12, 3072, 32, 64, 96, 6, 3, 8),
+        (512, 64, 12, 3072, 32, 64, 96, 6, 3, 8),
+        (2048, 64, 12, 3072, 32, 64, 96, 6, 3, 8),
+        (1024, 64, 12, 3072, 32, 64, 96, 6, 3, 8),
+        (512, 64, 16, 4096, 32, 64, 128, 4, 3, 8),
+        (1024, 64, 16, 4096, 32, 64, 128, 4, 3, 8),
+        (2048, 64, 16, 4096, 32, 64, 128, 4, 3, 8),
     ]
     extensive_params = []
 
     params = extensive_params if extensive else regular_params
     names = []
     for (
-        heads,
         seq_len,
         d,
-        seq_tile,
+        heads,
+        intermediate_size,
+        q_seq_tile,
         kv_seq_tile,
         emb_tile,
         parallel_heads,
-        o_proj_acc_depth,
-        down_proj_depth,
-        intermediate_size,
+        parallel_ffn,
+        proj_acc_depth,
     ) in params:
         names.append(
-            f"encoder_{heads}heads_{seq_len}seq_{d}hdim_{seq_tile}seqtile_{kv_seq_tile}kvtile_"
-            f"{emb_tile}embtile_{parallel_heads}pheads_{o_proj_acc_depth}acc_{down_proj_depth}dproj_"
-            f"{intermediate_size}ffn"
+            f"encoder_{seq_len}seq_{d}hdim_{heads}heads_{intermediate_size}ffn_{q_seq_tile}qseqtile_{kv_seq_tile}kvtile_"
+            f"{emb_tile}embtile_{parallel_heads}pheads_{parallel_ffn}pffn_{proj_acc_depth}pacc"
         )
     return params, names
 
@@ -82,50 +74,44 @@ all_params = [
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "heads,seq_len,d,seq_tile,kv_seq_tile,emb_tile,parallel_heads,o_proj_acc_depth,down_proj_depth,intermediate_size",
+    "seq_len,d,heads,intermediate_size,q_seq_tile,kv_seq_tile,emb_tile,parallel_heads,parallel_ffn,proj_acc_depth",
     all_params,
 )
 def test_encoder_pipeline(
-    heads,
     seq_len,
     d,
-    seq_tile,
+    heads,
+    intermediate_size,
+    q_seq_tile,
     kv_seq_tile,
     emb_tile,
     parallel_heads,
-    o_proj_acc_depth,
-    down_proj_depth,
-    intermediate_size,
+    parallel_ffn,
+    proj_acc_depth,
     aie_context,
 ):
     golden_ref = generate_golden_reference(
-        heads=heads,
         seq_len=seq_len,
         d=d,
+        heads=heads,
         intermediate_size=intermediate_size,
         seed=42,
         debug=DEBUG_MODE,
-        addnorm_debug_mode=ADDNORM_DEBUG_MODE,
-        addnorm1_debug_mode=ADDNORM1_DEBUG_MODE,
-        addnorm2_debug_mode=ADDNORM2_DEBUG_MODE,
     )
 
     operator = AIEEncoderPipeline(
-        num_heads=heads,
         seq_len=seq_len,
         d=d,
-        seq_tile=seq_tile,
+        num_heads=heads,
+        seq_tile=q_seq_tile,
         kv_seq_tile=kv_seq_tile,
         emb_tile=emb_tile,
         parallel_heads=parallel_heads,
-        o_proj_acc_depth=o_proj_acc_depth,
-        down_proj_depth=down_proj_depth,
+        o_proj_acc_depth=proj_acc_depth,
+        down_proj_depth=proj_acc_depth,
         ffn_intermediate_size=intermediate_size,
-        nB_tiles_distributed=1,
+        nB_tiles_distributed=parallel_ffn,
         debug=DEBUG_MODE,
-        addnorm_debug_mode=ADDNORM_DEBUG_MODE,
-        addnorm1_debug_mode=ADDNORM1_DEBUG_MODE,
-        addnorm2_debug_mode=ADDNORM2_DEBUG_MODE,
         ln1_weight=golden_ref["ln1_weight"],
         ln2_weight=golden_ref["ln2_weight"],
         context=aie_context,

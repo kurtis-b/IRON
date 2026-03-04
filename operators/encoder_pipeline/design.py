@@ -71,12 +71,6 @@ def main():
     argparser.add_argument(
         "--kernel-archive", type=str, default="encoder_pipeline_kernels.a"
     )
-    argparser.add_argument(
-        "--ln-weight-file",
-        type=str,
-        default=None,
-        help="Fallback LN weight file applied to both AddNorm stages if stage-specific files are not provided.",
-    )
     argparser.add_argument("--ln1-weight-file", type=str, default=None)
     argparser.add_argument("--ln2-weight-file", type=str, default=None)
     argparser.add_argument(
@@ -127,7 +121,6 @@ def main():
         trace_size=args.trace_size,
         ln1_weight_file=args.ln1_weight_file,
         ln2_weight_file=args.ln2_weight_file,
-        ln_weight_file=args.ln_weight_file,
         down_proj_depth=args.down_proj_depth,
         nB_tiles_distributed=args.nB_tiles_distributed,
         ffn_intermediate_size=args.ffn_intermediate_size,
@@ -161,7 +154,6 @@ def fused_mha(
     trace_size: int = 0,
     ln1_weight_file=None,
     ln2_weight_file=None,
-    ln_weight_file=None,
     down_proj_depth: int | None = None,
     nB_tiles_distributed: int = 1,
     ffn_intermediate_size: int | None = None,
@@ -172,13 +164,6 @@ def fused_mha(
     embed_sz = heads * d
     if ffn_intermediate_size is None:
         ffn_intermediate_size = 4 * embed_sz
-
-    # Backward-compatible fallback: a single ln_weight_file applies to both stages.
-    if ln_weight_file is not None:
-        if ln1_weight_file is None:
-            ln1_weight_file = ln_weight_file
-        if ln2_weight_file is None:
-            ln2_weight_file = ln_weight_file
 
     # Load static layer norm weights for AddNorm-1 and AddNorm-2.
     if ln1_weight_file is None:
@@ -195,20 +180,6 @@ def fused_mha(
     dtype_str = "bf16"
     dev = "npu2"
 
-    # NOTE: We don't split up the parallel_heads into two like how it's done in MHA operator
-    # with parallel sequence blocks. This is because this design will be used for the pipelined
-    # encoder, which will likely not require more than 6 parallel heads in order to have space
-    # for the the two Add & Norm blocks and FFN block.
-
-    # Fused encoder_pipeline currently requires conservative internal
-    # decomposition for reliable resource fit across FFN/AddNorm stages.
-    if parallel_heads > 1:
-        logging.warning(
-            "Remapping parallel_heads from %d to 1 for encoder_pipeline resource fit",
-            parallel_heads,
-        )
-        parallel_heads = 1
-
     num_q_seq_blocks = seq_len // seq_tile
     num_kv_seq_blocks = seq_len // kv_seq_tile
     num_qkv_head_block_per_parallel_head = heads // parallel_heads
@@ -223,10 +194,6 @@ def fused_mha(
         assert (
             embed_sz == emb_tile * down_proj_depth
         ), "down_proj_depth must satisfy emb_tile * down_proj_depth == embed_sz"
-    if nB_tiles_distributed != 1:
-        raise NotImplementedError(
-            "encoder_pipeline currently supports nB_tiles_distributed=1"
-        )
     if ffn_intermediate_size % emb_tile != 0:
         raise ValueError(
             "ffn_intermediate_size must be divisible by emb_tile "
@@ -248,12 +215,55 @@ def fused_mha(
             f"(got {addnorm2_debug_mode})"
         )
     ffn_col_groups = ffn_intermediate_size // emb_tile
+    if nB_tiles_distributed > ffn_col_groups:
+        raise ValueError(
+            "nB_tiles_distributed must be <= ffn_col_groups "
+            f"({nB_tiles_distributed} > {ffn_col_groups})"
+        )
+    ffn_group_base = ffn_col_groups // nB_tiles_distributed
+    ffn_group_rem = ffn_col_groups % nB_tiles_distributed
+    ffn_col_group_counts = [
+        ffn_group_base + (1 if i < ffn_group_rem else 0)
+        for i in range(nB_tiles_distributed)
+    ]
+    ffn_col_group_offsets = []
+    running_group_offset = 0
+    for count in ffn_col_group_counts:
+        ffn_col_group_offsets.append(running_group_offset)
+        running_group_offset += count
+
     num_o_col_groups = embed_sz // (emb_tile * o_proj_acc_depth)
     ln_tiles_per_q_block = num_o_col_groups * o_proj_acc_depth
     # FFN workers consume AddNorm-1 output directly. Place FFN one column to the
     # right of the first AddNorm core to avoid local tile resource contention.
     ffn_col = min(parallel_heads + 1, 6)
     ffn_ln2_col = min(ffn_col + 1, 7)
+
+    # Place FFN down/up workers on remaining compute slots in the two FFN columns.
+    reserved_ffn_tiles = {(parallel_heads, 5), (ffn_ln2_col, 2)}
+    ffn_slot_candidates = []
+    for col in (ffn_col, ffn_ln2_col):
+        for row in (2, 3, 4, 5):
+            if (col, row) in reserved_ffn_tiles:
+                continue
+            ffn_slot_candidates.append((col, row))
+    required_ffn_slots = 2 * nB_tiles_distributed
+    if len(ffn_slot_candidates) < required_ffn_slots:
+        raise ValueError(
+            "Insufficient FFN compute slots for requested nB_tiles_distributed: "
+            f"need {required_ffn_slots}, have {len(ffn_slot_candidates)}"
+        )
+    ffn_down_tiles = ffn_slot_candidates[0::2][:nB_tiles_distributed]
+    ffn_up_tiles = ffn_slot_candidates[1::2][:nB_tiles_distributed]
+
+    # MHA path uses 4 workers per parallel head + one AddNorm1 worker.
+    # FFN path uses one up + one down worker per distributed FFN tile + one AddNorm2 worker.
+    required_compute_tiles = parallel_heads * 4 + 1 + (2 * nB_tiles_distributed) + 1
+    if required_compute_tiles > 32:
+        raise ValueError(
+            "Configuration exceeds NPU2 compute tile capacity (32): "
+            f"needs {required_compute_tiles}"
+        )
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
     mac_dims = microkernel_mac_dim_map[dev][dtype_str]
@@ -277,6 +287,19 @@ def fused_mha(
     )
     logging.info(
         f"num_q_seq_blocks: {num_q_seq_blocks}, num_kv_seq_blocks: {num_kv_seq_blocks}, num_qkv_head_block_per_parallel_head: {num_qkv_head_block_per_parallel_head}, num_o_col_groups: {num_o_col_groups}"
+    )
+    logging.info(
+        "FFN distribution: groups=%d counts=%s offsets=%s",
+        ffn_col_groups,
+        ffn_col_group_counts,
+        ffn_col_group_offsets,
+    )
+    logging.info(
+        "FFN worker placement: down=%s up=%s ln2=(%d,%d)",
+        ffn_down_tiles,
+        ffn_up_tiles,
+        ffn_ln2_col,
+        2,
     )
     logging.info(f"Data type: {dtype_str}")
     logging.info(f"Microkernel MAC dimensions: r={r}, s={s}, t={t}")
@@ -580,20 +603,13 @@ def fused_mha(
         placement=Tile(col=3, row=1),
     )  # Split between N parallel blocks of heads
 
-    # Partial out proj tiles to store accumulations in MTs
+    # Partial out proj tiles to store accumulations in MTs.
     outOProj = []
     outOProjAccumIn = []
     outOProjAccumOut = []
-    # Keep LN/residual traffic on mem tile col 7. For high parallel-head
-    # configs, spill only the last O-proj accumulator to col 7 and keep the
-    # rest on cols 4/5/6 to reduce BD pressure on col 6.
-    acc_mem_tile_cols = [4, 5, 6]
-    if parallel_heads > 3:
-        for i in range(3, parallel_heads):
-            acc_mem_tile_cols.append(4 if ((i - 3) % 2 == 0) else 5)
-        acc_mem_tile_cols[-1] = 7
+    acc_mem_tile_cols = [4, 5, 6, 7] * ((parallel_heads + 3) // 4)
+    acc_mem_tile_cols = acc_mem_tile_cols[:parallel_heads]
     for i in range(parallel_heads):
-        acc_mem_tile_col = acc_mem_tile_cols[i]
         outOProj.append(
             ObjectFifo(q_ty, depth=of_depth, name=f"outOProj{i}")
         )  # Local to 1 parallel block of heads
@@ -604,13 +620,13 @@ def fused_mha(
             .forward(
                 name=f"outOProjAccumIn{i}",
                 depth=o_proj_acc_depth,
-                placement=Tile(col=acc_mem_tile_col, row=1),
+                placement=Tile(col=acc_mem_tile_cols[i], row=1),
             )
         )
         logging.debug(
             "Placed outOProjAccum[%d] on mem tile (%d,1) with acc_depth=%d",
             i,
-            acc_mem_tile_col,
+            acc_mem_tile_cols[i],
             o_proj_acc_depth,
         )
 
@@ -659,10 +675,8 @@ def fused_mha(
     o_dims = [(seq_tile // r, r * emb_tile), (r, s), (emb_tile // s, r * s), (s, 1)]
     outLN = ObjectFifo(o_ty, name="outLN", depth=ffn_up_input_depth)
     # FFN residual path for AddNorm-2.
-    # For 1-way head parallelism, keep the memtile-backed queue to avoid
-    # backpressure between LN1 and FFN-up/down at higher accumulation depths.
-    # For higher head parallelism, use a direct FIFO to avoid memtile BD
-    # pressure from another deep residual queue.
+    # Keep the single-head case memtile-backed to preserve buffering behavior,
+    # but avoid extra memtile BD pressure for multi-head by using a direct FIFO.
     if parallel_heads == 1:
         ffnROut = ObjectFifo(o_ty, name="ffnROut", depth=1)
         ffnRIn = ffnROut.cons(depth=ffn_residual_depth).forward(
@@ -673,7 +687,7 @@ def fused_mha(
         )
         ffn_residual_prod = ffnROut.prod()
     else:
-        ffnRIn = ObjectFifo(o_ty, name="ffnRIn", depth=ln_fifo_depth)
+        ffnRIn = ObjectFifo(o_ty, name="ffnRIn", depth=ffn_residual_depth)
         ffn_residual_prod = ffnRIn.prod()
 
     # FFN weights (Up/Down projections)

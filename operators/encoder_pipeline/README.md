@@ -5,12 +5,6 @@ MHA + AddNorm1 + FFN + AddNorm2.
 
 ## Python files
 
-- `constants.py`
-  - Defines debug mode enums and compatibility constants.
-  - Provides helper functions to resolve:
-    - top-level debug mode into MHA debug + FFN stage-only mode
-    - global/per-stage AddNorm debug modes.
-
 - `design.py`
   - Generates the AIE MLIR graph (`fused_mha`).
   - Defines object FIFOs, worker kernels, tile placement, tensor access patterns, and runtime fill/drain sequence.
@@ -40,38 +34,20 @@ MHA + AddNorm1 + FFN + AddNorm2.
 
 ## Debug modes
 
-Debug mode definitions are centralized in `constants.py` and used by `op.py`, `reference.py`, and `test.py`.
+`op.py` and `reference.py` accept a single top-level `debug` argument:
 
-- Top-level `debug` (values in `DebugMode`):
-  - `0` (`FULL`): run full pipeline.
-  - `1` (`SELF_ATTN`): self-attention-focused MHA debug mode.
-  - `2` (`O_PROJ`): output-projection-focused MHA debug mode.
-  - `3` (`FFN_UP_ONLY`): FFN stage isolation for up projection.
-  - `4` (`FFN_DOWN_ONLY`): FFN stage isolation for down projection.
-  - `5` (`FFN_ADDNORM_ONLY`): FFN stage isolation for AddNorm2.
+- `-1`: debug disabled (default full pipeline behavior).
+- `0`: self-attention debug path; AddNorm stages pass through their input path.
+- `1`: deterministic MHA-input debug path (linear QK/PV flow); AddNorm stages pass input.
+- `2`: residual-path debug; AddNorm stages pass residual.
+- `3`: FFN up-proj isolation (`ffn_stage_only=0`), deterministic MHA feed.
+- `4`: FFN down-proj isolation (`ffn_stage_only=1`), deterministic MHA feed.
+- `5`: FFN AddNorm2 isolation (`ffn_stage_only=2`), deterministic MHA feed.
 
-- FFN stage isolation mapping:
-  - `debug=3 -> ffn_stage_only=0`
-  - `debug=4 -> ffn_stage_only=1`
-  - `debug=5 -> ffn_stage_only=2`
-  - `debug in {0,1,2} -> ffn_stage_only=None` (all FFN stages enabled)
-
-- MHA debug mapping:
-  - `debug=0 -> mha_debug=0`
-  - `debug=1 -> mha_debug=1`
-  - `debug=2 -> mha_debug=2`
-  - `debug in {3,4,5} -> mha_debug=2` (deterministic O-proj-style MHA feed for FFN isolation)
-
-- AddNorm debug controls:
-  - Global: `addnorm_debug_mode` in `{-1, 0, 1}`
-  - Per-stage overrides: `addnorm1_debug_mode`, `addnorm2_debug_mode` in `{-1, 0, 1}`
-  - Meaning:
-    - `-1`: normal AddNorm (layer norm + residual add)
-    - `0`: pass through AddNorm input
-    - `1`: pass through residual
-  - Precedence:
-    - If per-stage mode is provided, it overrides global mode for that stage.
-    - Otherwise the stage uses `addnorm_debug_mode`.
+Internally, `op.py` resolves `debug` into:
+- MHA kernel debug value (`mha_debug`)
+- FFN stage-only selector (`ffn_stage_only`)
+- per-stage AddNorm pass-through modes (`addnorm1_debug_mode`, `addnorm2_debug_mode`)
 
 ## Dataflow mapping and pipelining
 
