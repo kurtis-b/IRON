@@ -1,0 +1,261 @@
+[
+  {
+    "idx": 1,
+    "name": "encoder_64seq_64hdim_3heads_768ffn_32qseqtile_64kvtile_96embtile_1pheads_1pffn_2pacc",
+    "params": {
+      "seq_len": 64,
+      "d": 64,
+      "heads": 3,
+      "intermediate_size": 768,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 96,
+      "parallel_heads": 1,
+      "parallel_ffn": 1,
+      "proj_acc_depth": 2
+    },
+    "status": "pass",
+    "errors": 23,
+    "latency_us": 657.23399984563,
+    "bandwidth_gbps": 1.2339714625087688,
+    "elapsed_s": 1.9
+  },
+  {
+    "idx": 2,
+    "name": "encoder_64seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_1pheads_1pffn_8pacc",
+    "params": {
+      "seq_len": 64,
+      "d": 64,
+      "heads": 12,
+      "intermediate_size": 3072,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 96,
+      "parallel_heads": 1,
+      "parallel_ffn": 1,
+      "proj_acc_depth": 8
+    },
+    "status": "pass",
+    "errors": 7,
+    "latency_us": 5306.247000589792,
+    "bandwidth_gbps": 2.111974056005002,
+    "elapsed_s": 1.72
+  },
+  {
+    "idx": 3,
+    "name": "encoder_128seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_1pheads_1pffn_8pacc",
+    "params": {
+      "seq_len": 128,
+      "d": 64,
+      "heads": 12,
+      "intermediate_size": 3072,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 96,
+      "parallel_heads": 1,
+      "parallel_ffn": 1,
+      "proj_acc_depth": 8
+    },
+    "status": "pass",
+    "errors": 29,
+    "latency_us": 10936.337999737589,
+    "bandwidth_gbps": 1.0786499100780398,
+    "elapsed_s": 1.86
+  },
+  {
+    "idx": 4,
+    "name": "encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_1pheads_1pffn_8pacc",
+    "params": {
+      "seq_len": 512,
+      "d": 64,
+      "heads": 12,
+      "intermediate_size": 3072,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 96,
+      "parallel_heads": 1,
+      "parallel_ffn": 1,
+      "proj_acc_depth": 8
+    },
+    "status": "pass",
+    "errors": 216,
+    "latency_us": 48986.47499976505,
+    "bandwidth_gbps": 0.31305424609697985,
+    "elapsed_s": 2.79
+  },
+  {
+    "idx": 5,
+    "name": "encoder_2048seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_1pheads_1pffn_8pacc",
+    "params": {
+      "seq_len": 2048,
+      "d": 64,
+      "heads": 12,
+      "intermediate_size": 3072,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 96,
+      "parallel_heads": 1,
+      "parallel_ffn": 1,
+      "proj_acc_depth": 8
+    },
+    "status": "pass",
+    "errors": 1506,
+    "latency_us": 288475.3849994013,
+    "bandwidth_gbps": 0.1022312527637712,
+    "elapsed_s": 6.03
+  },
+  {
+    "idx": 6,
+    "name": "encoder_64seq_64hdim_3heads_768ffn_32qseqtile_64kvtile_96embtile_3pheads_2pffn_2pacc",
+    "params": {
+      "seq_len": 64,
+      "d": 64,
+      "heads": 3,
+      "intermediate_size": 768,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 96,
+      "parallel_heads": 3,
+      "parallel_ffn": 2,
+      "proj_acc_depth": 2
+    },
+    "status": "pass",
+    "errors": 22,
+    "latency_us": 660.771000184468,
+    "bandwidth_gbps": 1.2273662127629545,
+    "elapsed_s": 1.5
+  },
+  {
+    "idx": 7,
+    "name": "encoder_64seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_6pheads_3pffn_8pacc",
+    "params": {
+      "seq_len": 64,
+      "d": 64,
+      "heads": 12,
+      "intermediate_size": 3072,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 96,
+      "parallel_heads": 6,
+      "parallel_ffn": 3,
+      "proj_acc_depth": 8
+    },
+    "status": "runtime_timeout",
+    "error": "runlist failed execution (ERT_CMD_STATE_TIMEOUT)",
+    "elapsed_s": 23.38
+  },
+  {
+    "idx": 8,
+    "name": "encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_6pheads_3pffn_8pacc",
+    "params": {
+      "seq_len": 512,
+      "d": 64,
+      "heads": 12,
+      "intermediate_size": 3072,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 96,
+      "parallel_heads": 6,
+      "parallel_ffn": 3,
+      "proj_acc_depth": 8
+    },
+    "status": "runtime_timeout",
+    "error": "runlist failed execution (ERT_CMD_STATE_TIMEOUT)",
+    "elapsed_s": 24.58
+  },
+  {
+    "idx": 9,
+    "name": "encoder_2048seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_6pheads_3pffn_8pacc",
+    "params": {
+      "seq_len": 2048,
+      "d": 64,
+      "heads": 12,
+      "intermediate_size": 3072,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 96,
+      "parallel_heads": 6,
+      "parallel_ffn": 3,
+      "proj_acc_depth": 8
+    },
+    "status": "runtime_timeout",
+    "error": "runlist failed execution (ERT_CMD_STATE_TIMEOUT)",
+    "elapsed_s": 24.58
+  },
+  {
+    "idx": 10,
+    "name": "encoder_1024seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_6pheads_3pffn_8pacc",
+    "params": {
+      "seq_len": 1024,
+      "d": 64,
+      "heads": 12,
+      "intermediate_size": 3072,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 96,
+      "parallel_heads": 6,
+      "parallel_ffn": 3,
+      "proj_acc_depth": 8
+    },
+    "status": "runtime_timeout",
+    "error": "runlist failed execution (ERT_CMD_STATE_TIMEOUT)",
+    "elapsed_s": 24.58
+  },
+  {
+    "idx": 11,
+    "name": "encoder_512seq_64hdim_16heads_4096ffn_32qseqtile_64kvtile_128embtile_4pheads_3pffn_8pacc",
+    "params": {
+      "seq_len": 512,
+      "d": 64,
+      "heads": 16,
+      "intermediate_size": 4096,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 128,
+      "parallel_heads": 4,
+      "parallel_ffn": 3,
+      "proj_acc_depth": 8
+    },
+    "status": "compile_bd_exhaustion",
+    "error": "MLIR compilation for /home/agi-demo/iron/build/encoder_pipeline_16h_512s_64d_32qt_64kvt_128e_4ph_8acc_8dproj_3nbdist_4096ffn_-1debug_mha0_ffnstgall_an1-1_an2-1_lnstage.mlir failed: Traceback (most recent call last):",
+    "elapsed_s": 0.89
+  },
+  {
+    "idx": 12,
+    "name": "encoder_1024seq_64hdim_16heads_4096ffn_32qseqtile_64kvtile_128embtile_4pheads_3pffn_8pacc",
+    "params": {
+      "seq_len": 1024,
+      "d": 64,
+      "heads": 16,
+      "intermediate_size": 4096,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 128,
+      "parallel_heads": 4,
+      "parallel_ffn": 3,
+      "proj_acc_depth": 8
+    },
+    "status": "compile_bd_exhaustion",
+    "error": "MLIR compilation for /home/agi-demo/iron/build/encoder_pipeline_16h_1024s_64d_32qt_64kvt_128e_4ph_8acc_8dproj_3nbdist_4096ffn_-1debug_mha0_ffnstgall_an1-1_an2-1_lnstage.mlir failed: Traceback (most recent call last):",
+    "elapsed_s": 1.01
+  },
+  {
+    "idx": 13,
+    "name": "encoder_2048seq_64hdim_16heads_4096ffn_32qseqtile_64kvtile_128embtile_4pheads_3pffn_8pacc",
+    "params": {
+      "seq_len": 2048,
+      "d": 64,
+      "heads": 16,
+      "intermediate_size": 4096,
+      "q_seq_tile": 32,
+      "kv_seq_tile": 64,
+      "emb_tile": 128,
+      "parallel_heads": 4,
+      "parallel_ffn": 3,
+      "proj_acc_depth": 8
+    },
+    "status": "compile_bd_exhaustion",
+    "error": "MLIR compilation for /home/agi-demo/iron/build/encoder_pipeline_16h_2048s_64d_32qt_64kvt_128e_4ph_8acc_8dproj_3nbdist_4096ffn_-1debug_mha0_ffnstgall_an1-1_an2-1_lnstage.mlir failed: Traceback (most recent call last):",
+    "elapsed_s": 1.3
+  }
+]

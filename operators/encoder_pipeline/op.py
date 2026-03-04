@@ -20,11 +20,7 @@ from operators.common import (
     PythonGeneratedMLIRArtifact,
 )
 from operators.common.utils import torch_to_numpy, numpy_to_torch
-from operators.encoder_pipeline.constants import (
-    resolve_addnorm_modes,
-    resolve_ffn_stage_only,
-    resolve_mha_debug_mode,
-)
+from operators.encoder_pipeline.debug_modes import resolve_pipeline_debug_modes
 
 
 class AIEEncoderPipeline(AIEOperatorBase):
@@ -48,10 +44,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         nB_tiles_distributed: int = 1,
         ffn_intermediate_size: int | None = None,
         static_weights: bool = False,
-        debug: int = 0,
-        addnorm_debug_mode: int = -1,
-        addnorm1_debug_mode: int | None = None,
-        addnorm2_debug_mode: int | None = None,
+        debug: int = -1,
         ln1_weight=None,
         ln2_weight=None,
         ln_weight=None,
@@ -69,17 +62,12 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.nB_tiles_distributed = nB_tiles_distributed
         self.debug = debug
         try:
-            self.mha_debug = resolve_mha_debug_mode(debug)
-            self.ffn_stage_only = resolve_ffn_stage_only(debug)
             (
-                self.addnorm_debug_mode,
+                self.mha_debug,
+                self.ffn_stage_only,
                 self.addnorm1_debug_mode,
                 self.addnorm2_debug_mode,
-            ) = resolve_addnorm_modes(
-                addnorm_debug_mode,
-                addnorm1_debug_mode,
-                addnorm2_debug_mode,
-            )
+            ) = resolve_pipeline_debug_modes(debug)
         except ValueError as exc:
             raise AIEOperatorConstraintError(str(exc)) from exc
         self.embed_sz = d * num_heads
