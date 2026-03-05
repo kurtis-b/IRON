@@ -33,17 +33,50 @@ def find_ffn_layout(
     mha_tiles = {(c, r) for c in range(parallel_heads) for r in COMPUTE_ROWS}
     free_tiles = all_compute_tiles - mha_tiles
 
-    def has_north_east_south(tile: tuple[int, int]) -> bool:
-        c, r = tile
-        required = [(c, r + 1), (c + 1, r), (c, r - 1)]
-        return all(t in free_tiles for t in required)
+    # Down tile must be north/east/south of paired up tile.
+    # Equivalently, up tile is south/west/north of down tile.
+    def allowed_up_tiles_for_down(down_tile: tuple[int, int]) -> list[tuple[int, int]]:
+        c, r = down_tile
+        candidates = [(c, r - 1), (c - 1, r), (c, r + 1)]
+        return [
+            (cc, rr)
+            for (cc, rr) in candidates
+            if cc in COMPUTE_COLS and rr in COMPUTE_ROWS
+        ]
 
-    ln1_candidates = [t for t in sorted(free_tiles) if has_north_east_south(t)]
+    def enumerate_neighbor_chains(
+        available_tiles: set[tuple[int, int]], length: int
+    ) -> list[list[tuple[int, int]]]:
+        chains: list[list[tuple[int, int]]] = []
+        for start in sorted(available_tiles):
+            stack = [(start, [start], {start})]
+            while stack:
+                cur, path, visited = stack.pop()
+                if len(path) == length:
+                    chains.append(path)
+                    continue
+                for nxt in sorted(cardinal_neighbors(cur)):
+                    if nxt not in available_tiles or nxt in visited:
+                        continue
+                    stack.append((nxt, path + [nxt], visited | {nxt}))
+        return chains
+
+    def pair_orientation_penalty(
+        up_tile: tuple[int, int], down_tile: tuple[int, int]
+    ) -> int:
+        dc = down_tile[0] - up_tile[0]
+        dr = down_tile[1] - up_tile[1]
+        # Target geometry preference: up on the left, down on the right.
+        if (dc, dr) == (1, 0):
+            return 0
+        # Accept N/S placement as fallback under routing pressure.
+        if (dc, dr) in ((0, 1), (0, -1)):
+            return 1
+        return 5
+
+    ln1_candidates = sorted(free_tiles)
     if not ln1_candidates:
-        raise ValueError(
-            "No valid LN1 placement with free north/east/south neighbors "
-            "after MHA mapping."
-        )
+        raise ValueError("No free tiles available for LN1 placement after MHA mapping.")
 
     best = None
     for ln1_tile in ln1_candidates:
@@ -53,98 +86,102 @@ def find_ffn_layout(
             and manhattan_distance(ln1_tile, mha_output_tile) != 1
         ):
             continue
-        c, r = ln1_tile
-        up_tiles = [(c, r + 1), (c + 1, r), (c, r - 1)]  # N, E, S
-        used_tiles = {ln1_tile, *up_tiles}
-
-        down_options = []
-        feasible = True
-        for up_tile in up_tiles:
-            options = [
-                t
-                for t in cardinal_neighbors(up_tile)
-                if t in free_tiles and t not in used_tiles
-            ]
-            if not options:
-                feasible = False
-                break
-            down_options.append(options)
-        if not feasible:
+        available = set(free_tiles) - {ln1_tile}
+        max_chain_len = min(3, len(available))
+        if max_chain_len <= 0:
             continue
-
-        for down_choice in product(*down_options):
-            if len(set(down_choice)) != 3:
-                continue
-            down_tiles = list(down_choice)
-            used_with_down = used_tiles | set(down_tiles)
-            ln2_candidates = [t for t in free_tiles if t not in used_with_down]
-
-            for ln2_tile in ln2_candidates:
-                # Build a reduction plan over down-proj tiles:
-                # - pick one root tile as the main down->LN2 source
-                # - reduce neighboring down tiles into the root when possible
-                # - any disconnected remainder streams directly to LN2
-                root_down = min(
-                    down_tiles,
-                    key=lambda d: (
-                        0 if manhattan_distance(d, ln2_tile) == 1 else 1,
-                        manhattan_distance(d, ln2_tile),
-                        d[0],
-                        d[1],
-                    ),
-                )
-                reduced = {root_down}
-                reduction_edges = []
-                progress = True
-                while progress:
-                    progress = False
-                    for d in down_tiles:
-                        if d in reduced:
-                            continue
-                        for sink in sorted(reduced):
-                            if manhattan_distance(d, sink) == 1:
-                                reduction_edges.append((d, sink))
-                                reduced.add(d)
-                                progress = True
-                                break
-
-                down_to_ln2 = [root_down] + [d for d in down_tiles if d not in reduced]
-                non_neighbor_down = [
-                    d for d in down_to_ln2 if manhattan_distance(d, ln2_tile) != 1
-                ]
-                if len(non_neighbor_down) > max_non_neighbor_down_to_ln2:
+        for chain_len in range(max_chain_len, 0, -1):
+            down_chains = enumerate_neighbor_chains(available, chain_len)
+            for down_tiles in down_chains:
+                down_set = set(down_tiles)
+                up_options = []
+                feasible = True
+                for down_tile in down_tiles:
+                    options = [
+                        t
+                        for t in allowed_up_tiles_for_down(down_tile)
+                        if t in free_tiles and t != ln1_tile and t not in down_set
+                    ]
+                    if not options:
+                        feasible = False
+                        break
+                    up_options.append(options)
+                if not feasible:
                     continue
 
-                # Prefer placements near the MHA/FFN boundary and with fewer
-                # unresolved down->LN2 streams.
-                mha_ln_dist = (
-                    manhattan_distance(ln1_tile, mha_output_tile)
-                    if mha_output_tile is not None
-                    else 0
-                )
-                score = (
-                    ln1_tile[0],
-                    mha_ln_dist,
-                    abs(ln1_tile[1] - 3),
-                    len(down_to_ln2),
-                    len(non_neighbor_down),
-                    ln2_tile[0],
-                    ln2_tile[1],
-                )
-                if best is None or score < best["score"]:
-                    best = {
-                        "score": score,
-                        "mha_tiles": sorted(mha_tiles),
-                        "free_tiles": sorted(free_tiles),
-                        "ln1_tile": ln1_tile,
-                        "up_tiles": up_tiles,
-                        "down_tiles": down_tiles,
-                        "ln2_tile": ln2_tile,
-                        "down_root_tile": root_down,
-                        "down_reduction_edges": reduction_edges,
-                        "down_to_ln2_tiles": down_to_ln2,
-                        "non_neighbor_down_to_ln2": non_neighbor_down,
-                    }
+                for up_choice in product(*up_options):
+                    if len(set(up_choice)) != chain_len:
+                        continue
+                    up_tiles = list(up_choice)
+                    used_with_down = {ln1_tile, *up_tiles, *down_tiles}
+                    ln2_candidates = [t for t in free_tiles if t not in used_with_down]
+                    root_down = down_tiles[-1]
+                    reduction_edges = [
+                        (down_tiles[i], down_tiles[i + 1]) for i in range(chain_len - 1)
+                    ]
+                    down_to_ln2 = [root_down]
+
+                    for ln2_tile in ln2_candidates:
+                        non_neighbor_down = [
+                            d
+                            for d in down_to_ln2
+                            if manhattan_distance(d, ln2_tile) != 1
+                        ]
+                        if len(non_neighbor_down) > max_non_neighbor_down_to_ln2:
+                            continue
+
+                        mha_ln_dist = (
+                            manhattan_distance(ln1_tile, mha_output_tile)
+                            if mha_output_tile is not None
+                            else 0
+                        )
+                        ln_row_score = -(ln1_tile[1] + ln2_tile[1])
+                        ffn_row_score = sum(r for (_, r) in up_tiles) + sum(
+                            r for (_, r) in down_tiles
+                        )
+                        orientation_score = sum(
+                            pair_orientation_penalty(up_tile, down_tile)
+                            for up_tile, down_tile in zip(up_tiles, down_tiles)
+                        )
+                        down_cols = [c for (c, _) in down_tiles]
+                        up_cols = [c for (c, _) in up_tiles]
+                        down_col_span = max(down_cols) - min(down_cols)
+                        up_col_span = max(up_cols) - min(up_cols)
+                        col_gap_score = -sum(
+                            down_tile[0] - up_tile[0]
+                            for up_tile, down_tile in zip(up_tiles, down_tiles)
+                        )
+                        score = (
+                            -chain_len,
+                            orientation_score,
+                            down_col_span,
+                            up_col_span,
+                            ln_row_score,
+                            ffn_row_score,
+                            col_gap_score,
+                            len(non_neighbor_down),
+                            manhattan_distance(root_down, ln2_tile),
+                            mha_ln_dist,
+                            -sum(c for (c, _) in down_tiles),
+                            ln2_tile[0],
+                            ln2_tile[1],
+                            ln1_tile[0],
+                            ln1_tile[1],
+                        )
+                        if best is None or score < best["score"]:
+                            best = {
+                                "score": score,
+                                "mha_tiles": sorted(mha_tiles),
+                                "free_tiles": sorted(free_tiles),
+                                "ln1_tile": ln1_tile,
+                                "up_tiles": up_tiles,
+                                "down_tiles": down_tiles,
+                                "ln2_tile": ln2_tile,
+                                "down_root_tile": root_down,
+                                "down_reduction_edges": reduction_edges,
+                                "down_to_ln2_tiles": down_to_ln2,
+                                "non_neighbor_down_to_ln2": non_neighbor_down,
+                            }
 
     if best is None:
         if require_mha_ln_neighbor and mha_output_tile is not None:
@@ -187,25 +224,6 @@ def validate_layout_constraints(
             f"mha_output={mha_output_tile}, ln1={ln1_tile}"
         )
 
-    expected_up_tiles = [
-        (ln1_tile[0], ln1_tile[1] + 1),
-        (ln1_tile[0] + 1, ln1_tile[1]),
-        (ln1_tile[0], ln1_tile[1] - 1),
-    ]
-    if up_tiles != expected_up_tiles:
-        errors.append(
-            "Up-proj tiles are not mapped to LN1 north/east/south: "
-            f"expected={expected_up_tiles}, got={up_tiles}"
-        )
-
-    for idx, up_tile in enumerate(up_tiles):
-        if manhattan_distance(ln1_tile, up_tile) != 1:
-            errors.append(
-                f"LN1->UP[{idx}] is non-neighbor: ln1={ln1_tile}, up={up_tile}"
-            )
-        if up_tile not in cardinal_neighbors(ln1_tile):
-            errors.append(f"UP[{idx}] is not cardinal-neighbor of LN1: {up_tile}")
-
     if len(up_tiles) != len(down_tiles):
         errors.append(
             "up/down stream counts mismatch: "
@@ -217,6 +235,15 @@ def validate_layout_constraints(
                 errors.append(
                     f"UP[{idx}]->DOWN[{idx}] is non-neighbor: "
                     f"up={up_tile}, down={down_tile}"
+                )
+                continue
+            # Design intent: down tile is north/east/south of its paired up tile.
+            dc = down_tile[0] - up_tile[0]
+            dr = down_tile[1] - up_tile[1]
+            if (dc, dr) not in [(0, 1), (1, 0), (0, -1)]:
+                errors.append(
+                    f"UP[{idx}]->DOWN[{idx}] is not in N/E/S relation: "
+                    f"up={up_tile}, down={down_tile}, delta={(dc, dr)}"
                 )
 
     down_set = set(down_tiles)

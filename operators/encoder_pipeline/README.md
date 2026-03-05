@@ -100,9 +100,16 @@ Internally, `op.py` resolves `debug` into:
 compile time when placement/channel limits are hit:
 
 1. Initial clamp to available mapped branch tiles.
-2. If no spare free tile remains for LN1-post worker placement, non-root branches are pruned.
-3. Direct LN1-post fanout currently limits active branches to at most 2.
-4. For `parallel_heads >= 4`, active FFN branches are currently reduced to 1 because the
-   down-root reduction topology exceeds input DMA-channel budget otherwise.
+2. If no spare free tile remains for LN1-post (and optional LN1-route) worker placement,
+   non-root branches are pruned.
+3. Inline FFN reduction is mapped in `ffn_addnorm` style (`ffnDownReduce*` chain), but
+   memtile-staged FFN-down accumulation (kept for LN full-row/two-pass requirements) already
+   consumes three input DMA streams per down core.
+4. Because of (3), adding the reduction input stream can exceed down-core input DMA channel
+   budget, so multi-branch requests are pruned until feasible.
+5. Additional memtile BD/channel feasibility guards are applied for high-acc configurations:
+   - `parallel_heads >= 6` with `proj_acc_depth >= 6`: prune to a single branch.
+   - `parallel_heads >= 4` with `proj_acc_depth >= 8`: prune to a single branch.
+6. Standard compute tile budget check (`<= 32` total compute tiles) is also enforced.
 
 The effective branch count is logged by `design.py` at compile time.

@@ -454,3 +454,139 @@ Key outcomes:
 ### Final status
 - Encoder pipeline tests are green in this environment with current focused constraints.
 - LN full-row memory staging behavior was retained throughout.
+
+## Follow-up (2026-03-05): Clamp Removal Attempt + Root Cause
+
+### What changed
+File changed:
+- `operators/encoder_pipeline/design.py`
+
+Updates:
+1. Restored known-good memtile placements for 4-head path:
+   - `acc_mem_tile_order` for `parallel_heads <= 4` set back to `[4, 5, 6, 3]`.
+   - Removed temporary `parallel_heads >= 4` branch-stage override; reverted to baseline stage columns.
+2. Removed the hard `parallel_heads >= 4 -> 1 branch` clamp.
+3. Rewired FFN-down reduction to `ffn_addnorm`-style in-core chain (`ffnDownReduce*`) and removed standalone reducer workers.
+4. Kept LN1 optional route worker for >2-way LN1 fanout.
+
+### Failure observed after clamp removal
+Target:
+- `pytest operators/encoder_pipeline/test.py -q -k "iter0 and 4pheads_3pffn_8pacc"`
+
+Compile failures:
+- `'aie.tile' op number of input DMA channel exceeded!` on tiles `(5,2)` and `(4,5)`.
+- downstream invalid flow allocation (`dest_channel = -1`).
+
+### Root cause diagnosis
+From generated MLIR for failing case:
+- each affected FFN-down branch tile consumed 4 input streams:
+  1. `ffnUpOut*`
+  2. `memBDown*`
+  3. `ffnDownAccum*` (memtile-staged accumulator replay)
+  4. `ffnDownReduce*` incoming reduction stream
+
+This exceeded available down-core input DMA channels for this topology.  
+Because LN/addnorm requires full-row/two-pass behavior, memtile staging (`ffnDownAccum`) was preserved and not removed.
+
+### Mitigation implemented
+Added explicit resource-budget pruning in branch-selection loop:
+- if inline reduction would exceed down-core input DMA channel budget (base 3 staged inputs + 1 reduction input),
+  prune non-root branches until feasible.
+- This is now resource-driven and logs the specific reason; no hard `parallel_heads` clamp remains.
+
+### Validation (with requested setup)
+Before runs:
+- `rm -r ./build` (executed as `rm -rf ./build`)
+- `source /opt/xilinx/xrt/setup.sh`
+- `source ~/iron/ironenv/bin/activate`
+
+Results:
+- `pytest operators/encoder_pipeline/test.py -q -k "iter0 and 4pheads_3pffn_8pacc"` -> **3 passed**
+- `pytest operators/encoder_pipeline/test.py -q` -> **55 passed**
+
+## Follow-up (2026-03-05): 6pheads/3pffn/6pacc Memtile Prioritization Check
+
+### Repro
+Run used:
+- `rm -rf ./build`
+- `source /opt/xilinx/xrt/setup.sh`
+- `source ~/iron/ironenv/bin/activate`
+- `pytest operators/encoder_pipeline/test.py -q --iterations 1 -k "6pheads_3pffn_6pacc"`
+
+Observed:
+- All 4 `6pheads_3pffn_6pacc` cases fail at compile with:
+  - `'aie.dma_bd' op Allocator exhausted available BD IDs (maximum 48 available)`.
+
+### Key diagnostic detail
+Using `aie-opt` with `--mlir-print-op-generic --mlir-print-ir-after-failure`, the failing op is:
+- `%119 = aie.buffer(... "outOProjAccumOut2_cons_buff_4") : memref<32x128xbf16>`
+- failure occurs in `%memtile_dma_6_1` while assigning BD IDs.
+
+At failure point in `%memtile_dma_6_1`, BD IDs had already reached `27`, and allocation failed on the next `aie.dma_bd` in the same block.
+
+### Memtile utilization snapshot (current focused remap)
+- `memtile_dma_4_1`: `38` BDs, `S2MM=4 ch`, `MM2S=4 ch`
+- `memtile_dma_5_1`: `40` BDs, `S2MM=5 ch`, `MM2S=5 ch`
+- `memtile_dma_6_1`: `30` BDs, `S2MM=5 ch`, `MM2S=5 ch` (fails during BD assignment)
+- `memtile_dma_7_1`: `32` BDs, `S2MM=4 ch`, `MM2S=4 ch`
+
+### High-acc-depth stream placement
+For `proj_acc_depth=6`, high-depth memtile-staged streams are:
+- `outOProjAccumOut0..5` (6 streams)
+- `ln1ReplayPart` (1)
+- `ffnDownPart` + `ffnDownPart1` (2)
+- `ffnROut` (1)
+
+Total high-depth streams: `10`.
+
+Current distribution across tail memtiles:
+- col4: `outOProjAccumOut0`, `outOProjAccumOut4`, `ffnDownPart1`
+- col5: `ln1ReplayPart`, `outOProjAccumOut1`, `outOProjAccumOut5`
+- col6: `outOProjAccumOut2`, `ffnDownPart`
+- col7: `outOProjAccumOut3`, `ffnROut`
+
+So the high-depth streams are already spread in a near-minimax way over 4 tail memtiles (`3/3/2/2`).
+
+### Feasibility conclusion for requested prioritization
+- Enforcing “one high-acc-depth stream per memtile” is **not feasible** in this design point:
+  - needs 10 memtiles for 10 high-depth streams,
+  - only 4 tail memtiles are currently available for these streams (`cols 4..7`).
+- Even with aggressive remaps attempted in this session, channel and/or BD allocator limits are hit before `6pheads_3pffn_6pacc` compiles.
+
+## Follow-up (2026-03-05): Incremental Viable-Fix Sweep
+
+### Goal
+- Implement fixes one-by-one and keep the first viable set that clears failing encoder pipeline tests without threshold changes.
+
+### Setup used for all reruns
+- `rm -r ./build` (executed as `rm -rf ./build`)
+- `source /opt/xilinx/xrt/setup.sh`
+- `source ~/iron/ironenv/bin/activate`
+
+### Attempted fixes and outcomes
+1. Remap `parallel_heads>4` O-proj accumulators off col6 (`acc_mem_tile_order` tweak).
+   - Result: **failed**. BD exhaustion moved from `%119` to `%147` (pressure shifted from `memtile_dma_6_1` to `memtile_dma_4_1`).
+2. Move high-head FFN stage/down weight memtile columns toward col7.
+   - Result: **failed**. Introduced tile DMA-channel overflow (`source_channel=-1`) on col7.
+3. Move only `ffnDownAccum` staging for high-head path.
+   - Result: **failed**. Original `6pheads_3pffn_6pacc` BD exhaustion persisted.
+4. Add resource-driven pruning for wide-head/high-acc (`parallel_heads>=6 && proj_acc_depth>=6`) to single active branch.
+   - Result: **fixed** `6pheads_3pffn_6pacc` subset (`4 passed`), but `4pheads_3pffn_8pacc` still failed.
+5. Extend pruning for high-acc `4pheads` (`parallel_heads>=4 && proj_acc_depth>=8`) to single active branch.
+   - Result: branch count reduced as intended, but `4pheads_3pffn_8pacc` still failed with BD exhaustion on O-proj accum stream.
+6. Remap `parallel_heads<=4` O-proj accumulator placement to avoid col6 concentration (`acc_mem_tile_order=[4,5,7,3]`).
+   - Result: **fixed** `4pheads_3pffn_8pacc` subset (`3 passed`).
+
+### Final validated state
+- Focused `6pheads_3pffn_6pacc`: `4 passed, 7 deselected`.
+- Focused `4pheads_3pffn_8pacc`: `3 passed, 8 deselected`.
+- Full encoder pipeline suite (`--iterations 1`): **`11 passed`**.
+- Full encoder pipeline suite (default iterations): **`55 passed`**.
+
+### Final patch behavior summary
+- Preserved LN full-row/two-pass staging model (no threshold tuning).
+- Effective FFN branches are pruned by feasibility guards in high-acc/high-head cases:
+  - `parallel_heads>=6 && proj_acc_depth>=6` -> prune to 1 branch.
+  - `parallel_heads>=4 && proj_acc_depth>=8` -> prune to 1 branch.
+- Updated <=4-head O-proj accumulator memtile mapping to reduce depth-8 BD pressure:
+  - `acc_mem_tile_order=[4,5,7,3]`.
