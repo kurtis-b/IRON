@@ -43,6 +43,8 @@ MHA + AddNorm1 + FFN + AddNorm2.
 - `3`: FFN up-proj isolation (`ffn_stage_only=0`), deterministic MHA feed.
 - `4`: FFN down-proj isolation (`ffn_stage_only=1`), deterministic MHA feed.
 - `5`: FFN AddNorm2 isolation (`ffn_stage_only=2`), deterministic MHA feed.
+- `6`: MHA-focused profiling path (FFN up/down disabled, AddNorm1 bypass input, AddNorm2 bypass residual).
+- `7`: AddNorm1-focused profiling path (FFN up/down disabled, AddNorm2 bypass residual).
 
 Internally, `op.py` resolves `debug` into:
 - MHA kernel debug value (`mha_debug`)
@@ -113,3 +115,64 @@ compile time when placement/channel limits are hit:
 6. Standard compute tile budget check (`<= 32` total compute tiles) is also enforced.
 
 The effective branch count is logged by `design.py` at compile time.
+
+## Stage Bottleneck Profiling
+
+`test.py` now includes an opt-in stage profiling path that mirrors `ffn_addnorm`-style
+`stage_only` profiling for encoder pipeline stages (MHA/AddNorm1/FFN/AddNorm2 focused modes).
+
+- Enable profiling with `ENCODER_PIPELINE_STAGE_PROFILE=1`.
+- Profiled modes are controlled by `ENCODER_PIPELINE_STAGE_PROFILE_MODES`
+  (comma-separated from `none,0,1,2,3,4`).
+  - `none`: full encoder pipeline (`debug=-1`)
+  - `0`: FFN up-proj-focused run (`debug=3`)
+  - `1`: FFN down-proj-focused run (`debug=4`)
+  - `2`: AddNorm2-focused run (`debug=5`)
+  - `3` / `mha`: MHA-focused run (`debug=6`)
+  - `4` / `an1`: AddNorm1-focused run (`debug=7`)
+- Workload is set by `ENCODER_PIPELINE_STAGE_PROFILE_CASE`:
+  - format: `seq_len,d,heads,intermediate_size,q_seq_tile,kv_seq_tile,emb_tile,parallel_heads,parallel_ffn,proj_acc_depth`
+- Profiling iteration controls:
+  - `ENCODER_PIPELINE_STAGE_PROFILE_WARMUP_ITERS`
+  - `ENCODER_PIPELINE_STAGE_PROFILE_TIMED_ITERS`
+
+Example:
+
+```bash
+pytest operators/encoder_pipeline/test.py -s --iterations 1 -k stage_profile \
+  -o log_cli=true
+```
+
+with:
+
+```bash
+export ENCODER_PIPELINE_STAGE_PROFILE=1
+export ENCODER_PIPELINE_STAGE_PROFILE_CASE="512,64,12,3072,32,64,128,6,3,6"
+export ENCODER_PIPELINE_STAGE_PROFILE_MODES="none,mha,an1,0,1,2"
+export ENCODER_PIPELINE_STAGE_PROFILE_WARMUP_ITERS=5
+export ENCODER_PIPELINE_STAGE_PROFILE_TIMED_ITERS=50
+```
+
+Notes:
+- Full mode (`none`) keeps the normal numeric threshold check.
+- Stage-only modes print latency/bandwidth and intentionally skip numeric assertions.
+- This is intended for bottleneck analysis, not functional correctness gating.
+
+## Experimental Tail-IO Toggle
+
+`design.py` supports an opt-in runtime-ordering experiment:
+- `ENCODER_SERIALIZE_TAIL_IO`:
+  - default unset -> strict serialized tail IO (current stable behavior)
+  - set to `0|false|off|no` -> disable strict tail serialization (profiling experiment only)
+- `ENCODER_TAIL_WAIT_MODE` (applies when `ENCODER_SERIALIZE_TAIL_IO` is enabled):
+  - `strict` (default)
+  - `relax_ffn_weights`
+  - `relax_ffn_weights_residual`
+  - `relax_all_tail` (known liveness risk)
+- `ENCODER_SERIALIZE_Q_PRESTAGE`:
+  - default unset -> keep dedicated Q pre-stage task-group barrier
+  - set to `0|false|off|no` -> schedule Q fill into the main task-group while keeping
+    the rest of tail ordering strict (profiling experiment only)
+
+This override is for A/B performance experiments; strict ordering remains the default because
+full-pipeline liveness/correctness is sensitive to tail DMA order.

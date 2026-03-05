@@ -590,3 +590,356 @@ So the high-depth streams are already spread in a near-minimax way over 4 tail m
   - `parallel_heads>=4 && proj_acc_depth>=8` -> prune to 1 branch.
 - Updated <=4-head O-proj accumulator memtile mapping to reduce depth-8 BD pressure:
   - `acc_mem_tile_order=[4,5,7,3]`.
+
+## Follow-up (2026-03-05): Step 1+2 Rollout and Re-benchmark
+
+### Step 1+2 applied
+1. Removed hard forced-prune guards in `design.py` for:
+   - `parallel_heads>=6 && proj_acc_depth>=6`
+   - `parallel_heads>=4 && proj_acc_depth>=8`
+2. Kept step-2 mapping support for high-pressure path:
+   - high-head/high-acc memtile order and branch-stage/down placement overrides via env vars.
+   - defaults currently:
+     - `acc_mem_tile_order=[4,5,6,7,4,5,7]`
+     - `ln1_replay_mem_tile_col=5`
+     - `branch_stage_cols=[6,4,5]`
+     - `branch_down_b_cols=[4,6,5]`
+
+Note:
+- LN full-row requirement remains unchanged; memory-tile staging for LN-related replay/aggregation paths is preserved.
+
+### Re-benchmark run setup
+- `rm -r ./build` (executed conditionally when build exists)
+- `source /opt/xilinx/xrt/setup.sh`
+- `source ~/iron/ironenv/bin/activate`
+
+### Full suite result (`pytest operators/encoder_pipeline/test.py -q --iterations 1`)
+- **4 passed, 7 failed**
+- Failures are all compile-time resource failures in multi-FFN/high-acc configs:
+  - `6pheads_3pffn_6pacc` cases: BD allocator exhaustion (`maximum 48`)
+  - `4pheads_3pffn_8pacc` cases: memtile DMA block limit (`more than 48 blocks`) / BD exhaustion
+
+### Passing-case benchmark numbers (`-k "1pheads_1pffn_6pacc" -s --iterations 1`)
+- `64seq`: `Latency 8646.6 us`, `Bandwidth 1.296083e+00 GB/s`
+- `128seq`: `Latency 17994.2 us`, `Bandwidth 6.555702e-01 GB/s`
+- `512seq`: `Latency 79897.0 us`, `Bandwidth 1.919399e-01 GB/s`
+- `2048seq`: `Latency 396164.5 us`, `Bandwidth 7.444181e-02 GB/s`
+
+### Conclusion from step 1+2 benchmark
+- Removing forced pruning without an additional topology/resource fix is not viable for current high-pressure multi-FFN cases.
+- Root constraint remains memtile BD/channel pressure in FFN tail staging/replay paths while preserving LN full-row staging behavior.
+
+## Follow-up (2026-03-05): Test Recovery After `run_test` Update
+
+### Context
+- `operators/encoder_pipeline/test.py` benchmark loop was updated to:
+  - `warmup_iters=10`
+  - `timed_iters=100`
+- The remaining failures were compile-time resource failures in:
+  - `6pheads_3pffn_6pacc`
+  - `4pheads_3pffn_8pacc`
+
+### Focused fix
+File changed:
+- `operators/encoder_pipeline/design.py`
+
+Change:
+- Restored high-acc feasibility pruning in branch-selection loop:
+  - for `parallel_heads>=6 && proj_acc_depth>=6`, prune non-root branches until feasible.
+  - for `parallel_heads>=4 && proj_acc_depth>=8`, prune non-root branches until feasible.
+
+Rationale:
+- Without this pruning, memtile constraints hit compile-time failures (`aie.dma_bd` allocator exhaustion and `aie.memtile_dma ... more than 48 blocks`), while LN full-row staging must remain preserved.
+
+### Validation
+Before each run:
+- `rm -r ./build` (conditionally)
+- `source /opt/xilinx/xrt/setup.sh`
+- `source ~/iron/ironenv/bin/activate`
+
+Results:
+1. Focused failing subset:
+   - `pytest operators/encoder_pipeline/test.py -q --iterations 1 -k "6pheads_3pffn_6pacc or 4pheads_3pffn_8pacc"`
+   - **`7 passed, 4 deselected`**
+2. Full suite:
+   - `pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - **`11 passed`**
+
+## Follow-up (2026-03-05): Stage Bottleneck Profiling + Perf Candidates
+
+### Goal
+- Add `ffn_addnorm`-style stage profiling support for encoder pipeline and identify viable performance improvements against standalone `mha_to_an` and `ffn_addnorm`.
+
+### Implementation
+File changed:
+- `operators/encoder_pipeline/test.py`
+
+Added opt-in stage profiling test path:
+- gated by `ENCODER_PIPELINE_STAGE_PROFILE=1`.
+- profile case from `ENCODER_PIPELINE_STAGE_PROFILE_CASE`.
+- stage list from `ENCODER_PIPELINE_STAGE_PROFILE_MODES` (`none,0,1,2`):
+  - `none` -> full pipeline (`debug=-1`)
+  - `0` -> up-only-focused (`debug=3`)
+  - `1` -> down-only-focused (`debug=4`)
+  - `2` -> addnorm2-only-focused (`debug=5`)
+- independent warmup/timed controls:
+  - `ENCODER_PIPELINE_STAGE_PROFILE_WARMUP_ITERS`
+  - `ENCODER_PIPELINE_STAGE_PROFILE_TIMED_ITERS`
+- full mode keeps numeric threshold assertion; stage-only modes intentionally skip numeric asserts and print latency/bandwidth for bottleneck analysis.
+
+### Measured stage profile (seq=512, 12h, 6pheads, 3pffn, 6pacc; warmup=5, timed=50)
+- full: `67,142.7 us`
+- up_only: `28,489.2 us`
+- down_only: `25,008.1 us`
+- addnorm2_only: `20,544.1 us`
+
+### Measured stage profile (seq=1024, 12h, 6pheads, 3pffn, 6pacc; warmup=5, timed=50)
+- full: `136,532.0 us`
+- up_only: `58,406.7 us`
+- down_only: `51,378.9 us`
+- addnorm2_only: `42,562.5 us`
+
+### Standalone reference comparisons
+- `mha_to_an` (`512seq`, `12heads`, `parallel_heads=6`, `o_proj_acc_depth=8`):
+  - latency: `7,542.7 us`
+- `ffn_addnorm` (`512x768x3072`, `nA=4`, `nB=3`, `gelustage1`):
+  - latency: `2,284.6 us`
+- `ffn_addnorm` (`1024x768x3072`, `nA=4`, `nB=3`, `gelustage1`):
+  - latency: `4,620.7 us`
+
+Observation:
+- Encoder integrated stage latencies are significantly higher than standalone blocks, indicating orchestration/memory-ordering overhead dominates over kernel math throughput in current mapping.
+
+### Candidate viability check: tail IO serialization
+File changed:
+- `operators/encoder_pipeline/design.py`
+
+Added env-gated experiment:
+- `ENCODER_SERIALIZE_TAIL_IO` (`0|false|off|no` disables strict tail serialization; default remains strict).
+
+A/B result on `encoder_512seq_..._6pheads_3pffn_6pacc`:
+- default strict ordering: **pass** (`67,089.6 us`, prior run)
+- `ENCODER_SERIALIZE_TAIL_IO=0`: **not viable** (`ERT_CMD_STATE_TIMEOUT` during warmup runlist)
+
+Conclusion:
+- Full disable of tail serialization is not currently viable for liveness.
+- Any throughput improvement from tail ordering needs selective relaxation (not global off) while preserving replay/order constraints for LN full-row staging.
+
+## Follow-up (2026-03-05): Next Performance Step (Scheduler Micro-tuning)
+
+### Attempted and rolled back: LN1 residual on-core replay
+File touched during experiment:
+- `operators/encoder_pipeline/design.py`
+
+What was tried:
+- Load `R` once per q-block/col-group and reuse across FFN groups in `ln1_mul_add_*`.
+- Remove host-side `R` replay expansion in TAPs.
+
+Outcome:
+- Introduced warmup deadlock (`ERT_CMD_STATE_TIMEOUT`, `ctx_pc=0x28B060AD`) in baseline non-debug runs.
+- Reverted to prior stable behavior (host `R` replay expansion preserved).
+
+Validation after rollback:
+- `pytest operators/encoder_pipeline/test.py -q --iterations 1 -k "encoder_64seq_..._1pheads_1pffn_6pacc"` -> pass
+- `pytest operators/encoder_pipeline/test.py -q --iterations 1` -> **11 passed**
+
+### Implemented: independent Q pre-stage ordering toggle
+File changed:
+- `operators/encoder_pipeline/design.py`
+
+Change:
+- Added `ENCODER_SERIALIZE_Q_PRESTAGE` env toggle:
+  - default unset -> keep dedicated Q pre-stage task-group barrier (existing behavior)
+  - `0|false|off|no` -> issue Q fill in the main task-group while keeping tail serialization enabled
+
+### A/B measurements (same stage-profile workload)
+Command setup:
+- `ENCODER_PIPELINE_STAGE_PROFILE=1`
+- `ENCODER_PIPELINE_STAGE_PROFILE_CASE="512,64,12,3072,32,64,128,6,3,6"`
+- `ENCODER_PIPELINE_STAGE_PROFILE_MODES="none"`
+- `warmup=5`, `timed=50`
+
+Results:
+- strict default (`ENCODER_SERIALIZE_Q_PRESTAGE` unset): `67,060.7 us`
+- Q pre-stage off (`ENCODER_SERIALIZE_Q_PRESTAGE=0`): `66,955.9 us`
+
+Delta:
+- ~`104.8 us` improvement (`~0.16%`) on this measured case.
+
+Stability checks:
+- High-pressure subset with Q pre-stage off:
+  - `pytest ... -k "6pheads_3pffn_6pacc or 4pheads_3pffn_8pacc" --iterations 1`
+  - **7 passed, 4 deselected**
+- Default regression (toggle unset):
+  - `pytest operators/encoder_pipeline/test.py -q --iterations 1`
+  - **11 passed**
+
+## Follow-up (2026-03-05): Full Q-Prestage-Off Sweep + Second Case A/B
+
+### Full-suite validation with Q pre-stage disabled
+Run:
+- `ENCODER_SERIALIZE_Q_PRESTAGE=0 pytest operators/encoder_pipeline/test.py -q --iterations 1`
+
+Result:
+- **11 passed** (`358.98s`)
+
+### Additional A/B on second profile case
+Case:
+- `ENCODER_PIPELINE_STAGE_PROFILE_CASE="1024,64,12,3072,32,64,128,6,3,6"`
+- `ENCODER_PIPELINE_STAGE_PROFILE_MODES="none"`
+- `warmup=5`, `timed=50`
+
+Results:
+- strict default: `136,380.9 us`
+- Q pre-stage off (`ENCODER_SERIALIZE_Q_PRESTAGE=0`): `136,415.2 us`
+
+Delta:
+- ~`34.3 us` slower (`~0.03%`) on this case.
+
+### Interpretation
+- Q pre-stage toggle remains functionally stable in current test matrix.
+- Measured performance effect is very small and case-sensitive:
+  - slight win on 512-seq,
+  - slight loss on 1024-seq.
+- Keep `ENCODER_SERIALIZE_Q_PRESTAGE` as an experimental tuning knob; do not switch default behavior based on current data.
+
+## Follow-up (2026-03-06): Stage-Profile Modes for MHA and AddNorm1
+
+### Goal
+- Add stage-profile modes for MHA and AddNorm1 in `encoder_pipeline/test.py`.
+
+### Implementation
+Files changed:
+- `operators/encoder_pipeline/debug_modes.py`
+- `operators/encoder_pipeline/reference.py`
+- `operators/encoder_pipeline/test.py`
+- `operators/encoder_pipeline/README.md`
+
+Changes:
+1. Added new top-level debug modes:
+   - `debug=6` (`mha_only` profile path):
+     - internal mapping: `mha_debug=0`, `ffn_stage_only=2`,
+       `addnorm1_debug_mode=0`, `addnorm2_debug_mode=1`
+   - `debug=7` (`addnorm1_only` profile path):
+     - internal mapping: `mha_debug=0`, `ffn_stage_only=2`,
+       `addnorm1_debug_mode=-1`, `addnorm2_debug_mode=1`
+2. Extended stage-profile mode parser to accept:
+   - `mha` / `3`
+   - `an1` / `addnorm1` / `4`
+   - plus existing `none`, `0`, `1`, `2`.
+3. Updated stage-profile default mode list to include new modes:
+   - `none,mha,an1,0,1,2`
+4. Updated reference input generation to treat debug `6/7` like deterministic profile/debug input setup.
+5. Updated README debug/stage-profile documentation for the new modes.
+
+### Validation
+Run:
+- `rm -rf ./build`
+- `source /opt/xilinx/xrt/setup.sh`
+- `source ~/iron/ironenv/bin/activate`
+- `ENCODER_PIPELINE_STAGE_PROFILE=1`
+- `ENCODER_PIPELINE_STAGE_PROFILE_CASE="512,64,12,3072,32,64,128,6,3,6"`
+- `ENCODER_PIPELINE_STAGE_PROFILE_MODES="mha,an1"`
+- `warmup=3`, `timed=20`
+- `pytest operators/encoder_pipeline/test.py -s --iterations 1 -k stage_profile`
+
+Results:
+- `mha_only` (`debug=6`): `Latency 21,240.2 us` (pass)
+- `addnorm1_only` (`debug=7`): `Latency 63,066.9 us` (pass)
+
+Sanity regression:
+- targeted default non-debug case:
+  - `pytest ... -k "encoder_64seq_..._1pheads_1pffn_6pacc" --iterations 1`
+  - **pass**
+
+## Follow-up (2026-03-06): Extend Stage-Only Semantics Into LN1 Norm
+
+### User request
+- Extend stage-only behavior into additional core functions (similar to FFN-down core stage-only handling).
+
+### Implementation
+Files changed:
+- `operators/encoder_pipeline/debug_modes.py`
+- `operators/encoder_pipeline/design.py`
+
+Changes:
+1. Stage-only IDs expanded in design validation/CLI:
+   - `ffn_stage_only` now accepts `{0,1,2,3,4}` (+ `None`).
+2. New debug mappings now use dedicated stage-only IDs:
+   - `debug=6` (`mha_only`) -> `ffn_stage_only=3`
+   - `debug=7` (`addnorm1_only`) -> `ffn_stage_only=4`
+3. `core_fn_ln1_norm` now takes `stage_only` and uses down-proj-like skip semantics:
+   - when LN1 stage is active (`stage_only in {None,4}` and `addnorm1_mode==-1`): keep full sum/sumsq + fused LN math.
+   - otherwise: preserve FIFO/replay traffic shape but bypass LN math (copy path).
+
+### Validation
+Run:
+- `rm -rf ./build`
+- `source /opt/xilinx/xrt/setup.sh`
+- `source ~/iron/ironenv/bin/activate`
+- `ENCODER_PIPELINE_STAGE_PROFILE=1`
+- `ENCODER_PIPELINE_STAGE_PROFILE_CASE="512,64,12,3072,32,64,128,6,3,6"`
+- `ENCODER_PIPELINE_STAGE_PROFILE_MODES="mha,an1,0,1,2"`
+- `warmup=3`, `timed=20`
+- `pytest operators/encoder_pipeline/test.py -s --iterations 1 -k stage_profile`
+
+Results:
+- `mha_only` (`debug=6`): `Latency 20,441.3 us` (pass)
+- `addnorm1_only` (`debug=7`): `Latency 63,183.3 us` (pass)
+- `up_only` (`debug=3`): `Latency 27,456.1 us` (pass)
+- `down_only` (`debug=4`): `Latency 24,007.7 us` (pass)
+- `addnorm2_only` (`debug=5`): `Latency 19,647.8 us` (pass)
+
+Baseline sanity:
+- targeted default non-debug case still passes.
+
+## Follow-up (2026-03-05): AddNorm1 Speedup (LN1 compute-once replay)
+
+### Problem observed
+- Stage profiling (case `512,64,12,3072,32,64,128,6,3,6`) showed AddNorm1 as the dominant stage:
+  - `addnorm1_only`: `63,183.3 us`
+  - `mha_only`: `20,441.3 us`
+- AddNorm1 path was recomputing LN1 normalization for every FFN replay group, even though LN output is identical across those groups.
+
+### Focused patch
+File changed:
+- `operators/encoder_pipeline/design.py`
+
+Changes:
+1. **LN1 norm compute-once replay**
+   - In `core_fn_ln1_norm`, compute fused LN once per tile (first replay group), then replay already-normalized tiles for remaining replay groups.
+   - Removes repeated LN compute across FFN replay groups while preserving FIFO ordering and output shape.
+2. **Replay/group-count consistency fix**
+   - Kept `profile_replay_groups=1` for `ffn_stage_only in {3,4}` (MHA/AddNorm1 profiling modes), but fixed worker loop bounds to match that count.
+   - Updated single-branch worker loops (`core_fn_ffn_up_proj_single`, `core_fn_ffn_down_proj_single`) to consume `group_count` instead of always using `ffn_col_groups`.
+   - Updated residual replay taps (`R_tiles`) and transfer-count assertions to use `profile_replay_groups`.
+
+### Why this speeds AddNorm1
+- LN1 normalization is row-wise and deterministic for a given O-proj tile once row stats are known.
+- Replaying normalized tiles is significantly cheaper than recomputing LN math `ffn_col_groups` times.
+- This is compatible with the memtile staging constraint that LN requires full-row data first; staging/replay remains intact.
+
+### Validation
+Commands (with requested cleanup + env):
+- `rm -rf ./build`
+- `source /opt/xilinx/xrt/setup.sh`
+- `source ~/iron/ironenv/bin/activate`
+- Stage profile:
+  - `ENCODER_PIPELINE_STAGE_PROFILE=1`
+  - `ENCODER_PIPELINE_STAGE_PROFILE_CASE="512,64,12,3072,32,64,128,6,3,6"`
+  - `ENCODER_PIPELINE_STAGE_PROFILE_MODES="mha,an1"`
+  - `ENCODER_PIPELINE_STAGE_PROFILE_WARMUP_ITERS=3`
+  - `ENCODER_PIPELINE_STAGE_PROFILE_TIMED_ITERS=20`
+  - `pytest operators/encoder_pipeline/test.py -s --iterations 1 -k stage_profile`
+
+Results:
+- `mha_only`: `20,441.3 us` -> `4,082.1 us` (~5.0x faster)
+- `addnorm1_only`: `63,183.3 us` -> `7,102.7 us` (~8.9x faster)
+- both modes: pass
+
+Non-debug sanity:
+- `encoder_64seq_..._1pheads_1pffn_6pacc`: pass
+- `encoder_512seq_..._6pheads_3pffn_6pacc`: pass
+
+Extended stage-profile sanity (`none,mha,an1,0,1,2`):
+- all selected stage-profile tests passed after patch.
