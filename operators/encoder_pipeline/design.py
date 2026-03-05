@@ -4,6 +4,7 @@
 import sys
 import math
 import argparse
+import os
 from pathlib import Path
 import logging
 
@@ -50,7 +51,7 @@ microkernel_mac_dim_map = {
     },
 }
 
-FFN_STAGE_ONLY_CHOICES = (-1, 0, 1, 2)
+FFN_STAGE_ONLY_CHOICES = (-1, 0, 1, 2, 3, 4)
 ADDNORM_DEBUG_CHOICES = (-1, 0, 1)
 
 
@@ -83,7 +84,8 @@ def main():
         default=-1,
         help=(
             "FFN stage isolation: 0=up-proj only, 1=down-proj only, "
-            "2=AddNorm2 only, -1=all FFN stages"
+            "2=AddNorm2 only, 3=MHA-focused (downstream skipped), "
+            "4=AddNorm1-focused (downstream skipped), -1=all stages"
         ),
     )
     argparser.add_argument(
@@ -162,6 +164,24 @@ def fused_mha(
     addnorm1_debug_mode: int = -1,
     addnorm2_debug_mode: int = -1,
 ):
+    def _override_int_list_env(name: str, default: list[int]) -> list[int]:
+        raw = os.getenv(name)
+        if raw is None or raw.strip() == "":
+            return default
+        values = [int(v.strip()) for v in raw.split(",") if v.strip() != ""]
+        if len(values) != len(default):
+            raise ValueError(
+                f"{name} must have {len(default)} comma-separated ints "
+                f"(got {len(values)} from '{raw}')"
+            )
+        return values
+
+    def _override_int_env(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None or raw.strip() == "":
+            return default
+        return int(raw.strip())
+
     embed_sz = heads * d
     if ffn_intermediate_size is None:
         ffn_intermediate_size = 4 * embed_sz
@@ -201,7 +221,7 @@ def fused_mha(
     valid_ffn_stage_only = (None, *FFN_STAGE_ONLY_CHOICES[1:])
     if ffn_stage_only not in valid_ffn_stage_only:
         raise ValueError(
-            f"ffn_stage_only must be one of {{None, 0, 1, 2}} (got {ffn_stage_only})"
+            f"ffn_stage_only must be one of {{None, 0, 1, 2, 3, 4}} (got {ffn_stage_only})"
         )
     if addnorm1_debug_mode not in ADDNORM_DEBUG_CHOICES:
         raise ValueError(
@@ -214,6 +234,10 @@ def fused_mha(
             f"(got {addnorm2_debug_mode})"
         )
     ffn_col_groups = ffn_intermediate_size // emb_tile
+    # In MHA/AddNorm1 focused profiling modes, downstream FFN/AddNorm2 are
+    # intentionally de-emphasized. Keep only one replay group to reduce
+    # non-target traffic while preserving stage-to-stage liveness.
+    profile_replay_groups = 1 if ffn_stage_only in (3, 4) else ffn_col_groups
     if nB_tiles_distributed > ffn_col_groups:
         raise ValueError(
             "nB_tiles_distributed must be <= ffn_col_groups "
@@ -350,7 +374,9 @@ def fused_mha(
                 "memtile BD/channel budget exceeded for high-acc tail staging"
             )
             continue
-
+        if ffn_stage_only in (3, 4) and len(selected_branch_indices) > 1:
+            drop_non_root_branch("downstream-profile mode uses a single FFN branch")
+            continue
         ln1_post_candidates = [
             tile for tile in free_ffn_tiles if tile not in used_tiles_base
         ]
@@ -395,8 +421,8 @@ def fused_mha(
             f"(selected={selected_branch_indices}, root_idx={down_root_idx})"
         )
 
-    ffn_group_base = ffn_col_groups // effective_ffn_branches
-    ffn_group_rem = ffn_col_groups % effective_ffn_branches
+    ffn_group_base = profile_replay_groups // effective_ffn_branches
+    ffn_group_rem = profile_replay_groups % effective_ffn_branches
     ffn_col_group_counts = [
         ffn_group_base + (1 if i < ffn_group_rem else 0)
         for i in range(effective_ffn_branches)
@@ -455,7 +481,7 @@ def fused_mha(
     )
     logging.info(
         "FFN distribution: groups=%d counts=%s offsets=%s",
-        ffn_col_groups,
+        profile_replay_groups,
         ffn_col_group_counts,
         ffn_col_group_offsets,
     )
@@ -810,6 +836,14 @@ def fused_mha(
         # Keep col5 in the <=4-head map and avoid concentrating depth-8
         # O-proj accumulators on col6 where FFN tail staging is anchored.
         acc_mem_tile_order = [4, 5, 7, 3]
+    elif proj_acc_depth >= 6:
+        # Keep high-head accumulator streams on 4/5/6/7. Col3 already carries
+        # high fanout from W_O staging and can hit output-channel limits.
+        acc_mem_tile_order = [4, 5, 6, 7, 4, 5, 7]
+        acc_mem_tile_order = _override_int_list_env(
+            "ENCODER_ACC_MEM_TILE_ORDER_PH_GE6_ACC_GE6",
+            acc_mem_tile_order,
+        )
     else:
         # For wider MHA parallelism, spread across available memtiles.
         acc_mem_tile_order = [4, 5, 6, 7, 4, 5, 7]
@@ -860,6 +894,10 @@ def fused_mha(
     )
     # LN1 norm replays the per-col O-proj tiles for FFN-group fanout.
     ln1_replay_mem_tile_col = 5
+    ln1_replay_mem_tile_col = _override_int_env(
+        "ENCODER_LN1_REPLAY_MEM_TILE_COL",
+        ln1_replay_mem_tile_col,
+    )
     ln1ReplayPart = ObjectFifo(o_ty, name="ln1ReplayPart", depth=1)
     ln1Replay = ln1ReplayPart.cons(depth=ln_tiles_per_q_block).forward(
         obj_type=o_ty,
@@ -897,7 +935,18 @@ def fused_mha(
     o_dims = [(seq_tile // r, r * emb_tile), (r, s), (emb_tile // s, r * s), (s, 1)]
     # Keep FFN branch staging streams off LN replay (col 5) when MHA uses many
     # heads; col 5 already carries LN1 full-row replay traffic.
-    if parallel_heads >= 6:
+    if parallel_heads >= 6 and proj_acc_depth >= 6:
+        branch_stage_cols = [6, 4, 5]
+        branch_down_b_cols = [4, 6, 5]
+        branch_stage_cols = _override_int_list_env(
+            "ENCODER_BRANCH_STAGE_COLS_PH_GE6_ACC_GE6",
+            branch_stage_cols,
+        )
+        branch_down_b_cols = _override_int_list_env(
+            "ENCODER_BRANCH_DOWN_B_COLS_PH_GE6_ACC_GE6",
+            branch_down_b_cols,
+        )
+    elif parallel_heads >= 6:
         branch_stage_cols = [6, 4, 5]
         branch_down_b_cols = [4, 6, 5]
     else:
@@ -1338,53 +1387,35 @@ def fused_mha(
         sum_buf,
         sumsq_buf,
         of_out_norm,
-        replay_scratch,
         norm_scratch,
         fused_layer_norm,
         calc_sum_sumsq,
         zero_f32,
         copy,
         addnorm1_mode,
+        stage_only,
     ):
+        # Mirror down-proj style stage-only semantics: if this stage is not active,
+        # keep FIFO traffic/replay shape but bypass heavy LN statistics/math.
+        ln1_norm_compute_enabled = (stage_only in [None, 4]) and (addnorm1_mode == -1)
         for _ in range_(sys.maxsize):
-            zero_f32(sum_buf, seq_tile)
-            zero_f32(sumsq_buf, seq_tile)
+            if ln1_norm_compute_enabled:
+                zero_f32(sum_buf, seq_tile)
+                zero_f32(sumsq_buf, seq_tile)
             # Pass 1 on raw O-proj output: accumulate row-wise statistics and seed replay FIFO.
             for _ in range_(ln_tiles_per_q_block):
                 elem_in = of_in_o_proj.acquire(1)
-                calc_sum_sumsq(elem_in, sum_buf, sumsq_buf)
+                if ln1_norm_compute_enabled:
+                    calc_sum_sumsq(elem_in, sum_buf, sumsq_buf)
                 elem_replay = of_replay_new.acquire(1)
                 copy(elem_in, elem_replay, seq_tile * emb_tile)
                 of_replay_new.release(1)
                 of_in_o_proj.release(1)
-            # Pass 2: replay from FIFO in FFN-group-major order and emit one tile per replay.
-            for _ in range_(ffn_col_groups - 1):
-                for _ in range_(ln_tiles_per_q_block):
-                    elem_in = of_replay_curr.acquire(1)
-                    copy(elem_in, replay_scratch, seq_tile * emb_tile)
-                    if addnorm1_mode == 0:
-                        # AddNorm1 debug input mode should expose pre-norm O-proj input.
-                        copy(replay_scratch, norm_scratch, seq_tile * emb_tile)
-                    else:
-                        fused_layer_norm(
-                            replay_scratch,
-                            sum_buf,
-                            sumsq_buf,
-                            norm_scratch,
-                            embed_sz,
-                        )
-                    elem_out_norm = of_out_norm.acquire(1)
-                    copy(norm_scratch, elem_out_norm, seq_tile * emb_tile)
-                    of_out_norm.release(1)
-                    of_replay_curr.release(1)
-                    elem_replay = of_replay_new.acquire(1)
-                    copy(replay_scratch, elem_replay, seq_tile * emb_tile)
-                    of_replay_new.release(1)
+            # Pass 2: emit normalized tiles in FFN-group-major order.
+            # Compute LN once per tile, then replay normalized tiles for later groups.
             for _ in range_(ln_tiles_per_q_block):
                 elem_in = of_replay_curr.acquire(1)
-                if addnorm1_mode == 0:
-                    copy(elem_in, norm_scratch, seq_tile * emb_tile)
-                else:
+                if ln1_norm_compute_enabled:
                     fused_layer_norm(
                         elem_in,
                         sum_buf,
@@ -1392,10 +1423,34 @@ def fused_mha(
                         norm_scratch,
                         embed_sz,
                     )
+                else:
+                    copy(elem_in, norm_scratch, seq_tile * emb_tile)
                 elem_out_norm = of_out_norm.acquire(1)
                 copy(norm_scratch, elem_out_norm, seq_tile * emb_tile)
                 of_out_norm.release(1)
+                if profile_replay_groups > 1:
+                    elem_replay = of_replay_new.acquire(1)
+                    copy(norm_scratch, elem_replay, seq_tile * emb_tile)
+                    of_replay_new.release(1)
                 of_replay_curr.release(1)
+            if profile_replay_groups > 2:
+                for _ in range_(profile_replay_groups - 2):
+                    for _ in range_(ln_tiles_per_q_block):
+                        elem_in = of_replay_curr.acquire(1)
+                        elem_out_norm = of_out_norm.acquire(1)
+                        copy(elem_in, elem_out_norm, seq_tile * emb_tile)
+                        of_out_norm.release(1)
+                        elem_replay = of_replay_new.acquire(1)
+                        copy(elem_in, elem_replay, seq_tile * emb_tile)
+                        of_replay_new.release(1)
+                        of_replay_curr.release(1)
+            if profile_replay_groups > 1:
+                for _ in range_(ln_tiles_per_q_block):
+                    elem_in = of_replay_curr.acquire(1)
+                    elem_out_norm = of_out_norm.acquire(1)
+                    copy(elem_in, elem_out_norm, seq_tile * emb_tile)
+                    of_out_norm.release(1)
+                    of_replay_curr.release(1)
 
     def core_fn_ln1_mul_add_single(
         of_in_norm,
@@ -1433,7 +1488,7 @@ def fused_mha(
                 of_out_up.release(1)
                 of_in_norm.release(1)
                 of_in_residual.release(1)
-            for _ in range_(ffn_col_groups - 1):
+            for _ in range_(profile_replay_groups - 1):
                 for col_idx in range_(ln_tiles_per_q_block):
                     col_i32 = index.casts(T.i32(), col_idx)
                     elem_in1 = of_in_norm.acquire(1)
@@ -1531,10 +1586,11 @@ def fused_mha(
         matmul,
         gelu,
         copy,
+        group_count,
         stage_only,
     ):
         for _ in range_(sys.maxsize):
-            for group_idx in range_(ffn_col_groups):
+            for group_idx in range_(group_count):
                 elem_out_matmul = of_out_c.acquire(1)
                 # Keep stage-only paths deterministic: when FFN-up is disabled,
                 # still emit a zero tile so downstream consumers do not read stale data.
@@ -1596,6 +1652,7 @@ def fused_mha(
         zero,
         matmul,
         copy,
+        group_count,
         stage_only,
     ):
         for _ in range_(sys.maxsize):
@@ -1608,7 +1665,7 @@ def fused_mha(
                     elem_acc = of_new_acc.acquire(1)
                     zero(elem_acc)
                     of_new_acc.release(1)
-                for _ in range_(ffn_col_groups):
+                for _ in range_(group_count):
                     elem_in_a = of_in_a.acquire(1)
                     for _ in range_(proj_acc_depth):
                         elem_in_b = of_in_b.acquire(1)
@@ -1640,7 +1697,7 @@ def fused_mha(
                     elem_acc = of_new_acc.acquire(1)
                     zero(elem_acc)
                     of_new_acc.release(1)
-                for _ in range_(ffn_col_groups):
+                for _ in range_(group_count):
                     elem_in_a = of_in_a.acquire(1)
                     for _ in range_(proj_acc_depth):
                         elem_in_b = of_in_b.acquire(1)
@@ -1965,7 +2022,6 @@ def fused_mha(
     )
     ln1_norm_sum_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sum_buffer")
     ln1_norm_sumsq_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sumsq_buffer")
-    ln1_replay_scratch = Buffer(type=o_ty, name="ln1_replay_scratch")
     ln1_norm_scratch = Buffer(type=o_ty, name="ln1_norm_scratch")
 
     ln1_norm_worker = Worker(
@@ -1977,13 +2033,13 @@ def fused_mha(
             ln1_norm_sum_buffer,
             ln1_norm_sumsq_buffer,
             ln1Norm.prod(),
-            ln1_replay_scratch,
             ln1_norm_scratch,
             ln_fused_layer_norm_kernel,
             ln_calc_sum_sumsq_kernel,
             ln_zero_f32_kernel,
             mem_copy_o_proj,
             addnorm1_debug_mode,
+            ffn_stage_only,
         ],
         placement=Tile(col=ln1_tile[0], row=ln1_tile[1]),
         while_true=False,
@@ -2059,6 +2115,7 @@ def fused_mha(
                 ffn_matmul_kernel_up_proj,
                 ffn_gelu_kernel,
                 mem_copy_o_proj,
+                ffn_col_group_counts[branch_idx],
                 ffn_stage_only,
             ]
         else:
@@ -2102,6 +2159,7 @@ def fused_mha(
                 ffn_zero_kernel_down_proj,
                 ffn_matmul_kernel_down_proj,
                 mem_copy_o_proj,
+                ffn_col_group_counts[branch_idx],
                 ffn_stage_only,
             ]
         else:
@@ -2259,7 +2317,7 @@ def fused_mha(
     for tile in R_tiles:
         if len(tile._sizes) < 1:
             raise ValueError(f"Unexpected R tile rank for replay: {tile._sizes}")
-        tile._sizes[0] = ffn_col_groups
+        tile._sizes[0] = profile_replay_groups
         tile._strides[0] = 0
 
     # FFN weight taps (per branch):
@@ -2472,7 +2530,7 @@ def fused_mha(
     assert_all_taps_match_count(
         R_tiles,
         (seq_tile, emb_tile),
-        ffn_col_groups * proj_acc_depth,
+        profile_replay_groups * proj_acc_depth,
         "R",
     )
     assert_all_taps_match_count(
@@ -2515,7 +2573,54 @@ def fused_mha(
         B_Down,
     ):
         # Full pipeline is sensitive to host DMA ordering of tail-stage IO.
+        # Keep strict ordering by default, with an opt-in override for profiling.
         serialize_tail_io = True
+        serialize_tail_io_env = os.getenv("ENCODER_SERIALIZE_TAIL_IO")
+        if serialize_tail_io_env is not None:
+            serialize_tail_io = serialize_tail_io_env.strip().lower() not in (
+                "0",
+                "false",
+                "off",
+                "no",
+            )
+        serialize_q_prestage = serialize_tail_io
+        serialize_q_prestage_env = os.getenv("ENCODER_SERIALIZE_Q_PRESTAGE")
+        if serialize_q_prestage_env is not None:
+            serialize_q_prestage = serialize_q_prestage_env.strip().lower() not in (
+                "0",
+                "false",
+                "off",
+                "no",
+            )
+        if not serialize_tail_io:
+            serialize_q_prestage = False
+        tail_wait_mode = os.getenv("ENCODER_TAIL_WAIT_MODE", "strict").strip().lower()
+        wait_residual_fill = serialize_tail_io
+        wait_ffn_weight_fill = serialize_tail_io
+        wait_output_drain = serialize_tail_io
+        if serialize_tail_io:
+            if tail_wait_mode in ("", "strict"):
+                pass
+            elif tail_wait_mode in ("relax_ffn_weights", "relax_weights"):
+                wait_ffn_weight_fill = False
+            elif tail_wait_mode in (
+                "relax_ffn_weights_residual",
+                "relax_weights_residual",
+                "relax_weights_r",
+            ):
+                wait_ffn_weight_fill = False
+                wait_residual_fill = False
+            elif tail_wait_mode in ("relax_all_tail", "relax_tail", "relax_all"):
+                wait_ffn_weight_fill = False
+                wait_residual_fill = False
+                wait_output_drain = False
+            else:
+                raise ValueError(
+                    "ENCODER_TAIL_WAIT_MODE must be one of "
+                    "{strict, relax_ffn_weights, relax_ffn_weights_residual, "
+                    "relax_all_tail} "
+                    f"(got '{tail_wait_mode}')"
+                )
 
         for i in range(parallel_heads):
             rt.start(matmul_workers[i])
@@ -2535,7 +2640,7 @@ def fused_mha(
             for col_group in range(num_o_col_groups):
                 # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
                 tg = rt.task_group()
-                if serialize_tail_io:
+                if serialize_q_prestage:
                     # Stage Q tiles first so head-0 compute cannot race ahead of Q load.
                     tg_q = rt.task_group()
                     rt.fill(
@@ -2637,9 +2742,8 @@ def fused_mha(
                     tap=R_tiles[q_block_idx * (num_o_col_groups) + col_group],
                     placement=Tile(col=ln_mem_tile_col, row=0),
                     task_group=tg,
-                    wait=serialize_tail_io,
+                    wait=wait_residual_fill,
                 )
-
                 for branch_idx in range(effective_ffn_branches):
                     rt.fill(
                         inBUp[branch_idx].prod(),
@@ -2647,7 +2751,7 @@ def fused_mha(
                         tap=B_Up_tiles[branch_idx][col_group],
                         placement=Tile(col=ffn_bup_mem_tile_cols[branch_idx], row=0),
                         task_group=tg,
-                        wait=serialize_tail_io,
+                        wait=wait_ffn_weight_fill,
                     )
                     rt.fill(
                         inBDown[branch_idx].prod(),
@@ -2658,7 +2762,7 @@ def fused_mha(
                             row=0,
                         ),
                         task_group=tg,
-                        wait=serialize_tail_io,
+                        wait=wait_ffn_weight_fill,
                     )
 
                 rt.drain(
@@ -2667,7 +2771,7 @@ def fused_mha(
                     tap=O_tiles[q_block_idx * (num_o_col_groups) + col_group],
                     placement=Tile(col=ln_mem_tile_col, row=0),
                     task_group=tg,
-                    wait=serialize_tail_io,
+                    wait=wait_output_drain,
                 )
                 logging.debug(
                     f"  O tap: {O_tiles[q_block_idx * (num_o_col_groups) + col_group]}"

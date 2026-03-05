@@ -11,9 +11,11 @@ import torch
 from operators.encoder_pipeline.debug_modes import (
     ADDNORM_DEBUG_INPUT,
     ADDNORM_DEBUG_RESIDUAL,
+    DEBUG_ADDNORM1_ONLY,
     DEBUG_FFN_ADDNORM_ONLY,
     DEBUG_FFN_DOWN_ONLY,
     DEBUG_FFN_UP_ONLY,
+    DEBUG_MHA_ONLY,
     DEBUG_MHA_INPUT_PATH,
     DEBUG_RESIDUAL_PATH,
     DEBUG_SELF_ATTN,
@@ -79,6 +81,8 @@ def generate_golden_reference(
         DEBUG_FFN_UP_ONLY,
         DEBUG_FFN_DOWN_ONLY,
         DEBUG_FFN_ADDNORM_ONLY,
+        DEBUG_MHA_ONLY,
+        DEBUG_ADDNORM1_ONLY,
     ):
         base = torch.eye(max(seq_len, embed_sz), max(seq_len, embed_sz), dtype=dtype)
         q2d = base[:seq_len, :embed_sz]
