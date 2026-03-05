@@ -5,6 +5,7 @@
 import sys
 import os
 import pytest
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -15,57 +16,24 @@ from operators.common.test_utils import run_test
 
 DEBUG_MODE = int(os.getenv("ENCODER_PIPELINE_DEBUG_MODE", "-1"))
 
-STAGE_PROFILE_ENABLED = os.getenv("ENCODER_PIPELINE_STAGE_PROFILE", "0") == "1"
-STAGE_PROFILE_CASE_RAW = os.getenv(
-    "ENCODER_PIPELINE_STAGE_PROFILE_CASE",
-    # seq_len,d,heads,intermediate_size,q_seq_tile,kv_seq_tile,emb_tile,parallel_heads,parallel_ffn,proj_acc_depth
-    "1024,64,12,3072,32,64,128,6,3,6",
-)
-STAGE_PROFILE_MODES_RAW = os.getenv(
-    "ENCODER_PIPELINE_STAGE_PROFILE_MODES",
-    "none,mha,an1,0,1,2",
-)
-STAGE_PROFILE_WARMUP_ITERS = int(
-    os.getenv("ENCODER_PIPELINE_STAGE_PROFILE_WARMUP_ITERS", "3")
-)
-STAGE_PROFILE_TIMED_ITERS = int(
-    os.getenv("ENCODER_PIPELINE_STAGE_PROFILE_TIMED_ITERS", "20")
-)
-
-_STAGE_PROFILE_MODE_TO_DEBUG = {
-    "full": -1,  # full pipeline
-    "up": 3,  # FFN up-proj-focused
-    "down": 4,  # FFN down-proj-focused
-    "an2": 5,  # FFN AddNorm2-focused
-    "mha": 6,  # MHA-focused (FFN up/down disabled, AddNorm bypassed)
-    "an1": 7,  # AddNorm1-focused (FFN up/down disabled, AddNorm2 bypassed)
-}
-
-_STAGE_PROFILE_MODE_ALIASES = {
-    "full": ("none", "full"),
-    "up": ("0", "up", "up_only", "ffn_up"),
-    "down": ("1", "down", "down_only", "ffn_down"),
-    "an2": ("2", "an2", "addnorm2", "addnorm2_only", "ln2"),
-    "mha": ("3", "mha", "mha_only"),
-    "an1": ("4", "an1", "addnorm1", "addnorm1_only", "ln1"),
-}
-_STAGE_PROFILE_MODE_BY_ALIAS = {
-    alias: mode
-    for mode, aliases in _STAGE_PROFILE_MODE_ALIASES.items()
-    for alias in aliases
-}
-_STAGE_PROFILE_MODE_LABELS = {
-    "full": "full",
-    "up": "up_only",
-    "down": "down_only",
-    "an2": "addnorm2_only",
-    "mha": "mha_only",
-    "an1": "addnorm1_only",
-}
-
 ERROR_THRESHOLD = 0.005
 REL_TOL = 4.0e-2
 ABS_TOL = 1.5e-1
+
+_STAGE_PROFILE_MODE_SPECS = {
+    # mode: (debug_mode, report_label, aliases...)
+    "full": (-1, "full", ("none", "full")),
+    "up": (3, "up_only", ("0", "up", "up_only", "ffn_up")),
+    "down": (4, "down_only", ("1", "down", "down_only", "ffn_down")),
+    "an2": (5, "addnorm2_only", ("2", "an2", "addnorm2", "addnorm2_only", "ln2")),
+    "mha": (6, "mha_only", ("3", "mha", "mha_only")),
+    "an1": (7, "addnorm1_only", ("4", "an1", "addnorm1", "addnorm1_only", "ln1")),
+}
+_STAGE_PROFILE_MODE_BY_ALIAS = {
+    alias: mode
+    for mode, (_, _, aliases) in _STAGE_PROFILE_MODE_SPECS.items()
+    for alias in aliases
+}
 
 
 def _parse_stage_profile_case(raw: str):
@@ -102,15 +70,50 @@ def _parse_stage_profile_modes(raw: str):
     return deduped
 
 
-STAGE_PROFILE_CASE = _parse_stage_profile_case(STAGE_PROFILE_CASE_RAW)
-STAGE_PROFILE_MODES = _parse_stage_profile_modes(STAGE_PROFILE_MODES_RAW)
+def _stage_profile_mode_debug(stage_profile_mode):
+    try:
+        return _STAGE_PROFILE_MODE_SPECS[stage_profile_mode][0]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported stage profile mode: {stage_profile_mode}"
+        ) from exc
 
 
 def _stage_profile_mode_label(stage_only):
     try:
-        return _STAGE_PROFILE_MODE_LABELS[stage_only]
+        return _STAGE_PROFILE_MODE_SPECS[stage_only][1]
     except KeyError as exc:
         raise ValueError(f"Unsupported stage profile mode: {stage_only}") from exc
+
+
+@dataclass(frozen=True)
+class _StageProfileConfig:
+    enabled: bool
+    case: tuple[int, ...]
+    modes: tuple[str, ...]
+    warmup_iters: int
+    timed_iters: int
+
+
+def _load_stage_profile_config() -> _StageProfileConfig:
+    return _StageProfileConfig(
+        enabled=os.getenv("ENCODER_PIPELINE_STAGE_PROFILE", "0") == "1",
+        case=_parse_stage_profile_case(
+            os.getenv(
+                "ENCODER_PIPELINE_STAGE_PROFILE_CASE",
+                # seq_len,d,heads,intermediate_size,q_seq_tile,kv_seq_tile,emb_tile,parallel_heads,parallel_ffn,proj_acc_depth
+                "1024,64,12,3072,32,64,128,6,3,6",
+            )
+        ),
+        modes=_parse_stage_profile_modes(
+            os.getenv("ENCODER_PIPELINE_STAGE_PROFILE_MODES", "none,mha,an1,0,1,2")
+        ),
+        warmup_iters=int(os.getenv("ENCODER_PIPELINE_STAGE_PROFILE_WARMUP_ITERS", "3")),
+        timed_iters=int(os.getenv("ENCODER_PIPELINE_STAGE_PROFILE_TIMED_ITERS", "20")),
+    )
+
+
+STAGE_PROFILE = _load_stage_profile_config()
 
 
 def _case_name(
@@ -292,28 +295,28 @@ def test_encoder_pipeline(
     _assert_error_budget(errors, seq_len, d, heads)
 
 
-if STAGE_PROFILE_ENABLED:
+if STAGE_PROFILE.enabled:
 
     @pytest.mark.parametrize(
         "stage_profile_mode",
-        STAGE_PROFILE_MODES,
+        STAGE_PROFILE.modes,
         ids=lambda stage_profile_mode: _stage_profile_mode_label(stage_profile_mode),
     )
     def test_encoder_pipeline_stage_profile(stage_profile_mode, aie_context):
-        seq_len, d, heads, *_ = STAGE_PROFILE_CASE
-        debug_mode = _STAGE_PROFILE_MODE_TO_DEBUG[stage_profile_mode]
+        seq_len, d, heads, *_ = STAGE_PROFILE.case
+        debug_mode = _stage_profile_mode_debug(stage_profile_mode)
         errors, latency_us, bandwidth_gbps = _run_encoder_pipeline_case(
-            STAGE_PROFILE_CASE,
+            STAGE_PROFILE.case,
             debug_mode=debug_mode,
             aie_context=aie_context,
-            warmup_iters=STAGE_PROFILE_WARMUP_ITERS,
-            timed_iters=STAGE_PROFILE_TIMED_ITERS,
+            warmup_iters=STAGE_PROFILE.warmup_iters,
+            timed_iters=STAGE_PROFILE.timed_iters,
         )
 
         stage_label = _stage_profile_mode_label(stage_profile_mode)
         print(
             f"\nStage Profile [{stage_label}] "
-            f"(debug={debug_mode}, warmup={STAGE_PROFILE_WARMUP_ITERS}, timed={STAGE_PROFILE_TIMED_ITERS})"
+            f"(debug={debug_mode}, warmup={STAGE_PROFILE.warmup_iters}, timed={STAGE_PROFILE.timed_iters})"
         )
         print(f"Latency (us): {latency_us:.1f}")
         print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")

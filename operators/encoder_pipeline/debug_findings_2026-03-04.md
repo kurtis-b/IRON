@@ -1397,3 +1397,63 @@ Validation:
 
 ### LOC status after pass 3 (`operators/encoder_pipeline/*.py`)
 - Total now: `3865` lines.
+
+## Progress Update (2026-03-05): Constant Cleanup Follow-up
+
+User follow-up: constant clutter in `test.py`.
+
+### Changes
+- `test.py`
+  - Collapsed stage-profile constants into a single `_STAGE_PROFILE_MODE_SPECS` table.
+  - Replaced multiple stage-profile env globals with one `_StageProfileConfig` object (`STAGE_PROFILE`).
+  - Added helper `_stage_profile_mode_debug(...)` to avoid duplicate mode maps.
+- `design.py`
+  - Removed redundant top-level constant tables and unused imports from a prior general cleanup pass.
+  - Kept behavior identical for supported path (`npu2`, `bf16`) and retained validation semantics.
+
+### Validation
+1. `python3 -m py_compile operators/encoder_pipeline/test.py operators/encoder_pipeline/design.py`
+   - Passed.
+2. `rm -rf ./build && source /opt/xilinx/xrt/setup.sh && source ~/iron/ironenv/bin/activate && pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - `11 passed in 290.61s (0:04:50)`.
+
+## Progress Update (2026-03-05): LN2 Replay + Output Path Check
+
+Question investigated:
+- Whether LN2 replay FIFO is strictly required.
+- Whether LN2 output can be sent directly to shim while keeping required layout transform.
+
+Findings:
+1. LN2 replay FIFO is not strictly required.
+   - Existing switch: `ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=1`.
+   - In this mode, final FFN-down core emits two passes to LN2 input (stats pass + output pass) and LN2 replay FIFO is bypassed.
+   - Validation command:
+     - `ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=1 pytest operators/encoder_pipeline/test.py -q --iterations 1 -k "encoder_64seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_128embtile_1pheads_1pffn_6pacc"`
+   - Result: `1 passed, 10 deselected`.
+
+2. LN2 output direct-to-shim is not currently viable without losing layout transform.
+   - Current path is `outLN2 -> memLN2.forward(dims_to_stream=o_dims) -> rt.drain(...)`.
+   - The `dims_to_stream` reorder is provided by the memtile forward path; `rt.drain` itself does not provide that stream-order transform.
+   - Same pattern is used in sibling designs (`mha_to_an`, `ffn_addnorm`) for LN-like outputs.
+
+## Progress Update (2026-03-05): Memtile Availability for FFN Parallelization
+
+Goal:
+- Increase memtile resource availability to support FFN parallelization attempts.
+
+Experiments:
+1. Enabled 2-branch wide-head/high-acc path (`6pheads_3pffn_6pacc`) by relaxing single-branch pruning.
+   - With LN1->FFN staging enabled (`ENCODER_BYPASS_LN_TO_FFN_STAGE=0`): compile failed (`aie.dma_bd` allocator exhausted, 48 BD limit).
+   - With staging bypass + LN2 replay FIFO path (`ENCODER_BYPASS_LN_TO_FFN_STAGE=1`, `ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0`): compile still failed on BD/channel pressure.
+   - With staging bypass + replay-from-down path (compile-feasible): runtime timed out (`ERT_CMD_STATE_TIMEOUT`) in full and FFN-focused debug modes.
+2. Tried increasing inter-branch L1 FIFO depth to break backpressure.
+   - Caused compute-tile L1 overflow on down branch tile (compile failure), so reverted.
+
+Implemented stable resource-relief change:
+- Set default `ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=true` in `encoder_pipeline/design.py`.
+  - This removes LN2 replay memtile FIFO by default, freeing memtile channel/BD budget while preserving LN2 two-pass behavior.
+  - Replay FIFO mode remains available via `ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0`.
+
+Validation:
+1. `rm -rf ./build && pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - Result: `11 passed in 284.43s (0:04:44)`.

@@ -189,7 +189,10 @@ full-pipeline liveness/correctness is sensitive to tail DMA order.
 - `ENCODER_LN2_REPLAY_MEM_TILE_COL`:
   - memtile column for LN2 replay staging in the FFN-down/AddNorm2 handoff path
   - default is `4` in current implementation
+- `ENCODER_EMIT_LN2_REPLAY_FROM_DOWN`:
+  - default unset -> `true` (final FFN-down core emits replay pass directly to LN2 input)
+  - set to `0|false|off|no` -> enable LN2 replay memtile FIFO path (higher memtile pressure)
 
 Note:
-- FFN-down now emits one pass to LN2 input and LN2 replays internally from memtile staging for norm statistics/output pass.
-- This keeps full-row LN behavior while reducing FFN-down replay pressure in the down-proj core.
+- FFN-down replay-from-down (`ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=1`) keeps full-row LN behavior while freeing LN2 replay memtile channels/BDs.
+- LN2 replay FIFO mode (`ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0`) is still available for targeted experiments.

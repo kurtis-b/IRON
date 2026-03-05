@@ -4,7 +4,6 @@
 import sys
 import math
 import os
-from pathlib import Path
 import logging
 
 from ml_dtypes import bfloat16
@@ -19,36 +18,20 @@ from aie.iron import (
     Buffer,
 )
 from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1Col1, NPU2, Tile
+from aie.iron.device import NPU2, Tile
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
 import aie.dialects.index as index
 from aie.dialects.aiex import *
+from operators.encoder_pipeline.debug_modes import (
+    ADDNORM_DEBUG_DISABLED,
+    ADDNORM_DEBUG_INPUT,
+    ADDNORM_DEBUG_RESIDUAL,
+)
 from operators.encoder_pipeline.mapping_validation import (
     find_ffn_layout,
     manhattan_distance,
 )
-
-dtype_map = {
-    "bf16": bfloat16,
-    "f32": np.float32,
-}
-
-microkernel_mac_dim_map = {
-    "npu": {
-        "bf16": (4, 8, 4),
-    },
-    "npu2": {
-        "bf16": {
-            # emulate_bf16_mmul_with_bfp16
-            True: (8, 8, 8),
-            False: (4, 8, 8),
-        },
-    },
-}
-
-FFN_STAGE_ONLY_CHOICES = (-1, 0, 1, 2, 3, 4)
-ADDNORM_DEBUG_CHOICES = (-1, 0, 1)
 
 
 def fused_mha(
@@ -131,17 +114,21 @@ def fused_mha(
             "ffn_intermediate_size must be divisible by emb_tile "
             f"({ffn_intermediate_size} % {emb_tile} != 0)"
         )
-    valid_ffn_stage_only = (None, *FFN_STAGE_ONLY_CHOICES[1:])
-    if ffn_stage_only not in valid_ffn_stage_only:
+    if ffn_stage_only not in {None, 0, 1, 2, 3, 4}:
         raise ValueError(
             f"ffn_stage_only must be one of {{None, 0, 1, 2, 3, 4}} (got {ffn_stage_only})"
         )
-    if addnorm1_debug_mode not in ADDNORM_DEBUG_CHOICES:
+    valid_addnorm_debug_modes = (
+        ADDNORM_DEBUG_DISABLED,
+        ADDNORM_DEBUG_INPUT,
+        ADDNORM_DEBUG_RESIDUAL,
+    )
+    if addnorm1_debug_mode not in valid_addnorm_debug_modes:
         raise ValueError(
             "addnorm1_debug_mode must be one of {-1, 0, 1} "
             f"(got {addnorm1_debug_mode})"
         )
-    if addnorm2_debug_mode not in ADDNORM_DEBUG_CHOICES:
+    if addnorm2_debug_mode not in valid_addnorm_debug_modes:
         raise ValueError(
             "addnorm2_debug_mode must be one of {-1, 0, 1} "
             f"(got {addnorm2_debug_mode})"
@@ -380,8 +367,10 @@ def fused_mha(
         )
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
-    mac_dims = microkernel_mac_dim_map[dev][dtype_str]
-    r, s, t = mac_dims[emulate_bf16_mmul_with_bfp16]
+    if emulate_bf16_mmul_with_bfp16:
+        r, s, t = 8, 8, 8
+    else:
+        r, s, t = 4, 8, 8
 
     logging.info(f"Device: {dev}")
     logging.info(f"Number of heads: {heads}")
@@ -450,7 +439,7 @@ def fused_mha(
     assert seq_len % seq_tile == 0, "seq_len must be divisible by seq_tile"
     assert seq_len % kv_seq_tile == 0, "seq_len must be divisible by kv_seq_tile"
 
-    dtype = dtype_map[dtype_str]
+    dtype = bfloat16
 
     inv_scale = (1 / np.sqrt(d)) * 1.4453125
 
@@ -852,11 +841,10 @@ def fused_mha(
     ffn_residual_depth = proj_acc_depth
     ln_mem_tile_col = 7
     # AddNorm2 needs two FFN-down passes (sum/sumsq pass + output pass).
-    # By default, stage replay on an LN2-side memtile FIFO to keep FFN-down
-    # cores on a single emission pass.
+    # Default to down-core replay emission to free LN2 replay memtile resources.
     emit_ln2_replay_from_down = _override_bool_env(
         "ENCODER_EMIT_LN2_REPLAY_FROM_DOWN",
-        False,
+        True,
     )
     use_ln2_replay_fifo = (ffn_stage_only in (None, 2)) and (
         not emit_ln2_replay_from_down
@@ -2611,10 +2599,7 @@ def fused_mha(
                 rt.finish_task_group(tg)
 
     # Create the program from the device type and runtime
-    if dev == "npu":
-        dev_ty = NPU1Col1()
-    else:
-        dev_ty = NPU2()
+    dev_ty = NPU2()
     my_program = Program(dev_ty, rt)
 
     # Place components (assign them resources on the device) and generate an MLIR module
