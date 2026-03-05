@@ -176,3 +176,20 @@ Notes:
 
 This override is for A/B performance experiments; strict ordering remains the default because
 full-pipeline liveness/correctness is sensitive to tail DMA order.
+
+## FFN Tail Mapping Knobs
+
+`design.py` also exposes guarded placement/pruning knobs for FFN-tail resource exploration:
+- `ENCODER_FORCE_SINGLE_BRANCH_WIDE_ACC`:
+  - default unset -> `true` (keep conservative single-branch fallback for `parallel_heads>=6` and `proj_acc_depth>=6`)
+  - set to `0|false|off|no` -> allow multi-branch attempt (may fail compile due memtile BD/channel limits)
+- `ENCODER_FORCE_SINGLE_BRANCH_HIGH_ACC`:
+  - default unset -> `true` (keep conservative single-branch fallback for `parallel_heads>=4` and `proj_acc_depth>=8`)
+  - set to `0|false|off|no` -> allow multi-branch attempt (may fail compile due memtile BD/channel limits)
+- `ENCODER_LN2_REPLAY_MEM_TILE_COL`:
+  - memtile column for LN2 replay staging in the FFN-down/AddNorm2 handoff path
+  - default is `4` in current implementation
+
+Note:
+- FFN-down now emits one pass to LN2 input and LN2 replays internally from memtile staging for norm statistics/output pass.
+- This keeps full-row LN behavior while reducing FFN-down replay pressure in the down-proj core.

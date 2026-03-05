@@ -26,10 +26,10 @@ STAGE_PROFILE_MODES_RAW = os.getenv(
     "none,mha,an1,0,1,2",
 )
 STAGE_PROFILE_WARMUP_ITERS = int(
-    os.getenv("ENCODER_PIPELINE_STAGE_PROFILE_WARMUP_ITERS", "10")
+    os.getenv("ENCODER_PIPELINE_STAGE_PROFILE_WARMUP_ITERS", "3")
 )
 STAGE_PROFILE_TIMED_ITERS = int(
-    os.getenv("ENCODER_PIPELINE_STAGE_PROFILE_TIMED_ITERS", "100")
+    os.getenv("ENCODER_PIPELINE_STAGE_PROFILE_TIMED_ITERS", "20")
 )
 
 _STAGE_PROFILE_MODE_TO_DEBUG = {
@@ -40,6 +40,32 @@ _STAGE_PROFILE_MODE_TO_DEBUG = {
     "mha": 6,  # MHA-focused (FFN up/down disabled, AddNorm bypassed)
     "an1": 7,  # AddNorm1-focused (FFN up/down disabled, AddNorm2 bypassed)
 }
+
+_STAGE_PROFILE_MODE_ALIASES = {
+    "full": ("none", "full"),
+    "up": ("0", "up", "up_only", "ffn_up"),
+    "down": ("1", "down", "down_only", "ffn_down"),
+    "an2": ("2", "an2", "addnorm2", "addnorm2_only", "ln2"),
+    "mha": ("3", "mha", "mha_only"),
+    "an1": ("4", "an1", "addnorm1", "addnorm1_only", "ln1"),
+}
+_STAGE_PROFILE_MODE_BY_ALIAS = {
+    alias: mode
+    for mode, aliases in _STAGE_PROFILE_MODE_ALIASES.items()
+    for alias in aliases
+}
+_STAGE_PROFILE_MODE_LABELS = {
+    "full": "full",
+    "up": "up_only",
+    "down": "down_only",
+    "an2": "addnorm2_only",
+    "mha": "mha_only",
+    "an1": "addnorm1_only",
+}
+
+ERROR_THRESHOLD = 0.005
+REL_TOL = 4.0e-2
+ABS_TOL = 1.5e-1
 
 
 def _parse_stage_profile_case(raw: str):
@@ -60,37 +86,20 @@ def _parse_stage_profile_modes(raw: str):
         t = tok.strip().lower()
         if t == "":
             continue
-        if t in ("none", "full"):
-            modes.append("full")
-            continue
-        if t in ("0", "up", "up_only", "ffn_up"):
-            modes.append("up")
-            continue
-        if t in ("1", "down", "down_only", "ffn_down"):
-            modes.append("down")
-            continue
-        if t in ("2", "an2", "addnorm2", "addnorm2_only", "ln2"):
-            modes.append("an2")
-            continue
-        if t in ("3", "mha", "mha_only"):
-            modes.append("mha")
-            continue
-        if t in ("4", "an1", "addnorm1", "addnorm1_only", "ln1"):
-            modes.append("an1")
+        mode = _STAGE_PROFILE_MODE_BY_ALIAS.get(t)
+        if mode is not None:
+            modes.append(mode)
             continue
         raise ValueError(
             "ENCODER_PIPELINE_STAGE_PROFILE_MODES entries must be one of "
             "{none,full,0/up,1/down,2/an2,3/mha,4/an1} (got '{tok}')"
         )
-    deduped = []
-    for mode in modes:
-        if mode not in deduped:
-            deduped.append(mode)
+    deduped = tuple(dict.fromkeys(modes))
     if not deduped:
         raise ValueError(
             "ENCODER_PIPELINE_STAGE_PROFILE_MODES must include at least one mode"
         )
-    return tuple(deduped)
+    return deduped
 
 
 STAGE_PROFILE_CASE = _parse_stage_profile_case(STAGE_PROFILE_CASE_RAW)
@@ -98,19 +107,28 @@ STAGE_PROFILE_MODES = _parse_stage_profile_modes(STAGE_PROFILE_MODES_RAW)
 
 
 def _stage_profile_mode_label(stage_only):
-    if stage_only == "full":
-        return "full"
-    if stage_only == "up":
-        return "up_only"
-    if stage_only == "down":
-        return "down_only"
-    if stage_only == "an2":
-        return "addnorm2_only"
-    if stage_only == "mha":
-        return "mha_only"
-    if stage_only == "an1":
-        return "addnorm1_only"
-    raise ValueError(f"Unsupported stage profile mode: {stage_only}")
+    try:
+        return _STAGE_PROFILE_MODE_LABELS[stage_only]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported stage profile mode: {stage_only}") from exc
+
+
+def _case_name(
+    seq_len,
+    d,
+    heads,
+    intermediate_size,
+    q_seq_tile,
+    kv_seq_tile,
+    emb_tile,
+    parallel_heads,
+    parallel_ffn,
+    proj_acc_depth,
+):
+    return (
+        f"encoder_{seq_len}seq_{d}hdim_{heads}heads_{intermediate_size}ffn_{q_seq_tile}qseqtile_{kv_seq_tile}kvtile_"
+        f"{emb_tile}embtile_{parallel_heads}pheads_{parallel_ffn}pffn_{proj_acc_depth}pacc"
+    )
 
 
 def generate_test_params(extensive=False):
@@ -133,8 +151,19 @@ def generate_test_params(extensive=False):
     extensive_params = []
 
     params = extensive_params if extensive else regular_params
-    names = []
-    for (
+    names = [_case_name(*case) for case in params]
+    return params, names
+
+
+def _run_encoder_pipeline_case(
+    case,
+    *,
+    debug_mode,
+    aie_context,
+    warmup_iters,
+    timed_iters,
+):
+    (
         seq_len,
         d,
         heads,
@@ -145,12 +174,64 @@ def generate_test_params(extensive=False):
         parallel_heads,
         parallel_ffn,
         proj_acc_depth,
-    ) in params:
-        names.append(
-            f"encoder_{seq_len}seq_{d}hdim_{heads}heads_{intermediate_size}ffn_{q_seq_tile}qseqtile_{kv_seq_tile}kvtile_"
-            f"{emb_tile}embtile_{parallel_heads}pheads_{parallel_ffn}pffn_{proj_acc_depth}pacc"
-        )
-    return params, names
+    ) = case
+
+    golden_ref = generate_golden_reference(
+        seq_len=seq_len,
+        d=d,
+        heads=heads,
+        intermediate_size=intermediate_size,
+        seed=42,
+        debug=debug_mode,
+    )
+
+    operator = AIEEncoderPipeline(
+        seq_len=seq_len,
+        d=d,
+        num_heads=heads,
+        seq_tile=q_seq_tile,
+        kv_seq_tile=kv_seq_tile,
+        emb_tile=emb_tile,
+        parallel_heads=parallel_heads,
+        proj_acc_depth=proj_acc_depth,
+        ffn_intermediate_size=intermediate_size,
+        nB_tiles_distributed=parallel_ffn,
+        debug=debug_mode,
+        ln1_weight=golden_ref["ln1_weight"],
+        ln2_weight=golden_ref["ln2_weight"],
+        context=aie_context,
+    )
+
+    input_buffers = {
+        "QKV": golden_ref["QKV"].flatten(),
+        "W_O": golden_ref["W_O"].flatten(),
+        "OR": golden_ref["OR"].flatten(),
+        "B_Up": golden_ref["B_Up"].flatten(),
+        "B_Down": golden_ref["B_Down"].flatten(),
+    }
+    output_buffers = {"O": golden_ref["O"].flatten()}
+
+    errors, latency_us, bandwidth_gbps = run_test(
+        operator,
+        input_buffers,
+        output_buffers,
+        rel_tol=REL_TOL,
+        abs_tol=ABS_TOL,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+    )
+    return errors, latency_us, bandwidth_gbps
+
+
+def _assert_error_budget(errors, seq_len, d, heads):
+    if not errors:
+        return
+    max_acceptable_errors = int(seq_len * d * heads * ERROR_THRESHOLD)
+    num_errors = len(errors.get("O", ()))
+    print(f"({num_errors} errors out of {max_acceptable_errors} max allowable)")
+    assert (
+        num_errors <= max_acceptable_errors
+    ), f"Test failed with {num_errors} errors (max allowable: {max_acceptable_errors})"
 
 
 regular_params, regular_names = generate_test_params(extensive=False)
@@ -186,65 +267,29 @@ def test_encoder_pipeline(
     proj_acc_depth,
     aie_context,
 ):
-    golden_ref = generate_golden_reference(
-        seq_len=seq_len,
-        d=d,
-        heads=heads,
-        intermediate_size=intermediate_size,
-        seed=42,
-        debug=DEBUG_MODE,
+    case = (
+        seq_len,
+        d,
+        heads,
+        intermediate_size,
+        q_seq_tile,
+        kv_seq_tile,
+        emb_tile,
+        parallel_heads,
+        parallel_ffn,
+        proj_acc_depth,
     )
-
-    operator = AIEEncoderPipeline(
-        seq_len=seq_len,
-        d=d,
-        num_heads=heads,
-        seq_tile=q_seq_tile,
-        kv_seq_tile=kv_seq_tile,
-        emb_tile=emb_tile,
-        parallel_heads=parallel_heads,
-        proj_acc_depth=proj_acc_depth,
-        ffn_intermediate_size=intermediate_size,
-        nB_tiles_distributed=parallel_ffn,
-        debug=DEBUG_MODE,
-        ln1_weight=golden_ref["ln1_weight"],
-        ln2_weight=golden_ref["ln2_weight"],
-        context=aie_context,
-    )
-
-    input_buffers = {
-        "QKV": golden_ref["QKV"].flatten(),
-        "W_O": golden_ref["W_O"].flatten(),
-        "OR": golden_ref["OR"].flatten(),
-        "B_Up": golden_ref["B_Up"].flatten(),
-        "B_Down": golden_ref["B_Down"].flatten(),
-    }
-    output_buffers = {"O": golden_ref["O"].flatten()}
-
-    errors, latency_us, bandwidth_gbps = run_test(
-        operator,
-        input_buffers,
-        output_buffers,
-        rel_tol=4.0e-2,
-        abs_tol=1.5e-1,
+    errors, latency_us, bandwidth_gbps = _run_encoder_pipeline_case(
+        case,
+        debug_mode=DEBUG_MODE,
+        aie_context=aie_context,
         warmup_iters=10,
         timed_iters=100,
     )
 
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
-
-    error_threshold = 0.005
-    max_acceptable_errors = int(seq_len * d * heads * error_threshold)
-    if errors:
-        print(
-            "({} errors out of {} max allowable)".format(
-                len(errors["O"]), max_acceptable_errors
-            )
-        )
-        assert (
-            len(errors["O"]) <= max_acceptable_errors
-        ), f"Test failed with {len(errors['O'])} errors (max allowable: {max_acceptable_errors})"
+    _assert_error_budget(errors, seq_len, d, heads)
 
 
 if STAGE_PROFILE_ENABLED:
@@ -255,61 +300,12 @@ if STAGE_PROFILE_ENABLED:
         ids=lambda stage_profile_mode: _stage_profile_mode_label(stage_profile_mode),
     )
     def test_encoder_pipeline_stage_profile(stage_profile_mode, aie_context):
-        (
-            seq_len,
-            d,
-            heads,
-            intermediate_size,
-            q_seq_tile,
-            kv_seq_tile,
-            emb_tile,
-            parallel_heads,
-            parallel_ffn,
-            proj_acc_depth,
-        ) = STAGE_PROFILE_CASE
+        seq_len, d, heads, *_ = STAGE_PROFILE_CASE
         debug_mode = _STAGE_PROFILE_MODE_TO_DEBUG[stage_profile_mode]
-
-        golden_ref = generate_golden_reference(
-            seq_len=seq_len,
-            d=d,
-            heads=heads,
-            intermediate_size=intermediate_size,
-            seed=42,
-            debug=debug_mode,
-        )
-
-        operator = AIEEncoderPipeline(
-            seq_len=seq_len,
-            d=d,
-            num_heads=heads,
-            seq_tile=q_seq_tile,
-            kv_seq_tile=kv_seq_tile,
-            emb_tile=emb_tile,
-            parallel_heads=parallel_heads,
-            proj_acc_depth=proj_acc_depth,
-            ffn_intermediate_size=intermediate_size,
-            nB_tiles_distributed=parallel_ffn,
-            debug=debug_mode,
-            ln1_weight=golden_ref["ln1_weight"],
-            ln2_weight=golden_ref["ln2_weight"],
-            context=aie_context,
-        )
-
-        input_buffers = {
-            "QKV": golden_ref["QKV"].flatten(),
-            "W_O": golden_ref["W_O"].flatten(),
-            "OR": golden_ref["OR"].flatten(),
-            "B_Up": golden_ref["B_Up"].flatten(),
-            "B_Down": golden_ref["B_Down"].flatten(),
-        }
-        output_buffers = {"O": golden_ref["O"].flatten()}
-
-        errors, latency_us, bandwidth_gbps = run_test(
-            operator,
-            input_buffers,
-            output_buffers,
-            rel_tol=4.0e-2,
-            abs_tol=1.5e-1,
+        errors, latency_us, bandwidth_gbps = _run_encoder_pipeline_case(
+            STAGE_PROFILE_CASE,
+            debug_mode=debug_mode,
+            aie_context=aie_context,
             warmup_iters=STAGE_PROFILE_WARMUP_ITERS,
             timed_iters=STAGE_PROFILE_TIMED_ITERS,
         )
@@ -323,17 +319,7 @@ if STAGE_PROFILE_ENABLED:
         print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
         if stage_profile_mode == "full":
-            error_threshold = 0.005
-            max_acceptable_errors = int(seq_len * d * heads * error_threshold)
-            if errors:
-                print(
-                    "({} errors out of {} max allowable)".format(
-                        len(errors["O"]), max_acceptable_errors
-                    )
-                )
-                assert (
-                    len(errors["O"]) <= max_acceptable_errors
-                ), f"Test failed with {len(errors['O'])} errors (max allowable: {max_acceptable_errors})"
+            _assert_error_budget(errors, seq_len, d, heads)
         elif errors:
             print(
                 f"Stage profile mode '{stage_label}' observed {len(errors['O'])} output mismatches; "
