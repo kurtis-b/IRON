@@ -237,99 +237,154 @@ def fused_mha(
 
     requested_ffn_branches = min(nB_tiles_distributed, max_ffn_branches)
     down_root_idx = all_ffn_down_tiles.index(down_root_tile)
-    non_root_indices = [i for i in range(max_ffn_branches) if i != down_root_idx]
-    selected_branch_indices = non_root_indices[: max(requested_ffn_branches - 1, 0)] + [
-        down_root_idx
-    ]
+    if down_root_idx != max_ffn_branches - 1:
+        raise ValueError(
+            "FFN layout invariant violated: down_root must be final down tile "
+            f"(root_idx={down_root_idx}, max={max_ffn_branches})"
+        )
+    # Keep the active branch subset as a suffix ending at root to preserve
+    # neighbor-chain reduction order when pruning.
+    selected_start_idx = max(0, max_ffn_branches - requested_ffn_branches)
+    selected_branch_indices = list(range(selected_start_idx, max_ffn_branches))
     if max_ffn_branches > 3:
         raise ValueError(
             "encoder_pipeline supports at most 3 FFN branches "
             f"(layout returned {max_ffn_branches})"
         )
 
-    # Prefer placing LN1 post worker on a free tile outside active FFN branch tiles.
-    # If none are available (e.g. high MHA parallelism), drop one non-root FFN branch.
+    def drop_non_root_branch(reason: str):
+        non_root_selected = [i for i in selected_branch_indices if i != down_root_idx]
+        if not non_root_selected:
+            raise ValueError(
+                f"Unable to prune FFN branches ({reason}): only root branch is selectable"
+            )
+        dropped_idx = max(
+            non_root_selected,
+            key=lambda i: (
+                manhattan_distance(all_ffn_down_tiles[i], down_root_tile),
+                manhattan_distance(all_ffn_up_tiles[i], ln1_tile),
+                i,
+            ),
+        )
+        selected_branch_indices.remove(dropped_idx)
+        logging.warning(
+            "Reduced effective FFN branch count from %d to %d: %s "
+            "(dropped branch idx=%d, up=%s, down=%s)",
+            len(selected_branch_indices) + 1,
+            len(selected_branch_indices),
+            reason,
+            dropped_idx,
+            all_ffn_up_tiles[dropped_idx],
+            all_ffn_down_tiles[dropped_idx],
+        )
+
+    # Prefer placing LN1 post worker and optional LN1 route helper core on free
+    # tiles outside active FFN branch tiles. If resources are insufficient, drop
+    # one non-root FFN branch and retry.
     free_ffn_tiles = [tuple(t) for t in ffn_layout["free_tiles"]]
+    layout_reduction_edges = {
+        (tuple(src), tuple(dst))
+        for (src, dst) in ffn_layout.get("down_reduction_edges", [])
+    }
+    ln1_route_tile = None
     while True:
+        if len(selected_branch_indices) <= 0:
+            raise ValueError("No FFN branches selected")
         selected_up_tiles = [all_ffn_up_tiles[i] for i in selected_branch_indices]
         selected_down_tiles = [all_ffn_down_tiles[i] for i in selected_branch_indices]
-        used_tiles = {ln1_tile, ln2_tile, *selected_up_tiles, *selected_down_tiles}
+        used_tiles_base = {ln1_tile, ln2_tile, *selected_up_tiles, *selected_down_tiles}
+        effective_candidate_branches = len(selected_branch_indices)
+        if effective_candidate_branches > 1:
+            expected_chain_edges = [
+                (selected_down_tiles[i], selected_down_tiles[i + 1])
+                for i in range(effective_candidate_branches - 1)
+            ]
+            missing_chain_edges = [
+                edge
+                for edge in expected_chain_edges
+                if edge not in layout_reduction_edges
+            ]
+            if missing_chain_edges:
+                drop_non_root_branch(
+                    "selected FFN branches are not on a valid neighbor reduction chain "
+                    f"(missing_edges={missing_chain_edges})"
+                )
+                continue
+        # A single LN1 mul/add core can directly emit at most two FFN streams.
+        ln1_router_tiles_needed = 1 if effective_candidate_branches > 2 else 0
+        required_compute_tiles = (
+            parallel_heads * 4
+            + 3  # LN1 norm + LN1 mul/add + LN2
+            + 2 * effective_candidate_branches  # FFN up/down compute branches
+            + ln1_router_tiles_needed
+        )
+        if required_compute_tiles > 32:
+            if len(selected_branch_indices) <= 1:
+                raise ValueError(
+                    "Configuration exceeds NPU2 compute tile capacity (32): "
+                    f"needs {required_compute_tiles}"
+                )
+            drop_non_root_branch(
+                f"compute tile capacity exceeded (needs {required_compute_tiles})"
+            )
+            continue
+        # For wide-head/high-acc configurations, memtile BD-ID allocation for
+        # FFN tail staging can fail even when nominal channel counts fit.
+        # Keep pruning non-root branches until the generated topology is
+        # within known feasible memtile BD/channel budgets.
+        if (
+            parallel_heads >= 6
+            and proj_acc_depth >= 6
+            and len(selected_branch_indices) > 1
+        ):
+            drop_non_root_branch(
+                "memtile BD/channel budget exceeded for wide-head high-acc tail staging"
+            )
+            continue
+        if (
+            parallel_heads >= 4
+            and proj_acc_depth >= 8
+            and len(selected_branch_indices) > 1
+        ):
+            drop_non_root_branch(
+                "memtile BD/channel budget exceeded for high-acc tail staging"
+            )
+            continue
+
         ln1_post_candidates = [
-            tile for tile in free_ffn_tiles if tile not in used_tiles
+            tile for tile in free_ffn_tiles if tile not in used_tiles_base
         ]
-        if ln1_post_candidates:
-            ln1_post_tile = ln1_post_candidates[0]
+        placement_found = False
+        for candidate_ln1_post_tile in ln1_post_candidates:
+            used_with_ln1_post = used_tiles_base | {candidate_ln1_post_tile}
+            aux_candidates = [
+                tile for tile in free_ffn_tiles if tile not in used_with_ln1_post
+            ]
+            if len(aux_candidates) < ln1_router_tiles_needed:
+                continue
+            candidate_ln1_route_tile = None
+            if ln1_router_tiles_needed:
+                candidate_ln1_route_tile = min(
+                    aux_candidates,
+                    key=lambda t: (
+                        manhattan_distance(t, candidate_ln1_post_tile),
+                        manhattan_distance(t, ln1_tile),
+                        t[0],
+                        t[1],
+                    ),
+                )
+            ln1_post_tile = candidate_ln1_post_tile
+            ln1_route_tile = candidate_ln1_route_tile
+            placement_found = True
+            break
+        if placement_found:
             break
         if len(selected_branch_indices) <= 1:
             raise ValueError(
-                "No free FFN tile available for LN1 post worker after branch selection"
+                "Insufficient free FFN tiles for LN1 post/route helper placement "
+                f"(branches={len(selected_branch_indices)})"
             )
-        non_root_selected = [i for i in selected_branch_indices if i != down_root_idx]
-        if not non_root_selected:
-            raise ValueError(
-                "Unable to prune FFN branches: only root branch is selectable"
-            )
-        dropped_idx = max(
-            non_root_selected,
-            key=lambda i: (
-                manhattan_distance(all_ffn_down_tiles[i], down_root_tile),
-                manhattan_distance(all_ffn_up_tiles[i], ln1_tile),
-                i,
-            ),
-        )
-        selected_branch_indices.remove(dropped_idx)
-        logging.warning(
-            "Reduced effective FFN branch count from %d to %d: no spare tile for LN1 post worker "
-            "(dropped branch idx=%d, up=%s, down=%s)",
-            len(selected_branch_indices) + 1,
-            len(selected_branch_indices),
-            dropped_idx,
-            all_ffn_up_tiles[dropped_idx],
-            all_ffn_down_tiles[dropped_idx],
-        )
-
-    # LN1 post worker directly fans out normalized tiles into per-branch streams.
-    # With the current direct-fanout path, >2 branch outputs exceed channel budget.
-    while len(selected_branch_indices) > 2:
-        non_root_selected = [i for i in selected_branch_indices if i != down_root_idx]
-        if not non_root_selected:
-            break
-        dropped_idx = max(
-            non_root_selected,
-            key=lambda i: (
-                manhattan_distance(all_ffn_down_tiles[i], down_root_tile),
-                manhattan_distance(all_ffn_up_tiles[i], ln1_tile),
-                i,
-            ),
-        )
-        selected_branch_indices.remove(dropped_idx)
-        selected_up_tiles = [all_ffn_up_tiles[i] for i in selected_branch_indices]
-        selected_down_tiles = [all_ffn_down_tiles[i] for i in selected_branch_indices]
-        logging.warning(
-            "Reduced effective FFN branch count from %d to %d due LN1-post output channel budget "
-            "(dropped branch idx=%d, up=%s, down=%s)",
-            len(selected_branch_indices) + 1,
-            len(selected_branch_indices),
-            dropped_idx,
-            all_ffn_up_tiles[dropped_idx],
-            all_ffn_down_tiles[dropped_idx],
-        )
-
-    # At high MHA parallelism, down-root currently runs out of input channels
-    # when combining multi-branch FFN reduction with its own up/down streams.
-    if parallel_heads >= 4 and len(selected_branch_indices) > 1:
-        logging.warning(
-            "Reduced effective FFN branch count from %d to 1 due down-root input channel budget "
-            "at parallel_heads=%d (kept root idx=%d, up=%s, down=%s)",
-            len(selected_branch_indices),
-            parallel_heads,
-            down_root_idx,
-            all_ffn_up_tiles[down_root_idx],
-            all_ffn_down_tiles[down_root_idx],
-        )
-        selected_branch_indices = [down_root_idx]
-        selected_up_tiles = [all_ffn_up_tiles[down_root_idx]]
-        selected_down_tiles = [all_ffn_down_tiles[down_root_idx]]
+        drop_non_root_branch("insufficient free tile budget for LN1 post/route helpers")
 
     effective_ffn_branches = len(selected_branch_indices)
     if effective_ffn_branches <= 0:
@@ -352,14 +407,23 @@ def fused_mha(
         ffn_col_group_offsets.append(running_group_offset)
         running_group_offset += count
     final_ffn_branch_idx = effective_ffn_branches - 1
-    # Reduction chain topology over active branches (one incoming reduction stream
-    # per down core): b0 -> b1 -> ... -> bN(final/root).
+    # Reduction chain topology over active branches (one incoming reduction
+    # stream per down core): b0 -> b1 -> ... -> bN(final/root).
     ffn_reduction_sources = list(range(final_ffn_branch_idx))
+    ffn_requires_ln1_router = effective_ffn_branches > 2
 
     # Worker count:
     # - MHA path: 4 workers per parallel head
-    # - Encoder tail: LN1(norm) + LN1(mul+resadd) + (FFN up/down)*branches + AddNorm2
-    required_compute_tiles = parallel_heads * 4 + 3 + 2 * effective_ffn_branches
+    # - Encoder tail:
+    #   LN1(norm) + LN1(mul+resadd) + AddNorm2
+    #   + (FFN up/down)*branches
+    #   + optional LN1 route worker for branch fanout > 2
+    required_compute_tiles = (
+        parallel_heads * 4
+        + 3
+        + 2 * effective_ffn_branches
+        + (1 if ffn_requires_ln1_router else 0)
+    )
     if required_compute_tiles > 32:
         raise ValueError(
             "Configuration exceeds NPU2 compute tile capacity (32): "
@@ -396,9 +460,10 @@ def fused_mha(
         ffn_col_group_offsets,
     )
     logging.info(
-        "FFN mapped placement: ln1_norm=%s ln1_post=%s up(all)=%s down(all)=%s up(active)=%s down(active)=%s ln2=%s down_root=%s down_reduction_edges=%s down_to_ln2=%s non_neighbor_down_to_ln2=%s active_branch_indices=%s",
+        "FFN mapped placement: ln1_norm=%s ln1_post=%s ln1_route=%s up(all)=%s down(all)=%s up(active)=%s down(active)=%s ln2=%s down_root=%s down_reduction_edges=%s down_to_ln2=%s non_neighbor_down_to_ln2=%s active_branch_indices=%s",
         ln1_tile,
         ln1_post_tile,
+        ln1_route_tile,
         all_ffn_up_tiles,
         all_ffn_down_tiles,
         selected_up_tiles,
@@ -411,10 +476,12 @@ def fused_mha(
         selected_branch_indices,
     )
     logging.info(
-        "FFN reduction topology(active branch order): chain_edges=%s final_branch_idx=%d (down_tile=%s)",
+        "FFN reduction topology(active branch order): chain_edges=%s final_branch_idx=%d "
+        "(down_tile=%s) ln1_router=%s",
         [(i, i + 1) for i in range(final_ffn_branch_idx)],
         final_ffn_branch_idx,
         selected_down_tiles[final_ffn_branch_idx],
+        ffn_requires_ln1_router,
     )
     logging.info(f"Data type: {dtype_str}")
     logging.info(f"Microkernel MAC dimensions: r={r}, s={s}, t={t}")
@@ -740,10 +807,11 @@ def fused_mha(
     # Keep O-proj accum FIFOs off cols 6/7 for <=4 parallel heads so those
     # memtiles can absorb FFN/LN traffic at high seq/head configurations.
     if parallel_heads <= 4:
-        # Avoid placing O-proj accum FIFOs on cols 6/7 for <=4-head configs.
-        acc_mem_tile_order = [4, 5, 6, 3]
+        # Keep col5 in the <=4-head map and avoid concentrating depth-8
+        # O-proj accumulators on col6 where FFN tail staging is anchored.
+        acc_mem_tile_order = [4, 5, 7, 3]
     else:
-        # For wider MHA parallelism, spread across all available memtiles.
+        # For wider MHA parallelism, spread across available memtiles.
         acc_mem_tile_order = [4, 5, 6, 7, 4, 5, 7]
     if parallel_heads > len(acc_mem_tile_order):
         raise ValueError(
@@ -834,7 +902,7 @@ def fused_mha(
         branch_down_b_cols = [4, 6, 5]
     else:
         branch_stage_cols = [6, 5, 4]
-        branch_down_b_cols = [7, 5, 4]
+        branch_down_b_cols = [6, 5, 4]
     if effective_ffn_branches > len(branch_stage_cols):
         raise ValueError(
             "Unsupported effective_ffn_branches for current memtile assignment "
@@ -982,6 +1050,15 @@ def fused_mha(
         depth=ln_fifo_depth,
         placement=Tile(col=ln_mem_tile_col, row=1),
     )
+
+    # Additional LN1 fanout stage when more than two FFN branches are active.
+    outLNRest = None
+    if ffn_requires_ln1_router:
+        outLNRest = ObjectFifo(
+            o_ty,
+            name="outLNFfnRest",
+            depth=1,
+        )
 
     def batched_matmul_qk(
         of_q,
@@ -1384,17 +1461,21 @@ def fused_mha(
         weights,
         of_out_up_0,
         of_out_up_1,
-        of_out_up_2,
+        of_out_up_2_or_rest,
         ln_mul_add,
         copy,
         addnorm1_mode,
+        route_remaining_branches,
     ):
-        of_out_up_list = [of_out_up_0, of_out_up_1, of_out_up_2]
+        of_out_up_list = [of_out_up_0, of_out_up_1, of_out_up_2_or_rest]
         for _ in range_(sys.maxsize):
             # Emit FFN input in branch-major group order so each branch receives
             # only its assigned ffn_col_group_count tiles.
             for branch_idx in range(effective_ffn_branches):
-                of_out_up = of_out_up_list[branch_idx]
+                if route_remaining_branches and branch_idx >= 1:
+                    of_out_up = of_out_up_list[2]
+                else:
+                    of_out_up = of_out_up_list[branch_idx]
                 for branch_group_idx in range_(ffn_col_group_counts[branch_idx]):
                     for col_idx in range_(ln_tiles_per_q_block):
                         col_i32 = index.casts(T.i32(), col_idx)
@@ -1416,6 +1497,30 @@ def fused_mha(
                         of_out_up.release(1)
                         of_in_norm.release(1)
                         of_in_residual.release(1)
+
+    def core_fn_ln1_route_rest(
+        of_in_rest,
+        of_out_up_1,
+        of_out_up_2,
+        copy,
+    ):
+        for _ in range_(sys.maxsize):
+            # Branch-1 groups.
+            for _ in range_(ffn_col_group_counts[1]):
+                for _ in range_(ln_tiles_per_q_block):
+                    elem_in_rest = of_in_rest.acquire(1)
+                    elem_out_up_1 = of_out_up_1.acquire(1)
+                    copy(elem_in_rest, elem_out_up_1, seq_tile * emb_tile)
+                    of_out_up_1.release(1)
+                    of_in_rest.release(1)
+            # Branch-2 groups.
+            for _ in range_(ffn_col_group_counts[2]):
+                for _ in range_(ln_tiles_per_q_block):
+                    elem_in_rest = of_in_rest.acquire(1)
+                    elem_out_up_2 = of_out_up_2.acquire(1)
+                    copy(elem_in_rest, elem_out_up_2, seq_tile * emb_tile)
+                    of_out_up_2.release(1)
+                    of_in_rest.release(1)
 
     def core_fn_ffn_up_proj_single(
         of_in_a_curr,
@@ -1907,13 +2012,37 @@ def fused_mha(
                 memR.cons(),
                 ln1_weight_buffer,
                 outLN[0].prod() if effective_ffn_branches > 0 else None,
-                outLN[1].prod() if effective_ffn_branches > 1 else None,
-                outLN[2].prod() if effective_ffn_branches > 2 else None,
+                (
+                    None
+                    if ffn_requires_ln1_router
+                    else (outLN[1].prod() if effective_ffn_branches > 1 else None)
+                ),
+                (
+                    outLNRest.prod()
+                    if ffn_requires_ln1_router
+                    else (outLN[2].prod() if effective_ffn_branches > 2 else None)
+                ),
                 ln_mul_add_kernel,
                 mem_copy_o_proj,
                 addnorm1_debug_mode,
+                ffn_requires_ln1_router,
             ],
             placement=Tile(col=ln1_post_tile[0], row=ln1_post_tile[1]),
+            while_true=False,
+        )
+    ln1_route_worker = None
+    if ffn_requires_ln1_router:
+        if ln1_route_tile is None:
+            raise ValueError("Missing LN1 route tile for multi-branch fanout")
+        ln1_route_worker = Worker(
+            core_fn_ln1_route_rest,
+            fn_args=[
+                outLNRest.cons(),
+                outLN[1].prod(),
+                outLN[2].prod(),
+                mem_copy_o_proj,
+            ],
+            placement=Tile(col=ln1_route_tile[0], row=ln1_route_tile[1]),
             while_true=False,
         )
 
@@ -2395,6 +2524,8 @@ def fused_mha(
             rt.start(o_proj_workers[i])
         rt.start(ln1_norm_worker)
         rt.start(ln1_muladd_worker)
+        if ln1_route_worker is not None:
+            rt.start(ln1_route_worker)
         for branch_idx in range(effective_ffn_branches):
             rt.start(ffn_up_workers[branch_idx])
             rt.start(ffn_down_workers[branch_idx])

@@ -60,3 +60,17 @@ Assumptions used for percentages:
 - The `seq_len` variants with the same `(heads, parallel_heads, proj_acc_depth, nB_tiles_distributed)` have identical placement/utilization, which matches expectations because tile graph shape is independent of sequence length here.
 - Peak compute-tile L1 is consistently ~87.5%, so L1 headroom is limited but non-zero in all tested designs.
 - Highest mem-tile DMA output pressure appears in `6pheads` designs (6/6 channels on at least one mem tile).
+
+## Revalidation Update (2026-03-05)
+
+- Re-ran encoder pipeline tests after the latest FFN branch-mapping/reduction changes:
+  - `rm -r ./build` (executed as `rm -rf ./build`)
+  - `source /opt/xilinx/xrt/setup.sh`
+  - `source ~/iron/ironenv/bin/activate`
+  - `pytest operators/encoder_pipeline/test.py -q`
+  - Result: `55 passed`
+- Regenerated `.mlir.prj` artifacts are present for all 11 designs listed in this document.
+- Effective generated topology for these tested designs remains the same resource shape as this table:
+  - `1pheads` designs: single FFN branch.
+  - `6pheads` and `4pheads` test designs: FFN branch requests are still resource-pruned under current channel limits, so compute/memory footprints stay aligned with the entries above.
+- MHA/AddNorm/FFN block locations for the tested designs remain consistent with the “Block Locations” table above.
