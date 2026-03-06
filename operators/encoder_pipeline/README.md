@@ -69,7 +69,9 @@ Internally, `op.py` resolves `debug` into:
       are computed once and replayed across FFN column groups.
     - residual stream for AddNorm2 is staged through `ffnROut -> ffnRIn`:
       - single-branch FFN path: emitted by LN1 mul+add core.
-      - multi-branch FFN path: emitted by FFN-up branch 0.
+      - 2-branch path with LN1 two-branch router enabled: emitted by LN1 mul+add core,
+        then LN1 route split fans out FFN branch traffic.
+      - other multi-branch paths: emitted by FFN-up branch 0.
   - FFN path:
     - `outLN + B_Up -> FFN up (with GeLU) -> ffnUpOut`
     - `ffnUpOut + B_Down -> FFN down`, with accumulation queue in `ffnDownAccum`.
@@ -101,7 +103,7 @@ Internally, `op.py` resolves `debug` into:
 `nB_tiles_distributed` is the requested FFN branch count. The generated design may reduce it at
 compile time when placement/channel limits are hit:
 
-1. Initial clamp to available mapped branch tiles.
+1. Initial clamp to available mapped branch tiles (mapping now searches up to 6-branch chains).
 2. If no spare free tile remains for LN1-post (and optional LN1-route) worker placement,
    non-root branches are pruned.
 3. Inline FFN reduction is mapped in `ffn_addnorm` style (`ffnDownReduce*` chain), but
@@ -109,10 +111,14 @@ compile time when placement/channel limits are hit:
    consumes three input DMA streams per down core.
 4. Because of (3), adding the reduction input stream can exceed down-core input DMA channel
    budget, so multi-branch requests are pruned until feasible.
-5. Additional memtile BD/channel feasibility guards are applied for high-acc configurations:
-   - `parallel_heads >= 6` with `proj_acc_depth >= 6`: prune to a single branch.
-   - `parallel_heads >= 4` with `proj_acc_depth >= 8`: prune to a single branch.
-6. Standard compute tile budget check (`<= 32` total compute tiles) is also enforced.
+5. Shim-output budget check is applied for FFN weight streams (`B_Up` + `B_Down`).
+6. High-acc tail liveness/BD guard is applied for `proj_acc_depth >= 6`, currently pruning to a
+   single physical FFN branch for stable execution.
+7. Standard compute tile budget check (`<= 32` total compute tiles) is also enforced.
+
+When physical branches are pruned below requested `nB_tiles_distributed`, the requested `nB`
+value is still used as a logical FFN partition count and those logical parts are mapped onto the
+remaining physical branch workers.
 
 The effective branch count is logged by `design.py` at compile time.
 
@@ -186,13 +192,45 @@ full-pipeline liveness/correctness is sensitive to tail DMA order.
 - `ENCODER_FORCE_SINGLE_BRANCH_HIGH_ACC`:
   - default unset -> `true` (keep conservative single-branch fallback for `parallel_heads>=4` and `proj_acc_depth>=8`)
   - set to `0|false|off|no` -> allow multi-branch attempt (may fail compile due memtile BD/channel limits)
+- `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6`:
+  - default unset -> `true` (keep conservative single-branch fallback for `proj_acc_depth>=6`)
+  - set to `0|false|off|no` -> allow multi-branch attempt (may fail compile or runtime liveness)
 - `ENCODER_LN2_REPLAY_MEM_TILE_COL`:
   - memtile column for LN2 replay staging in the FFN-down/AddNorm2 handoff path
   - default is `4` in current implementation
 - `ENCODER_EMIT_LN2_REPLAY_FROM_DOWN`:
   - default unset -> `true` (final FFN-down core emits replay pass directly to LN2 input)
   - set to `0|false|off|no` -> enable LN2 replay memtile FIFO path (higher memtile pressure)
+- `ENCODER_BRANCH_STAGE_COLS`:
+  - low-head (`parallel_heads<6`) override for FFN stage memtile column pool
+  - must provide 6 comma-separated ints (same arity as default pool)
+- `ENCODER_BRANCH_BUP_COLS`:
+  - low-head (`parallel_heads<6`) override for FFN `B_Up` memtile columns
+  - must provide one column per effective FFN branch
+- `ENCODER_BRANCH_DOWN_B_COLS`:
+  - low-head (`parallel_heads<6`) override for FFN `B_Down` memtile columns
+  - must provide one column per effective FFN branch
+- `ENCODER_FFN_BRANCH_START_IDX`:
+  - override starting branch index of the contiguous selected FFN branch subset
+  - default selects a suffix ending at the layout-preferred root
+- `ENCODER_FFN_GROUP_SPLIT`:
+  - override physical FFN group counts per effective branch (comma-separated)
+  - values must be `>0`, one per effective branch, summing to `profile_replay_groups`
+- `ENCODER_ENABLE_LN1_TWO_BRANCH_ROUTER`:
+  - default unset -> `true` for `proj_acc_depth>=6`, else `false`
+  - when enabled for effective 2-branch FFN, inserts one LN1 route worker so LN1 can emit
+    AddNorm2 residual directly (improves replay/order stability for 2-branch high-acc tails)
+- `ENCODER_BYPASS_LN_TO_FFN_STAGE`:
+  - controls LN1->FFN memtile staging bypass
+  - default unset enables bypass for high-acc multi-branch when LN1 two-branch router mode is active
+  - set to `0|false|off|no` to force staging path (can increase memtile BD pressure)
+- `ENCODER_FFN_DOWN_REDUCE_DEPTH`:
+  - override depth for `ffnDownReduce*` inter-branch reduction FIFOs (default `1`)
+- `ENCODER_FFN_DOWN_OUT_DEPTH`:
+  - override depth for `ffnDownOut` FIFO (default follows internal heuristic)
 
 Note:
 - FFN-down replay-from-down (`ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=1`) keeps full-row LN behavior while freeing LN2 replay memtile channels/BDs.
 - LN2 replay FIFO mode (`ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0`) is still available for targeted experiments.
+- Even with force-single overrides disabled, `proj_acc_depth >= 6` currently has an additional
+  stability guard that prunes to one physical FFN branch.

@@ -1457,3 +1457,248 @@ Implemented stable resource-relief change:
 Validation:
 1. `rm -rf ./build && pytest operators/encoder_pipeline/test.py -q --iterations 1`
    - Result: `11 passed in 284.43s (0:04:44)`.
+
+## Progress Update (2026-03-05): Updated Test Matrix Revalidation
+
+User-updated test parameters in `operators/encoder_pipeline/test.py`:
+- `6pheads` cases changed from `3pffn` to `2pffn`.
+- `4pheads, 8acc` cases changed from `3pffn` to `6pffn`.
+
+Validation:
+1. `rm -rf ./build`
+2. `source /opt/xilinx/xrt/setup.sh`
+3. `source ~/iron/ironenv/bin/activate`
+4. `pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - Result: `11 passed in 285.40s (0:04:45)`.
+
+## Progress Update (2026-03-05): `parallel_ffn` Sweep + FFN Parallelization Checks
+
+User-updated matrix (current `test.py`) emphasizes:
+- `1pheads`: `parallel_ffn` in `{1,2,6}` (all `proj_acc_depth=6`)
+- `2pheads`: `parallel_ffn=2`
+- `6pheads`: `parallel_ffn=1`
+
+Implemented changes:
+1. Increased FFN layout search capacity:
+   - `mapping_validation.find_ffn_layout()` chain search cap from 3 to 6.
+2. Generalized LN1 fanout infrastructure to support >3-branch topologies:
+   - Route-worker chain (`N-2`) and route-stream chain.
+3. Added shim-output budget pruning for FFN weight streams:
+   - checks `B_Up/B_Down` stream feasibility against shim output channel capacity.
+4. Added high-acc (`proj_acc_depth >= 6`) stability guard:
+   - prunes to one physical FFN branch to avoid observed BD/liveness failures.
+5. Kept requested `nB_tiles_distributed` as logical partition count:
+   - logical FFN partitions are mapped onto feasible physical branches.
+
+Key findings from targeted runs (`encoder_..._1pheads_6pffn_6pacc`):
+- Pure multi-branch attempts showed cascading constraints:
+  - shim output-channel over-subscription,
+  - then memtile BD-ID exhaustion,
+  - and runtime timeouts (`ERT_CMD_STATE_TIMEOUT`) on compile-feasible variants.
+- Clean-run warnings confirm pruning path:
+  - `6 -> 5` (shim output budget)
+  - `5 -> 4` (invalid neighbor reduction chain subset)
+  - `4 -> 3 -> 2 -> 1` (high-acc tail stability guard)
+
+Validation:
+1. Targeted cases:
+   - `1pheads_2pffn_6pacc`: passed.
+   - `1pheads_6pffn_6pacc`: passed (with expected pruning warnings).
+2. Full current matrix:
+   - `rm -rf ./build && pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - Result: `5 passed in 87.44s`.
+
+## Progress Update (2026-03-05): `parallel_ffn=6` Physical-Parallelism Recheck
+
+Goal:
+- Re-run encoder pipeline tests and verify whether `parallel_ffn=6` is implemented as true physical FFN branch parallelism (ffn_addnorm-style split across branch cores).
+
+Baseline verification (current tree):
+1. `rm -rf ./build && source /opt/xilinx/xrt/setup.sh && source ~/iron/ironenv/bin/activate && pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - Result: `5 passed in 88.00s`.
+2. Inspected generated MLIR for `encoder_..._1ph_6acc_6nbdist_...mlir`:
+   - Only single FFN branch FIFOs present (`@ffnUpOut`, `@ffnDownPart`, single `@memBUp/@memBDown` pair).
+   - No multi-branch `ffnUpOut{idx}` / `ffnDownReduce{idx}` objects.
+   - Conclusion: with current guards, `parallel_ffn=6` is logical partitioning, not 6 physical FFN branches.
+
+Experiment to force physical multi-branch:
+- Temporarily removed the blanket high-acc prune:
+  - `if proj_acc_depth >= 6 and len(selected_branch_indices) > 1: ...`.
+
+Observed failures:
+1. `1pheads_6pffn_6pacc` compile failure:
+   - `aie.dma_bd Allocator exhausted available BD IDs (maximum 48 available).`
+   - pruning chain before failure:
+     - `6 -> 5` (shim output budget),
+     - `5 -> 4` (invalid neighbor reduction subset),
+     - fail at 4-branch candidate (BD exhaustion).
+2. `1pheads_2pffn_6pacc` runtime timeout:
+   - `ERT_CMD_STATE_TIMEOUT` during warmup runlist.
+3. Switching LN2 replay source (`ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0`) did not resolve `2pffn` timeout.
+
+Final action:
+- Restored high-acc prune block to maintain stable test behavior.
+- Re-validated:
+  - `rm -rf ./build && source /opt/xilinx/xrt/setup.sh && source ~/iron/ironenv/bin/activate && pytest operators/encoder_pipeline/test.py -q --iterations 1`
+  - Result: `5 passed in 88.73s`.
+
+Current status:
+- `parallel_ffn=6` remains implemented as 6 logical FFN partitions mapped onto 1 physical FFN branch for `proj_acc_depth=6` test cases due current memtile BD/liveness constraints in multi-branch tail staging.
+
+## Progress Update (2026-03-05): Next-Step Topology Pass (Forced Multi-Branch)
+
+Goal:
+- Proceed with next topology step toward real FFN physical parallelization while preserving default test stability.
+
+Code adjustments (default behavior unchanged):
+1. Added env gate for blanket `proj_acc_depth>=6` single-branch guard:
+   - `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6` (default `true`).
+2. Added low-head branch-stage placement override:
+   - `ENCODER_BRANCH_STAGE_COLS` (same-length override as default stage-col pool).
+3. Added env-controlled FFN-down FIFO depth knobs:
+   - `ENCODER_FFN_DOWN_REDUCE_DEPTH` (default `1`)
+   - `ENCODER_FFN_DOWN_OUT_DEPTH` (default previous behavior).
+4. Added 2-branch AddNorm1 feed interleaving path (paired group emission) to reduce branch starvation risk before down-reduction.
+5. Reordered runtime tail weight fills to issue all `B_Up` branch fills before `B_Down` branch fills.
+
+Forced 2-branch diagnostics (`1pheads_2pffn_6pacc`, with `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0`):
+1. Debug sweep (`ENCODER_PIPELINE_DEBUG_MODE in {-1,3,4,5,6,7}`):
+   - Modes `-1, 3, 4, 5`: runtime timeout (`ERT_CMD_STATE_TIMEOUT`, `ctx_pc=0x28B060AD`).
+   - Mode `6`: pass (this mode prunes to single FFN branch via stage-profile rule).
+   - Mode `7`: executes but expected numerical mismatch; logs confirm single-branch prune.
+2. Tail wait-mode experiments:
+   - `ENCODER_TAIL_WAIT_MODE=relax_ffn_weights` and `relax_all_tail`: still timeout.
+3. Mapping sweep (`ENCODER_BRANCH_STAGE_COLS` + `ENCODER_LN1_REPLAY_MEM_TILE_COL`):
+   - Several variants compile then timeout at same PC.
+   - Several variants fail compile with memtile BD allocator exhaustion.
+4. Deeper down-reduction buffering:
+   - `ENCODER_FFN_DOWN_REDUCE_DEPTH>=2` causes L1 overflow on down core tile (compile failure).
+
+Result:
+- No forced 2-branch (`acc_depth=6`) configuration found that is both compile-clean and runtime-clean in this pass.
+- Failures remain split between:
+  - compile-time resource failures (`aie.dma_bd` exhausted, or tile L1 overflow),
+  - runtime timeout at the same program counter for compile-feasible multi-branch variants.
+
+Stability check:
+1. Restored default path (no force-disable envs) and revalidated:
+   - `rm -rf ./build && source /opt/xilinx/xrt/setup.sh && source ~/iron/ironenv/bin/activate && pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - Result: `5 passed in 86.82s`.
+
+Current status after this pass:
+- Default matrix remains green with conservative high-acc pruning.
+- Forced multi-branch (`acc_depth=6`) still not viable with current topology/resource envelope.
+
+## Progress Update (2026-03-06): Deeper Topology/Reduction Root-Cause Pass
+
+Goal:
+- Continue from previous step and probe deeper FFN-tail topology/reduction behaviors for forced `2` physical branches in `1pheads_2pffn_6pacc`.
+
+Additional env-gated tooling added:
+1. Low-head weight stream placement overrides:
+   - `ENCODER_BRANCH_BUP_COLS`
+   - `ENCODER_BRANCH_DOWN_B_COLS`
+2. Contiguous branch-subset start override:
+   - `ENCODER_FFN_BRANCH_START_IDX`
+3. Physical FFN group-count override:
+   - `ENCODER_FFN_GROUP_SPLIT`
+
+Additional structural experiments:
+1. B-weight memtile remap sweep (`ENCODER_BRANCH_BUP_COLS`/`ENCODER_BRANCH_DOWN_B_COLS`), prioritizing root `B_Down` away from col7:
+   - all tested variants still timed out with same signature:
+     - `ERT_CMD_STATE_TIMEOUT`, `ctx_pc=0x28B060AD`.
+2. Non-default branch-root sweeps (`ENCODER_FFN_BRANCH_START_IDX=0..4`):
+   - `start=0`: compile fails (tile L1 overflow on selected down root tile).
+   - `start=1,2,3,4`: compile-feasible variants still timeout with same `ctx_pc`.
+3. Asymmetric group split sweeps (`ENCODER_FFN_GROUP_SPLIT`):
+   - `12,12`, `8,16`, `4,20`, `16,8`: timeout with same `ctx_pc`.
+   - `1,23`: **runtime completes (no timeout)** but fails numerically (`28221` errors).
+
+Interpretation:
+- The timeout is strongly linked to FFN branch-reduction liveness when both branches contribute materially.
+- A highly asymmetric split (`1,23`) can avoid the deadlock, which indicates sensitivity to reduction-token timing/order.
+- However, the `1,23` case is numerically incorrect, pointing to a remaining reduction/data-mapping correctness issue even when liveness is preserved.
+
+Stability check after this pass:
+1. Default validation:
+   - `rm -rf ./build && source /opt/xilinx/xrt/setup.sh && source ~/iron/ironenv/bin/activate && pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - Result: `5 passed in 86.64s`.
+
+Current state:
+- Baseline remains stable and fully passing.
+- Forced `2`-branch `acc=6` remains unresolved: either timeout (`ctx_pc=0x28B060AD`) or, in one liveness-relaxed split, large numerical mismatch.
+
+## Progress Update (2026-03-06): Focused 2-Branch Replay/Order Fix
+
+Goal:
+- Continue the forced multi-branch (`proj_acc_depth=6`) debug path and fix the replay/order mismatch without changing test thresholds.
+
+Root-cause narrowing:
+1. Forced `1pheads_2pffn_6pacc` with `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0` and split `1,23` reproduced the known full-mode numerical failure (`28221` errors).
+2. Debug sweeps on the same forced case:
+   - `debug=1` (AddNorm stages copy input): **pass**
+   - `debug=2` (AddNorm stages copy residual): **fail**
+   - `debug=3/4/5` (FFN stage-only profiles): **pass**
+3. Interpretation:
+   - FFN up/down kernels were not the direct mismatch source.
+   - Failure localized to AddNorm2 residual-path alignment in multi-branch topology.
+   - Existing multi-branch residual source (`ffn_up` branch0 emission) was sensitive to branch timing/skew.
+
+Implemented focused patch:
+1. Added a 2-branch LN1 routing mode so LN1 can emit residual directly (single-branch-like behavior) while still splitting FFN inputs:
+   - LN1 mul/add uses `core_fn_ln1_mul_add_single` -> `ln1_route_streams[0]` + `ffnROut`.
+   - One LN1 route worker (`core_fn_ln1_route_split`) fans LN1 output to `outLN[0]` and `outLN[1]` by configured group counts.
+   - FFN-up residual capture is disabled for this mode.
+2. Kept this mode scoped by default to high-risk low-head/high-acc shape:
+   - new env knob: `ENCODER_ENABLE_LN1_TWO_BRANCH_ROUTER`
+   - default at this step: `true` when `parallel_heads==1 && proj_acc_depth>=6`, else `false`
+     (broadened later in the same day; see next update).
+3. Updated docs (`README.md`) for this behavior and knob.
+
+Validation results:
+1. Default matrix (no forced env):
+   - `pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - Result: `5 passed`.
+2. Forced 2-branch target:
+   - `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0 -k "1pheads_2pffn_6pacc"`: **pass**
+   - `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0 ENCODER_PIPELINE_DEBUG_MODE=2 -k "1pheads_2pffn_6pacc"`: **pass**
+   - `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0 ENCODER_FFN_GROUP_SPLIT=1,23`:
+     - `debug=2`: **pass**
+     - `debug=-1`: **pass**
+3. Forced full matrix (`ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0`):
+   - `3 passed, 2 failed`.
+   - Remaining failures are compile-time memtile BD allocator exhaustion (`max 48`) for:
+     - `2pheads_2pffn_6pacc`
+     - `1pheads_6pffn_6pacc`
+   - No threshold/tolerance changes were made.
+
+## Progress Update (2026-03-06): High-Acc 2-Branch Default Tuning
+
+Goal:
+- Improve forced multi-branch coverage beyond `1pheads_2pffn_6pacc` while preserving default-matrix stability.
+
+Experiments:
+1. `2pheads_2pffn_6pacc` under forced multi-branch:
+   - baseline (after focused fix): compile-time BD exhaustion.
+   - `ENCODER_BYPASS_LN_TO_FFN_STAGE=1` only: compile succeeded but runtime timeout (`ctx_pc=0x28B060AD`).
+   - `ENCODER_BYPASS_LN_TO_FFN_STAGE=1` + `ENCODER_ENABLE_LN1_TWO_BRANCH_ROUTER=1`: **pass**.
+
+Implemented tuning:
+1. Broadened `ENCODER_ENABLE_LN1_TWO_BRANCH_ROUTER` default to high-acc generally:
+   - default `true` when `proj_acc_depth>=6`.
+2. Broadened default LN1->FFN staging bypass activation for high-acc multi-branch when LN1 two-branch router mode is enabled.
+   - retains env override via `ENCODER_BYPASS_LN_TO_FFN_STAGE`.
+
+Validation:
+1. Forced targeted cases (`ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0`):
+   - `1pheads_2pffn_6pacc`: **pass**
+   - `2pheads_2pffn_6pacc`: **pass**
+   - `1pheads_6pffn_6pacc`: still **fails** with runtime timeout (`ctx_pc=0x28B060AD`) after pruning `6->5->4`.
+2. Forced full matrix:
+   - `4 passed, 1 failed` (only `1pheads_6pffn_6pacc` remains failing).
+3. Default matrix (no forced env):
+   - `5 passed`.
+
+Current status:
+- 2-branch high-acc forced cases (`1pheads_2pffn`, `2pheads_2pffn`) are now stable and passing.
+- Remaining blocker is higher-branch forced case (`1pheads_6pffn_6pacc`) with runtime liveness timeout.
