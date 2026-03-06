@@ -10,6 +10,14 @@ MHA + AddNorm1 + FFN + AddNorm2.
   - Defines object FIFOs, worker kernels, tile placement, tensor access patterns, and runtime fill/drain sequence.
   - Includes CLI entrypoint (`main`) to emit MLIR to `build/encoder_pipeline.mlir` (or a provided output path).
 
+- `design_ln1_ddr.py`
+  - DDR-staged LN1 wrapper entrypoint.
+  - Forwards to `design.py:fused_mha` with `ln1_stage_mode="ddr"`.
+
+- `design_ln1_memtile.py`
+  - Memtile-staged LN1 wrapper entrypoint.
+  - Forwards to `design.py:fused_mha` with `ln1_stage_mode="memtile"`.
+
 - `op.py`
   - Runtime-facing operator wrapper class: `AIEEncoderPipeline`.
   - Validates shape/depth constraints, builds compile artifacts, sets up runtime buffers, and runs the kernel.
@@ -55,7 +63,7 @@ Internally, `op.py` resolves `debug` into:
 
 - Host-facing buffer packing:
   - `QKV` packs `[Q; K; V]` row-wise.
-  - `OR` packs `[output_region; residual]` row-wise.
+  - `OR` packs `[output_region; residual; ln1_stage_scratch]` row-wise.
   - `B_Up` and `B_Down` are flat host buffers; `TensorAccessPattern`s in `design.py` define their logical 2D tile order.
   - Runtime aliases `O` to the first half of `OR`.
 
@@ -77,6 +85,13 @@ Internally, `op.py` resolves `debug` into:
     - `ffnUpOut + B_Down -> FFN down`, with accumulation queue in `ffnDownAccum`.
     - when multiple FFN branches are active, down-proj branches reduce in a chain
       (`ffnDownReduce*`) into a final/root branch before AddNorm2.
+    - LN1 DDR staging mode (default design path, `ENCODER_LN1_STAGING_DESIGN=ddr`):
+      - LN1 branch outputs drain via memtile/shim to host staging buffer.
+      - FFN-up A inputs are refilled from host staging buffer via shim/memtile.
+      - runtime uses a one-step interleave pipeline:
+        - first staged drain is explicitly waited (bootstrap),
+        - then previous-tap refill/output and current-tap MHA-side fills are overlapped,
+        - current-tap staged refill is carried as pending work to the next tap.
   - Final norm:
     - `ffnDownOut + ffnRIn -> AddNorm2 -> outLN2 -> memLN2 -> drain to OR/O`.
 
@@ -112,8 +127,8 @@ compile time when placement/channel limits are hit:
 4. Because of (3), adding the reduction input stream can exceed down-core input DMA channel
    budget, so multi-branch requests are pruned until feasible.
 5. Shim-output budget check is applied for FFN weight streams (`B_Up` + `B_Down`).
-6. High-acc tail liveness/BD guard is applied for `proj_acc_depth >= 6`, currently pruning to a
-   single physical FFN branch for stable execution.
+6. High-acc tail liveness/BD guard is applied for `proj_acc_depth >= 6`, currently capping to at
+   most 2 physical FFN branches for stable execution.
 7. Standard compute tile budget check (`<= 32` total compute tiles) is also enforced.
 
 When physical branches are pruned below requested `nB_tiles_distributed`, the requested `nB`
@@ -164,6 +179,28 @@ Notes:
 - Stage-only modes print latency/bandwidth and intentionally skip numeric assertions.
 - This is intended for bottleneck analysis, not functional correctness gating.
 
+### Scripted All-Mode Bottleneck Profiling
+
+For automated per-test-case sweeps across all debug modes (`-1..7`) and bottleneck detection,
+use:
+
+```bash
+python operators/encoder_pipeline/profile_debug_modes.py --clean-build
+```
+
+Useful options:
+- `--design ddr|memtile`:
+  choose LN1 staging design path for the run (default `ddr`)
+- `--case-index 0,2,4`:
+  run only selected generated test-case indices
+- `--warmup-iters N` / `--timed-iters N`:
+  control measurement iterations
+- `--output-json /tmp/encoder_profile.json`:
+  emit machine-readable results
+
+The script prints each mode latency/error status and reports the bottleneck stage among:
+`mha`, `addnorm1`, `ffn_up`, `ffn_down`, `addnorm2`.
+
 ## Experimental Tail-IO Toggle
 
 `design.py` supports an opt-in runtime-ordering experiment:
@@ -186,6 +223,13 @@ full-pipeline liveness/correctness is sensitive to tail DMA order.
 ## FFN Tail Mapping Knobs
 
 `design.py` also exposes guarded placement/pruning knobs for FFN-tail resource exploration:
+- `ENCODER_LN1_STAGING_DESIGN`:
+  - selects which design entry file is used by `AIEEncoderPipeline`:
+    - `ddr` (default): LN1 staged through DDR path (`design_ln1_ddr.py`)
+    - `memtile`: LN1 staged on memtile path (`design_ln1_memtile.py`)
+  - aliases accepted:
+    - DDR: `ddr`, `dram`, `host`
+    - Memtile: `memtile`, `mt`, `onchip`
 - `ENCODER_FORCE_SINGLE_BRANCH_WIDE_ACC`:
   - default unset -> `true` (keep conservative single-branch fallback for `parallel_heads>=6` and `proj_acc_depth>=6`)
   - set to `0|false|off|no` -> allow multi-branch attempt (may fail compile due memtile BD/channel limits)
@@ -212,6 +256,26 @@ full-pipeline liveness/correctness is sensitive to tail DMA order.
 - `ENCODER_BRANCH_DOWN_B_COLS`:
   - low-head (`parallel_heads<6`) override for FFN `B_Down` memtile columns
   - must provide one column per effective FFN branch
+- `ENCODER_USE_B_WEIGHT_SPLIT`:
+  - default unset -> `false`
+  - when set to `1|true|on|yes`, enables experimental packed `B_Up`/`B_Down` shim streams with memtile `split(...)` fanout per FFN branch chunk
+  - currently intended for bring-up only; runtime liveness is not yet stable on all high-acc profiles
+- `ENCODER_USE_BUP_SPLIT`:
+  - applies when `ENCODER_USE_B_WEIGHT_SPLIT` is enabled
+  - default unset -> `true`
+  - controls whether `B_Up` uses packed+split ingress (`1`) or legacy per-branch ingress (`0`)
+- `ENCODER_USE_BDOWN_SPLIT`:
+  - applies when `ENCODER_USE_B_WEIGHT_SPLIT` is enabled
+  - default unset -> `true`
+  - controls whether `B_Down` uses packed+split ingress (`1`) or legacy per-branch ingress (`0`)
+- `ENCODER_B_WEIGHT_SPLIT_CHUNK_SIZE`:
+  - applies only when `ENCODER_USE_B_WEIGHT_SPLIT` is enabled
+  - controls branches per packed B stream chunk (default `min(3, effective_ffn_branches)`)
+  - must be `> 0`
+- `ENCODER_B_WEIGHT_SPLIT_PARENT_DEPTH`:
+  - applies when either `ENCODER_USE_BUP_SPLIT` or `ENCODER_USE_BDOWN_SPLIT` is enabled
+  - controls packed parent ObjectFifo depth (default `max(2, legacy_depth)`)
+  - must be `> 0`
 - `ENCODER_FFN_BRANCH_START_IDX`:
   - override starting branch index of the contiguous selected FFN branch subset
   - default selects a suffix ending at the layout-preferred root
@@ -226,6 +290,20 @@ full-pipeline liveness/correctness is sensitive to tail DMA order.
   - controls LN1->FFN memtile staging bypass
   - default unset enables bypass for high-acc multi-branch when LN1 two-branch router mode is active
   - set to `0|false|off|no` to force staging path (can increase memtile BD pressure)
+- `ENCODER_STAGE_LN1_TO_DDR`:
+  - legacy/low-level override only when invoking `design.py` directly
+    (the operator-level knob is `ENCODER_LN1_STAGING_DESIGN` and defaults to DDR).
+  - default unset -> `true` in `design.py`
+  - when enabled (`1|true|on|yes`), stages LN1->FFN A-stream through host DDR:
+    - `LN1 -> memtile -> shim -> host` drain, then
+    - `host -> shim -> memtile -> FFN-up` fill.
+  - uses the appended `ln1_stage_scratch` region inside `OR` (no extra kernel argument).
+  - if enabled, `ENCODER_BYPASS_LN_TO_FFN_STAGE` is forced off.
+  - runtime now schedules LN1 refills and FFN weight fills together to avoid handoff deadlocks.
+  - staged multi-branch drains are issued in one task-group to avoid LN1 fanout backpressure deadlocks.
+- `ENCODER_LN1_DDR_STAGE_FIFO_DEPTH`:
+  - override memtile FIFO depth for LN1 DDR staging forwards (`memOutLNStageToDDR*` and staged `memOutLN*`)
+  - default `1` to reduce memtile BD pressure in staged larger-topology mappings.
 - `ENCODER_FFN_DOWN_REDUCE_DEPTH`:
   - override depth for `ffnDownReduce*` inter-branch reduction FIFOs (default `1`)
 - `ENCODER_FFN_DOWN_OUT_DEPTH`:
@@ -236,3 +314,5 @@ Note:
 - LN2 replay FIFO mode (`ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0`) is still available for targeted experiments.
 - Even with force-single overrides disabled, `proj_acc_depth >= 6` currently has an additional
   stability guard path for `>2` physical FFN branches.
+- Current staged validation (March 6, 2026):
+  - `ENCODER_LN1_STAGING_DESIGN=ddr pytest operators/encoder_pipeline/test.py -q --iterations 1` -> `5 passed`.
