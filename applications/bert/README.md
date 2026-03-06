@@ -44,3 +44,21 @@ python3 inference.py <weights_file_path> <config_file_path> [--num_samples NUM_S
 - `config_file_path`: Path to the config file (e.g., `config.json`).
 - `--num_samples`: (Optional) Set the number of samples to use for evaluation. Default is `10`.
 - `--fine_tune`: (Optional) Fine-tune the model before running evaluation.
+
+## AIE Operator Knobs
+
+The BERT app now supports explicit operator-level execution knobs in `aie_config`.
+
+- `use_aie_mha_to_an`: Use `mha_to_an` for MHA + output projection + AddNorm1.
+- `use_aie_ffn_addnorm`: Use `ffn_addnorm` (same behavior as legacy `use_aie_addnorm_ffn`).
+- `use_aie_encoder_pipeline`: Use the fused `encoder_pipeline` operator.
+- `encoder_operator`: Optional selector string (`none`, `mha_to_an`, `ffn_addnorm`, `encoder_pipeline`, `bert_encoder`).
+
+`encoder_operator` is an alias knob; when set, it overrides the corresponding fused-mode booleans.
+
+Example config files:
+- `config/config_offload_mha_to_an.json`
+- `config/config_offload_addnorm_ffn.json`
+- `config/config_offload_encoder_pipeline.json`
+
+Current limitation: `mha_to_an` and `encoder_pipeline` paths are wired for unmasked execution (`attention_mask=None`).

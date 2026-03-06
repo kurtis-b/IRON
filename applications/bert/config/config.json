@@ -28,6 +28,10 @@
     "use_aie_ffn": false,
     "use_aie_addandnorm": false,
     "use_aie_mha": false,
-    "use_aie_addnorm_ffn": false
+    "use_aie_addnorm_ffn": false,
+    "use_aie_mha_to_an": false,
+    "use_aie_ffn_addnorm": false,
+    "use_aie_encoder_pipeline": false,
+    "encoder_operator": "none"
   }
 }

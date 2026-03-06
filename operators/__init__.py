@@ -27,3 +27,7 @@ from .encoder_pipeline.op import AIEEncoderPipeline
 from .ffn.op import AIEFFN
 from .addnorm.op import AIEAddAndNorm
 from .ffn_addnorm.op import AIEFFNAN
+from .mha_to_an.op import AIEMHAOutProj
+
+# Backward-compatible alias used in some application code.
+AIEANFFN = AIEFFNAN

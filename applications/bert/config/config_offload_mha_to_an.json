@@ -24,14 +24,20 @@
     "use_aie_elementwise_add": false,
     "use_aie_elementwise_mul": false,
     "use_aie_transpose": false,
-    "use_aie_bert_encoder": true,
+    "use_aie_bert_encoder": false,
     "use_aie_ffn": false,
     "use_aie_addandnorm": false,
     "use_aie_mha": false,
     "use_aie_addnorm_ffn": false,
-    "use_aie_mha_to_an": false,
+    "use_aie_mha_to_an": true,
     "use_aie_ffn_addnorm": false,
     "use_aie_encoder_pipeline": false,
-    "encoder_operator": "none"
+    "encoder_operator": "mha_to_an",
+    "mha_to_an_seq_tile": 32,
+    "mha_to_an_kv_seq_tile": 64,
+    "mha_to_an_emb_tile": 96,
+    "mha_to_an_parallel_heads": 1,
+    "mha_to_an_o_proj_acc_depth": 8,
+    "mha_to_an_debug": -1
   }
 }

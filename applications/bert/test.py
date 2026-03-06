@@ -27,6 +27,8 @@ def generate_test_params():
         # "_offload_mha",
         # "_offload_mha_ffn",
         # "_offload_mha_addnorm_ffn",
+        # "_offload_mha_to_an",
+        # "_offload_encoder_pipeline",
     ]
 
     params = []

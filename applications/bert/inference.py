@@ -324,6 +324,72 @@ def dtype_from_string(inp):
     )
 
 
+def _apply_aie_config_defaults(aie_config):
+    defaults = {
+        "use_aie_gemm": False,
+        "use_aie_gelu": False,
+        "use_aie_softmax": False,
+        "use_aie_layernorm": False,
+        "use_aie_elementwise_add": False,
+        "use_aie_elementwise_mul": False,
+        "use_aie_transpose": False,
+        "use_aie_bert_encoder": False,
+        "use_aie_ffn": False,
+        "use_aie_addandnorm": False,
+        "use_aie_mha": False,
+        "use_aie_addnorm_ffn": False,
+        "use_aie_mha_to_an": False,
+        "use_aie_ffn_addnorm": False,
+        "use_aie_encoder_pipeline": False,
+        "encoder_operator": "none",
+    }
+    for key, value in defaults.items():
+        if not hasattr(aie_config, key):
+            setattr(aie_config, key, value)
+
+    # Keep legacy and new fused-FFN flags synchronized.
+    aie_config.use_aie_ffn_addnorm = bool(
+        aie_config.use_aie_ffn_addnorm or aie_config.use_aie_addnorm_ffn
+    )
+    aie_config.use_aie_addnorm_ffn = aie_config.use_aie_ffn_addnorm
+
+    mode = str(getattr(aie_config, "encoder_operator", "none")).strip().lower()
+    if mode in {"none", ""}:
+        return
+    if mode == "mha_to_an":
+        aie_config.use_aie_mha_to_an = True
+        aie_config.use_aie_ffn_addnorm = False
+        aie_config.use_aie_addnorm_ffn = False
+        aie_config.use_aie_encoder_pipeline = False
+        aie_config.use_aie_bert_encoder = False
+        return
+    if mode == "ffn_addnorm":
+        aie_config.use_aie_mha_to_an = False
+        aie_config.use_aie_ffn_addnorm = True
+        aie_config.use_aie_addnorm_ffn = True
+        aie_config.use_aie_encoder_pipeline = False
+        aie_config.use_aie_bert_encoder = False
+        return
+    if mode == "encoder_pipeline":
+        aie_config.use_aie_mha_to_an = False
+        aie_config.use_aie_ffn_addnorm = False
+        aie_config.use_aie_addnorm_ffn = False
+        aie_config.use_aie_encoder_pipeline = True
+        aie_config.use_aie_bert_encoder = False
+        return
+    if mode == "bert_encoder":
+        aie_config.use_aie_mha_to_an = False
+        aie_config.use_aie_ffn_addnorm = False
+        aie_config.use_aie_addnorm_ffn = False
+        aie_config.use_aie_encoder_pipeline = False
+        aie_config.use_aie_bert_encoder = True
+        return
+    raise ValueError(
+        "aie_config.encoder_operator must be one of "
+        "{none,mha_to_an,ffn_addnorm,encoder_pipeline,bert_encoder}"
+    )
+
+
 def load_bert_config(config_path=None):
     """Load BERT configuration from JSON file"""
     if config_path is None:
@@ -340,6 +406,7 @@ def load_bert_config(config_path=None):
             "num_labels", 2
         )  # Default to 2 if not specified
         config.aie_config.dtype = dtype_from_string(config.aie_config.dtype)
+        _apply_aie_config_defaults(config.aie_config)
 
     return config
 
