@@ -28,7 +28,7 @@ from operators import AIESoftmax
 from operators import AIEElementwiseAdd
 from operators import AIELayerNorm
 from operators import AIEAddAndNorm
-from operators import AIEANFFN
+from operators import AIEFFNAN
 from operators import AIEMHA
 
 
@@ -135,14 +135,18 @@ class BertSelfAttention(nn.Module):
         self.use_aie_mha = config.aie_config.use_aie_mha
         self.use_aie_gemm = config.aie_config.use_aie_gemm
 
-    def forward(self, hidden_states, attention_mask):
+    def project_qkv(self, hidden_states):
+        """Project hidden states to Q/K/V and reshape to (batch, heads, seq, head_dim)."""
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.attention_head_size)
-
-        # get all proj
         query_layer = self.query(hidden_states).view(*hidden_shape).transpose(1, 2)
         key_layer = self.key(hidden_states).view(*hidden_shape).transpose(1, 2)
         value_layer = self.value(hidden_states).view(*hidden_shape).transpose(1, 2)
+        return query_layer, key_layer, value_layer
+
+    def forward(self, hidden_states, attention_mask):
+        input_shape = hidden_states.shape[:-1]
+        query_layer, key_layer, value_layer = self.project_qkv(hidden_states)
 
         if self.use_aie_mha:
             attn_output = self.aie_mha(
@@ -277,7 +281,7 @@ class BertSelfOutput(nn.Module):
                 "gelu_stage": 1,
             }
             # Second Layer normalization kernel
-            self.anffn = AIEANFFN(
+            self.anffn = AIEFFNAN(
                 M=seq_len,
                 K=config.model_config.hidden_size,
                 N=config.model_config.intermediate_size,
