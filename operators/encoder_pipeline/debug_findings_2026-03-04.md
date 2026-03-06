@@ -1702,3 +1702,377 @@ Validation:
 Current status:
 - 2-branch high-acc forced cases (`1pheads_2pffn`, `2pheads_2pffn`) are now stable and passing.
 - Remaining blocker is higher-branch forced case (`1pheads_6pffn_6pacc`) with runtime liveness timeout.
+
+## Progress Update (2026-03-06): Pruning Policy Adjustment for Parallelization Intent
+
+Goal:
+- Reduce over-conservative pruning so requested `pffn=2` can parallelize by default, while keeping stability for known-problematic `>2` high-acc tails.
+
+Change:
+1. Adjusted high-acc pruning guard in `design.py`:
+   - prior behavior: with `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=true`, prune while `physical_branches > 1` (effectively forcing single branch).
+   - new behavior: prune while `physical_branches > 2`.
+2. Kept existing env knob name for compatibility (`ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6`) and documented the updated semantics in README.
+
+Validation:
+1. Default matrix:
+   - `pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - Result: `5 passed`.
+2. Targeted default `1pheads_2pffn_6pacc` with INFO logs:
+   - compile log reports:
+     - `nB_tiles_distributed(requested)=2 effective=2`
+   - confirms no prune-to-1 for this case.
+
+Interpretation:
+- The previous prune-to-1 policy did not align with the immediate FFN-parallelization objective for `pffn=2`.
+- The updated policy better matches intent by preserving 2-way FFN parallelism where stable.
+- Remaining pruning/limits still come from hard/observed constraints for larger branch counts (`>2`):
+  - shim output channel budget (`Q/K/V/W_O/R` + `B_Up/B_Down` streams),
+  - memtile BD budget,
+  - runtime liveness (`ctx_pc=0x28B060AD`) in higher-branch high-acc tails.
+
+## Progress Update (2026-03-06): `pffn=4` Bring-Up Attempt
+
+Goal:
+- Get true physical `pffn=4` working (not logically split onto fewer physical branches).
+
+Baseline observation:
+1. Default (`ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=true`) with `pffn=4`:
+   - passes, but with pruning to `effective=2`.
+2. True 4-branch run (`ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0`):
+   - compiles with `effective=4`,
+   - runtime deadlocks (`ERT_CMD_STATE_TIMEOUT`, `ctx_pc=0x28B060AD`).
+
+Diagnostics:
+1. Stage-profile isolation on true 4-branch case:
+   - failures: `full`, `up_only`, `down_only`, `addnorm2_only`
+   - passes: `mha_only`, `addnorm1_only` (these modes prune downstream FFN path)
+   - indicates deadlock is in FFN tail path.
+2. Tail wait-order sweeps:
+   - `strict`, `relax_ffn_weights`, `relax_ffn_weights_residual`, `relax_all_tail`:
+   - all still deadlock at same `ctx_pc`.
+3. FIFO depth sweeps:
+   - `ENCODER_FFN_DOWN_OUT_DEPTH>1`: compile fails due L1 overflow on final down tile.
+   - `ENCODER_FFN_DOWN_REDUCE_DEPTH=2`: compile fails due L1 overflow on intermediate down tile.
+4. Group-split sweeps:
+   - `6,6,6,6`, `1,1,1,21`, `1,1,11,11`, `1,5,6,12`, `3,3,3,15`:
+   - all deadlock at same `ctx_pc`.
+5. Branch-subset start sweep:
+   - non-default starts can shift failure mode to compile-time L1 overflow.
+   - default suffix (root-anchored) still deadlocks when true 4-branch is forced.
+6. B-weight memtile-column override sweeps:
+   - some mappings fail compile (shim output channel overflow),
+   - compile-feasible mappings still deadlock.
+
+Conclusion from this pass:
+- True physical 4-branch FFN (`pffn=4`, high-acc) remains unresolved.
+- Current stable behavior is:
+  - keep default pruning policy (now preserving up to 2 physical branches by default),
+  - true 4-branch remains blocked by FFN-tail liveness/resource interaction.
+
+Regression check:
+1. Default matrix:
+   - `pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - Result: `5 passed`.
+
+## Progress Update (2026-03-06): Root-Cause Determination for True `pffn=4`
+
+Question:
+- Is true physical `pffn=4` feasible for current high-acc path (`proj_acc_depth=6`)?
+
+What was verified:
+1. True 4-branch instantiation does happen when pruning is disabled:
+   - `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0`
+   - compile logs report `requested=4 effective=4`.
+2. Two failure regimes appear depending on staging/buffering:
+   - with LN1->FFN staging enabled (`ENCODER_BYPASS_LN_TO_FFN_STAGE=0`):
+     - frequent compile-time failures from hard resource limits:
+       - memtile BD exhaustion (`aie.dma_bd`, max 48),
+       - compute-tile L1 overflow on down chain/final down tile when increasing FIFO depth.
+   - with staging bypass (compile-feasible path):
+     - runtime deadlock persists with stable signature:
+       - `ERT_CMD_STATE_TIMEOUT`, `ctx_pc=0x28B060AD`.
+3. Deadlock persisted across all attempted liveness knobs:
+   - stage-profile modes (full/up/down/an2 fail; mha/an1 pass because downstream FFN path is de-emphasized),
+   - tail wait-order modes (`strict`, `relax_ffn_weights`, `relax_ffn_weights_residual`, `relax_all_tail`),
+   - FFN group split overrides (balanced and highly asymmetric),
+   - branch subset start offsets,
+   - B_Up/B_Down memtile-column remaps (compile-feasible variants still deadlock),
+   - LN1-route group interleaving tweak.
+
+Root-cause conclusion:
+- For the current architecture and constraints (notably full-row LN replay/staging requirement, high-acc `proj_acc_depth=6`, and the existing FFN down-chain/AddNorm2 two-pass handoff), true physical 4-branch FFN is blocked by a coupled resource+liveness limit:
+  1. resource side: limited memtile BD budget / per-tile L1 budget leaves little buffering headroom,
+  2. liveness side: 4-branch FFN down reduction chain exhibits persistent cyclic backpressure in runtime on compile-feasible mappings.
+
+Feasibility verdict:
+- **Not feasible with the current design structure and parameter envelope** without a larger architectural change.
+- Practical options to make true `pffn=4` feasible would require redesign-level changes (not simple knob tuning), e.g.:
+  - different FFN reduction topology (less serial down-chain pressure),
+  - moving part of reduction/replay traffic to a different staging domain (additional memtile/DDR choreography),
+  - reducing per-core buffering pressure via altered staging scheme.
+
+Current stable policy:
+- Keep default high-acc cap at up to 2 physical FFN branches (which is now passing and matches `pffn=2` parallelization intent).
+
+## Progress Update (2026-03-06): Additional `pffn>2` Attempts and Revalidation
+
+Goal:
+- Find a viable path for true physical FFN branching above 2 (`pffn=3/4`) on the `1pheads_6acc` profile.
+
+Additional experiments:
+1. Reproduced true 4-branch and stage sweep with device permissions:
+   - `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0` + stage profile case `64,64,12,3072,32,64,128,1,4,6`
+   - result unchanged:
+     - fail: `full`, `up_only`, `down_only`, `addnorm2_only`
+     - pass: `mha_only`, `addnorm1_only`
+     - signature unchanged: `ERT_CMD_STATE_TIMEOUT`, `ctx_pc=0x28B060AD`.
+2. Control check on true 2-branch:
+   - same stage sweep with case `...parallel_ffn=2...`
+   - result: pass (all selected modes).
+3. Branch-start topology sweep for true 3-branch (`ENCODER_FFN_BRANCH_START_IDX=0..3`):
+   - `start=0`: compile-time L1 overflow on down core (`tile(5,2)`).
+   - `start=1,2,3`: compile succeeds, runtime deadlock with same `ctx_pc`.
+4. Alternate ordering/buffering attempts:
+   - `ENCODER_FILL_BDOWN_REVERSE=0` (non-reverse B_Down fill order): still deadlock.
+   - `ENCODER_TAIL_WAIT_MODE=relax_ffn_weights`: still deadlock.
+   - `ENCODER_FFN_DOWN_REDUCE_DEPTH=2`: compile-time down-core L1 overflow.
+   - `ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0`: compile-time memtile BD-ID exhaustion.
+   - `ENCODER_BYPASS_LN_TO_FFN_STAGE=0`: compile-time memtile BD-ID exhaustion.
+5. Code-side focused patches attempted and then rolled back after failing to resolve deadlock:
+   - LN1 route ordering variants (branch-first/interleaved/primed-rest variants).
+   - FFN down reduction acquisition-order alignment toward `ffn_addnorm` style.
+   - extra experimental FIFO-depth knobs for LN1 route and FFN-up output links.
+   - none resolved true `pffn>2` runtime deadlock on compile-feasible mappings.
+
+State after rollback/revalidation:
+1. Reverted non-working experimental changes from this pass.
+2. Re-ran baseline matrix:
+   - `pytest operators/encoder_pipeline/test.py -q --iterations 1`
+   - result: `5 passed`.
+
+Conclusion (unchanged):
+- For this high-acc profile, true physical FFN branching above 2 remains blocked by the same coupled liveness/resource limit.
+- Current viable path remains capped physical branching (up to 2) with logical partitioning preserved via `nB_tiles_distributed`.
+
+## Progress Update (2026-03-06): Path-2 Redesign Attempt (Pairwise Reduction + Dual LN2 Input)
+
+Goal:
+- Continue with "path 2" (architectural redesign) for true physical `pffn>2` on `1pheads_6acc`.
+- Keep baseline/default matrix stable while probing true `pffn=3/4` (`ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0`).
+
+### Code-side experiments in this pass
+
+1. Completed staged-reduction wiring fix (source down cores write to staged producer FIFO endpoints).
+2. Tried staging FFN reduction links through memtiles for `>2` branches.
+3. Added multi-branch LN1 fanout balancing (branch0 vs rest interleaving when route workers are used).
+4. Implemented a larger topology change for `effective_ffn_branches in {3,4}`:
+   - pairwise FFN down reduction edges,
+   - two FFN down outputs into LN2 (`ffnDownOut0/ffnDownOut1`),
+   - LN2 merge path for dual FFN inputs before AddNorm2.
+
+### Hardware outcomes
+
+1. **Staged reduction via memtile (enabled)**:
+   - compile failure for true `pffn=4`:
+     - down compute tiles exceeded input DMA channels,
+     - representative pass errors at tiles `(5,4)`, `(5,5)`, `(6,5)`,
+     - invalid `aie.flow` with `dest_channel=-1`.
+   - conclusion: this staging mode is not viable with current down-core input mix.
+
+2. **Staged reduction disabled + LN1 balancing only**:
+   - true `pffn=4` compile succeeds,
+   - runtime still deadlocks in `full/up/down/an2` with unchanged signature:
+     - `ERT_CMD_STATE_TIMEOUT`, `ctx_pc=0x28B060AD`.
+
+3. **Pairwise reduction + dual LN2 input topology (active in MLIR)**:
+   - confirmed emitted objects include `ffnDownOut0/ffnDownOut1`, pairwise reduction links,
+   - true `pffn=4` still deadlocks (same `ctx_pc`) for balanced split.
+   - stage sweep remains unchanged:
+     - fail: `full`, `up_only`, `down_only`, `addnorm2_only`
+     - pass: `mha_only`, `addnorm1_only`.
+
+4. **LN2 replay from memtile (`ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0`) with dual-input topology**:
+   - compile failure at LN2 tile `(7,5)` due input DMA-channel limit.
+
+5. **Asymmetric split probes (liveness vs correctness)**:
+   - true `pffn=4` with `ENCODER_FFN_GROUP_SPLIT=1,1,1,21`:
+     - runtime completes (no timeout),
+     - large numerical failure (`28223` output mismatches).
+   - true `pffn=3` with `ENCODER_FFN_GROUP_SPLIT=1,1,22`:
+     - runtime completes,
+     - large numerical failure (`28220` mismatches).
+   - control: forced `2`-branch with `ENCODER_FFN_GROUP_SPLIT=1,23` still passes.
+
+### Interpretation
+
+- For true `pffn>2`, balanced splits still exhibit the same FFN-tail liveness failure (`ctx_pc=0x28B060AD`) across multiple topology variants.
+- Highly asymmetric splits can avoid deadlock but expose a correctness failure mode (large mismatch), indicating unresolved data alignment/reduction correctness under multi-branch timing skew.
+- Moving replay responsibility to LN2 memtile path is blocked by LN2 input-channel limits in the dual-input design.
+
+### Stability check
+
+- Default regression check remains green:
+  - `pytest operators/encoder_pipeline/test.py -q --iterations 1`
+  - result: `5 passed in 86.53s`.
+
+Current status after this pass:
+- Baseline/default path remains stable.
+- True physical `pffn=3/4` on `1pheads_6acc` is still unresolved under current resource/liveness envelope; path-2 variants tested so far did not produce a balanced, numerically-correct, deadlock-free configuration.
+
+## Progress Update (2026-03-06): Path-2 DDR Staging + Reducer Core Follow-up
+
+Goal:
+- Proceed with path-2 redesign and attempt a concrete deadlock break for true `pffn=4` (`1pheads_6acc`) using host DDR staging in FFN tail.
+
+### Implemented changes
+
+1. Added optional FFN-down DDR staging path for true multi-branch (`effective_ffn_branches in {3,4}`):
+   - stage one FFN-down output stream through shim/DDR and refill into array.
+2. Added explicit FFN down merge worker core:
+   - merges two FFN-down output streams into a single stream before LN2.
+3. Updated placement/tile accounting:
+   - reserves one additional free compute tile for the merge worker in 3/4-branch layouts.
+4. Fixed staging replay count bug:
+   - when `ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=1`, DDR staging now drains/fills both FFN replay passes.
+
+### Results
+
+1. True `pffn=4` with forced multi-branch (`ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0`) and stage profile:
+   - compile succeeds with reducer+DDR path active,
+   - runtime still times out in full/up/down/an2 modes with unchanged signature:
+     - `ERT_CMD_STATE_TIMEOUT`, `ctx_pc=0x28B060AD`.
+   - `mha_only` and `addnorm1_only` continue to pass.
+
+2. LN2 replay-from-FIFO variant with this path (`ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0`):
+   - compile failure due memtile BD-ID exhaustion (`aie.dma_bd` allocator limit).
+
+3. DDR stage column sweep (`ENCODER_FFN_DOWN_DDR_STAGE_COL=0,1,2`):
+   - all columns compile,
+   - all runtime timeout with same `ctx_pc`.
+
+### Interpretation
+
+- The path-2 DDR-staged FFN stream + dedicated merge core does not break the underlying FFN-tail liveness cycle for balanced true `pffn=4` under current constraints.
+- Remaining timeout signature is stable and unchanged, indicating the root liveness cycle is deeper than the tested staging/merge insertion points.
+
+### Stability check
+
+- Baseline/default test matrix remains stable:
+  - `pytest operators/encoder_pipeline/test.py -q --iterations 1`
+  - result: `5 passed in 86.42s`.
+
+## Progress Update (2026-03-06): Additional Path-2 Deadlock Probes (Post-Resume)
+
+Goal:
+- Continue path-2 debugging for true `pffn>2` (`1pheads_6acc`) and attempt focused fixes with hardware revalidation.
+
+Code changes attempted in this pass (`operators/encoder_pipeline/design.py`):
+1. `core_fn_ffn_down_merge`: switched acquire order to consume staged/secondary input first (`of_in1` before `of_in0`) to reduce head-of-line backpressure on the direct output branch.
+2. `core_fn_ln1_route_split`: added `prioritize_rest` path; enabled on first route stage when multi-output FFN tail is active, to push downstream "rest" branch traffic earlier.
+3. Runtime sequence update:
+   - split tail fills (`R`, `B_Up`, `B_Down`) into separate task group `tg_tail_fill`,
+   - deferred `finish_task_group(tg_tail_fill)` until after output drain,
+   - intent: avoid pre-drain barrier waiting on all FFN tail fills.
+
+Focused hardware results:
+1. Repro check (`pffn=4`, forced true branches):
+   - `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6=0`
+   - stage profile case: `64,64,12,3072,32,64,128,1,4,6`
+   - mode: `full`
+   - result after patches: unchanged runtime timeout
+     - `ERT_CMD_STATE_TIMEOUT`, `ctx_pc=0x28B060AD`.
+2. Isolation check (`pffn=4`, DDR staging disabled):
+   - `ENCODER_STAGE_FFN_DOWN_TO_DDR=0`
+   - same timeout signature (`ctx_pc=0x28B060AD`).
+3. Cross-check on `pffn=3` (forced true branches):
+   - same full-stage timeout signature (`ctx_pc=0x28B060AD`).
+4. Stage probes (`pffn=3`):
+   - `mha_only`: pass.
+   - `up_only`: timeout at same `ctx_pc`.
+   - confirms failure remains in FFN-tail plumbing path (not MHA-only path).
+5. Replay-source variant (`pffn=3`):
+   - `ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0`
+   - compile failure (allocator exhausted):
+     - `aie.dma_bd` max 48 exceeded.
+6. Regression sanity (`pffn=2` full stage profile):
+   - pass (error budget satisfied), no regression on stable 2-branch path.
+
+Interpretation from this pass:
+- The newly tested scheduling/backpressure-order fixes did not alter the deadlock signature for true `pffn>2`.
+- Deadlock remains tied to FFN-tail multi-branch path under high-acc (`proj_acc_depth=6`), and replay-from-FIFO alternative remains blocked by memtile BD budget.
+- Stable default path (`pffn<=2`) remains operational.
+
+## Progress Update (2026-03-06): Test-Harness Optimization (encoder_pipeline/test.py)
+
+Goal:
+- Reduce encoder_pipeline test turnaround time without changing numeric thresholds.
+
+Changes applied:
+1. Added cached golden-reference generation in `operators/encoder_pipeline/test.py`:
+   - `_cached_golden_reference(...)` with `@lru_cache(maxsize=64)`.
+   - avoids recomputing deterministic reference tensors for repeated case/debug combinations.
+2. Added env-configurable regular-test timing knobs:
+   - `ENCODER_PIPELINE_TEST_WARMUP_ITERS` (default: `3`)
+   - `ENCODER_PIPELINE_TEST_TIMED_ITERS` (default: `20`)
+   - replaces hardcoded `warmup=10`, `timed=100` in `test_encoder_pipeline`.
+3. Passed cloned LN weight tensors into operator construction:
+   - `ln1_weight=...clone()`, `ln2_weight=...clone()`
+   - keeps cached references immutable across repeated runs.
+
+Validation run (focused):
+1. Cleared build first:
+   - `rm -r ./build`
+2. Ran case:
+   - `pytest operators/encoder_pipeline/test.py -q -k "encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_128embtile_6pheads_2pffn_6pacc" -s --maxfail=1 --iterations 1`
+3. Result:
+   - pass (`1 passed`)
+   - latency: `39037.8 us`
+   - bandwidth: `3.928355e-01 GB/s`
+   - mismatch count stayed within configured budget (`212 <= 1966`).
+
+Notes:
+- No threshold/tolerance constants were changed.
+- Stage-profile path remains controlled by its own env knobs (`ENCODER_PIPELINE_STAGE_PROFILE_*`).
+
+## Progress Update (2026-03-06): Design Optimization for `pheads=6, pffn=2, acc=6`
+
+Goal:
+- Optimize encoder_pipeline design performance for test case:
+  - `64,64,12,3072,32,64,128,6,2,6`
+
+Baseline (before patch):
+1. Command (stage-profile full mode):
+   - `ENCODER_PIPELINE_STAGE_PROFILE=1`
+   - `ENCODER_PIPELINE_STAGE_PROFILE_CASE=64,64,12,3072,32,64,128,6,2,6`
+   - `ENCODER_PIPELINE_STAGE_PROFILE_MODES=none`
+   - `warmup=3`, `timed=20`
+2. Result:
+   - pass (error budget satisfied)
+   - latency: `4877.6 us`
+
+Diagnosis:
+1. `design.py` still had an aggressive pruning guard for wide-head/high-acc:
+   - when `parallel_heads >= 6` and `proj_acc_depth >= 6`, it pruned FFN branches down to 1 (`len(selected_branch_indices) > 1`).
+2. For this test (`pffn=2` requested), that behavior removed intended FFN parallelism and hurt latency.
+
+Patch applied (`operators/encoder_pipeline/design.py`):
+1. Updated wide-head/high-acc pruning threshold:
+   - from `len(selected_branch_indices) > 1`
+   - to `len(selected_branch_indices) > 2`
+2. Net effect:
+   - keep up to 2 FFN branches for `6pheads/6acc` path by default,
+   - still prune above 2 to respect known resource/liveness constraints.
+
+Validation (after patch):
+1. Re-ran same case and mode (no env override for pruning).
+2. Result:
+   - pass (error budget satisfied)
+   - latency: `3043.7 us`
+   - effective bandwidth increased accordingly.
+3. Generated MLIR confirms true 2-branch FFN is active:
+   - branch-1 objects present (`ffnUpOut1`, `ffnDownPart1`, `memBUp1`, `memBDown1`).
+
+Performance outcome:
+- Latency improved from `4877.6 us` -> `3043.7 us`
+- Approximate speedup: `1.60x` (about `37.6%` lower latency).

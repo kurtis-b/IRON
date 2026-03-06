@@ -193,8 +193,10 @@ full-pipeline liveness/correctness is sensitive to tail DMA order.
   - default unset -> `true` (keep conservative single-branch fallback for `parallel_heads>=4` and `proj_acc_depth>=8`)
   - set to `0|false|off|no` -> allow multi-branch attempt (may fail compile due memtile BD/channel limits)
 - `ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6`:
-  - default unset -> `true` (keep conservative single-branch fallback for `proj_acc_depth>=6`)
-  - set to `0|false|off|no` -> allow multi-branch attempt (may fail compile or runtime liveness)
+  - default unset -> `true` (keep conservative high-acc fallback for `proj_acc_depth>=6`)
+  - when enabled, current behavior caps high-acc tails to at most 2 physical FFN branches
+    (instead of forcing a single branch)
+  - set to `0|false|off|no` -> allow `>2` branch attempts (may fail compile or runtime liveness)
 - `ENCODER_LN2_REPLAY_MEM_TILE_COL`:
   - memtile column for LN2 replay staging in the FFN-down/AddNorm2 handoff path
   - default is `4` in current implementation
@@ -233,4 +235,4 @@ Note:
 - FFN-down replay-from-down (`ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=1`) keeps full-row LN behavior while freeing LN2 replay memtile channels/BDs.
 - LN2 replay FIFO mode (`ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0`) is still available for targeted experiments.
 - Even with force-single overrides disabled, `proj_acc_depth >= 6` currently has an additional
-  stability guard that prunes to one physical FFN branch.
+  stability guard path for `>2` physical FFN branches.
