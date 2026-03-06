@@ -5,6 +5,7 @@
 import sys
 import os
 import pytest
+from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -116,6 +117,38 @@ def _load_stage_profile_config() -> _StageProfileConfig:
 STAGE_PROFILE = _load_stage_profile_config()
 
 
+def _load_nonnegative_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = int(raw)
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0 (got {value})")
+    return value
+
+
+TEST_WARMUP_ITERS = _load_nonnegative_int_env("ENCODER_PIPELINE_TEST_WARMUP_ITERS", 3)
+TEST_TIMED_ITERS = _load_nonnegative_int_env("ENCODER_PIPELINE_TEST_TIMED_ITERS", 20)
+
+
+@lru_cache(maxsize=64)
+def _cached_golden_reference(
+    seq_len: int,
+    d: int,
+    heads: int,
+    intermediate_size: int,
+    debug_mode: int,
+):
+    return generate_golden_reference(
+        seq_len=seq_len,
+        d=d,
+        heads=heads,
+        intermediate_size=intermediate_size,
+        seed=42,
+        debug=debug_mode,
+    )
+
+
 def _case_name(
     seq_len,
     d,
@@ -143,20 +176,20 @@ def generate_test_params(extensive=False):
         (64, 64, 12, 3072, 32, 64, 128, 1, 2, 6),
         (64, 64, 12, 3072, 32, 64, 128, 2, 2, 6),
         (64, 64, 12, 3072, 32, 64, 128, 6, 1, 6),
-        (64, 64, 12, 3072, 32, 64, 128, 1, 6, 6),
-        # (64, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
-        # (128, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
-        # (512, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
-        # (2048, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
-        # (64, 64, 12, 3072, 32, 64, 128, 6, 1, 6),
-        # (64, 64, 12, 3072, 32, 64, 128, 1, 2, 6),
-        # (64, 64, 12, 3072, 32, 64, 128, 6, 2, 6),
-        # (512, 64, 12, 3072, 32, 64, 128, 6, 2, 6),
-        # (2048, 64, 12, 3072, 32, 64, 128, 6, 2, 6),
-        # (1024, 64, 12, 3072, 32, 64, 128, 6, 2, 6),
-        # (512, 64, 16, 4096, 32, 64, 128, 4, 6, 8),
-        # (1024, 64, 16, 4096, 32, 64, 128, 4, 6, 8),
-        # (2048, 64, 16, 4096, 32, 64, 128, 4, 6, 8),
+        (64, 64, 12, 3072, 32, 64, 128, 1, 4, 6),
+        (64, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
+        (128, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
+        (512, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
+        (2048, 64, 12, 3072, 32, 64, 128, 1, 1, 6),
+        (64, 64, 12, 3072, 32, 64, 128, 6, 1, 6),
+        (64, 64, 12, 3072, 32, 64, 128, 1, 2, 6),
+        (64, 64, 12, 3072, 32, 64, 128, 6, 2, 6),
+        (512, 64, 12, 3072, 32, 64, 128, 6, 2, 6),
+        (2048, 64, 12, 3072, 32, 64, 128, 6, 2, 6),
+        (1024, 64, 12, 3072, 32, 64, 128, 6, 2, 6),
+        (512, 64, 16, 4096, 32, 64, 128, 4, 6, 8),
+        (1024, 64, 16, 4096, 32, 64, 128, 4, 6, 8),
+        (2048, 64, 16, 4096, 32, 64, 128, 4, 6, 8),
     ]
     extensive_params = []
 
@@ -186,13 +219,12 @@ def _run_encoder_pipeline_case(
         proj_acc_depth,
     ) = case
 
-    golden_ref = generate_golden_reference(
-        seq_len=seq_len,
-        d=d,
-        heads=heads,
-        intermediate_size=intermediate_size,
-        seed=42,
-        debug=debug_mode,
+    golden_ref = _cached_golden_reference(
+        seq_len,
+        d,
+        heads,
+        intermediate_size,
+        debug_mode,
     )
 
     operator = AIEEncoderPipeline(
@@ -207,8 +239,8 @@ def _run_encoder_pipeline_case(
         ffn_intermediate_size=intermediate_size,
         nB_tiles_distributed=parallel_ffn,
         debug=debug_mode,
-        ln1_weight=golden_ref["ln1_weight"],
-        ln2_weight=golden_ref["ln2_weight"],
+        ln1_weight=golden_ref["ln1_weight"].clone(),
+        ln2_weight=golden_ref["ln2_weight"].clone(),
         context=aie_context,
     )
 
@@ -293,8 +325,8 @@ def test_encoder_pipeline(
         case,
         debug_mode=DEBUG_MODE,
         aie_context=aie_context,
-        warmup_iters=10,
-        timed_iters=100,
+        warmup_iters=TEST_WARMUP_ITERS,
+        timed_iters=TEST_TIMED_ITERS,
     )
 
     print(f"\nLatency (us): {latency_us:.1f}")
