@@ -126,6 +126,88 @@ void matmul_vectorized_1x4_mmul(const T_in *__restrict pA, const T_in *__restric
     event1();
 }
 
+/* First-K matmul variant: computes C = A*B without loading prior C values.
+ * This avoids an unnecessary accumulator-buffer read when starting a new reduction.
+ */
+template <typename T_in,
+          typename T_out,
+          unsigned rowA,
+          unsigned colA,
+          unsigned colB,
+          unsigned r,
+          unsigned s,
+          unsigned t>
+void matmul_init_vectorized_1x4_mmul(const T_in *__restrict pA, const T_in *__restrict pB, T_out *__restrict pC)
+{
+    using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
+
+    event0();
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
+
+        T_out *__restrict pC1 = pC + (z * colB) * MMUL::size_C;
+
+        for (unsigned j = 0; j < colB; j += 4)
+#ifdef OPT_PERF_ENABLED
+            AIE_LOOP_FLATTEN
+#endif
+            {
+
+                const T_in *__restrict pA1 = pA + (z * colA) * MMUL::size_A;
+                const T_in *__restrict pB1 = pB + (j)*MMUL::size_B;
+                const T_in *__restrict pB2 = pB + (j + 1) * MMUL::size_B;
+                const T_in *__restrict pB3 = pB + (j + 2) * MMUL::size_B;
+                const T_in *__restrict pB4 = pB + (j + 3) * MMUL::size_B;
+                aie::vector<T_in, MMUL::size_A> A0;
+                aie::vector<T_in, MMUL::size_B> B0;
+                aie::vector<T_in, MMUL::size_B> B1;
+                aie::vector<T_in, MMUL::size_B> B2;
+                aie::vector<T_in, MMUL::size_B> B3;
+
+                aie::vector<T_out, MMUL::size_C> zero_c = aie::zeros<T_out, MMUL::size_C>();
+                MMUL C00(zero_c);
+                MMUL C01(zero_c);
+                MMUL C02(zero_c);
+                MMUL C03(zero_c);
+
+                for (unsigned i = 0; i < colA; ++i)
+#ifdef OPT_PERF_ENABLED
+                    AIE_LOOP_FLATTEN
+#endif
+                    {
+                        A0 = aie::load_v<MMUL::size_A>(pA1);
+                        pA1 += MMUL::size_A;
+                        B0 = aie::load_v<MMUL::size_B>(pB1);
+                        pB1 += MMUL::size_B * colB;
+                        B1 = aie::load_v<MMUL::size_B>(pB2);
+                        pB2 += MMUL::size_B * colB;
+                        B2 = aie::load_v<MMUL::size_B>(pB3);
+                        pB3 += MMUL::size_B * colB;
+                        B3 = aie::load_v<MMUL::size_B>(pB4);
+                        pB4 += MMUL::size_B * colB;
+
+                        C00.mac(A0, B0);
+                        C01.mac(A0, B1);
+                        C02.mac(A0, B2);
+                        C03.mac(A0, B3);
+                    }
+
+                aie::store_v(pC1, C00.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C01.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C02.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C03.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+            }
+    }
+
+    event1();
+}
+
 /* Blocked MatMul kernel (vectorized) utilizing the aie::mmul class.
  * The matrices are assumed to be pre-tiled with the following shapes
  * for the aie:mmul class: A => rxs, B => sxt, C => rxt.
@@ -708,6 +790,24 @@ void ffn_zero_bf16_up_proj(bfloat16 *C)
 void ffn_zero_bf16_down_proj(bfloat16 *C)
 {
     zero_vectorized<bfloat16, DIM_M, DIM_K>(C);
+}
+
+void ffn_matmul_init_bf16_bf16_up_proj(const bfloat16 *A, const bfloat16 *B, bfloat16 *C)
+{
+#ifndef AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
+    static_assert(false, "AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 must be defined for this kernel");
+#endif
+    constexpr int r = 8;
+    constexpr int s = 8;
+    constexpr int t = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_N % t == 0);
+    static_assert(DIM_K % (4 * s) == 0);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+    matmul_init_vectorized_1x4_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, t, s>(A, B, C);
 }
 
 void ffn_matmul_bf16_bf16_up_proj(const bfloat16 *A, const bfloat16 *B, bfloat16 *C)

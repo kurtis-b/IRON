@@ -1,76 +1,48 @@
-# Encoder Pipeline Resource Utilization (2026-03-04)
+# Encoder Pipeline Resource Utilization (Cleaned)
 
-Source artifacts: `build/encoder_pipeline_*_lnstage.mlir.prj/{input_physical.mlir,input_with_addresses.mlir}`
+Last updated: 2026-03-06
 
-Assumptions used for percentages:
-- Compute tile L1 capacity: 64 KiB
-- Mem tile L2 capacity: 512 KiB
-- DMA channels per compute tile direction: 2
-- DMA channels per mem tile direction: 6
+## Data source
+- Physical artifacts from `build/encoder_pipeline_*_lnstage.mlir.prj/{input_physical.mlir,input_with_addresses.mlir}`.
+- Capacity assumptions:
+  - Compute-tile L1: 64 KiB
+  - Mem-tile L2: 512 KiB
+  - Compute-tile DMA channels: 2 in / 2 out
+  - Mem-tile DMA channels: 6 in / 6 out
 
-## Summary Table
+## Topology-level summary
 
-| Design | Compute Tiles Used | Peak L1 (tile) | Peak L2 (mem tile) | Peak Compute DMA In/Out | Peak Mem DMA In/Out |
-|---|---:|---|---|---|---|
-| `12h_1024s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | 29 | 57,364 B (87.5%) on `tile_6_5` | 147,456 B (28.1%) on `mem_tile_5_1` | 2/2 in (`tile_6_5`), 2/2 out (`tile_6_2`) | 4/6 in (`mem_tile_6_1`), 6/6 out (`mem_tile_1_1`) |
-| `12h_128s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | 9 | 57,364 B (87.5%) on `tile_1_5` | 114,688 B (21.9%) on `mem_tile_7_1` | 2/2 in (`tile_1_5`), 2/2 out (`tile_1_2`) | 4/6 in (`mem_tile_7_1`), 4/6 out (`mem_tile_7_1`) |
-| `12h_2048s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | 9 | 57,364 B (87.5%) on `tile_1_5` | 114,688 B (21.9%) on `mem_tile_7_1` | 2/2 in (`tile_1_5`), 2/2 out (`tile_1_2`) | 4/6 in (`mem_tile_7_1`), 4/6 out (`mem_tile_7_1`) |
-| `12h_2048s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | 29 | 57,364 B (87.5%) on `tile_6_5` | 147,456 B (28.1%) on `mem_tile_5_1` | 2/2 in (`tile_6_5`), 2/2 out (`tile_6_2`) | 4/6 in (`mem_tile_6_1`), 6/6 out (`mem_tile_1_1`) |
-| `12h_512s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | 9 | 57,364 B (87.5%) on `tile_1_5` | 114,688 B (21.9%) on `mem_tile_7_1` | 2/2 in (`tile_1_5`), 2/2 out (`tile_1_2`) | 4/6 in (`mem_tile_7_1`), 4/6 out (`mem_tile_7_1`) |
-| `12h_512s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | 29 | 57,364 B (87.5%) on `tile_6_5` | 147,456 B (28.1%) on `mem_tile_5_1` | 2/2 in (`tile_6_5`), 2/2 out (`tile_6_2`) | 4/6 in (`mem_tile_6_1`), 6/6 out (`mem_tile_1_1`) |
-| `12h_64s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | 9 | 57,364 B (87.5%) on `tile_1_5` | 114,688 B (21.9%) on `mem_tile_7_1` | 2/2 in (`tile_1_5`), 2/2 out (`tile_1_2`) | 4/6 in (`mem_tile_7_1`), 4/6 out (`mem_tile_7_1`) |
-| `12h_64s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | 29 | 57,364 B (87.5%) on `tile_6_5` | 147,456 B (28.1%) on `mem_tile_5_1` | 2/2 in (`tile_6_5`), 2/2 out (`tile_6_2`) | 4/6 in (`mem_tile_6_1`), 6/6 out (`mem_tile_1_1`) |
-| `16h_1024s_64d_32qt_64kvt_128e_4ph_8acc_3nbdist_4096ffn` | 21 | 57,364 B (87.5%) on `tile_4_5` | 172,032 B (32.8%) on `mem_tile_6_1` | 2/2 in (`tile_4_5`), 2/2 out (`tile_6_2`) | 4/6 in (`mem_tile_6_1`), 5/6 out (`mem_tile_3_1`) |
-| `16h_2048s_64d_32qt_64kvt_128e_4ph_8acc_3nbdist_4096ffn` | 21 | 57,364 B (87.5%) on `tile_4_5` | 172,032 B (32.8%) on `mem_tile_6_1` | 2/2 in (`tile_4_5`), 2/2 out (`tile_6_2`) | 4/6 in (`mem_tile_6_1`), 5/6 out (`mem_tile_3_1`) |
-| `16h_512s_64d_32qt_64kvt_128e_4ph_8acc_3nbdist_4096ffn` | 21 | 57,364 B (87.5%) on `tile_4_5` | 172,032 B (32.8%) on `mem_tile_6_1` | 2/2 in (`tile_4_5`), 2/2 out (`tile_6_2`) | 4/6 in (`mem_tile_6_1`), 5/6 out (`mem_tile_3_1`) |
+The previous table had repeated entries across sequence lengths. The utilization pattern is effectively topology-dependent, not `seq_len`-dependent, for the measured set.
 
-## Block Locations (MHA / AddNorm / FFN)
+| Topology Class | Covered designs | Compute tiles | Peak compute L1 | Peak mem L2 | Peak compute DMA | Peak mem DMA |
+|---|---|---:|---|---|---|---|
+| `12h, 1ph, 1nbdist, 6acc, 3072ffn` | `64s`, `128s`, `512s`, `2048s` | 9 | 57,364 B (87.5%) on `tile_1_5` | 114,688 B (21.9%) on `mem_tile_7_1` | 2/2 in (`tile_1_5`), 2/2 out (`tile_1_2`) | 4/6 in, 4/6 out (`mem_tile_7_1`) |
+| `12h, 6ph, 3nbdist, 6acc, 3072ffn` | `64s`, `512s`, `1024s`, `2048s` | 29 | 57,364 B (87.5%) on `tile_6_5` | 147,456 B (28.1%) on `mem_tile_5_1` | 2/2 in (`tile_6_5`), 2/2 out (`tile_6_2`) | 4/6 in (`mem_tile_6_1`), 6/6 out (`mem_tile_1_1`) |
+| `16h, 4ph, 3nbdist, 8acc, 4096ffn` | `512s`, `1024s`, `2048s` | 21 | 57,364 B (87.5%) on `tile_4_5` | 172,032 B (32.8%) on `mem_tile_6_1` | 2/2 in (`tile_4_5`), 2/2 out (`tile_6_2`) | 4/6 in (`mem_tile_6_1`), 5/6 out (`mem_tile_3_1`) |
 
-| Design | MHA Tiles | AddNorm Tiles | FFN Tiles |
+## Block locations by topology
+
+| Topology Class | MHA | AddNorm | FFN |
 |---|---|---|---|
-| `12h_1024s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | (0,2), (0,3), (0,4), (0,5), (1,2), (1,3), (1,4), (1,5), (2,2), (2,3), (2,4), (2,5), (3,2), (3,3), (3,4), (3,5), (4,2), (4,3), (4,4), (4,5), (5,2), (5,3), (5,4), (5,5) | LN1-norm: (6,3); LN1-post: (6,2); LN2: (7,5) | up: (6,4); down: (6,5) |
-| `12h_128s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | (0,2), (0,3), (0,4), (0,5) | LN1-norm: (1,3); LN1-post: (1,2); LN2: (2,5) | up: (1,4); down: (1,5) |
-| `12h_2048s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | (0,2), (0,3), (0,4), (0,5) | LN1-norm: (1,3); LN1-post: (1,2); LN2: (2,5) | up: (1,4); down: (1,5) |
-| `12h_2048s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | (0,2), (0,3), (0,4), (0,5), (1,2), (1,3), (1,4), (1,5), (2,2), (2,3), (2,4), (2,5), (3,2), (3,3), (3,4), (3,5), (4,2), (4,3), (4,4), (4,5), (5,2), (5,3), (5,4), (5,5) | LN1-norm: (6,3); LN1-post: (6,2); LN2: (7,5) | up: (6,4); down: (6,5) |
-| `12h_512s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | (0,2), (0,3), (0,4), (0,5) | LN1-norm: (1,3); LN1-post: (1,2); LN2: (2,5) | up: (1,4); down: (1,5) |
-| `12h_512s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | (0,2), (0,3), (0,4), (0,5), (1,2), (1,3), (1,4), (1,5), (2,2), (2,3), (2,4), (2,5), (3,2), (3,3), (3,4), (3,5), (4,2), (4,3), (4,4), (4,5), (5,2), (5,3), (5,4), (5,5) | LN1-norm: (6,3); LN1-post: (6,2); LN2: (7,5) | up: (6,4); down: (6,5) |
-| `12h_64s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | (0,2), (0,3), (0,4), (0,5) | LN1-norm: (1,3); LN1-post: (1,2); LN2: (2,5) | up: (1,4); down: (1,5) |
-| `12h_64s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | (0,2), (0,3), (0,4), (0,5), (1,2), (1,3), (1,4), (1,5), (2,2), (2,3), (2,4), (2,5), (3,2), (3,3), (3,4), (3,5), (4,2), (4,3), (4,4), (4,5), (5,2), (5,3), (5,4), (5,5) | LN1-norm: (6,3); LN1-post: (6,2); LN2: (7,5) | up: (6,4); down: (6,5) |
-| `16h_1024s_64d_32qt_64kvt_128e_4ph_8acc_3nbdist_4096ffn` | (0,2), (0,3), (0,4), (0,5), (1,2), (1,3), (1,4), (1,5), (2,2), (2,3), (2,4), (2,5), (3,2), (3,3), (3,4), (3,5) | LN1-norm: (4,3); LN1-post: (6,2); LN2: (5,5) | up: (4,4); down: (4,5) |
-| `16h_2048s_64d_32qt_64kvt_128e_4ph_8acc_3nbdist_4096ffn` | (0,2), (0,3), (0,4), (0,5), (1,2), (1,3), (1,4), (1,5), (2,2), (2,3), (2,4), (2,5), (3,2), (3,3), (3,4), (3,5) | LN1-norm: (4,3); LN1-post: (6,2); LN2: (5,5) | up: (4,4); down: (4,5) |
-| `16h_512s_64d_32qt_64kvt_128e_4ph_8acc_3nbdist_4096ffn` | (0,2), (0,3), (0,4), (0,5), (1,2), (1,3), (1,4), (1,5), (2,2), (2,3), (2,4), (2,5), (3,2), (3,3), (3,4), (3,5) | LN1-norm: (4,3); LN1-post: (6,2); LN2: (5,5) | up: (4,4); down: (4,5) |
+| `12h, 1ph, 1nbdist, 6acc` | `(0,2..5)` | `LN1-norm (1,3), LN1-post (1,2), LN2 (2,5)` | `up (1,4), down (1,5)` |
+| `12h, 6ph, 3nbdist, 6acc` | `(0..5, 2..5)` | `LN1-norm (6,3), LN1-post (6,2), LN2 (7,5)` | `up (6,4), down (6,5)` |
+| `16h, 4ph, 3nbdist, 8acc` | `(0..3, 2..5)` | `LN1-norm (4,3), LN1-post (6,2), LN2 (5,5)` | `up (4,4), down (4,5)` |
 
-## Totals (Allocated Buffers)
+## Total allocated memory (from measured artifacts)
 
-| Design | Total L1 on Used Compute Tiles | Total L2 on Mem Tiles |
+| Topology Class | Total L1 on used compute tiles | Total L2 on mem tiles |
 |---|---:|---:|
-| `12h_1024s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | 1,016,408 B | 892,928 B |
-| `12h_128s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | 356,768 B | 360,448 B |
-| `12h_2048s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | 356,768 B | 360,448 B |
-| `12h_2048s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | 1,016,408 B | 892,928 B |
-| `12h_512s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | 356,768 B | 360,448 B |
-| `12h_512s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | 1,016,408 B | 892,928 B |
-| `12h_64s_64d_32qt_64kvt_128e_1ph_6acc_1nbdist_3072ffn` | 356,768 B | 360,448 B |
-| `12h_64s_64d_32qt_64kvt_128e_6ph_6acc_3nbdist_3072ffn` | 1,016,408 B | 892,928 B |
-| `16h_1024s_64d_32qt_64kvt_128e_4ph_8acc_3nbdist_4096ffn` | 761,768 B | 794,624 B |
-| `16h_2048s_64d_32qt_64kvt_128e_4ph_8acc_3nbdist_4096ffn` | 761,768 B | 794,624 B |
-| `16h_512s_64d_32qt_64kvt_128e_4ph_8acc_3nbdist_4096ffn` | 761,768 B | 794,624 B |
+| `12h, 1ph, 1nbdist, 6acc, 3072ffn` | 356,768 B | 360,448 B |
+| `12h, 6ph, 3nbdist, 6acc, 3072ffn` | 1,016,408 B | 892,928 B |
+| `16h, 4ph, 3nbdist, 8acc, 4096ffn` | 761,768 B | 794,624 B |
 
-## Notes
-- The `seq_len` variants with the same `(heads, parallel_heads, proj_acc_depth, nB_tiles_distributed)` have identical placement/utilization, which matches expectations because tile graph shape is independent of sequence length here.
-- Peak compute-tile L1 is consistently ~87.5%, so L1 headroom is limited but non-zero in all tested designs.
-- Highest mem-tile DMA output pressure appears in `6pheads` designs (6/6 channels on at least one mem tile).
+## Revalidation status (2026-03-06)
+- Functional regression check after latest OR/LN1 staging-buffer layout update:
+  - `pytest operators/encoder_pipeline/test.py -q --iterations 1`
+  - result: `5 passed`
+- Default resource shape for baseline path is unchanged by this host-buffer layout update.
 
-## Revalidation Update (2026-03-05)
-
-- Re-ran encoder pipeline tests after the latest FFN branch-mapping/reduction changes:
-  - `rm -r ./build` (executed as `rm -rf ./build`)
-  - `source /opt/xilinx/xrt/setup.sh`
-  - `source ~/iron/ironenv/bin/activate`
-  - `pytest operators/encoder_pipeline/test.py -q`
-  - Result: `55 passed`
-- Regenerated `.mlir.prj` artifacts are present for all 11 designs listed in this document.
-- Effective generated topology for these tested designs remains the same resource shape as this table:
-  - `1pheads` designs: single FFN branch.
-  - `6pheads` and `4pheads` test designs: FFN branch requests are still resource-pruned under current channel limits, so compute/memory footprints stay aligned with the entries above.
-- MHA/AddNorm/FFN block locations for the tested designs remain consistent with the “Block Locations” table above.
+## LN1 DDR staging caveat
+- `ENCODER_STAGE_LN1_TO_DDR=1` introduces extra shim/memtile traffic for LN1->FFN handoff.
+- Timeout on the targeted `1pheads_1pffn_6pacc` case was fixed via runtime synchronization/order updates.
+- The mode is still not globally feasible for all tested topologies due compile-time resource limits (output DMA-channel and memtile-BD pressure), so it is not included in the stable utilization snapshot above.

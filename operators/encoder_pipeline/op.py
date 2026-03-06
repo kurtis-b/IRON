@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +47,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         debug: int = -1,
         ln1_weight=None,
         ln2_weight=None,
+        ln1_staging_design: str | None = None,
         ln_weight=None,
         context=None,
         skip_add_to_list=False,
@@ -60,6 +62,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.proj_acc_depth = proj_acc_depth
         self.nB_tiles_distributed = nB_tiles_distributed
         self.debug = debug
+        self.ln1_staging_design = self._resolve_ln1_staging_design(ln1_staging_design)
         try:
             (
                 self.mha_debug,
@@ -136,11 +139,35 @@ class AIEEncoderPipeline(AIEOperatorBase):
             self, context=context, skip_add_to_list=skip_add_to_list
         )
 
+    @staticmethod
+    def _resolve_ln1_staging_design(ln1_staging_design: str | None) -> str:
+        raw = (
+            ln1_staging_design
+            if ln1_staging_design is not None
+            else os.getenv("ENCODER_LN1_STAGING_DESIGN", "ddr")
+        )
+        mode = raw.strip().lower()
+        if mode in ("ddr", "dram", "host"):
+            return "ddr"
+        if mode in ("memtile", "mt", "onchip"):
+            return "memtile"
+        raise AIEOperatorConstraintError(
+            "ln1_staging_design must be one of "
+            "{ddr, dram, host, memtile, mt, onchip} "
+            f"(got '{raw}')"
+        )
+
+    def _design_import_path(self, operator_dir: Path) -> Path:
+        if self.ln1_staging_design == "ddr":
+            return operator_dir / "design_ln1_ddr.py"
+        return operator_dir / "design_ln1_memtile.py"
+
     def _debug_suffix(self) -> str:
         ffn_stage = self.ffn_stage_only if self.ffn_stage_only is not None else "all"
         return (
             f"{self.debug}debug_mha{self.mha_debug}_ffnstg{ffn_stage}_"
-            f"an1{self.addnorm1_debug_mode}_an2{self.addnorm2_debug_mode}_lnstage"
+            f"an1{self.addnorm1_debug_mode}_an2{self.addnorm2_debug_mode}_"
+            f"lnstage_{self.ln1_staging_design}"
         )
 
     def get_artifacts(self, prefix="encoder_pipeline"):
@@ -230,7 +257,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
-            import_path=operator_dir / "design.py",
+            import_path=self._design_import_path(operator_dir),
             callback_fn="fused_mha",
             callback_kwargs={
                 "heads": self.num_heads,
@@ -377,9 +404,14 @@ class AIEEncoderPipeline(AIEOperatorBase):
             "QKV",
             3 * self.embed_sz * self.seq_len,
         )
+        ln1_stage_rows = 0
+        if self.ln1_staging_design == "ddr":
+            ln1_stage_rows = (
+                self.ffn_intermediate_size // self.emb_tile
+            ) * self.seq_tile
         self.add_buffer(
             "OR",
-            2 * self.embed_sz * self.seq_len,
+            (2 * self.seq_len + ln1_stage_rows) * self.embed_sz,
         )
         self.add_buffer(
             "O",
