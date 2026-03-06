@@ -151,6 +151,14 @@ def fused_mha(
         "ENCODER_FORCE_SINGLE_BRANCH_HIGH_ACC",
         True,
     )
+    force_single_branch_acc_ge6 = _override_bool_env(
+        "ENCODER_FORCE_SINGLE_BRANCH_ACC_GE6",
+        True,
+    )
+    enable_ln1_two_branch_router = _override_bool_env(
+        "ENCODER_ENABLE_LN1_TWO_BRANCH_ROUTER",
+        proj_acc_depth >= 6,
+    )
 
     num_o_col_groups = embed_sz // (emb_tile * proj_acc_depth)
     ln_tiles_per_q_block = num_o_col_groups * proj_acc_depth
@@ -177,10 +185,24 @@ def fused_mha(
     # Keep the active branch subset as a suffix ending at root to preserve
     # neighbor-chain reduction order when pruning.
     selected_start_idx = max(0, max_ffn_branches - requested_ffn_branches)
-    selected_branch_indices = list(range(selected_start_idx, max_ffn_branches))
-    if max_ffn_branches > 3:
+    selected_start_idx = _override_int_env(
+        "ENCODER_FFN_BRANCH_START_IDX",
+        selected_start_idx,
+    )
+    if (
+        selected_start_idx < 0
+        or selected_start_idx + requested_ffn_branches > max_ffn_branches
+    ):
         raise ValueError(
-            "encoder_pipeline supports at most 3 FFN branches "
+            "ENCODER_FFN_BRANCH_START_IDX out of range for requested branches: "
+            f"start={selected_start_idx}, requested={requested_ffn_branches}, "
+            f"max={max_ffn_branches}"
+        )
+    selected_branch_indices = list(range(selected_start_idx, max_ffn_branches))
+    selected_branch_indices = selected_branch_indices[:requested_ffn_branches]
+    if max_ffn_branches > 6:
+        raise ValueError(
+            "encoder_pipeline supports at most 6 FFN branches "
             f"(layout returned {max_ffn_branches})"
         )
 
@@ -218,7 +240,7 @@ def fused_mha(
         (tuple(src), tuple(dst))
         for (src, dst) in ffn_layout.get("down_reduction_edges", [])
     }
-    ln1_route_tile = None
+    ln1_route_tiles = []
     while True:
         if len(selected_branch_indices) <= 0:
             raise ValueError("No FFN branches selected")
@@ -243,7 +265,14 @@ def fused_mha(
                 )
                 continue
         # A single LN1 mul/add core can directly emit at most two FFN streams.
-        ln1_router_tiles_needed = 1 if effective_candidate_branches > 2 else 0
+        # For N branches, route workers needed = N-2. For the 2-branch case,
+        # keep one route worker so LN1 can also emit a dedicated residual stream
+        # for AddNorm2 without relying on FFN-up branch capture.
+        ln1_router_tiles_needed = (
+            1
+            if effective_candidate_branches == 2 and enable_ln1_two_branch_router
+            else max(0, effective_candidate_branches - 2)
+        )
         required_compute_tiles = (
             parallel_heads * 4
             + 3  # LN1 norm + LN1 mul/add + LN2
@@ -258,6 +287,16 @@ def fused_mha(
                 )
             drop_non_root_branch(
                 f"compute tile capacity exceeded (needs {required_compute_tiles})"
+            )
+            continue
+        # Shim output DMA budget: Q/K/V/W_O/R occupy five output streams.
+        # Each FFN branch adds two host->array streams (B_Up + B_Down).
+        max_branches_by_shim_outputs = (16 - 5) // 2
+        if effective_candidate_branches > max_branches_by_shim_outputs:
+            drop_non_root_branch(
+                "shim output DMA budget exceeded for FFN weight streams "
+                f"(branches={effective_candidate_branches} > "
+                f"{max_branches_by_shim_outputs})"
             )
             continue
         # For wide-head/high-acc configurations, memtile BD-ID allocation for
@@ -287,6 +326,18 @@ def fused_mha(
         if ffn_stage_only in (3, 4) and len(selected_branch_indices) > 1:
             drop_non_root_branch("downstream-profile mode uses a single FFN branch")
             continue
+        # Even when shim/channel counts fit, high-acc FFN tail staging can hit
+        # memtile BD-ID and liveness limits for >1 physical branch.
+        if (
+            force_single_branch_acc_ge6
+            and proj_acc_depth >= 6
+            and len(selected_branch_indices) > 1
+        ):
+            drop_non_root_branch(
+                "memtile BD budget exceeded for high-acc FFN tail staging "
+                "(physical branches > 1)"
+            )
+            continue
         ln1_post_candidates = [
             tile for tile in free_ffn_tiles if tile not in used_tiles_base
         ]
@@ -298,9 +349,9 @@ def fused_mha(
             ]
             if len(aux_candidates) < ln1_router_tiles_needed:
                 continue
-            candidate_ln1_route_tile = None
+            candidate_ln1_route_tiles = []
             if ln1_router_tiles_needed:
-                candidate_ln1_route_tile = min(
+                candidate_ln1_route_tiles = sorted(
                     aux_candidates,
                     key=lambda t: (
                         manhattan_distance(t, candidate_ln1_post_tile),
@@ -308,9 +359,15 @@ def fused_mha(
                         t[0],
                         t[1],
                     ),
+                )[:ln1_router_tiles_needed]
+                if len(candidate_ln1_route_tiles) != ln1_router_tiles_needed:
+                    continue
+                candidate_ln1_route_tiles = sorted(
+                    candidate_ln1_route_tiles,
+                    key=lambda t: (t[0], t[1]),
                 )
             ln1_post_tile = candidate_ln1_post_tile
-            ln1_route_tile = candidate_ln1_route_tile
+            ln1_route_tiles = candidate_ln1_route_tiles
             placement_found = True
             break
         if placement_found:
@@ -326,39 +383,110 @@ def fused_mha(
     if effective_ffn_branches <= 0:
         raise ValueError("No FFN branches selected")
     if selected_branch_indices[-1] != down_root_idx:
-        raise ValueError(
-            "FFN branch ordering invariant violated: root branch must be final "
-            f"(selected={selected_branch_indices}, root_idx={down_root_idx})"
+        logging.warning(
+            "Using non-default FFN reduction root branch (selected tail idx=%d, layout root idx=%d)",
+            selected_branch_indices[-1],
+            down_root_idx,
         )
 
-    ffn_group_base = profile_replay_groups // effective_ffn_branches
-    ffn_group_rem = profile_replay_groups % effective_ffn_branches
-    ffn_col_group_counts = [
-        ffn_group_base + (1 if i < ffn_group_rem else 0)
-        for i in range(effective_ffn_branches)
+    # Keep requested nB distribution as the logical FFN partition count, then
+    # map those logical parts onto the feasible physical branch count.
+    logical_ffn_parts = min(max(1, nB_tiles_distributed), profile_replay_groups)
+    logical_part_base = profile_replay_groups // logical_ffn_parts
+    logical_part_rem = profile_replay_groups % logical_ffn_parts
+    logical_part_group_counts = [
+        logical_part_base + (1 if i < logical_part_rem else 0)
+        for i in range(logical_ffn_parts)
     ]
+    parts_per_branch_base = logical_ffn_parts // effective_ffn_branches
+    parts_per_branch_rem = logical_ffn_parts % effective_ffn_branches
+    ffn_col_group_counts = []
     ffn_col_group_offsets = []
+    ffn_branch_logical_ranges = []
     running_group_offset = 0
-    for count in ffn_col_group_counts:
+    running_part_offset = 0
+    for branch_idx in range(effective_ffn_branches):
+        part_count = parts_per_branch_base + (
+            1 if branch_idx < parts_per_branch_rem else 0
+        )
+        if part_count <= 0:
+            raise ValueError(
+                "Invalid logical-to-physical FFN partition mapping: "
+                f"logical_parts={logical_ffn_parts}, physical_branches={effective_ffn_branches}"
+            )
+        part_start = running_part_offset
+        part_end = part_start + part_count
+        count = sum(logical_part_group_counts[part_start:part_end])
+        ffn_col_group_counts.append(count)
         ffn_col_group_offsets.append(running_group_offset)
+        ffn_branch_logical_ranges.append((part_start, part_end))
         running_group_offset += count
+        running_part_offset = part_end
+    if running_group_offset != profile_replay_groups:
+        raise ValueError(
+            "FFN logical partition mapping error: "
+            f"mapped_groups={running_group_offset}, expected={profile_replay_groups}"
+        )
+    if running_part_offset != logical_ffn_parts:
+        raise ValueError(
+            "FFN logical partition mapping error: "
+            f"mapped_parts={running_part_offset}, expected={logical_ffn_parts}"
+        )
+    ffn_group_split_override = os.getenv("ENCODER_FFN_GROUP_SPLIT")
+    if ffn_group_split_override is not None and ffn_group_split_override.strip() != "":
+        override_counts = [
+            int(v.strip())
+            for v in ffn_group_split_override.split(",")
+            if v.strip() != ""
+        ]
+        if len(override_counts) != effective_ffn_branches:
+            raise ValueError(
+                "ENCODER_FFN_GROUP_SPLIT must have one count per effective branch "
+                f"(got {len(override_counts)}, expected {effective_ffn_branches})"
+            )
+        if any(v <= 0 for v in override_counts):
+            raise ValueError(
+                "ENCODER_FFN_GROUP_SPLIT values must be > 0 " f"(got {override_counts})"
+            )
+        if sum(override_counts) != profile_replay_groups:
+            raise ValueError(
+                "ENCODER_FFN_GROUP_SPLIT counts must sum to profile_replay_groups "
+                f"(sum={sum(override_counts)}, expected={profile_replay_groups})"
+            )
+        ffn_col_group_counts = override_counts
+        ffn_col_group_offsets = []
+        running_group_offset = 0
+        for count in ffn_col_group_counts:
+            ffn_col_group_offsets.append(running_group_offset)
+            running_group_offset += count
+        logging.warning(
+            "Overriding FFN physical group split via ENCODER_FFN_GROUP_SPLIT=%s",
+            ffn_col_group_counts,
+        )
     final_ffn_branch_idx = effective_ffn_branches - 1
     # Reduction chain topology over active branches (one incoming reduction
     # stream per down core): b0 -> b1 -> ... -> bN(final/root).
     ffn_reduction_sources = list(range(final_ffn_branch_idx))
-    ffn_requires_ln1_router = effective_ffn_branches > 2
+    ln1_route_worker_count = (
+        1
+        if effective_ffn_branches == 2 and enable_ln1_two_branch_router
+        else max(0, effective_ffn_branches - 2)
+    )
+    ffn_requires_ln1_router = ln1_route_worker_count > 0
+    if len(ln1_route_tiles) != ln1_route_worker_count:
+        raise ValueError(
+            "LN1 route tile count mismatch: "
+            f"have {len(ln1_route_tiles)} tiles, need {ln1_route_worker_count}"
+        )
 
     # Worker count:
     # - MHA path: 4 workers per parallel head
     # - Encoder tail:
     #   LN1(norm) + LN1(mul+resadd) + AddNorm2
     #   + (FFN up/down)*branches
-    #   + optional LN1 route worker for branch fanout > 2
+    #   + optional LN1 route worker chain for branch fanout > 2
     required_compute_tiles = (
-        parallel_heads * 4
-        + 3
-        + 2 * effective_ffn_branches
-        + (1 if ffn_requires_ln1_router else 0)
+        parallel_heads * 4 + 3 + 2 * effective_ffn_branches + ln1_route_worker_count
     )
     if required_compute_tiles > 32:
         raise ValueError(
@@ -392,16 +520,19 @@ def fused_mha(
         f"num_q_seq_blocks: {num_q_seq_blocks}, num_kv_seq_blocks: {num_kv_seq_blocks}, num_qkv_head_block_per_parallel_head: {num_qkv_head_block_per_parallel_head}, num_o_col_groups: {num_o_col_groups}"
     )
     logging.info(
-        "FFN distribution: groups=%d counts=%s offsets=%s",
+        "FFN distribution: groups=%d logical_parts=%d logical_part_counts=%s physical_counts=%s offsets=%s logical_ranges=%s",
         profile_replay_groups,
+        logical_ffn_parts,
+        logical_part_group_counts,
         ffn_col_group_counts,
         ffn_col_group_offsets,
+        ffn_branch_logical_ranges,
     )
     logging.info(
         "FFN mapped placement: ln1_norm=%s ln1_post=%s ln1_route=%s up(all)=%s down(all)=%s up(active)=%s down(active)=%s ln2=%s down_root=%s down_reduction_edges=%s down_to_ln2=%s non_neighbor_down_to_ln2=%s active_branch_indices=%s",
         ln1_tile,
         ln1_post_tile,
-        ln1_route_tile,
+        ln1_route_tiles,
         all_ffn_up_tiles,
         all_ffn_down_tiles,
         selected_up_tiles,
@@ -415,11 +546,11 @@ def fused_mha(
     )
     logging.info(
         "FFN reduction topology(active branch order): chain_edges=%s final_branch_idx=%d "
-        "(down_tile=%s) ln1_router=%s",
+        "(down_tile=%s) ln1_route_workers=%d",
         [(i, i + 1) for i in range(final_ffn_branch_idx)],
         final_ffn_branch_idx,
         selected_down_tiles[final_ffn_branch_idx],
-        ffn_requires_ln1_router,
+        ln1_route_worker_count,
     )
     logging.info(f"Data type: {dtype_str}")
     logging.info(f"Microkernel MAC dimensions: r={r}, s={s}, t={t}")
@@ -869,6 +1000,34 @@ def fused_mha(
 
     # LN output
     o_dims = [(seq_tile // r, r * emb_tile), (r, s), (emb_tile // s, r * s), (s, 1)]
+
+    def _allocate_ffn_weight_mem_tile_cols(
+        branches: int,
+    ) -> tuple[list[int], list[int]]:
+        # Per-shim output-channel capacity is 2. Baseline encoder streams use:
+        # col0(Q), col1(K), col2(V), col3(W_O), col7(R).
+        shim_out_capacity = {col: 2 for col in range(8)}
+        for used_col in (0, 1, 2, 3, 7):
+            shim_out_capacity[used_col] -= 1
+
+        preferred_cols = [6, 5, 4, 7, 3, 2, 1, 0]
+        stream_cols = []
+        for _ in range(2 * branches):
+            candidates = [c for c in preferred_cols if shim_out_capacity[c] > 0]
+            if not candidates:
+                raise ValueError(
+                    "Insufficient shim output DMA channels for FFN weight streams "
+                    f"(need {2 * branches}, available {sum(v for v in shim_out_capacity.values() if v > 0)})"
+                )
+            # Pick the column with the most remaining budget; tie-break by preference order.
+            col = max(
+                candidates,
+                key=lambda c: (shim_out_capacity[c], -preferred_cols.index(c)),
+            )
+            stream_cols.append(col)
+            shim_out_capacity[col] -= 1
+        return stream_cols[:branches], stream_cols[branches:]
+
     # Keep FFN branch staging streams off LN replay (col 5) when MHA uses many
     # heads; col 5 already carries LN1 full-row replay traffic.
     if parallel_heads >= 6 and proj_acc_depth >= 6:
@@ -894,9 +1053,24 @@ def fused_mha(
         branch_bup_cols = [6, 4, 5]
         branch_down_b_cols = [4, 6, 5]
     else:
-        branch_stage_cols = [6, 5, 4]
-        branch_bup_cols = [6, 5, 4]
-        branch_down_b_cols = [6, 5, 4]
+        # For low-head configurations, keep a wider default pool so FFN can
+        # scale up to 6-way distribution when resources permit.
+        branch_stage_cols = [6, 5, 4, 7, 3, 2]
+        branch_stage_cols = _override_int_list_env(
+            "ENCODER_BRANCH_STAGE_COLS",
+            branch_stage_cols,
+        )
+        branch_bup_cols, branch_down_b_cols = _allocate_ffn_weight_mem_tile_cols(
+            effective_ffn_branches
+        )
+        branch_bup_cols = _override_int_list_env(
+            "ENCODER_BRANCH_BUP_COLS",
+            branch_bup_cols,
+        )
+        branch_down_b_cols = _override_int_list_env(
+            "ENCODER_BRANCH_DOWN_B_COLS",
+            branch_down_b_cols,
+        )
     if effective_ffn_branches > len(branch_stage_cols):
         raise ValueError(
             "Unsupported effective_ffn_branches for current memtile assignment "
@@ -911,6 +1085,10 @@ def fused_mha(
     # channel/BD pressure in high-head multi-branch mappings.
     bypass_ln_to_ffn_stage = (
         parallel_heads >= 6 and proj_acc_depth >= 6 and effective_ffn_branches > 1
+    ) or (
+        enable_ln1_two_branch_router
+        and proj_acc_depth >= 6
+        and effective_ffn_branches > 1
     )
     bypass_ln_to_ffn_stage = _override_bool_env(
         "ENCODER_BYPASS_LN_TO_FFN_STAGE",
@@ -1037,16 +1215,21 @@ def fused_mha(
                 placement=Tile(col=ffn_down_acc_mem_tile_cols[branch_idx], row=1),
             )
         )
+    ffn_down_reduce_depth = _override_int_env("ENCODER_FFN_DOWN_REDUCE_DEPTH", 1)
     ffnDownReduce = []
     for src_branch_idx in ffn_reduction_sources:
         ffnDownReduce.append(
             ObjectFifo(
                 o_ty,
                 name=f"ffnDownReduce{src_branch_idx}",
-                depth=1,
+                depth=ffn_down_reduce_depth,
             )
         )
-    ffn_down_out_depth = 1 if emb_tile >= 128 else ln_fifo_depth
+    ffn_down_out_depth_default = 1 if emb_tile >= 128 else ln_fifo_depth
+    ffn_down_out_depth = _override_int_env(
+        "ENCODER_FFN_DOWN_OUT_DEPTH",
+        ffn_down_out_depth_default,
+    )
     ffnDownOut = ObjectFifo(
         o_ty,
         name="ffnDownOut",
@@ -1071,14 +1254,20 @@ def fused_mha(
         placement=Tile(col=ln_mem_tile_col, row=1),
     )
 
-    # Additional LN1 fanout stage when more than two FFN branches are active.
-    outLNRest = None
-    if ffn_requires_ln1_router:
-        outLNRest = ObjectFifo(
-            o_ty,
-            name="outLNFfnRest",
-            depth=1,
-        )
+    # Additional LN1 fanout routing stream chain when more than two FFN
+    # branches are active.
+    ln1_route_streams = []
+    if ln1_route_worker_count:
+        for route_idx in range(ln1_route_worker_count):
+            ln1_route_streams.append(
+                ObjectFifo(
+                    o_ty,
+                    name=(
+                        "outLNFfnRest" if route_idx == 0 else f"outLNFfnRest{route_idx}"
+                    ),
+                    depth=1,
+                )
+            )
 
     def batched_matmul_qk(
         of_q,
@@ -1486,66 +1675,146 @@ def fused_mha(
         of_in_residual,
         weights,
         of_out_up_0,
-        of_out_up_1,
-        of_out_up_2_or_rest,
+        of_out_up_1_or_rest,
         ln_mul_add,
         copy,
         addnorm1_mode,
         route_remaining_branches,
     ):
-        of_out_up_list = [of_out_up_0, of_out_up_1, of_out_up_2_or_rest]
         for _ in range_(sys.maxsize):
-            # Emit FFN input in branch-major group order so each branch receives
-            # only its assigned ffn_col_group_count tiles.
-            for branch_idx in range(effective_ffn_branches):
-                if route_remaining_branches and branch_idx >= 1:
-                    of_out_up = of_out_up_list[2]
-                else:
-                    of_out_up = of_out_up_list[branch_idx]
-                for branch_group_idx in range_(ffn_col_group_counts[branch_idx]):
-                    for col_idx in range_(ln_tiles_per_q_block):
-                        col_i32 = index.casts(T.i32(), col_idx)
-                        elem_in1 = of_in_norm.acquire(1)
-                        elem_in2 = of_in_residual.acquire(1)
-                        elem_out_up = of_out_up.acquire(1)
-                        if addnorm1_mode == 0:
-                            copy(elem_in1, elem_out_up, seq_tile * emb_tile)
-                        elif addnorm1_mode == 1:
-                            copy(elem_in2, elem_out_up, seq_tile * emb_tile)
-                        else:
-                            ln_mul_add(
-                                elem_in1,
-                                elem_in2,
-                                weights,
-                                elem_out_up,
-                                col_i32,
-                            )
-                        of_out_up.release(1)
-                        of_in_norm.release(1)
-                        of_in_residual.release(1)
+            # For the 2-branch FFN case, emit groups in round-robin order
+            # so both branches can make forward progress before down-reduction.
+            # This avoids starvation cycles where branch0 reaches reduction
+            # output while branch1 has not received any LN1 feed yet.
+            if not route_remaining_branches and effective_ffn_branches == 2:
+                group_count_0 = ffn_col_group_counts[0]
+                group_count_1 = ffn_col_group_counts[1]
+                paired_group_count = min(group_count_0, group_count_1)
+                for _ in range_(paired_group_count):
+                    for of_out_up in (of_out_up_0, of_out_up_1_or_rest):
+                        for col_idx in range_(ln_tiles_per_q_block):
+                            col_i32 = index.casts(T.i32(), col_idx)
+                            elem_in1 = of_in_norm.acquire(1)
+                            elem_in2 = of_in_residual.acquire(1)
+                            elem_out_up = of_out_up.acquire(1)
+                            if addnorm1_mode == 0:
+                                copy(elem_in1, elem_out_up, seq_tile * emb_tile)
+                            elif addnorm1_mode == 1:
+                                copy(elem_in2, elem_out_up, seq_tile * emb_tile)
+                            else:
+                                ln_mul_add(
+                                    elem_in1,
+                                    elem_in2,
+                                    weights,
+                                    elem_out_up,
+                                    col_i32,
+                                )
+                            of_out_up.release(1)
+                            of_in_norm.release(1)
+                            of_in_residual.release(1)
+                if group_count_0 > paired_group_count:
+                    for _ in range_(group_count_0 - paired_group_count):
+                        for col_idx in range_(ln_tiles_per_q_block):
+                            col_i32 = index.casts(T.i32(), col_idx)
+                            elem_in1 = of_in_norm.acquire(1)
+                            elem_in2 = of_in_residual.acquire(1)
+                            elem_out_up = of_out_up_0.acquire(1)
+                            if addnorm1_mode == 0:
+                                copy(elem_in1, elem_out_up, seq_tile * emb_tile)
+                            elif addnorm1_mode == 1:
+                                copy(elem_in2, elem_out_up, seq_tile * emb_tile)
+                            else:
+                                ln_mul_add(
+                                    elem_in1,
+                                    elem_in2,
+                                    weights,
+                                    elem_out_up,
+                                    col_i32,
+                                )
+                            of_out_up_0.release(1)
+                            of_in_norm.release(1)
+                            of_in_residual.release(1)
+                if group_count_1 > paired_group_count:
+                    for _ in range_(group_count_1 - paired_group_count):
+                        for col_idx in range_(ln_tiles_per_q_block):
+                            col_i32 = index.casts(T.i32(), col_idx)
+                            elem_in1 = of_in_norm.acquire(1)
+                            elem_in2 = of_in_residual.acquire(1)
+                            elem_out_up = of_out_up_1_or_rest.acquire(1)
+                            if addnorm1_mode == 0:
+                                copy(elem_in1, elem_out_up, seq_tile * emb_tile)
+                            elif addnorm1_mode == 1:
+                                copy(elem_in2, elem_out_up, seq_tile * emb_tile)
+                            else:
+                                ln_mul_add(
+                                    elem_in1,
+                                    elem_in2,
+                                    weights,
+                                    elem_out_up,
+                                    col_i32,
+                                )
+                            of_out_up_1_or_rest.release(1)
+                            of_in_norm.release(1)
+                            of_in_residual.release(1)
+            else:
+                # Emit FFN input in branch-major group order so each branch receives
+                # only its assigned ffn_col_group_count tiles.
+                for branch_idx in range(effective_ffn_branches):
+                    of_out_up = (
+                        of_out_up_0
+                        if branch_idx == 0
+                        else (
+                            of_out_up_1_or_rest
+                            if (not route_remaining_branches or branch_idx >= 1)
+                            else of_out_up_0
+                        )
+                    )
+                    for _ in range_(ffn_col_group_counts[branch_idx]):
+                        for col_idx in range_(ln_tiles_per_q_block):
+                            col_i32 = index.casts(T.i32(), col_idx)
+                            elem_in1 = of_in_norm.acquire(1)
+                            elem_in2 = of_in_residual.acquire(1)
+                            elem_out_up = of_out_up.acquire(1)
+                            if addnorm1_mode == 0:
+                                copy(elem_in1, elem_out_up, seq_tile * emb_tile)
+                            elif addnorm1_mode == 1:
+                                copy(elem_in2, elem_out_up, seq_tile * emb_tile)
+                            else:
+                                ln_mul_add(
+                                    elem_in1,
+                                    elem_in2,
+                                    weights,
+                                    elem_out_up,
+                                    col_i32,
+                                )
+                            of_out_up.release(1)
+                            of_in_norm.release(1)
+                            of_in_residual.release(1)
 
-    def core_fn_ln1_route_rest(
+    def core_fn_ln1_route_split(
         of_in_rest,
-        of_out_up_1,
-        of_out_up_2,
+        of_out_branch,
+        of_out_rest,
         copy,
+        branch_group_count,
+        rest_group_count,
     ):
         for _ in range_(sys.maxsize):
-            # Branch-1 groups.
-            for _ in range_(ffn_col_group_counts[1]):
+            # Emit this route stage's branch groups first.
+            for _ in range_(branch_group_count):
                 for _ in range_(ln_tiles_per_q_block):
                     elem_in_rest = of_in_rest.acquire(1)
-                    elem_out_up_1 = of_out_up_1.acquire(1)
-                    copy(elem_in_rest, elem_out_up_1, seq_tile * emb_tile)
-                    of_out_up_1.release(1)
+                    elem_out_branch = of_out_branch.acquire(1)
+                    copy(elem_in_rest, elem_out_branch, seq_tile * emb_tile)
+                    of_out_branch.release(1)
                     of_in_rest.release(1)
-            # Branch-2 groups.
-            for _ in range_(ffn_col_group_counts[2]):
+            # Forward remaining branch groups to the next route stage (or final branch).
+            for _ in range_(rest_group_count):
                 for _ in range_(ln_tiles_per_q_block):
                     elem_in_rest = of_in_rest.acquire(1)
-                    elem_out_up_2 = of_out_up_2.acquire(1)
-                    copy(elem_in_rest, elem_out_up_2, seq_tile * emb_tile)
-                    of_out_up_2.release(1)
+                    elem_out_rest = of_out_rest.acquire(1)
+                    copy(elem_in_rest, elem_out_rest, seq_tile * emb_tile)
+                    of_out_rest.release(1)
                     of_in_rest.release(1)
 
     def core_fn_ffn_up_proj(
@@ -1901,6 +2170,7 @@ def fused_mha(
         placement=Tile(col=ln1_tile[0], row=ln1_tile[1]),
         while_true=False,
     )
+    use_two_branch_ln1_router = effective_ffn_branches == 2 and ffn_requires_ln1_router
     if effective_ffn_branches == 1:
         ln1_muladd_worker = Worker(
             core_fn_ln1_mul_add_single,
@@ -1917,7 +2187,28 @@ def fused_mha(
             placement=Tile(col=ln1_post_tile[0], row=ln1_post_tile[1]),
             while_true=False,
         )
+    elif use_two_branch_ln1_router:
+        ln1_muladd_worker = Worker(
+            core_fn_ln1_mul_add_single,
+            fn_args=[
+                ln1Norm.cons(),
+                memR.cons(),
+                ln1_weight_buffer,
+                ln1_route_streams[0].prod(),
+                ffn_residual_prod,
+                ln_mul_add_kernel,
+                mem_copy_o_proj,
+                addnorm1_debug_mode,
+            ],
+            placement=Tile(col=ln1_post_tile[0], row=ln1_post_tile[1]),
+            while_true=False,
+        )
     else:
+        ln1_muladd_secondary_out = (
+            ln1_route_streams[0].prod()
+            if ffn_requires_ln1_router
+            else (outLN[1].prod() if effective_ffn_branches > 1 else None)
+        )
         ln1_muladd_worker = Worker(
             core_fn_ln1_mul_add_multi,
             fn_args=[
@@ -1925,16 +2216,7 @@ def fused_mha(
                 memR.cons(),
                 ln1_weight_buffer,
                 outLN[0].prod() if effective_ffn_branches > 0 else None,
-                (
-                    None
-                    if ffn_requires_ln1_router
-                    else (outLN[1].prod() if effective_ffn_branches > 1 else None)
-                ),
-                (
-                    outLNRest.prod()
-                    if ffn_requires_ln1_router
-                    else (outLN[2].prod() if effective_ffn_branches > 2 else None)
-                ),
+                ln1_muladd_secondary_out,
                 ln_mul_add_kernel,
                 mem_copy_o_proj,
                 addnorm1_debug_mode,
@@ -1943,33 +2225,72 @@ def fused_mha(
             placement=Tile(col=ln1_post_tile[0], row=ln1_post_tile[1]),
             while_true=False,
         )
-    ln1_route_worker = None
+    ln1_route_workers = []
     if ffn_requires_ln1_router:
-        if ln1_route_tile is None:
-            raise ValueError("Missing LN1 route tile for multi-branch fanout")
-        ln1_route_worker = Worker(
-            core_fn_ln1_route_rest,
-            fn_args=[
-                outLNRest.cons(),
-                outLN[1].prod(),
-                outLN[2].prod(),
-                mem_copy_o_proj,
-            ],
-            placement=Tile(col=ln1_route_tile[0], row=ln1_route_tile[1]),
-            while_true=False,
-        )
+        if len(ln1_route_tiles) != ln1_route_worker_count:
+            raise ValueError(
+                "Missing LN1 route tiles for multi-branch fanout: "
+                f"have={len(ln1_route_tiles)} need={ln1_route_worker_count}"
+            )
+        if use_two_branch_ln1_router:
+            ln1_route_workers.append(
+                Worker(
+                    core_fn_ln1_route_split,
+                    fn_args=[
+                        ln1_route_streams[0].cons(),
+                        outLN[0].prod(),
+                        outLN[1].prod(),
+                        mem_copy_o_proj,
+                        ffn_col_group_counts[0],
+                        ffn_col_group_counts[1],
+                    ],
+                    placement=Tile(
+                        col=ln1_route_tiles[0][0],
+                        row=ln1_route_tiles[0][1],
+                    ),
+                    while_true=False,
+                )
+            )
+        else:
+            for route_idx in range(ln1_route_worker_count):
+                branch_idx = route_idx + 1
+                rest_group_count = sum(ffn_col_group_counts[branch_idx + 1 :])
+                route_out_rest = (
+                    ln1_route_streams[route_idx + 1].prod()
+                    if route_idx + 1 < ln1_route_worker_count
+                    else outLN[effective_ffn_branches - 1].prod()
+                )
+                ln1_route_workers.append(
+                    Worker(
+                        core_fn_ln1_route_split,
+                        fn_args=[
+                            ln1_route_streams[route_idx].cons(),
+                            outLN[branch_idx].prod(),
+                            route_out_rest,
+                            mem_copy_o_proj,
+                            ffn_col_group_counts[branch_idx],
+                            rest_group_count,
+                        ],
+                        placement=Tile(
+                            col=ln1_route_tiles[route_idx][0],
+                            row=ln1_route_tiles[route_idx][1],
+                        ),
+                        while_true=False,
+                    )
+                )
 
     ffn_up_workers = []
     for branch_idx in range(effective_ffn_branches):
+        residual_from_up_branch = (
+            effective_ffn_branches > 1
+            and not use_two_branch_ln1_router
+            and branch_idx == 0
+        )
         ffn_up_worker_args = [
             memOutLN[branch_idx].cons(depth=1),
             memBUp[branch_idx].cons(),
             ffnUpOut[branch_idx].prod(),
-            (
-                ffn_residual_prod
-                if effective_ffn_branches > 1 and branch_idx == 0
-                else None
-            ),
+            (ffn_residual_prod if residual_from_up_branch else None),
             ffn_zero_kernel_up_proj,
             ffn_matmul_kernel_up_proj,
             ffn_gelu_kernel,
@@ -2449,7 +2770,7 @@ def fused_mha(
             rt.start(o_proj_workers[i])
         rt.start(ln1_norm_worker)
         rt.start(ln1_muladd_worker)
-        if ln1_route_worker is not None:
+        for ln1_route_worker in ln1_route_workers:
             rt.start(ln1_route_worker)
         for branch_idx in range(effective_ffn_branches):
             rt.start(ffn_up_workers[branch_idx])
@@ -2564,6 +2885,8 @@ def fused_mha(
                     task_group=tg,
                     wait=wait_residual_fill,
                 )
+                # Fill all B_Up streams first so every FFN-up branch can start
+                # before B_Down transfers contend for shim/memtile bandwidth.
                 for branch_idx in range(effective_ffn_branches):
                     rt.fill(
                         inBUp[branch_idx].prod(),
@@ -2573,6 +2896,7 @@ def fused_mha(
                         task_group=tg,
                         wait=wait_ffn_weight_fill,
                     )
+                for branch_idx in range(effective_ffn_branches):
                     rt.fill(
                         inBDown[branch_idx].prod(),
                         B_Down,

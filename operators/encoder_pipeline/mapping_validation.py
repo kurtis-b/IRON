@@ -85,7 +85,7 @@ def find_ffn_layout(
         ):
             continue
         available = set(free_tiles) - {ln1_tile}
-        max_chain_len = min(3, len(available))
+        max_chain_len = min(6, len(available))
         if max_chain_len <= 0:
             continue
         for chain_len in range(max_chain_len, 0, -1):
