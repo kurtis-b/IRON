@@ -492,6 +492,11 @@ def fused_mha(
     ffn_down_output_branches: list[int] | None = None
     use_dual_ln2_ffn_inputs = False
     ffn_reduction_mode = "all_cores"
+    # Mode-aware shim-output budget:
+    # - base 5 streams: Q/K/V/W_O/R
+    # - +FFN B-weight streams
+    # - +1 stream in DDR mode for LN1 stage refill from host
+    ln1_ddr_shim_output_streams = 1 if stage_ln1_to_ddr else 0
     while True:
         if len(selected_branch_indices) <= 0:
             raise ValueError("No FFN branches selected")
@@ -547,17 +552,23 @@ def fused_mha(
                 f"compute tile capacity exceeded (needs {required_compute_tiles})"
             )
             continue
-        # Shim output DMA budget: Q/K/V/W_O/R occupy five output streams.
-        # FFN B-weight streams are either per-branch (legacy) or packed/split.
+        # Shim output DMA budget:
+        # - base streams: Q/K/V/W_O/R
+        # - FFN B-weight streams (per-branch or split/packed)
+        # - LN1 DDR stage refill stream in DDR mode
         estimated_b_weight_streams = _estimate_b_weight_stream_count(
             effective_candidate_branches
         )
-        if 5 + estimated_b_weight_streams > 16:
+        shim_output_stream_total = (
+            5 + estimated_b_weight_streams + ln1_ddr_shim_output_streams
+        )
+        if shim_output_stream_total > 16:
             prune_or_fail(
                 "shim output DMA budget exceeded for FFN weight streams "
                 f"(branches={effective_candidate_branches}, "
                 f"estimated_B_streams={estimated_b_weight_streams}, "
-                f"total_streams={5 + estimated_b_weight_streams} > 16)"
+                f"ln1_ddr_streams={ln1_ddr_shim_output_streams}, "
+                f"total_streams={shim_output_stream_total} > 16)"
             )
             continue
         # For wide-head/high-acc configurations, memtile BD-ID allocation for
@@ -586,19 +597,6 @@ def fused_mha(
             continue
         if ffn_stage_only in (3, 4) and len(selected_branch_indices) > 1:
             prune_or_fail("downstream-profile mode uses a single FFN branch")
-            continue
-        if (
-            o_proj_acc_group_size > 1
-            and parallel_heads == 4
-            and proj_acc_depth >= 6
-            and len(selected_branch_indices) > 2
-        ):
-            # Grouped O-proj with 4 MHA heads and high-acc FFN tails can hit
-            # downstream DMA channel limits even after nominal tile-capacity
-            # pruning; keep at most two physical FFN branches.
-            prune_or_fail(
-                "compute tile capacity exceeded (grouped 4-head high-acc DMA/channel budget)"
-            )
             continue
         ln1_post_candidates = [
             tile for tile in free_ffn_tiles if tile not in used_tiles_base

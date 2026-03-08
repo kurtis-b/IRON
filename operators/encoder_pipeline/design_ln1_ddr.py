@@ -33,6 +33,8 @@ def plan_branch_stage_configuration(
     branch_down_b_cols,
     effective_ffn_branches,
     parallel_heads,
+    proj_acc_depth,
+    ln1_replay_mem_tile_col,
     ffn_col_group_counts,
     bup_split_enabled,
     bdown_split_enabled,
@@ -41,6 +43,7 @@ def plan_branch_stage_configuration(
     _allocate_ffn_weight_mem_tile_cols_by_streams,
     logging_module,
 ):
+    del proj_acc_depth, ln1_replay_mem_tile_col, _override_int_env
     branch_stage_cols = list(branch_stage_cols)
     if parallel_heads >= 6 and len(branch_stage_cols) >= 2:
         branch_stage_cols = [
@@ -51,36 +54,6 @@ def plan_branch_stage_configuration(
     if 5 in branch_stage_cols:
         branch_stage_cols = [c for c in branch_stage_cols if c != 5] + [5]
 
-    ln1_ddr_stage_branch_limit = _override_int_env(
-        "ENCODER_LN1_DDR_STAGE_BRANCH_LIMIT",
-        effective_ffn_branches,
-    )
-    invalid_stage_limit_checks = [
-        ln1_ddr_stage_branch_limit <= 0,
-        ln1_ddr_stage_branch_limit > effective_ffn_branches,
-    ]
-    if any(invalid_stage_limit_checks):
-        raise ValueError(
-            "ENCODER_LN1_DDR_STAGE_BRANCH_LIMIT must be in [1, effective_ffn_branches] "
-            f"(got {ln1_ddr_stage_branch_limit}, branches={effective_ffn_branches})"
-        )
-    branch_priority = sorted(
-        range(effective_ffn_branches),
-        key=lambda idx: (-ffn_col_group_counts[idx], idx),
-    )
-    ln1_ddr_staged_branch_indices = sorted(branch_priority[:ln1_ddr_stage_branch_limit])
-    logging_module.info(
-        "LN1 DDR staging branches: %s / %d (group_counts=%s)",
-        ln1_ddr_staged_branch_indices,
-        effective_ffn_branches,
-        ffn_col_group_counts,
-    )
-    reserved_ln1_refill_cols = {}
-    for branch_idx in ln1_ddr_staged_branch_indices:
-        stage_col = branch_stage_cols[branch_idx]
-        reserved_ln1_refill_cols[stage_col] = (
-            reserved_ln1_refill_cols.get(stage_col, 0) + 1
-        )
     if bup_split_enabled or bdown_split_enabled:
         split_chunk_count = len(branch_split_chunks)
         up_stream_count = (
@@ -89,11 +62,39 @@ def plan_branch_stage_configuration(
         down_stream_count = (
             split_chunk_count if bdown_split_enabled else effective_ffn_branches
         )
+    else:
+        up_stream_count = effective_ffn_branches
+        down_stream_count = effective_ffn_branches
+
+    # DDR mode uses one LN1 stage drain and one LN1 stage refill stream.
+    # Refill is then broadcast on-chip to all FFN-up branches.
+    ln1_ddr_stage_source_branch_idx = 0
+    ln1_ddr_staged_branch_indices = [ln1_ddr_stage_source_branch_idx]
+    stage_col = branch_stage_cols[ln1_ddr_stage_source_branch_idx]
+    candidate_reserved_cols = {stage_col: 1}
+    try:
         alloc_bup_cols, alloc_down_cols = _allocate_ffn_weight_mem_tile_cols_by_streams(
             up_stream_count,
             down_stream_count,
-            reserved_output_load_by_col=reserved_ln1_refill_cols,
+            reserved_output_load_by_col=candidate_reserved_cols,
         )
+    except ValueError as exc:
+        raise ValueError(
+            "Unable to allocate shim output channels for LN1 DDR single-stream staging "
+            f"(branches={effective_ffn_branches}, reserved_cols={candidate_reserved_cols})"
+        ) from exc
+    logging_module.info(
+        "LN1 DDR single-stream staging: source_branch=%d stage_col=%d "
+        "(broadcast to %d FFN branches, group_counts=%s)",
+        ln1_ddr_stage_source_branch_idx,
+        stage_col,
+        effective_ffn_branches,
+        ffn_col_group_counts,
+    )
+
+    if bup_split_enabled or bdown_split_enabled:
+        if alloc_bup_cols is None or alloc_down_cols is None:
+            raise ValueError("Missing precomputed FFN weight column allocation")
         branch_bup_cols = [0] * effective_ffn_branches
         branch_down_b_cols = [0] * effective_ffn_branches
         if bup_split_enabled:
@@ -111,13 +112,9 @@ def plan_branch_stage_configuration(
             for branch_idx in range(effective_ffn_branches):
                 branch_down_b_cols[branch_idx] = alloc_down_cols[branch_idx]
     else:
-        branch_bup_cols, branch_down_b_cols = (
-            _allocate_ffn_weight_mem_tile_cols_by_streams(
-                effective_ffn_branches,
-                effective_ffn_branches,
-                reserved_output_load_by_col=reserved_ln1_refill_cols,
-            )
-        )
+        if alloc_bup_cols is None or alloc_down_cols is None:
+            raise ValueError("Missing precomputed FFN weight column allocation")
+        branch_bup_cols, branch_down_b_cols = alloc_bup_cols, alloc_down_cols
 
     return (
         branch_stage_cols,
@@ -142,77 +139,38 @@ def build_ln1_to_ffn_up_path(
     object_fifo_ctor,
     tile_ctor,
 ):
+    del tile_ctor, _override_int_env, _override_bool_env, parallel_heads, proj_acc_depth
+    del o_proj_acc_group_size, ffn_a_stage_mem_tile_cols
     mem_out_ln_cons = []
     ln1_out_stage_to_ddr = {}
     ln1_in_from_ddr = {}
     ln1_ddr_staged_branch_set = set(ln1_ddr_staged_branch_indices)
 
-    ln1_ddr_stage_fifo_depth = _override_int_env(
-        "ENCODER_LN1_DDR_STAGE_FIFO_DEPTH",
-        1,
-    )
-    ln1_ddr_direct_shim_io = _override_bool_env(
-        "ENCODER_LN1_DDR_DIRECT_SHIM_IO",
-        parallel_heads >= 6 and proj_acc_depth >= 6 and o_proj_acc_group_size > 1,
-    )
     ln1_broadcast = object_fifo_ctor(
         o_ty,
         name="outLNBroadcast",
         depth=ffn_up_input_depth,
     )
-
-    for branch_idx in range(effective_ffn_branches):
-        stage_col = ffn_a_stage_mem_tile_cols[branch_idx]
-        if branch_idx in ln1_ddr_staged_branch_set:
-            if ln1_ddr_direct_shim_io:
-                ln1_out_stage_to_ddr[branch_idx] = ln1_broadcast
-            else:
-                ln_stage_source = ln1_broadcast.cons(depth=ffn_up_input_depth)
-                ln1_out_stage_to_ddr[branch_idx] = ln_stage_source.forward(
-                    obj_type=o_ty,
-                    name=(
-                        "memOutLNStageToDDR"
-                        if branch_idx == 0
-                        else f"memOutLNStageToDDR{branch_idx}"
-                    ),
-                    depth=ln1_ddr_stage_fifo_depth,
-                    placement=tile_ctor(col=stage_col, row=1),
-                )
-            ln1_in_from_ddr[branch_idx] = object_fifo_ctor(
-                o_ty,
-                name=("inLNFromDDR" if branch_idx == 0 else f"inLNFromDDR{branch_idx}"),
-                depth=ffn_up_input_depth,
-            )
-            if ln1_ddr_direct_shim_io:
-                mem_out_ln_cons.append(ln1_in_from_ddr[branch_idx].cons(depth=1))
-            else:
-                mem_out_ln_cons.append(
-                    ln1_in_from_ddr[branch_idx]
-                    .cons(depth=ffn_up_input_depth)
-                    .forward(
-                        obj_type=o_ty,
-                        name=(
-                            "memOutLN"
-                            if branch_idx == 0
-                            else f"memOutLNFfn{branch_idx}"
-                        ),
-                        depth=ln1_ddr_stage_fifo_depth,
-                        placement=tile_ctor(col=stage_col, row=1),
-                    )
-                    .cons(depth=1)
-                )
-        else:
-            # Non-staged branch in DDR mode: keep direct memtile hop.
-            mem_out_ln_cons.append(
-                ln1_broadcast.cons(depth=ffn_up_input_depth)
-                .forward(
-                    obj_type=o_ty,
-                    name="memOutLN" if branch_idx == 0 else f"memOutLNFfn{branch_idx}",
-                    depth=ffn_up_input_depth,
-                    placement=tile_ctor(col=stage_col, row=1),
-                )
-                .cons(depth=1)
-            )
+    if sorted(ln1_ddr_staged_branch_set) != [0]:
+        raise ValueError(
+            "DDR mode requires one LN1 stage source branch for DDR staging "
+            f"(staged={sorted(ln1_ddr_staged_branch_set)}, branches={effective_ffn_branches})"
+        )
+    ln1_stage_source = (
+        ln1_broadcast.cons(depth=ffn_up_input_depth)
+        if ln1_ddr_staged_branch_set
+        else None
+    )
+    # Single host refill stream, then broadcast to all FFN-up branches.
+    ln1_refill_broadcast = object_fifo_ctor(
+        o_ty,
+        name="inLNFromDDR",
+        depth=ffn_up_input_depth,
+    )
+    ln1_out_stage_to_ddr[0] = ln1_stage_source
+    ln1_in_from_ddr[0] = ln1_refill_broadcast
+    for _ in range(effective_ffn_branches):
+        mem_out_ln_cons.append(ln1_refill_broadcast.cons(depth=1))
 
     return {
         "ln1Broadcast": ln1_broadcast,
@@ -226,7 +184,33 @@ def adjust_ffn_down_acc_mem_tile_cols(
     *,
     ffn_down_acc_mem_tile_cols,
     effective_ffn_branches,
+    proj_acc_depth,
+    parallel_heads,
+    ln1_replay_mem_tile_col,
 ):
+    del ln1_replay_mem_tile_col
+    # For low-head/high-acc DDR topologies with two FFN branches, keeping the
+    # second FFN-down accumulation stream on col4 can collide with O-proj
+    # accumulation BD allocation on memtile4. Move that second stream to a
+    # different memtile column while preserving branch-0 placement.
+    if (
+        effective_ffn_branches == 2
+        and parallel_heads <= 4
+        and proj_acc_depth >= 8
+        and len(ffn_down_acc_mem_tile_cols) >= 2
+    ):
+        # Prefer col7 first to avoid overloading memtile5 in 2pheads/2pffn/high-acc
+        # DDR topologies (memtile5 already hosts ln1Replay + O-proj accum + B-up flows).
+        fallback_cols = [7, 5, 6, 3, 2, 1, 0, 4]
+        branch0_col = ffn_down_acc_mem_tile_cols[0]
+        chosen_col = None
+        for col in fallback_cols:
+            if col == branch0_col:
+                continue
+            chosen_col = col
+            break
+        if chosen_col is not None:
+            ffn_down_acc_mem_tile_cols[1] = chosen_col
     if effective_ffn_branches >= 6:
         replacement_col = 1
         if replacement_col in ffn_down_acc_mem_tile_cols[:-1]:
@@ -247,9 +231,6 @@ def build_runtime_state(
 ):
     ln1_ddr_stage_enabled_branches = sorted(ln1OutStageToDDR.keys())
     ln1_ddr_stage_enabled = len(ln1_ddr_stage_enabled_branches) > 0
-    ln1_ddr_mixed_mode = ln1_ddr_stage_enabled and (
-        len(ln1_ddr_stage_enabled_branches) < effective_ffn_branches
-    )
     if not ln1_ddr_stage_enabled:
         raise ValueError(
             "LN1 DDR staging is enabled but no staged branch FIFOs were created "
@@ -272,10 +253,19 @@ def build_runtime_state(
             f"planned={sorted(ln1_ddr_staged_branch_indices)} "
             f"created={ln1_ddr_stage_enabled_branches}"
         )
+    if ln1_ddr_stage_enabled_branches != [0]:
+        raise ValueError(
+            "DDR mode expects a single LN1 stage source branch "
+            f"(staged={ln1_ddr_stage_enabled_branches}, branches={effective_ffn_branches})"
+        )
+    if 0 not in ln1InFromDDR:
+        raise ValueError(
+            "LN1 DDR refill broadcast FIFO missing for staged branch 0 "
+            f"(available_refills={sorted(ln1InFromDDR.keys())})"
+        )
     return {
         "ln1_ddr_stage_enabled_branches": ln1_ddr_stage_enabled_branches,
         "ln1_ddr_stage_enabled": ln1_ddr_stage_enabled,
-        "ln1_ddr_mixed_mode": ln1_ddr_mixed_mode,
     }
 
 
@@ -285,8 +275,7 @@ def adjust_wait_ffn_weight_fill(
     runtime_state,
     **_unused,
 ):
-    if runtime_state["ln1_ddr_mixed_mode"]:
-        return False
+    del runtime_state
     return wait_ffn_weight_fill
 
 
@@ -295,9 +284,8 @@ def should_prefill_ffn_weights(
     runtime_state,
     **_unused,
 ):
-    return (not runtime_state["ln1_ddr_stage_enabled"]) or runtime_state[
-        "ln1_ddr_mixed_mode"
-    ]
+    del runtime_state
+    return False
 
 
 def use_bup_broadcast_priming(**_unused):
@@ -335,66 +323,67 @@ def schedule_runtime_tap(
 ):
     # Single-buffered LN1 scratch region: complete prior refill first.
     if pending_ln1_refill_tg is not None:
-        rt.finish_task_group(pending_ln1_refill_tg)
-        pending_ln1_refill_tg = None
+        # Drain the previous tap output before waiting on the prior LN1 refill
+        # task-group. Otherwise, FFN/LN2 backpressure can block those fills,
+        # creating a wait cycle (refill waits on downstream progress while the
+        # downstream drain is deferred until after refill completion).
         if pending_output_tap_idx is not None:
             schedule_final_output_for_tap(pending_output_tap_idx)
             pending_output_tap_idx = None
+        rt.finish_task_group(pending_ln1_refill_tg)
+        pending_ln1_refill_tg = None
 
     ln1_stage_region_offset = 2 * seq_len * embed_sz
     ln1_stage_base_offset = (
         ln1_stage_region_offset + col_group * proj_acc_depth * emb_tile
     )
-    ln1_branch_stage_taps = {}
+    del runtime_state
+    stage_source_branch = 0
     tg_ln1_drain = rt.task_group()
-    for branch_idx in runtime_state["ln1_ddr_stage_enabled_branches"]:
-        stage_col = ffn_a_stage_mem_tile_cols[branch_idx]
-        branch_stage_tap = tensor_access_pattern_cls(
-            or_tensor_shape,
-            offset=ln1_stage_base_offset,
-            sizes=[
-                profile_replay_groups,
-                proj_acc_depth,
-                seq_tile,
-                emb_tile,
-            ],
-            strides=[0, emb_tile, embed_sz, 1],
+    branch_stage_tap = tensor_access_pattern_cls(
+        or_tensor_shape,
+        offset=ln1_stage_base_offset,
+        sizes=[
+            profile_replay_groups,
+            proj_acc_depth,
+            seq_tile,
+            emb_tile,
+        ],
+        strides=[0, emb_tile, embed_sz, 1],
+    )
+    expected_branch_tokens = profile_replay_groups * proj_acc_depth
+    staged_branch_tokens = transfer_count_for_fifo_obj(
+        branch_stage_tap,
+        (seq_tile, emb_tile),
+    )
+    if staged_branch_tokens != expected_branch_tokens:
+        raise ValueError(
+            "LN1 DDR staging transfer count mismatch: "
+            f"staged={staged_branch_tokens} expected={expected_branch_tokens}"
         )
-        expected_branch_tokens = profile_replay_groups * proj_acc_depth
-        staged_branch_tokens = transfer_count_for_fifo_obj(
-            branch_stage_tap,
-            (seq_tile, emb_tile),
-        )
-        if staged_branch_tokens != expected_branch_tokens:
-            raise ValueError(
-                "LN1 DDR staging transfer count mismatch for branch "
-                f"{branch_idx}: staged={staged_branch_tokens} "
-                f"expected={expected_branch_tokens}"
-            )
-        ln1_branch_stage_taps[branch_idx] = branch_stage_tap
-        rt.drain(
-            ln1OutStageToDDR[branch_idx].cons(),
-            OR,
-            tap=branch_stage_tap,
-            placement=tile_ctor(col=stage_col, row=0),
-            task_group=tg_ln1_drain,
-            wait=True,
-        )
+    stage_src = ln1OutStageToDDR[stage_source_branch]
+    if hasattr(stage_src, "cons"):
+        stage_src = stage_src.cons()
+    rt.drain(
+        stage_src,
+        OR,
+        tap=branch_stage_tap,
+        placement=tile_ctor(col=ffn_a_stage_mem_tile_cols[stage_source_branch], row=0),
+        task_group=tg_ln1_drain,
+        wait=True,
+    )
     rt.finish_task_group(tg_ln1_drain)
 
     tg_ln1_refill_and_weights = rt.task_group()
-    for branch_idx in runtime_state["ln1_ddr_stage_enabled_branches"]:
-        stage_col = ffn_a_stage_mem_tile_cols[branch_idx]
-        rt.fill(
-            ln1InFromDDR[branch_idx].prod(),
-            OR,
-            tap=ln1_branch_stage_taps[branch_idx],
-            placement=tile_ctor(col=stage_col, row=0),
-            task_group=tg_ln1_refill_and_weights,
-            wait=True,
-        )
-    if not runtime_state["ln1_ddr_mixed_mode"]:
-        schedule_ffn_weight_fills(tg_ln1_refill_and_weights, col_group)
+    rt.fill(
+        ln1InFromDDR[stage_source_branch].prod(),
+        OR,
+        tap=branch_stage_tap,
+        placement=tile_ctor(col=ffn_a_stage_mem_tile_cols[stage_source_branch], row=0),
+        task_group=tg_ln1_refill_and_weights,
+        wait=True,
+    )
+    schedule_ffn_weight_fills(tg_ln1_refill_and_weights, col_group)
     rt.finish_task_group(tg)
     if decouple_tail_fill:
         rt.finish_task_group(tg_tail_fill)
@@ -409,12 +398,12 @@ def finalize_runtime(
     pending_output_tap_idx,
     **_unused,
 ):
-    if pending_ln1_refill_tg is not None:
-        rt.finish_task_group(pending_ln1_refill_tg)
-        pending_ln1_refill_tg = None
     if pending_output_tap_idx is not None:
         schedule_final_output_for_tap(pending_output_tap_idx)
         pending_output_tap_idx = None
+    if pending_ln1_refill_tg is not None:
+        rt.finish_task_group(pending_ln1_refill_tg)
+        pending_ln1_refill_tg = None
     return pending_ln1_refill_tg, pending_output_tap_idx
 
 
