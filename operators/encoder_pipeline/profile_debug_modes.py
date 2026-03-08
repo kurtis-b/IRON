@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import sys
 import traceback
@@ -19,8 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from operators.common.aie_context import AIEContext
 from operators.common.aie_device_manager import AIEDeviceManager
 from operators.encoder_pipeline.test import (
-    TEST_TIMED_ITERS,
-    TEST_WARMUP_ITERS,
+    DEFAULT_TEST_TIMED_ITERS,
+    DEFAULT_TEST_WARMUP_ITERS,
     _case_name,
     _run_encoder_pipeline_case,
     generate_test_params,
@@ -75,6 +74,7 @@ def _run_single_mode(
     mode: DebugModeSpec,
     warmup_iters: int,
     timed_iters: int,
+    ln1_staging_design: str,
 ) -> dict:
     ctx = None
     try:
@@ -85,6 +85,7 @@ def _run_single_mode(
             aie_context=ctx,
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
+            ln1_staging_design=ln1_staging_design,
         )
         return {
             "mode": mode.name,
@@ -139,20 +140,20 @@ def main() -> int:
     parser.add_argument(
         "--design",
         choices=("ddr", "memtile"),
-        default=os.getenv("ENCODER_LN1_STAGING_DESIGN", "ddr"),
-        help="LN1 staging design to use (default: env ENCODER_LN1_STAGING_DESIGN or ddr).",
+        default="ddr",
+        help="LN1 staging design to use.",
     )
     parser.add_argument(
         "--warmup-iters",
         type=int,
-        default=TEST_WARMUP_ITERS,
-        help=f"Warmup iterations per mode (default: {TEST_WARMUP_ITERS}).",
+        default=DEFAULT_TEST_WARMUP_ITERS,
+        help=f"Warmup iterations per mode (default: {DEFAULT_TEST_WARMUP_ITERS}).",
     )
     parser.add_argument(
         "--timed-iters",
         type=int,
-        default=TEST_TIMED_ITERS,
-        help=f"Timed iterations per mode (default: {TEST_TIMED_ITERS}).",
+        default=DEFAULT_TEST_TIMED_ITERS,
+        help=f"Timed iterations per mode (default: {DEFAULT_TEST_TIMED_ITERS}).",
     )
     parser.add_argument(
         "--extensive",
@@ -189,7 +190,6 @@ def main() -> int:
     if args.clean_build:
         shutil.rmtree(Path.cwd() / "build", ignore_errors=True)
 
-    os.environ["ENCODER_LN1_STAGING_DESIGN"] = args.design
     cases, names = generate_test_params(extensive=args.extensive)
     selected_idxs = _parse_case_filter(args.case_index, len(cases))
 
@@ -213,6 +213,7 @@ def main() -> int:
                 spec,
                 warmup_iters=args.warmup_iters,
                 timed_iters=args.timed_iters,
+                ln1_staging_design=args.design,
             )
             mode_results.append(result)
             if result["status"] == "pass":
