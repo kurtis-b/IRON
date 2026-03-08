@@ -22,6 +22,10 @@ def choose_ln1_replay_mem_tile_col(
     if parallel_heads >= 6 and proj_acc_depth >= 6:
         return 5
     if parallel_heads >= 4 and proj_acc_depth >= 8 and effective_ffn_branches > 1:
+        # For 4-way FFN tails, col3 already carries W_O split fanout and can
+        # exceed memtile output-channel limits when LN1 replay is colocated.
+        if effective_ffn_branches >= 4:
+            return 5
         return 3
     return 5
 
@@ -211,6 +215,16 @@ def adjust_ffn_down_acc_mem_tile_cols(
             break
         if chosen_col is not None:
             ffn_down_acc_mem_tile_cols[1] = chosen_col
+    if effective_ffn_branches >= 4 and parallel_heads <= 4 and proj_acc_depth >= 8:
+        # Col3 already carries W_O fanout in these topologies. Keep FFN down
+        # accumulation staging off col3 to stay within memtile BD allocation.
+        for idx, col in enumerate(ffn_down_acc_mem_tile_cols):
+            if col != 3:
+                continue
+            for candidate_col in (6, 5, 4, 7, 2, 1, 0):
+                if candidate_col not in ffn_down_acc_mem_tile_cols:
+                    ffn_down_acc_mem_tile_cols[idx] = candidate_col
+                    break
     if effective_ffn_branches >= 6:
         replacement_col = 1
         if replacement_col in ffn_down_acc_mem_tile_cols[:-1]:

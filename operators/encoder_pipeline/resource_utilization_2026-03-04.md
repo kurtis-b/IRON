@@ -2,7 +2,7 @@
 
 Last updated: 2026-03-08
 
-## NPU2 capacity model
+## NPU2 limits used by the design
 
 - Compute tiles: 32 total, 64 KiB L1 each
 - Memtiles: 512 KiB L2 each
@@ -10,7 +10,7 @@ Last updated: 2026-03-08
 - Memtile DMA channels: 6 in / 6 out
 - Memtile DMA block budget: 48 blocks per memtile DMA op
 
-## Budget guards in design
+## Enforced budget guards
 
 - Compute tiles:
   - `parallel_heads*4 + 3 + 2*effective_ffn_branches <= 32`
@@ -20,7 +20,7 @@ Last updated: 2026-03-08
   - `ln1_ddr_streams = 1` in DDR mode, `0` in memtile mode
   - require `total <= 16`
 
-## LN1 staging resource effect
+## Mode-specific LN1 impact
 
 - Memtile mode:
   - no LN1 DDR shim refill stream.
@@ -28,19 +28,14 @@ Last updated: 2026-03-08
   - one LN1 stage drain to DDR and one LN1 refill stream from DDR.
   - refill stream is broadcast on-chip to FFN-up branches (no per-branch host refill).
 
-## Common hotspots
+## Current high-pressure areas
 
-- Shim cols `0/1/2/3` from `Q/K/V/W_O`
-- Shim col `7` from residual/LN traffic
-- Tail memtiles carrying FFN-down accumulation/reduction and replay FIFOs
+- Shim cols `0/1/2/3`: `Q/K/V/W_O` ingress fanout
+- Shim col `7`: residual and LN2 traffic
+- Tail down-proj tiles with `emb_tile=128`: L1 pressure from B weights + reduction/out FIFOs
+- Tail memtiles: FFN-down accumulation/reduction + replay channels/BDs
 
-## Utilization inspection workflow
+## Practical notes from current baseline
 
-1. Generate a design (`pytest -x ...` or direct build).
-2. Inspect:
-   - `build/encoder_pipeline_*.mlir.prj/input_physical.mlir`
-   - `build/encoder_pipeline_*.mlir.prj/input_with_addresses.mlir`
-3. Record:
-   - compute-tile count and mapping,
-   - per-memtile channel usage (in/out),
-   - per-memtile DMA block usage.
+- DDR and memtile regressions are currently green with clean builds.
+- Default FIFO depth adjustments for `emb_tile >= 128` are required to keep FFN tiles within 64 KiB L1.
