@@ -21,11 +21,22 @@ def cardinal_neighbors(tile: tuple[int, int]) -> list[tuple[int, int]]:
     ]
 
 
+def reduction_neighbors_nes(tile: tuple[int, int]) -> list[tuple[int, int]]:
+    """Directed neighbors for down-reduction links (north/east/south only)."""
+    c, r = tile
+    candidates = [(c, r + 1), (c + 1, r), (c, r - 1)]
+    return [
+        (cc, rr) for (cc, rr) in candidates if cc in COMPUTE_COLS and rr in COMPUTE_ROWS
+    ]
+
+
 def find_ffn_layout(
     parallel_heads: int,
     max_non_neighbor_down_to_ln2: int = 2,
     mha_output_tile: tuple[int, int] | None = None,
     require_mha_ln_neighbor: bool = False,
+    restrict_down_reduction_to_nes: bool = True,
+    restrict_down_to_ln2_to_nes: bool = False,
 ) -> dict:
     all_compute_tiles = {(c, r) for c in COMPUTE_COLS for r in COMPUTE_ROWS}
     mha_tiles = {(c, r) for c in range(parallel_heads) for r in COMPUTE_ROWS}
@@ -43,7 +54,9 @@ def find_ffn_layout(
         ]
 
     def enumerate_neighbor_chains(
-        available_tiles: set[tuple[int, int]], length: int
+        available_tiles: set[tuple[int, int]],
+        length: int,
+        next_hops_fn,
     ) -> list[list[tuple[int, int]]]:
         chains: list[list[tuple[int, int]]] = []
         for start in sorted(available_tiles):
@@ -53,7 +66,7 @@ def find_ffn_layout(
                 if len(path) == length:
                     chains.append(path)
                     continue
-                for nxt in sorted(cardinal_neighbors(cur)):
+                for nxt in sorted(next_hops_fn(cur)):
                     if nxt not in available_tiles or nxt in visited:
                         continue
                     stack.append((nxt, path + [nxt], visited | {nxt}))
@@ -88,8 +101,15 @@ def find_ffn_layout(
         max_chain_len = min(6, len(available))
         if max_chain_len <= 0:
             continue
+        down_chain_hops_fn = (
+            reduction_neighbors_nes
+            if restrict_down_reduction_to_nes
+            else cardinal_neighbors
+        )
         for chain_len in range(max_chain_len, 0, -1):
-            down_chains = enumerate_neighbor_chains(available, chain_len)
+            down_chains = enumerate_neighbor_chains(
+                available, chain_len, down_chain_hops_fn
+            )
             for down_tiles in down_chains:
                 down_set = set(down_tiles)
                 up_options = []
@@ -120,6 +140,11 @@ def find_ffn_layout(
                     down_to_ln2 = [root_down]
 
                     for ln2_tile in ln2_candidates:
+                        if (
+                            restrict_down_to_ln2_to_nes
+                            and ln2_tile not in reduction_neighbors_nes(root_down)
+                        ):
+                            continue
                         non_neighbor_down = [
                             d
                             for d in down_to_ln2

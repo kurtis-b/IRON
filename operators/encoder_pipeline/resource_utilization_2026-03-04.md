@@ -1,48 +1,53 @@
-# Encoder Pipeline Resource Utilization (Cleaned)
+# encoder_pipeline Resource Utilization (Current)
 
-Last updated: 2026-03-06
+Last updated: 2026-03-08
 
-## Data source
-- Physical artifacts from `build/encoder_pipeline_*_lnstage.mlir.prj/{input_physical.mlir,input_with_addresses.mlir}`.
-- Capacity assumptions:
-  - Compute-tile L1: 64 KiB
-  - Mem-tile L2: 512 KiB
-  - Compute-tile DMA channels: 2 in / 2 out
-  - Mem-tile DMA channels: 6 in / 6 out
+This file documents the current resource model, active pressure points, and
+how to collect per-design utilization from build artifacts.
 
-## Topology-level summary
+## Capacity model (NPU2)
 
-The previous table had repeated entries across sequence lengths. The utilization pattern is effectively topology-dependent, not `seq_len`-dependent, for the measured set.
+- Compute-tile L1: 64 KiB
+- Mem-tile L2: 512 KiB
+- Compute-tile DMA channels: 2 in / 2 out
+- Mem-tile DMA channels: 6 in / 6 out
+- Compute-tile budget: 32 tiles
+- Memtile DMA block budget: 48 blocks per memtile DMA op
 
-| Topology Class | Covered designs | Compute tiles | Peak compute L1 | Peak mem L2 | Peak compute DMA | Peak mem DMA |
-|---|---|---:|---|---|---|---|
-| `12h, 1ph, 1nbdist, 6acc, 3072ffn` | `64s`, `128s`, `512s`, `2048s` | 9 | 57,364 B (87.5%) on `tile_1_5` | 114,688 B (21.9%) on `mem_tile_7_1` | 2/2 in (`tile_1_5`), 2/2 out (`tile_1_2`) | 4/6 in, 4/6 out (`mem_tile_7_1`) |
-| `12h, 6ph, 3nbdist, 6acc, 3072ffn` | `64s`, `512s`, `1024s`, `2048s` | 29 | 57,364 B (87.5%) on `tile_6_5` | 147,456 B (28.1%) on `mem_tile_5_1` | 2/2 in (`tile_6_5`), 2/2 out (`tile_6_2`) | 4/6 in (`mem_tile_6_1`), 6/6 out (`mem_tile_1_1`) |
-| `16h, 4ph, 3nbdist, 8acc, 4096ffn` | `512s`, `1024s`, `2048s` | 21 | 57,364 B (87.5%) on `tile_4_5` | 172,032 B (32.8%) on `mem_tile_6_1` | 2/2 in (`tile_4_5`), 2/2 out (`tile_6_2`) | 4/6 in (`mem_tile_6_1`), 5/6 out (`mem_tile_3_1`) |
+## Compute-tile budget rule
 
-## Block locations by topology
+`parallel_heads*4 + 3 + 2*effective_ffn_branches <= 32`
 
-| Topology Class | MHA | AddNorm | FFN |
-|---|---|---|---|
-| `12h, 1ph, 1nbdist, 6acc` | `(0,2..5)` | `LN1-norm (1,3), LN1-post (1,2), LN2 (2,5)` | `up (1,4), down (1,5)` |
-| `12h, 6ph, 3nbdist, 6acc` | `(0..5, 2..5)` | `LN1-norm (6,3), LN1-post (6,2), LN2 (7,5)` | `up (6,4), down (6,5)` |
-| `16h, 4ph, 3nbdist, 8acc` | `(0..3, 2..5)` | `LN1-norm (4,3), LN1-post (6,2), LN2 (5,5)` | `up (4,4), down (4,5)` |
+Where:
+- `parallel_heads*4`: MHA (`QK`, `softmax`, `PV`, `O-proj`)
+- `+3`: (`LN1 norm`, `LN1 mul+add`, `LN2`)
+- `2*effective_ffn_branches`: (`FFN up`, `FFN down`)
 
-## Total allocated memory (from measured artifacts)
+## Current pressure hotspots
 
-| Topology Class | Total L1 on used compute tiles | Total L2 on mem tiles |
-|---|---:|---:|
-| `12h, 1ph, 1nbdist, 6acc, 3072ffn` | 356,768 B | 360,448 B |
-| `12h, 6ph, 3nbdist, 6acc, 3072ffn` | 1,016,408 B | 892,928 B |
-| `16h, 4ph, 3nbdist, 8acc, 4096ffn` | 761,768 B | 794,624 B |
+- Col `0/1/2/3`: Q/K/V/W_O host ingress
+- Col `7`: residual/LN paths and LN outputs
+- Cols used by FFN B-stream staging and FFN-down accumulation (topology-dependent)
 
-## Revalidation status (2026-03-06)
-- Functional regression check after latest OR/LN1 staging-buffer layout update:
-  - `pytest operators/encoder_pipeline/test.py -q --iterations 1`
-  - result: `5 passed`
-- Default resource shape for baseline path is unchanged by this host-buffer layout update.
+Current mapping policy now prefers non-col7 placement for FFN B-stream columns,
+using col7 only as fallback, to reduce channel contention with residual/LN traffic.
 
-## LN1 DDR staging caveat
-- `ENCODER_STAGE_LN1_TO_DDR=1` introduces extra shim/memtile traffic for LN1->FFN handoff.
-- Timeout on the targeted `1pheads_1pffn_6pacc` case was fixed via runtime synchronization/order updates.
-- The mode is still not globally feasible for all tested topologies due compile-time resource limits (output DMA-channel and memtile-BD pressure), so it is not included in the stable utilization snapshot above.
+## Current status snapshot
+
+- `1pheads_4pffn_8pacc_1opg` (memtile):
+  - prior per-tile DMA channel overflow on col7 was fixed by column-placement updates.
+- `6pheads_2pffn_8pacc_2opg` (memtile):
+  - currently fails compile with memtile BD overflow:
+    - `aie.memtile_dma op has more than 48 blocks`
+  - this is a per-memtile BD allocation bottleneck, not a compute-tile count limit.
+
+## How to inspect utilization for a generated design
+
+1. Build a topology (for example with `pytest -x`) so artifacts are generated.
+2. Inspect:
+   - `build/encoder_pipeline_*.mlir.prj/input_physical.mlir`
+   - `build/encoder_pipeline_*.mlir.prj/input_with_addresses.mlir`
+3. Record, per relevant tile/memtile:
+   - compute-tile usage and L1 high-water marks,
+   - memtile channel usage (in/out),
+   - memtile BD usage and overflow point.

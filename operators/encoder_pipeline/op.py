@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +40,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         emb_tile: int = 96,
         parallel_heads: int = 1,
         proj_acc_depth: int = 1,
+        o_proj_acc_group_size: int = 1,
         nB_tiles_distributed: int = 1,
         ffn_intermediate_size: int | None = None,
         static_weights: bool = False,
@@ -60,6 +60,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.emb_tile = emb_tile
         self.parallel_heads = parallel_heads
         self.proj_acc_depth = proj_acc_depth
+        self.o_proj_acc_group_size = o_proj_acc_group_size
         self.nB_tiles_distributed = nB_tiles_distributed
         self.debug = debug
         self.ln1_staging_design = self._resolve_ln1_staging_design(ln1_staging_design)
@@ -82,6 +83,27 @@ class AIEEncoderPipeline(AIEOperatorBase):
         if self.nB_tiles_distributed <= 0:
             raise AIEOperatorConstraintError(
                 f"encoder_pipeline requires nB_tiles_distributed > 0 (got {self.nB_tiles_distributed})"
+            )
+        if self.o_proj_acc_group_size <= 0:
+            raise AIEOperatorConstraintError(
+                "encoder_pipeline requires o_proj_acc_group_size > 0 "
+                f"(got {self.o_proj_acc_group_size})"
+            )
+        if self.o_proj_acc_group_size > self.parallel_heads:
+            raise AIEOperatorConstraintError(
+                "encoder_pipeline requires o_proj_acc_group_size <= parallel_heads "
+                f"({self.o_proj_acc_group_size} > {self.parallel_heads})"
+            )
+        if self.o_proj_acc_group_size not in (1, 2, 4):
+            raise AIEOperatorConstraintError(
+                "encoder_pipeline currently supports o_proj_acc_group_size in {1, 2, 4} "
+                f"(got {self.o_proj_acc_group_size})"
+            )
+        if self.parallel_heads % self.o_proj_acc_group_size != 0:
+            raise AIEOperatorConstraintError(
+                "encoder_pipeline requires parallel_heads divisible by "
+                "o_proj_acc_group_size "
+                f"({self.parallel_heads} % {self.o_proj_acc_group_size} != 0)"
             )
 
         expected_depth = self.embed_sz // self.emb_tile
@@ -141,11 +163,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
 
     @staticmethod
     def _resolve_ln1_staging_design(ln1_staging_design: str | None) -> str:
-        raw = (
-            ln1_staging_design
-            if ln1_staging_design is not None
-            else os.getenv("ENCODER_LN1_STAGING_DESIGN", "ddr")
-        )
+        raw = ln1_staging_design if ln1_staging_design is not None else "ddr"
         mode = raw.strip().lower()
         if mode in ("ddr", "dram", "host"):
             return "ddr"
@@ -177,7 +195,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         file_name_base = (
             f"{prefix}_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}qt_"
             f"{self.kv_seq_tile}kvt_{self.emb_tile}e_{self.parallel_heads}ph_"
-            f"{self.proj_acc_depth}acc_"
+            f"{self.proj_acc_depth}acc_{self.o_proj_acc_group_size}opg_"
             f"{self.nB_tiles_distributed}nbdist_{self.ffn_intermediate_size}ffn_"
             f"{debug_suffix}"
         )
@@ -271,6 +289,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "emulate_bf16_mmul_with_bfp16": True,
                 "kernel_archive": kernel_archive,
                 "trace_size": 0,
+                "o_proj_acc_group_size": self.o_proj_acc_group_size,
                 "ln1_weight_file": ln1_weight_file_name,
                 "ln2_weight_file": ln2_weight_file_name,
                 "nB_tiles_distributed": self.nB_tiles_distributed,
