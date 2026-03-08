@@ -1622,8 +1622,9 @@ def fused_mha(
         (s, emb_tile),
         (t, 1),
     ]
-    # FFN weight FIFOs feed FFN up/down cores directly.
-    ffn_weight_fifo_depth = 2
+    # Large emb_tile (e.g. 128) can overflow FFN-up L1 when B-weight FIFOs are
+    # double-buffered at the consumer; keep them shallow in that regime.
+    ffn_weight_fifo_depth = 1 if emb_tile >= 128 else 2
     ffn_bup_mem_tile_cols = branch_bup_cols[:effective_ffn_branches]
     ffn_bdown_mem_tile_cols = branch_down_b_cols[:effective_ffn_branches]
     logging.info(
@@ -1811,7 +1812,13 @@ def fused_mha(
                 placement=Tile(col=ffn_down_acc_mem_tile_cols[branch_idx], row=1),
             )
         )
-    ffn_down_reduce_depth = _override_int_env("ENCODER_FFN_DOWN_REDUCE_DEPTH", 2)
+    # Large emb_tile (128) can overflow FFN-down L1 when reduction FIFOs are
+    # double-buffered alongside B-down and accumulation buffers.
+    default_ffn_down_reduce_depth = 1 if emb_tile >= 128 else 2
+    ffn_down_reduce_depth = _override_int_env(
+        "ENCODER_FFN_DOWN_REDUCE_DEPTH",
+        default_ffn_down_reduce_depth,
+    )
     stage_ffn_reduce_via_memtile = _override_bool_env(
         "ENCODER_STAGE_FFN_REDUCE_VIA_MEMTILE",
         False,
@@ -1871,7 +1878,7 @@ def fused_mha(
             )
             ffnDownReduce.append(link)
             ffnDownReduceSrc.append(link)
-    ffn_down_out_depth_default = 2
+    ffn_down_out_depth_default = 1 if emb_tile >= 128 else 2
     ffn_down_out_depth = _override_int_env(
         "ENCODER_FFN_DOWN_OUT_DEPTH",
         ffn_down_out_depth_default,

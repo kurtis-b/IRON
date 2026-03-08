@@ -2,14 +2,6 @@
 
 Fused encoder operator: `MHA + AddNorm1 + FFN + AddNorm2`.
 
-## Files
-
-- `design.py`: shared placement, workers, and runtime sequence
-- `design_ln1_ddr.py`: DDR-specific LN1 staging hooks
-- `design_ln1_memtile.py`: memtile-specific LN1 staging hooks
-- `op.py`: operator API, artifact generation, host buffers
-- `test.py`: topology matrix and stage-profile tests
-
 ## LN1 staging modes
 
 - `ln1_staging_design="memtile"`:
@@ -18,15 +10,6 @@ Fused encoder operator: `MHA + AddNorm1 + FFN + AddNorm2`.
   - LN1 uses a single stage stream to DDR per tap, then a single DDR refill stream.
   - Refilled LN1 data is broadcast on-chip to all FFN-up branches.
   - No per-branch host refill streams.
-
-## Mapping summary
-
-- MHA lane `i` is fixed at:
-  - QK `(i,2)`, softmax `(i,3)`, PV `(i,4)`, O-proj `(i,5)`.
-- Tail tiles (`LN1`, `FFN up/down`, `LN2`) are selected by `mapping_validation.py`.
-- FFN down reduction supports:
-  - full chain through all selected down cores, or
-  - chain through all-but-one down core (dual LN2 FFN input case).
 
 ## Key constraints
 
@@ -45,6 +28,11 @@ Fused encoder operator: `MHA + AddNorm1 + FFN + AddNorm2`.
   - `ln1_ddr_streams = 1` in DDR mode, `0` in memtile mode
   - require `total <= 16`
 - Per-column shim and memtile BD/channel limits are validated during allocation/lowering.
+
+## Current regression status (2026-03-08)
+
+- DDR mode (`-k lnstage_ddr`): `80 passed, 30 skipped`
+- Memtile mode (`-k lnstage_memtile`): `65 passed, 30 skipped`
 
 ## Quick runs
 

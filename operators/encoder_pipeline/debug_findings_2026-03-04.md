@@ -2,30 +2,28 @@
 
 Last updated: 2026-03-08
 
-## Active design facts
+## Current facts
 
-- Layer norm requires full-row statistics, so LN1/LN2 remain two-pass.
-- FFN branch count may be reduced by shared placement/resource guards in `design.py`.
-- LN1 staging behavior is mode-specific:
+- Layer norm requires full-row stats, so LN1/LN2 remain two-pass.
+- LN1 staging is mode-specific:
   - `memtile`: direct on-chip LN1 broadcast to FFN-up branches.
-  - `ddr`: single LN1 stage drain + single LN1 refill stream, then on-chip broadcast to FFN-up branches.
+  - `ddr`: single LN1 drain + single LN1 refill stream, then on-chip broadcast.
 
-## Recent fixes
+## Fixes in current baseline
 
-1. Removed DDR LN1 per-branch host refill pattern.
-2. Replaced with single-stream DDR refill + on-chip broadcast fanout.
-3. Updated shim-output stream guard to account for DDR mode (`+1` LN1 DDR refill stream).
-4. Updated `op.py` OR host writes to include DDR LN1 scratch rows.
+1. DDR LN1 replay placement avoids high-pressure memtile combinations in high-acc grouped topologies.
+2. DDR FFN-down accumulation memtile placement avoids col3 collision with `W_O` fanout.
+3. For `emb_tile >= 128`, default FIFO depths are reduced where needed (`B`-weight, FFN-down reduce, FFN-down out) to prevent L1 over-allocation.
+4. Shim-output budgeting remains mode-aware (`+1` LN1 stream only in DDR mode).
 
-## Validation snapshot
+## Regression validation (2026-03-08)
 
-- Generation-level check on regular topology set:
-  - no LN1 DDR staging allocator failures after single-stream redesign.
-- Targeted DDR hardware tests:
-  - `1pheads_4pffn_8pacc_1opg`: pass.
-  - `2pheads_2pffn_8pacc_1opg`: pass.
+- `pytest operators/encoder_pipeline/test.py -k lnstage_ddr -q`:
+  - `80 passed, 30 skipped, 95 deselected`
+- `pytest operators/encoder_pipeline/test.py -k lnstage_memtile -q`:
+  - `65 passed, 30 skipped, 110 deselected`
 
 ## Guardrails
 
-- Do not relax numerical error thresholds to hide routing/liveness defects.
-- Keep LN replay/two-pass semantics intact.
+- Do not change numerical thresholds to mask liveness/routing issues.
+- Preserve LN two-pass semantics and row-complete staging requirements.
