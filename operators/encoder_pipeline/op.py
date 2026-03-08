@@ -523,6 +523,18 @@ class AIEEncoderPipeline(AIEOperatorBase):
         else:
             r_np = np.zeros((self.seq_len, self.embed_sz), dtype=bfloat16)
         or_np = np.concatenate((np.zeros_like(r_np), r_np), axis=0)
+        if self.ln1_staging_design == "ddr":
+            ln1_stage_rows = (
+                self.ffn_intermediate_size // self.emb_tile
+            ) * self.seq_tile
+            if ln1_stage_rows > 0:
+                or_np = np.concatenate(
+                    (
+                        or_np,
+                        np.zeros((ln1_stage_rows, self.embed_sz), dtype=or_np.dtype),
+                    ),
+                    axis=0,
+                )
 
         self.write_buffer("QKV", qkv_np)
         self.write_buffer("OR", or_np)

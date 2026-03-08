@@ -2,52 +2,45 @@
 
 Last updated: 2026-03-08
 
-This file documents the current resource model, active pressure points, and
-how to collect per-design utilization from build artifacts.
+## NPU2 capacity model
 
-## Capacity model (NPU2)
-
-- Compute-tile L1: 64 KiB
-- Mem-tile L2: 512 KiB
+- Compute tiles: 32 total, 64 KiB L1 each
+- Memtiles: 512 KiB L2 each
 - Compute-tile DMA channels: 2 in / 2 out
-- Mem-tile DMA channels: 6 in / 6 out
-- Compute-tile budget: 32 tiles
+- Memtile DMA channels: 6 in / 6 out
 - Memtile DMA block budget: 48 blocks per memtile DMA op
 
-## Compute-tile budget rule
+## Budget guards in design
 
-`parallel_heads*4 + 3 + 2*effective_ffn_branches <= 32`
+- Compute tiles:
+  - `parallel_heads*4 + 3 + 2*effective_ffn_branches <= 32`
+- Shim output stream budget:
+  - `total = 5 + estimated_B_streams + ln1_ddr_streams`
+  - base `5` is `Q/K/V/W_O/R`
+  - `ln1_ddr_streams = 1` in DDR mode, `0` in memtile mode
+  - require `total <= 16`
 
-Where:
-- `parallel_heads*4`: MHA (`QK`, `softmax`, `PV`, `O-proj`)
-- `+3`: (`LN1 norm`, `LN1 mul+add`, `LN2`)
-- `2*effective_ffn_branches`: (`FFN up`, `FFN down`)
+## LN1 staging resource effect
 
-## Current pressure hotspots
+- Memtile mode:
+  - no LN1 DDR shim refill stream.
+- DDR mode:
+  - one LN1 stage drain to DDR and one LN1 refill stream from DDR.
+  - refill stream is broadcast on-chip to FFN-up branches (no per-branch host refill).
 
-- Col `0/1/2/3`: Q/K/V/W_O host ingress
-- Col `7`: residual/LN paths and LN outputs
-- Cols used by FFN B-stream staging and FFN-down accumulation (topology-dependent)
+## Common hotspots
 
-Current mapping policy now prefers non-col7 placement for FFN B-stream columns,
-using col7 only as fallback, to reduce channel contention with residual/LN traffic.
+- Shim cols `0/1/2/3` from `Q/K/V/W_O`
+- Shim col `7` from residual/LN traffic
+- Tail memtiles carrying FFN-down accumulation/reduction and replay FIFOs
 
-## Current status snapshot
+## Utilization inspection workflow
 
-- `1pheads_4pffn_8pacc_1opg` (memtile):
-  - prior per-tile DMA channel overflow on col7 was fixed by column-placement updates.
-- `6pheads_2pffn_8pacc_2opg` (memtile):
-  - currently fails compile with memtile BD overflow:
-    - `aie.memtile_dma op has more than 48 blocks`
-  - this is a per-memtile BD allocation bottleneck, not a compute-tile count limit.
-
-## How to inspect utilization for a generated design
-
-1. Build a topology (for example with `pytest -x`) so artifacts are generated.
+1. Generate a design (`pytest -x ...` or direct build).
 2. Inspect:
    - `build/encoder_pipeline_*.mlir.prj/input_physical.mlir`
    - `build/encoder_pipeline_*.mlir.prj/input_with_addresses.mlir`
-3. Record, per relevant tile/memtile:
-   - compute-tile usage and L1 high-water marks,
-   - memtile channel usage (in/out),
-   - memtile BD usage and overflow point.
+3. Record:
+   - compute-tile count and mapping,
+   - per-memtile channel usage (in/out),
+   - per-memtile DMA block usage.

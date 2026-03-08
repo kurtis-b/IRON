@@ -21,7 +21,7 @@ ERROR_THRESHOLD = 0.005
 
 DEFAULT_TEST_WARMUP_ITERS = 3
 DEFAULT_TEST_TIMED_ITERS = 20
-DEFAULT_TEST_LN1_STAGING_DESIGNS = ("memtile",)
+DEFAULT_TEST_LN1_STAGING_DESIGNS = ("memtile", "ddr")
 
 ENABLE_STAGE_PROFILE_TESTS = False
 DEFAULT_STAGE_PROFILE_CASE = (1024, 64, 12, 3072, 32, 64, 96, 6, 3, 8)
@@ -53,9 +53,9 @@ _REGULAR_BASE_CASES = [
     (2048, 64, 12, 3072, 32, 64, 96, 6, 2, 8),
     (1024, 64, 12, 3072, 32, 64, 96, 6, 2, 8),
     # TODO: Below should use DDR mode
-    # (512, 64, 16, 4096, 32, 64, 96, 4, 6, 8),
-    # (1024, 64, 16, 4096, 32, 64, 96, 4, 6, 8),
-    # (2048, 64, 16, 4096, 32, 64, 96, 4, 6, 8),
+    (512, 64, 16, 4096, 32, 64, 128, 4, 4, 8),
+    (1024, 64, 16, 4096, 32, 64, 128, 4, 4, 8),
+    (2048, 64, 16, 4096, 32, 64, 128, 4, 4, 8),
 ]
 
 
@@ -145,6 +145,9 @@ STAGE_PROFILE_CASES = (
 _REGULAR_CASES = [_case_with_default_opg(case) for case in _REGULAR_BASE_CASES]
 for _case in _REGULAR_CASES:
     _validate_case(_case)
+_DDR_ONLY_REGULAR_CASES = {
+    _case_with_default_opg(case) for case in _REGULAR_BASE_CASES[-3:]
+}
 _EXTENSIVE_CASES: list[tuple[int, ...]] = []
 
 
@@ -272,7 +275,10 @@ def _build_encoder_params():
     params = []
     for p in _build_case_params():
         case = p.values[0]
-        for design in TEST_LN1_STAGING_DESIGNS:
+        designs = (
+            ("ddr",) if case in _DDR_ONLY_REGULAR_CASES else TEST_LN1_STAGING_DESIGNS
+        )
+        for design in designs:
             params.append(
                 pytest.param(
                     case,
