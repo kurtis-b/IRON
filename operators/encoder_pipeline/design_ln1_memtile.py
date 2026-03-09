@@ -19,6 +19,8 @@ def choose_ln1_replay_mem_tile_col(
     effective_ffn_branches,
     o_proj_acc_group_size=1,
 ):
+    if parallel_heads <= 2 and proj_acc_depth >= 8 and effective_ffn_branches > 1:
+        return 1
     if parallel_heads >= 6 and proj_acc_depth >= 6:
         if effective_ffn_branches <= 2 and o_proj_acc_group_size > 1:
             return 5
@@ -40,16 +42,7 @@ def plan_branch_stage_configuration(
     proj_acc_depth,
     **_unused,
 ):
-    if effective_ffn_branches == 2 and parallel_heads <= 2 and proj_acc_depth >= 8:
-        stage = list(branch_stage_cols)
-        bup = list(branch_bup_cols)
-        bdown = list(branch_down_b_cols)
-        for idx in range(effective_ffn_branches):
-            if idx == 0:
-                stage[idx], bup[idx], bdown[idx] = 6, 6, 5
-            elif idx == 1:
-                stage[idx], bup[idx], bdown[idx] = 7, 7, 4
-        return stage, bup, bdown, []
+    del effective_ffn_branches, parallel_heads, proj_acc_depth
     return branch_stage_cols, branch_bup_cols, branch_down_b_cols, []
 
 
@@ -69,7 +62,8 @@ def build_ln1_to_ffn_up_path(
     return {
         "ln1Broadcast": ln1_broadcast,
         "memOutLNCons": [
-            ln1_broadcast.cons(depth=1) for _ in range(effective_ffn_branches)
+            ln1_broadcast.cons(depth=ffn_up_input_depth)
+            for _ in range(effective_ffn_branches)
         ],
         "ln1OutStageToDDR": {},
         "ln1InFromDDR": {},
@@ -89,11 +83,21 @@ def adjust_ffn_down_acc_mem_tile_cols(
     if effective_ffn_branches <= 1:
         return cols
     if parallel_heads <= 2 and proj_acc_depth >= 8:
+        # Keep high-depth down-acc streams off the LN1 replay memtile when
+        # possible, and avoid col5 where low-head topologies often place
+        # O-proj accumulation staging.
+        preferred_fallback_cols = (2, 4, 3, 1, 0, 7, 6)
         remapped = []
         for idx, col in enumerate(cols):
             new_col = col
-            if idx > 0 and col == ln1_replay_mem_tile_col:
-                new_col = 6
+            if idx > 0 and col in (ln1_replay_mem_tile_col, 5):
+                for candidate_col in preferred_fallback_cols:
+                    if candidate_col == ln1_replay_mem_tile_col:
+                        continue
+                    if candidate_col in remapped:
+                        continue
+                    new_col = candidate_col
+                    break
             remapped.append(new_col)
         return remapped
     return cols

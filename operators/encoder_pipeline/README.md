@@ -2,42 +2,123 @@
 
 Fused encoder operator: `MHA + AddNorm1 + FFN + AddNorm2`.
 
-## LN1 staging modes
+## Design summary
 
-- `ln1_staging_design="memtile"`:
-  - LN1 mul+add broadcasts directly on-chip to FFN-up branches.
-- `ln1_staging_design="ddr"`:
-  - LN1 uses a single stage stream to DDR per tap, then a single DDR refill stream.
-  - Refilled LN1 data is broadcast on-chip to all FFN-up branches.
-  - No per-branch host refill streams.
+- LN1 and LN2 stay two-pass because layer norm requires full-row statistics.
+- LN1 staging modes:
+- `ln1_staging_design="memtile"`: LN1 output is broadcast on-chip to FFN-up branches.
+- `ln1_staging_design="ddr"`: LN1 output stages through DDR once, then is broadcast on-chip.
+- FFN and O-proj parallelization are controlled by test topology parameters (`pheads`, `pffn`, `pacc`, `opg` in test IDs).
 
-## Key constraints
+## Core constraints
 
 - `emb_tile * proj_acc_depth == embed_sz`
-- `o_proj_acc_group_size in {1,2,4}` and divides `parallel_heads`
-- Layer norm remains two-pass (full-row stats requirement):
-  - pass 1: sum/sumsq
-  - pass 2: normalized output
+- `o_proj_acc_group_size in {1, 2, 4}`
+- `parallel_heads % o_proj_acc_group_size == 0`
+- Compute-tile and DMA/BD budgets are validated during design construction/lowering.
 
-## Resource guards
+## Test entry points
 
-- Compute tiles:
-  - `parallel_heads*4 + 3 + 2*effective_ffn_branches <= 32`
-- Shim output stream guard (mode-aware):
-  - `total = 5 (Q/K/V/W_O/R) + estimated_B_streams + ln1_ddr_streams`
-  - `ln1_ddr_streams = 1` in DDR mode, `0` in memtile mode
-  - require `total <= 16`
-- Per-column shim and memtile BD/channel limits are validated during allocation/lowering.
+- Main regression suite: `operators/encoder_pipeline/test.py`
+- Bottleneck/debug sweep helper: `operators/encoder_pipeline/profile_debug_modes.py`
 
-## Current regression status (2026-03-08)
+## Environment setup for tests
 
-- DDR mode (`-k lnstage_ddr`): `80 passed, 30 skipped`
-- Memtile mode (`-k lnstage_memtile`): `65 passed, 30 skipped`
+```bash
+cd /home/agi-demo/iron
+# If conda is active in your shell:
+conda deactivate
+source /opt/xilinx/xrt/setup.sh
+source ~/iron/ironenv/bin/activate
+rm -rf ./build
+```
 
-## Quick runs
+## Pytest commands
+
+Run all encoder_pipeline tests:
 
 ```bash
 pytest operators/encoder_pipeline/test.py -q
-pytest operators/encoder_pipeline/test.py -q -k stage_profile
-python operators/encoder_pipeline/profile_debug_modes.py --clean-build
 ```
+
+Run one LN1 staging mode only:
+
+```bash
+pytest operators/encoder_pipeline/test.py -q -k lnstage_ddr
+pytest operators/encoder_pipeline/test.py -q -k lnstage_memtile
+```
+
+Run both modes explicitly:
+
+```bash
+pytest operators/encoder_pipeline/test.py -q -k "(lnstage_ddr or lnstage_memtile)"
+```
+
+Run one topology/case by node-id substring:
+
+```bash
+pytest operators/encoder_pipeline/test.py -q -k "4pheads_4pffn_8pacc_4opg and lnstage_memtile"
+```
+
+Stop on first failure during triage:
+
+```bash
+pytest operators/encoder_pipeline/test.py -q -x
+```
+
+Print per-test logs/stdout (useful for mismatch/runtime diagnostics):
+
+```bash
+pytest operators/encoder_pipeline/test.py -s -vv
+```
+
+## CSV output and iteration control
+
+`conftest.py` provides two pytest options used by this suite:
+
+- `--csv-output <path>`: write metrics CSV to a chosen file.
+- `--iterations <N>`: repeat each test `N` times and aggregate metrics.
+
+Run both LN1 modes and write all results to one CSV:
+
+```bash
+pytest operators/encoder_pipeline/test.py \
+  -q \
+  -k "(lnstage_ddr or lnstage_memtile) and not stage_profile" \
+  --csv-output operators/encoder_pipeline/encoder_pipeline_results.csv \
+  --iterations 1
+```
+
+## Stage-profile tests
+
+- Stage-profile test cases are in `test_encoder_pipeline_stage_profile`.
+- They are skipped unless `ENABLE_STAGE_PROFILE_TESTS = True` in `test.py`.
+- Once enabled, run only stage-profile tests:
+
+```bash
+pytest operators/encoder_pipeline/test.py -q -k stage_profile
+```
+
+Run stage profile for one mode:
+
+```bash
+pytest operators/encoder_pipeline/test.py -q -k "stage_profile and lnstage_ddr"
+```
+
+## Debug-mode sweep script
+
+`profile_debug_modes.py` runs all debug modes for selected cases and reports bottleneck stages.
+
+```bash
+python operators/encoder_pipeline/profile_debug_modes.py --design ddr --clean-build
+```
+
+Useful script options:
+
+- `--design {ddr,memtile}`
+- `--warmup-iters <N>`
+- `--timed-iters <N>`
+- `--case-index 0,2,4`
+- `--extensive`
+- `--stop-on-fail`
+- `--output-json <path>`

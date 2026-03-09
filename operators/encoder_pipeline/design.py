@@ -58,7 +58,7 @@ def fused_mha(
     ffn_group_split: str | None = None,
     runtime_serialize_tail_io: bool | None = None,
     runtime_serialize_q_prestage: bool | None = None,
-    runtime_tail_wait_mode: str = "strict",
+    runtime_tail_wait_mode: str = "relax_ffn_weights",
     _ln1_mode_hooks=None,
 ):
     def _override_int_list_env(_name: str, default: list[int]) -> list[int]:
@@ -1048,6 +1048,11 @@ def fused_mha(
         bin_name,
         [o_ty, ffn_b_ty, o_ty],
     )
+    ffn_matmul_init_kernel_down_proj = Kernel(
+        f"ffn_matmul_init_{dtype_str}_{dtype_str}_down_proj",
+        bin_name,
+        [o_ty, ffn_b_ty, o_ty],
+    )
     ffn_matmul_kernel_down_proj = Kernel(
         f"ffn_matmul_with_acc_{dtype_str}_{dtype_str}_down_proj",
         bin_name,
@@ -1210,16 +1215,26 @@ def fused_mha(
         # Grouped O-proj staging uses fewer accum streams; prioritize less
         # contended memtiles while avoiding col3 fanout pressure from W_O
         # split and reducing col5 pressure from LN1 replay + B streams.
-        acc_mem_tile_order = [4, 6, 7, 5]
+        acc_mem_tile_order = [5, 6, 7, 4]
         acc_mem_tile_order = _override_int_list_env(
             "ENCODER_ACC_MEM_TILE_ORDER_GROUPED_PH_GE6_ACC_GE6",
             acc_mem_tile_order,
         )
     elif parallel_heads <= 4:
         if proj_acc_depth >= 8 and effective_ffn_branches > 1:
-            # For high-acc (depth=8), keep one O-proj accumulator on col6 so
-            # col3 has room for LN1 replay without tripping memtile BD limits.
-            acc_mem_tile_order = [4, 5, 7, 6]
+            # For 4-way grouped O-proj at high acc depth, placing the only
+            # stage core on col4 can collide with FFN/LN replay staging.
+            if (
+                o_proj_acc_group_size >= 4
+                and len(o_proj_accum_core_indices) == 1
+                and effective_ffn_branches >= 4
+            ):
+                acc_mem_tile_order = [0, 6, 5, 7, 4]
+            else:
+                # For high-acc (depth=8) multi-branch tails, keep the base
+                # O-proj staging order stable and remap LN replay / FFN
+                # down-acc streams around it via mode-specific hooks.
+                acc_mem_tile_order = [4, 5, 7, 6]
         else:
             # Keep col5 in the <=4-head map and avoid concentrating depth-8
             # O-proj accumulators on col6 where FFN tail staging is anchored.
@@ -1306,21 +1321,15 @@ def fused_mha(
         o_proj_group_idx,
     )
 
-    # Keep non-accumulation FIFOs shallow to avoid L1 over-allocation on FFN-down.
+    # Keep LN residual staging shallow to avoid BD allocator over-subscription
+    # in high-acc/high-parallel topologies.
     ln_fifo_depth = of_depth
     # FFN-up FIFO depths.
-    ffn_up_input_depth = 2
-    # Keep LN1 buffering shallow to stay within L1 budget on LN1 tiles.
-    ln_input_depth = _override_int_env("ENCODER_LN1_NORM_OUT_DEPTH", 1)
-    if ln_input_depth <= 0:
-        raise ValueError(
-            "ENCODER_LN1_NORM_OUT_DEPTH must be > 0 " f"(got {ln_input_depth})"
-        )
-    o_proj_input_depth = _override_int_env("ENCODER_O_PROJ_INPUT_DEPTH", 1)
-    if o_proj_input_depth <= 0:
-        raise ValueError(
-            "ENCODER_O_PROJ_INPUT_DEPTH must be > 0 " f"(got {o_proj_input_depth})"
-        )
+    ffn_up_input_depth = 1 if emb_tile >= 128 else 2
+    # Use depth 2 for O-proj->LN1 input and LN1 norm->muladd link.
+    ln_input_depth = 2
+    # emb_tile=128 can exceed O-proj core L1 with double-buffered O->LN1.
+    o_proj_input_depth = 1 if emb_tile >= 128 else 2
     # O-proj stream into LN1 norm worker (no DMA layout transform).
     outOProjInput = ObjectFifo(
         o_ty,
@@ -1364,10 +1373,10 @@ def fused_mha(
             f"(got {ffn_residual_depth}, proj_acc_depth={proj_acc_depth})"
         )
     ln_mem_tile_col = 7
-    # AddNorm2 needs two FFN-down passes (sum/sumsq pass + output pass).
-    # For dual-input LN2 mode, stage replay in memtile on LN2 side so one FFN
-    # stream can remain a neighboring core link while the other uses DMA.
-    emit_ln2_replay_from_down_default = not use_dual_ln2_ffn_inputs
+    # AddNorm2 needs two logical passes (sum/sumsq pass + output pass).
+    # Prefer LN2-side replay FIFO by default so FFN-down only emits one pass
+    # unless explicitly overridden.
+    emit_ln2_replay_from_down_default = False
     emit_ln2_replay_from_down = _override_bool_env(
         "ENCODER_EMIT_LN2_REPLAY_FROM_DOWN",
         emit_ln2_replay_from_down_default,
@@ -1380,9 +1389,14 @@ def fused_mha(
     use_ln2_replay_fifo = (ffn_stage_only in (None, 2)) and (
         not emit_ln2_replay_from_down
     )
+    ln2_replay_mem_tile_default = (
+        3
+        if (parallel_heads <= 2 and proj_acc_depth >= 8 and effective_ffn_branches > 1)
+        else 4
+    )
     ln2_replay_mem_tile_col = _override_int_env(
         "ENCODER_LN2_REPLAY_MEM_TILE_COL",
-        4,
+        ln2_replay_mem_tile_default,
     )
     # Residual R
     inR = ObjectFifo(
@@ -1398,7 +1412,8 @@ def fused_mha(
         placement=Tile(col=ln_mem_tile_col, row=1),
     )
 
-    # LN output
+    # LN2 output stream to shim.
+    ln2_output_fifo_depth = of_depth
     o_dims = [(seq_tile // r, r * emb_tile), (r, s), (emb_tile // s, r * s), (s, 1)]
 
     def _allocate_ffn_weight_mem_tile_cols_by_streams(
@@ -1947,12 +1962,12 @@ def fused_mha(
             depth=proj_acc_depth,
             placement=Tile(col=ln2_replay_mem_tile_col, row=1),
         )
-    outLN2 = ObjectFifo(o_ty, name="outLN2", depth=ln_fifo_depth)
+    outLN2 = ObjectFifo(o_ty, name="outLN2", depth=ln2_output_fifo_depth)
     memLN2 = outLN2.cons().forward(
         obj_type=o_ty,
         name="memLN2",
         dims_to_stream=o_dims,
-        depth=ln_fifo_depth,
+        depth=ln2_output_fifo_depth,
         placement=Tile(col=ln_mem_tile_col, row=1),
     )
 
@@ -2546,6 +2561,7 @@ def fused_mha(
         of_new_acc,
         of_out,
         zero,
+        matmul_init,
         matmul,
         add,
         copy,
@@ -2557,13 +2573,24 @@ def fused_mha(
     ):
         down_enabled = stage_only in (1, None)
         for _ in range_(sys.maxsize):
-            # First iteration just passes the partial C tile through.
-            for _ in range_(proj_acc_depth):
-                elem_acc = of_new_acc.acquire(1)
-                zero(elem_acc)
-                of_new_acc.release(1)
+            if group_count <= 0:
+                continue
 
-            for _ in range_(group_count):
+            # First FFN-down group seeds the accumulator directly.
+            elem_in_a = of_in_a.acquire(1)
+            for _ in range_(proj_acc_depth):
+                elem_in_b = of_in_b.acquire(1)
+                elem_new_acc = of_new_acc.acquire(1)
+                if down_enabled:
+                    matmul_init(elem_in_a, elem_in_b, elem_new_acc)
+                else:
+                    zero(elem_new_acc)
+                of_in_b.release(1)
+                of_new_acc.release(1)
+            of_in_a.release(1)
+
+            # Remaining groups accumulate onto the current partials.
+            for _ in range_(group_count - 1):
                 elem_in_a = of_in_a.acquire(1)
                 for _ in range_(proj_acc_depth):
                     elem_in_b = of_in_b.acquire(1)
@@ -3017,7 +3044,7 @@ def fused_mha(
     )
 
     ffn_up_workers = []
-    ffn_up_use_init_matmul_default = effective_ffn_branches <= 2
+    ffn_up_use_init_matmul_default = True
     ffn_up_use_init_matmul = _override_bool_env(
         "ENCODER_FFN_UP_USE_INIT_MATMUL",
         ffn_up_use_init_matmul_default,
@@ -3079,6 +3106,7 @@ def fused_mha(
             ffnDownPart[branch_idx].prod(),
             reduce_out,
             ffn_zero_kernel_down_proj,
+            ffn_matmul_init_kernel_down_proj,
             ffn_matmul_kernel_down_proj,
             eltwise_add_vector if effective_ffn_branches > 1 else None,
             mem_copy_o_proj,
@@ -3595,7 +3623,8 @@ def fused_mha(
         B_Down,
     ):
         # Full pipeline is sensitive to host DMA ordering of tail-stage IO.
-        # Keep strict ordering by default, with an opt-in override for profiling.
+        # Default to relaxed FFN-weight waits to improve overlap while keeping
+        # residual/output waits serialized unless explicitly overridden.
         serialize_tail_io = (
             True if runtime_serialize_tail_io is None else runtime_serialize_tail_io
         )
@@ -3684,9 +3713,18 @@ def fused_mha(
                 "ENCODER_R_FILL_MAX_GROUPS_PER_DMA must be > 0 "
                 f"(got {residual_fill_max_groups})"
             )
+        b_weight_fill_max_groups_default = min(max(ffn_col_group_counts), 22)
+        # For low-pressure topologies, avoid fragmenting each B-weight tap into
+        # multiple fills; this reduces runtime fill scheduling overhead.
+        if (
+            not b_weight_split_enabled
+            and effective_ffn_branches <= 2
+            and parallel_heads <= 2
+        ):
+            b_weight_fill_max_groups_default = max(ffn_col_group_counts)
         b_weight_fill_max_groups = _override_int_env(
             "ENCODER_B_WEIGHT_FILL_MAX_GROUPS_PER_DMA",
-            min(max(ffn_col_group_counts), 22),
+            b_weight_fill_max_groups_default,
         )
         if b_weight_fill_max_groups <= 0:
             raise ValueError(
