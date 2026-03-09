@@ -19,13 +19,15 @@ def choose_ln1_replay_mem_tile_col(
     o_proj_acc_group_size=1,
 ):
     del o_proj_acc_group_size
+    if parallel_heads <= 2 and proj_acc_depth >= 8 and effective_ffn_branches > 1:
+        return 1
     if parallel_heads >= 6 and proj_acc_depth >= 6:
         return 5
     if parallel_heads >= 4 and proj_acc_depth >= 8 and effective_ffn_branches > 1:
         # For 4-way FFN tails, col3 already carries W_O split fanout and can
         # exceed memtile output-channel limits when LN1 replay is colocated.
         if effective_ffn_branches >= 4:
-            return 5
+            return 3
         return 3
     return 5
 
@@ -47,7 +49,7 @@ def plan_branch_stage_configuration(
     _allocate_ffn_weight_mem_tile_cols_by_streams,
     logging_module,
 ):
-    del proj_acc_depth, ln1_replay_mem_tile_col, _override_int_env
+    del ln1_replay_mem_tile_col, _override_int_env
     branch_stage_cols = list(branch_stage_cols)
     if parallel_heads >= 6 and len(branch_stage_cols) >= 2:
         branch_stage_cols = [
@@ -120,6 +122,35 @@ def plan_branch_stage_configuration(
             raise ValueError("Missing precomputed FFN weight column allocation")
         branch_bup_cols, branch_down_b_cols = alloc_bup_cols, alloc_down_cols
 
+    # In low-head/high-acc 4-branch DDR tails, duplicating B_Up staging on one
+    # memtile can push that tile over the 48-BD limit once LN replay and FFN
+    # down-acc staging are included. Spread duplicate B_Up streams onto spare
+    # shim-output columns without exceeding the per-column 2-channel budget.
+    if parallel_heads <= 4 and proj_acc_depth >= 8 and effective_ffn_branches >= 4:
+        output_load = {col: 0 for col in range(8)}
+        for col in (0, 1, 2, 3, 7):
+            output_load[col] += 1
+        stage_col = branch_stage_cols[ln1_ddr_stage_source_branch_idx]
+        output_load[stage_col] += 1
+        for col in branch_down_b_cols:
+            output_load[col] += 1
+
+        remapped_bup_cols = []
+        for col in branch_bup_cols:
+            mapped_col = col
+            duplicate_bup_col = mapped_col in remapped_bup_cols
+            if duplicate_bup_col:
+                for candidate_col in (0, 7, 6, 5, 4, 3, 2, 1):
+                    if candidate_col in remapped_bup_cols:
+                        continue
+                    if output_load[candidate_col] >= 2:
+                        continue
+                    mapped_col = candidate_col
+                    break
+            remapped_bup_cols.append(mapped_col)
+            output_load[mapped_col] += 1
+        branch_bup_cols = remapped_bup_cols
+
     return (
         branch_stage_cols,
         branch_bup_cols,
@@ -174,7 +205,7 @@ def build_ln1_to_ffn_up_path(
     ln1_out_stage_to_ddr[0] = ln1_stage_source
     ln1_in_from_ddr[0] = ln1_refill_broadcast
     for _ in range(effective_ffn_branches):
-        mem_out_ln_cons.append(ln1_refill_broadcast.cons(depth=1))
+        mem_out_ln_cons.append(ln1_refill_broadcast.cons(depth=ffn_up_input_depth))
 
     return {
         "ln1Broadcast": ln1_broadcast,
@@ -203,9 +234,9 @@ def adjust_ffn_down_acc_mem_tile_cols(
         and proj_acc_depth >= 8
         and len(ffn_down_acc_mem_tile_cols) >= 2
     ):
-        # Prefer col7 first to avoid overloading memtile5 in 2pheads/2pffn/high-acc
-        # DDR topologies (memtile5 already hosts ln1Replay + O-proj accum + B-up flows).
-        fallback_cols = [7, 5, 6, 3, 2, 1, 0, 4]
+        # Keep col7 as a last resort because it already carries high-depth
+        # residual/LN2 traffic in these topologies.
+        fallback_cols = [2, 5, 6, 3, 1, 0, 4, 7]
         branch0_col = ffn_down_acc_mem_tile_cols[0]
         chosen_col = None
         for col in fallback_cols:

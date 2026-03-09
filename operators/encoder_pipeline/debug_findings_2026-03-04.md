@@ -1,29 +1,26 @@
-# encoder_pipeline Debug Findings (Current)
+# encoder_pipeline Debug Findings
 
-Last updated: 2026-03-08
+## Stable design facts
 
-## Current facts
+- Layer norm is two-pass in both LN stages because row-complete statistics are required.
+- LN1 staging modes:
+- `memtile`: LN1 output is broadcast on-chip to FFN-up branches.
+- `ddr`: one drain to DDR, one refill from DDR, then on-chip broadcast.
 
-- Layer norm requires full-row stats, so LN1/LN2 remain two-pass.
-- LN1 staging is mode-specific:
-  - `memtile`: direct on-chip LN1 broadcast to FFN-up branches.
-  - `ddr`: single LN1 drain + single LN1 refill stream, then on-chip broadcast.
+## Failure classes seen during bring-up
 
-## Fixes in current baseline
+- Memtile/channel pressure in high-parallel tails (shim outputs, memtile channels, BD budget).
+- Runtime deadlock from stream-order or token-flow mismatch.
+- L1 overflow on `emb_tile=128` topologies when FIFO depths are too deep.
 
-1. DDR LN1 replay placement avoids high-pressure memtile combinations in high-acc grouped topologies.
-2. DDR FFN-down accumulation memtile placement avoids col3 collision with `W_O` fanout.
-3. For `emb_tile >= 128`, default FIFO depths are reduced where needed (`B`-weight, FFN-down reduce, FFN-down out) to prevent L1 over-allocation.
-4. Shim-output budgeting remains mode-aware (`+1` LN1 stream only in DDR mode).
+## Fix patterns that were effective
 
-## Regression validation (2026-03-08)
-
-- `pytest operators/encoder_pipeline/test.py -k lnstage_ddr -q`:
-  - `80 passed, 30 skipped, 95 deselected`
-- `pytest operators/encoder_pipeline/test.py -k lnstage_memtile -q`:
-  - `65 passed, 30 skipped, 110 deselected`
+- Keep shim-output budgeting mode-aware (`+1` only for DDR LN1 staging stream).
+- Rebalance high-pressure tail memtile placement instead of changing numeric thresholds.
+- Reduce selected FIFO depths for large-embedding topologies to stay within 64 KiB L1.
+- Validate runtime fill/drain counts against core loop trip counts when diagnosing deadlock.
 
 ## Guardrails
 
-- Do not change numerical thresholds to mask liveness/routing issues.
-- Preserve LN two-pass semantics and row-complete staging requirements.
+- Do not relax correctness thresholds to hide routing/liveness issues.
+- Preserve layer-norm full-row/two-pass behavior.

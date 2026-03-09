@@ -830,6 +830,26 @@ void ffn_matmul_bf16_bf16_up_proj(const bfloat16 *A, const bfloat16 *B, bfloat16
     matmul_vectorized_1x4_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, t, s>(A, B, C);
 }
 
+void ffn_matmul_init_bf16_bf16_down_proj(const bfloat16 *A, const bfloat16 *B, bfloat16 *C)
+{
+#ifndef AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
+    static_assert(false, "AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 must be defined for this kernel");
+#endif
+    constexpr int r = 8;
+    constexpr int s = 8;
+    constexpr int t = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_N % t == 0);
+    static_assert(DIM_K % (4 * s) == 0);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+    // NOTE: K and N, s and t are swapped here compared to the up projection since up projection
+    // computes MxK with KxN, while down projection computes MxN with NxK.
+    matmul_init_vectorized_1x4_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, t, s>(A, B, C);
+}
+
 void ffn_matmul_with_acc_bf16_bf16_down_proj(const bfloat16 *A, const bfloat16 *B, bfloat16 *pAcc, bfloat16 *C)
 {
 #ifndef AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
