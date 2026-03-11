@@ -190,10 +190,10 @@ def fused_mha(
             from operators.encoder_pipeline import design_ln1_memtile as ln1_mode_hooks
     else:
         ln1_mode_hooks = _ln1_mode_hooks
-    # In MHA/AddNorm1 focused profiling modes, downstream FFN/AddNorm2 are
-    # intentionally de-emphasized. Keep only one replay group to reduce
-    # non-target traffic while preserving stage-to-stage liveness.
-    profile_replay_groups = 1 if ffn_stage_only in (3, 4) else ffn_col_groups
+    # Keep FFN replay topology identical across debug/non-debug configurations.
+    # Stage-only modes already bypass compute inside core functions; changing
+    # replay-group topology here can cause artificial resource/pruning behavior.
+    profile_replay_groups = ffn_col_groups
     if nB_tiles_distributed > ffn_col_groups:
         raise ValueError(
             "nB_tiles_distributed must be <= ffn_col_groups "
@@ -595,9 +595,6 @@ def fused_mha(
                 "memtile BD/channel budget exceeded for high-acc tail staging"
             )
             continue
-        if ffn_stage_only in (3, 4) and len(selected_branch_indices) > 1:
-            prune_or_fail("downstream-profile mode uses a single FFN branch")
-            continue
         ln1_post_candidates = [
             tile for tile in free_ffn_tiles if tile not in used_tiles_base
         ]
@@ -721,6 +718,18 @@ def fused_mha(
             "ENCODER_B_WEIGHT_SPLIT_CHUNK_SIZE must be > 0 "
             f"(got {b_weight_split_chunk_size})"
         )
+    # Targeted memtile stress topology:
+    # - 4pheads, 6pffn, 8pacc, 2opg (memtile mode)
+    # Use 2-way branch grouping for B-weight streams.
+    use_low_head_6way_qkvo_split_group = (
+        (not stage_ln1_to_ddr)
+        and parallel_heads == 4
+        and proj_acc_depth >= 8
+        and o_proj_acc_group_size == 2
+        and effective_ffn_branches >= 6
+    )
+    if use_low_head_6way_qkvo_split_group:
+        b_weight_split_chunk_size = 2
     b_weight_split_chunk_size = min(b_weight_split_chunk_size, effective_ffn_branches)
     requested_split_chunks = [
         list(
@@ -745,6 +754,19 @@ def fused_mha(
             b_weight_split_enabled = False
     bup_split_enabled = b_weight_split_enabled and bup_split_requested
     bdown_split_enabled = b_weight_split_enabled and bdown_split_requested
+    # Keep B_Up unsplit for low-head 6-way FFN tails.
+    # This still fits shim output-channel budget (6 B_Up streams + 3 B_Down
+    # streams + 5 baseline streams) while avoiding packed B_Up split ordering
+    # sensitivity on this topology family.
+    force_unsplit_bup_low_head_6way = (
+        bup_split_enabled
+        and bdown_split_enabled
+        and effective_ffn_branches >= 6
+        and parallel_heads <= 4
+        and proj_acc_depth >= 6
+    )
+    if force_unsplit_bup_low_head_6way:
+        bup_split_enabled = False
     branch_split_chunks = (
         requested_split_chunks
         if b_weight_split_enabled
@@ -1066,39 +1088,110 @@ def fused_mha(
 
     # AIE-array data movement with object fifos
     q_dims = [(seq_tile // r, r * d), (d // s, s), (r, d), (s, 1)]
-
-    inQ = ObjectFifo(
-        np.ndarray[(seq_tile, d * parallel_heads), np.dtype[dtype]],
-        name="inQ",
-        depth=of_depth,
+    # Topology-specific split/group path:
+    # - Split Q/K/V/W_O ingress into 2 streams.
+    # - Pair with 2-way B-stream grouping for 6 FFN branches.
+    use_two_way_mha_stream_split = use_low_head_6way_qkvo_split_group
+    mha_stream_split_factor = 2 if use_two_way_mha_stream_split else 1
+    if parallel_heads % mha_stream_split_factor != 0:
+        raise ValueError(
+            "parallel_heads must be divisible by MHA stream split factor "
+            f"({parallel_heads} % {mha_stream_split_factor} != 0)"
+        )
+    heads_per_mha_stream = parallel_heads // mha_stream_split_factor
+    if use_two_way_mha_stream_split:
+        # Keep split endpoints off col6 in the current mapping (col6 already
+        # carries dense B-stream traffic in 2-way chunk mode).
+        q_stream_mem_cols = [0, 5]
+        k_stream_mem_cols = [1, 2]
+        v_stream_mem_cols = [2, 3]
+        ow_stream_mem_cols = [3, 4]
+    else:
+        q_stream_mem_cols = [0]
+        k_stream_mem_cols = [1]
+        v_stream_mem_cols = [2]
+        ow_stream_mem_cols = [3]
+    stream_col_checks = [
+        len(q_stream_mem_cols) != mha_stream_split_factor,
+        len(k_stream_mem_cols) != mha_stream_split_factor,
+        len(v_stream_mem_cols) != mha_stream_split_factor,
+        len(ow_stream_mem_cols) != mha_stream_split_factor,
+    ]
+    if any(stream_col_checks):
+        raise ValueError(
+            "Invalid MHA stream memtile column mapping for split factor "
+            f"{mha_stream_split_factor}: "
+            f"Q={q_stream_mem_cols} K={k_stream_mem_cols} "
+            f"V={v_stream_mem_cols} W_O={ow_stream_mem_cols}"
+        )
+    logging.info(
+        "MHA ingress split: enabled=%s factor=%d Q=%s K=%s V=%s W_O=%s",
+        use_two_way_mha_stream_split,
+        mha_stream_split_factor,
+        q_stream_mem_cols,
+        k_stream_mem_cols,
+        v_stream_mem_cols,
+        ow_stream_mem_cols,
     )
-    memQ = inQ.cons().split(
-        offsets=[seq_tile * d * i for i in range(parallel_heads)],
-        obj_types=[q_ty] * parallel_heads,
-        names=[f"memQ{i}" for i in range(parallel_heads)],
-        dims_to_stream=[q_dims] * parallel_heads,
-        depths=[of_depth] * parallel_heads,
-        placement=Tile(col=0, row=1),
-    )  # Split between N parallel blocks of sequences
+
+    # Reduce BD pressure for the stressed 4pheads/6pffn/8pacc/2opg memtile case.
+    mha_ingress_fifo_depth = 1 if use_low_head_6way_qkvo_split_group else of_depth
+    inQ_streams = []
+    memQ = []
+    for split_idx in range(mha_stream_split_factor):
+        inQ_streams.append(
+            ObjectFifo(
+                np.ndarray[(seq_tile, d * heads_per_mha_stream), np.dtype[dtype]],
+                name="inQ" if split_idx == 0 else f"inQSplit{split_idx}",
+                depth=mha_ingress_fifo_depth,
+            )
+        )
+        memQ.extend(
+            inQ_streams[split_idx]
+            .cons()
+            .split(
+                offsets=[seq_tile * d * i for i in range(heads_per_mha_stream)],
+                obj_types=[q_ty] * heads_per_mha_stream,
+                names=[
+                    f"memQ{split_idx * heads_per_mha_stream + i}"
+                    for i in range(heads_per_mha_stream)
+                ],
+                dims_to_stream=[q_dims] * heads_per_mha_stream,
+                depths=[mha_ingress_fifo_depth] * heads_per_mha_stream,
+                placement=Tile(col=q_stream_mem_cols[split_idx], row=1),
+            )
+        )  # Split between N parallel blocks of sequences
 
     # VJUNG: The SequentialPlacer will place all of these on the same MemTile if Placement is specified. We would need a list of placement in case of one-many or many-one.
     # I think the Sequential Placer will fail if we do a split/join with more than 6 I/Os cuz it tries to place them all on the same tile.
 
     # K is stored in column-major order
     k_dims = [(kv_seq_tile // t, t * d), (d // s, s), (t, d), (s, 1)]
-    inK = ObjectFifo(
-        np.ndarray[(kv_seq_tile, d * parallel_heads), np.dtype[dtype]],
-        name="inK",
-        depth=of_depth,
-    )
-    memK = inK.cons().split(
-        offsets=[kv_seq_tile * d * i for i in range(parallel_heads)],
-        obj_types=[k_ty] * parallel_heads,
-        names=[f"memK{i}" for i in range(parallel_heads)],
-        dims_to_stream=[k_dims] * parallel_heads,
-        depths=[of_depth] * parallel_heads,
-        placement=Tile(col=1, row=1),
-    )  # Split between N parallel blocks of heads
+    inK_streams = []
+    memK = []
+    for split_idx in range(mha_stream_split_factor):
+        inK_streams.append(
+            ObjectFifo(
+                np.ndarray[(kv_seq_tile, d * heads_per_mha_stream), np.dtype[dtype]],
+                name="inK" if split_idx == 0 else f"inKSplit{split_idx}",
+                depth=mha_ingress_fifo_depth,
+            )
+        )
+        memK.extend(
+            inK_streams[split_idx]
+            .cons()
+            .split(
+                offsets=[kv_seq_tile * d * i for i in range(heads_per_mha_stream)],
+                obj_types=[k_ty] * heads_per_mha_stream,
+                names=[
+                    f"memK{split_idx * heads_per_mha_stream + i}"
+                    for i in range(heads_per_mha_stream)
+                ],
+                dims_to_stream=[k_dims] * heads_per_mha_stream,
+                depths=[mha_ingress_fifo_depth] * heads_per_mha_stream,
+                placement=Tile(col=k_stream_mem_cols[split_idx], row=1),
+            )
+        )  # Split between N parallel blocks of heads
 
     v_dims = [
         (kv_seq_tile // s, s * kv_seq_tile),
@@ -1106,20 +1199,31 @@ def fused_mha(
         (s, kv_seq_tile),
         (t, 1),
     ]
-
-    inV = ObjectFifo(
-        np.ndarray[(kv_seq_tile, d * parallel_heads), np.dtype[dtype]],
-        name="inV",
-        depth=of_depth,
-    )
-    memV = inV.cons().split(
-        offsets=[kv_seq_tile * d * i for i in range(parallel_heads)],
-        obj_types=[v_ty] * parallel_heads,
-        names=[f"memV{i}" for i in range(parallel_heads)],
-        dims_to_stream=[v_dims] * parallel_heads,
-        depths=[of_depth] * parallel_heads,
-        placement=Tile(col=2, row=1),
-    )  # Split between N parallel blocks of heads
+    inV_streams = []
+    memV = []
+    for split_idx in range(mha_stream_split_factor):
+        inV_streams.append(
+            ObjectFifo(
+                np.ndarray[(kv_seq_tile, d * heads_per_mha_stream), np.dtype[dtype]],
+                name="inV" if split_idx == 0 else f"inVSplit{split_idx}",
+                depth=mha_ingress_fifo_depth,
+            )
+        )
+        memV.extend(
+            inV_streams[split_idx]
+            .cons()
+            .split(
+                offsets=[kv_seq_tile * d * i for i in range(heads_per_mha_stream)],
+                obj_types=[v_ty] * heads_per_mha_stream,
+                names=[
+                    f"memV{split_idx * heads_per_mha_stream + i}"
+                    for i in range(heads_per_mha_stream)
+                ],
+                dims_to_stream=[v_dims] * heads_per_mha_stream,
+                depths=[mha_ingress_fifo_depth] * heads_per_mha_stream,
+                placement=Tile(col=v_stream_mem_cols[split_idx], row=1),
+            )
+        )  # Split between N parallel blocks of heads
 
     memA = []
     a_dims_out = [
@@ -1177,19 +1281,33 @@ def fused_mha(
     # Large emb_tile (e.g. 128) with depth=2 can overflow o-proj core L1 on
     # larger models; keep a single buffered WO tile in that case.
     ow_fifo_depth = 1 if emb_tile >= 128 else of_depth
-    inOW = ObjectFifo(
-        np.ndarray[(d * parallel_heads, emb_tile), np.dtype[dtype]],
-        name="inOW",
-        depth=ow_fifo_depth,
-    )
-    memOW = inOW.cons().split(
-        offsets=[d * emb_tile * i for i in range(parallel_heads)],
-        obj_types=[wo_ty] * parallel_heads,
-        names=[f"memOW{i}" for i in range(parallel_heads)],
-        dims_to_stream=[ow_dims] * parallel_heads,
-        depths=[ow_fifo_depth] * parallel_heads,
-        placement=Tile(col=3, row=1),
-    )  # Split between N parallel blocks of heads
+    if use_low_head_6way_qkvo_split_group:
+        ow_fifo_depth = 1
+    inOW_streams = []
+    memOW = []
+    for split_idx in range(mha_stream_split_factor):
+        inOW_streams.append(
+            ObjectFifo(
+                np.ndarray[(d * heads_per_mha_stream, emb_tile), np.dtype[dtype]],
+                name="inOW" if split_idx == 0 else f"inOWSplit{split_idx}",
+                depth=ow_fifo_depth,
+            )
+        )
+        memOW.extend(
+            inOW_streams[split_idx]
+            .cons()
+            .split(
+                offsets=[d * emb_tile * i for i in range(heads_per_mha_stream)],
+                obj_types=[wo_ty] * heads_per_mha_stream,
+                names=[
+                    f"memOW{split_idx * heads_per_mha_stream + i}"
+                    for i in range(heads_per_mha_stream)
+                ],
+                dims_to_stream=[ow_dims] * heads_per_mha_stream,
+                depths=[ow_fifo_depth] * heads_per_mha_stream,
+                placement=Tile(col=ow_stream_mem_cols[split_idx], row=1),
+            )
+        )  # Split between N parallel blocks of heads
 
     # Partial out proj tiles produced by per-head PV workers.
     outOProj = [
@@ -1238,7 +1356,20 @@ def fused_mha(
         else:
             # Keep col5 in the <=4-head map and avoid concentrating depth-8
             # O-proj accumulators on col6 where FFN tail staging is anchored.
-            acc_mem_tile_order = [4, 5, 7, 3]
+            # For low-head grouped 6-way FFN (acc>=6), place the second
+            # O-proj accum stream on col3 to avoid memtile-5 BD saturation.
+            if (
+                parallel_heads == 4
+                and proj_acc_depth >= 6
+                and o_proj_acc_group_size > 1
+                and effective_ffn_branches >= 6
+            ):
+                # For low-head 6-way tails, keep grouped O-proj staging away
+                # from col4/5 where LN replay and dual B_Up ingress can push
+                # the memtile BD allocator over its limit.
+                acc_mem_tile_order = [6, 3, 7, 4]
+            else:
+                acc_mem_tile_order = [4, 5, 7, 3]
     elif proj_acc_depth >= 6:
         # Keep high-head accumulator streams on 4/5/6/7. Col3 already carries
         # high fanout from W_O staging and can hit output-channel limits.
@@ -1294,9 +1425,16 @@ def fused_mha(
     outOGroupPart = [None] * (parallel_heads - 1)
     for i in range(parallel_heads - 1):
         if o_proj_acc_group_size > 1 or o_proj_group_idx[i] == o_proj_group_idx[i + 1]:
+            edge_depth = o_proj_group_chain_depth
+            if (
+                emb_tile >= 128
+                and o_proj_acc_group_size > 1
+                and i in o_proj_accum_core_set
+            ):
+                edge_depth = 1
             outOGroupPart[i] = ObjectFifo(
                 o_ty,
-                depth=o_proj_group_chain_depth,
+                depth=edge_depth,
                 name=f"outOGroupPart{i}",
             )
 
@@ -1324,8 +1462,12 @@ def fused_mha(
     # Keep LN residual staging shallow to avoid BD allocator over-subscription
     # in high-acc/high-parallel topologies.
     ln_fifo_depth = of_depth
-    # FFN-up FIFO depths.
-    ffn_up_input_depth = 1 if emb_tile >= 128 else 2
+    # FFN-up A-input depth controls:
+    # - Broadcast FIFO at LN1 producer side.
+    # - Per-branch consumer FIFO depth at FFN-up cores.
+    # Keep consumer-side depth shallow for emb_tile=128 to stay within L1.
+    ffn_up_broadcast_depth = 2 if (effective_ffn_branches >= 6) else 1
+    ffn_up_consumer_depth = 1 if emb_tile >= 128 else 2
     # Use depth 2 for O-proj->LN1 input and LN1 norm->muladd link.
     ln_input_depth = 2
     # emb_tile=128 can exceed O-proj core L1 with double-buffered O->LN1.
@@ -1389,15 +1531,42 @@ def fused_mha(
     use_ln2_replay_fifo = (ffn_stage_only in (None, 2)) and (
         not emit_ln2_replay_from_down
     )
-    ln2_replay_mem_tile_default = (
-        3
-        if (parallel_heads <= 2 and proj_acc_depth >= 8 and effective_ffn_branches > 1)
-        else 4
+    # Targeted remap for low-head/high-acc grouped-O-proj memtile topologies:
+    # col4 can saturate BD budget with {O-proj accum + LN2 replay + FFN down}.
+    # Route LN2 replay through col2 to keep per-memtile BD usage <= 48.
+    needs_low_head_6way_ln2_replay_remap = (
+        (not stage_ln1_to_ddr)
+        and parallel_heads <= 4
+        and proj_acc_depth >= 8
+        and o_proj_acc_group_size > 1
+        and effective_ffn_branches >= 6
     )
+    if needs_low_head_6way_ln2_replay_remap:
+        ln2_replay_mem_tile_default = 2
+    else:
+        ln2_replay_mem_tile_default = (
+            3
+            if (
+                parallel_heads <= 2
+                and proj_acc_depth >= 8
+                and effective_ffn_branches > 1
+            )
+            else 4
+        )
     ln2_replay_mem_tile_col = _override_int_env(
         "ENCODER_LN2_REPLAY_MEM_TILE_COL",
         ln2_replay_mem_tile_default,
     )
+    # Enforce targeted remap for the known saturated memtile topology.
+    if (
+        (not stage_ln1_to_ddr)
+        and parallel_heads == 4
+        and proj_acc_depth >= 8
+        and o_proj_acc_group_size == 2
+        and nB_tiles_distributed >= 6
+        and effective_ffn_branches >= 6
+    ):
+        ln2_replay_mem_tile_col = 2
     # Residual R
     inR = ObjectFifo(
         o_ty,
@@ -1560,6 +1729,74 @@ def fused_mha(
             else:
                 for branch_idx in range(effective_ffn_branches):
                     branch_down_b_cols[branch_idx] = alloc_down_cols[branch_idx]
+            # For low-head/high-acc 6-way FFN grouped-O-proj memtile layouts,
+            # rebalance legacy 2-branch split chunks across memtiles.
+            needs_low_head_6way_b_rebalance = (
+                parallel_heads <= 4
+                and proj_acc_depth >= 8
+                and o_proj_acc_group_size > 1
+                and effective_ffn_branches >= 6
+                and bup_split_enabled
+                and bdown_split_enabled
+                and len(branch_split_chunks) == 3
+                and all(len(chunk) == 2 for chunk in branch_split_chunks)
+            )
+            if needs_low_head_6way_b_rebalance:
+                # Keep col5 below BD saturation and avoid overloading col7
+                # once LN2 replay is remapped for high-acc grouped topologies.
+                rebalance_up_cols = [6, 4, 0]
+                rebalance_down_cols = [6, 5, 1]
+                for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
+                    for branch_idx in chunk_branches:
+                        branch_bup_cols[branch_idx] = rebalance_up_cols[chunk_idx]
+                        branch_down_b_cols[branch_idx] = rebalance_down_cols[chunk_idx]
+                logging.info(
+                    "Applied low-head 6-way B-stream rebalance: B_Up=%s B_Down=%s",
+                    branch_bup_cols,
+                    branch_down_b_cols,
+                )
+            needs_low_head_6way_b_rebalance_acc6 = (
+                parallel_heads == 4
+                and proj_acc_depth >= 6
+                and proj_acc_depth < 8
+                and o_proj_acc_group_size > 1
+                and effective_ffn_branches >= 6
+                and bdown_split_enabled
+                and len(branch_split_chunks) == 3
+                and all(len(chunk) == 2 for chunk in branch_split_chunks)
+            )
+            if needs_low_head_6way_b_rebalance_acc6:
+                if bup_split_enabled:
+                    # For 4pheads/6pffn/6pacc/2opg with split B_Up/B_Down,
+                    # keep cols4/5 below the memtile output-channel limit by
+                    # shifting one B-stream chunk to col0 and one to col7.
+                    rebalance_up_cols = [6, 5, 0]
+                    rebalance_down_cols = [6, 1, 7]
+                    for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
+                        for branch_idx in chunk_branches:
+                            branch_bup_cols[branch_idx] = rebalance_up_cols[chunk_idx]
+                            branch_down_b_cols[branch_idx] = rebalance_down_cols[
+                                chunk_idx
+                            ]
+                else:
+                    # When B_Up is unsplit, B_Up already saturates cols4/5/6
+                    # at shim output. Move B_Down chunks off cols2/3 (which
+                    # also carry V/W_O split fanout) and onto cols0/7/1.
+                    # Also move one B_Up branch off col6 to reduce memtile-6
+                    # BD/start pressure in 4pheads/6pffn/6pacc/2opg layouts.
+                    if len(branch_bup_cols) >= 4:
+                        branch_bup_cols[3] = 2
+                    rebalance_down_cols = [0, 7, 1]
+                    for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
+                        for branch_idx in chunk_branches:
+                            branch_down_b_cols[branch_idx] = rebalance_down_cols[
+                                chunk_idx
+                            ]
+                logging.info(
+                    "Applied low-head 6-way B-stream rebalance(acc6): B_Up=%s B_Down=%s",
+                    branch_bup_cols,
+                    branch_down_b_cols,
+                )
         else:
             branch_bup_cols, branch_down_b_cols = _allocate_ffn_weight_mem_tile_cols(
                 effective_ffn_branches
@@ -1602,7 +1839,8 @@ def fused_mha(
 
     ln1_path = ln1_mode_hooks.build_ln1_to_ffn_up_path(
         o_ty=o_ty,
-        ffn_up_input_depth=ffn_up_input_depth,
+        ffn_up_broadcast_depth=ffn_up_broadcast_depth,
+        ffn_up_consumer_depth=ffn_up_consumer_depth,
         effective_ffn_branches=effective_ffn_branches,
         ffn_a_stage_mem_tile_cols=ffn_a_stage_mem_tile_cols,
         ln1_ddr_staged_branch_indices=ln1_ddr_staged_branch_indices,
@@ -1640,6 +1878,8 @@ def fused_mha(
     # Large emb_tile (e.g. 128) can overflow FFN-up L1 when B-weight FIFOs are
     # double-buffered at the consumer; keep them shallow in that regime.
     ffn_weight_fifo_depth = 1 if emb_tile >= 128 else 2
+    if use_low_head_6way_qkvo_split_group:
+        ffn_weight_fifo_depth = 1
     ffn_bup_mem_tile_cols = branch_bup_cols[:effective_ffn_branches]
     ffn_bdown_mem_tile_cols = branch_down_b_cols[:effective_ffn_branches]
     logging.info(
@@ -1655,9 +1895,12 @@ def fused_mha(
     ffn_bdown_split_mem_tile_cols = []
     ffn_b_pack_elem_count = emb_tile * emb_tile
     if bup_split_enabled or bdown_split_enabled:
+        default_split_parent_depth = (
+            1 if use_low_head_6way_qkvo_split_group else max(2, ffn_weight_fifo_depth)
+        )
         ffn_weight_split_parent_depth = _override_int_env(
             "ENCODER_B_WEIGHT_SPLIT_PARENT_DEPTH",
-            max(2, ffn_weight_fifo_depth),
+            default_split_parent_depth,
         )
         if ffn_weight_split_parent_depth <= 0:
             raise ValueError(
@@ -1799,11 +2042,12 @@ def fused_mha(
         ffn_down_acc_mem_tile_cols,
     )
     for branch_idx in range(effective_ffn_branches):
+        ffn_up_out_depth = 1 if emb_tile >= 128 else 2
         ffnUpOut.append(
             ObjectFifo(
                 o_ty,
                 name="ffnUpOut" if branch_idx == 0 else f"ffnUpOut{branch_idx}",
-                depth=2,
+                depth=ffn_up_out_depth,
             )
         )
         # Keep FFN-down accumulation in mem tile FIFO(s) so down-proj core L1 stays
@@ -3261,6 +3505,66 @@ def fused_mha(
             tile._strides[3],
         ]
 
+    def split_tap_along_axis(
+        tap: TensorAccessPattern,
+        tensor_shape: tuple[int, int],
+        axis_idx: int,
+        parts: int,
+    ) -> list[TensorAccessPattern]:
+        if parts <= 1:
+            return [tap]
+        sizes = [int(v) for v in tap.sizes]
+        strides = [int(v) for v in tap.strides]
+        axis_size = sizes[axis_idx]
+        if axis_size % parts != 0:
+            raise ValueError(
+                "Cannot split tap axis evenly: "
+                f"axis_size={axis_size}, parts={parts}, tap={tap}"
+            )
+        chunk = axis_size // parts
+        taps = []
+        for part_idx in range(parts):
+            sizes_part = list(sizes)
+            sizes_part[axis_idx] = chunk
+            taps.append(
+                TensorAccessPattern(
+                    tensor_shape,
+                    offset=int(tap.offset) + part_idx * chunk * strides[axis_idx],
+                    sizes=sizes_part,
+                    strides=strides,
+                )
+            )
+        return taps
+
+    Q_tiles_by_stream = [[] for _ in range(mha_stream_split_factor)]
+    K_tiles_by_stream = [[] for _ in range(mha_stream_split_factor)]
+    V_tiles_by_stream = [[] for _ in range(mha_stream_split_factor)]
+    WO_tiles_by_stream = [[] for _ in range(mha_stream_split_factor)]
+    for q_tap in Q_tiles:
+        q_parts = split_tap_along_axis(
+            q_tap, qkv_tensor_shape, axis_idx=1, parts=mha_stream_split_factor
+        )
+        for split_idx in range(mha_stream_split_factor):
+            Q_tiles_by_stream[split_idx].append(q_parts[split_idx])
+    for k_tap in K_tiles:
+        k_parts = split_tap_along_axis(
+            k_tap, qkv_tensor_shape, axis_idx=1, parts=mha_stream_split_factor
+        )
+        for split_idx in range(mha_stream_split_factor):
+            K_tiles_by_stream[split_idx].append(k_parts[split_idx])
+    for v_tap in V_tiles:
+        v_parts = split_tap_along_axis(
+            v_tap, qkv_tensor_shape, axis_idx=1, parts=mha_stream_split_factor
+        )
+        for split_idx in range(mha_stream_split_factor):
+            V_tiles_by_stream[split_idx].append(v_parts[split_idx])
+    for wo_tap in WO_tiles:
+        wo_parts = split_tap_along_axis(
+            wo_tap, (embed_sz, embed_sz), axis_idx=0, parts=mha_stream_split_factor
+        )
+        for split_idx in range(mha_stream_split_factor):
+            WO_tiles_by_stream[split_idx].append(wo_parts[split_idx])
+
     o_tiles_base = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
         (seq_tile, emb_tile),
@@ -3366,12 +3670,7 @@ def fused_mha(
                                 * (proj_acc_depth * emb_tile * ffn_intermediate_size)
                                 + (first_group_offset + local_group_idx) * emb_tile
                             ),
-                            sizes=[
-                                proj_acc_depth,
-                                chunk_size,
-                                emb_tile,
-                                emb_tile,
-                            ],
+                            sizes=[proj_acc_depth, chunk_size, emb_tile, emb_tile],
                             strides=[
                                 emb_tile * ffn_intermediate_size,
                                 shared_group_count * emb_tile,
@@ -3389,12 +3688,7 @@ def fused_mha(
                                 * emb_tile
                                 * embed_sz
                             ),
-                            sizes=[
-                                proj_acc_depth,
-                                chunk_size,
-                                emb_tile,
-                                emb_tile,
-                            ],
+                            sizes=[proj_acc_depth, chunk_size, emb_tile, emb_tile],
                             strides=[
                                 emb_tile,
                                 shared_group_count * emb_tile * embed_sz,
@@ -3633,6 +3927,8 @@ def fused_mha(
             serialize_q_prestage = runtime_serialize_q_prestage
         if not serialize_tail_io:
             serialize_q_prestage = False
+        if b_weight_split_enabled and effective_ffn_branches > 2:
+            serialize_q_prestage = False
         ffn_down_ddr_stage_enabled = (
             staged_ffn_down_stream_idx is not None
             and ffnDownOutStageToDDR is not None
@@ -3680,6 +3976,8 @@ def fused_mha(
             "ENCODER_DECOUPLE_TAIL_FILL",
             effective_ffn_branches > 2,
         )
+        if b_weight_split_enabled and effective_ffn_branches > 2:
+            decouple_tail_fill = False
         if serialize_tail_io:
             if tail_wait_mode in ("", "strict"):
                 pass
@@ -3703,6 +4001,11 @@ def fused_mha(
                     "relax_all_tail} "
                     f"(got '{tail_wait_mode}')"
                 )
+        # Split B-stream topologies rely on deterministic per-iteration
+        # completion of FFN-weight fills; relaxing these waits can accumulate
+        # cross-iteration backpressure and lead to runtime timeouts.
+        if b_weight_split_enabled and use_ln1_broadcast and effective_ffn_branches > 1:
+            wait_ffn_weight_fill = True
 
         residual_fill_max_groups = _override_int_env(
             "ENCODER_R_FILL_MAX_GROUPS_PER_DMA",
@@ -3714,6 +4017,22 @@ def fused_mha(
                 f"(got {residual_fill_max_groups})"
             )
         b_weight_fill_max_groups_default = min(max(ffn_col_group_counts), 22)
+        # For low-head 6-way split-B tails, avoid splitting each packed B_Down
+        # tap into multiple DMA BDs (e.g. 8 -> 4+4 groups). Keeping one fill
+        # per packed tap reduces runtime-sequence BD pressure.
+        if (
+            bdown_split_enabled
+            and effective_ffn_branches >= 6
+            and parallel_heads <= 4
+            and proj_acc_depth >= 6
+        ):
+            max_chunk_groups = max(
+                ffn_col_group_counts[chunk[0]] * len(chunk)
+                for chunk in branch_split_chunks
+            )
+            b_weight_fill_max_groups_default = min(
+                22, max(b_weight_fill_max_groups_default, max_chunk_groups)
+            )
         # For low-pressure topologies, avoid fragmenting each B-weight tap into
         # multiple fills; this reduces runtime fill scheduling overhead.
         if (
@@ -3817,13 +4136,13 @@ def fused_mha(
                         branch_split_chunks[chunk_idx][0]
                     ]
                     for local_group_idx in range(chunk_group_count):
-                        split_tap_idx = (
+                        b_up_tap = B_Up_split_tiles[chunk_idx][
                             col_group_idx * chunk_group_count + local_group_idx
-                        )
+                        ]
                         rt.fill(
                             inBUp[chunk_idx].prod(),
                             B_Up,
-                            tap=B_Up_split_tiles[chunk_idx][split_tap_idx],
+                            tap=b_up_tap,
                             placement=Tile(
                                 col=ffn_bup_split_mem_tile_cols[chunk_idx], row=0
                             ),
@@ -3909,13 +4228,13 @@ def fused_mha(
                         branch_split_chunks[chunk_idx][0]
                     ]
                     for local_group_idx in range(chunk_group_count):
-                        split_tap_idx = (
+                        b_down_tap = B_Down_split_tiles[chunk_idx][
                             col_group_idx * chunk_group_count + local_group_idx
-                        )
+                        ]
                         rt.fill(
                             inBDown[chunk_idx].prod(),
                             B_Down,
-                            tap=B_Down_split_tiles[chunk_idx][split_tap_idx],
+                            tap=b_down_tap,
                             placement=Tile(
                                 col=ffn_bdown_split_mem_tile_cols[chunk_idx],
                                 row=0,
@@ -4012,26 +4331,39 @@ def fused_mha(
                 if serialize_q_prestage:
                     # Stage Q tiles first so head-0 compute cannot race ahead of Q load.
                     tg_q = rt.task_group()
-                    rt.fill(
-                        inQ.prod(),
-                        QKV,
-                        tap=Q_tiles[q_block_idx],
-                        placement=Tile(col=0, row=0),
-                        task_group=tg_q,
-                    )
+                    for split_idx in range(mha_stream_split_factor):
+                        rt.fill(
+                            inQ_streams[split_idx].prod(),
+                            QKV,
+                            tap=Q_tiles_by_stream[split_idx][q_block_idx],
+                            placement=Tile(col=q_stream_mem_cols[split_idx], row=0),
+                            task_group=tg_q,
+                        )
                     rt.finish_task_group(tg_q)
                 else:
-                    rt.fill(
-                        inQ.prod(),
-                        QKV,
-                        tap=Q_tiles[q_block_idx],
-                        placement=Tile(col=0, row=0),
-                        task_group=tg,
-                    )
+                    for split_idx in range(mha_stream_split_factor):
+                        rt.fill(
+                            inQ_streams[split_idx].prod(),
+                            QKV,
+                            tap=Q_tiles_by_stream[split_idx][q_block_idx],
+                            placement=Tile(col=q_stream_mem_cols[split_idx], row=0),
+                            task_group=tg,
+                            # Non-prestaged Q fills must be awaited at end-of-tap
+                            # to avoid run-to-run drift in persistent worker loops.
+                            wait=True,
+                        )
                 logging.debug(
                     f"Scheduling fills for q block {q_block_idx}, col group {col_group} for QKV, W_O, and OR"
                 )
-                logging.debug(f"  Q tap: {Q_tiles[q_block_idx]}")
+                if mha_stream_split_factor == 1:
+                    logging.debug(f"  Q tap: {Q_tiles_by_stream[0][q_block_idx]}")
+                else:
+                    for split_idx in range(mha_stream_split_factor):
+                        logging.debug(
+                            "  Q tap split[%d]: %s",
+                            split_idx,
+                            Q_tiles_by_stream[split_idx][q_block_idx],
+                        )
                 tap_idx = q_block_idx * num_o_col_groups + col_group
                 o_offsets = enumerate_outer_object_offsets(
                     O_tiles[tap_idx], inner_rank=2
@@ -4064,38 +4396,58 @@ def fused_mha(
                         )
                 for head_idx in range(heads // parallel_heads):
                     tg_head = rt.task_group()
-                    rt.fill(
-                        inK.prod(),
-                        QKV,
-                        tap=K_tiles[head_idx],
-                        placement=Tile(col=1, row=0),
-                        task_group=tg_head,
-                        wait=True,
-                    )
-                    rt.fill(
-                        inV.prod(),
-                        QKV,
-                        tap=V_tiles[head_idx],
-                        placement=Tile(col=2, row=0),
-                        task_group=tg_head,
-                        wait=True,
-                    )
-                    rt.fill(
-                        inOW.prod(),
-                        W_O,
-                        tap=WO_tiles[head_idx * num_o_col_groups + col_group],
-                        placement=Tile(col=3, row=0),
-                        task_group=tg_head,
-                        wait=True,
-                    )
+                    wo_tap_idx = head_idx * num_o_col_groups + col_group
+                    for split_idx in range(mha_stream_split_factor):
+                        rt.fill(
+                            inK_streams[split_idx].prod(),
+                            QKV,
+                            tap=K_tiles_by_stream[split_idx][head_idx],
+                            placement=Tile(col=k_stream_mem_cols[split_idx], row=0),
+                            task_group=tg_head,
+                            wait=True,
+                        )
+                        rt.fill(
+                            inV_streams[split_idx].prod(),
+                            QKV,
+                            tap=V_tiles_by_stream[split_idx][head_idx],
+                            placement=Tile(col=v_stream_mem_cols[split_idx], row=0),
+                            task_group=tg_head,
+                            wait=True,
+                        )
+                        rt.fill(
+                            inOW_streams[split_idx].prod(),
+                            W_O,
+                            tap=WO_tiles_by_stream[split_idx][wo_tap_idx],
+                            placement=Tile(col=ow_stream_mem_cols[split_idx], row=0),
+                            task_group=tg_head,
+                            wait=True,
+                        )
                     rt.finish_task_group(tg_head)
-                    logging.debug(f"    K tap: {K_tiles[head_idx]}")
-                    logging.debug(f"    V tap: {V_tiles[head_idx]}")
-                    logging.debug(
-                        f"    W_O tap: {WO_tiles[head_idx * num_o_col_groups + col_group]}"
-                    )
+                    if mha_stream_split_factor == 1:
+                        logging.debug(f"    K tap: {K_tiles_by_stream[0][head_idx]}")
+                        logging.debug(f"    V tap: {V_tiles_by_stream[0][head_idx]}")
+                        logging.debug(
+                            f"    W_O tap: {WO_tiles_by_stream[0][wo_tap_idx]}"
+                        )
+                    else:
+                        for split_idx in range(mha_stream_split_factor):
+                            logging.debug(
+                                "    K tap split[%d]: %s",
+                                split_idx,
+                                K_tiles_by_stream[split_idx][head_idx],
+                            )
+                            logging.debug(
+                                "    V tap split[%d]: %s",
+                                split_idx,
+                                V_tiles_by_stream[split_idx][head_idx],
+                            )
+                            logging.debug(
+                                "    W_O tap split[%d]: %s",
+                                split_idx,
+                                WO_tiles_by_stream[split_idx][wo_tap_idx],
+                            )
                     wo_offsets = enumerate_outer_object_offsets(
-                        WO_tiles[head_idx * num_o_col_groups + col_group], inner_rank=2
+                        WO_tiles[wo_tap_idx], inner_rank=2
                     )
                     logging.debug(
                         "    W_O outer offsets (head_idx=%d, q_block=%d, col_group=%d): %s",

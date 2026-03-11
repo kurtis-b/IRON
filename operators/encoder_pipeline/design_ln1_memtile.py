@@ -49,7 +49,8 @@ def plan_branch_stage_configuration(
 def build_ln1_to_ffn_up_path(
     *,
     o_ty,
-    ffn_up_input_depth,
+    ffn_up_broadcast_depth,
+    ffn_up_consumer_depth,
     effective_ffn_branches,
     object_fifo_ctor,
     **_unused,
@@ -57,12 +58,12 @@ def build_ln1_to_ffn_up_path(
     ln1_broadcast = object_fifo_ctor(
         o_ty,
         name="outLNBroadcast",
-        depth=ffn_up_input_depth,
+        depth=ffn_up_broadcast_depth,
     )
     return {
         "ln1Broadcast": ln1_broadcast,
         "memOutLNCons": [
-            ln1_broadcast.cons(depth=ffn_up_input_depth)
+            ln1_broadcast.cons(depth=ffn_up_consumer_depth)
             for _ in range(effective_ffn_branches)
         ],
         "ln1OutStageToDDR": {},
@@ -100,6 +101,18 @@ def adjust_ffn_down_acc_mem_tile_cols(
                     break
             remapped.append(new_col)
         return remapped
+    if (
+        parallel_heads == 4
+        and proj_acc_depth >= 6
+        and proj_acc_depth < 8
+        and effective_ffn_branches >= 6
+        and len(cols) >= 4
+        and cols[3] == 7
+    ):
+        # Col7 already carries residual/LN2 traffic. Move one FFN down-acc
+        # stream to col6 to reduce BD pressure when B_Down split streams are
+        # also mapped onto col7.
+        cols[3] = 6
     return cols
 
 

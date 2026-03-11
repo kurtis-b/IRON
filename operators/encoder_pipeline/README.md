@@ -2,86 +2,92 @@
 
 Fused encoder operator: `MHA + AddNorm1 + FFN + AddNorm2`.
 
-## Design summary
+## What matters
 
-- LN1 and LN2 stay two-pass because layer norm requires full-row statistics.
-- LN1 staging modes:
+- LN1 and LN2 are both two-pass layer norm stages (full-row statistics are required).
 - `ln1_staging_design="memtile"`: LN1 output is broadcast on-chip to FFN-up branches.
-- `ln1_staging_design="ddr"`: LN1 output stages through DDR once, then is broadcast on-chip.
-- FFN and O-proj parallelization are controlled by test topology parameters (`pheads`, `pffn`, `pacc`, `opg` in test IDs).
+- `ln1_staging_design="ddr"`: LN1 output is staged through DDR once, then broadcast on-chip.
+- Topology knobs in test IDs: `pheads`, `pffn`, `pacc`, `opg`.
 
-## Core constraints
+## Placement overview
+
+- MHA + O-proj: per-head compute columns (`rows 2..5`).
+- AddNorm1: LN1 norm then LN1 mul/add with residual.
+- FFN: up/down tiles selected from FFN layout; down reduction is a neighbor chain that ends near LN2.
+- AddNorm2: LN2 consumes reduced FFN output + residual and drains final output.
+- Exact coordinates are printed in runtime logs (`FFN mapped placement`, `down_reduction_edges`).
+
+## Hard constraints
 
 - `emb_tile * proj_acc_depth == embed_sz`
-- `o_proj_acc_group_size in {1, 2, 4}`
 - `parallel_heads % o_proj_acc_group_size == 0`
-- Compute-tile and DMA/BD budgets are validated during design construction/lowering.
+- `o_proj_acc_group_size <= parallel_heads`
+- Compute-tile, shim-channel, memtile-channel, and BD budgets are validated during generation/lowering.
 
-## Test entry points
+## Entry points
 
-- Main regression suite: `operators/encoder_pipeline/test.py`
-- Bottleneck/debug sweep helper: `operators/encoder_pipeline/profile_debug_modes.py`
+- Regression: `operators/encoder_pipeline/test.py`
+- Debug/bottleneck sweep: `operators/encoder_pipeline/profile_debug_modes.py`
 
-## Environment setup for tests
+## Environment setup
 
 ```bash
 cd /home/agi-demo/iron
-# If conda is active in your shell:
+# Only if conda is initialized and active in your shell:
 conda deactivate
 source /opt/xilinx/xrt/setup.sh
 source ~/iron/ironenv/bin/activate
+```
+
+## Required run rule
+
+Delete `./build` before each test run:
+
+```bash
 rm -rf ./build
 ```
 
-## Pytest commands
+## Common commands
 
-Run all encoder_pipeline tests:
+All encoder pipeline tests:
 
 ```bash
+rm -rf ./build
 pytest operators/encoder_pipeline/test.py -q
 ```
 
-Run one LN1 staging mode only:
+One staging mode:
 
 ```bash
-pytest operators/encoder_pipeline/test.py -q -k lnstage_ddr
+rm -rf ./build
 pytest operators/encoder_pipeline/test.py -q -k lnstage_memtile
 ```
 
-Run both modes explicitly:
+One topology:
 
 ```bash
-pytest operators/encoder_pipeline/test.py -q -k "(lnstage_ddr or lnstage_memtile)"
-```
-
-Run one topology/case by node-id substring:
-
-```bash
+rm -rf ./build
 pytest operators/encoder_pipeline/test.py -q -k "4pheads_4pffn_8pacc_4opg and lnstage_memtile"
 ```
 
-Stop on first failure during triage:
+Verbose run:
 
 ```bash
-pytest operators/encoder_pipeline/test.py -q -x
-```
-
-Print per-test logs/stdout (useful for mismatch/runtime diagnostics):
-
-```bash
+rm -rf ./build
 pytest operators/encoder_pipeline/test.py -s -vv
 ```
 
-## CSV output and iteration control
+## CSV and iteration options
 
-`conftest.py` provides two pytest options used by this suite:
+Provided via pytest options:
 
-- `--csv-output <path>`: write metrics CSV to a chosen file.
-- `--iterations <N>`: repeat each test `N` times and aggregate metrics.
+- `--csv-output <path>`
+- `--iterations <N>`
 
-Run both LN1 modes and write all results to one CSV:
+Example:
 
 ```bash
+rm -rf ./build
 pytest operators/encoder_pipeline/test.py \
   -q \
   -k "(lnstage_ddr or lnstage_memtile) and not stage_profile" \
@@ -89,36 +95,17 @@ pytest operators/encoder_pipeline/test.py \
   --iterations 1
 ```
 
-## Stage-profile tests
+## Stage-profile runs
 
-- Stage-profile test cases are in `test_encoder_pipeline_stage_profile`.
-- They are skipped unless `ENABLE_STAGE_PROFILE_TESTS = True` in `test.py`.
-- Once enabled, run only stage-profile tests:
+`test_encoder_pipeline_stage_profile` is skipped unless `ENABLE_STAGE_PROFILE_TESTS=True` in `test.py`.
 
 ```bash
+rm -rf ./build
 pytest operators/encoder_pipeline/test.py -q -k stage_profile
 ```
 
-Run stage profile for one mode:
+## Debug-mode sweep helper
 
 ```bash
-pytest operators/encoder_pipeline/test.py -q -k "stage_profile and lnstage_ddr"
+python operators/encoder_pipeline/profile_debug_modes.py --design memtile --clean-build
 ```
-
-## Debug-mode sweep script
-
-`profile_debug_modes.py` runs all debug modes for selected cases and reports bottleneck stages.
-
-```bash
-python operators/encoder_pipeline/profile_debug_modes.py --design ddr --clean-build
-```
-
-Useful script options:
-
-- `--design {ddr,memtile}`
-- `--warmup-iters <N>`
-- `--timed-iters <N>`
-- `--case-index 0,2,4`
-- `--extensive`
-- `--stop-on-fail`
-- `--output-json <path>`
