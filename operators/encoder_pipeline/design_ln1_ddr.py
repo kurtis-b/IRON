@@ -162,7 +162,8 @@ def plan_branch_stage_configuration(
 def build_ln1_to_ffn_up_path(
     *,
     o_ty,
-    ffn_up_input_depth,
+    ffn_up_broadcast_depth,
+    ffn_up_consumer_depth,
     effective_ffn_branches,
     ffn_a_stage_mem_tile_cols,
     ln1_ddr_staged_branch_indices,
@@ -184,7 +185,7 @@ def build_ln1_to_ffn_up_path(
     ln1_broadcast = object_fifo_ctor(
         o_ty,
         name="outLNBroadcast",
-        depth=ffn_up_input_depth,
+        depth=ffn_up_broadcast_depth,
     )
     if sorted(ln1_ddr_staged_branch_set) != [0]:
         raise ValueError(
@@ -192,7 +193,7 @@ def build_ln1_to_ffn_up_path(
             f"(staged={sorted(ln1_ddr_staged_branch_set)}, branches={effective_ffn_branches})"
         )
     ln1_stage_source = (
-        ln1_broadcast.cons(depth=ffn_up_input_depth)
+        ln1_broadcast.cons(depth=ffn_up_broadcast_depth)
         if ln1_ddr_staged_branch_set
         else None
     )
@@ -200,12 +201,12 @@ def build_ln1_to_ffn_up_path(
     ln1_refill_broadcast = object_fifo_ctor(
         o_ty,
         name="inLNFromDDR",
-        depth=ffn_up_input_depth,
+        depth=ffn_up_broadcast_depth,
     )
     ln1_out_stage_to_ddr[0] = ln1_stage_source
     ln1_in_from_ddr[0] = ln1_refill_broadcast
     for _ in range(effective_ffn_branches):
-        mem_out_ln_cons.append(ln1_refill_broadcast.cons(depth=ffn_up_input_depth))
+        mem_out_ln_cons.append(ln1_refill_broadcast.cons(depth=ffn_up_consumer_depth))
 
     return {
         "ln1Broadcast": ln1_broadcast,
