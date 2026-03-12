@@ -20,7 +20,7 @@ from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU2, Tile
 from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
-from aie.helpers.dialects.ext.scf import if_, else_
+from aie.helpers.dialects.scf import if_, else_
 import aie.dialects.index as index
 from aie.dialects.aiex import *
 from operators.encoder_pipeline.debug_modes import (
@@ -1562,8 +1562,11 @@ def fused_mha(
         "ENCODER_LN1_REPLAY_MEM_TILE_COL",
         ln1_replay_mem_tile_col,
     )
-    ln1ReplayPart = None
-    ln1Replay = None
+    ln1_norm_tile_obj = Tile(col=ln1_tile[0], row=ln1_tile[1])
+    # Keep LN1 replay on the forwarded FIFO path until the compiler has an
+    # explicit double-buffered row-store abstraction. The current single-row
+    # memtile row-store deadlocks when LN1 consumes row N while producing row
+    # N+1 in the same steady-state loop.
     ln1ReplayPart = ObjectFifo(o_ty, name="ln1ReplayPart", depth=1)
     ln1Replay = ln1ReplayPart.cons(depth=ln_tiles_per_q_block).forward(
         obj_type=o_ty,
@@ -3612,7 +3615,7 @@ def fused_mha(
             addnorm1_debug_mode,
             ffn_stage_only,
         ],
-        placement=Tile(col=ln1_tile[0], row=ln1_tile[1]),
+        placement=ln1_norm_tile_obj,
         while_true=False,
     )
     ln1_muladd_worker = Worker(
