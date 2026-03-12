@@ -13,6 +13,8 @@ DEBUG_FFN_DOWN_ONLY = 4
 DEBUG_FFN_ADDNORM_ONLY = 5
 DEBUG_MHA_ONLY = 6
 DEBUG_ADDNORM1_ONLY = 7
+DEBUG_ADDNORM1_STATS_ONLY = 8
+DEBUG_ADDNORM1_POST_ONLY = 9
 
 ADDNORM_DEBUG_DISABLED = -1
 ADDNORM_DEBUG_INPUT = 0
@@ -32,6 +34,22 @@ _PIPELINE_DEBUG_TO_INTERNAL = {
     # Keep full MHA + AddNorm1 behavior while disabling downstream FFN/AddNorm2
     # compute via stage-only selection.
     DEBUG_ADDNORM1_ONLY: (0, 4, ADDNORM_DEBUG_DISABLED, ADDNORM_DEBUG_RESIDUAL),
+    # Keep MHA + LN1 norm statistics/normalization behavior, bypass LN1 mul/add,
+    # and disable downstream FFN/AddNorm2 compute.
+    DEBUG_ADDNORM1_STATS_ONLY: (
+        0,
+        5,
+        ADDNORM_DEBUG_DISABLED,
+        ADDNORM_DEBUG_RESIDUAL,
+    ),
+    # Bypass LN1 norm math, keep LN1 mul/add behavior, and disable downstream
+    # FFN/AddNorm2 compute.
+    DEBUG_ADDNORM1_POST_ONLY: (
+        0,
+        6,
+        ADDNORM_DEBUG_DISABLED,
+        ADDNORM_DEBUG_RESIDUAL,
+    ),
 }
 
 _DEBUG_CHOICES = tuple(_PIPELINE_DEBUG_TO_INTERNAL)

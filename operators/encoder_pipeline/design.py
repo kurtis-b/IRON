@@ -145,9 +145,11 @@ def fused_mha(
             "ffn_intermediate_size must be divisible by emb_tile "
             f"({ffn_intermediate_size} % {emb_tile} != 0)"
         )
-    if ffn_stage_only not in {None, 0, 1, 2, 3, 4}:
+    if ffn_stage_only not in {None, 0, 1, 2, 3, 4, 5, 6}:
         raise ValueError(
-            f"ffn_stage_only must be one of {{None, 0, 1, 2, 3, 4}} (got {ffn_stage_only})"
+            "ffn_stage_only must be one of "
+            "{None, 0, 1, 2, 3, 4, 5, 6} "
+            f"(got {ffn_stage_only})"
         )
     valid_addnorm_debug_modes = (
         ADDNORM_DEBUG_DISABLED,
@@ -238,6 +240,7 @@ def fused_mha(
     layout_has_west_down_edge = any(
         delta_col < 0 for (delta_col, _delta_row) in layout_down_edge_deltas
     )
+
     if not allow_west_down_reduction and layout_has_west_down_edge:
         raise ValueError(
             "FFN layout produced westward down-reduction edge(s) while "
@@ -718,11 +721,21 @@ def fused_mha(
             "ENCODER_B_WEIGHT_SPLIT_CHUNK_SIZE must be > 0 "
             f"(got {b_weight_split_chunk_size})"
         )
-    # Targeted memtile stress topology:
-    # - 4pheads, 6pffn, 8pacc, 2opg (memtile mode)
+    # Targeted low-head 6-way FFN memtile topology:
+    # - 4pheads, 6pffn, 8pacc, 2opg
     # Use 2-way branch grouping for B-weight streams.
     use_low_head_6way_qkvo_split_group = (
         (not stage_ln1_to_ddr)
+        and parallel_heads == 4
+        and proj_acc_depth >= 8
+        and o_proj_acc_group_size == 2
+        and effective_ffn_branches >= 6
+    )
+    # DDR-specific variant:
+    # - 4pheads, 6pffn, >=6pacc, 2opg
+    # Split MHA ingress so W_O no longer concentrates on memtile col3.
+    use_low_head_6way_ddr_mha_split = (
+        stage_ln1_to_ddr
         and parallel_heads == 4
         and proj_acc_depth >= 8
         and o_proj_acc_group_size == 2
@@ -754,19 +767,6 @@ def fused_mha(
             b_weight_split_enabled = False
     bup_split_enabled = b_weight_split_enabled and bup_split_requested
     bdown_split_enabled = b_weight_split_enabled and bdown_split_requested
-    # Keep B_Up unsplit for low-head 6-way FFN tails.
-    # This still fits shim output-channel budget (6 B_Up streams + 3 B_Down
-    # streams + 5 baseline streams) while avoiding packed B_Up split ordering
-    # sensitivity on this topology family.
-    force_unsplit_bup_low_head_6way = (
-        bup_split_enabled
-        and bdown_split_enabled
-        and effective_ffn_branches >= 6
-        and parallel_heads <= 4
-        and proj_acc_depth >= 6
-    )
-    if force_unsplit_bup_low_head_6way:
-        bup_split_enabled = False
     branch_split_chunks = (
         requested_split_chunks
         if b_weight_split_enabled
@@ -788,6 +788,69 @@ def fused_mha(
             f"(got {ln1_broadcast_groups}, branch_counts={ffn_col_group_counts})"
         )
     final_ffn_branch_idx = effective_ffn_branches - 1
+    ffn_down_acc_grouping_enabled = (
+        not stage_ln1_to_ddr and proj_acc_depth >= 6 and effective_ffn_branches > 1
+    )
+    ffn_down_acc_group_ranges = [(0, effective_ffn_branches)]
+    if ffn_down_acc_grouping_enabled:
+        if effective_ffn_branches <= 3:
+            ffn_down_acc_group_ranges = [(0, effective_ffn_branches)]
+        else:
+            first_group_size = (effective_ffn_branches + 1) // 2
+            ffn_down_acc_group_ranges = [
+                (0, first_group_size),
+                (first_group_size, effective_ffn_branches),
+            ]
+    ffn_down_acc_group_size = max(
+        group_end - group_start for group_start, group_end in ffn_down_acc_group_ranges
+    )
+    ffn_down_groups_have_uniform_counts = all(
+        len(set(ffn_col_group_counts[group_start:group_end])) == 1
+        for group_start, group_end in ffn_down_acc_group_ranges
+    )
+    grouped_ffn_down_root_input_overflow_risk = (
+        emb_tile >= 128
+        and parallel_heads <= 4
+        and o_proj_acc_group_size > 1
+        and effective_ffn_branches >= 6
+    )
+    if ffn_down_acc_grouping_enabled and not ffn_down_groups_have_uniform_counts:
+        logging.info(
+            "Disabling FFN down accumulation grouping because group branch counts are uneven: ranges=%s counts=%s",
+            ffn_down_acc_group_ranges,
+            ffn_col_group_counts,
+        )
+        ffn_down_acc_grouping_enabled = False
+        ffn_down_acc_group_ranges = [(0, effective_ffn_branches)]
+    if ffn_down_acc_grouping_enabled and grouped_ffn_down_root_input_overflow_risk:
+        logging.info(
+            "Disabling FFN down accumulation grouping because grouped roots would exceed compute-tile input DMA budget "
+            "(emb_tile=%d parallel_heads=%d o_proj_acc_group_size=%d effective_ffn_branches=%d)",
+            emb_tile,
+            parallel_heads,
+            o_proj_acc_group_size,
+            effective_ffn_branches,
+        )
+        ffn_down_acc_grouping_enabled = False
+        ffn_down_acc_group_ranges = [(0, effective_ffn_branches)]
+    if ffn_down_acc_grouping_enabled:
+        ffn_down_group_stage_branches = [
+            group_end - 1 for group_start, group_end in ffn_down_acc_group_ranges
+        ]
+    else:
+        ffn_down_group_stage_branches = list(range(effective_ffn_branches))
+    ffn_down_group_stage_set = set(ffn_down_group_stage_branches)
+    ffn_down_group_partner_srcs_by_stage = {}
+    ffn_down_group_stage_by_src = {}
+    if ffn_down_acc_grouping_enabled:
+        for group_start, group_end in ffn_down_acc_group_ranges:
+            stage_branch_idx = group_end - 1
+            partner_sources = list(range(group_start, stage_branch_idx))
+            ffn_down_group_partner_srcs_by_stage[stage_branch_idx] = partner_sources
+            for src_branch_idx in partner_sources:
+                ffn_down_group_stage_by_src[src_branch_idx] = stage_branch_idx
+        ffn_reduction_edges = []
+        ffn_down_output_branches = list(ffn_down_group_stage_branches)
     use_dual_ln2_ffn_inputs = len(ffn_down_output_branches) == 2
     ffn_reduction_sources = [src for (src, _) in ffn_reduction_edges]
     ffn_reduce_in_by_branch = {dst: src for (src, dst) in ffn_reduction_edges}
@@ -946,7 +1009,6 @@ def fused_mha(
     wo_ty = np.ndarray[(d, emb_tile), np.dtype[dtype]]
     o_ty = np.ndarray[(seq_tile, emb_tile), np.dtype[dtype]]
     ffn_b_ty = np.ndarray[(emb_tile, emb_tile), np.dtype[dtype]]
-
     # AIE kernel declarations
     bin_name = kernel_archive
 
@@ -1048,6 +1110,16 @@ def fused_mha(
         bin_name,
         [o_ty, o_ty, ln_weights_ty, o_ty, np.int32],
     )
+    convert_stats_to_packet_kernel = Kernel(
+        "pack_stats_f32_to_bf16_packet",
+        bin_name,
+        [sum_l1_ty, sum_l1_ty, o_ty, np.int32],
+    )
+    convert_packet_to_stats_kernel = Kernel(
+        "unpack_stats_bf16_packet_to_f32",
+        bin_name,
+        [o_ty, sum_l1_ty, sum_l1_ty, np.int32],
+    )
 
     # FFN + second AddNorm kernels from encoder.cc
     ffn_zero_kernel_up_proj = Kernel(
@@ -1091,7 +1163,9 @@ def fused_mha(
     # Topology-specific split/group path:
     # - Split Q/K/V/W_O ingress into 2 streams.
     # - Pair with 2-way B-stream grouping for 6 FFN branches.
-    use_two_way_mha_stream_split = use_low_head_6way_qkvo_split_group
+    use_two_way_mha_stream_split = (
+        use_low_head_6way_qkvo_split_group or use_low_head_6way_ddr_mha_split
+    )
     mha_stream_split_factor = 2 if use_two_way_mha_stream_split else 1
     if parallel_heads % mha_stream_split_factor != 0:
         raise ValueError(
@@ -1100,11 +1174,11 @@ def fused_mha(
         )
     heads_per_mha_stream = parallel_heads // mha_stream_split_factor
     if use_two_way_mha_stream_split:
-        # Keep split endpoints off col6 in the current mapping (col6 already
-        # carries dense B-stream traffic in 2-way chunk mode).
+        # Rebalance low-head 6-way FFN topologies so each shim column stays
+        # within the 2-output-channel budget once B-weight streams are packed.
         q_stream_mem_cols = [0, 5]
         k_stream_mem_cols = [1, 2]
-        v_stream_mem_cols = [2, 3]
+        v_stream_mem_cols = [0, 6]
         ow_stream_mem_cols = [3, 4]
     else:
         q_stream_mem_cols = [0]
@@ -1135,7 +1209,7 @@ def fused_mha(
     )
 
     # Reduce BD pressure for the stressed 4pheads/6pffn/8pacc/2opg memtile case.
-    mha_ingress_fifo_depth = 1 if use_low_head_6way_qkvo_split_group else of_depth
+    mha_ingress_fifo_depth = 1 if use_two_way_mha_stream_split else of_depth
     inQ_streams = []
     memQ = []
     for split_idx in range(mha_stream_split_factor):
@@ -1281,7 +1355,7 @@ def fused_mha(
     # Large emb_tile (e.g. 128) with depth=2 can overflow o-proj core L1 on
     # larger models; keep a single buffered WO tile in that case.
     ow_fifo_depth = 1 if emb_tile >= 128 else of_depth
-    if use_low_head_6way_qkvo_split_group:
+    if use_two_way_mha_stream_split:
         ow_fifo_depth = 1
     inOW_streams = []
     memOW = []
@@ -1478,7 +1552,6 @@ def fused_mha(
         name="outOProjInput",
         depth=o_proj_input_depth,
     )
-    # LN1 norm replays the per-col O-proj tiles for FFN-group fanout.
     ln1_replay_mem_tile_col = ln1_mode_hooks.choose_ln1_replay_mem_tile_col(
         parallel_heads=parallel_heads,
         proj_acc_depth=proj_acc_depth,
@@ -1489,6 +1562,8 @@ def fused_mha(
         "ENCODER_LN1_REPLAY_MEM_TILE_COL",
         ln1_replay_mem_tile_col,
     )
+    ln1ReplayPart = None
+    ln1Replay = None
     ln1ReplayPart = ObjectFifo(o_ty, name="ln1ReplayPart", depth=1)
     ln1Replay = ln1ReplayPart.cons(depth=ln_tiles_per_q_block).forward(
         obj_type=o_ty,
@@ -1518,12 +1593,18 @@ def fused_mha(
     # AddNorm2 needs two logical passes (sum/sumsq pass + output pass).
     # Prefer LN2-side replay FIFO by default so FFN-down only emits one pass
     # unless explicitly overridden.
-    emit_ln2_replay_from_down_default = False
+    emit_ln2_replay_from_down_default = (
+        ffn_down_acc_grouping_enabled and use_dual_ln2_ffn_inputs
+    )
     emit_ln2_replay_from_down = _override_bool_env(
         "ENCODER_EMIT_LN2_REPLAY_FROM_DOWN",
         emit_ln2_replay_from_down_default,
     )
-    if use_dual_ln2_ffn_inputs and emit_ln2_replay_from_down:
+    if (
+        use_dual_ln2_ffn_inputs
+        and emit_ln2_replay_from_down
+        and not ffn_down_acc_grouping_enabled
+    ):
         logging.warning(
             "Forcing ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0 for dual-input LN2 topology"
         )
@@ -1556,6 +1637,14 @@ def fused_mha(
     ln2_replay_mem_tile_col = _override_int_env(
         "ENCODER_LN2_REPLAY_MEM_TILE_COL",
         ln2_replay_mem_tile_default,
+    )
+    ln2_replay_mem_tile_col = ln1_mode_hooks.choose_ln2_replay_mem_tile_col(
+        parallel_heads=parallel_heads,
+        proj_acc_depth=proj_acc_depth,
+        effective_ffn_branches=effective_ffn_branches,
+        o_proj_acc_group_size=o_proj_acc_group_size,
+        stage_ln1_to_ddr=stage_ln1_to_ddr,
+        default_col=ln2_replay_mem_tile_col,
     )
     # Enforce targeted remap for the known saturated memtile topology.
     if (
@@ -1742,10 +1831,10 @@ def fused_mha(
                 and all(len(chunk) == 2 for chunk in branch_split_chunks)
             )
             if needs_low_head_6way_b_rebalance:
-                # Keep col5 below BD saturation and avoid overloading col7
-                # once LN2 replay is remapped for high-acc grouped topologies.
-                rebalance_up_cols = [6, 4, 0]
-                rebalance_down_cols = [6, 5, 1]
+                # Keep each shim column at <=2 output streams for the
+                # 4pheads/6pffn/8pacc/2opg memtile topology.
+                rebalance_up_cols = [6, 4, 5]
+                rebalance_down_cols = [1, 2, 3]
                 for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
                     for branch_idx in chunk_branches:
                         branch_bup_cols[branch_idx] = rebalance_up_cols[chunk_idx]
@@ -1767,11 +1856,20 @@ def fused_mha(
             )
             if needs_low_head_6way_b_rebalance_acc6:
                 if bup_split_enabled:
-                    # For 4pheads/6pffn/6pacc/2opg with split B_Up/B_Down,
-                    # keep cols4/5 below the memtile output-channel limit by
-                    # shifting one B-stream chunk to col0 and one to col7.
-                    rebalance_up_cols = [6, 5, 0]
-                    rebalance_down_cols = [6, 1, 7]
+                    if use_low_head_6way_ddr_mha_split:
+                        # DDR low-head 6-way split path already occupies:
+                        # Q on cols0/5, K on cols1/2, V on cols0/6, W_O on
+                        # cols3/4, LN1 refill on col6, and residual on col7.
+                        # Pack B streams onto the remaining shim slots so no
+                        # shim or memtile exceeds its output-channel budget.
+                        rebalance_up_cols = [5, 4, 7]
+                        rebalance_down_cols = [1, 2, 3]
+                    else:
+                        # For 4pheads/6pffn/6pacc/2opg with split B_Up/B_Down,
+                        # keep cols4/5 below the memtile output-channel limit by
+                        # shifting one B-stream chunk to col0 and one to col7.
+                        rebalance_up_cols = [6, 5, 0]
+                        rebalance_down_cols = [6, 1, 7]
                     for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
                         for branch_idx in chunk_branches:
                             branch_bup_cols[branch_idx] = rebalance_up_cols[chunk_idx]
@@ -1878,7 +1976,7 @@ def fused_mha(
     # Large emb_tile (e.g. 128) can overflow FFN-up L1 when B-weight FIFOs are
     # double-buffered at the consumer; keep them shallow in that regime.
     ffn_weight_fifo_depth = 1 if emb_tile >= 128 else 2
-    if use_low_head_6way_qkvo_split_group:
+    if use_two_way_mha_stream_split:
         ffn_weight_fifo_depth = 1
     ffn_bup_mem_tile_cols = branch_bup_cols[:effective_ffn_branches]
     ffn_bdown_mem_tile_cols = branch_down_b_cols[:effective_ffn_branches]
@@ -1891,12 +1989,14 @@ def fused_mha(
     memBUp = [None] * effective_ffn_branches
     inBDown = []
     memBDown = [None] * effective_ffn_branches
+    need_bup_weights = ffn_stage_only in (None, 0)
+    need_bdown_weights = ffn_stage_only in (None, 1)
     ffn_bup_split_mem_tile_cols = []
     ffn_bdown_split_mem_tile_cols = []
     ffn_b_pack_elem_count = emb_tile * emb_tile
     if bup_split_enabled or bdown_split_enabled:
         default_split_parent_depth = (
-            1 if use_low_head_6way_qkvo_split_group else max(2, ffn_weight_fifo_depth)
+            1 if use_two_way_mha_stream_split else max(2, ffn_weight_fifo_depth)
         )
         ffn_weight_split_parent_depth = _override_int_env(
             "ENCODER_B_WEIGHT_SPLIT_PARENT_DEPTH",
@@ -1910,126 +2010,134 @@ def fused_mha(
     else:
         ffn_weight_split_parent_depth = ffn_weight_fifo_depth
 
-    if bup_split_enabled:
-        for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
-            chunk_size = len(chunk_branches)
-            ffn_b_pack_ty = np.ndarray[
-                (chunk_size * ffn_b_pack_elem_count,),
-                np.dtype[dtype],
-            ]
-            inBUp.append(
-                ObjectFifo(
-                    ffn_b_pack_ty,
-                    name="inBUp" if chunk_idx == 0 else f"inBUpPack{chunk_idx}",
-                    depth=ffn_weight_split_parent_depth,
+    if need_bup_weights:
+        if bup_split_enabled:
+            for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
+                chunk_size = len(chunk_branches)
+                ffn_b_pack_ty = np.ndarray[
+                    (chunk_size * ffn_b_pack_elem_count,),
+                    np.dtype[dtype],
+                ]
+                inBUp.append(
+                    ObjectFifo(
+                        ffn_b_pack_ty,
+                        name="inBUp" if chunk_idx == 0 else f"inBUpPack{chunk_idx}",
+                        depth=ffn_weight_split_parent_depth,
+                    )
                 )
-            )
-            ffn_bup_split_mem_tile_cols.append(ffn_bup_mem_tile_cols[chunk_branches[0]])
-            mem_bup_chunk = (
-                inBUp[-1]
-                .cons()
-                .split(
-                    offsets=[
-                        local_idx * ffn_b_pack_elem_count
-                        for local_idx in range(chunk_size)
-                    ],
-                    obj_types=[ffn_b_ty] * chunk_size,
-                    names=[
-                        "memBUp" if branch_idx == 0 else f"memBUp{branch_idx}"
-                        for branch_idx in chunk_branches
-                    ],
-                    dims_to_stream=[b_dims] * chunk_size,
-                    depths=[ffn_weight_fifo_depth] * chunk_size,
-                    placement=Tile(col=ffn_bup_split_mem_tile_cols[-1], row=1),
+                ffn_bup_split_mem_tile_cols.append(
+                    ffn_bup_mem_tile_cols[chunk_branches[0]]
                 )
-            )
-            for local_idx, branch_idx in enumerate(chunk_branches):
-                memBUp[branch_idx] = mem_bup_chunk[local_idx]
-    else:
-        for branch_idx in range(effective_ffn_branches):
-            inBUp.append(
-                ObjectFifo(
-                    ffn_b_ty,
-                    name="inBUp" if branch_idx == 0 else f"inBUp{branch_idx}",
-                    depth=ffn_weight_fifo_depth,
+                mem_bup_chunk = (
+                    inBUp[-1]
+                    .cons()
+                    .split(
+                        offsets=[
+                            local_idx * ffn_b_pack_elem_count
+                            for local_idx in range(chunk_size)
+                        ],
+                        obj_types=[ffn_b_ty] * chunk_size,
+                        names=[
+                            "memBUp" if branch_idx == 0 else f"memBUp{branch_idx}"
+                            for branch_idx in chunk_branches
+                        ],
+                        dims_to_stream=[b_dims] * chunk_size,
+                        depths=[ffn_weight_fifo_depth] * chunk_size,
+                        placement=Tile(col=ffn_bup_split_mem_tile_cols[-1], row=1),
+                    )
                 )
-            )
-            memBUp[branch_idx] = (
-                inBUp[branch_idx]
-                .cons()
-                .forward(
-                    obj_type=ffn_b_ty,
-                    name="memBUp" if branch_idx == 0 else f"memBUp{branch_idx}",
-                    dims_to_stream=b_dims,
-                    depth=ffn_weight_fifo_depth,
-                    placement=Tile(col=ffn_bup_mem_tile_cols[branch_idx], row=1),
+                for local_idx, branch_idx in enumerate(chunk_branches):
+                    memBUp[branch_idx] = mem_bup_chunk[local_idx]
+        else:
+            for branch_idx in range(effective_ffn_branches):
+                inBUp.append(
+                    ObjectFifo(
+                        ffn_b_ty,
+                        name="inBUp" if branch_idx == 0 else f"inBUp{branch_idx}",
+                        depth=ffn_weight_fifo_depth,
+                    )
                 )
-            )
+                memBUp[branch_idx] = (
+                    inBUp[branch_idx]
+                    .cons()
+                    .forward(
+                        obj_type=ffn_b_ty,
+                        name="memBUp" if branch_idx == 0 else f"memBUp{branch_idx}",
+                        dims_to_stream=b_dims,
+                        depth=ffn_weight_fifo_depth,
+                        placement=Tile(col=ffn_bup_mem_tile_cols[branch_idx], row=1),
+                    )
+                )
 
-    if bdown_split_enabled:
-        for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
-            chunk_size = len(chunk_branches)
-            ffn_b_pack_ty = np.ndarray[
-                (chunk_size * ffn_b_pack_elem_count,),
-                np.dtype[dtype],
-            ]
-            inBDown.append(
-                ObjectFifo(
-                    ffn_b_pack_ty,
-                    name="inBDown" if chunk_idx == 0 else f"inBDownPack{chunk_idx}",
-                    depth=ffn_weight_split_parent_depth,
+    if need_bdown_weights:
+        if bdown_split_enabled:
+            for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
+                chunk_size = len(chunk_branches)
+                ffn_b_pack_ty = np.ndarray[
+                    (chunk_size * ffn_b_pack_elem_count,),
+                    np.dtype[dtype],
+                ]
+                inBDown.append(
+                    ObjectFifo(
+                        ffn_b_pack_ty,
+                        name="inBDown" if chunk_idx == 0 else f"inBDownPack{chunk_idx}",
+                        depth=ffn_weight_split_parent_depth,
+                    )
                 )
-            )
-            ffn_bdown_split_mem_tile_cols.append(
-                ffn_bdown_mem_tile_cols[chunk_branches[0]]
-            )
-            mem_bdown_chunk = (
-                inBDown[-1]
-                .cons()
-                .split(
-                    offsets=[
-                        local_idx * ffn_b_pack_elem_count
-                        for local_idx in range(chunk_size)
-                    ],
-                    obj_types=[ffn_b_ty] * chunk_size,
-                    names=[
-                        "memBDown" if branch_idx == 0 else f"memBDown{branch_idx}"
-                        for branch_idx in chunk_branches
-                    ],
-                    dims_to_stream=[b_dims] * chunk_size,
-                    depths=[ffn_weight_fifo_depth] * chunk_size,
-                    placement=Tile(col=ffn_bdown_split_mem_tile_cols[-1], row=1),
+                ffn_bdown_split_mem_tile_cols.append(
+                    ffn_bdown_mem_tile_cols[chunk_branches[0]]
                 )
-            )
-            for local_idx, branch_idx in enumerate(chunk_branches):
-                memBDown[branch_idx] = mem_bdown_chunk[local_idx]
-    else:
-        for branch_idx in range(effective_ffn_branches):
-            inBDown.append(
-                ObjectFifo(
-                    ffn_b_ty,
-                    name="inBDown" if branch_idx == 0 else f"inBDown{branch_idx}",
-                    depth=ffn_weight_fifo_depth,
+                mem_bdown_chunk = (
+                    inBDown[-1]
+                    .cons()
+                    .split(
+                        offsets=[
+                            local_idx * ffn_b_pack_elem_count
+                            for local_idx in range(chunk_size)
+                        ],
+                        obj_types=[ffn_b_ty] * chunk_size,
+                        names=[
+                            "memBDown" if branch_idx == 0 else f"memBDown{branch_idx}"
+                            for branch_idx in chunk_branches
+                        ],
+                        dims_to_stream=[b_dims] * chunk_size,
+                        depths=[ffn_weight_fifo_depth] * chunk_size,
+                        placement=Tile(col=ffn_bdown_split_mem_tile_cols[-1], row=1),
+                    )
                 )
-            )
-            memBDown[branch_idx] = (
-                inBDown[branch_idx]
-                .cons()
-                .forward(
-                    obj_type=ffn_b_ty,
-                    name="memBDown" if branch_idx == 0 else f"memBDown{branch_idx}",
-                    dims_to_stream=b_dims,
-                    depth=ffn_weight_fifo_depth,
-                    placement=Tile(col=ffn_bdown_mem_tile_cols[branch_idx], row=1),
+                for local_idx, branch_idx in enumerate(chunk_branches):
+                    memBDown[branch_idx] = mem_bdown_chunk[local_idx]
+        else:
+            for branch_idx in range(effective_ffn_branches):
+                inBDown.append(
+                    ObjectFifo(
+                        ffn_b_ty,
+                        name="inBDown" if branch_idx == 0 else f"inBDown{branch_idx}",
+                        depth=ffn_weight_fifo_depth,
+                    )
                 )
-            )
-    if any(fifo is None for fifo in memBUp) or any(fifo is None for fifo in memBDown):
+                memBDown[branch_idx] = (
+                    inBDown[branch_idx]
+                    .cons()
+                    .forward(
+                        obj_type=ffn_b_ty,
+                        name="memBDown" if branch_idx == 0 else f"memBDown{branch_idx}",
+                        dims_to_stream=b_dims,
+                        depth=ffn_weight_fifo_depth,
+                        placement=Tile(col=ffn_bdown_mem_tile_cols[branch_idx], row=1),
+                    )
+                )
+    if (need_bup_weights and any(fifo is None for fifo in memBUp)) or (
+        need_bdown_weights and any(fifo is None for fifo in memBDown)
+    ):
         raise ValueError("FFN B-weight FIFO assignment is incomplete")
+    inBUpProd = [fifo.prod() for fifo in inBUp] if need_bup_weights else []
+    inBDownProd = [fifo.prod() for fifo in inBDown] if need_bdown_weights else []
 
     # FFN internal pipelines and final encoder output
     ffnUpOut = []
-    ffnDownPart = []
-    ffnDownAccum = []
+    ffnDownPart = [None] * effective_ffn_branches
+    ffnDownAccum = [None] * effective_ffn_branches
     ffn_down_acc_mem_tile_cols = ln1_mode_hooks.adjust_ffn_down_acc_mem_tile_cols(
         ffn_down_acc_mem_tile_cols=list(branch_stage_cols[:effective_ffn_branches]),
         effective_ffn_branches=effective_ffn_branches,
@@ -2041,6 +2149,14 @@ def fused_mha(
         "FFN down-acc memtile columns: %s",
         ffn_down_acc_mem_tile_cols,
     )
+    if ffn_down_acc_grouping_enabled:
+        logging.info(
+            "FFN down accumulation grouping: ranges=%s stage_branches=%s max_group_size=%d partner_map=%s",
+            ffn_down_acc_group_ranges,
+            ffn_down_group_stage_branches,
+            ffn_down_acc_group_size,
+            ffn_down_group_partner_srcs_by_stage,
+        )
     for branch_idx in range(effective_ffn_branches):
         ffn_up_out_depth = 1 if emb_tile >= 128 else 2
         ffnUpOut.append(
@@ -2050,16 +2166,16 @@ def fused_mha(
                 depth=ffn_up_out_depth,
             )
         )
+        if branch_idx not in ffn_down_group_stage_set:
+            continue
         # Keep FFN-down accumulation in mem tile FIFO(s) so down-proj core L1 stays
         # within limits while replaying for LN2's two-pass consumption.
-        ffnDownPart.append(
-            ObjectFifo(
-                o_ty,
-                name="ffnDownPart" if branch_idx == 0 else f"ffnDownPart{branch_idx}",
-                depth=1,
-            )
+        ffnDownPart[branch_idx] = ObjectFifo(
+            o_ty,
+            name="ffnDownPart" if branch_idx == 0 else f"ffnDownPart{branch_idx}",
+            depth=1,
         )
-        ffnDownAccum.append(
+        ffnDownAccum[branch_idx] = (
             ffnDownPart[branch_idx]
             .cons(depth=proj_acc_depth)
             .forward(
@@ -2082,6 +2198,13 @@ def fused_mha(
         "ENCODER_STAGE_FFN_REDUCE_VIA_MEMTILE",
         False,
     )
+    ffnDownGroupPartial = [None] * effective_ffn_branches
+    for src_branch_idx, _stage_branch_idx in ffn_down_group_stage_by_src.items():
+        ffnDownGroupPartial[src_branch_idx] = ObjectFifo(
+            o_ty,
+            name=f"ffnDownGroup{src_branch_idx}",
+            depth=ffn_down_reduce_depth,
+        )
     ffnDownReduce = []
     ffnDownReduceSrc = []
     ffnDownReducePart = []
@@ -2417,17 +2540,24 @@ def fused_mha(
         of_o_acc_in,
         of_o_acc_out,
         of_o_out,
+        of_o_row_store_parts,
         buffer_to_reduce,
         group_reduce_in,
         group_reduce_out,
         partial_o_scratch,
         zero_o_scratch,
+        stats_sum_buf,
+        stats_sumsq_buf,
+        zero_f32,
+        calc_sum_sumsq,
+        pack_stats,
         zero,
         matmul,
         add,
         copy,
         is_group_staging_core,
         emit_final_output,
+        emit_ln1_stats,
         use_grouped_chain,
         core_idx,
     ):
@@ -2452,6 +2582,9 @@ def fused_mha(
             if not use_grouped_chain:
                 # Baseline O-proj flow: each core accumulates in memtile, then
                 # a stage-level chain reduces to the LN1 input.
+                if emit_ln1_stats:
+                    zero_f32(stats_sum_buf, seq_tile)
+                    zero_f32(stats_sumsq_buf, seq_tile)
                 for _ in range_(proj_acc_depth):
                     elem_out_o_acc = of_o_acc_out.acquire(1)
                     zero(elem_out_o_acc)
@@ -2469,7 +2602,12 @@ def fused_mha(
                         of_o_acc_in.release(1)
                     of_o_in.release(1)
 
-                for _ in range_(proj_acc_depth):
+                tile_indices = (
+                    range(proj_acc_depth)
+                    if of_o_row_store_parts is not None
+                    else range_(proj_acc_depth)
+                )
+                for tile_idx in tile_indices:
                     elem_in_o_acc = of_o_acc_in.acquire(1)
                     if buffer_to_reduce:
                         partial_o_acc = buffer_to_reduce.acquire(1)
@@ -2480,9 +2618,20 @@ def fused_mha(
                             seq_tile * emb_tile,
                         )
                         buffer_to_reduce.release(1)
-                    elem_out_o = of_o_out.acquire(1)
-                    copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                    if emit_ln1_stats:
+                        calc_sum_sumsq(elem_in_o_acc, stats_sum_buf, stats_sumsq_buf)
+                    if of_o_row_store_parts is not None:
+                        elem_out_o = of_o_row_store_parts[tile_idx].acquire(1)
+                        copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                        of_o_row_store_parts[tile_idx].release(1)
+                    else:
+                        elem_out_o = of_o_out.acquire(1)
+                        copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                        of_o_out.release(1)
                     of_o_acc_in.release(1)
+                if emit_ln1_stats:
+                    elem_stats_pkt = of_o_out.acquire(1)
+                    pack_stats(stats_sum_buf, stats_sumsq_buf, elem_stats_pkt, seq_tile)
                     of_o_out.release(1)
             else:
                 # Grouped flow:
@@ -2496,6 +2645,9 @@ def fused_mha(
                 local_has_output = group_pos < (o_proj_acc_group_size - 1)
                 global_has_input = group_idx > 0
                 global_has_output = group_reduce_out is not None
+                if emit_ln1_stats:
+                    zero_f32(stats_sum_buf, seq_tile)
+                    zero_f32(stats_sumsq_buf, seq_tile)
                 zero(zero_o_scratch)
                 if is_group_staging_core:
                     for _ in range_(proj_acc_depth):
@@ -2548,7 +2700,12 @@ def fused_mha(
                 # Cross-group reduction after local group accumulation.
                 # Stage cores provide local staged results, while non-stage
                 # cores in later groups pass through global reductions.
-                for _ in range_(proj_acc_depth):
+                tile_indices = (
+                    range(proj_acc_depth)
+                    if of_o_row_store_parts is not None
+                    else range_(proj_acc_depth)
+                )
+                for tile_idx in tile_indices:
                     if is_group_staging_core:
                         elem_in_o_acc = of_o_acc_in.acquire(1)
                         if global_has_input:
@@ -2566,9 +2723,18 @@ def fused_mha(
                             )
                             group_reduce_in.release(1)
                         if emit_final_output:
-                            elem_out_o = of_o_out.acquire(1)
-                            copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
-                            of_o_out.release(1)
+                            if emit_ln1_stats:
+                                calc_sum_sumsq(
+                                    elem_in_o_acc, stats_sum_buf, stats_sumsq_buf
+                                )
+                            if of_o_row_store_parts is not None:
+                                elem_out_o = of_o_row_store_parts[tile_idx].acquire(1)
+                                copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                                of_o_row_store_parts[tile_idx].release(1)
+                            else:
+                                elem_out_o = of_o_out.acquire(1)
+                                copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                                of_o_out.release(1)
                         else:
                             if not global_has_output:
                                 raise ValueError(
@@ -2593,6 +2759,10 @@ def fused_mha(
                         copy(elem_group, elem_group_out, seq_tile * emb_tile)
                         group_reduce_out.release(1)
                         group_reduce_in.release(1)
+                if emit_ln1_stats:
+                    elem_stats_pkt = of_o_out.acquire(1)
+                    pack_stats(stats_sum_buf, stats_sumsq_buf, elem_stats_pkt, seq_tile)
+                    of_o_out.release(1)
 
     def core_fn_ln1_norm(
         of_in_o_proj,
@@ -2601,9 +2771,9 @@ def fused_mha(
         sum_buf,
         sumsq_buf,
         of_out_norm,
-        norm_scratch,
         fused_layer_norm,
         calc_sum_sumsq,
+        unpack_stats,
         zero_f32,
         copy,
         addnorm1_mode,
@@ -2611,41 +2781,61 @@ def fused_mha(
     ):
         # Mirror down-proj style stage-only semantics: if this stage is not active,
         # keep FIFO traffic/replay shape but bypass heavy LN statistics/math.
-        ln1_norm_compute_enabled = (stage_only in [None, 4]) and (addnorm1_mode == -1)
+        ln1_norm_compute_enabled = (stage_only in (None, 4, 5)) and (
+            addnorm1_mode == -1
+        )
+        use_packed_ln1_stats = ln1_norm_compute_enabled and (emb_tile >= 2 * seq_tile)
+
         for _ in range_(sys.maxsize):
-            if ln1_norm_compute_enabled:
+            if ln1_norm_compute_enabled and not use_packed_ln1_stats:
                 zero_f32(sum_buf, seq_tile)
                 zero_f32(sumsq_buf, seq_tile)
             # Pass 1 on raw O-proj output: accumulate row-wise statistics and seed replay FIFO.
             for _ in range_(ln_tiles_per_q_block):
                 elem_in = of_in_o_proj.acquire(1)
-                if ln1_norm_compute_enabled:
+                if ln1_norm_compute_enabled and not use_packed_ln1_stats:
                     calc_sum_sumsq(elem_in, sum_buf, sumsq_buf)
                 elem_replay = of_replay_new.acquire(1)
                 copy(elem_in, elem_replay, seq_tile * emb_tile)
                 of_replay_new.release(1)
                 of_in_o_proj.release(1)
+            if use_packed_ln1_stats:
+                elem_stats_pkt = of_in_o_proj.acquire(1)
+                unpack_stats(elem_stats_pkt, sum_buf, sumsq_buf, seq_tile)
+                of_in_o_proj.release(1)
             # Pass 2: emit normalized tiles in FFN-group-major order.
             # Compute LN once per tile, then replay normalized tiles for later groups.
             for _ in range_(ln_tiles_per_q_block):
                 elem_in = of_replay_curr.acquire(1)
-                if ln1_norm_compute_enabled:
-                    fused_layer_norm(
-                        elem_in,
-                        sum_buf,
-                        sumsq_buf,
-                        norm_scratch,
-                        embed_sz,
-                    )
-                else:
-                    copy(elem_in, norm_scratch, seq_tile * emb_tile)
-                elem_out_norm = of_out_norm.acquire(1)
-                copy(norm_scratch, elem_out_norm, seq_tile * emb_tile)
-                of_out_norm.release(1)
                 if ln1_broadcast_groups > 1:
                     elem_replay = of_replay_new.acquire(1)
-                    copy(norm_scratch, elem_replay, seq_tile * emb_tile)
+                    if ln1_norm_compute_enabled:
+                        fused_layer_norm(
+                            elem_in,
+                            sum_buf,
+                            sumsq_buf,
+                            elem_replay,
+                            embed_sz,
+                        )
+                    else:
+                        copy(elem_in, elem_replay, seq_tile * emb_tile)
+                    elem_out_norm = of_out_norm.acquire(1)
+                    copy(elem_replay, elem_out_norm, seq_tile * emb_tile)
+                    of_out_norm.release(1)
                     of_replay_new.release(1)
+                else:
+                    elem_out_norm = of_out_norm.acquire(1)
+                    if ln1_norm_compute_enabled:
+                        fused_layer_norm(
+                            elem_in,
+                            sum_buf,
+                            sumsq_buf,
+                            elem_out_norm,
+                            embed_sz,
+                        )
+                    else:
+                        copy(elem_in, elem_out_norm, seq_tile * emb_tile)
+                    of_out_norm.release(1)
                 of_replay_curr.release(1)
             if ln1_broadcast_groups > 2:
                 for _ in range_(ln1_broadcast_groups - 2):
@@ -2675,9 +2865,13 @@ def fused_mha(
         ln_mul_add,
         copy,
         addnorm1_mode,
+        stage_only,
         up_group_count,
         consume_group_count,
     ):
+        ln1_post_compute_enabled = (stage_only in (None, 4, 6)) and (
+            addnorm1_mode == -1
+        )
         for _ in range_(sys.maxsize):
             # Group 0.
             for col_idx in range_(ln_tiles_per_q_block):
@@ -2685,11 +2879,11 @@ def fused_mha(
                 elem_in1 = of_in_norm.acquire(1)
                 elem_in2 = of_in_residual.acquire(1)
                 elem_out_up = of_out_up.acquire(1)
-                if addnorm1_mode == 0:
+                if stage_only == 5 or addnorm1_mode == 0:
                     copy(elem_in1, elem_out_up, seq_tile * emb_tile)
                 elif addnorm1_mode == 1:
                     copy(elem_in2, elem_out_up, seq_tile * emb_tile)
-                else:
+                elif ln1_post_compute_enabled:
                     ln_mul_add(
                         elem_in1,
                         elem_in2,
@@ -2697,6 +2891,8 @@ def fused_mha(
                         elem_out_up,
                         col_i32,
                     )
+                else:
+                    copy(elem_in1, elem_out_up, seq_tile * emb_tile)
                 if of_out_residual:
                     elem_out_res = of_out_residual.acquire(1)
                     copy(elem_out_up, elem_out_res, seq_tile * emb_tile)
@@ -2710,11 +2906,11 @@ def fused_mha(
                     elem_in1 = of_in_norm.acquire(1)
                     elem_in2 = of_in_residual.acquire(1)
                     elem_out_up = of_out_up.acquire(1)
-                    if addnorm1_mode == 0:
+                    if stage_only == 5 or addnorm1_mode == 0:
                         copy(elem_in1, elem_out_up, seq_tile * emb_tile)
                     elif addnorm1_mode == 1:
                         copy(elem_in2, elem_out_up, seq_tile * emb_tile)
-                    else:
+                    elif ln1_post_compute_enabled:
                         ln_mul_add(
                             elem_in1,
                             elem_in2,
@@ -2722,6 +2918,8 @@ def fused_mha(
                             elem_out_up,
                             col_i32,
                         )
+                    else:
+                        copy(elem_in1, elem_out_up, seq_tile * emb_tile)
                     of_out_up.release(1)
                     of_in_norm.release(1)
                     of_in_residual.release(1)
@@ -2760,31 +2958,37 @@ def fused_mha(
                 group_idx_i32 = index.casts(T.i32(), group_idx)
                 with if_(group_idx_i32 < group_count) as if_group_produces:
                     elem_out_matmul = of_out_c.acquire(1)
-                    for acc_idx in range_(proj_acc_depth):
-                        elem_in_a = of_in_a_curr.acquire(1)
-                        if of_out_residual:
-                            with if_(group_idx_i32 == 0):
-                                elem_out_res = of_out_residual.acquire(1)
-                                copy(elem_in_a, elem_out_res, seq_tile * emb_tile)
-                                of_out_residual.release(1)
-                        elem_in_b = of_in_b.acquire(1)
-                        acc_idx_i32 = index.casts(T.i32(), acc_idx)
-                        if use_init_matmul:
-                            with if_(acc_idx_i32 == 0) as if_first_acc:
-                                if up_enabled:
+                    if up_enabled:
+                        for acc_idx in range_(proj_acc_depth):
+                            elem_in_a = of_in_a_curr.acquire(1)
+                            if of_out_residual:
+                                with if_(group_idx_i32 == 0):
+                                    elem_out_res = of_out_residual.acquire(1)
+                                    copy(elem_in_a, elem_out_res, seq_tile * emb_tile)
+                                    of_out_residual.release(1)
+                            elem_in_b = of_in_b.acquire(1)
+                            acc_idx_i32 = index.casts(T.i32(), acc_idx)
+                            if use_init_matmul:
+                                with if_(acc_idx_i32 == 0) as if_first_acc:
                                     matmul_init(elem_in_a, elem_in_b, elem_out_matmul)
-                                else:
-                                    zero(elem_out_matmul)
-                            with else_(if_first_acc):
-                                if up_enabled:
+                                with else_(if_first_acc):
                                     matmul(elem_in_a, elem_in_b, elem_out_matmul)
-                        else:
-                            with if_(acc_idx_i32 == 0):
-                                zero(elem_out_matmul)
-                            if up_enabled:
+                            else:
+                                with if_(acc_idx_i32 == 0):
+                                    zero(elem_out_matmul)
                                 matmul(elem_in_a, elem_in_b, elem_out_matmul)
-                        of_in_b.release(1)
-                        of_in_a_curr.release(1)
+                            of_in_b.release(1)
+                            of_in_a_curr.release(1)
+                    else:
+                        zero(elem_out_matmul)
+                        for _ in range_(proj_acc_depth):
+                            elem_in_a = of_in_a_curr.acquire(1)
+                            if of_out_residual:
+                                with if_(group_idx_i32 == 0):
+                                    elem_out_res = of_out_residual.acquire(1)
+                                    copy(elem_in_a, elem_out_res, seq_tile * emb_tile)
+                                    of_out_residual.release(1)
+                            of_in_a_curr.release(1)
                     if up_enabled and gelu:
                         gelu(elem_out_matmul, elem_out_matmul, seq_tile * emb_tile)
                     of_out_c.release(1)
@@ -2814,40 +3018,155 @@ def fused_mha(
         is_final_branch,
         stage_only,
         emit_replay_pass,
+        of_group_partial_in0,
+        partner_group_count0,
+        of_group_partial_in1,
+        partner_group_count1,
+        of_group_partial_out,
     ):
         down_enabled = stage_only in (1, None)
+        grouped_leaf_mode = of_group_partial_out is not None
+        grouped_stage_mode = (
+            of_curr_acc is not None
+            and of_new_acc is not None
+            and (
+                (of_group_partial_in0 is not None and partner_group_count0 > 0)
+                or (of_group_partial_in1 is not None and partner_group_count1 > 0)
+            )
+        )
+        partner_inputs = [
+            (partner_fifo, partner_count)
+            for partner_fifo, partner_count in (
+                (of_group_partial_in0, partner_group_count0),
+                (of_group_partial_in1, partner_group_count1),
+            )
+            if partner_fifo is not None and partner_count > 0
+        ]
+        if grouped_stage_mode and any(
+            partner_group_count != group_count
+            for _partner_fifo, partner_group_count in partner_inputs
+        ):
+            raise ValueError(
+                "Grouped FFN-down stage requires uniform branch group counts: "
+                f"group_count={group_count} partner_counts="
+                f"{[partner_group_count for _, partner_group_count in partner_inputs]}"
+            )
+
         for _ in range_(sys.maxsize):
             if group_count <= 0:
                 continue
 
-            # First FFN-down group seeds the accumulator directly.
-            elem_in_a = of_in_a.acquire(1)
-            for _ in range_(proj_acc_depth):
-                elem_in_b = of_in_b.acquire(1)
-                elem_new_acc = of_new_acc.acquire(1)
-                if down_enabled:
-                    matmul_init(elem_in_a, elem_in_b, elem_new_acc)
-                else:
-                    zero(elem_new_acc)
-                of_in_b.release(1)
-                of_new_acc.release(1)
-            of_in_a.release(1)
+            if grouped_leaf_mode:
+                for _ in range_(group_count):
+                    elem_in_a = of_in_a.acquire(1)
+                    for _ in range_(proj_acc_depth):
+                        elem_partial = of_group_partial_out.acquire(1)
+                        if down_enabled:
+                            elem_in_b = of_in_b.acquire(1)
+                            matmul_init(elem_in_a, elem_in_b, elem_partial)
+                            of_in_b.release(1)
+                        else:
+                            zero(elem_partial)
+                        of_group_partial_out.release(1)
+                    of_in_a.release(1)
+                continue
 
-            # Remaining groups accumulate onto the current partials.
-            for _ in range_(group_count - 1):
+            if grouped_stage_mode:
                 elem_in_a = of_in_a.acquire(1)
                 for _ in range_(proj_acc_depth):
-                    elem_in_b = of_in_b.acquire(1)
-                    elem_curr_acc = of_curr_acc.acquire(1)
                     elem_new_acc = of_new_acc.acquire(1)
+                    if partner_inputs:
+                        elem_partial = partner_inputs[0][0].acquire(1)
+                        copy(elem_partial, elem_new_acc, seq_tile * emb_tile)
+                        partner_inputs[0][0].release(1)
+                        for partner_fifo, _partner_group_count in partner_inputs[1:]:
+                            elem_partial = partner_fifo.acquire(1)
+                            add(
+                                elem_partial,
+                                elem_new_acc,
+                                elem_new_acc,
+                                seq_tile * emb_tile,
+                            )
+                            partner_fifo.release(1)
                     if down_enabled:
-                        matmul(elem_in_a, elem_in_b, elem_curr_acc, elem_new_acc)
+                        elem_in_b = of_in_b.acquire(1)
+                        if partner_inputs:
+                            matmul(elem_in_a, elem_in_b, elem_new_acc, elem_new_acc)
+                        else:
+                            matmul_init(elem_in_a, elem_in_b, elem_new_acc)
+                        of_in_b.release(1)
                     else:
                         zero(elem_new_acc)
-                    of_in_b.release(1)
                     of_new_acc.release(1)
-                    of_curr_acc.release(1)
                 of_in_a.release(1)
+
+                for _ in range_(group_count - 1):
+                    elem_in_a = of_in_a.acquire(1)
+                    for _ in range_(proj_acc_depth):
+                        elem_curr_acc = of_curr_acc.acquire(1)
+                        elem_new_acc = of_new_acc.acquire(1)
+                        if partner_inputs:
+                            elem_partial = partner_inputs[0][0].acquire(1)
+                            copy(elem_partial, elem_new_acc, seq_tile * emb_tile)
+                            partner_inputs[0][0].release(1)
+                            for partner_fifo, _partner_group_count in partner_inputs[
+                                1:
+                            ]:
+                                elem_partial = partner_fifo.acquire(1)
+                                add(
+                                    elem_partial,
+                                    elem_new_acc,
+                                    elem_new_acc,
+                                    seq_tile * emb_tile,
+                                )
+                                partner_fifo.release(1)
+                        if down_enabled:
+                            elem_in_b = of_in_b.acquire(1)
+                            if partner_inputs:
+                                matmul(elem_in_a, elem_in_b, elem_new_acc, elem_new_acc)
+                            else:
+                                matmul_init(elem_in_a, elem_in_b, elem_new_acc)
+                            of_in_b.release(1)
+                        else:
+                            zero(elem_new_acc)
+                        add(
+                            elem_new_acc,
+                            elem_curr_acc,
+                            elem_new_acc,
+                            seq_tile * emb_tile,
+                        )
+                        of_new_acc.release(1)
+                        of_curr_acc.release(1)
+                    of_in_a.release(1)
+            else:
+                # First FFN-down group seeds the accumulator directly.
+                elem_in_a = of_in_a.acquire(1)
+                for _ in range_(proj_acc_depth):
+                    elem_new_acc = of_new_acc.acquire(1)
+                    if down_enabled:
+                        elem_in_b = of_in_b.acquire(1)
+                        matmul_init(elem_in_a, elem_in_b, elem_new_acc)
+                        of_in_b.release(1)
+                    else:
+                        zero(elem_new_acc)
+                    of_new_acc.release(1)
+                of_in_a.release(1)
+
+                # Remaining groups accumulate onto the current partials.
+                for _ in range_(group_count - 1):
+                    elem_in_a = of_in_a.acquire(1)
+                    for _ in range_(proj_acc_depth):
+                        elem_curr_acc = of_curr_acc.acquire(1)
+                        elem_new_acc = of_new_acc.acquire(1)
+                        if down_enabled:
+                            elem_in_b = of_in_b.acquire(1)
+                            matmul(elem_in_a, elem_in_b, elem_curr_acc, elem_new_acc)
+                            of_in_b.release(1)
+                        else:
+                            zero(elem_new_acc)
+                        of_new_acc.release(1)
+                        of_curr_acc.release(1)
+                    of_in_a.release(1)
 
             for _ in range_(proj_acc_depth):
                 # Acquire what's in L2, which is the final accumulated result for the tile.
@@ -3163,6 +3482,7 @@ def fused_mha(
             )
         o_proj_in = outOProj[i].cons()
         o_proj_ow = memOW[i].cons()
+        o_proj_row_store_parts = None
         if is_group_boundary_core:
             stage_order = o_proj_stage_order_by_core[i]
             if o_proj_acc_group_size > 1:
@@ -3176,6 +3496,12 @@ def fused_mha(
                 o_proj_reduce_in = None
                 emit_final_output = i == (parallel_heads - 1)
                 o_proj_output = outOProjInput.prod() if emit_final_output else None
+                emit_ln1_stats = (
+                    emit_final_output
+                    and (ffn_stage_only in (None, 4, 5))
+                    and (addnorm1_debug_mode == -1)
+                    and (emb_tile >= 2 * seq_tile)
+                )
             else:
                 o_proj_acc_in = outOProjAccumIn[i].cons(depth=1)
                 o_proj_acc_out = outOProjAccumOut[i].prod()
@@ -3184,11 +3510,16 @@ def fused_mha(
                     outOPart[stage_order - 1].cons() if stage_order > 0 else None
                 )
                 emit_final_output = True
-                o_proj_output = (
-                    outOPart[stage_order].prod()
-                    if stage_order < num_o_proj_acc_groups - 1
-                    else outOProjInput.prod()
+                emit_ln1_stats = (
+                    stage_order == (num_o_proj_acc_groups - 1)
+                    and (ffn_stage_only in (None, 4, 5))
+                    and (addnorm1_debug_mode == -1)
+                    and (emb_tile >= 2 * seq_tile)
                 )
+                if stage_order < num_o_proj_acc_groups - 1:
+                    o_proj_output = outOPart[stage_order].prod()
+                else:
+                    o_proj_output = outOProjInput.prod()
         else:
             stage_order = -1
             o_proj_acc_in = None
@@ -3196,37 +3527,53 @@ def fused_mha(
             o_proj_group_out = group_reduce_out
             o_proj_reduce_in = None
             emit_final_output = False
+            emit_ln1_stats = False
             o_proj_output = None
+            o_proj_row_store_parts = None
         o_proj_partial_scratch = Buffer(type=o_ty, name=f"o_proj_partial_scratch_{i}")
         o_proj_zero_scratch = Buffer(type=o_ty, name=f"o_proj_zero_scratch_{i}")
-        o_proj_workers.append(
-            Worker(
-                matmul_o_proj,
-                fn_args=[
-                    o_proj_in,
-                    o_proj_ow,
-                    o_proj_acc_in,
-                    o_proj_acc_out,
-                    o_proj_output,
-                    o_proj_reduce_in,
-                    group_reduce_in,
-                    o_proj_group_out,
-                    o_proj_partial_scratch,
-                    o_proj_zero_scratch,
-                    zero_kernel_o_proj,
-                    matmul_kernel_o_proj,
-                    eltwise_add_vector,
-                    mem_copy_o_proj,
-                    is_group_accum_core,
-                    emit_final_output,
-                    o_proj_acc_group_size > 1,
-                    i,
-                ],
-                stack_size=0xD00,
-                placement=Tile(col=i, row=5),
-                while_true=False,
-            )
+        o_proj_stats_sum_buffer = Buffer(type=sum_l1_ty, name=f"o_proj_stats_sum_{i}")
+        o_proj_stats_sumsq_buffer = Buffer(
+            type=sum_l1_ty, name=f"o_proj_stats_sumsq_{i}"
         )
+        o_proj_worker = Worker(
+            matmul_o_proj,
+            fn_args=[
+                o_proj_in,
+                o_proj_ow,
+                o_proj_acc_in,
+                o_proj_acc_out,
+                o_proj_output,
+                o_proj_row_store_parts,
+                o_proj_reduce_in,
+                group_reduce_in,
+                o_proj_group_out,
+                o_proj_partial_scratch,
+                o_proj_zero_scratch,
+                o_proj_stats_sum_buffer,
+                o_proj_stats_sumsq_buffer,
+                ln_zero_f32_kernel,
+                ln_calc_sum_sumsq_kernel,
+                convert_stats_to_packet_kernel,
+                zero_kernel_o_proj,
+                matmul_kernel_o_proj,
+                eltwise_add_vector,
+                mem_copy_o_proj,
+                is_group_accum_core,
+                emit_final_output,
+                emit_ln1_stats,
+                o_proj_acc_group_size > 1,
+                i,
+            ],
+            stack_size=0xD00,
+            placement=Tile(col=i, row=5),
+            while_true=False,
+        )
+        if o_proj_row_store_parts is not None:
+            for handle in o_proj_row_store_parts:
+                handle.endpoint = o_proj_worker
+                o_proj_worker._fifos.append(handle)
+        o_proj_workers.append(o_proj_worker)
         logging.debug(
             "Configured o_proj worker %d with acc_depth=%d "
             "(group=%d pos=%d stage_core=%s stage_order=%d emit_final=%s)",
@@ -3247,7 +3594,6 @@ def fused_mha(
     )
     ln1_norm_sum_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sum_buffer")
     ln1_norm_sumsq_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sumsq_buffer")
-    ln1_norm_scratch = Buffer(type=o_ty, name="ln1_norm_scratch")
 
     ln1_norm_worker = Worker(
         core_fn_ln1_norm,
@@ -3258,9 +3604,9 @@ def fused_mha(
             ln1_norm_sum_buffer,
             ln1_norm_sumsq_buffer,
             ln1Norm.prod(),
-            ln1_norm_scratch,
             ln_fused_layer_norm_kernel,
             ln_calc_sum_sumsq_kernel,
+            convert_packet_to_stats_kernel,
             ln_zero_f32_kernel,
             mem_copy_o_proj,
             addnorm1_debug_mode,
@@ -3280,6 +3626,7 @@ def fused_mha(
             ln_mul_add_kernel,
             mem_copy_o_proj,
             addnorm1_debug_mode,
+            ffn_stage_only,
             ln1_broadcast_groups,
             ln1_broadcast_groups,
         ],
@@ -3296,7 +3643,7 @@ def fused_mha(
     for branch_idx in range(effective_ffn_branches):
         ffn_up_worker_args = [
             memOutLNCons[branch_idx],
-            memBUp[branch_idx].cons(),
+            memBUp[branch_idx].cons() if memBUp[branch_idx] is not None else None,
             ffnUpOut[branch_idx].prod(),
             None,
             ffn_zero_kernel_up_proj,
@@ -3324,30 +3671,61 @@ def fused_mha(
 
     ffn_down_workers = []
     for branch_idx in range(effective_ffn_branches):
-        reduce_in_src_branch = ffn_reduce_in_by_branch.get(branch_idx)
-        reduce_in = (
-            ffnDownReduce[ffn_reduction_link_idx_by_src[reduce_in_src_branch]].cons()
-            if reduce_in_src_branch is not None
+        group_partner_srcs = ffn_down_group_partner_srcs_by_stage.get(branch_idx, [])
+        group_partner_in0 = (
+            ffnDownGroupPartial[group_partner_srcs[0]].cons()
+            if len(group_partner_srcs) > 0
             else None
         )
-        output_stream_idx = ffn_down_output_stream_idx_by_branch.get(branch_idx)
-        is_output_branch = output_stream_idx is not None
-        if is_output_branch:
-            reduce_out = ffnDownOut[output_stream_idx].prod(ffn_down_out_depth)
+        group_partner_in1 = (
+            ffnDownGroupPartial[group_partner_srcs[1]].cons()
+            if len(group_partner_srcs) > 1
+            else None
+        )
+        group_partial_out = (
+            ffnDownGroupPartial[branch_idx].prod()
+            if branch_idx in ffn_down_group_stage_by_src
+            else None
+        )
+        if branch_idx in ffn_down_group_stage_set:
+            reduce_in_src_branch = ffn_reduce_in_by_branch.get(branch_idx)
+            reduce_in = (
+                ffnDownReduce[
+                    ffn_reduction_link_idx_by_src[reduce_in_src_branch]
+                ].cons()
+                if reduce_in_src_branch is not None
+                else None
+            )
+            output_stream_idx = ffn_down_output_stream_idx_by_branch.get(branch_idx)
+            is_output_branch = output_stream_idx is not None
+            if is_output_branch:
+                reduce_out = ffnDownOut[output_stream_idx].prod(ffn_down_out_depth)
+            else:
+                reduce_out_link_idx = ffn_reduction_link_idx_by_src.get(branch_idx)
+                if reduce_out_link_idx is None:
+                    raise ValueError(
+                        "FFN down stage branch has neither reduction output nor LN2 output stream: "
+                        f"branch={branch_idx} edges={ffn_reduction_edges} "
+                        f"ln2_output_branches={ffn_down_output_branches}"
+                    )
+                reduce_out = ffnDownReduceSrc[reduce_out_link_idx].prod()
         else:
-            reduce_out_link_idx = ffn_reduction_link_idx_by_src.get(branch_idx)
-            if reduce_out_link_idx is None:
-                raise ValueError(
-                    "FFN down branch has neither reduction output nor LN2 output stream: "
-                    f"branch={branch_idx} edges={ffn_reduction_edges} "
-                    f"ln2_output_branches={ffn_down_output_branches}"
-                )
-            reduce_out = ffnDownReduceSrc[reduce_out_link_idx].prod()
+            reduce_in = None
+            reduce_out = None
+            is_output_branch = False
         ffn_down_worker_args = [
             ffnUpOut[branch_idx].cons(),
-            memBDown[branch_idx].cons(),
-            ffnDownAccum[branch_idx].cons(depth=1),
-            ffnDownPart[branch_idx].prod(),
+            memBDown[branch_idx].cons() if memBDown[branch_idx] is not None else None,
+            (
+                ffnDownAccum[branch_idx].cons(depth=1)
+                if ffnDownAccum[branch_idx] is not None
+                else None
+            ),
+            (
+                ffnDownPart[branch_idx].prod()
+                if ffnDownPart[branch_idx] is not None
+                else None
+            ),
             reduce_out,
             ffn_zero_kernel_down_proj,
             ffn_matmul_init_kernel_down_proj,
@@ -3359,6 +3737,19 @@ def fused_mha(
             is_output_branch,
             ffn_stage_only,
             emit_ln2_replay_from_down and is_output_branch,
+            group_partner_in0,
+            (
+                ffn_col_group_counts[group_partner_srcs[0]]
+                if len(group_partner_srcs) > 0
+                else 0
+            ),
+            group_partner_in1,
+            (
+                ffn_col_group_counts[group_partner_srcs[1]]
+                if len(group_partner_srcs) > 1
+                else 0
+            ),
+            group_partial_out,
         ]
         ffn_down_workers.append(
             Worker(
@@ -3581,9 +3972,6 @@ def fused_mha(
     R_tiles = retarget_tas(
         r_tiles_base, or_tensor_shape, offset_delta=seq_len * embed_sz
     )
-    # LN1 mul+add consumes residual in FFN-group-major order:
-    # [group][proj-acc-col]. Expand leading repeat dimension (stride=0) so
-    # each residual col tile is replayed once per FFN column group.
     for tile in R_tiles:
         if len(tile._sizes) < 1:
             raise ValueError(f"Unexpected R tile rank for replay: {tile._sizes}")
@@ -4125,7 +4513,9 @@ def fused_mha(
         def schedule_ffn_weight_fills(task_group, col_group_idx):
             # Fill all B_Up streams first so every FFN-up branch can start
             # before B_Down transfers contend for shim/memtile bandwidth.
-            if bup_split_enabled:
+            schedule_bup = ffn_stage_only in (None, 0)
+            schedule_bdown = ffn_stage_only in (None, 1)
+            if schedule_bup and bup_split_enabled:
                 bup_chunk_order = (
                     list(range(len(branch_split_chunks) - 1, -1, -1))
                     if fill_bup_reverse
@@ -4140,7 +4530,7 @@ def fused_mha(
                             col_group_idx * chunk_group_count + local_group_idx
                         ]
                         rt.fill(
-                            inBUp[chunk_idx].prod(),
+                            inBUpProd[chunk_idx],
                             B_Up,
                             tap=b_up_tap,
                             placement=Tile(
@@ -4149,7 +4539,7 @@ def fused_mha(
                             task_group=task_group,
                             wait=wait_ffn_weight_fill,
                         )
-            else:
+            elif schedule_bup:
                 bup_branch_order = (
                     list(range(effective_ffn_branches - 1, -1, -1))
                     if fill_bup_reverse
@@ -4166,7 +4556,7 @@ def fused_mha(
                         )
                         if first_tap is not None:
                             rt.fill(
-                                inBUp[branch_idx].prod(),
+                                inBUpProd[branch_idx],
                                 B_Up,
                                 tap=first_tap,
                                 placement=Tile(
@@ -4187,7 +4577,7 @@ def fused_mha(
                             b_weight_fill_max_groups,
                         ):
                             rt.fill(
-                                inBUp[branch_idx].prod(),
+                                inBUpProd[branch_idx],
                                 B_Up,
                                 tap=b_up_tap_part,
                                 placement=Tile(
@@ -4207,7 +4597,7 @@ def fused_mha(
                             b_weight_fill_max_groups,
                         ):
                             rt.fill(
-                                inBUp[branch_idx].prod(),
+                                inBUpProd[branch_idx],
                                 B_Up,
                                 tap=b_up_tap_part,
                                 placement=Tile(
@@ -4217,7 +4607,7 @@ def fused_mha(
                                 wait=wait_ffn_weight_fill,
                             )
 
-            if bdown_split_enabled:
+            if schedule_bdown and bdown_split_enabled:
                 bdown_chunk_order = (
                     list(range(len(branch_split_chunks) - 1, -1, -1))
                     if fill_bdown_reverse
@@ -4232,7 +4622,7 @@ def fused_mha(
                             col_group_idx * chunk_group_count + local_group_idx
                         ]
                         rt.fill(
-                            inBDown[chunk_idx].prod(),
+                            inBDownProd[chunk_idx],
                             B_Down,
                             tap=b_down_tap,
                             placement=Tile(
@@ -4242,7 +4632,7 @@ def fused_mha(
                             task_group=task_group,
                             wait=wait_ffn_weight_fill,
                         )
-            else:
+            elif schedule_bdown:
                 bdown_branch_order = (
                     list(range(effective_ffn_branches - 1, -1, -1))
                     if fill_bdown_reverse
@@ -4256,7 +4646,7 @@ def fused_mha(
                         b_weight_fill_max_groups,
                     ):
                         rt.fill(
-                            inBDown[branch_idx].prod(),
+                            inBDownProd[branch_idx],
                             B_Down,
                             tap=b_down_tap_part,
                             placement=Tile(

@@ -32,6 +32,20 @@ def choose_ln1_replay_mem_tile_col(
     return 5
 
 
+def choose_ln2_replay_mem_tile_col(
+    *,
+    parallel_heads,
+    proj_acc_depth,
+    effective_ffn_branches,
+    o_proj_acc_group_size,
+    stage_ln1_to_ddr,
+    default_col,
+):
+    del parallel_heads, proj_acc_depth, effective_ffn_branches
+    del o_proj_acc_group_size, stage_ln1_to_ddr
+    return default_col
+
+
 def plan_branch_stage_configuration(
     *,
     branch_stage_cols,
@@ -109,10 +123,11 @@ def adjust_ffn_down_acc_mem_tile_cols(
         and len(cols) >= 4
         and cols[3] == 7
     ):
-        # Col7 already carries residual/LN2 traffic. Move one FFN down-acc
-        # stream to col6 to reduce BD pressure when B_Down split streams are
-        # also mapped onto col7.
-        cols[3] = 6
+        # In the 4pheads/6pffn/6pacc/2opg memtile topology, col6 already hosts
+        # two B-stream chunks plus one O-proj accumulator stream. Put branch-3's
+        # FFN-down accumulation on col2 instead; col2 still fits this extra
+        # output stream alongside the V fanout and branch-5 accumulator.
+        cols[3] = 2
     return cols
 
 
@@ -156,8 +171,8 @@ def schedule_runtime_tap(
     pending_output_tap_idx,
     **_unused,
 ):
-    rt.finish_task_group(tg)
     schedule_final_output_for_tap(tap_idx)
+    rt.finish_task_group(tg)
     if decouple_tail_fill:
         rt.finish_task_group(tg_tail_fill)
     return pending_ln1_refill_tg, pending_output_tap_idx
@@ -176,6 +191,7 @@ def _hook_namespace():
     return SimpleNamespace(
         ln1_dram_stage_rows=ln1_dram_stage_rows,
         choose_ln1_replay_mem_tile_col=choose_ln1_replay_mem_tile_col,
+        choose_ln2_replay_mem_tile_col=choose_ln2_replay_mem_tile_col,
         plan_branch_stage_configuration=plan_branch_stage_configuration,
         build_ln1_to_ffn_up_path=build_ln1_to_ffn_up_path,
         adjust_ffn_down_acc_mem_tile_cols=adjust_ffn_down_acc_mem_tile_cols,
