@@ -5,7 +5,14 @@ Fused encoder operator: `MHA + AddNorm1 + FFN + AddNorm2`.
 ## What matters
 
 - LN1 and LN2 are both two-pass layer norm stages (full-row statistics are required).
-- LN1 replay now uses `aie.memtile_row_store` with `buffer_count=2` to support steady-state overlap safely.
+- Same-tile full-row staging now uses `aie.memtile_row_store` with `buffer_count=2` where legal:
+  - LN1 replay
+  - LN2 replay in `memtile` mode only for the current stable envelope:
+    `parallel_heads == 4` and `effective_ffn_branches <= 4`
+  - O-proj accumulation staging for the current stable envelope:
+    `parallel_heads <= 4`, with FIFO fallback when no safe memtile slot exists
+  - FFN-down accumulation staging only for `effective_ffn_branches <= 4`, with
+    DDR low-head layouts falling back to FIFO by default
 - `ln1_staging_design="memtile"`: LN1 output is broadcast on-chip to FFN-up branches.
 - `ln1_staging_design="ddr"`: LN1 output is staged through DDR once, then broadcast on-chip.
 - Topology knobs in test IDs: `pheads`, `pffn`, `pacc`, `opg`.
@@ -123,6 +130,16 @@ python operators/encoder_pipeline/profile_debug_modes.py --design memtile --clea
 
 ## Current validated state
 
-- Full `lnstage_memtile` selection: `100 passed, 40 skipped`
-- Full `lnstage_ddr` selection: `115 passed, 40 skipped`
-- These runs were validated after switching LN1 replay to the double-buffered row-store lowering.
+- Targeted row-store control case (`memtile`) passes:
+  - `encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_4pheads_4pffn_8pacc_4opg`
+- Targeted row-store control case (`ddr`) passes:
+  - `encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_4pheads_4pffn_8pacc_4opg`
+- Long-sequence complex subset passes after narrowing row-store usage to the stable envelope:
+  - `105 passed, 190 deselected`
+  - covers `512/1024/2048` for:
+    - `6pheads_2pffn_8pacc_2opg`
+    - `4pheads_4pffn_8pacc_4opg`
+    - `4pheads_6pffn_6pacc_2opg`
+    - `16heads_4096ffn_32qseqtile_64kvtile_128embtile_4pheads_4pffn_8pacc_4opg` (`ddr` only)
+- Re-run broader selections after changing row-store channel maps or adding new row-store sites.
+- The current `64embtile / 12pacc` experiments no longer fail on LN/O-proj/FFN-down row-store staging; the first exposed allocator limit is now the final `memLN2` shim drain.
