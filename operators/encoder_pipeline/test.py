@@ -25,7 +25,16 @@ DEFAULT_TEST_LN1_STAGING_DESIGNS = ("memtile", "ddr")
 
 ENABLE_STAGE_PROFILE_TESTS = False
 DEFAULT_STAGE_PROFILE_CASE = (1024, 64, 12, 3072, 32, 64, 96, 6, 3, 8)
-DEFAULT_STAGE_PROFILE_MODES = ("full", "mha", "an1", "up", "down", "an2")
+DEFAULT_STAGE_PROFILE_MODES = (
+    "full",
+    "mha",
+    "an1",
+    "an1_stats",
+    "an1_post",
+    "up",
+    "down",
+    "an2",
+)
 DEFAULT_STAGE_PROFILE_WARMUP_ITERS = 3
 DEFAULT_STAGE_PROFILE_TIMED_ITERS = 20
 
@@ -34,6 +43,8 @@ _STAGE_PROFILE_SPECS = {
     "full": (-1, "full"),
     "mha": (6, "mha_only"),
     "an1": (7, "addnorm1_only"),
+    "an1_stats": (8, "addnorm1_stats_only"),
+    "an1_post": (9, "addnorm1_post_only"),
     "up": (3, "up_only"),
     "down": (4, "down_only"),
     "an2": (5, "addnorm2_only"),

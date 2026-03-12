@@ -43,6 +43,8 @@ DEBUG_MODE_SPECS: tuple[DebugModeSpec, ...] = (
     DebugModeSpec("addnorm2", 5, True),
     DebugModeSpec("mha", 6, True),
     DebugModeSpec("addnorm1", 7, True),
+    DebugModeSpec("addnorm1_stats", 8, True),
+    DebugModeSpec("addnorm1_post", 9, True),
 )
 
 

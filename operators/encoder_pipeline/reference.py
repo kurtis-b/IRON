@@ -12,6 +12,8 @@ from operators.encoder_pipeline.debug_modes import (
     ADDNORM_DEBUG_INPUT,
     ADDNORM_DEBUG_RESIDUAL,
     DEBUG_ADDNORM1_ONLY,
+    DEBUG_ADDNORM1_POST_ONLY,
+    DEBUG_ADDNORM1_STATS_ONLY,
     DEBUG_FFN_ADDNORM_ONLY,
     DEBUG_FFN_DOWN_ONLY,
     DEBUG_FFN_UP_ONLY,
@@ -37,6 +39,21 @@ def _apply_addnorm(
         bias=None,
     )
     return y + residual
+
+
+def _apply_addnorm_stats_only(x: torch.Tensor, weight: torch.Tensor):
+    return torch.nn.functional.layer_norm(
+        x,
+        normalized_shape=(x.shape[-1],),
+        weight=weight,
+        bias=None,
+    )
+
+
+def _apply_addnorm_post_only(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
+):
+    return x * weight + residual
 
 
 def generate_golden_reference(
@@ -83,6 +100,8 @@ def generate_golden_reference(
         DEBUG_FFN_ADDNORM_ONLY,
         DEBUG_MHA_ONLY,
         DEBUG_ADDNORM1_ONLY,
+        DEBUG_ADDNORM1_STATS_ONLY,
+        DEBUG_ADDNORM1_POST_ONLY,
     ):
         base = torch.eye(max(seq_len, embed_sz), max(seq_len, embed_sz), dtype=dtype)
         q2d = base[:seq_len, :embed_sz]
@@ -129,7 +148,12 @@ def generate_golden_reference(
 
     attn_2d = attn.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     o_proj = torch.matmul(attn_2d, w_o)
-    h1 = _apply_addnorm(o_proj, r1, ln1_w, stage1_mode)
+    if debug == DEBUG_ADDNORM1_STATS_ONLY:
+        h1 = _apply_addnorm_stats_only(o_proj, ln1_w)
+    elif debug == DEBUG_ADDNORM1_POST_ONLY:
+        h1 = _apply_addnorm_post_only(o_proj, r1, ln1_w)
+    else:
+        h1 = _apply_addnorm(o_proj, r1, ln1_w, stage1_mode)
 
     # Stage 2: FFN -> AddNorm2.
     run_up = ffn_stage_only in (None, 0)

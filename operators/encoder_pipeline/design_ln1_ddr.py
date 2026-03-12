@@ -18,7 +18,13 @@ def choose_ln1_replay_mem_tile_col(
     effective_ffn_branches,
     o_proj_acc_group_size=1,
 ):
-    del o_proj_acc_group_size
+    if (
+        parallel_heads == 4
+        and proj_acc_depth >= 8
+        and effective_ffn_branches >= 6
+        and o_proj_acc_group_size > 1
+    ):
+        return 2
     if parallel_heads <= 2 and proj_acc_depth >= 8 and effective_ffn_branches > 1:
         return 1
     if parallel_heads >= 6 and proj_acc_depth >= 6:
@@ -30,6 +36,26 @@ def choose_ln1_replay_mem_tile_col(
             return 3
         return 3
     return 5
+
+
+def choose_ln2_replay_mem_tile_col(
+    *,
+    parallel_heads,
+    proj_acc_depth,
+    effective_ffn_branches,
+    o_proj_acc_group_size,
+    stage_ln1_to_ddr,
+    default_col,
+):
+    if (
+        stage_ln1_to_ddr
+        and parallel_heads == 4
+        and proj_acc_depth >= 8
+        and effective_ffn_branches >= 6
+        and o_proj_acc_group_size > 1
+    ):
+        return 6
+    return default_col
 
 
 def plan_branch_stage_configuration(
@@ -121,6 +147,34 @@ def plan_branch_stage_configuration(
         if alloc_bup_cols is None or alloc_down_cols is None:
             raise ValueError("Missing precomputed FFN weight column allocation")
         branch_bup_cols, branch_down_b_cols = alloc_bup_cols, alloc_down_cols
+
+    low_head_acc6_split_checks = [
+        parallel_heads == 4,
+        proj_acc_depth >= 6,
+        proj_acc_depth < 8,
+        effective_ffn_branches >= 6,
+        bup_split_enabled,
+        bdown_split_enabled,
+        len(branch_split_chunks) == 3,
+        all(len(chunk) == 2 for chunk in branch_split_chunks),
+    ]
+    if all(low_head_acc6_split_checks):
+        # Keep the 6pacc DDR case on the correctness-stable unsplit MHA path.
+        # That leaves:
+        # - Q on col0
+        # - K on col1
+        # - V on col2
+        # - W_O on col3
+        # - residual on col7
+        # - LN1 refill on col6
+        # Use the remaining shim slots exactly once while keeping memtile
+        # output load under control.
+        remap_up_cols = [5, 4, 6]
+        remap_down_cols = [1, 2, 7]
+        for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
+            for branch_idx in chunk_branches:
+                branch_bup_cols[branch_idx] = remap_up_cols[chunk_idx]
+                branch_down_b_cols[branch_idx] = remap_down_cols[chunk_idx]
 
     # In low-head/high-acc 4-branch DDR tails, duplicating B_Up staging on one
     # memtile can push that tile over the 48-BD limit once LN replay and FFN
@@ -225,6 +279,22 @@ def adjust_ffn_down_acc_mem_tile_cols(
     ln1_replay_mem_tile_col,
 ):
     del ln1_replay_mem_tile_col
+    low_head_acc6_checks = [
+        parallel_heads == 4,
+        proj_acc_depth >= 6,
+        proj_acc_depth < 8,
+        effective_ffn_branches >= 6,
+        len(ffn_down_acc_mem_tile_cols) >= 5,
+    ]
+    if all(low_head_acc6_checks):
+        # Keep memtile col2 at its 6-output limit in the unsplit-MHA DDR case:
+        # V already uses 4 outputs on col2, and B_Down chunk 1 adds 2 more.
+        # Move branch-4's FFN-down accumulator stream off col2 and keep the
+        # final branch off col1, which already carries K plus one B_Down chunk.
+        if ffn_down_acc_mem_tile_cols[4] == 2:
+            ffn_down_acc_mem_tile_cols[4] = 0
+        if len(ffn_down_acc_mem_tile_cols) >= 6 and ffn_down_acc_mem_tile_cols[5] == 1:
+            ffn_down_acc_mem_tile_cols[5] = 5
     # For low-head/high-acc DDR topologies with two FFN branches, keeping the
     # second FFN-down accumulation stream on col4 can collide with O-proj
     # accumulation BD allocation on memtile4. Move that second stream to a
@@ -257,7 +327,7 @@ def adjust_ffn_down_acc_mem_tile_cols(
                 if candidate_col not in ffn_down_acc_mem_tile_cols:
                     ffn_down_acc_mem_tile_cols[idx] = candidate_col
                     break
-    if effective_ffn_branches >= 6:
+    if effective_ffn_branches >= 6 and not all(low_head_acc6_checks):
         replacement_col = 1
         if replacement_col in ffn_down_acc_mem_tile_cols[:-1]:
             for candidate_col in (0, 1, 2, 3, 4, 5, 6, 7):
@@ -457,6 +527,7 @@ def _hook_namespace():
     return SimpleNamespace(
         ln1_dram_stage_rows=ln1_dram_stage_rows,
         choose_ln1_replay_mem_tile_col=choose_ln1_replay_mem_tile_col,
+        choose_ln2_replay_mem_tile_col=choose_ln2_replay_mem_tile_col,
         plan_branch_stage_configuration=plan_branch_stage_configuration,
         build_ln1_to_ffn_up_path=build_ln1_to_ffn_up_path,
         adjust_ffn_down_acc_mem_tile_cols=adjust_ffn_down_acc_mem_tile_cols,

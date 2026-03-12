@@ -361,20 +361,17 @@ void fused_add_layer_norm_1(const T *restrict input,
 
         // For each row within this microtile, apply layer norm and add residual
         for (unsigned ri = 0; ri < r; ri++) {
+            float mean = aie::div(*pSum1, aie::to_float(cols));
+            float mean_sq = mean * mean;
+            float variance = aie::div(*pSumSq1, aie::to_float(cols)) - mean_sq;
+            if (variance < 0.0f) {
+                variance = 0.0f;
+            }
+            float inv_std = aie::invsqrt(variance + epsilon);
 
             const T *__restrict pW = weight + (col_idx * colA * s);
 
             for (unsigned j = 0; j < colA; j += 2) {
-
-                // Processing vectors of size s
-                float mean = aie::div(*pSum1, aie::to_float(cols));
-                float mean_sq = mean * mean;
-                float variance = aie::div(*pSumSq1, aie::to_float(cols)) - mean_sq;
-                if (variance < 0.0f) {
-                    variance = 0.0f;
-                }
-                float inv_std = aie::invsqrt(variance + epsilon);
-
                 aie::vector<T, s> A0 = aie::load_v<s>(pA1);
                 pA1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
                 aie::vector<T, s> A1 = aie::load_v<s>(pA1);
@@ -453,15 +450,15 @@ void fused_layer_norm_1(const T *restrict input,
 
         // For each row within this microtile, apply layer norm (no weight/residual).
         for (unsigned ri = 0; ri < r; ri++) {
-            for (unsigned j = 0; j < colA; j += 2) {
-                float mean = aie::div(*pSum1, aie::to_float(cols));
-                float mean_sq = mean * mean;
-                float variance = aie::div(*pSumSq1, aie::to_float(cols)) - mean_sq;
-                if (variance < 0.0f) {
-                    variance = 0.0f;
-                }
-                float inv_std = aie::invsqrt(variance + epsilon);
+            float mean = aie::div(*pSum1, aie::to_float(cols));
+            float mean_sq = mean * mean;
+            float variance = aie::div(*pSumSq1, aie::to_float(cols)) - mean_sq;
+            if (variance < 0.0f) {
+                variance = 0.0f;
+            }
+            float inv_std = aie::invsqrt(variance + epsilon);
 
+            for (unsigned j = 0; j < colA; j += 2) {
                 aie::vector<T, s> A0 = aie::load_v<s>(pA1);
                 pA1 += mmul_c_size;
                 aie::vector<T, s> A1 = aie::load_v<s>(pA1);
@@ -733,6 +730,8 @@ void ln_calc_sum_sumsq_vectorized(const T *__restrict pA, float *__restrict pSum
 
         // Per-row accumulators for sum and sum-squared across all column tiles
         for (unsigned i = 0; i < r; i++) {
+            float row_sum = *pSum1;
+            float row_sumsq = *pSumSq1;
             for (unsigned j = 0; j < colA; j += 2) {
                 aie::vector<T, s> A0 = aie::load_v<s>(pA1);
                 pA1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
@@ -743,15 +742,17 @@ void ln_calc_sum_sumsq_vectorized(const T *__restrict pA, float *__restrict pSum
                 aie::accum<accfloat, 2 * s> sum_acc;
                 sum_acc.from_vector(A01);
                 float sum = aie::reduce_add(sum_acc.template to_vector<float>());
-                *pSum1 += sum;
+                row_sum += sum;
 
                 aie::vector<float, s> a_acc_sq0 = aie::mul(A0, A0);
                 float sumsq = aie::reduce_add(a_acc_sq0);
-                *pSumSq1 += sumsq;
+                row_sumsq += sumsq;
                 aie::vector<float, s> a_acc_sq1 = aie::mul(A1, A1);
                 sumsq = aie::reduce_add(a_acc_sq1);
-                *pSumSq1 += sumsq;
+                row_sumsq += sumsq;
             }
+            *pSum1 = row_sum;
+            *pSumSq1 = row_sumsq;
             pSum1++;
             pSumSq1++;
             pA1 -= colA * mmul_c_size; // Move pointer back to the start of the row

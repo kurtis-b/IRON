@@ -152,12 +152,16 @@ class PythonGeneratedMLIRArtifact(CompilationArtifact):
         callback_args=None,
         callback_kwargs=None,
         requires_context=False,
+        tracked_paths=None,
     ):
         self.import_path = import_path
         self.callback_fn = callback_fn
         self.callback_args = callback_args if callback_args is not None else []
         self.callback_kwargs = callback_kwargs if callback_kwargs is not None else {}
         self.requires_context = requires_context
+        self.tracked_paths = [Path(import_path)] + [
+            Path(p) for p in (tracked_paths if tracked_paths is not None else [])
+        ]
         super().__init__(path)
 
     def is_available(self):
@@ -165,10 +169,11 @@ class PythonGeneratedMLIRArtifact(CompilationArtifact):
             return True
         is_available = super().is_available()
         if is_available:
-            # Force regeneration if the Python source is changed
-            return os.path.getmtime(str(self.path)) >= os.path.getmtime(
-                self.import_path
+            # Force regeneration if any tracked Python source is changed.
+            newest_input = max(
+                os.path.getmtime(str(path)) for path in self.tracked_paths
             )
+            return os.path.getmtime(str(self.path)) >= newest_input
         return is_available
 
 

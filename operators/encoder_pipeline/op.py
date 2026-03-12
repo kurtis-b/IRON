@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -180,25 +181,55 @@ class AIEEncoderPipeline(AIEOperatorBase):
             return operator_dir / "design_ln1_ddr.py"
         return operator_dir / "design_ln1_memtile.py"
 
-    def _debug_suffix(self) -> str:
+    @staticmethod
+    def _short_prefix(prefix: str) -> str:
+        parts = [part[:1] for part in prefix.split("_") if part]
+        if parts:
+            return "".join(parts)
+        return prefix[:4]
+
+    def _artifact_stem(self, prefix: str) -> str:
         ffn_stage = self.ffn_stage_only if self.ffn_stage_only is not None else "all"
+        identity = "|".join(
+            map(
+                str,
+                [
+                    prefix,
+                    self.num_heads,
+                    self.seq_len,
+                    self.d,
+                    self.seq_tile,
+                    self.kv_seq_tile,
+                    self.emb_tile,
+                    self.parallel_heads,
+                    self.proj_acc_depth,
+                    self.o_proj_acc_group_size,
+                    self.nB_tiles_distributed,
+                    self.ffn_intermediate_size,
+                    self.debug,
+                    self.mha_debug,
+                    ffn_stage,
+                    self.addnorm1_debug_mode,
+                    self.addnorm2_debug_mode,
+                    self.ln1_staging_design,
+                ],
+            )
+        )
+        digest = hashlib.blake2s(identity.encode(), digest_size=6).hexdigest()
+        prefix_tag = self._short_prefix(prefix)
+        stage_tag = "a" if self.ffn_stage_only is None else ffn_stage
         return (
-            f"{self.debug}debug_mha{self.mha_debug}_ffnstg{ffn_stage}_"
-            f"an1{self.addnorm1_debug_mode}_an2{self.addnorm2_debug_mode}_"
-            f"lnstage_{self.ln1_staging_design}"
+            f"{prefix_tag}_{self.num_heads}h_{self.seq_len}s_{self.emb_tile}e_"
+            f"{self.parallel_heads}ph_{self.proj_acc_depth}pa_"
+            f"{self.o_proj_acc_group_size}g_{self.nB_tiles_distributed}pf_"
+            f"d{self.debug}_m{self.mha_debug}_f{stage_tag}_"
+            f"n1{self.addnorm1_debug_mode}_n2{self.addnorm2_debug_mode}_"
+            f"{self.ln1_staging_design[:2]}_{digest}"
         )
 
     def get_artifacts(self, prefix="encoder_pipeline"):
         operator_dir = Path(__file__).parent
-        debug_suffix = self._debug_suffix()
-
-        file_name_base = (
-            f"{prefix}_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.seq_tile}qt_"
-            f"{self.kv_seq_tile}kvt_{self.emb_tile}e_{self.parallel_heads}ph_"
-            f"{self.proj_acc_depth}acc_{self.o_proj_acc_group_size}opg_"
-            f"{self.nB_tiles_distributed}nbdist_{self.ffn_intermediate_size}ffn_"
-            f"{debug_suffix}"
-        )
+        file_name_base = self._artifact_stem(prefix)
 
         ln1_weight_file_name = (
             self.context.build_dir / f"{file_name_base}_ln1_weight_{self.embed_sz}.npy"
@@ -216,6 +247,9 @@ class AIEEncoderPipeline(AIEOperatorBase):
         mha_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mha.cc")
         passthrough_source = str(
             self.context.base_dir / "aie_kernels" / "generic" / "passThrough.cc"
+        )
+        convert_copy_source = str(
+            self.context.base_dir / "aie_kernels" / "generic" / "convert_copy.cc"
         )
         add_source = str(self.context.base_dir / "aie_kernels" / "generic" / "add.cc")
 
@@ -260,10 +294,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
             "zero_scalar_bf16": "zero_scalar_bf16_o_proj",
         }
 
-        kernel_archive = (
-            f"{prefix}_kernels_{self.num_heads}h_{self.seq_len}s_{self.d}d_"
-            f"{debug_suffix}.a"
-        )
+        kernel_archive = f"{file_name_base}_kernels.a"
         encoder_kernel_flags = [
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
             "-DBUILD_FFN",
@@ -277,6 +308,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
             f"{file_name_base}.mlir",
             import_path=self._design_import_path(operator_dir),
             callback_fn="fused_mha",
+            tracked_paths=[operator_dir / "design.py"],
             callback_kwargs={
                 "heads": self.num_heads,
                 "seq_len": self.seq_len,
@@ -351,6 +383,10 @@ class AIEEncoderPipeline(AIEOperatorBase):
                                 "passThroughLine": "passThroughLine_o_proj",
                                 "passThroughTile": "passThroughTile_o_proj",
                             },
+                        ),
+                        KernelObjectArtifact.new(
+                            f"{prefix}_convert_copy.o",
+                            depends=[SourceArtifact.new(convert_copy_source)],
                         ),
                         KernelObjectArtifact.new(
                             f"{prefix}_add_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
