@@ -5,6 +5,7 @@ Fused encoder operator: `MHA + AddNorm1 + FFN + AddNorm2`.
 ## What matters
 
 - LN1 and LN2 are both two-pass layer norm stages (full-row statistics are required).
+- LN1 replay now uses `aie.memtile_row_store` with `buffer_count=2` to support steady-state overlap safely.
 - `ln1_staging_design="memtile"`: LN1 output is broadcast on-chip to FFN-up branches.
 - `ln1_staging_design="ddr"`: LN1 output is staged through DDR once, then broadcast on-chip.
 - Topology knobs in test IDs: `pheads`, `pffn`, `pacc`, `opg`.
@@ -54,6 +55,16 @@ All encoder pipeline tests:
 ```bash
 rm -rf ./build
 pytest operators/encoder_pipeline/test.py -q
+```
+
+Tracked staging-mode selections:
+
+```bash
+rm -rf ./build
+pytest operators/encoder_pipeline/test.py -q -k lnstage_memtile
+
+rm -rf ./build
+pytest operators/encoder_pipeline/test.py -q -k lnstage_ddr
 ```
 
 One staging mode:
@@ -109,3 +120,9 @@ pytest operators/encoder_pipeline/test.py -q -k stage_profile
 ```bash
 python operators/encoder_pipeline/profile_debug_modes.py --design memtile --clean-build
 ```
+
+## Current validated state
+
+- Full `lnstage_memtile` selection: `100 passed, 40 skipped`
+- Full `lnstage_ddr` selection: `115 passed, 40 skipped`
+- These runs were validated after switching LN1 replay to the double-buffered row-store lowering.

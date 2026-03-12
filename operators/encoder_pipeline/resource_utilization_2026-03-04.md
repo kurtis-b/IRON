@@ -16,6 +16,7 @@
 
 ## Mode impact
 
+- LN1 replay uses a double-buffered memtile row-store in both modes.
 - `memtile` LN1 mode: no LN1 DDR refill stream at shim.
 - `ddr` LN1 mode: LN1 adds DDR stage traffic at shim (drain + refill pattern in runtime).
 

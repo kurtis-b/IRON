@@ -32,6 +32,7 @@ from operators.encoder_pipeline.mapping_validation import (
     find_ffn_layout,
     manhattan_distance,
 )
+from operators.encoder_pipeline.row_store import MemTileRowStore
 
 
 def fused_mha(
@@ -1563,16 +1564,13 @@ def fused_mha(
         ln1_replay_mem_tile_col,
     )
     ln1_norm_tile_obj = Tile(col=ln1_tile[0], row=ln1_tile[1])
-    # Keep LN1 replay on the forwarded FIFO path until the compiler has an
-    # explicit double-buffered row-store abstraction. The current single-row
-    # memtile row-store deadlocks when LN1 consumes row N while producing row
-    # N+1 in the same steady-state loop.
-    ln1ReplayPart = ObjectFifo(o_ty, name="ln1ReplayPart", depth=1)
-    ln1Replay = ln1ReplayPart.cons(depth=ln_tiles_per_q_block).forward(
+    ln1Replay = MemTileRowStore(
         obj_type=o_ty,
+        compute_tile=ln1_norm_tile_obj,
+        mem_tile=Tile(col=ln1_replay_mem_tile_col, row=1),
+        part_count=ln_tiles_per_q_block,
+        buffer_count=2,
         name="ln1Replay",
-        depth=ln_tiles_per_q_block,
-        placement=Tile(col=ln1_replay_mem_tile_col, row=1),
     )
     # LN1 split-stage link (norm output -> mul+resadd input).
     ln1Norm = ObjectFifo(o_ty, name="ln1Norm", depth=ln_input_depth)
@@ -3602,8 +3600,8 @@ def fused_mha(
         core_fn_ln1_norm,
         fn_args=[
             outOProjInput.cons(),
-            ln1Replay.cons(depth=1),
-            ln1ReplayPart.prod(),
+            ln1Replay.cons(),
+            ln1Replay.prod(),
             ln1_norm_sum_buffer,
             ln1_norm_sumsq_buffer,
             ln1Norm.prod(),

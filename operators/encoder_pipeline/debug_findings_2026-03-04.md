@@ -3,8 +3,16 @@
 ## Stable facts
 
 - Layer norm remains two-pass in LN1 and LN2 (row-complete statistics requirement).
+- LN1 replay now uses `aie.memtile_row_store` with `buffer_count=2`.
 - `memtile` mode: LN1 output broadcasts on-chip to FFN-up branches.
 - `ddr` mode: LN1 output drains to DDR once, refills once, then broadcasts on-chip.
+
+## Current status
+
+- Full `lnstage_memtile` selection passes: `100 passed, 40 skipped`.
+- Full `lnstage_ddr` selection passes: `115 passed, 40 skipped`.
+- The previous single-row LN1 row-store deadlock is no longer the live design path.
+- The current passing path depends on the compiler-side double-buffered row-store lowering.
 
 ## Recent resolved issue
 
@@ -26,23 +34,10 @@
   - packed `B_Down` chunk columns `[3,2,1]`
 - Current blocker: runtime timeout (`ERT_CMD_STATE_TIMEOUT`) still occurs in normal mode after the compile constraints are removed.
 
-## Compiler-side repro
+## Historical note
 
-- Minimal failing pattern: AddNorm1 post-stage residual path with shim-managed host traffic.
-- Smallest confirmed repro shape:
-  - `muladd`-only probe
-  - `parts=8`, `rows=64`, `groups=1`, `branches=1`, `seq_tile=32`, `emb_tile=96`
-- Worker-managed residual input/output passes.
-- Shim-managed residual input or shim-managed residual output fails with:
-  - `ERT_CMD_STATE_TIMEOUT`
-  - `ctx_pc = 0x28B060AD`
-- Lowering difference:
-  - compute-side AddNorm1 post graph stays effectively unchanged
-  - residual endpoint moves to shim
-  - runtime lowers that path into many serial awaited shim DMA tasks (`repeat_count = 7` per row task)
-- Interpretation:
-  - strong compiler/runtime bug candidate on the shim-managed residual path
-  - not evidence of a replay-row-store bug
+- Earlier single-row LN1 row-store integration attempts exposed runtime hangs.
+- Those results are historical now; the current design uses the compiler-side double-buffered lowering and passes the full staging-mode selections above.
 
 ## Effective debug patterns
 
