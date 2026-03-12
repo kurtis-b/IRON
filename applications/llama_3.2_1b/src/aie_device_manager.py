@@ -11,8 +11,18 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional, Any
 import pyxrt
-from aie.iron.hostruntime.config import detect_npu_device
 from aie.iron.device import NPU1, NPU2
+
+try:
+    from aie.iron.hostruntime.config import detect_npu_device
+except ImportError:
+    from aie.utils import get_current_device
+
+    def detect_npu_device():
+        device = get_current_device()
+        if device is None:
+            raise RuntimeError("Could not detect current NPU device")
+        return device
 
 
 class AIEDeviceManager:
