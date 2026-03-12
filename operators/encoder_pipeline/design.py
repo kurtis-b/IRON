@@ -1389,6 +1389,7 @@ def fused_mha(
         ObjectFifo(q_ty, depth=of_depth, name=f"outOProj{i}")
         for i in range(parallel_heads)
     ]
+    o_proj_worker_tiles = [Tile(col=i, row=5) for i in range(parallel_heads)]
     # Grouped O-proj accumulation staging.
     # For grouped mode, each group-boundary core (group_size-1, 2*group_size-1, ...)
     # performs memtile accumulation buffering. This matches per-group local
@@ -1397,6 +1398,30 @@ def fused_mha(
     o_proj_accum_core_set = set(o_proj_accum_core_indices)
     outOProjAccumIn = [None] * parallel_heads
     outOProjAccumOut = [None] * parallel_heads
+    use_o_proj_acc_row_store = _override_bool_env(
+        "ENCODER_USE_O_PROJ_ACC_ROW_STORE",
+        parallel_heads <= 4,
+    )
+
+    def _allocate_o_proj_acc_row_store_channels(
+        mem_tile_col: int, slot_idx: int
+    ) -> tuple[int, int] | None:
+        # Keep grouped O-proj row-store traffic off the heavily used low
+        # channels on each memtile. Some columns, such as col3, are already
+        # saturated by W_O/LN replay traffic in common topologies and still
+        # need the old forwarded FIFO path.
+        channel_pairs_by_col = {
+            0: [(5, 5)],
+            4: [(2, 2), (3, 3)],
+            5: [(3, 3), (4, 4)],
+            6: [(3, 3)],
+            7: [(4, 4), (5, 5)],
+        }
+        col_pairs = channel_pairs_by_col.get(mem_tile_col)
+        if col_pairs is None or slot_idx >= len(col_pairs):
+            return None
+        return col_pairs[slot_idx]
+
     # Memtile DMA/BD pressure model (per tile):
     # - col4: memBUp stream pair (low depth), can host 2 O-proj accum FIFOs.
     # - col5: memBDown stream pair (low depth), can host 2 O-proj accum FIFOs.
@@ -1466,25 +1491,58 @@ def fused_mha(
     # accumulation step before reuse. Shrinking this depth below proj_acc_depth
     # can deadlock (producer fills FIFO before consumer phase starts).
     o_proj_acc_fifo_depth = proj_acc_depth
+    o_proj_acc_row_store_slots_by_col: dict[int, int] = {}
     for stage_idx, core_idx in enumerate(o_proj_accum_core_indices):
-        outOProjAccumOut[core_idx] = ObjectFifo(
-            o_ty, depth=1, name=f"outOProjAccumOut{core_idx}"
+        acc_mem_col = acc_mem_tile_cols[stage_idx]
+        row_store_slot_idx = o_proj_acc_row_store_slots_by_col.get(acc_mem_col, 0)
+        row_store_channels = (
+            _allocate_o_proj_acc_row_store_channels(acc_mem_col, row_store_slot_idx)
+            if use_o_proj_acc_row_store
+            else None
         )
-        outOProjAccumIn[core_idx] = (
-            outOProjAccumOut[core_idx]
-            .cons(depth=o_proj_acc_fifo_depth)
-            .forward(
-                name=f"outOProjAccumIn{core_idx}",
-                depth=o_proj_acc_fifo_depth,
-                placement=Tile(col=acc_mem_tile_cols[stage_idx], row=1),
+        if row_store_channels is not None:
+            memtile_ingress_channel, memtile_egress_channel = row_store_channels
+            outOProjAccumIn[core_idx] = outOProjAccumOut[core_idx] = MemTileRowStore(
+                obj_type=o_ty,
+                compute_tile=o_proj_worker_tiles[core_idx],
+                mem_tile=Tile(col=acc_mem_col, row=1),
+                part_count=proj_acc_depth,
+                buffer_count=2,
+                name=f"outOProjAccum{core_idx}",
+                compute_mm2s_channel=0,
+                compute_s2mm_channel=1,
+                memtile_ingress_channel=memtile_ingress_channel,
+                memtile_egress_channel=memtile_egress_channel,
             )
-        )
-        logging.debug(
-            "Placed outOProjAccum[%d] on mem tile (%d,1) with fifo_depth=%d",
-            core_idx,
-            acc_mem_tile_cols[stage_idx],
-            o_proj_acc_fifo_depth,
-        )
+            o_proj_acc_row_store_slots_by_col[acc_mem_col] = row_store_slot_idx + 1
+            logging.debug(
+                "Placed outOProjAccum[%d] row-store on mem tile (%d,1) "
+                "with channels in=%d out=%d",
+                core_idx,
+                acc_mem_col,
+                memtile_ingress_channel,
+                memtile_egress_channel,
+            )
+        else:
+            outOProjAccumOut[core_idx] = ObjectFifo(
+                o_ty, depth=1, name=f"outOProjAccumOut{core_idx}"
+            )
+            outOProjAccumIn[core_idx] = (
+                outOProjAccumOut[core_idx]
+                .cons(depth=o_proj_acc_fifo_depth)
+                .forward(
+                    name=f"outOProjAccumIn{core_idx}",
+                    depth=o_proj_acc_fifo_depth,
+                    placement=Tile(col=acc_mem_col, row=1),
+                )
+            )
+            logging.debug(
+                "Placed outOProjAccum[%d] FIFO fallback on mem tile (%d,1) "
+                "with fifo_depth=%d",
+                core_idx,
+                acc_mem_col,
+                o_proj_acc_fifo_depth,
+            )
 
     # Intra-group neighbor chain: each core forwards its partial contribution to
     # the next core in the same group each qkv/acc iteration.
@@ -1610,7 +1668,7 @@ def fused_mha(
             "Forcing ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0 for dual-input LN2 topology"
         )
         emit_ln2_replay_from_down = False
-    use_ln2_replay_fifo = (ffn_stage_only in (None, 2)) and (
+    use_ln2_replay_store = (ffn_stage_only in (None, 2)) and (
         not emit_ln2_replay_from_down
     )
     # Targeted remap for low-head/high-acc grouped-O-proj memtile topologies:
@@ -2139,6 +2197,37 @@ def fused_mha(
     ffnUpOut = []
     ffnDownPart = [None] * effective_ffn_branches
     ffnDownAccum = [None] * effective_ffn_branches
+    ffn_down_worker_tiles = [
+        Tile(
+            col=selected_down_tiles[branch_idx][0],
+            row=selected_down_tiles[branch_idx][1],
+        )
+        for branch_idx in range(effective_ffn_branches)
+    ]
+    use_ffn_down_acc_row_store = _override_bool_env(
+        "ENCODER_USE_FFN_DOWN_ACC_ROW_STORE",
+        effective_ffn_branches <= 4
+        and (ln1_stage_mode != "ddr" or parallel_heads >= 4),
+    )
+
+    def _allocate_ffn_down_acc_row_store_channels(
+        mem_tile_col: int, slot_idx: int
+    ) -> tuple[int, int] | None:
+        # Keep FFN-down row-store traffic off channels already consumed by
+        # LN1 replay and split B-weight ingress on the same memtile.
+        # Col5 specifically cannot use channel 0 once LN1 replay is lowered
+        # through memtile_row_store there in both memtile and ddr modes.
+        channel_pairs_by_col = {
+            4: [(2, 2), (3, 3)],
+            5: [(2, 2), (4, 4)],
+            6: [(2, 2), (3, 3)],
+            7: [(0, 0), (1, 1)],
+        }
+        col_pairs = channel_pairs_by_col.get(mem_tile_col)
+        if col_pairs is None or slot_idx >= len(col_pairs):
+            return None
+        return col_pairs[slot_idx]
+
     ffn_down_acc_mem_tile_cols = ln1_mode_hooks.adjust_ffn_down_acc_mem_tile_cols(
         ffn_down_acc_mem_tile_cols=list(branch_stage_cols[:effective_ffn_branches]),
         effective_ffn_branches=effective_ffn_branches,
@@ -2158,6 +2247,7 @@ def fused_mha(
             ffn_down_acc_group_size,
             ffn_down_group_partner_srcs_by_stage,
         )
+    ffn_down_acc_row_store_slots_by_col = dict(o_proj_acc_row_store_slots_by_col)
     for branch_idx in range(effective_ffn_branches):
         ffn_up_out_depth = 1 if emb_tile >= 128 else 2
         ffnUpOut.append(
@@ -2171,23 +2261,56 @@ def fused_mha(
             continue
         # Keep FFN-down accumulation in mem tile FIFO(s) so down-proj core L1 stays
         # within limits while replaying for LN2's two-pass consumption.
-        ffnDownPart[branch_idx] = ObjectFifo(
-            o_ty,
-            name="ffnDownPart" if branch_idx == 0 else f"ffnDownPart{branch_idx}",
-            depth=1,
+        ffn_down_acc_mem_col = ffn_down_acc_mem_tile_cols[branch_idx]
+        row_store_slot_idx = ffn_down_acc_row_store_slots_by_col.get(
+            ffn_down_acc_mem_col, 0
         )
-        ffnDownAccum[branch_idx] = (
-            ffnDownPart[branch_idx]
-            .cons(depth=proj_acc_depth)
-            .forward(
-                obj_type=o_ty,
-                name=(
-                    "ffnDownAccum" if branch_idx == 0 else f"ffnDownAccum{branch_idx}"
-                ),
-                depth=proj_acc_depth,
-                placement=Tile(col=ffn_down_acc_mem_tile_cols[branch_idx], row=1),
+        ffn_down_row_store_channels = (
+            _allocate_ffn_down_acc_row_store_channels(
+                ffn_down_acc_mem_col, row_store_slot_idx
             )
+            if use_ffn_down_acc_row_store
+            else None
         )
+        if ffn_down_row_store_channels is not None:
+            memtile_ingress_channel, memtile_egress_channel = (
+                ffn_down_row_store_channels
+            )
+            ffnDownPart[branch_idx] = ffnDownAccum[branch_idx] = MemTileRowStore(
+                obj_type=o_ty,
+                compute_tile=ffn_down_worker_tiles[branch_idx],
+                mem_tile=Tile(col=ffn_down_acc_mem_col, row=1),
+                part_count=proj_acc_depth,
+                buffer_count=2,
+                name="ffnDownAccum" if branch_idx == 0 else f"ffnDownAccum{branch_idx}",
+                compute_mm2s_channel=0,
+                compute_s2mm_channel=0,
+                memtile_ingress_channel=memtile_ingress_channel,
+                memtile_egress_channel=memtile_egress_channel,
+            )
+            ffn_down_acc_row_store_slots_by_col[ffn_down_acc_mem_col] = (
+                row_store_slot_idx + 1
+            )
+        else:
+            ffnDownPart[branch_idx] = ObjectFifo(
+                o_ty,
+                name="ffnDownPart" if branch_idx == 0 else f"ffnDownPart{branch_idx}",
+                depth=1,
+            )
+            ffnDownAccum[branch_idx] = (
+                ffnDownPart[branch_idx]
+                .cons(depth=proj_acc_depth)
+                .forward(
+                    obj_type=o_ty,
+                    name=(
+                        "ffnDownAccum"
+                        if branch_idx == 0
+                        else f"ffnDownAccum{branch_idx}"
+                    ),
+                    depth=proj_acc_depth,
+                    placement=Tile(col=ffn_down_acc_mem_col, row=1),
+                )
+            )
     # Large emb_tile (128) can overflow FFN-down L1 when reduction FIFOs are
     # double-buffered alongside B-down and accumulation buffers.
     default_ffn_down_reduce_depth = 1 if emb_tile >= 128 else 2
@@ -2322,7 +2445,33 @@ def fused_mha(
             )
     ln2ReplayPart = None
     ln2Replay = None
-    if use_ln2_replay_fifo:
+    ln2_replay_curr = None
+    ln2_replay_new = None
+    ln2_tile_obj = Tile(col=ln2_tile[0], row=ln2_tile[1])
+    # The current LN2 row-store lowering is stable on the broader 4/6-head
+    # encoder topologies with <=4 FFN branches. The 6-head and 6-FFN-branch
+    # layouts still regress with the current compiler/runtime path, so keep
+    # those on the forwarded FIFO path for now.
+    use_ln2_row_store = (
+        use_ln2_replay_store
+        and (not stage_ln1_to_ddr)
+        and parallel_heads == 4
+        and effective_ffn_branches <= 4
+    )
+    if use_ln2_row_store:
+        ln2Replay = MemTileRowStore(
+            obj_type=o_ty,
+            compute_tile=ln2_tile_obj,
+            mem_tile=Tile(col=ln2_replay_mem_tile_col, row=1),
+            part_count=proj_acc_depth,
+            buffer_count=2,
+            name="ln2Replay",
+        )
+        ln2_replay_curr = ln2Replay.cons(depth=1)
+        ln2_replay_new = ln2Replay.prod()
+    elif use_ln2_replay_store:
+        # Keep DDR mode on the forwarded FIFO path until the row-store verifier
+        # accepts the current AddNorm2 placement there.
         ln2ReplayPart = ObjectFifo(o_ty, name="ln2ReplayPart", depth=1)
         ln2Replay = ln2ReplayPart.cons(depth=proj_acc_depth).forward(
             obj_type=o_ty,
@@ -2330,6 +2479,8 @@ def fused_mha(
             depth=proj_acc_depth,
             placement=Tile(col=ln2_replay_mem_tile_col, row=1),
         )
+        ln2_replay_curr = ln2Replay.cons(depth=1)
+        ln2_replay_new = ln2ReplayPart.prod()
     outLN2 = ObjectFifo(o_ty, name="outLN2", depth=ln2_output_fifo_depth)
     memLN2 = outLN2.cons().forward(
         obj_type=o_ty,
@@ -3567,7 +3718,7 @@ def fused_mha(
                 i,
             ],
             stack_size=0xD00,
-            placement=Tile(col=i, row=5),
+            placement=o_proj_worker_tiles[i],
             while_true=False,
         )
         if o_proj_row_store_parts is not None:
@@ -3756,10 +3907,7 @@ def fused_mha(
             Worker(
                 core_fn_ffn_down_proj,
                 fn_args=ffn_down_worker_args,
-                placement=Tile(
-                    col=selected_down_tiles[branch_idx][0],
-                    row=selected_down_tiles[branch_idx][1],
-                ),
+                placement=ffn_down_worker_tiles[branch_idx],
                 stack_size=0xF00,
                 while_true=False,
             )
@@ -3820,10 +3968,10 @@ def fused_mha(
             ffn_stage_only,
             addnorm2_debug_mode,
             emit_ln2_replay_from_down,
-            ln2Replay.cons(depth=1) if use_ln2_replay_fifo else None,
-            ln2ReplayPart.prod() if use_ln2_replay_fifo else None,
+            ln2_replay_curr,
+            ln2_replay_new,
         ],
-        placement=Tile(col=ln2_tile[0], row=ln2_tile[1]),
+        placement=ln2_tile_obj,
         stack_size=0xF00,
         while_true=False,
     )
