@@ -23,7 +23,7 @@ from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1Col1, NPU1Col2, NPU1, NPU2, Tile
 from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D, TensorAccessPattern
 from aie.iron.controlflow import range_
-from aie.helpers.dialects.ext.scf import if_, else_
+from aie.helpers.dialects.scf import if_, else_
 
 microkernel_mac_dim_map = {
     "npu": {
