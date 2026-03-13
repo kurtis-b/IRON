@@ -89,6 +89,8 @@ def fused_mha(
     enable_tracing = True if trace_size > 0 else False
     dtype_str = "bf16"
     dev = "npu2"
+    replay_row_store_compute_buffer_count = 2
+    accum_row_store_compute_buffer_count = 1
 
     num_q_seq_blocks = seq_len // seq_tile
     num_kv_seq_blocks = seq_len // kv_seq_tile
@@ -1512,6 +1514,7 @@ def fused_mha(
                 mem_tile=Tile(col=acc_mem_col, row=1),
                 part_count=proj_acc_depth,
                 buffer_count=2,
+                compute_buffer_count=accum_row_store_compute_buffer_count,
                 name=f"outOProjAccum{core_idx}",
                 compute_mm2s_channel=0,
                 compute_s2mm_channel=1,
@@ -1632,6 +1635,7 @@ def fused_mha(
         mem_tile=Tile(col=ln1_replay_mem_tile_col, row=1),
         part_count=ln_tiles_per_q_block,
         buffer_count=2,
+        compute_buffer_count=replay_row_store_compute_buffer_count,
         name="ln1Replay",
     )
     # LN1 split-stage link (norm output -> mul+resadd input).
@@ -2295,6 +2299,7 @@ def fused_mha(
                 mem_tile=Tile(col=ffn_down_acc_mem_col, row=1),
                 part_count=proj_acc_depth,
                 buffer_count=2,
+                compute_buffer_count=accum_row_store_compute_buffer_count,
                 name="ffnDownAccum" if branch_idx == 0 else f"ffnDownAccum{branch_idx}",
                 compute_mm2s_channel=0,
                 compute_s2mm_channel=0,
@@ -2478,6 +2483,7 @@ def fused_mha(
             mem_tile=Tile(col=ln2_replay_mem_tile_col, row=1),
             part_count=proj_acc_depth,
             buffer_count=2,
+            compute_buffer_count=replay_row_store_compute_buffer_count,
             name="ln2Replay",
         )
         ln2_replay_curr = ln2Replay.cons(depth=1)
