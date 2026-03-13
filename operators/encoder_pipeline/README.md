@@ -30,14 +30,17 @@ Fused encoder operator: `MHA + AddNorm1 + FFN + AddNorm2`.
 ## Hard constraints
 
 - `emb_tile * proj_acc_depth == embed_sz`
+- `ffn_intermediate_size % (emb_tile * pffn) == 0` for supported FFN layouts
 - `parallel_heads % o_proj_acc_group_size == 0`
 - `o_proj_acc_group_size <= parallel_heads`
 - Compute-tile, shim-channel, memtile-channel, and BD budgets are validated during generation/lowering.
+- Unsupported uneven FFN partitions now fail immediately during design construction.
 
 ## Entry points
 
 - Regression: `operators/encoder_pipeline/test.py`
 - Debug/bottleneck sweep: `operators/encoder_pipeline/profile_debug_modes.py`
+- Optimization plan: `operators/encoder_pipeline/design_optimization_plan.md`
 
 ## Environment setup
 
