@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
-
 from operators.encoder_pipeline.design import fused_mha as _fused_mha_base
 
 
@@ -66,16 +64,14 @@ def plan_branch_stage_configuration(
     effective_ffn_branches,
     parallel_heads,
     proj_acc_depth,
-    ln1_replay_mem_tile_col,
     ffn_col_group_counts,
     bup_split_enabled,
     bdown_split_enabled,
     branch_split_chunks,
-    _override_int_env,
     _allocate_ffn_weight_mem_tile_cols_by_streams,
     logging_module,
+    **_unused,
 ):
-    del ln1_replay_mem_tile_col, _override_int_env
     branch_stage_cols = list(branch_stage_cols)
     if parallel_heads >= 6 and len(branch_stage_cols) >= 2:
         branch_stage_cols = [
@@ -98,8 +94,6 @@ def plan_branch_stage_configuration(
         up_stream_count = effective_ffn_branches
         down_stream_count = effective_ffn_branches
 
-    # DDR mode uses one LN1 stage drain and one LN1 stage refill stream.
-    # Refill is then broadcast on-chip to all FFN-up branches.
     ln1_ddr_stage_source_branch_idx = 0
     ln1_ddr_staged_branch_indices = [ln1_ddr_stage_source_branch_idx]
     stage_col = branch_stage_cols[ln1_ddr_stage_source_branch_idx]
@@ -159,16 +153,7 @@ def plan_branch_stage_configuration(
         all(len(chunk) == 2 for chunk in branch_split_chunks),
     ]
     if all(low_head_acc6_split_checks):
-        # Keep the 6pacc DDR case on the correctness-stable unsplit MHA path.
-        # That leaves:
-        # - Q on col0
-        # - K on col1
-        # - V on col2
-        # - W_O on col3
-        # - residual on col7
-        # - LN1 refill on col6
-        # Use the remaining shim slots exactly once while keeping memtile
-        # output load under control.
+        # Keep the unsplit-MHA 6pacc DDR case on the known-good shim layout.
         remap_up_cols = [5, 4, 6]
         remap_down_cols = [1, 2, 7]
         for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
@@ -176,10 +161,6 @@ def plan_branch_stage_configuration(
                 branch_bup_cols[branch_idx] = remap_up_cols[chunk_idx]
                 branch_down_b_cols[branch_idx] = remap_down_cols[chunk_idx]
 
-    # In low-head/high-acc 4-branch DDR tails, duplicating B_Up staging on one
-    # memtile can push that tile over the 48-BD limit once LN replay and FFN
-    # down-acc staging are included. Spread duplicate B_Up streams onto spare
-    # shim-output columns without exceeding the per-column 2-channel budget.
     if parallel_heads <= 4 and proj_acc_depth >= 8 and effective_ffn_branches >= 4:
         output_load = {col: 0 for col in range(8)}
         for col in (0, 1, 2, 3, 7):
@@ -219,18 +200,10 @@ def build_ln1_to_ffn_up_path(
     ffn_up_broadcast_depth,
     ffn_up_consumer_depth,
     effective_ffn_branches,
-    ffn_a_stage_mem_tile_cols,
     ln1_ddr_staged_branch_indices,
-    _override_int_env,
-    _override_bool_env,
-    parallel_heads,
-    proj_acc_depth,
-    o_proj_acc_group_size,
     object_fifo_ctor,
-    tile_ctor,
+    **_unused,
 ):
-    del tile_ctor, _override_int_env, _override_bool_env, parallel_heads, proj_acc_depth
-    del o_proj_acc_group_size, ffn_a_stage_mem_tile_cols
     mem_out_ln_cons = []
     ln1_out_stage_to_ddr = {}
     ln1_in_from_ddr = {}
@@ -251,7 +224,6 @@ def build_ln1_to_ffn_up_path(
         if ln1_ddr_staged_branch_set
         else None
     )
-    # Single host refill stream, then broadcast to all FFN-up branches.
     ln1_refill_broadcast = object_fifo_ctor(
         o_ty,
         name="inLNFromDDR",
@@ -276,9 +248,8 @@ def adjust_ffn_down_acc_mem_tile_cols(
     effective_ffn_branches,
     proj_acc_depth,
     parallel_heads,
-    ln1_replay_mem_tile_col,
+    **_unused,
 ):
-    del ln1_replay_mem_tile_col
     low_head_acc6_checks = [
         parallel_heads == 4,
         proj_acc_depth >= 6,
@@ -287,26 +258,17 @@ def adjust_ffn_down_acc_mem_tile_cols(
         len(ffn_down_acc_mem_tile_cols) >= 5,
     ]
     if all(low_head_acc6_checks):
-        # Keep memtile col2 at its 6-output limit in the unsplit-MHA DDR case:
-        # V already uses 4 outputs on col2, and B_Down chunk 1 adds 2 more.
-        # Move branch-4's FFN-down accumulator stream off col2 and keep the
-        # final branch off col1, which already carries K plus one B_Down chunk.
+        # Keep col2 within the unsplit-MHA DDR output-channel budget.
         if ffn_down_acc_mem_tile_cols[4] == 2:
             ffn_down_acc_mem_tile_cols[4] = 0
         if len(ffn_down_acc_mem_tile_cols) >= 6 and ffn_down_acc_mem_tile_cols[5] == 1:
             ffn_down_acc_mem_tile_cols[5] = 5
-    # For low-head/high-acc DDR topologies with two FFN branches, keeping the
-    # second FFN-down accumulation stream on col4 can collide with O-proj
-    # accumulation BD allocation on memtile4. Move that second stream to a
-    # different memtile column while preserving branch-0 placement.
     if (
         effective_ffn_branches == 2
         and parallel_heads <= 4
         and proj_acc_depth >= 8
         and len(ffn_down_acc_mem_tile_cols) >= 2
     ):
-        # Keep col7 as a last resort because it already carries high-depth
-        # residual/LN2 traffic in these topologies.
         fallback_cols = [2, 5, 6, 3, 1, 0, 4, 7]
         branch0_col = ffn_down_acc_mem_tile_cols[0]
         chosen_col = None
@@ -318,8 +280,6 @@ def adjust_ffn_down_acc_mem_tile_cols(
         if chosen_col is not None:
             ffn_down_acc_mem_tile_cols[1] = chosen_col
     if effective_ffn_branches >= 4 and parallel_heads <= 4 and proj_acc_depth >= 8:
-        # Col3 already carries W_O fanout in these topologies. Keep FFN down
-        # accumulation staging off col3 to stay within memtile BD allocation.
         for idx, col in enumerate(ffn_down_acc_mem_tile_cols):
             if col != 3:
                 continue
@@ -328,8 +288,6 @@ def adjust_ffn_down_acc_mem_tile_cols(
                     ffn_down_acc_mem_tile_cols[idx] = candidate_col
                     break
     if parallel_heads <= 1 and proj_acc_depth >= 16:
-        # Col7 already carries residual staging and the final LN2 drain in
-        # low-head DDR topologies. Do not also pin FFN-down accumulation there.
         for idx, col in enumerate(ffn_down_acc_mem_tile_cols):
             if col != 7:
                 continue
@@ -399,19 +357,12 @@ def build_runtime_state(
 def adjust_wait_ffn_weight_fill(
     *,
     wait_ffn_weight_fill,
-    runtime_state,
     **_unused,
 ):
-    del runtime_state
     return wait_ffn_weight_fill
 
 
-def should_prefill_ffn_weights(
-    *,
-    runtime_state,
-    **_unused,
-):
-    del runtime_state
+def should_prefill_ffn_weights(**_unused):
     return False
 
 
@@ -430,7 +381,6 @@ def schedule_runtime_tap(
     profile_replay_groups,
     proj_acc_depth,
     emb_tile,
-    runtime_state,
     ln1OutStageToDDR,
     ln1InFromDDR,
     ffn_a_stage_mem_tile_cols,
@@ -448,12 +398,7 @@ def schedule_runtime_tap(
     tile_ctor,
     **_unused,
 ):
-    # Single-buffered LN1 scratch region: complete prior refill first.
     if pending_ln1_refill_tg is not None:
-        # Drain the previous tap output before waiting on the prior LN1 refill
-        # task-group. Otherwise, FFN/LN2 backpressure can block those fills,
-        # creating a wait cycle (refill waits on downstream progress while the
-        # downstream drain is deferred until after refill completion).
         if pending_output_tap_idx is not None:
             schedule_final_output_for_tap(pending_output_tap_idx)
             pending_output_tap_idx = None
@@ -464,7 +409,6 @@ def schedule_runtime_tap(
     ln1_stage_base_offset = (
         ln1_stage_region_offset + col_group * proj_acc_depth * emb_tile
     )
-    del runtime_state
     stage_source_branch = 0
     tg_ln1_drain = rt.task_group()
     branch_stage_tap = tensor_access_pattern_cls(
@@ -533,25 +477,6 @@ def finalize_runtime(
         pending_ln1_refill_tg = None
     return pending_ln1_refill_tg, pending_output_tap_idx
 
-
-def _hook_namespace():
-    return SimpleNamespace(
-        ln1_dram_stage_rows=ln1_dram_stage_rows,
-        choose_ln1_replay_mem_tile_col=choose_ln1_replay_mem_tile_col,
-        choose_ln2_replay_mem_tile_col=choose_ln2_replay_mem_tile_col,
-        plan_branch_stage_configuration=plan_branch_stage_configuration,
-        build_ln1_to_ffn_up_path=build_ln1_to_ffn_up_path,
-        adjust_ffn_down_acc_mem_tile_cols=adjust_ffn_down_acc_mem_tile_cols,
-        build_runtime_state=build_runtime_state,
-        adjust_wait_ffn_weight_fill=adjust_wait_ffn_weight_fill,
-        should_prefill_ffn_weights=should_prefill_ffn_weights,
-        use_bup_broadcast_priming=use_bup_broadcast_priming,
-        schedule_runtime_tap=schedule_runtime_tap,
-        finalize_runtime=finalize_runtime,
-    )
-
-
 def fused_mha(*args, **kwargs):
     kwargs["ln1_stage_mode"] = "ddr"
-    kwargs["_ln1_mode_hooks"] = _hook_namespace()
     return _fused_mha_base(*args, **kwargs)
