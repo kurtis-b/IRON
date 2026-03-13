@@ -77,6 +77,27 @@
     - `lnstage_memtile`: `100 passed, 40 skipped`
     - `lnstage_ddr`: `115 passed, 40 skipped`
 
+## High-pacc single-branch LN2 tail
+
+- Topology class:
+  - `parallel_heads >= 6`
+  - `proj_acc_depth >= 16`
+  - `effective_ffn_branches == 1`
+- Symptom:
+  - the `64qseqtile / 48embtile / 16pacc` single-branch tail was not fixed by
+    moving grouped O-proj accumulation or `ln2Replay` between memtiles; the
+    output-DMA overflow just moved between tail columns.
+- Working fix:
+  - stop creating `ln2Replay` for this topology class
+  - let AddNorm2 consume the direct replay pass emitted by FFN-down
+- Outcome:
+  - `lnstage_memtile-encoder_64seq_64hdim_12heads_3072ffn_64qseqtile_64kvtile_48embtile_6pheads_1pffn_16pacc_2opg`
+    now passes
+  - `lnstage_ddr-encoder_64seq_64hdim_12heads_3072ffn_64qseqtile_64kvtile_48embtile_6pheads_1pffn_16pacc_2opg`
+    now passes
+  - updated `64qseqtile / 16pacc` comparison matrix:
+    - `120 passed, 95 failed, 295 deselected`
+
 ## Historical note
 
 - Earlier single-row LN1 row-store integration attempts exposed runtime hangs.

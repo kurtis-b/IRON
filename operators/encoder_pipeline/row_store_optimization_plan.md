@@ -29,6 +29,11 @@ The design currently uses row-store in these places:
   - `parallel_heads == 4`
   - `effective_ffn_branches <= 4`
 
+For the high-`pacc` single-FFN-branch tail (`parallel_heads >= 6`,
+`proj_acc_depth >= 16`, `effective_ffn_branches == 1`), the design now avoids
+`ln2Replay` entirely and uses the direct replay pass emitted by FFN-down into
+AddNorm2.
+
 Everything else falls back to forwarded `ObjectFifo` staging.
 
 ### What Row-Store Should Replace
@@ -153,6 +158,16 @@ After targeted validation, rerun:
   - full tracked selections are green again:
     - `lnstage_memtile`: `100 passed, 40 skipped`
     - `lnstage_ddr`: `115 passed, 40 skipped`
+
+- AddNorm2 tail replay is now partially optimized for the high-`pacc`
+  single-branch case:
+  - when `parallel_heads >= 6`, `proj_acc_depth >= 16`, and
+    `effective_ffn_branches == 1`, AddNorm2 consumes FFN-down's direct replay
+    pass instead of instantiating a separate `ln2Replay` memtile stream
+  - this fixes the previously failing `6pheads_1pffn_16pacc_2opg` `64seq`
+    cases in both `memtile` and `ddr`
+  - updated `64qseqtile / 48embtile / 16pacc` comparison matrix:
+    - `120 passed, 95 failed, 295 deselected`
 
 ### Expected Outcome
 

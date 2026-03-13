@@ -15,6 +15,8 @@ Fused encoder operator: `MHA + AddNorm1 + FFN + AddNorm2`.
     DDR low-head layouts falling back to FIFO by default
 - `ln1_staging_design="memtile"`: LN1 output is broadcast on-chip to FFN-up branches.
 - `ln1_staging_design="ddr"`: LN1 output is staged through DDR once, then broadcast on-chip.
+- For the high-`pacc` single-FFN-branch tail (`parallel_heads >= 6`, `proj_acc_depth >= 16`, `effective_ffn_branches == 1`),
+  AddNorm2 now consumes the direct replay pass from FFN-down instead of creating a separate `ln2Replay` memtile stream.
 - Topology knobs in test IDs: `pheads`, `pffn`, `pacc`, `opg`.
 
 ## Placement overview
@@ -141,5 +143,8 @@ python operators/encoder_pipeline/profile_debug_modes.py --design memtile --clea
     - `4pheads_4pffn_8pacc_4opg`
     - `4pheads_6pffn_6pacc_2opg`
     - `16heads_4096ffn_32qseqtile_64kvtile_128embtile_4pheads_4pffn_8pacc_4opg` (`ddr` only)
+- Updated `64qseqtile / 48embtile / 16pacc` comparison matrix after the LN2 direct-replay change:
+  - `120 passed, 95 failed, 295 deselected`
+  - the previously failing `6pheads_1pffn_16pacc_2opg` `64seq` cases now pass in both `memtile` and `ddr`
 - Re-run broader selections after changing row-store channel maps or adding new row-store sites.
 - The current `64embtile / 12pacc` experiments no longer fail on LN/O-proj/FFN-down row-store staging; the first exposed allocator limit is now the final `memLN2` shim drain.
