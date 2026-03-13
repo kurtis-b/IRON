@@ -19,13 +19,13 @@ REL_TOL = 4.0e-2
 ABS_TOL = 1.5e-1
 ERROR_THRESHOLD = 0.005
 
-DEFAULT_TEST_WARMUP_ITERS = 3
-DEFAULT_TEST_TIMED_ITERS = 20
-DEFAULT_TEST_LN1_STAGING_DESIGNS = ("memtile", "ddr")
+TEST_WARMUP_ITERS = 3
+TEST_TIMED_ITERS = 20
+TEST_LN1_STAGING_DESIGNS = ("memtile", "ddr")
 
 ENABLE_STAGE_PROFILE_TESTS = False
-DEFAULT_STAGE_PROFILE_CASE = (1024, 64, 12, 3072, 32, 64, 96, 6, 3, 8)
-DEFAULT_STAGE_PROFILE_MODES = (
+STAGE_PROFILE_BASE_CASE = (1024, 64, 12, 3072, 32, 64, 96, 6, 3, 8)
+STAGE_PROFILE_MODES = (
     "full",
     "mha",
     "an1",
@@ -35,8 +35,8 @@ DEFAULT_STAGE_PROFILE_MODES = (
     "down",
     "an2",
 )
-DEFAULT_STAGE_PROFILE_WARMUP_ITERS = 3
-DEFAULT_STAGE_PROFILE_TIMED_ITERS = 20
+STAGE_PROFILE_WARMUP_ITERS = 3
+STAGE_PROFILE_TIMED_ITERS = 20
 
 _INPUT_KEYS = ("QKV", "W_O", "OR", "B_Up", "B_Down")
 _STAGE_PROFILE_SPECS = {
@@ -151,59 +151,13 @@ def _validate_case(case: tuple[int, ...]) -> None:
         raise ValueError(f"o_proj_acc_group_size must divide parallel_heads for {case}")
 
 
-TEST_WARMUP_ITERS = int(DEFAULT_TEST_WARMUP_ITERS)
-TEST_TIMED_ITERS = int(DEFAULT_TEST_TIMED_ITERS)
-invalid_test_iter_checks = [
-    TEST_WARMUP_ITERS < 0,
-    TEST_TIMED_ITERS <= 0,
-]
-if any(invalid_test_iter_checks):
-    raise ValueError("Warmup must be >= 0 and timed iterations must be > 0")
-TEST_LN1_STAGING_DESIGNS = tuple(
-    dict.fromkeys(
-        str(v).strip().lower()
-        for v in DEFAULT_TEST_LN1_STAGING_DESIGNS
-        if str(v).strip()
-    )
-)
-invalid_ln1_design_checks = [
-    not TEST_LN1_STAGING_DESIGNS,
-    any(v not in ("ddr", "memtile") for v in TEST_LN1_STAGING_DESIGNS),
-]
-if any(invalid_ln1_design_checks):
-    raise ValueError(
-        "DEFAULT_TEST_LN1_STAGING_DESIGNS must contain only 'ddr'/'memtile'"
-    )
-STAGE_PROFILE_MODES = tuple(dict.fromkeys(DEFAULT_STAGE_PROFILE_MODES))
-invalid_stage_mode_checks = [
-    not STAGE_PROFILE_MODES,
-    any(m not in _STAGE_PROFILE_SPECS for m in STAGE_PROFILE_MODES),
-]
-if any(invalid_stage_mode_checks):
-    raise ValueError(
-        "DEFAULT_STAGE_PROFILE_MODES contains invalid entries "
-        f"(got {DEFAULT_STAGE_PROFILE_MODES}, valid={tuple(_STAGE_PROFILE_SPECS)})"
-    )
-STAGE_PROFILE_WARMUP_ITERS = int(DEFAULT_STAGE_PROFILE_WARMUP_ITERS)
-STAGE_PROFILE_TIMED_ITERS = int(DEFAULT_STAGE_PROFILE_TIMED_ITERS)
-invalid_stage_iter_checks = [
-    STAGE_PROFILE_WARMUP_ITERS < 0,
-    STAGE_PROFILE_TIMED_ITERS <= 0,
-]
-if any(invalid_stage_iter_checks):
-    raise ValueError(
-        "Stage profile warmup must be >= 0 and timed iterations must be > 0"
-    )
-STAGE_PROFILE_CASES = (
-    _case_with_default_opg(tuple(map(int, DEFAULT_STAGE_PROFILE_CASE))),
-)
+STAGE_PROFILE_CASE = _case_with_default_opg(STAGE_PROFILE_BASE_CASE)
 
 _COMPARISON_BASE_CASES = list(
     dict.fromkeys(
-        variant
+        _high_pacc_seq64_variant(case)
         for case in _REGULAR_BASE_CASES
-        for variant in (_high_pacc_seq64_variant(case),)
-        if _is_evenly_partitioned(variant)
+        if _is_evenly_partitioned(_high_pacc_seq64_variant(case))
     )
 )
 _REGULAR_CASES = [
@@ -218,9 +172,6 @@ _DDR_ONLY_REGULAR_CASES = {
     _case_with_default_opg(_high_pacc_seq64_variant(case))
     for case in _REGULAR_BASE_CASES[-3:]
 }
-_EXTENSIVE_CASES: list[tuple[int, ...]] = []
-
-
 @lru_cache(maxsize=64)
 def _cached_golden_reference(
     seq_len: int, d: int, heads: int, intermediate_size: int, debug_mode: int
@@ -254,12 +205,6 @@ def _case_name(
         f"{parallel_heads}pheads_{parallel_ffn}pffn_{proj_acc_depth}pacc_"
         f"{o_proj_acc_group_size}opg"
     )
-
-
-def generate_test_params(extensive: bool = False):
-    params = _EXTENSIVE_CASES if extensive else _REGULAR_CASES
-    return params, [_case_name(*case) for case in params]
-
 
 def _run_encoder_pipeline_case(
     case,
@@ -326,25 +271,9 @@ def _assert_error_budget(errors, case):
     ), f"Test failed with {num_errors} errors (max allowable: {max_errors})"
 
 
-def _build_case_params():
-    regular, regular_names = generate_test_params(extensive=False)
-    extensive, extensive_names = generate_test_params(extensive=True)
-    return [
-        pytest.param(case, id=name) for case, name in zip(regular, regular_names)
-    ] + [
-        pytest.param(case, marks=pytest.mark.extensive, id=name)
-        for case, name in zip(extensive, extensive_names)
-    ]
-
-
-def _stage_case_id(case):
-    return f"{case[0]}seq_{case[2]}heads_{case[7]}pheads_{case[8]}pffn_{case[9]}pacc"
-
-
 def _build_encoder_params():
     params = []
-    for p in _build_case_params():
-        case = p.values[0]
+    for case in _REGULAR_CASES:
         designs = (
             ("ddr",) if case in _DDR_ONLY_REGULAR_CASES else TEST_LN1_STAGING_DESIGNS
         )
@@ -353,8 +282,7 @@ def _build_encoder_params():
                 pytest.param(
                     case,
                     design,
-                    marks=p.marks,
-                    id=f"lnstage_{design}-{p.id}",
+                    id=f"lnstage_{design}-{_case_name(*case)}",
                 )
             )
     return params
@@ -364,18 +292,22 @@ def _build_stage_profile_params():
     params = []
     for stage_mode in STAGE_PROFILE_MODES:
         debug_mode, label = _STAGE_PROFILE_SPECS[stage_mode]
-        for stage_case in STAGE_PROFILE_CASES:
-            for design in TEST_LN1_STAGING_DESIGNS:
-                params.append(
-                    pytest.param(
-                        stage_mode,
-                        debug_mode,
-                        label,
-                        stage_case,
-                        design,
-                        id=f"lnstage_{design}-{_stage_case_id(stage_case)}-{label}",
-                    )
+        for design in TEST_LN1_STAGING_DESIGNS:
+            params.append(
+                pytest.param(
+                    stage_mode,
+                    debug_mode,
+                    label,
+                    STAGE_PROFILE_CASE,
+                    design,
+                    id=(
+                        f"lnstage_{design}-"
+                        f"{STAGE_PROFILE_CASE[0]}seq_{STAGE_PROFILE_CASE[2]}heads_"
+                        f"{STAGE_PROFILE_CASE[7]}pheads_{STAGE_PROFILE_CASE[8]}pffn_"
+                        f"{STAGE_PROFILE_CASE[9]}pacc-{label}"
+                    ),
                 )
+            )
     return params
 
 

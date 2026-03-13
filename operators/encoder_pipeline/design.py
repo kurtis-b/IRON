@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 import sys
 import math
 import logging
+from types import SimpleNamespace
 
 from ml_dtypes import bfloat16
 import numpy as np
@@ -61,59 +61,7 @@ def fused_mha(
     runtime_serialize_tail_io: bool | None = None,
     runtime_serialize_q_prestage: bool | None = None,
     runtime_tail_wait_mode: str = "relax_ffn_weights",
-    _ln1_mode_hooks=None,
 ):
-    def _override_int_list_env(name: str, default: list[int]) -> list[int]:
-        raw = os.environ.get(name)
-        if raw is None or raw.strip() == "":
-            return default
-        return [int(part.strip()) for part in raw.split(",") if part.strip()]
-
-    def _override_int_env(name: str, default: int) -> int:
-        raw = os.environ.get(name)
-        if raw is None or raw.strip() == "":
-            return default
-        return int(raw)
-
-    def _override_bool_env(name: str, default: bool) -> bool:
-        raw = os.environ.get(name)
-        if raw is None or raw.strip() == "":
-            return default
-        norm = raw.strip().lower()
-        if norm in {"1", "true", "yes", "on"}:
-            return True
-        if norm in {"0", "false", "no", "off"}:
-            return False
-        raise ValueError(
-            f"{name} must be one of 1/0/true/false/yes/no/on/off (got {raw!r})"
-        )
-
-    def _has_any_env_override(names: list[str]) -> bool:
-        return any(
-            os.environ.get(name) is not None and os.environ.get(name).strip() != ""
-            for name in names
-        )
-
-    def _resolve_row_store_compute_buffer_counts(
-        *,
-        shared_env: str,
-        default_shared: int,
-        produce_env: str,
-        default_produce: int = 0,
-        consume_env: str,
-        default_consume: int = 0,
-    ) -> tuple[int, int, int]:
-        shared = _override_int_env(shared_env, default_shared)
-        produce = _override_int_env(produce_env, default_produce)
-        consume = _override_int_env(consume_env, default_consume)
-        if shared < 1:
-            raise ValueError(f"{shared_env} must be >= 1 (got {shared})")
-        if produce < 0:
-            raise ValueError(f"{produce_env} must be >= 0 (got {produce})")
-        if consume < 0:
-            raise ValueError(f"{consume_env} must be >= 0 (got {consume})")
-        return shared, produce, consume
-
     embed_sz = heads * d
     if ffn_intermediate_size is None:
         ffn_intermediate_size = 4 * embed_sz
@@ -132,86 +80,18 @@ def fused_mha(
     enable_tracing = True if trace_size > 0 else False
     dtype_str = "bf16"
     dev = "npu2"
-    (
-        replay_row_store_compute_buffer_count,
-        replay_row_store_compute_produce_buffer_count,
-        replay_row_store_compute_consume_buffer_count,
-    ) = _resolve_row_store_compute_buffer_counts(
-        shared_env="ENCODER_REPLAY_ROW_STORE_COMPUTE_BUFFER_COUNT",
-        default_shared=2,
-        produce_env="ENCODER_REPLAY_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
-        default_produce=0,
-        consume_env="ENCODER_REPLAY_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
-        default_consume=0,
-    )
-    (
-        accum_row_store_compute_buffer_count,
-        accum_row_store_compute_produce_buffer_count,
-        accum_row_store_compute_consume_buffer_count,
-    ) = _resolve_row_store_compute_buffer_counts(
-        shared_env="ENCODER_ACCUM_ROW_STORE_COMPUTE_BUFFER_COUNT",
-        default_shared=1,
-        produce_env="ENCODER_ACCUM_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
-        default_produce=0,
-        consume_env="ENCODER_ACCUM_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
-        default_consume=0,
-    )
-    (
-        ln1_replay_row_store_compute_buffer_count,
-        ln1_replay_row_store_compute_produce_buffer_count,
-        ln1_replay_row_store_compute_consume_buffer_count,
-    ) = _resolve_row_store_compute_buffer_counts(
-        shared_env="ENCODER_LN1_REPLAY_ROW_STORE_COMPUTE_BUFFER_COUNT",
-        default_shared=replay_row_store_compute_buffer_count,
-        produce_env="ENCODER_LN1_REPLAY_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
-        default_produce=(
-            replay_row_store_compute_produce_buffer_count
-            if replay_row_store_compute_produce_buffer_count > 0
-            else 2
-        ),
-        consume_env="ENCODER_LN1_REPLAY_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
-        default_consume=(
-            replay_row_store_compute_consume_buffer_count
-            if replay_row_store_compute_consume_buffer_count > 0
-            else 1
-        ),
-    )
-    (
-        ln2_replay_row_store_compute_buffer_count,
-        ln2_replay_row_store_compute_produce_buffer_count,
-        ln2_replay_row_store_compute_consume_buffer_count,
-    ) = _resolve_row_store_compute_buffer_counts(
-        shared_env="ENCODER_LN2_REPLAY_ROW_STORE_COMPUTE_BUFFER_COUNT",
-        default_shared=replay_row_store_compute_buffer_count,
-        produce_env="ENCODER_LN2_REPLAY_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
-        default_produce=replay_row_store_compute_produce_buffer_count,
-        consume_env="ENCODER_LN2_REPLAY_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
-        default_consume=replay_row_store_compute_consume_buffer_count,
-    )
-    (
-        o_proj_acc_row_store_compute_buffer_count,
-        o_proj_acc_row_store_compute_produce_buffer_count,
-        o_proj_acc_row_store_compute_consume_buffer_count,
-    ) = _resolve_row_store_compute_buffer_counts(
-        shared_env="ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_BUFFER_COUNT",
-        default_shared=accum_row_store_compute_buffer_count,
-        produce_env="ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
-        default_produce=accum_row_store_compute_produce_buffer_count,
-        consume_env="ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
-        default_consume=accum_row_store_compute_consume_buffer_count,
-    )
-    (
-        ffn_down_acc_row_store_compute_buffer_count,
-        ffn_down_acc_row_store_compute_produce_buffer_count,
-        ffn_down_acc_row_store_compute_consume_buffer_count,
-    ) = _resolve_row_store_compute_buffer_counts(
-        shared_env="ENCODER_FFN_DOWN_ACC_ROW_STORE_COMPUTE_BUFFER_COUNT",
-        default_shared=accum_row_store_compute_buffer_count,
-        produce_env="ENCODER_FFN_DOWN_ACC_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
-        default_produce=accum_row_store_compute_produce_buffer_count,
-        consume_env="ENCODER_FFN_DOWN_ACC_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
-        default_consume=accum_row_store_compute_consume_buffer_count,
-    )
+    ln1_replay_row_store_compute_buffer_count = 2
+    ln1_replay_row_store_compute_produce_buffer_count = 2
+    ln1_replay_row_store_compute_consume_buffer_count = 1
+    ln2_replay_row_store_compute_buffer_count = 2
+    ln2_replay_row_store_compute_produce_buffer_count = 0
+    ln2_replay_row_store_compute_consume_buffer_count = 0
+    o_proj_acc_row_store_compute_buffer_count = 1
+    o_proj_acc_row_store_compute_produce_buffer_count = 0
+    o_proj_acc_row_store_compute_consume_buffer_count = 0
+    ffn_down_acc_row_store_compute_buffer_count = 1
+    ffn_down_acc_row_store_compute_produce_buffer_count = 0
+    ffn_down_acc_row_store_compute_consume_buffer_count = 0
 
     num_q_seq_blocks = seq_len // seq_tile
     num_kv_seq_blocks = seq_len // kv_seq_tile
@@ -223,14 +103,6 @@ def fused_mha(
     if o_proj_acc_group_size <= 0:
         raise ValueError(
             f"o_proj_acc_group_size must be > 0 (got {o_proj_acc_group_size})"
-        )
-    o_proj_acc_group_size = _override_int_env(
-        "ENCODER_OPROJ_ACC_GROUP_SIZE",
-        o_proj_acc_group_size,
-    )
-    if o_proj_acc_group_size <= 0:
-        raise ValueError(
-            "ENCODER_OPROJ_ACC_GROUP_SIZE must be > 0 " f"(got {o_proj_acc_group_size})"
         )
     if o_proj_acc_group_size > parallel_heads:
         raise ValueError(
@@ -293,11 +165,7 @@ def fused_mha(
         )
     ffn_col_groups = ffn_intermediate_size // emb_tile
     if ln1_stage_mode is None:
-        # Default to DDR-staged LN1 design unless explicitly disabled.
-        stage_ln1_to_ddr = _override_bool_env(
-            "ENCODER_STAGE_LN1_TO_DDR",
-            True,
-        )
+        stage_ln1_to_ddr = True
     else:
         ln1_stage_mode_norm = ln1_stage_mode.strip().lower()
         if ln1_stage_mode_norm in ("ddr", "dram", "host"):
@@ -310,26 +178,94 @@ def fused_mha(
                 "{ddr, dram, host, memtile, mt, onchip} "
                 f"(got '{ln1_stage_mode}')"
             )
-    if _ln1_mode_hooks is None:
-        if stage_ln1_to_ddr:
-            from operators.encoder_pipeline import design_ln1_ddr as ln1_mode_hooks
-        else:
-            from operators.encoder_pipeline import design_ln1_memtile as ln1_mode_hooks
+    if stage_ln1_to_ddr:
+        from operators.encoder_pipeline import design_ln1_ddr as ln1_mode_hooks
     else:
-        ln1_mode_hooks = _ln1_mode_hooks
-    default_oproj_row_store_tuning_allowed = not _has_any_env_override(
-        [
-            "ENCODER_ACCUM_ROW_STORE_COMPUTE_BUFFER_COUNT",
-            "ENCODER_ACCUM_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
-            "ENCODER_ACCUM_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
-            "ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_BUFFER_COUNT",
-            "ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
-            "ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
-        ]
+        from operators.encoder_pipeline import design_ln1_memtile as ln1_mode_hooks
+    ln1_mode_hooks = SimpleNamespace(
+        choose_ln2_replay_mem_tile_col=getattr(
+            ln1_mode_hooks,
+            "choose_ln2_replay_mem_tile_col",
+            lambda **kwargs: kwargs["default_col"],
+        ),
+        plan_branch_stage_configuration=getattr(
+            ln1_mode_hooks,
+            "plan_branch_stage_configuration",
+            lambda *, branch_stage_cols, branch_bup_cols, branch_down_b_cols, **_unused: (
+                branch_stage_cols,
+                branch_bup_cols,
+                branch_down_b_cols,
+                [],
+            ),
+        ),
+        build_runtime_state=getattr(
+            ln1_mode_hooks,
+            "build_runtime_state",
+            lambda **_unused: {
+                "ln1_ddr_stage_enabled_branches": [],
+                "ln1_ddr_stage_enabled": False,
+            },
+        ),
+        adjust_wait_ffn_weight_fill=getattr(
+            ln1_mode_hooks,
+            "adjust_wait_ffn_weight_fill",
+            lambda *,
+            wait_ffn_weight_fill,
+            use_ln1_broadcast,
+            effective_ffn_branches,
+            **_unused: True
+            if use_ln1_broadcast and effective_ffn_branches > 1
+            else wait_ffn_weight_fill,
+        ),
+        should_prefill_ffn_weights=getattr(
+            ln1_mode_hooks,
+            "should_prefill_ffn_weights",
+            lambda **_unused: True,
+        ),
+        use_bup_broadcast_priming=getattr(
+            ln1_mode_hooks,
+            "use_bup_broadcast_priming",
+            lambda **_unused: False,
+        ),
+        schedule_runtime_tap=getattr(
+            ln1_mode_hooks,
+            "schedule_runtime_tap",
+            lambda *,
+            rt,
+            schedule_final_output_for_tap,
+            tap_idx,
+            tg,
+            tg_tail_fill,
+            decouple_tail_fill,
+            pending_ln1_refill_tg,
+            pending_output_tap_idx,
+            **_unused: (
+                schedule_final_output_for_tap(tap_idx),
+                rt.finish_task_group(tg),
+                rt.finish_task_group(tg_tail_fill) if decouple_tail_fill else None,
+                (pending_ln1_refill_tg, pending_output_tap_idx),
+            )[-1],
+        ),
+        finalize_runtime=getattr(
+            ln1_mode_hooks,
+            "finalize_runtime",
+            lambda *,
+            pending_ln1_refill_tg,
+            pending_output_tap_idx,
+            **_unused: (pending_ln1_refill_tg, pending_output_tap_idx),
+        ),
+        **{
+            name: getattr(ln1_mode_hooks, name)
+            for name in (
+                "ln1_dram_stage_rows",
+                "choose_ln1_replay_mem_tile_col",
+                "build_ln1_to_ffn_up_path",
+                "adjust_ffn_down_acc_mem_tile_cols",
+            )
+        },
     )
     if (
-        default_oproj_row_store_tuning_allowed
-        and not stage_ln1_to_ddr
+        not stage_ln1_to_ddr
         and parallel_heads == 4
         and emb_tile <= 96
     ):
@@ -344,26 +280,7 @@ def fused_mha(
             "nB_tiles_distributed must be <= ffn_col_groups "
             f"({nB_tiles_distributed} > {ffn_col_groups})"
         )
-    disable_ffn_pruning_when_opg_gt1 = _override_bool_env(
-        "ENCODER_DISABLE_FFN_PRUNING_WHEN_OPG_GT1",
-        True,
-    )
-    pruning_disabled_for_this_config = (
-        disable_ffn_pruning_when_opg_gt1 and o_proj_acc_group_size > 1
-    )
-    force_single_branch_wide_acc = _override_bool_env(
-        "ENCODER_FORCE_SINGLE_BRANCH_WIDE_ACC",
-        not pruning_disabled_for_this_config,
-    )
-    force_single_branch_high_acc = _override_bool_env(
-        "ENCODER_FORCE_SINGLE_BRANCH_HIGH_ACC",
-        not pruning_disabled_for_this_config,
-    )
-    allow_west_down_reduction = _override_bool_env(
-        "ENCODER_ALLOW_WEST_DOWN_REDUCTION",
-        False,
-    )
-
+    pruning_disabled_for_this_config = o_proj_acc_group_size > 1
     num_o_col_groups = embed_sz // (emb_tile * proj_acc_depth)
     ln_tiles_per_q_block = num_o_col_groups * proj_acc_depth
     ffn_layout = find_ffn_layout(
@@ -371,7 +288,7 @@ def fused_mha(
         # For the no-merge topology, LN2 must always receive one reduced FFN stream
         # via a direct N/E/S neighboring down-proj connection.
         max_non_neighbor_down_to_ln2=0,
-        restrict_down_reduction_to_nes=not allow_west_down_reduction,
+        restrict_down_reduction_to_nes=True,
         restrict_down_to_ln2_to_nes=True,
     )
     layout_down_edge_deltas = [
@@ -384,10 +301,9 @@ def fused_mha(
         delta_col < 0 for (delta_col, _delta_row) in layout_down_edge_deltas
     )
 
-    if not allow_west_down_reduction and layout_has_west_down_edge:
+    if layout_has_west_down_edge:
         raise ValueError(
-            "FFN layout produced westward down-reduction edge(s) while "
-            "ENCODER_ALLOW_WEST_DOWN_REDUCTION=0: "
+            "FFN layout produced westward down-reduction edge(s): "
             f"edges={ffn_layout['down_reduction_edges']} deltas={layout_down_edge_deltas}"
         )
     ln1_tile = tuple(ffn_layout["ln1_tile"])
@@ -406,49 +322,20 @@ def fused_mha(
             "FFN layout invariant violated: down_root must be final down tile "
             f"(root_idx={down_root_idx}, max={max_ffn_branches})"
         )
-    # Keep the active branch subset as a suffix ending at root to preserve
-    # neighbor-chain reduction order when pruning.
-    selected_start_idx = max(0, max_ffn_branches - requested_ffn_branches)
-    selected_start_idx = _override_int_env(
-        "ENCODER_FFN_BRANCH_START_IDX",
-        selected_start_idx,
+    selected_branch_indices = list(
+        range(max_ffn_branches - requested_ffn_branches, max_ffn_branches)
     )
-    if (
-        selected_start_idx < 0
-        or selected_start_idx + requested_ffn_branches > max_ffn_branches
-    ):
-        raise ValueError(
-            "ENCODER_FFN_BRANCH_START_IDX out of range for requested branches: "
-            f"start={selected_start_idx}, requested={requested_ffn_branches}, "
-            f"max={max_ffn_branches}"
-        )
-    selected_branch_indices = list(range(selected_start_idx, max_ffn_branches))
-    selected_branch_indices = selected_branch_indices[:requested_ffn_branches]
     if max_ffn_branches > 6:
         raise ValueError(
             "encoder_pipeline supports at most 6 FFN branches "
             f"(layout returned {max_ffn_branches})"
         )
-    # Grouped O-proj topologies need split B-weight ingress by default so
-    # requested FFN branch parallelism does not get pruned by shim stream count.
-    b_weight_split_requested = _override_bool_env(
-        "ENCODER_USE_B_WEIGHT_SPLIT",
-        o_proj_acc_group_size > 1 and nB_tiles_distributed >= 6,
-    )
-    bup_split_requested = _override_bool_env("ENCODER_USE_BUP_SPLIT", True)
-    bdown_split_requested = _override_bool_env("ENCODER_USE_BDOWN_SPLIT", True)
-    default_b_weight_split_chunk_size = (
+    b_weight_split_requested = o_proj_acc_group_size > 1 and nB_tiles_distributed >= 6
+    bup_split_requested = True
+    bdown_split_requested = True
+    b_weight_split_chunk_size_requested = (
         2 if (o_proj_acc_group_size > 1 and nB_tiles_distributed >= 6) else 3
     )
-    b_weight_split_chunk_size_requested = _override_int_env(
-        "ENCODER_B_WEIGHT_SPLIT_CHUNK_SIZE",
-        default_b_weight_split_chunk_size,
-    )
-    if b_weight_split_chunk_size_requested <= 0:
-        raise ValueError(
-            "ENCODER_B_WEIGHT_SPLIT_CHUNK_SIZE must be > 0 "
-            f"(got {b_weight_split_chunk_size_requested})"
-        )
 
     def _is_nes_neighbor(
         src_tile: tuple[int, int],
@@ -722,7 +609,7 @@ def fused_mha(
         # Keep up to 2 FFN branches (for practical parallelism), and prune
         # non-root branches only beyond that.
         if (
-            force_single_branch_wide_acc
+            not pruning_disabled_for_this_config
             and parallel_heads >= 6
             and proj_acc_depth >= 6
             and len(selected_branch_indices) > 2
@@ -732,7 +619,7 @@ def fused_mha(
             )
             continue
         if (
-            force_single_branch_high_acc
+            not pruning_disabled_for_this_config
             and parallel_heads >= 4
             and proj_acc_depth >= 8
             and len(selected_branch_indices) > 1
@@ -819,37 +706,6 @@ def fused_mha(
         )
     # LN1 fanout is broadcast-only in both memtile and DDR modes.
     use_ln1_broadcast = True
-    ffn_group_split_override = ffn_group_split
-    if ffn_group_split_override is not None and ffn_group_split_override.strip() != "":
-        override_counts = [
-            int(v.strip())
-            for v in ffn_group_split_override.split(",")
-            if v.strip() != ""
-        ]
-        if len(override_counts) != effective_ffn_branches:
-            raise ValueError(
-                "ENCODER_FFN_GROUP_SPLIT must have one count per effective branch "
-                f"(got {len(override_counts)}, expected {effective_ffn_branches})"
-            )
-        if any(v <= 0 for v in override_counts):
-            raise ValueError(
-                "ENCODER_FFN_GROUP_SPLIT values must be > 0 " f"(got {override_counts})"
-            )
-        if sum(override_counts) != profile_replay_groups:
-            raise ValueError(
-                "ENCODER_FFN_GROUP_SPLIT counts must sum to profile_replay_groups "
-                f"(sum={sum(override_counts)}, expected={profile_replay_groups})"
-            )
-        ffn_col_group_counts = override_counts
-        ffn_col_group_offsets = []
-        running_group_offset = 0
-        for count in ffn_col_group_counts:
-            ffn_col_group_offsets.append(running_group_offset)
-            running_group_offset += count
-        logging.warning(
-            "Overriding FFN physical group split via ENCODER_FFN_GROUP_SPLIT=%s",
-            ffn_col_group_counts,
-        )
     if len(set(ffn_col_group_counts)) != 1:
         raise ValueError(
             "FFN branches must be evenly partitioned for encoder_pipeline "
@@ -866,11 +722,6 @@ def fused_mha(
         )
         b_weight_split_enabled = False
     b_weight_split_chunk_size = b_weight_split_chunk_size_requested
-    if b_weight_split_chunk_size <= 0:
-        raise ValueError(
-            "ENCODER_B_WEIGHT_SPLIT_CHUNK_SIZE must be > 0 "
-            f"(got {b_weight_split_chunk_size})"
-        )
     # Targeted low-head 6-way FFN memtile topology:
     # - 4pheads, 6pffn, 8pacc, 2opg
     # Use 2-way branch grouping for B-weight streams.
@@ -1009,14 +860,13 @@ def fused_mha(
         branch_idx: stream_idx
         for stream_idx, branch_idx in enumerate(ffn_down_output_branches)
     }
-    stage_ffn_down_to_ddr = _override_bool_env(
-        "ENCODER_STAGE_FFN_DOWN_TO_DDR",
-        len(ffn_down_output_branches) == 2 and not use_dual_ln2_ffn_inputs,
+    stage_ffn_down_to_ddr = (
+        len(ffn_down_output_branches) == 2 and not use_dual_ln2_ffn_inputs
     )
     staged_ffn_down_stream_idx = (
         1 if stage_ffn_down_to_ddr and len(ffn_down_output_branches) > 1 else None
     )
-    ffn_down_ddr_stage_col = _override_int_env("ENCODER_FFN_DOWN_DDR_STAGE_COL", 0)
+    ffn_down_ddr_stage_col = 0
     # Worker count:
     # - MHA path: 4 workers per parallel head
     # - Encoder tail:
@@ -1080,7 +930,7 @@ def fused_mha(
     )
     logging.info(
         "FFN down-reduction direction policy: allow_west=%s edge_deltas=%s",
-        allow_west_down_reduction,
+        False,
         layout_down_edge_deltas,
     )
     logging.info(
@@ -1391,9 +1241,6 @@ def fused_mha(
             )
         )  # Split between N parallel blocks of sequences
 
-    # VJUNG: The SequentialPlacer will place all of these on the same MemTile if Placement is specified. We would need a list of placement in case of one-many or many-one.
-    # I think the Sequential Placer will fail if we do a split/join with more than 6 I/Os cuz it tries to place them all on the same tile.
-
     # K is stored in column-major order
     k_dims = [(kv_seq_tile // t, t * d), (d // s, s), (t, d), (s, 1)]
     inK_streams = []
@@ -1512,15 +1359,6 @@ def fused_mha(
     ow_fifo_depth = 1 if emb_tile >= 128 else of_depth
     if use_two_way_mha_stream_split:
         ow_fifo_depth = 1
-    ow_fifo_depth = _override_int_env("ENCODER_OW_FIFO_DEPTH", ow_fifo_depth)
-    if ow_fifo_depth <= 0:
-        raise ValueError(
-            "ENCODER_OW_FIFO_DEPTH must be > 0 " f"(got {ow_fifo_depth})"
-        )
-    shallow_ow_on_o_proj_accum = _override_bool_env(
-        "ENCODER_SHALLOW_OW_ON_O_PROJ_ACCUM",
-        False,
-    )
     inOW_streams = []
     memOW = []
     for split_idx in range(mha_stream_split_factor):
@@ -1542,16 +1380,7 @@ def fused_mha(
                     for i in range(heads_per_mha_stream)
                 ],
                 dims_to_stream=[ow_dims] * heads_per_mha_stream,
-                depths=[
-                    (
-                        1
-                        if shallow_ow_on_o_proj_accum
-                        and (split_idx * heads_per_mha_stream + i)
-                        in o_proj_stage_core_set
-                        else ow_fifo_depth
-                    )
-                    for i in range(heads_per_mha_stream)
-                ],
+                depths=[ow_fifo_depth] * heads_per_mha_stream,
                 placement=Tile(col=ow_stream_mem_cols[split_idx], row=1),
             )
         )  # Split between N parallel blocks of heads
@@ -1570,10 +1399,7 @@ def fused_mha(
     o_proj_accum_core_set = set(o_proj_accum_core_indices)
     outOProjAccumIn = [None] * parallel_heads
     outOProjAccumOut = [None] * parallel_heads
-    use_o_proj_acc_row_store = _override_bool_env(
-        "ENCODER_USE_O_PROJ_ACC_ROW_STORE",
-        parallel_heads <= 4,
-    )
+    use_o_proj_acc_row_store = parallel_heads <= 4
 
     def _allocate_o_proj_acc_row_store_channels(
         mem_tile_col: int, slot_idx: int
@@ -1609,10 +1435,6 @@ def fused_mha(
             [5, 6, 4, 7]
             if effective_ffn_branches <= 2 and proj_acc_depth >= 16
             else [5, 6, 7, 4]
-        )
-        acc_mem_tile_order = _override_int_list_env(
-            "ENCODER_ACC_MEM_TILE_ORDER_GROUPED_PH_GE6_ACC_GE6",
-            acc_mem_tile_order,
         )
     elif parallel_heads <= 4:
         if proj_acc_depth >= 8 and effective_ffn_branches > 1:
@@ -1650,10 +1472,6 @@ def fused_mha(
         # Keep high-head accumulator streams on 4/5/6/7. Col3 already carries
         # high fanout from W_O staging and can hit output-channel limits.
         acc_mem_tile_order = [4, 5, 6, 7, 6, 5, 7]
-        acc_mem_tile_order = _override_int_list_env(
-            "ENCODER_ACC_MEM_TILE_ORDER_PH_GE6_ACC_GE6",
-            acc_mem_tile_order,
-        )
     else:
         # For wider MHA parallelism, spread across available memtiles.
         acc_mem_tile_order = [4, 5, 6, 7, 4, 5, 7]
@@ -1729,15 +1547,9 @@ def fused_mha(
 
     # Intra-group neighbor chain: each core forwards its partial contribution to
     # the next core in the same group each qkv/acc iteration.
-    o_proj_group_chain_depth = _override_int_env(
-        "ENCODER_O_PROJ_GROUP_CHAIN_DEPTH",
-        1 if (o_proj_acc_group_size > 1 and parallel_heads >= 6) else of_depth,
+    o_proj_group_chain_depth = (
+        1 if (o_proj_acc_group_size > 1 and parallel_heads >= 6) else of_depth
     )
-    if o_proj_group_chain_depth <= 0:
-        raise ValueError(
-            "ENCODER_O_PROJ_GROUP_CHAIN_DEPTH must be > 0 "
-            f"(got {o_proj_group_chain_depth})"
-        )
     outOGroupPart = [None] * (parallel_heads - 1)
     for i in range(parallel_heads - 1):
         if o_proj_acc_group_size > 1 or o_proj_group_idx[i] == o_proj_group_idx[i + 1]:
@@ -1788,15 +1600,6 @@ def fused_mha(
     ln_input_depth = 2
     # emb_tile=128 can exceed O-proj core L1 with double-buffered O->LN1.
     o_proj_input_depth = 1 if emb_tile >= 128 else 2
-    o_proj_input_depth = _override_int_env(
-        "ENCODER_O_PROJ_INPUT_DEPTH",
-        o_proj_input_depth,
-    )
-    if o_proj_input_depth <= 0:
-        raise ValueError(
-            "ENCODER_O_PROJ_INPUT_DEPTH must be > 0 "
-            f"(got {o_proj_input_depth})"
-        )
     # O-proj stream into LN1 norm worker (no DMA layout transform).
     outOProjInput = ObjectFifo(
         o_ty,
@@ -1808,10 +1611,6 @@ def fused_mha(
         proj_acc_depth=proj_acc_depth,
         effective_ffn_branches=effective_ffn_branches,
         o_proj_acc_group_size=o_proj_acc_group_size,
-    )
-    ln1_replay_mem_tile_col = _override_int_env(
-        "ENCODER_LN1_REPLAY_MEM_TILE_COL",
-        ln1_replay_mem_tile_col,
     )
     ln1_norm_tile_obj = Tile(col=ln1_tile[0], row=ln1_tile[1])
     ln1Replay = MemTileRowStore(
@@ -1838,15 +1637,7 @@ def fused_mha(
         (s, 1),
     ]
     # AddNorm-2 consumes staged residual tiles from LN1 output path.
-    ffn_residual_depth = _override_int_env(
-        "ENCODER_FFN_RESIDUAL_DEPTH",
-        proj_acc_depth,
-    )
-    if ffn_residual_depth < proj_acc_depth:
-        raise ValueError(
-            "ENCODER_FFN_RESIDUAL_DEPTH must be >= proj_acc_depth "
-            f"(got {ffn_residual_depth}, proj_acc_depth={proj_acc_depth})"
-        )
+    ffn_residual_depth = proj_acc_depth
     ln_mem_tile_col = 7
     # AddNorm2 needs two logical passes (sum/sumsq pass + output pass).
     # Prefer LN2-side replay FIFO by default so FFN-down only emits one pass
@@ -1858,10 +1649,7 @@ def fused_mha(
     emit_ln2_replay_from_down_default = (
         ffn_down_acc_grouping_enabled and use_dual_ln2_ffn_inputs
     ) or high_pacc_direct_ln2_replay_default
-    emit_ln2_replay_from_down = _override_bool_env(
-        "ENCODER_EMIT_LN2_REPLAY_FROM_DOWN",
-        emit_ln2_replay_from_down_default,
-    )
+    emit_ln2_replay_from_down = emit_ln2_replay_from_down_default
     allow_high_pacc_dual_ln2_direct_replay = (
         use_dual_ln2_ffn_inputs
         and high_pacc_direct_ln2_replay_default
@@ -1872,9 +1660,6 @@ def fused_mha(
         and not ffn_down_acc_grouping_enabled
         and not allow_high_pacc_dual_ln2_direct_replay
     ):
-        logging.warning(
-            "Forcing ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0 for dual-input LN2 topology"
-        )
         emit_ln2_replay_from_down = False
     use_ln2_replay_store = (ffn_stage_only in (None, 2)) and (
         not emit_ln2_replay_from_down
@@ -1901,17 +1686,13 @@ def fused_mha(
             )
             else 4
         )
-    ln2_replay_mem_tile_col = _override_int_env(
-        "ENCODER_LN2_REPLAY_MEM_TILE_COL",
-        ln2_replay_mem_tile_default,
-    )
     ln2_replay_mem_tile_col = ln1_mode_hooks.choose_ln2_replay_mem_tile_col(
         parallel_heads=parallel_heads,
         proj_acc_depth=proj_acc_depth,
         effective_ffn_branches=effective_ffn_branches,
         o_proj_acc_group_size=o_proj_acc_group_size,
         stage_ln1_to_ddr=stage_ln1_to_ddr,
-        default_col=ln2_replay_mem_tile_col,
+        default_col=ln2_replay_mem_tile_default,
     )
     if (
         (not stage_ln1_to_ddr)
@@ -2040,18 +1821,6 @@ def fused_mha(
             # tail memtile block usage within the 48-block allocator budget.
             branch_bup_cols = [5, 5, 5]
             branch_down_b_cols = [4, 6, 5]
-        branch_stage_cols = _override_int_list_env(
-            "ENCODER_BRANCH_STAGE_COLS_PH_GE6_ACC_GE6",
-            branch_stage_cols,
-        )
-        branch_bup_cols = _override_int_list_env(
-            "ENCODER_BRANCH_BUP_COLS_PH_GE6_ACC_GE6",
-            branch_bup_cols,
-        )
-        branch_down_b_cols = _override_int_list_env(
-            "ENCODER_BRANCH_DOWN_B_COLS_PH_GE6_ACC_GE6",
-            branch_down_b_cols,
-        )
     elif parallel_heads >= 6:
         branch_stage_cols = [6, 4, 5]
         branch_bup_cols = [6, 4, 5]
@@ -2060,10 +1829,6 @@ def fused_mha(
         # For low-head configurations, keep a wider default pool so FFN can
         # scale up to 6-way distribution when resources permit.
         branch_stage_cols = [6, 5, 4, 7, 3, 2]
-        branch_stage_cols = _override_int_list_env(
-            "ENCODER_BRANCH_STAGE_COLS",
-            branch_stage_cols,
-        )
         if bup_split_enabled or bdown_split_enabled:
             split_chunk_count = len(branch_split_chunks)
             up_stream_count = (
@@ -2175,14 +1940,6 @@ def fused_mha(
             branch_bup_cols, branch_down_b_cols = _allocate_ffn_weight_mem_tile_cols(
                 effective_ffn_branches
             )
-            branch_bup_cols = _override_int_list_env(
-                "ENCODER_BRANCH_BUP_COLS",
-                branch_bup_cols,
-            )
-            branch_down_b_cols = _override_int_list_env(
-                "ENCODER_BRANCH_DOWN_B_COLS",
-                branch_down_b_cols,
-            )
     if effective_ffn_branches > len(branch_stage_cols):
         raise ValueError(
             "Unsupported effective_ffn_branches for current memtile assignment "
@@ -2205,7 +1962,6 @@ def fused_mha(
         bup_split_enabled=bup_split_enabled,
         bdown_split_enabled=bdown_split_enabled,
         branch_split_chunks=branch_split_chunks,
-        _override_int_env=_override_int_env,
         _allocate_ffn_weight_mem_tile_cols_by_streams=_allocate_ffn_weight_mem_tile_cols_by_streams,
         logging_module=logging,
     )
@@ -2218,8 +1974,6 @@ def fused_mha(
         effective_ffn_branches=effective_ffn_branches,
         ffn_a_stage_mem_tile_cols=ffn_a_stage_mem_tile_cols,
         ln1_ddr_staged_branch_indices=ln1_ddr_staged_branch_indices,
-        _override_int_env=_override_int_env,
-        _override_bool_env=_override_bool_env,
         parallel_heads=parallel_heads,
         proj_acc_depth=proj_acc_depth,
         o_proj_acc_group_size=o_proj_acc_group_size,
@@ -2254,15 +2008,6 @@ def fused_mha(
     ffn_weight_fifo_depth = 1 if emb_tile >= 128 else 2
     if use_two_way_mha_stream_split:
         ffn_weight_fifo_depth = 1
-    ffn_weight_fifo_depth = _override_int_env(
-        "ENCODER_FFN_WEIGHT_FIFO_DEPTH",
-        ffn_weight_fifo_depth,
-    )
-    if ffn_weight_fifo_depth <= 0:
-        raise ValueError(
-            "ENCODER_FFN_WEIGHT_FIFO_DEPTH must be > 0 "
-            f"(got {ffn_weight_fifo_depth})"
-        )
     ffn_bup_mem_tile_cols = branch_bup_cols[:effective_ffn_branches]
     ffn_bdown_mem_tile_cols = branch_down_b_cols[:effective_ffn_branches]
     logging.info(
@@ -2280,18 +2025,9 @@ def fused_mha(
     ffn_bdown_split_mem_tile_cols = []
     ffn_b_pack_elem_count = emb_tile * emb_tile
     if bup_split_enabled or bdown_split_enabled:
-        default_split_parent_depth = (
+        ffn_weight_split_parent_depth = (
             1 if use_two_way_mha_stream_split else max(2, ffn_weight_fifo_depth)
         )
-        ffn_weight_split_parent_depth = _override_int_env(
-            "ENCODER_B_WEIGHT_SPLIT_PARENT_DEPTH",
-            default_split_parent_depth,
-        )
-        if ffn_weight_split_parent_depth <= 0:
-            raise ValueError(
-                "ENCODER_B_WEIGHT_SPLIT_PARENT_DEPTH must be > 0 "
-                f"(got {ffn_weight_split_parent_depth})"
-            )
     else:
         ffn_weight_split_parent_depth = ffn_weight_fifo_depth
 
@@ -2355,10 +2091,6 @@ def fused_mha(
                 )
 
     if need_bdown_weights:
-        shallow_bdown_on_ffn_accum = _override_bool_env(
-            "ENCODER_SHALLOW_BDOWN_ON_FFN_ACCUM",
-            False,
-        )
         if bdown_split_enabled:
             for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
                 chunk_size = len(chunk_branches)
@@ -2390,15 +2122,7 @@ def fused_mha(
                             for branch_idx in chunk_branches
                         ],
                         dims_to_stream=[b_dims] * chunk_size,
-                        depths=[
-                            (
-                                1
-                                if shallow_bdown_on_ffn_accum
-                                and branch_idx in ffn_down_group_stage_set
-                                else ffn_weight_fifo_depth
-                            )
-                            for branch_idx in chunk_branches
-                        ],
+                        depths=[ffn_weight_fifo_depth] * chunk_size,
                         placement=Tile(col=ffn_bdown_split_mem_tile_cols[-1], row=1),
                     )
                 )
@@ -2420,12 +2144,7 @@ def fused_mha(
                         obj_type=ffn_b_ty,
                         name="memBDown" if branch_idx == 0 else f"memBDown{branch_idx}",
                         dims_to_stream=b_dims,
-                        depth=(
-                            1
-                            if shallow_bdown_on_ffn_accum
-                            and branch_idx in ffn_down_group_stage_set
-                            else ffn_weight_fifo_depth
-                        ),
+                        depth=ffn_weight_fifo_depth,
                         placement=Tile(col=ffn_bdown_mem_tile_cols[branch_idx], row=1),
                     )
                 )
@@ -2447,10 +2166,8 @@ def fused_mha(
         )
         for branch_idx in range(effective_ffn_branches)
     ]
-    use_ffn_down_acc_row_store = _override_bool_env(
-        "ENCODER_USE_FFN_DOWN_ACC_ROW_STORE",
-        effective_ffn_branches <= 4
-        and (ln1_stage_mode != "ddr" or parallel_heads >= 4),
+    use_ffn_down_acc_row_store = effective_ffn_branches <= 4 and (
+        not stage_ln1_to_ddr or parallel_heads >= 4
     )
 
     def _allocate_ffn_down_acc_row_store_channels(
@@ -2495,15 +2212,6 @@ def fused_mha(
     ffn_down_acc_row_store_slots_by_col = dict(o_proj_acc_row_store_slots_by_col)
     for branch_idx in range(effective_ffn_branches):
         ffn_up_out_depth = 1 if emb_tile >= 128 else 2
-        ffn_up_out_depth = _override_int_env(
-            "ENCODER_FFN_UP_OUT_DEPTH",
-            ffn_up_out_depth,
-        )
-        if ffn_up_out_depth <= 0:
-            raise ValueError(
-                "ENCODER_FFN_UP_OUT_DEPTH must be > 0 "
-                f"(got {ffn_up_out_depth})"
-            )
         ffnUpOut.append(
             ObjectFifo(
                 o_ty,
@@ -2574,15 +2282,8 @@ def fused_mha(
             )
     # Large emb_tile (128) can overflow FFN-down L1 when reduction FIFOs are
     # double-buffered alongside B-down and accumulation buffers.
-    default_ffn_down_reduce_depth = 1 if emb_tile >= 128 else 2
-    ffn_down_reduce_depth = _override_int_env(
-        "ENCODER_FFN_DOWN_REDUCE_DEPTH",
-        default_ffn_down_reduce_depth,
-    )
-    stage_ffn_reduce_via_memtile = _override_bool_env(
-        "ENCODER_STAGE_FFN_REDUCE_VIA_MEMTILE",
-        False,
-    )
+    ffn_down_reduce_depth = 1 if emb_tile >= 128 else 2
+    stage_ffn_reduce_via_memtile = False
     ffnDownGroupPartial = [None] * effective_ffn_branches
     for src_branch_idx, _stage_branch_idx in ffn_down_group_stage_by_src.items():
         ffnDownGroupPartial[src_branch_idx] = ObjectFifo(
@@ -2645,11 +2346,7 @@ def fused_mha(
             )
             ffnDownReduce.append(link)
             ffnDownReduceSrc.append(link)
-    ffn_down_out_depth_default = 1 if emb_tile >= 128 else 2
-    ffn_down_out_depth = _override_int_env(
-        "ENCODER_FFN_DOWN_OUT_DEPTH",
-        ffn_down_out_depth_default,
-    )
+    ffn_down_out_depth = 1 if emb_tile >= 128 else 2
     ffnDownOut = []
     ffnDownOutStageToDDR = None
     ffnDownInFromDDR = None
@@ -2770,11 +2467,6 @@ def fused_mha(
 
         for _ in range_(sys.maxsize):
 
-            # NOTE: Second element in idx_buffer used to be set to q_block_bias, which
-            # seems to be used for causal masking and for when
-            # attention is parallelized across the sequence dimension. For this
-            # design, it shouldn't be getting used since we parallelize across heads.
-            # Since it affects the computations, we set the value to 0.
             idx_buffer[0] = 0
             idx_buffer[1] = 0
 
@@ -2811,12 +2503,8 @@ def fused_mha(
         scale_buffer,
     ):
 
-        # VJUNG: The index buffer count how many Q and KV block this worker has processed
-        # From this info we can infer the position in A and P
-
         for _ in range_(sys.maxsize):
 
-            # VJUNG: Required otherwise the buffer is maintained when doing warmup!
             idx_buffer[0] = 0
             idx_buffer[1] = 0
 
@@ -2865,7 +2553,6 @@ def fused_mha(
 
         for _ in range_(sys.maxsize):
 
-            # VJUNG: Required otherwise the buffer is maintained when doing warmup!
             idx_buffer[0] = 0
             idx_buffer[1] = 0
 
@@ -4054,11 +3741,7 @@ def fused_mha(
     )
 
     ffn_up_workers = []
-    ffn_up_use_init_matmul_default = True
-    ffn_up_use_init_matmul = _override_bool_env(
-        "ENCODER_FFN_UP_USE_INIT_MATMUL",
-        ffn_up_use_init_matmul_default,
-    )
+    ffn_up_use_init_matmul = True
     for branch_idx in range(effective_ffn_branches):
         ffn_up_worker_args = [
             memOutLNCons[branch_idx],
@@ -4243,12 +3926,7 @@ def fused_mha(
         while_true=False,
     )
 
-    # Define tensor access patterns for inputs/outputs
-    # A and B are tiled across M and N respectively, while C is tiled across M and N
-    # NOTE: It's important that the tiling of Q/K/V are such that the subsequent tiles
-    # across the heads, not the sequence length (i.e. how it's done in the MHA operator),
-    # because the cores execute on each head. However, we have to keep in mind that
-    # K/v need to have the full sequence length passed for each head.
+    # Define tensor access patterns for inputs/outputs.
     q_tiles_base = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
         (seq_tile, d),
@@ -4289,20 +3967,13 @@ def fused_mha(
         v_tiles_base, qkv_tensor_shape, offset_delta=2 * seq_len * embed_sz
     )
 
-    # NOTE: Dividing by num_o_col_groups to get the correct number of tiles expected
-    # in the runtime seequence. Also not including proj_acc_depth in the tile col
-    # dim because the WO buffers operate on tiles with size emb_tile. If we
-    # use a tile col dim of emb_tile * proj_acc_depth, then the (d, emb_tile)
-    # used for WO will be wrong as the data is written contiguously based on the
-    # access pattern, i.e. written contiguously as rows of size emb_tile * proj_acc_depth,
-    # when it should be rows of size emb_tile
+    # WO remains tiled by emb_tile rather than emb_tile * proj_acc_depth.
     WO_tiles = TensorTiler2D.group_tiler(
         (embed_sz, embed_sz),
         (d, emb_tile),
         (parallel_heads, embed_sz // emb_tile // num_o_col_groups),
     )
-    # Flip the first two dimensions of WO so that the 3rd dimension iterates over rows for splitting
-    # to FIFOs and 4th dimension iterates over columns for partial accumulations
+    # Flip the first two dimensions so splitting iterates over rows first.
     for tile in WO_tiles:
         tile._sizes = [tile._sizes[1], tile._sizes[0], tile._sizes[2], tile._sizes[3]]
         tile._strides = [
@@ -4763,23 +4434,12 @@ def fused_mha(
         # For wider FFN branch counts, prioritize downstream reduction-chain
         # branches when issuing B_Down fills so consumers are ready before
         # upstream branches push partial sums.
-        fill_bdown_reverse_default = effective_ffn_branches > 2
-        fill_bdown_reverse = _override_bool_env(
-            "ENCODER_FILL_BDOWN_REVERSE",
-            fill_bdown_reverse_default,
-        )
-        fill_bup_reverse_default = False
-        fill_bup_reverse = _override_bool_env(
-            "ENCODER_FILL_BUP_REVERSE",
-            fill_bup_reverse_default,
-        )
+        fill_bdown_reverse = effective_ffn_branches > 2
+        fill_bup_reverse = False
         # Decoupling tail fills (R/B_Up/B_Down) from output drains can help
         # in wider-branch topologies, but adds runtime scheduling overhead for
         # small branch counts. Keep it enabled by default only when >2 branches.
-        decouple_tail_fill = _override_bool_env(
-            "ENCODER_DECOUPLE_TAIL_FILL",
-            effective_ffn_branches > 2,
-        )
+        decouple_tail_fill = effective_ffn_branches > 2
         if b_weight_split_enabled and effective_ffn_branches > 2:
             decouple_tail_fill = False
         if serialize_tail_io:
@@ -4800,7 +4460,7 @@ def fused_mha(
                 wait_output_drain = False
             else:
                 raise ValueError(
-                    "ENCODER_TAIL_WAIT_MODE must be one of "
+                    "runtime_tail_wait_mode must be one of "
                     "{strict, relax_ffn_weights, relax_ffn_weights_residual, "
                     "relax_all_tail} "
                     f"(got '{tail_wait_mode}')"
@@ -4811,15 +4471,7 @@ def fused_mha(
         if b_weight_split_enabled and use_ln1_broadcast and effective_ffn_branches > 1:
             wait_ffn_weight_fill = True
 
-        residual_fill_max_groups = _override_int_env(
-            "ENCODER_R_FILL_MAX_GROUPS_PER_DMA",
-            min(ln1_broadcast_groups, 22),
-        )
-        if residual_fill_max_groups <= 0:
-            raise ValueError(
-                "ENCODER_R_FILL_MAX_GROUPS_PER_DMA must be > 0 "
-                f"(got {residual_fill_max_groups})"
-            )
+        residual_fill_max_groups = min(ln1_broadcast_groups, 22)
         b_weight_fill_max_groups_default = min(max(ffn_col_group_counts), 22)
         # For low-head 6-way split-B tails, avoid splitting each packed B_Down
         # tap into multiple DMA BDs (e.g. 8 -> 4+4 groups). Keeping one fill
@@ -4845,15 +4497,7 @@ def fused_mha(
             and parallel_heads <= 2
         ):
             b_weight_fill_max_groups_default = max(ffn_col_group_counts)
-        b_weight_fill_max_groups = _override_int_env(
-            "ENCODER_B_WEIGHT_FILL_MAX_GROUPS_PER_DMA",
-            b_weight_fill_max_groups_default,
-        )
-        if b_weight_fill_max_groups <= 0:
-            raise ValueError(
-                "ENCODER_B_WEIGHT_FILL_MAX_GROUPS_PER_DMA must be > 0 "
-                f"(got {b_weight_fill_max_groups})"
-            )
+        b_weight_fill_max_groups = b_weight_fill_max_groups_default
 
         def split_tap_dim0(
             tap: TensorAccessPattern,
