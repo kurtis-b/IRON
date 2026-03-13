@@ -24,6 +24,8 @@ class MemTileRowStore(Resolvable):
         name: str,
         buffer_count: int = 1,
         compute_buffer_count: int = 1,
+        compute_produce_buffer_count: int = 0,
+        compute_consume_buffer_count: int = 0,
         compute_mm2s_channel: int = 0,
         compute_s2mm_channel: int = 0,
         memtile_ingress_channel: int = 0,
@@ -33,24 +35,31 @@ class MemTileRowStore(Resolvable):
             raise ValueError(f"part_count must be >= 1, got {part_count}")
         if buffer_count < 1:
             raise ValueError(f"buffer_count must be >= 1, got {buffer_count}")
-        if compute_buffer_count not in (1, 2):
+        if compute_buffer_count < 1:
             raise ValueError(
-                "compute_buffer_count must be 1 or 2, " f"got {compute_buffer_count}"
+                "compute_buffer_count must be >= 1, "
+                f"got {compute_buffer_count}"
+            )
+        if compute_produce_buffer_count < 0:
+            raise ValueError(
+                "compute_produce_buffer_count must be >= 0, "
+                f"got {compute_produce_buffer_count}"
+            )
+        if compute_consume_buffer_count < 0:
+            raise ValueError(
+                "compute_consume_buffer_count must be >= 0, "
+                f"got {compute_consume_buffer_count}"
             )
         if buffer_count not in (1, 2):
             raise ValueError(f"buffer_count must be 1 or 2, got {buffer_count}")
-        if compute_buffer_count > buffer_count:
-            raise ValueError(
-                "compute_buffer_count must be <= buffer_count "
-                f"(got compute_buffer_count={compute_buffer_count}, "
-                f"buffer_count={buffer_count})"
-            )
         self.obj_type = obj_type
         self.compute_tile = compute_tile
         self.mem_tile = mem_tile
         self.part_count = part_count
         self.buffer_count = buffer_count
         self.compute_buffer_count = compute_buffer_count
+        self.compute_produce_buffer_count = compute_produce_buffer_count
+        self.compute_consume_buffer_count = compute_consume_buffer_count
         self.name = name
         self.compute_mm2s_channel = compute_mm2s_channel
         self.compute_s2mm_channel = compute_s2mm_channel
@@ -93,6 +102,18 @@ class MemTileRowStore(Resolvable):
         row_store_op.operation.attributes["compute_buffer_count"] = ir.IntegerAttr.get(
             ir.IntegerType.get_signless(32),
             self.compute_buffer_count,
+        )
+        row_store_op.operation.attributes["compute_produce_buffer_count"] = (
+            ir.IntegerAttr.get(
+                ir.IntegerType.get_signless(32),
+                self.compute_produce_buffer_count,
+            )
+        )
+        row_store_op.operation.attributes["compute_consume_buffer_count"] = (
+            ir.IntegerAttr.get(
+                ir.IntegerType.get_signless(32),
+                self.compute_consume_buffer_count,
+            )
         )
         self._resolved = True
 

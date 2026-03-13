@@ -89,6 +89,11 @@ def _default_case_o_proj_acc_group_size(
     )
 
 
+def _is_evenly_partitioned(case: tuple[int, ...]) -> bool:
+    _, _, _, intermediate_size, _, _, emb_tile, _, parallel_ffn, _ = case
+    return intermediate_size % (emb_tile * parallel_ffn) == 0
+
+
 def _high_pacc_seq64_variant(case: tuple[int, ...]) -> tuple[int, ...]:
     (
         seq_len,
@@ -122,7 +127,7 @@ def _case_with_default_opg(case: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def _validate_case(case: tuple[int, ...]) -> None:
-    _, d, heads, _, _, _, emb_tile, parallel_heads, _, proj_acc_depth, opg = case
+    _, d, heads, intermediate_size, _, _, emb_tile, parallel_heads, parallel_ffn, proj_acc_depth, opg = case
     emb_size = d * heads
     if emb_size % emb_tile:
         raise ValueError(
@@ -132,6 +137,11 @@ def _validate_case(case: tuple[int, ...]) -> None:
         raise ValueError(
             f"proj_acc_depth * emb_tile must equal emb_size "
             f"({proj_acc_depth} * {emb_tile} != {emb_size}) for {case}"
+        )
+    if not _is_evenly_partitioned(case[:-1]):
+        raise ValueError(
+            "FFN branches must be evenly partitioned "
+            f"({intermediate_size} % ({emb_tile} * {parallel_ffn}) != 0) for {case}"
         )
     invalid_opg_checks = [
         opg > parallel_heads,
@@ -189,7 +199,12 @@ STAGE_PROFILE_CASES = (
 )
 
 _COMPARISON_BASE_CASES = list(
-    dict.fromkeys(_high_pacc_seq64_variant(case) for case in _REGULAR_BASE_CASES)
+    dict.fromkeys(
+        variant
+        for case in _REGULAR_BASE_CASES
+        for variant in (_high_pacc_seq64_variant(case),)
+        if _is_evenly_partitioned(variant)
+    )
 )
 _REGULAR_CASES = [
     _case_with_default_opg(case)

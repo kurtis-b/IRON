@@ -118,16 +118,14 @@ def adjust_ffn_down_acc_mem_tile_cols(
     if (
         parallel_heads == 4
         and proj_acc_depth >= 6
-        and proj_acc_depth < 8
         and effective_ffn_branches >= 6
         and len(cols) >= 4
         and cols[3] == 7
     ):
-        # In the 4pheads/6pffn/6pacc/2opg memtile topology, col6 already hosts
-        # two B-stream chunks plus one O-proj accumulator stream. Put branch-3's
-        # FFN-down accumulation on col2 instead; col2 still fits this extra
-        # output stream alongside the V fanout and branch-5 accumulator.
-        cols[3] = 2
+        # In the 4pheads/6pffn memtile topology, col7 already carries the
+        # AddNorm tail streams. For the 16-pacc case, col2 also carries an
+        # extra K fanout plus branch-5 accumulation, so move branch-3 to col1.
+        cols[3] = 1 if proj_acc_depth >= 16 else 2
     return cols
 
 
