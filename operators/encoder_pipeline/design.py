@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import sys
 import math
 import logging
@@ -62,14 +63,56 @@ def fused_mha(
     runtime_tail_wait_mode: str = "relax_ffn_weights",
     _ln1_mode_hooks=None,
 ):
-    def _override_int_list_env(_name: str, default: list[int]) -> list[int]:
-        return default
+    def _override_int_list_env(name: str, default: list[int]) -> list[int]:
+        raw = os.environ.get(name)
+        if raw is None or raw.strip() == "":
+            return default
+        return [int(part.strip()) for part in raw.split(",") if part.strip()]
 
-    def _override_int_env(_name: str, default: int) -> int:
-        return default
+    def _override_int_env(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or raw.strip() == "":
+            return default
+        return int(raw)
 
-    def _override_bool_env(_name: str, default: bool) -> bool:
-        return default
+    def _override_bool_env(name: str, default: bool) -> bool:
+        raw = os.environ.get(name)
+        if raw is None or raw.strip() == "":
+            return default
+        norm = raw.strip().lower()
+        if norm in {"1", "true", "yes", "on"}:
+            return True
+        if norm in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(
+            f"{name} must be one of 1/0/true/false/yes/no/on/off (got {raw!r})"
+        )
+
+    def _has_any_env_override(names: list[str]) -> bool:
+        return any(
+            os.environ.get(name) is not None and os.environ.get(name).strip() != ""
+            for name in names
+        )
+
+    def _resolve_row_store_compute_buffer_counts(
+        *,
+        shared_env: str,
+        default_shared: int,
+        produce_env: str,
+        default_produce: int = 0,
+        consume_env: str,
+        default_consume: int = 0,
+    ) -> tuple[int, int, int]:
+        shared = _override_int_env(shared_env, default_shared)
+        produce = _override_int_env(produce_env, default_produce)
+        consume = _override_int_env(consume_env, default_consume)
+        if shared < 1:
+            raise ValueError(f"{shared_env} must be >= 1 (got {shared})")
+        if produce < 0:
+            raise ValueError(f"{produce_env} must be >= 0 (got {produce})")
+        if consume < 0:
+            raise ValueError(f"{consume_env} must be >= 0 (got {consume})")
+        return shared, produce, consume
 
     embed_sz = heads * d
     if ffn_intermediate_size is None:
@@ -89,8 +132,86 @@ def fused_mha(
     enable_tracing = True if trace_size > 0 else False
     dtype_str = "bf16"
     dev = "npu2"
-    replay_row_store_compute_buffer_count = 2
-    accum_row_store_compute_buffer_count = 1
+    (
+        replay_row_store_compute_buffer_count,
+        replay_row_store_compute_produce_buffer_count,
+        replay_row_store_compute_consume_buffer_count,
+    ) = _resolve_row_store_compute_buffer_counts(
+        shared_env="ENCODER_REPLAY_ROW_STORE_COMPUTE_BUFFER_COUNT",
+        default_shared=2,
+        produce_env="ENCODER_REPLAY_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
+        default_produce=0,
+        consume_env="ENCODER_REPLAY_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
+        default_consume=0,
+    )
+    (
+        accum_row_store_compute_buffer_count,
+        accum_row_store_compute_produce_buffer_count,
+        accum_row_store_compute_consume_buffer_count,
+    ) = _resolve_row_store_compute_buffer_counts(
+        shared_env="ENCODER_ACCUM_ROW_STORE_COMPUTE_BUFFER_COUNT",
+        default_shared=1,
+        produce_env="ENCODER_ACCUM_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
+        default_produce=0,
+        consume_env="ENCODER_ACCUM_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
+        default_consume=0,
+    )
+    (
+        ln1_replay_row_store_compute_buffer_count,
+        ln1_replay_row_store_compute_produce_buffer_count,
+        ln1_replay_row_store_compute_consume_buffer_count,
+    ) = _resolve_row_store_compute_buffer_counts(
+        shared_env="ENCODER_LN1_REPLAY_ROW_STORE_COMPUTE_BUFFER_COUNT",
+        default_shared=replay_row_store_compute_buffer_count,
+        produce_env="ENCODER_LN1_REPLAY_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
+        default_produce=(
+            replay_row_store_compute_produce_buffer_count
+            if replay_row_store_compute_produce_buffer_count > 0
+            else 2
+        ),
+        consume_env="ENCODER_LN1_REPLAY_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
+        default_consume=(
+            replay_row_store_compute_consume_buffer_count
+            if replay_row_store_compute_consume_buffer_count > 0
+            else 1
+        ),
+    )
+    (
+        ln2_replay_row_store_compute_buffer_count,
+        ln2_replay_row_store_compute_produce_buffer_count,
+        ln2_replay_row_store_compute_consume_buffer_count,
+    ) = _resolve_row_store_compute_buffer_counts(
+        shared_env="ENCODER_LN2_REPLAY_ROW_STORE_COMPUTE_BUFFER_COUNT",
+        default_shared=replay_row_store_compute_buffer_count,
+        produce_env="ENCODER_LN2_REPLAY_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
+        default_produce=replay_row_store_compute_produce_buffer_count,
+        consume_env="ENCODER_LN2_REPLAY_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
+        default_consume=replay_row_store_compute_consume_buffer_count,
+    )
+    (
+        o_proj_acc_row_store_compute_buffer_count,
+        o_proj_acc_row_store_compute_produce_buffer_count,
+        o_proj_acc_row_store_compute_consume_buffer_count,
+    ) = _resolve_row_store_compute_buffer_counts(
+        shared_env="ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_BUFFER_COUNT",
+        default_shared=accum_row_store_compute_buffer_count,
+        produce_env="ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
+        default_produce=accum_row_store_compute_produce_buffer_count,
+        consume_env="ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
+        default_consume=accum_row_store_compute_consume_buffer_count,
+    )
+    (
+        ffn_down_acc_row_store_compute_buffer_count,
+        ffn_down_acc_row_store_compute_produce_buffer_count,
+        ffn_down_acc_row_store_compute_consume_buffer_count,
+    ) = _resolve_row_store_compute_buffer_counts(
+        shared_env="ENCODER_FFN_DOWN_ACC_ROW_STORE_COMPUTE_BUFFER_COUNT",
+        default_shared=accum_row_store_compute_buffer_count,
+        produce_env="ENCODER_FFN_DOWN_ACC_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
+        default_produce=accum_row_store_compute_produce_buffer_count,
+        consume_env="ENCODER_FFN_DOWN_ACC_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
+        default_consume=accum_row_store_compute_consume_buffer_count,
+    )
 
     num_q_seq_blocks = seq_len // seq_tile
     num_kv_seq_blocks = seq_len // kv_seq_tile
@@ -138,6 +259,7 @@ def fused_mha(
         core_idx: stage_idx
         for stage_idx, core_idx in enumerate(o_proj_stage_core_indices)
     }
+    o_proj_stage_core_set = set(o_proj_stage_core_indices)
     if embed_sz != emb_tile * proj_acc_depth:
         raise ValueError(
             "proj_acc_depth must satisfy emb_tile * proj_acc_depth == embed_sz "
@@ -195,6 +317,24 @@ def fused_mha(
             from operators.encoder_pipeline import design_ln1_memtile as ln1_mode_hooks
     else:
         ln1_mode_hooks = _ln1_mode_hooks
+    default_oproj_row_store_tuning_allowed = not _has_any_env_override(
+        [
+            "ENCODER_ACCUM_ROW_STORE_COMPUTE_BUFFER_COUNT",
+            "ENCODER_ACCUM_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
+            "ENCODER_ACCUM_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
+            "ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_BUFFER_COUNT",
+            "ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_PRODUCE_BUFFER_COUNT",
+            "ENCODER_OPROJ_ACC_ROW_STORE_COMPUTE_CONSUME_BUFFER_COUNT",
+        ]
+    )
+    if (
+        default_oproj_row_store_tuning_allowed
+        and not stage_ln1_to_ddr
+        and parallel_heads == 4
+        and emb_tile <= 96
+    ):
+        o_proj_acc_row_store_compute_produce_buffer_count = 2
+        o_proj_acc_row_store_compute_consume_buffer_count = 1
     # Keep FFN replay topology identical across debug/non-debug configurations.
     # Stage-only modes already bypass compute inside core functions; changing
     # replay-group topology here can cause artificial resource/pruning behavior.
@@ -710,6 +850,13 @@ def fused_mha(
             "Overriding FFN physical group split via ENCODER_FFN_GROUP_SPLIT=%s",
             ffn_col_group_counts,
         )
+    if len(set(ffn_col_group_counts)) != 1:
+        raise ValueError(
+            "FFN branches must be evenly partitioned for encoder_pipeline "
+            f"(intermediate_size={ffn_intermediate_size}, emb_tile={emb_tile}, "
+            f"requested_branches={nB_tiles_distributed}, effective_branches={effective_ffn_branches}, "
+            f"branch_group_counts={ffn_col_group_counts})"
+        )
     b_weight_split_enabled = b_weight_split_requested
     if b_weight_split_enabled and effective_ffn_branches <= 2:
         logging.info(
@@ -1068,6 +1215,11 @@ def fused_mha(
         bin_name,
         [o_ty],
     )
+    matmul_init_kernel_o_proj = Kernel(
+        f"matmul_init_bf16_bf16_o_proj",
+        bin_name,
+        [q_ty, wo_ty, o_ty],
+    )
     matmul_kernel_o_proj = Kernel(
         f"matmul_with_acc_bf16_bf16_o_proj",
         bin_name,
@@ -1360,6 +1512,15 @@ def fused_mha(
     ow_fifo_depth = 1 if emb_tile >= 128 else of_depth
     if use_two_way_mha_stream_split:
         ow_fifo_depth = 1
+    ow_fifo_depth = _override_int_env("ENCODER_OW_FIFO_DEPTH", ow_fifo_depth)
+    if ow_fifo_depth <= 0:
+        raise ValueError(
+            "ENCODER_OW_FIFO_DEPTH must be > 0 " f"(got {ow_fifo_depth})"
+        )
+    shallow_ow_on_o_proj_accum = _override_bool_env(
+        "ENCODER_SHALLOW_OW_ON_O_PROJ_ACCUM",
+        False,
+    )
     inOW_streams = []
     memOW = []
     for split_idx in range(mha_stream_split_factor):
@@ -1381,7 +1542,16 @@ def fused_mha(
                     for i in range(heads_per_mha_stream)
                 ],
                 dims_to_stream=[ow_dims] * heads_per_mha_stream,
-                depths=[ow_fifo_depth] * heads_per_mha_stream,
+                depths=[
+                    (
+                        1
+                        if shallow_ow_on_o_proj_accum
+                        and (split_idx * heads_per_mha_stream + i)
+                        in o_proj_stage_core_set
+                        else ow_fifo_depth
+                    )
+                    for i in range(heads_per_mha_stream)
+                ],
                 placement=Tile(col=ow_stream_mem_cols[split_idx], row=1),
             )
         )  # Split between N parallel blocks of heads
@@ -1437,7 +1607,7 @@ def fused_mha(
         # split and reducing col5 pressure from LN1 replay + B streams.
         acc_mem_tile_order = (
             [5, 6, 4, 7]
-            if effective_ffn_branches <= 1 and proj_acc_depth >= 16
+            if effective_ffn_branches <= 2 and proj_acc_depth >= 16
             else [5, 6, 7, 4]
         )
         acc_mem_tile_order = _override_int_list_env(
@@ -1514,7 +1684,13 @@ def fused_mha(
                 mem_tile=Tile(col=acc_mem_col, row=1),
                 part_count=proj_acc_depth,
                 buffer_count=2,
-                compute_buffer_count=accum_row_store_compute_buffer_count,
+                compute_buffer_count=o_proj_acc_row_store_compute_buffer_count,
+                compute_produce_buffer_count=(
+                    o_proj_acc_row_store_compute_produce_buffer_count
+                ),
+                compute_consume_buffer_count=(
+                    o_proj_acc_row_store_compute_consume_buffer_count
+                ),
                 name=f"outOProjAccum{core_idx}",
                 compute_mm2s_channel=0,
                 compute_s2mm_channel=1,
@@ -1612,6 +1788,15 @@ def fused_mha(
     ln_input_depth = 2
     # emb_tile=128 can exceed O-proj core L1 with double-buffered O->LN1.
     o_proj_input_depth = 1 if emb_tile >= 128 else 2
+    o_proj_input_depth = _override_int_env(
+        "ENCODER_O_PROJ_INPUT_DEPTH",
+        o_proj_input_depth,
+    )
+    if o_proj_input_depth <= 0:
+        raise ValueError(
+            "ENCODER_O_PROJ_INPUT_DEPTH must be > 0 "
+            f"(got {o_proj_input_depth})"
+        )
     # O-proj stream into LN1 norm worker (no DMA layout transform).
     outOProjInput = ObjectFifo(
         o_ty,
@@ -1635,7 +1820,13 @@ def fused_mha(
         mem_tile=Tile(col=ln1_replay_mem_tile_col, row=1),
         part_count=ln_tiles_per_q_block,
         buffer_count=2,
-        compute_buffer_count=replay_row_store_compute_buffer_count,
+        compute_buffer_count=ln1_replay_row_store_compute_buffer_count,
+        compute_produce_buffer_count=(
+            ln1_replay_row_store_compute_produce_buffer_count
+        ),
+        compute_consume_buffer_count=(
+            ln1_replay_row_store_compute_consume_buffer_count
+        ),
         name="ln1Replay",
     )
     # LN1 split-stage link (norm output -> mul+resadd input).
@@ -1660,17 +1851,26 @@ def fused_mha(
     # AddNorm2 needs two logical passes (sum/sumsq pass + output pass).
     # Prefer LN2-side replay FIFO by default so FFN-down only emits one pass
     # unless explicitly overridden.
+    high_pacc_direct_ln2_replay_default = proj_acc_depth >= 16 and (
+        (parallel_heads >= 6 and effective_ffn_branches <= 2)
+        or (parallel_heads == 4 and effective_ffn_branches >= 6)
+    )
     emit_ln2_replay_from_down_default = (
         ffn_down_acc_grouping_enabled and use_dual_ln2_ffn_inputs
-    ) or (parallel_heads >= 6 and proj_acc_depth >= 16 and effective_ffn_branches <= 1)
+    ) or high_pacc_direct_ln2_replay_default
     emit_ln2_replay_from_down = _override_bool_env(
         "ENCODER_EMIT_LN2_REPLAY_FROM_DOWN",
         emit_ln2_replay_from_down_default,
+    )
+    allow_high_pacc_dual_ln2_direct_replay = (
+        use_dual_ln2_ffn_inputs
+        and high_pacc_direct_ln2_replay_default
     )
     if (
         use_dual_ln2_ffn_inputs
         and emit_ln2_replay_from_down
         and not ffn_down_acc_grouping_enabled
+        and not allow_high_pacc_dual_ln2_direct_replay
     ):
         logging.warning(
             "Forcing ENCODER_EMIT_LN2_REPLAY_FROM_DOWN=0 for dual-input LN2 topology"
@@ -2054,6 +2254,15 @@ def fused_mha(
     ffn_weight_fifo_depth = 1 if emb_tile >= 128 else 2
     if use_two_way_mha_stream_split:
         ffn_weight_fifo_depth = 1
+    ffn_weight_fifo_depth = _override_int_env(
+        "ENCODER_FFN_WEIGHT_FIFO_DEPTH",
+        ffn_weight_fifo_depth,
+    )
+    if ffn_weight_fifo_depth <= 0:
+        raise ValueError(
+            "ENCODER_FFN_WEIGHT_FIFO_DEPTH must be > 0 "
+            f"(got {ffn_weight_fifo_depth})"
+        )
     ffn_bup_mem_tile_cols = branch_bup_cols[:effective_ffn_branches]
     ffn_bdown_mem_tile_cols = branch_down_b_cols[:effective_ffn_branches]
     logging.info(
@@ -2146,6 +2355,10 @@ def fused_mha(
                 )
 
     if need_bdown_weights:
+        shallow_bdown_on_ffn_accum = _override_bool_env(
+            "ENCODER_SHALLOW_BDOWN_ON_FFN_ACCUM",
+            False,
+        )
         if bdown_split_enabled:
             for chunk_idx, chunk_branches in enumerate(branch_split_chunks):
                 chunk_size = len(chunk_branches)
@@ -2177,7 +2390,15 @@ def fused_mha(
                             for branch_idx in chunk_branches
                         ],
                         dims_to_stream=[b_dims] * chunk_size,
-                        depths=[ffn_weight_fifo_depth] * chunk_size,
+                        depths=[
+                            (
+                                1
+                                if shallow_bdown_on_ffn_accum
+                                and branch_idx in ffn_down_group_stage_set
+                                else ffn_weight_fifo_depth
+                            )
+                            for branch_idx in chunk_branches
+                        ],
                         placement=Tile(col=ffn_bdown_split_mem_tile_cols[-1], row=1),
                     )
                 )
@@ -2199,7 +2420,12 @@ def fused_mha(
                         obj_type=ffn_b_ty,
                         name="memBDown" if branch_idx == 0 else f"memBDown{branch_idx}",
                         dims_to_stream=b_dims,
-                        depth=ffn_weight_fifo_depth,
+                        depth=(
+                            1
+                            if shallow_bdown_on_ffn_accum
+                            and branch_idx in ffn_down_group_stage_set
+                            else ffn_weight_fifo_depth
+                        ),
                         placement=Tile(col=ffn_bdown_mem_tile_cols[branch_idx], row=1),
                     )
                 )
@@ -2235,6 +2461,8 @@ def fused_mha(
         # Col5 specifically cannot use channel 0 once LN1 replay is lowered
         # through memtile_row_store there in both memtile and ddr modes.
         channel_pairs_by_col = {
+            1: [(4, 4)],
+            2: [(4, 4)],
             4: [(2, 2), (3, 3)],
             5: [(2, 2), (4, 4)],
             6: [(2, 2), (3, 3)],
@@ -2267,6 +2495,15 @@ def fused_mha(
     ffn_down_acc_row_store_slots_by_col = dict(o_proj_acc_row_store_slots_by_col)
     for branch_idx in range(effective_ffn_branches):
         ffn_up_out_depth = 1 if emb_tile >= 128 else 2
+        ffn_up_out_depth = _override_int_env(
+            "ENCODER_FFN_UP_OUT_DEPTH",
+            ffn_up_out_depth,
+        )
+        if ffn_up_out_depth <= 0:
+            raise ValueError(
+                "ENCODER_FFN_UP_OUT_DEPTH must be > 0 "
+                f"(got {ffn_up_out_depth})"
+            )
         ffnUpOut.append(
             ObjectFifo(
                 o_ty,
@@ -2299,7 +2536,13 @@ def fused_mha(
                 mem_tile=Tile(col=ffn_down_acc_mem_col, row=1),
                 part_count=proj_acc_depth,
                 buffer_count=2,
-                compute_buffer_count=accum_row_store_compute_buffer_count,
+                compute_buffer_count=ffn_down_acc_row_store_compute_buffer_count,
+                compute_produce_buffer_count=(
+                    ffn_down_acc_row_store_compute_produce_buffer_count
+                ),
+                compute_consume_buffer_count=(
+                    ffn_down_acc_row_store_compute_consume_buffer_count
+                ),
                 name="ffnDownAccum" if branch_idx == 0 else f"ffnDownAccum{branch_idx}",
                 compute_mm2s_channel=0,
                 compute_s2mm_channel=0,
@@ -2483,7 +2726,13 @@ def fused_mha(
             mem_tile=Tile(col=ln2_replay_mem_tile_col, row=1),
             part_count=proj_acc_depth,
             buffer_count=2,
-            compute_buffer_count=replay_row_store_compute_buffer_count,
+            compute_buffer_count=ln2_replay_row_store_compute_buffer_count,
+            compute_produce_buffer_count=(
+                ln2_replay_row_store_compute_produce_buffer_count
+            ),
+            compute_consume_buffer_count=(
+                ln2_replay_row_store_compute_consume_buffer_count
+            ),
             name="ln2Replay",
         )
         ln2_replay_curr = ln2Replay.cons(depth=1)
@@ -2716,13 +2965,13 @@ def fused_mha(
         group_reduce_in,
         group_reduce_out,
         partial_o_scratch,
-        zero_o_scratch,
         stats_sum_buf,
         stats_sumsq_buf,
         zero_f32,
         calc_sum_sumsq,
         pack_stats,
         zero,
+        matmul_init,
         matmul,
         add,
         copy,
@@ -2819,7 +3068,6 @@ def fused_mha(
                 if emit_ln1_stats:
                     zero_f32(stats_sum_buf, seq_tile)
                     zero_f32(stats_sumsq_buf, seq_tile)
-                zero(zero_o_scratch)
                 if is_group_staging_core:
                     for _ in range_(proj_acc_depth):
                         elem_out_o_acc = of_o_acc_out.acquire(1)
@@ -2830,7 +3078,7 @@ def fused_mha(
                     elem_in_o = of_o_in.acquire(1)
                     for _ in range_(proj_acc_depth):
                         elem_in_ow = of_ow_in.acquire(1)
-                        matmul(elem_in_o, elem_in_ow, zero_o_scratch, partial_o_scratch)
+                        matmul_init(elem_in_o, elem_in_ow, partial_o_scratch)
                         if local_has_input:
                             if group_reduce_in is None:
                                 raise ValueError(
@@ -3359,15 +3607,16 @@ def fused_mha(
                     copy(elem_curr_acc, elem_out, seq_tile * emb_tile)
                 else:
                     zero(elem_out)
+                of_curr_acc.release(1)
                 if is_final_branch and emit_replay_pass:
                     elem_new_acc = of_new_acc.acquire(1)
                     if down_enabled:
-                        # Make sure to copy the final accumulated C tile for the replay pass.
-                        copy(elem_curr_acc, elem_new_acc, seq_tile * emb_tile)
+                        # Copy from the output slot after releasing the current-accumulator
+                        # slot so FIFO-backed replay does not self-deadlock.
+                        copy(elem_out, elem_new_acc, seq_tile * emb_tile)
                     else:
                         zero(elem_new_acc)
                     of_new_acc.release(1)
-                of_curr_acc.release(1)
                 of_out.release(1)
 
             if is_final_branch and emit_replay_pass:
@@ -3702,7 +3951,6 @@ def fused_mha(
             o_proj_output = None
             o_proj_row_store_parts = None
         o_proj_partial_scratch = Buffer(type=o_ty, name=f"o_proj_partial_scratch_{i}")
-        o_proj_zero_scratch = Buffer(type=o_ty, name=f"o_proj_zero_scratch_{i}")
         o_proj_stats_sum_buffer = Buffer(type=sum_l1_ty, name=f"o_proj_stats_sum_{i}")
         o_proj_stats_sumsq_buffer = Buffer(
             type=sum_l1_ty, name=f"o_proj_stats_sumsq_{i}"
@@ -3720,13 +3968,13 @@ def fused_mha(
                 group_reduce_in,
                 o_proj_group_out,
                 o_proj_partial_scratch,
-                o_proj_zero_scratch,
                 o_proj_stats_sum_buffer,
                 o_proj_stats_sumsq_buffer,
                 ln_zero_f32_kernel,
                 ln_calc_sum_sumsq_kernel,
                 convert_stats_to_packet_kernel,
                 zero_kernel_o_proj,
+                matmul_init_kernel_o_proj,
                 matmul_kernel_o_proj,
                 eltwise_add_vector,
                 mem_copy_o_proj,
