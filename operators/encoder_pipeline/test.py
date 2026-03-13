@@ -89,6 +89,34 @@ def _default_case_o_proj_acc_group_size(
     )
 
 
+def _high_pacc_seq64_variant(case: tuple[int, ...]) -> tuple[int, ...]:
+    (
+        seq_len,
+        d,
+        heads,
+        intermediate_size,
+        _,
+        kv_seq_tile,
+        _,
+        parallel_heads,
+        parallel_ffn,
+        _,
+    ) = case
+    embed_sz = d * heads
+    return (
+        seq_len,
+        d,
+        heads,
+        intermediate_size,
+        64,
+        kv_seq_tile,
+        embed_sz // 16,
+        parallel_heads,
+        parallel_ffn,
+        16,
+    )
+
+
 def _case_with_default_opg(case: tuple[int, ...]) -> tuple[int, ...]:
     return (*case, _default_case_o_proj_acc_group_size(case[7], case[8], case[9]))
 
@@ -160,11 +188,20 @@ STAGE_PROFILE_CASES = (
     _case_with_default_opg(tuple(map(int, DEFAULT_STAGE_PROFILE_CASE))),
 )
 
-_REGULAR_CASES = [_case_with_default_opg(case) for case in _REGULAR_BASE_CASES]
+_COMPARISON_BASE_CASES = list(
+    dict.fromkeys(_high_pacc_seq64_variant(case) for case in _REGULAR_BASE_CASES)
+)
+_REGULAR_CASES = [
+    _case_with_default_opg(case)
+    for case in (*_REGULAR_BASE_CASES, *_COMPARISON_BASE_CASES)
+]
 for _case in _REGULAR_CASES:
     _validate_case(_case)
 _DDR_ONLY_REGULAR_CASES = {
     _case_with_default_opg(case) for case in _REGULAR_BASE_CASES[-3:]
+} | {
+    _case_with_default_opg(_high_pacc_seq64_variant(case))
+    for case in _REGULAR_BASE_CASES[-3:]
 }
 _EXTENSIVE_CASES: list[tuple[int, ...]] = []
 
