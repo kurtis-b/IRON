@@ -1,46 +1,40 @@
 # encoder_pipeline
 
-Fused encoder operator: `MHA + AddNorm1 + FFN + AddNorm2`.
+Fused encoder operator:
 
-## What matters
+- `MHA + AddNorm1 + FFN + AddNorm2`
 
-- LN1 and LN2 are both two-pass layer norm stages (full-row statistics are required).
-- Same-tile full-row staging now uses `aie.memtile_row_store` with `buffer_count=2` where legal:
-  - LN1 replay
-  - LN2 replay in `memtile` mode only for the current stable envelope:
-    `parallel_heads == 4` and `effective_ffn_branches <= 4`
-  - O-proj accumulation staging for the current stable envelope:
-    `parallel_heads <= 4`, with FIFO fallback when no safe memtile slot exists
-  - FFN-down accumulation staging only for `effective_ffn_branches <= 4`, with
-    DDR low-head layouts falling back to FIFO by default
-- `ln1_staging_design="memtile"`: LN1 output is broadcast on-chip to FFN-up branches.
-- `ln1_staging_design="ddr"`: LN1 output is staged through DDR once, then broadcast on-chip.
-- For the high-`pacc` single-FFN-branch tail (`parallel_heads >= 6`, `proj_acc_depth >= 16`, `effective_ffn_branches == 1`),
-  AddNorm2 now consumes the direct replay pass from FFN-down instead of creating a separate `ln2Replay` memtile stream.
-- Topology knobs in test IDs: `pheads`, `pffn`, `pacc`, `opg`.
+This file is the entrypoint only. The active design state and forward work live
+in:
 
-## Placement overview
+- [current_status.md](/home/agi-demo/iron/operators/encoder_pipeline/current_status.md)
+- [optimization_plan.md](/home/agi-demo/iron/operators/encoder_pipeline/optimization_plan.md)
+- [readability_cleanup_plan.md](/home/agi-demo/iron/operators/encoder_pipeline/readability_cleanup_plan.md)
 
-- MHA + O-proj: per-head compute columns (`rows 2..5`).
-- AddNorm1: LN1 norm then LN1 mul/add with residual.
-- FFN: up/down tiles selected from FFN layout; down reduction is a neighbor chain that ends near LN2.
-- AddNorm2: LN2 consumes reduced FFN output + residual and drains final output.
-- Exact coordinates are printed in runtime logs (`FFN mapped placement`, `down_reduction_edges`).
+Historical notes and experiment logs live under:
 
-## Hard constraints
+- [docs/history.md](/home/agi-demo/iron/operators/encoder_pipeline/docs/history.md)
+
+## Core facts
+
+- LN1 and LN2 are both two-pass layer norm stages.
+- `ln1_staging_design="memtile"` broadcasts LN1 output on-chip.
+- `ln1_staging_design="ddr"` stages LN1 output through DDR once, then
+  broadcasts on-chip.
+- Same-tile full-row staging uses `aie.memtile_row_store` where the current
+  runtime path is stable.
+
+## Supported constraints
 
 - `emb_tile * proj_acc_depth == embed_sz`
-- `ffn_intermediate_size % (emb_tile * pffn) == 0` for supported FFN layouts
 - `parallel_heads % o_proj_acc_group_size == 0`
 - `o_proj_acc_group_size <= parallel_heads`
-- Compute-tile, shim-channel, memtile-channel, and BD budgets are validated during generation/lowering.
-- Unsupported uneven FFN partitions now fail immediately during design construction.
+- only evenly partitioned FFN layouts are supported
 
-## Entry points
+## Main entry points
 
-- Regression: `operators/encoder_pipeline/test.py`
-- Debug/bottleneck sweep: `operators/encoder_pipeline/profile_debug_modes.py`
-- Optimization plan: `operators/encoder_pipeline/design_optimization_plan.md`
+- regression: `operators/encoder_pipeline/test.py`
+- debug sweep: `operators/encoder_pipeline/profile_debug_modes.py`
 
 ## Environment setup
 
@@ -135,19 +129,9 @@ python operators/encoder_pipeline/profile_debug_modes.py --design memtile --clea
 
 ## Current validated state
 
-- Targeted row-store control case (`memtile`) passes:
-  - `encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_4pheads_4pffn_8pacc_4opg`
-- Targeted row-store control case (`ddr`) passes:
-  - `encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_4pheads_4pffn_8pacc_4opg`
-- Long-sequence complex subset passes after narrowing row-store usage to the stable envelope:
-  - `105 passed, 190 deselected`
-  - covers `512/1024/2048` for:
-    - `6pheads_2pffn_8pacc_2opg`
-    - `4pheads_4pffn_8pacc_4opg`
-    - `4pheads_6pffn_6pacc_2opg`
-    - `16heads_4096ffn_32qseqtile_64kvtile_128embtile_4pheads_4pffn_8pacc_4opg` (`ddr` only)
-- Updated `64qseqtile / 48embtile / 16pacc` comparison matrix after the LN2 direct-replay change:
-  - `120 passed, 95 failed, 295 deselected`
-  - the previously failing `6pheads_1pffn_16pacc_2opg` `64seq` cases now pass in both `memtile` and `ddr`
-- Re-run broader selections after changing row-store channel maps or adding new row-store sites.
-- The current `64embtile / 12pacc` experiments no longer fail on LN/O-proj/FFN-down row-store staging; the first exposed allocator limit is now the final `memLN2` shim drain.
+- Tracked staging-mode selections are currently green:
+  - `lnstage_memtile`: `100 passed, 40 skipped`
+  - `lnstage_ddr`: `115 passed, 40 skipped`
+- See [current_status.md](/home/agi-demo/iron/operators/encoder_pipeline/current_status.md)
+  for the current stable row-store envelope, representative cases, and the
+  active bottlenecks.
