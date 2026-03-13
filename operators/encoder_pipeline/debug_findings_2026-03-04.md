@@ -13,6 +13,25 @@
 - Revalidated control cases after converting additional accumulator paths to row-store:
   - `memtile`: `encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_4pheads_4pffn_8pacc_4opg`
   - `ddr`: `encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_4pheads_4pffn_8pacc_4opg`
+- Full-vs-stage profiling on current passing cases:
+  - `memtile` control `512seq / 96e / 4pheads / 4pffn / 8pacc / 4opg`
+    - `full = 16488.12 us`
+    - bottleneck isolated stage `addnorm1 = 11739.34 us`
+    - exposed gap above max stage = `4748.78 us`
+  - `ddr` fast case `512seq / 128e / 4pheads / 6pffn / 6pacc / 2opg`
+    - `full = 12226.31 us`
+    - bottleneck isolated stage `addnorm1 = 8984.99 us`
+    - exposed gap above max stage = `3241.32 us`
+  - higher-`pacc` passing memtile case `64q / 48e / 16pacc / 6pheads / 1pffn / 2opg`
+    - `full = 4349 us`
+    - bottleneck isolated stage `addnorm1 = 3514 us`
+    - exposed gap above max stage = `835 us`
+- Interpretation:
+  - the high-`pacc` passing memtile case is much closer to ideal overlap and is
+    primarily dominated by `AddNorm1`
+  - the `512seq` control and fast DDR topology still expose a few milliseconds
+    of sequentialized or otherwise non-overlapped work beyond the bottleneck
+    stage
 
 ## High-pacc row-store experiment
 
