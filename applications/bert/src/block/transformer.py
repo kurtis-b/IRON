@@ -25,7 +25,7 @@ from .feed_forward import BertFeedForward
 from .mha import BertAttention
 from .mha import BertSelfAttention
 from operators import AIEBERTEncoder
-from operators import AIEEncoderPipeline
+from operators import AIEEncoderPipelineDDR
 from operators import AIEMHAOutProj
 
 
@@ -159,7 +159,7 @@ class BertEncoderPipelineLayer(nn.Module):
             getattr(aie_cfg, "encoder_pipeline_proj_acc_depth", hidden_size // emb_tile)
         )
         self.self_attention = BertSelfAttention(config, seq_len=seq_len)
-        self.encoder_pipeline = AIEEncoderPipeline(
+        self.encoder_pipeline = AIEEncoderPipelineDDR(
             num_heads=num_heads,
             seq_len=seq_len,
             d=head_dim,
