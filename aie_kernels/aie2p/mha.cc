@@ -23,6 +23,52 @@ extern "C" {
 #define IS_CAUSAL 1
 #endif
 
+static inline void
+scale_O_tile_rows(bfloat16 *out, const bfloat16 *scale_buffer, const int32_t scale_offset, const int32_t B_q)
+{
+    // The PV row-major microkernel emits an output tile laid out as contiguous 8x64 row groups.
+    // Walk the number of emitted 8-row groups from B_q instead of assuming a fixed 32-row tile.
+    constexpr int32_t rows_per_group = 8;
+    constexpr int32_t cols = 64;
+    constexpr int32_t tile_elems = rows_per_group * rows_per_group;
+    constexpr int32_t col_groups = cols / rows_per_group;
+    using Vec8bf16 = aie::vector<bfloat16, rows_per_group>;
+
+    for (int32_t l = 0; l < B_q / rows_per_group; l++) {
+        Vec8bf16 scale_row = aie::load_v<rows_per_group>(scale_buffer + scale_offset + l * rows_per_group);
+        const int32_t row_group_base = l * rows_per_group * cols;
+        for (int32_t k = 0; k < rows_per_group; k++) {
+            Vec8bf16 scale_vec = aie::broadcast<bfloat16, rows_per_group>(scale_row[k]);
+            for (int32_t j = 0; j < col_groups; j++) {
+                const int32_t offset = row_group_base + j * tile_elems + k * rows_per_group;
+                Vec8bf16 o_vec = aie::load_v<rows_per_group>(out + offset);
+                o_vec = aie::mul(o_vec, scale_vec);
+                aie::store_v(out + offset, o_vec);
+            }
+        }
+    }
+}
+
+static inline void copy_O_tile_rows(bfloat16 *out, const int32_t B_q)
+{
+    constexpr int32_t rows_per_group = 8;
+    constexpr int32_t cols = 64;
+    constexpr int32_t tile_elems = rows_per_group * rows_per_group;
+    constexpr int32_t col_groups = cols / rows_per_group;
+    using Vec8bf16 = aie::vector<bfloat16, rows_per_group>;
+
+    for (int32_t l = 0; l < B_q / rows_per_group; l++) {
+        const int32_t row_group_base = l * rows_per_group * cols;
+        for (int32_t k = 0; k < rows_per_group; k++) {
+            for (int32_t j = 0; j < col_groups; j++) {
+                const int32_t offset = row_group_base + j * tile_elems + k * rows_per_group;
+                Vec8bf16 o_vec = aie::load_v<rows_per_group>(out + offset);
+                aie::store_v(out + offset, o_vec);
+            }
+        }
+    }
+}
+
 void matmul_scalar_bf16_bf16(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out);
 void matmul_bf16_bf16(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out);
 void matmul_bf16_bf16_rowmaj(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out);
@@ -75,28 +121,11 @@ void matmul_PV(bfloat16 *Q,
 #endif
 
 #if DEBUG == 0 || DEBUG == 1
-    // 64 emul: O dims = [(4, 512), (8, 8), (8, 64), (8, 1)]
     // VJUNG: Scale O_{i-1} by 1/exp(m_{i-1} - m_{i}) store in scale_buffer[3*B_q:3*B_q + B_q]
     // VJUNG: Skip this for the first iteration as 1/exp(m_{i-1} - m_{i}) degenerates to inf due to m intizalized to
     // -inf
-    using Vec8bf16 = aie::vector<bfloat16, 8>;
     if (first_iter != 0) {
-        for (int32_t l = 0; l < 4; l++) {
-            // Load 8 scale values at once for the current l iteration
-            Vec8bf16 scale_row = aie::load_v<8>(scale_buffer + 3 * B_q + l * 8);
-
-            for (int32_t k = 0; k < 8; k++) {
-                // Extract the scale value for this k from the loaded vector
-                bfloat16 scale_val = scale_row[k];
-                Vec8bf16 scale_vec = aie::broadcast<bfloat16, 8>(scale_val);
-
-                for (int32_t j = 0; j < 8; j++) {
-                    Vec8bf16 o_vec = aie::load_v<8>(out + j * 64 + k * 8 + l * 512);
-                    o_vec = aie::mul(o_vec, scale_vec);
-                    aie::store_v(out + j * 64 + k * 8 + l * 512, o_vec);
-                }
-            }
-        }
+        scale_O_tile_rows(out, scale_buffer, 3 * B_q, B_q);
     }
 #endif
 
@@ -117,38 +146,11 @@ void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_bu
     }
 
     // VJUNG: Only after all KV are processed
-    // VJUNG: TODO: Make this generic for every tile size
-    // VJUNG: Need to scale depending on the data layout at the output of GEMM
     // VJUNG: Scale O_{i} by 1/l_{i}
-    using Vec8bf16 = aie::vector<bfloat16, 8>;
-    for (int32_t l = 0; l < 4; l++) {
-        // Load 8 scale values at once for the current l iteration
-        using Vec8bf16 = aie::vector<bfloat16, 8>;
-        Vec8bf16 scale_row = aie::load_v<8>(scale_buffer + 2 * B_q + l * 8);
-
-        for (int32_t k = 0; k < 8; k++) {
-            // Extract the scale value for this k from the loaded vector
-            bfloat16 scale_val = scale_row[k];
-            Vec8bf16 scale_vec = aie::broadcast<bfloat16, 8>(scale_val);
-
-            for (int32_t j = 0; j < 8; j++) {
-                Vec8bf16 o_vec = aie::load_v<8>(O + j * 64 + k * 8 + l * 512);
-                o_vec = aie::mul(o_vec, scale_vec);
-                aie::store_v(O + j * 64 + k * 8 + l * 512, o_vec);
-            }
-        }
-    }
+    scale_O_tile_rows(O, scale_buffer, 2 * B_q, B_q);
 #else
     // In debug mode, just copy input to output
-    using Vec8bf16 = aie::vector<bfloat16, 8>;
-    for (int32_t l = 0; l < 4; l++) {
-        for (int32_t k = 0; k < 8; k++) {
-            for (int32_t j = 0; j < 8; j++) {
-                Vec8bf16 o_vec = aie::load_v<8>(O + j * 64 + k * 8 + l * 512);
-                aie::store_v(O + j * 64 + k * 8 + l * 512, o_vec);
-            }
-        }
-    }
+    copy_O_tile_rows(O, B_q);
 #endif
 }
 

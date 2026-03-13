@@ -327,6 +327,17 @@ def adjust_ffn_down_acc_mem_tile_cols(
                 if candidate_col not in ffn_down_acc_mem_tile_cols:
                     ffn_down_acc_mem_tile_cols[idx] = candidate_col
                     break
+    if parallel_heads <= 1 and proj_acc_depth >= 16:
+        # Col7 already carries residual staging and the final LN2 drain in
+        # low-head DDR topologies. Do not also pin FFN-down accumulation there.
+        for idx, col in enumerate(ffn_down_acc_mem_tile_cols):
+            if col != 7:
+                continue
+            for candidate_col in (2, 6, 5, 4, 3, 1, 0):
+                if candidate_col == 7:
+                    continue
+                ffn_down_acc_mem_tile_cols[idx] = candidate_col
+                break
     if effective_ffn_branches >= 6 and not all(low_head_acc6_checks):
         replacement_col = 1
         if replacement_col in ffn_down_acc_mem_tile_cols[:-1]:
