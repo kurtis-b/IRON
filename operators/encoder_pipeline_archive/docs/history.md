@@ -5,18 +5,18 @@ were useful during bring-up, but they made the active operator harder to read.
 
 The active docs are now:
 
-- [README.md](/home/agi-demo/iron/operators/encoder_pipeline/README.md)
-- [current_status.md](/home/agi-demo/iron/operators/encoder_pipeline/current_status.md)
-- [optimization_plan.md](/home/agi-demo/iron/operators/encoder_pipeline/optimization_plan.md)
-- [readability_cleanup_plan.md](/home/agi-demo/iron/operators/encoder_pipeline/readability_cleanup_plan.md)
+- [README.md](/home/agi-demo/iron/operators/encoder_pipeline_archive/README.md)
+- [current_status.md](/home/agi-demo/iron/operators/encoder_pipeline_archive/current_status.md)
+- [optimization_plan.md](/home/agi-demo/iron/operators/encoder_pipeline_archive/optimization_plan.md)
+- [readability_cleanup_plan.md](/home/agi-demo/iron/operators/encoder_pipeline_archive/readability_cleanup_plan.md)
 
 Archived docs live in:
 
-- `operators/encoder_pipeline/docs/archive/`
+- `operators/encoder_pipeline_archive/docs/archive/`
 
 Frozen compiler repros now live in:
 
-- `operators/encoder_pipeline/docs/repros/`
+- `operators/encoder_pipeline_archive/docs/repros/`
 
 Archive contents:
 

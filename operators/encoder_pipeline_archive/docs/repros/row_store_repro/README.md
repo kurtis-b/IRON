@@ -1,5 +1,11 @@
 # Row-Store AddNorm1 Repro
 
+Historical repro for the old shared `operators/encoder_pipeline/` package.
+Current live entrypoints are:
+
+- [encoder_pipeline_ddr](/home/agi-demo/iron/operators/encoder_pipeline_ddr)
+- [encoder_pipeline_memtile](/home/agi-demo/iron/operators/encoder_pipeline_memtile)
+
 This folder contains the smallest failing `encoder_pipeline` row-store case found so far.
 
 ## Failing Case
@@ -44,11 +50,11 @@ Phase timings from the isolated run:
 
 ## Files
 
-- [`addnorm1_debug9_pffn1.mlir`](/home/agi-demo/iron/operators/encoder_pipeline/row_store_repro/addnorm1_debug9_pffn1.mlir)
+- [`addnorm1_debug9_pffn1.mlir`](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/row_store_repro/addnorm1_debug9_pffn1.mlir)
   - source MLIR before row-store lowering
-- [`addnorm1_debug9_pffn1.row_store_lowered.mlir`](/home/agi-demo/iron/operators/encoder_pipeline/row_store_repro/addnorm1_debug9_pffn1.row_store_lowered.mlir)
+- [`addnorm1_debug9_pffn1.row_store_lowered.mlir`](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/row_store_repro/addnorm1_debug9_pffn1.row_store_lowered.mlir)
   - MLIR after `aie-opt --aie-lower-memtile-row-stores`
-- [`addnorm1_debug9_pffn1.input_with_addresses.mlir`](/home/agi-demo/iron/operators/encoder_pipeline/row_store_repro/addnorm1_debug9_pffn1.input_with_addresses.mlir)
+- [`addnorm1_debug9_pffn1.input_with_addresses.mlir`](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/row_store_repro/addnorm1_debug9_pffn1.input_with_addresses.mlir)
   - lowered project artifact with concrete addresses, locks, flows, and DMA BD assignments
 
 ## Useful Anchors
@@ -82,7 +88,7 @@ From `/home/agi-demo/iron`:
 rm -rf ./build
 source /opt/xilinx/xrt/setup.sh
 source ~/iron/ironenv/bin/activate
-pytest -q operators/encoder_pipeline/test.py -k "lnstage_memtile-encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_4pheads_4pffn_8pacc_4opg" -s -x
+pytest -q operators/encoder_pipeline_memtile/cases.py -k "encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_4pheads_4pffn_8pacc_4opg" -s -x
 ```
 
 For the isolated AddNorm1-post run used to produce these artifacts:
@@ -95,7 +101,7 @@ python - <<'PY'
 import time
 import numpy as np
 from operators.common.aie_context import AIEContext
-from operators.encoder_pipeline.op import AIEEncoderPipeline
+from operators.encoder_pipeline_memtile.op import AIEEncoderPipelineMemtile
 from operators.encoder_pipeline.test import _cached_golden_reference
 
 case = (512, 64, 12, 3072, 32, 64, 96, 4, 1, 8, 4)
@@ -103,7 +109,7 @@ debug = 9
 seq_len, d, heads, intermediate_size, q_seq_tile, kv_seq_tile, emb_tile, parallel_heads, parallel_ffn, proj_acc_depth, opg = case
 ref = _cached_golden_reference(seq_len, d, heads, intermediate_size, debug)
 ctx = AIEContext()
-op = AIEEncoderPipeline(
+op = AIEEncoderPipelineMemtile(
     seq_len=seq_len,
     d=d,
     num_heads=heads,
@@ -161,7 +167,7 @@ python "$AIECC" \
   --dynamic-objFifos \
   --aie-generate-npu-insts \
   --npu-insts-name=/tmp/addnorm1_debug9_pffn1.bin \
-  operators/encoder_pipeline/row_store_repro/addnorm1_debug9_pffn1.row_store_lowered.mlir
+  operators/encoder_pipeline_archive/docs/repros/row_store_repro/addnorm1_debug9_pffn1.row_store_lowered.mlir
 ```
 
 ## Notes

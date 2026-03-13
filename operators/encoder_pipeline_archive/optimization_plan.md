@@ -18,6 +18,9 @@ Why first:
 Target directions:
 
 - reduce replay traffic around AddNorm1
+- keep the current LN1 replay row-store asymmetry:
+  - memtile `2/1`
+  - ddr `3/1`
 - move more partial-stat work upstream where possible
 - keep full-row layer-norm semantics unchanged
 
@@ -33,6 +36,9 @@ Target directions:
 - audit B-weight fill ordering and waits
 - reduce conservative tail synchronization
 - overlap data movement with compute more aggressively
+- keep the current DDR-only residual-fill wait relaxation
+- avoid naive wait removal on `K/V/W_O` head-block fills; that path was tested
+  and broke correctness on the memtile control case
 
 ### 3. O-proj accumulation core residency
 
