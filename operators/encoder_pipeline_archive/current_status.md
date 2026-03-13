@@ -14,6 +14,10 @@
 Active row-store use on the current tree:
 
 - `ln1Replay`: always
+  - memtile mode uses producer/consumer compute buffering `2/1`
+  - ddr mode uses producer/consumer compute buffering `3/1`
+  - ddr mode also relaxes residual-fill waits while keeping FFN-weight and
+    output-drain waits intact
 - `outOProjAccum*`: enabled for the current stable `parallel_heads <= 4`
   envelope, with FIFO fallback when no safe memtile slot exists
 - `ffnDownAccum*`: enabled only when `effective_ffn_branches <= 4`, with
@@ -78,6 +82,12 @@ Interpretation:
   non-overlapped work above the stage bottleneck
 - the high-`pacc` passing memtile case is much closer to ideal overlap and is
   more directly `AddNorm1`-bound
+- a narrow DDR-only residual-fill wait relaxation is now part of the design
+  because it improved the representative DDR cases without changing mismatch
+  counts
+- a simple runtime relaxation of per-head `K/V/W_O` waits was rejected because
+  it broke correctness, so overlap work now needs to focus on safer structural
+  changes rather than blindly removing waits
 
 ### Known remaining pressure points
 
