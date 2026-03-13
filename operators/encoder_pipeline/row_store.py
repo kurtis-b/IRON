@@ -23,6 +23,7 @@ class MemTileRowStore(Resolvable):
         part_count: int,
         name: str,
         buffer_count: int = 1,
+        compute_buffer_count: int = 1,
         compute_mm2s_channel: int = 0,
         compute_s2mm_channel: int = 0,
         memtile_ingress_channel: int = 0,
@@ -32,11 +33,24 @@ class MemTileRowStore(Resolvable):
             raise ValueError(f"part_count must be >= 1, got {part_count}")
         if buffer_count < 1:
             raise ValueError(f"buffer_count must be >= 1, got {buffer_count}")
+        if compute_buffer_count not in (1, 2):
+            raise ValueError(
+                "compute_buffer_count must be 1 or 2, " f"got {compute_buffer_count}"
+            )
+        if buffer_count not in (1, 2):
+            raise ValueError(f"buffer_count must be 1 or 2, got {buffer_count}")
+        if compute_buffer_count > buffer_count:
+            raise ValueError(
+                "compute_buffer_count must be <= buffer_count "
+                f"(got compute_buffer_count={compute_buffer_count}, "
+                f"buffer_count={buffer_count})"
+            )
         self.obj_type = obj_type
         self.compute_tile = compute_tile
         self.mem_tile = mem_tile
         self.part_count = part_count
         self.buffer_count = buffer_count
+        self.compute_buffer_count = compute_buffer_count
         self.name = name
         self.compute_mm2s_channel = compute_mm2s_channel
         self.compute_s2mm_channel = compute_s2mm_channel
@@ -62,7 +76,7 @@ class MemTileRowStore(Resolvable):
             return
         compute_tile_op = self._ensure_tile_op(self.compute_tile, loc=loc, ip=ip)
         mem_tile_op = self._ensure_tile_op(self.mem_tile, loc=loc, ip=ip)
-        memtile_row_store(
+        row_store_op = memtile_row_store(
             self.name,
             compute_tile_op,
             mem_tile_op,
@@ -75,6 +89,10 @@ class MemTileRowStore(Resolvable):
             memtile_egress_channel=self.memtile_egress_channel,
             loc=loc,
             ip=ip,
+        )
+        row_store_op.operation.attributes["compute_buffer_count"] = ir.IntegerAttr.get(
+            ir.IntegerType.get_signless(32),
+            self.compute_buffer_count,
         )
         self._resolved = True
 
