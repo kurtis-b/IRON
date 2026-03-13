@@ -285,9 +285,11 @@ class AIEEncoderPipeline(AIEOperatorBase):
             "-DROUND_CONV_EVEN",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
             "-DGENERATE_MATMUL_WITH_ACC_KERNELS",
+            "-DGENERATE_MATMUL_INIT_KERNELS",
         ]
         mm_o_proj_rename_symbols = {
             "matmul_bf16_bf16": "matmul_bf16_bf16_o_proj",
+            "matmul_init_bf16_bf16": "matmul_init_bf16_bf16_o_proj",
             "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_o_proj",
             "matmul_with_acc_bf16_bf16": "matmul_with_acc_bf16_bf16_o_proj",
             "zero_bf16": "zero_bf16_o_proj",
