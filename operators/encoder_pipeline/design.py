@@ -1433,7 +1433,11 @@ def fused_mha(
         # Grouped O-proj staging uses fewer accum streams; prioritize less
         # contended memtiles while avoiding col3 fanout pressure from W_O
         # split and reducing col5 pressure from LN1 replay + B streams.
-        acc_mem_tile_order = [5, 6, 7, 4]
+        acc_mem_tile_order = (
+            [5, 6, 4, 7]
+            if effective_ffn_branches <= 1 and proj_acc_depth >= 16
+            else [5, 6, 7, 4]
+        )
         acc_mem_tile_order = _override_int_list_env(
             "ENCODER_ACC_MEM_TILE_ORDER_GROUPED_PH_GE6_ACC_GE6",
             acc_mem_tile_order,
@@ -1654,7 +1658,7 @@ def fused_mha(
     # unless explicitly overridden.
     emit_ln2_replay_from_down_default = (
         ffn_down_acc_grouping_enabled and use_dual_ln2_ffn_inputs
-    )
+    ) or (parallel_heads >= 6 and proj_acc_depth >= 16 and effective_ffn_branches <= 1)
     emit_ln2_replay_from_down = _override_bool_env(
         "ENCODER_EMIT_LN2_REPLAY_FROM_DOWN",
         emit_ln2_replay_from_down_default,
@@ -1705,6 +1709,15 @@ def fused_mha(
         stage_ln1_to_ddr=stage_ln1_to_ddr,
         default_col=ln2_replay_mem_tile_col,
     )
+    if (
+        (not stage_ln1_to_ddr)
+        and parallel_heads >= 6
+        and proj_acc_depth >= 16
+        and effective_ffn_branches <= 1
+        and o_proj_acc_group_size > 1
+        and ln2_replay_mem_tile_col == 4
+    ):
+        ln2_replay_mem_tile_col = 5
     # Enforce targeted remap for the known saturated memtile topology.
     if (
         (not stage_ln1_to_ddr)
