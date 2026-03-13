@@ -167,7 +167,6 @@ def fused_mha(
     del ln1_stage_mode
     stage_ln1_to_ddr = True
     from operators.encoder_pipeline_ddr import hooks as ln1_mode_hooks
-    ln1_replay_row_store_compute_produce_buffer_count = 3
     ln1_mode_hooks = SimpleNamespace(
         choose_ln2_replay_mem_tile_col=getattr(
             ln1_mode_hooks,
@@ -1586,6 +1585,15 @@ def fused_mha(
     ln_input_depth = 2
     # emb_tile=128 can exceed O-proj core L1 with double-buffered O->LN1.
     o_proj_input_depth = 1 if emb_tile >= 128 else 2
+    ln1_replay_tile_bytes = seq_tile * emb_tile * 2
+    ln1_replay_row_store_compute_produce_buffer_count = (
+        3
+        if (
+            (o_proj_input_depth + ln_input_depth + 3 + 1) * ln1_replay_tile_bytes
+            <= 60 * 1024
+        )
+        else 2
+    )
     # O-proj stream into LN1 norm worker (no DMA layout transform).
     outOProjInput = ObjectFifo(
         o_ty,
