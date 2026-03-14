@@ -37,8 +37,7 @@ class MemTileRowStore(Resolvable):
             raise ValueError(f"buffer_count must be >= 1, got {buffer_count}")
         if compute_buffer_count < 1:
             raise ValueError(
-                "compute_buffer_count must be >= 1, "
-                f"got {compute_buffer_count}"
+                "compute_buffer_count must be >= 1, " f"got {compute_buffer_count}"
             )
         if compute_produce_buffer_count < 0:
             raise ValueError(
