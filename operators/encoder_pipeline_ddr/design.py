@@ -270,6 +270,10 @@ def fused_mha(
     ln_tiles_per_q_block = num_o_col_groups * proj_acc_depth
     ffn_layout = find_ffn_layout(
         parallel_heads=parallel_heads,
+        # The final O-proj stage hands off directly into AddNorm1 in DDR mode.
+        # Keep LN1 adjacent to the final O-proj worker so that path stays local.
+        mha_output_tile=(parallel_heads - 1, 5),
+        require_mha_ln_neighbor=True,
         # For the no-merge topology, LN2 must always receive one reduced FFN stream
         # via a direct N/E/S neighboring down-proj connection.
         max_non_neighbor_down_to_ln2=0,
@@ -498,10 +502,6 @@ def fused_mha(
             )
         drop_non_root_branch(reason)
 
-    # Prefer placing LN1 post worker on free tiles outside active FFN branch
-    # tiles. If resources are insufficient, drop
-    # one non-root FFN branch and retry.
-    free_ffn_tiles = [tuple(t) for t in ffn_layout["free_tiles"]]
     layout_reduction_edges = {
         (tuple(src), tuple(dst))
         for (src, dst) in ffn_layout.get("down_reduction_edges", [])
@@ -557,7 +557,7 @@ def fused_mha(
         candidate_use_dual_ln2_inputs = len(candidate_down_output_branches) == 2
         required_compute_tiles = (
             parallel_heads * 4
-            + 3  # LN1 norm + LN1 mul/add + LN2
+            + 2  # LN1 + LN2
             + 2 * effective_candidate_branches  # FFN up/down compute branches
         )
         if required_compute_tiles > 32:
@@ -613,26 +613,11 @@ def fused_mha(
                 "memtile BD/channel budget exceeded for high-acc tail staging"
             )
             continue
-        ln1_post_candidates = [
-            tile for tile in free_ffn_tiles if tile not in used_tiles_base
-        ]
-        placement_found = False
-        for candidate_ln1_post_tile in ln1_post_candidates:
-            ln1_post_tile = candidate_ln1_post_tile
-            ffn_reduction_edges = candidate_reduction_edges
-            ffn_down_output_branches = candidate_down_output_branches
-            use_dual_ln2_ffn_inputs = candidate_use_dual_ln2_inputs
-            ffn_reduction_mode = candidate_reduction_mode
-            placement_found = True
-            break
-        if placement_found:
-            break
-        if len(selected_branch_indices) <= 1:
-            raise ValueError(
-                "Insufficient free FFN tiles for LN1 post placement "
-                f"(branches={len(selected_branch_indices)})"
-            )
-        prune_or_fail("insufficient free tile budget for LN1 post helper")
+        ffn_reduction_edges = candidate_reduction_edges
+        ffn_down_output_branches = candidate_down_output_branches
+        use_dual_ln2_ffn_inputs = candidate_use_dual_ln2_inputs
+        ffn_reduction_mode = candidate_reduction_mode
+        break
 
     effective_ffn_branches = len(selected_branch_indices)
     if effective_ffn_branches <= 0:
@@ -899,9 +884,8 @@ def fused_mha(
         ffn_branch_logical_ranges,
     )
     logging.info(
-        "FFN mapped placement: ln1_norm=%s ln1_post=%s up(all)=%s down(all)=%s up(active)=%s down(active)=%s ln2=%s down_root=%s down_reduction_edges=%s down_to_ln2=%s non_neighbor_down_to_ln2=%s active_branch_indices=%s",
+        "FFN mapped placement: ln1=%s up(all)=%s down(all)=%s up(active)=%s down(active)=%s ln2=%s down_root=%s down_reduction_edges=%s down_to_ln2=%s non_neighbor_down_to_ln2=%s active_branch_indices=%s",
         ln1_tile,
-        ln1_post_tile,
         all_ffn_up_tiles,
         all_ffn_down_tiles,
         selected_up_tiles,
@@ -1581,15 +1565,20 @@ def fused_mha(
     # Keep consumer-side depth shallow for emb_tile=128 to stay within L1.
     ffn_up_broadcast_depth = 2 if (effective_ffn_branches >= 6) else 1
     ffn_up_consumer_depth = 1 if emb_tile >= 128 else 2
-    # Use depth 2 for O-proj->LN1 input and LN1 norm->muladd link.
+    # Use depth 2 for O-proj->LN1 input.
     ln_input_depth = 2
     # emb_tile=128 can exceed O-proj core L1 with double-buffered O->LN1.
     o_proj_input_depth = 1 if emb_tile >= 128 else 2
     ln1_replay_tile_bytes = seq_tile * emb_tile * 2
+    # Fused LN1 now keeps these buffers resident on the LN1 tile:
+    # - outLNBroadcast producer double buffer
+    # - memR consumer double buffer
+    # - ln1Replay destination slot
+    ln1_fused_tile_resident_slots = 5
     ln1_replay_row_store_compute_produce_buffer_count = (
         3
         if (
-            (o_proj_input_depth + ln_input_depth + 3 + 1) * ln1_replay_tile_bytes
+            (ln1_fused_tile_resident_slots + 3) * ln1_replay_tile_bytes
             <= 60 * 1024
         )
         else 2
@@ -1622,8 +1611,6 @@ def fused_mha(
         ),
         name="ln1Replay",
     )
-    # LN1 split-stage link (norm output -> mul+resadd input).
-    ln1Norm = ObjectFifo(o_ty, name="ln1Norm", depth=ln_input_depth)
     r_dims = [
         (seq_tile // r, r * emb_tile),
         (emb_tile // s, s),
@@ -1978,17 +1965,16 @@ def fused_mha(
     memOutLNCons = ln1_path["memOutLNCons"]
     ln1OutStageToDDR = ln1_path["ln1OutStageToDDR"]
     ln1InFromDDR = ln1_path["ln1InFromDDR"]
-    # FFN residual path for AddNorm-2, staged through mem tile from LN1 post core.
-    # Keep producer-side residual buffering shallow. Full-row staging depth is
-    # preserved on the memtile-side forward FIFO for AddNorm2 consumption.
-    ffnROut = ObjectFifo(o_ty, name="ffnROut", depth=1)
-    ffnRIn = ffnROut.cons(depth=ffn_residual_depth).forward(
+    # FFN residual path for AddNorm-2. In DDR mode, reuse the staged LN1 output
+    # in host memory instead of emitting a duplicate on-chip residual stream
+    # from the LN1 worker.
+    ffnRFromDDR = ObjectFifo(o_ty, name="ffnRFromDDR", depth=1)
+    ffnRIn = ffnRFromDDR.cons(depth=ffn_residual_depth).forward(
         obj_type=o_ty,
         name="ffnRIn",
         depth=ffn_residual_depth,
         placement=Tile(col=ln_mem_tile_col, row=1),
     )
-    ffn_residual_prod = ffnROut.prod()
 
     # FFN weights (Up/Down projections)
     b_dims = [
@@ -2009,6 +1995,49 @@ def fused_mha(
         ffn_bup_mem_tile_cols,
         ffn_bdown_mem_tile_cols,
     )
+    def _choose_ln1_residual_refill_col(
+        stage_fill_col: int,
+        bup_fill_cols: list[int],
+        bdown_fill_cols: list[int],
+    ) -> int:
+        shim_out_capacity = {col: 2 for col in range(8)}
+        for used_col in (0, 1, 2, 3, 7):
+            shim_out_capacity[used_col] -= 1
+        shim_out_capacity[stage_fill_col] -= 1
+        for col in bup_fill_cols:
+            shim_out_capacity[col] -= 1
+        for col in bdown_fill_cols:
+            shim_out_capacity[col] -= 1
+        preferred_cols = [6, 5, 4, 3, 2, 1, 0, 7]
+        candidates = [col for col in preferred_cols if shim_out_capacity[col] > 0]
+        if not candidates:
+            raise ValueError(
+                "No shim output DMA headroom left for LN1 residual refill "
+                f"(stage={stage_fill_col}, bup={bup_fill_cols}, bdown={bdown_fill_cols}, "
+                f"remaining={shim_out_capacity})"
+            )
+        return max(
+            candidates,
+            key=lambda c: (shim_out_capacity[c], -preferred_cols.index(c)),
+        )
+
+    ffn_bup_fill_cols = (
+        [ffn_bup_mem_tile_cols[chunk[0]] for chunk in branch_split_chunks]
+        if b_weight_split_enabled
+        else ffn_bup_mem_tile_cols
+    )
+    ffn_bdown_fill_cols = (
+        [ffn_bdown_mem_tile_cols[chunk[0]] for chunk in branch_split_chunks]
+        if b_weight_split_enabled
+        else ffn_bdown_mem_tile_cols
+    )
+    ffn_residual_fill_col = _choose_ln1_residual_refill_col(
+        ffn_a_stage_mem_tile_cols[0],
+        ffn_bup_fill_cols,
+        ffn_bdown_fill_cols,
+    )
+    logging.info("LN1 residual refill shim column: %d", ffn_residual_fill_col)
+
     inBUp = []
     memBUp = [None] * effective_ffn_branches
     inBDown = []
@@ -2864,24 +2893,39 @@ def fused_mha(
                     pack_stats(stats_sum_buf, stats_sumsq_buf, elem_stats_pkt, seq_tile)
                     of_o_out.release(1)
 
-    def core_fn_ln1_norm(
+    def core_fn_ln1_fused(
         of_in_o_proj,
         of_replay_curr,
         of_replay_new,
+        of_in_residual,
         sum_buf,
         sumsq_buf,
-        of_out_norm,
+        weights,
+        of_out_up,
+        of_out_residual,
+        fused_add_layer_norm,
         fused_layer_norm,
         calc_sum_sumsq,
         unpack_stats,
         zero_f32,
         copy,
+        ln_mul_add,
         addnorm1_mode,
         stage_only,
+        up_group_count,
+        consume_group_count,
     ):
+        if consume_group_count < up_group_count:
+            raise ValueError(
+                "LN1 consume_group_count must be >= up_group_count "
+                f"(consume={consume_group_count}, up={up_group_count})"
+            )
         # Mirror down-proj style stage-only semantics: if this stage is not active,
         # keep FIFO traffic/replay shape but bypass heavy LN statistics/math.
         ln1_norm_compute_enabled = (stage_only in (None, 4, 5)) and (
+            addnorm1_mode == -1
+        )
+        ln1_post_compute_enabled = (stage_only in (None, 4, 6)) and (
             addnorm1_mode == -1
         )
         use_packed_ln1_stats = ln1_norm_compute_enabled and (emb_tile >= 2 * seq_tile)
@@ -2903,133 +2947,81 @@ def fused_mha(
                 elem_stats_pkt = of_in_o_proj.acquire(1)
                 unpack_stats(elem_stats_pkt, sum_buf, sumsq_buf, seq_tile)
                 of_in_o_proj.release(1)
-            # Pass 2: emit normalized tiles in FFN-group-major order.
-            # Compute LN once per tile, then replay normalized tiles for later groups.
-            for _ in range_(ln_tiles_per_q_block):
-                elem_in = of_replay_curr.acquire(1)
-                if ln1_broadcast_groups > 1:
-                    elem_replay = of_replay_new.acquire(1)
-                    if ln1_norm_compute_enabled:
-                        fused_layer_norm(
-                            elem_in,
-                            sum_buf,
-                            sumsq_buf,
-                            elem_replay,
-                            embed_sz,
-                        )
-                    else:
-                        copy(elem_in, elem_replay, seq_tile * emb_tile)
-                    elem_out_norm = of_out_norm.acquire(1)
-                    copy(elem_replay, elem_out_norm, seq_tile * emb_tile)
-                    of_out_norm.release(1)
-                    of_replay_new.release(1)
-                else:
-                    elem_out_norm = of_out_norm.acquire(1)
-                    if ln1_norm_compute_enabled:
-                        fused_layer_norm(
-                            elem_in,
-                            sum_buf,
-                            sumsq_buf,
-                            elem_out_norm,
-                            embed_sz,
-                        )
-                    else:
-                        copy(elem_in, elem_out_norm, seq_tile * emb_tile)
-                    of_out_norm.release(1)
-                of_replay_curr.release(1)
-            if ln1_broadcast_groups > 2:
-                for _ in range_(ln1_broadcast_groups - 2):
-                    for _ in range_(ln_tiles_per_q_block):
-                        elem_in = of_replay_curr.acquire(1)
-                        elem_out_norm = of_out_norm.acquire(1)
-                        copy(elem_in, elem_out_norm, seq_tile * emb_tile)
-                        of_out_norm.release(1)
-                        elem_replay = of_replay_new.acquire(1)
-                        copy(elem_in, elem_replay, seq_tile * emb_tile)
-                        of_replay_new.release(1)
-                        of_replay_curr.release(1)
-            if ln1_broadcast_groups > 1:
-                for _ in range_(ln_tiles_per_q_block):
-                    elem_in = of_replay_curr.acquire(1)
-                    elem_out_norm = of_out_norm.acquire(1)
-                    copy(elem_in, elem_out_norm, seq_tile * emb_tile)
-                    of_out_norm.release(1)
-                    of_replay_curr.release(1)
-
-    def core_fn_ln1_mul_add_single(
-        of_in_norm,
-        of_in_residual,
-        weights,
-        of_out_up,
-        of_out_residual,
-        ln_mul_add,
-        copy,
-        addnorm1_mode,
-        stage_only,
-        up_group_count,
-        consume_group_count,
-    ):
-        ln1_post_compute_enabled = (stage_only in (None, 4, 6)) and (
-            addnorm1_mode == -1
-        )
-        for _ in range_(sys.maxsize):
-            # Group 0.
+            # Pass 2: compute AddNorm1 once for group 0, then replay the
+            # post-LN1 output for later groups while still draining repeated
+            # residual tokens to preserve the existing runtime fill contract.
+            # Group 0: consume raw O-proj replay and produce the stage output.
             for col_idx in range_(ln_tiles_per_q_block):
                 col_i32 = index.casts(T.i32(), col_idx)
-                elem_in1 = of_in_norm.acquire(1)
-                elem_in2 = of_in_residual.acquire(1)
+                elem_in = of_replay_curr.acquire(1)
+                elem_residual = of_in_residual.acquire(1)
                 elem_out_up = of_out_up.acquire(1)
-                if stage_only == 5 or addnorm1_mode == 0:
-                    copy(elem_in1, elem_out_up, seq_tile * emb_tile)
+                if stage_only == 5:
+                    if ln1_norm_compute_enabled:
+                        fused_layer_norm(
+                            elem_in,
+                            sum_buf,
+                            sumsq_buf,
+                            elem_out_up,
+                            embed_sz,
+                        )
+                    else:
+                        copy(elem_in, elem_out_up, seq_tile * emb_tile)
+                elif addnorm1_mode == 0:
+                    copy(elem_in, elem_out_up, seq_tile * emb_tile)
                 elif addnorm1_mode == 1:
-                    copy(elem_in2, elem_out_up, seq_tile * emb_tile)
+                    copy(elem_residual, elem_out_up, seq_tile * emb_tile)
+                elif ln1_post_compute_enabled and ln1_norm_compute_enabled:
+                    fused_add_layer_norm(
+                        elem_in,
+                        elem_residual,
+                        weights,
+                        sum_buf,
+                        sumsq_buf,
+                        elem_out_up,
+                        embed_sz,
+                        col_i32,
+                    )
                 elif ln1_post_compute_enabled:
                     ln_mul_add(
-                        elem_in1,
-                        elem_in2,
+                        elem_in,
+                        elem_residual,
                         weights,
                         elem_out_up,
                         col_i32,
                     )
                 else:
-                    copy(elem_in1, elem_out_up, seq_tile * emb_tile)
+                    copy(elem_in, elem_out_up, seq_tile * emb_tile)
                 if of_out_residual:
                     elem_out_res = of_out_residual.acquire(1)
                     copy(elem_out_up, elem_out_res, seq_tile * emb_tile)
                     of_out_residual.release(1)
+                if consume_group_count > 1:
+                    elem_replay = of_replay_new.acquire(1)
+                    copy(elem_out_up, elem_replay, seq_tile * emb_tile)
+                    of_replay_new.release(1)
                 of_out_up.release(1)
-                of_in_norm.release(1)
+                of_replay_curr.release(1)
                 of_in_residual.release(1)
-            for _ in range_(up_group_count - 1):
-                for col_idx in range_(ln_tiles_per_q_block):
-                    col_i32 = index.casts(T.i32(), col_idx)
-                    elem_in1 = of_in_norm.acquire(1)
-                    elem_in2 = of_in_residual.acquire(1)
-                    elem_out_up = of_out_up.acquire(1)
-                    if stage_only == 5 or addnorm1_mode == 0:
-                        copy(elem_in1, elem_out_up, seq_tile * emb_tile)
-                    elif addnorm1_mode == 1:
-                        copy(elem_in2, elem_out_up, seq_tile * emb_tile)
-                    elif ln1_post_compute_enabled:
-                        ln_mul_add(
-                            elem_in1,
-                            elem_in2,
-                            weights,
-                            elem_out_up,
-                            col_i32,
-                        )
-                    else:
-                        copy(elem_in1, elem_out_up, seq_tile * emb_tile)
-                    of_out_up.release(1)
-                    of_in_norm.release(1)
-                    of_in_residual.release(1)
-            # In broadcast DDR mode we may intentionally emit fewer replay groups
-            # while still draining the full LN1 replay stream to avoid backpressure.
-            for _ in range_(consume_group_count - up_group_count):
+
+            # Additional broadcast groups: replay the post-LN1 output and only
+            # emit to FFN-up for the requested groups.
+            for group_idx in range_(consume_group_count - 1):
+                group_idx_i32 = index.casts(T.i32(), group_idx)
+                emit_up_group = group_idx_i32 < (up_group_count - 1)
+                replay_next_group = group_idx_i32 < (consume_group_count - 2)
                 for _ in range_(ln_tiles_per_q_block):
-                    elem_in1 = of_in_norm.acquire(1)
-                    elem_in2 = of_in_residual.acquire(1)
-                    of_in_norm.release(1)
+                    elem_in = of_replay_curr.acquire(1)
+                    elem_residual = of_in_residual.acquire(1)
+                    with if_(emit_up_group):
+                        elem_out_up = of_out_up.acquire(1)
+                        copy(elem_in, elem_out_up, seq_tile * emb_tile)
+                        of_out_up.release(1)
+                    with if_(replay_next_group):
+                        elem_replay = of_replay_new.acquire(1)
+                        copy(elem_in, elem_replay, seq_tile * emb_tile)
+                        of_replay_new.release(1)
+                    of_replay_curr.release(1)
                     of_in_residual.release(1)
 
     def core_fn_ffn_up_proj(
@@ -3686,7 +3678,7 @@ def fused_mha(
             emit_final_output,
         )
 
-    # Create split LN1 workers (norm + mul/add).
+    # Create a single fused LN1 worker (stats + add/norm + replay).
     ln1_weight_buffer = Buffer(
         type=ln_weights_ty,
         initial_value=static_ln1_weights,
@@ -3695,42 +3687,31 @@ def fused_mha(
     ln1_norm_sum_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sum_buffer")
     ln1_norm_sumsq_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sumsq_buffer")
 
-    ln1_norm_worker = Worker(
-        core_fn_ln1_norm,
+    ln1_worker = Worker(
+        core_fn_ln1_fused,
         fn_args=[
             outOProjInput.cons(),
             ln1Replay.cons(),
             ln1Replay.prod(),
+            memR.cons(),
             ln1_norm_sum_buffer,
             ln1_norm_sumsq_buffer,
-            ln1Norm.prod(),
+            ln1_weight_buffer,
+            ln1Broadcast.prod(),
+            None,
+            ln_fused_add_layer_norm_kernel,
             ln_fused_layer_norm_kernel,
             ln_calc_sum_sumsq_kernel,
             convert_packet_to_stats_kernel,
             ln_zero_f32_kernel,
             mem_copy_o_proj,
+            ln_mul_add_kernel,
             addnorm1_debug_mode,
             ffn_stage_only,
+            ln1_broadcast_groups,
+            ln1_broadcast_groups,
         ],
         placement=ln1_norm_tile_obj,
-        while_true=False,
-    )
-    ln1_muladd_worker = Worker(
-        core_fn_ln1_mul_add_single,
-        fn_args=[
-            ln1Norm.cons(),
-            memR.cons(),
-            ln1_weight_buffer,
-            ln1Broadcast.prod(),
-            ffn_residual_prod,
-            ln_mul_add_kernel,
-            mem_copy_o_proj,
-            addnorm1_debug_mode,
-            ffn_stage_only,
-            ln1_broadcast_groups,
-            ln1_broadcast_groups,
-        ],
-        placement=Tile(col=ln1_post_tile[0], row=ln1_post_tile[1]),
         while_true=False,
     )
 
@@ -4758,8 +4739,7 @@ def fused_mha(
             rt.start(softmax_workers[i])
             rt.start(matmul_pv_workers[i])
             rt.start(o_proj_workers[i])
-        rt.start(ln1_norm_worker)
-        rt.start(ln1_muladd_worker)
+        rt.start(ln1_worker)
         for branch_idx in range(effective_ffn_branches):
             rt.start(ffn_up_workers[branch_idx])
             rt.start(ffn_down_workers[branch_idx])
@@ -4925,7 +4905,9 @@ def fused_mha(
                         runtime_state=runtime_state,
                         ln1OutStageToDDR=ln1OutStageToDDR,
                         ln1InFromDDR=ln1InFromDDR,
+                        ffnRFromDDR=ffnRFromDDR,
                         ffn_a_stage_mem_tile_cols=ffn_a_stage_mem_tile_cols,
+                        ffn_residual_fill_col=ffn_residual_fill_col,
                         transfer_count_for_fifo_obj=transfer_count_for_fifo_obj,
                         tensor_access_pattern_cls=TensorAccessPattern,
                         schedule_ffn_weight_fills=schedule_ffn_weight_fills,

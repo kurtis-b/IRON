@@ -381,7 +381,9 @@ def schedule_runtime_tap(
     emb_tile,
     ln1OutStageToDDR,
     ln1InFromDDR,
+    ffnRFromDDR,
     ffn_a_stage_mem_tile_cols,
+    ffn_residual_fill_col,
     transfer_count_for_fifo_obj,
     tensor_access_pattern_cls,
     schedule_ffn_weight_fills,
@@ -449,6 +451,34 @@ def schedule_runtime_tap(
         OR,
         tap=branch_stage_tap,
         placement=tile_ctor(col=ffn_a_stage_mem_tile_cols[stage_source_branch], row=0),
+        task_group=tg_ln1_refill_and_weights,
+        wait=True,
+    )
+    residual_stage_tap = tensor_access_pattern_cls(
+        or_tensor_shape,
+        offset=ln1_stage_base_offset,
+        sizes=[
+            1,
+            proj_acc_depth,
+            seq_tile,
+            emb_tile,
+        ],
+        strides=[0, emb_tile, embed_sz, 1],
+    )
+    residual_tokens = transfer_count_for_fifo_obj(
+        residual_stage_tap,
+        (seq_tile, emb_tile),
+    )
+    if residual_tokens != proj_acc_depth:
+        raise ValueError(
+            "LN1 DDR residual refill transfer count mismatch: "
+            f"staged={residual_tokens} expected={proj_acc_depth}"
+        )
+    rt.fill(
+        ffnRFromDDR.prod(),
+        OR,
+        tap=residual_stage_tap,
+        placement=tile_ctor(col=ffn_residual_fill_col, row=0),
         task_group=tg_ln1_refill_and_weights,
         wait=True,
     )
