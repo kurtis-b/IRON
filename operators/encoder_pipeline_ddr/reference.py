@@ -9,51 +9,24 @@ import numpy as np
 import torch
 
 from operators.encoder_pipeline_ddr.debug_modes import (
-    ADDNORM_DEBUG_INPUT,
-    ADDNORM_DEBUG_RESIDUAL,
-    DEBUG_ADDNORM1_ONLY,
-    DEBUG_ADDNORM1_POST_ONLY,
-    DEBUG_ADDNORM1_STATS_ONLY,
-    DEBUG_FFN_ADDNORM_ONLY,
-    DEBUG_FFN_DOWN_ONLY,
-    DEBUG_FFN_UP_ONLY,
-    DEBUG_MHA_ONLY,
-    DEBUG_MHA_INPUT_PATH,
-    DEBUG_RESIDUAL_PATH,
-    DEBUG_SELF_ATTN,
+    STAGE_DOWN_PROJ,
+    STAGE_LN2,
+    STAGE_O_PROJ,
+    STAGE_PV,
+    STAGE_QK,
+    STAGE_SOFTMAX,
     resolve_pipeline_debug_modes,
+    stage_compute_enabled,
 )
 
 
-def _apply_addnorm(
-    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, mode: int
-):
-    if mode == ADDNORM_DEBUG_INPUT:
-        return x.clone()
-    if mode == ADDNORM_DEBUG_RESIDUAL:
-        return residual.clone()
-    y = torch.nn.functional.layer_norm(
-        x,
-        normalized_shape=(x.shape[-1],),
-        weight=weight,
-        bias=None,
-    )
-    return y + residual
-
-
-def _apply_addnorm_stats_only(x: torch.Tensor, weight: torch.Tensor):
+def _layer_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.layer_norm(
         x,
         normalized_shape=(x.shape[-1],),
         weight=weight,
         bias=None,
     )
-
-
-def _apply_addnorm_post_only(
-    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
-):
-    return x * weight + residual
 
 
 def generate_golden_reference(
@@ -64,8 +37,6 @@ def generate_golden_reference(
     seed: int = 42,
     debug: int = -1,
 ):
-    """Golden reference for encoder pipeline (mha_to_an + ffn_addnorm)."""
-
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -74,115 +45,51 @@ def generate_golden_reference(
     dtype = torch.bfloat16
     val_range = 4
 
-    mha_debug, ffn_stage_only, stage1_mode, stage2_mode = resolve_pipeline_debug_modes(
-        debug
-    )
+    debug_cfg = resolve_pipeline_debug_modes(debug)
+    profile_stage = debug_cfg.profile_stage
+    verify_stage = debug_cfg.verify_stage
 
-    # Stage-1 inputs/weights follow mha_to_an reference behavior.
-    if debug == DEBUG_SELF_ATTN:
-        q = torch.randn(heads, seq_len, d, dtype=dtype) * val_range
-        k = torch.randn(heads, seq_len, d, dtype=dtype) * val_range
-        v = torch.randn(heads, seq_len, d, dtype=dtype) * val_range
-        w_o = torch.eye(embed_sz, embed_sz, dtype=dtype)
-        r1 = torch.zeros(seq_len, embed_sz, dtype=dtype)
-        ln1_w = torch.ones(embed_sz, dtype=dtype)
-    elif debug == DEBUG_RESIDUAL_PATH:
-        q = torch.zeros((heads, seq_len, d), dtype=dtype)
-        k = torch.zeros((heads, seq_len, d), dtype=dtype)
-        v = torch.zeros((heads, seq_len, d), dtype=dtype)
-        w_o = torch.eye(embed_sz, embed_sz, dtype=dtype)
-        r1 = torch.arange(seq_len * embed_sz, dtype=dtype).reshape(seq_len, embed_sz)
-        ln1_w = torch.ones(embed_sz, dtype=dtype)
-    elif debug in (
-        DEBUG_MHA_INPUT_PATH,
-        DEBUG_FFN_UP_ONLY,
-        DEBUG_FFN_DOWN_ONLY,
-        DEBUG_FFN_ADDNORM_ONLY,
-        DEBUG_MHA_ONLY,
-        DEBUG_ADDNORM1_ONLY,
-        DEBUG_ADDNORM1_STATS_ONLY,
-        DEBUG_ADDNORM1_POST_ONLY,
-    ):
-        base = torch.eye(max(seq_len, embed_sz), max(seq_len, embed_sz), dtype=dtype)
-        q2d = base[:seq_len, :embed_sz]
-        k2d = base[:seq_len, :embed_sz]
-        v2d = torch.arange(seq_len * embed_sz, dtype=dtype).reshape(seq_len, embed_sz)
-        q = q2d.view(seq_len, heads, d).transpose(0, 1).contiguous()
-        k = k2d.view(seq_len, heads, d).transpose(0, 1).contiguous()
-        v = v2d.view(seq_len, heads, d).transpose(0, 1).contiguous()
-        w_o = torch.eye(embed_sz, embed_sz, dtype=dtype)
-        r1 = torch.zeros(seq_len, embed_sz, dtype=dtype)
-        ln1_w = torch.ones(embed_sz, dtype=dtype)
+    q = torch.randn(heads, seq_len, d, dtype=dtype) * val_range
+    k = torch.randn(heads, seq_len, d, dtype=dtype) * val_range
+    v = torch.randn(heads, seq_len, d, dtype=dtype) * val_range
+    w_o = torch.randn(embed_sz, embed_sz, dtype=dtype) * val_range
+    r1 = torch.rand(seq_len, embed_sz, dtype=dtype) * val_range
+    b_up = torch.randn(embed_sz, intermediate_size, dtype=dtype) * val_range
+    b_down = torch.randn(intermediate_size, embed_sz, dtype=dtype) * val_range
+    ln1_w = torch.rand(embed_sz, dtype=dtype)
+    ln2_w = torch.rand(embed_sz, dtype=dtype)
+
+    scores = torch.matmul(q, k.transpose(-2, -1))
+    probs = torch.softmax(scores / math.sqrt(d), dim=-1)
+    attn = torch.matmul(probs, v)
+    pv = attn.transpose(0, 1).contiguous().view(seq_len, embed_sz)
+    o_proj = torch.matmul(pv, w_o)
+    ln1 = _layer_norm(o_proj, ln1_w) + r1
+    up = torch.matmul(ln1, b_up)
+    up_gelu = torch.nn.functional.gelu(up)
+    down = torch.matmul(up_gelu, b_down)
+    y = _layer_norm(down, ln2_w) + ln1
+
+    if verify_stage == STAGE_O_PROJ:
+        o = o_proj
+    elif verify_stage == STAGE_DOWN_PROJ:
+        o = down
+    elif verify_stage == STAGE_LN2:
+        o = y
+    elif profile_stage is None:
+        o = y
     else:
-        q = torch.randn(heads, seq_len, d, dtype=dtype) * val_range
-        k = torch.randn(heads, seq_len, d, dtype=dtype) * val_range
-        v = torch.randn(heads, seq_len, d, dtype=dtype) * val_range
-        w_o = torch.randn(embed_sz, embed_sz, dtype=dtype) * val_range
-        r1 = torch.rand(seq_len, embed_sz, dtype=dtype) * val_range
-        ln1_w = torch.rand(embed_sz, dtype=dtype)
-
-    # Stage-2 weights follow ffn_addnorm full/debug generation style.
-    if debug < 0:
-        b_up = torch.randn(embed_sz, intermediate_size, dtype=dtype) * val_range
-        b_down = torch.randn(intermediate_size, embed_sz, dtype=dtype) * val_range
-        ln2_w = torch.rand(embed_sz, dtype=dtype)
-    else:
-        b_up = torch.eye(embed_sz, intermediate_size, dtype=dtype)
-        b_down = torch.eye(intermediate_size, embed_sz, dtype=dtype)
-        ln2_w = torch.ones(embed_sz, dtype=dtype)
-
-    # Stage 1: MHA -> out-proj -> AddNorm1.
-    if mha_debug == -1:
-        # Kernel debug path bypasses softmax and uses linear QK/PV flow.
-        attn_scores = torch.matmul(q, k.transpose(-2, -1))
-        attn = torch.matmul(attn_scores, v)
-    else:
-        attn = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=(1.0 / math.sqrt(d)),
-        )
-
-    attn_2d = attn.transpose(0, 1).contiguous().view(seq_len, embed_sz)
-    o_proj = torch.matmul(attn_2d, w_o)
-    if debug == DEBUG_ADDNORM1_STATS_ONLY:
-        h1 = _apply_addnorm_stats_only(o_proj, ln1_w)
-    elif debug == DEBUG_ADDNORM1_POST_ONLY:
-        h1 = _apply_addnorm_post_only(o_proj, r1, ln1_w)
-    else:
-        h1 = _apply_addnorm(o_proj, r1, ln1_w, stage1_mode)
-
-    # Stage 2: FFN -> AddNorm2.
-    run_up = ffn_stage_only in (None, 0)
-    run_down = ffn_stage_only in (None, 1)
-    run_addnorm2 = ffn_stage_only in (None, 2)
-
-    if run_up:
-        up = torch.matmul(h1, b_up)
-        gelu = torch.nn.functional.gelu(up)
-    else:
-        gelu = torch.zeros(seq_len, intermediate_size, dtype=dtype)
-
-    if run_down:
-        down = torch.matmul(gelu, b_down)
-    else:
-        down = torch.zeros(seq_len, embed_sz, dtype=dtype)
-
-    if run_addnorm2:
-        y = _apply_addnorm(down, h1, ln2_w, stage2_mode)
-    else:
-        # Match encoder design stage-only behavior: bypass LN2 to residual.
-        y = h1.clone()
+        # Profile modes do not have a meaningful stage-native host output contract.
+        # Keep the golden output shape stable for any debug utility that still asks
+        # for a reference in that mode.
+        o = torch.zeros(seq_len, embed_sz, dtype=dtype)
 
     q_2d = q.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     k_2d = k.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     v_2d = v.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     qkv = torch.cat((q_2d, k_2d, v_2d), dim=0)
     or_buf = torch.cat((torch.zeros_like(r1), r1), dim=0)
-    ar = torch.cat((down, h1), dim=0)
+    ar = torch.cat((down, ln1), dim=0)
 
     return {
         "Q": q_2d,
@@ -193,10 +100,25 @@ def generate_golden_reference(
         "R1": r1,
         "OR": or_buf,
         "ln1_weight": ln1_w,
-        "mha_to_an_out": h1,
+        "mha_to_an_out": ln1,
         "AR": ar,
         "B_Up": b_up,
         "B_Down": b_down,
         "ln2_weight": ln2_w,
-        "O": y,
+        "O": o,
+        "stage_compute_enabled": {
+            stage_id: stage_compute_enabled(
+                stage_id=stage_id,
+                profile_stage=profile_stage,
+                verify_stage=verify_stage,
+            )
+            for stage_id in (
+                STAGE_QK,
+                STAGE_SOFTMAX,
+                STAGE_PV,
+                STAGE_O_PROJ,
+                STAGE_DOWN_PROJ,
+                STAGE_LN2,
+            )
+        },
     }

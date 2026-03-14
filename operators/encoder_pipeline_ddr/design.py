@@ -25,9 +25,16 @@ from aie.helpers.dialects.scf import if_, else_
 import aie.dialects.index as index
 from aie.dialects.aiex import *
 from operators.encoder_pipeline_ddr.debug_modes import (
-    ADDNORM_DEBUG_DISABLED,
-    ADDNORM_DEBUG_INPUT,
-    ADDNORM_DEBUG_RESIDUAL,
+    STAGE_DOWN_PROJ,
+    STAGE_LN1,
+    STAGE_LN2,
+    STAGE_O_PROJ,
+    STAGE_PV,
+    STAGE_QK,
+    STAGE_SOFTMAX,
+    STAGE_UP_PROJ,
+    is_direct_verify_stage,
+    stage_compute_enabled,
 )
 from operators.encoder_pipeline_ddr.mapping_validation import (
     find_ffn_layout,
@@ -52,9 +59,8 @@ def fused_mha(
     ln2_weight_file=None,
     nB_tiles_distributed: int = 1,
     ffn_intermediate_size: int | None = None,
-    ffn_stage_only: int | None = None,
-    addnorm1_debug_mode: int = -1,
-    addnorm2_debug_mode: int = -1,
+    profile_stage: int | None = None,
+    verify_stage: int | None = None,
     ln1_stage_mode: str | None = None,
     o_proj_acc_group_size: int = 1,
     ffn_group_split: str | None = None,
@@ -142,31 +148,39 @@ def fused_mha(
             "ffn_intermediate_size must be divisible by emb_tile "
             f"({ffn_intermediate_size} % {emb_tile} != 0)"
         )
-    if ffn_stage_only not in {None, 0, 1, 2, 3, 4, 5, 6}:
+    valid_stage_modes = {
+        None,
+        STAGE_QK,
+        STAGE_SOFTMAX,
+        STAGE_PV,
+        STAGE_O_PROJ,
+        STAGE_LN1,
+        STAGE_UP_PROJ,
+        STAGE_DOWN_PROJ,
+        STAGE_LN2,
+    }
+    if profile_stage not in valid_stage_modes:
         raise ValueError(
-            "ffn_stage_only must be one of "
-            "{None, 0, 1, 2, 3, 4, 5, 6} "
-            f"(got {ffn_stage_only})"
+            "profile_stage must be one of "
+            f"{sorted(v for v in valid_stage_modes if v is not None)} or None "
+            f"(got {profile_stage})"
         )
-    valid_addnorm_debug_modes = (
-        ADDNORM_DEBUG_DISABLED,
-        ADDNORM_DEBUG_INPUT,
-        ADDNORM_DEBUG_RESIDUAL,
-    )
-    if addnorm1_debug_mode not in valid_addnorm_debug_modes:
+    if verify_stage not in valid_stage_modes:
         raise ValueError(
-            "addnorm1_debug_mode must be one of {-1, 0, 1} "
-            f"(got {addnorm1_debug_mode})"
+            "verify_stage must be one of "
+            f"{sorted(v for v in valid_stage_modes if v is not None)} or None "
+            f"(got {verify_stage})"
         )
-    if addnorm2_debug_mode not in valid_addnorm_debug_modes:
+    if profile_stage is not None and verify_stage is not None:
         raise ValueError(
-            "addnorm2_debug_mode must be one of {-1, 0, 1} "
-            f"(got {addnorm2_debug_mode})"
+            "profile_stage and verify_stage are mutually exclusive "
+            f"(profile={profile_stage}, verify={verify_stage})"
         )
     ffn_col_groups = ffn_intermediate_size // emb_tile
     del ln1_stage_mode
     stage_ln1_to_ddr = True
     from operators.encoder_pipeline_ddr import hooks as ln1_mode_hooks
+
     ln1_mode_hooks = SimpleNamespace(
         choose_ln2_replay_mem_tile_col=getattr(
             ln1_mode_hooks,
@@ -194,13 +208,11 @@ def fused_mha(
         adjust_wait_ffn_weight_fill=getattr(
             ln1_mode_hooks,
             "adjust_wait_ffn_weight_fill",
-            lambda *,
-            wait_ffn_weight_fill,
-            use_ln1_broadcast,
-            effective_ffn_branches,
-            **_unused: True
-            if use_ln1_broadcast and effective_ffn_branches > 1
-            else wait_ffn_weight_fill,
+            lambda *, wait_ffn_weight_fill, use_ln1_broadcast, effective_ffn_branches, **_unused: (
+                True
+                if use_ln1_broadcast and effective_ffn_branches > 1
+                else wait_ffn_weight_fill
+            ),
         ),
         should_prefill_ffn_weights=getattr(
             ln1_mode_hooks,
@@ -215,29 +227,22 @@ def fused_mha(
         schedule_runtime_tap=getattr(
             ln1_mode_hooks,
             "schedule_runtime_tap",
-            lambda *,
-            rt,
-            schedule_final_output_for_tap,
-            tap_idx,
-            tg,
-            tg_tail_fill,
-            decouple_tail_fill,
-            pending_ln1_refill_tg,
-            pending_output_tap_idx,
-            **_unused: (
+            lambda *, rt, schedule_final_output_for_tap, tap_idx, tg, tg_tail_fill, decouple_tail_fill, pending_ln1_refill_tg, pending_output_tap_idx, **_unused: (
                 schedule_final_output_for_tap(tap_idx),
                 rt.finish_task_group(tg),
                 rt.finish_task_group(tg_tail_fill) if decouple_tail_fill else None,
                 (pending_ln1_refill_tg, pending_output_tap_idx),
-            )[-1],
+            )[
+                -1
+            ],
         ),
         finalize_runtime=getattr(
             ln1_mode_hooks,
             "finalize_runtime",
-            lambda *,
-            pending_ln1_refill_tg,
-            pending_output_tap_idx,
-            **_unused: (pending_ln1_refill_tg, pending_output_tap_idx),
+            lambda *, pending_ln1_refill_tg, pending_output_tap_idx, **_unused: (
+                pending_ln1_refill_tg,
+                pending_output_tap_idx,
+            ),
         ),
         **{
             name: getattr(ln1_mode_hooks, name)
@@ -249,11 +254,94 @@ def fused_mha(
             )
         },
     )
-    if (
-        not stage_ln1_to_ddr
-        and parallel_heads == 4
-        and emb_tile <= 96
+    qk_compute_enabled = stage_compute_enabled(
+        stage_id=STAGE_QK,
+        profile_stage=profile_stage,
+        verify_stage=verify_stage,
+    )
+    softmax_compute_enabled = stage_compute_enabled(
+        stage_id=STAGE_SOFTMAX,
+        profile_stage=profile_stage,
+        verify_stage=verify_stage,
+    )
+    pv_compute_enabled = stage_compute_enabled(
+        stage_id=STAGE_PV,
+        profile_stage=profile_stage,
+        verify_stage=verify_stage,
+    )
+    oproj_compute_enabled = stage_compute_enabled(
+        stage_id=STAGE_O_PROJ,
+        profile_stage=profile_stage,
+        verify_stage=verify_stage,
+    )
+    ln1_compute_enabled = stage_compute_enabled(
+        stage_id=STAGE_LN1,
+        profile_stage=profile_stage,
+        verify_stage=verify_stage,
+    )
+    up_compute_enabled = stage_compute_enabled(
+        stage_id=STAGE_UP_PROJ,
+        profile_stage=profile_stage,
+        verify_stage=verify_stage,
+    )
+    down_compute_enabled = stage_compute_enabled(
+        stage_id=STAGE_DOWN_PROJ,
+        profile_stage=profile_stage,
+        verify_stage=verify_stage,
+    )
+    ln2_compute_enabled = stage_compute_enabled(
+        stage_id=STAGE_LN2,
+        profile_stage=profile_stage,
+        verify_stage=verify_stage,
+    )
+    direct_verify_stage = verify_stage if is_direct_verify_stage(verify_stage) else None
+    if profile_stage is None and verify_stage is None:
+        ffn_stage_only = None
+        addnorm1_debug_mode = -1
+        addnorm2_debug_mode = -1
+    elif (
+        profile_stage
+        in (
+            STAGE_QK,
+            STAGE_SOFTMAX,
+            STAGE_PV,
+            STAGE_O_PROJ,
+        )
+        or verify_stage == STAGE_O_PROJ
     ):
+        ffn_stage_only = 3
+        addnorm1_debug_mode = 0
+        addnorm2_debug_mode = 1
+    elif profile_stage == STAGE_LN1:
+        ffn_stage_only = 4
+        addnorm1_debug_mode = -1
+        addnorm2_debug_mode = 1
+    elif profile_stage == STAGE_UP_PROJ:
+        ffn_stage_only = 0
+        addnorm1_debug_mode = 0
+        addnorm2_debug_mode = 1
+    elif profile_stage == STAGE_DOWN_PROJ:
+        ffn_stage_only = 1
+        addnorm1_debug_mode = 0
+        addnorm2_debug_mode = 0
+    elif verify_stage == STAGE_DOWN_PROJ:
+        ffn_stage_only = 1
+        addnorm1_debug_mode = -1
+        addnorm2_debug_mode = 0
+    elif profile_stage == STAGE_LN2:
+        ffn_stage_only = 2
+        addnorm1_debug_mode = 0
+        addnorm2_debug_mode = -1
+    elif verify_stage == STAGE_LN2:
+        ffn_stage_only = None
+        addnorm1_debug_mode = -1
+        addnorm2_debug_mode = -1
+    else:
+        raise ValueError(
+            "Unhandled profile/verify stage combination "
+            f"(profile={profile_stage}, verify={verify_stage})"
+        )
+    if not stage_ln1_to_ddr and parallel_heads == 4 and emb_tile <= 96:
         o_proj_acc_row_store_compute_produce_buffer_count = 2
         o_proj_acc_row_store_compute_consume_buffer_count = 1
     # Keep FFN replay topology identical across debug/non-debug configurations.
@@ -984,7 +1072,6 @@ def fused_mha(
     zero_kernel = Kernel(f"zero_{dtype_str}", bin_name, [qk_ty])
 
     memcopy_kernel_scale = Kernel(f"passThroughLine", bin_name, [s_ty, s_ty, np.int32])
-
     scale_buffer_init_kernel = Kernel("init_scale_buffer", bin_name, [s_ty, np.int32])
 
     partial_softmax_kernel = Kernel(
@@ -1287,7 +1374,6 @@ def fused_mha(
                 dims_from_stream_per_cons=a_dims_in,
             )
         )  # Local to 1 parallel block of heads
-
     memP = []
     # First send microkernel tiles across the sequence dimension of the output,
     # then place those microkernel tiles in the correct locations with another DMA
@@ -1307,7 +1393,6 @@ def fused_mha(
                 dims_from_stream_per_cons=p_dims_in,
             )
         )  # Local to 1 parallel block of heads
-
     # Scale buffer for partial softmax
     scaleOF = []
     for i in range(parallel_heads):
@@ -1577,10 +1662,7 @@ def fused_mha(
     ln1_fused_tile_resident_slots = 5
     ln1_replay_row_store_compute_produce_buffer_count = (
         3
-        if (
-            (ln1_fused_tile_resident_slots + 3) * ln1_replay_tile_bytes
-            <= 60 * 1024
-        )
+        if ((ln1_fused_tile_resident_slots + 3) * ln1_replay_tile_bytes <= 60 * 1024)
         else 2
     )
     # O-proj stream into LN1 norm worker (no DMA layout transform).
@@ -1588,6 +1670,11 @@ def fused_mha(
         o_ty,
         name="outOProjInput",
         depth=o_proj_input_depth,
+    )
+    oProjVerifyOut = (
+        ObjectFifo(o_ty, name="oProjVerifyOut", depth=o_proj_input_depth)
+        if direct_verify_stage == STAGE_O_PROJ
+        else None
     )
     ln1_replay_mem_tile_col = ln1_mode_hooks.choose_ln1_replay_mem_tile_col(
         parallel_heads=parallel_heads,
@@ -1632,8 +1719,7 @@ def fused_mha(
     ) or high_pacc_direct_ln2_replay_default
     emit_ln2_replay_from_down = emit_ln2_replay_from_down_default
     allow_high_pacc_dual_ln2_direct_replay = (
-        use_dual_ln2_ffn_inputs
-        and high_pacc_direct_ln2_replay_default
+        use_dual_ln2_ffn_inputs and high_pacc_direct_ln2_replay_default
     )
     if (
         use_dual_ln2_ffn_inputs
@@ -1642,9 +1728,7 @@ def fused_mha(
         and not allow_high_pacc_dual_ln2_direct_replay
     ):
         emit_ln2_replay_from_down = False
-    use_ln2_replay_store = (ffn_stage_only in (None, 2)) and (
-        not emit_ln2_replay_from_down
-    )
+    use_ln2_replay_store = ln2_compute_enabled and (not emit_ln2_replay_from_down)
     # Targeted remap for low-head/high-acc grouped-O-proj memtile topologies:
     # col4 can saturate BD budget with {O-proj accum + LN2 replay + FFN down}.
     # Route LN2 replay through col2 to keep per-memtile BD usage <= 48.
@@ -1995,6 +2079,7 @@ def fused_mha(
         ffn_bup_mem_tile_cols,
         ffn_bdown_mem_tile_cols,
     )
+
     def _choose_ln1_residual_refill_col(
         stage_fill_col: int,
         bup_fill_cols: list[int],
@@ -2042,8 +2127,8 @@ def fused_mha(
     memBUp = [None] * effective_ffn_branches
     inBDown = []
     memBDown = [None] * effective_ffn_branches
-    need_bup_weights = ffn_stage_only in (None, 0)
-    need_bdown_weights = ffn_stage_only in (None, 1)
+    need_bup_weights = up_compute_enabled
+    need_bdown_weights = down_compute_enabled
     ffn_bup_split_mem_tile_cols = []
     ffn_bdown_split_mem_tile_cols = []
     ffn_b_pack_elem_count = emb_tile * emb_tile
@@ -2486,6 +2571,7 @@ def fused_mha(
         matmul_QK,
         q_block_bias,
         idx_buffer,
+        compute_enabled,
     ):
 
         for _ in range_(sys.maxsize):
@@ -2502,8 +2588,11 @@ def fused_mha(
                     elem_in_k = of_k.acquire(1)
                     elem_a_out = of_a_out.acquire(1)
 
-                    zero(elem_a_out)
-                    matmul_QK(elem_in_q, elem_in_k, elem_a_out, idx_buffer)
+                    if compute_enabled:
+                        zero(elem_a_out)
+                        matmul_QK(elem_in_q, elem_in_k, elem_a_out, idx_buffer)
+                    else:
+                        zero(elem_a_out)
 
                     of_k.release(1)
                     of_a_out.release(1)
@@ -2521,9 +2610,13 @@ def fused_mha(
         partial_softmax,
         init_scale_buffer,
         memcopy_kernel_scale,
+        zero_qk,
         q_block_bias,
         idx_buffer,
         scale_buffer,
+        scale_passthrough_buffer,
+        compute_enabled,
+        emit_scale,
     ):
 
         for _ in range_(sys.maxsize):
@@ -2539,24 +2632,38 @@ def fused_mha(
 
                     elt_of_out_p = of_out_p.acquire(1)
                     elt_of_in_a = of_in_a.acquire(1)
-                    elt_of_out_scale = of_out_scale.acquire(1)
+                    elt_of_out_scale = of_out_scale.acquire(1) if emit_scale else None
 
-                    partial_softmax(
-                        elt_of_in_a,
-                        elt_of_out_p,
-                        scale_buffer,
-                        idx_buffer,
-                        inv_scale,
-                        seq_tile,
-                        kv_seq_tile,
-                        seq_len,
-                        seq_len,
-                    )
-                    memcopy_kernel_scale(scale_buffer, elt_of_out_scale, 4 * seq_tile)
+                    if compute_enabled:
+                        partial_softmax(
+                            elt_of_in_a,
+                            elt_of_out_p,
+                            scale_buffer,
+                            idx_buffer,
+                            inv_scale,
+                            seq_tile,
+                            kv_seq_tile,
+                            seq_len,
+                            seq_len,
+                        )
+                    else:
+                        zero_qk(elt_of_out_p)
+                    if emit_scale:
+                        if compute_enabled:
+                            memcopy_kernel_scale(
+                                scale_buffer, elt_of_out_scale, 4 * seq_tile
+                            )
+                        else:
+                            memcopy_kernel_scale(
+                                scale_passthrough_buffer,
+                                elt_of_out_scale,
+                                4 * seq_tile,
+                            )
 
                     of_in_a.release(1)
                     of_out_p.release(1)
-                    of_out_scale.release(1)
+                    if emit_scale:
+                        of_out_scale.release(1)
 
                     idx_buffer[0] += 0
                 idx_buffer[0] = 0
@@ -2572,6 +2679,7 @@ def fused_mha(
         rescale_O,
         q_block_bias,
         idx_buffer,
+        compute_enabled,
     ):
 
         for _ in range_(sys.maxsize):
@@ -2590,21 +2698,25 @@ def fused_mha(
                 ### First iteration, don't rescale O_{i-1}
                 elem_in_p = of_p.acquire(1)
                 elem_in_v = of_v.acquire(1)
-                elt_of_out_scale = of_scale.acquire(1)
+                elt_of_out_scale = of_scale.acquire(1) if compute_enabled else None
 
-                matmul_PV(
-                    elem_in_p,
-                    elem_in_v,
-                    elem_o_out,
-                    elt_of_out_scale,
-                    seq_tile,
-                    0,
-                    idx_buffer,
-                )
+                if compute_enabled:
+                    matmul_PV(
+                        elem_in_p,
+                        elem_in_v,
+                        elem_o_out,
+                        elt_of_out_scale,
+                        seq_tile,
+                        0,
+                        idx_buffer,
+                    )
+                else:
+                    zero(elem_o_out)
 
                 of_p.release(1)
                 of_v.release(1)
-                of_scale.release(1)
+                if compute_enabled:
+                    of_scale.release(1)
 
                 idx_buffer[0] += 0
                 ###
@@ -2613,21 +2725,25 @@ def fused_mha(
                     for _ in range_(num_kv_seq_blocks - 2):
                         elem_in_p = of_p.acquire(1)
                         elem_in_v = of_v.acquire(1)
-                        elt_of_out_scale2 = of_scale.acquire(1)
-
-                        matmul_PV(
-                            elem_in_p,
-                            elem_in_v,
-                            elem_o_out,
-                            elt_of_out_scale2,
-                            seq_tile,
-                            1,
-                            idx_buffer,
+                        elt_of_out_scale2 = (
+                            of_scale.acquire(1) if compute_enabled else None
                         )
+
+                        if compute_enabled:
+                            matmul_PV(
+                                elem_in_p,
+                                elem_in_v,
+                                elem_o_out,
+                                elt_of_out_scale2,
+                                seq_tile,
+                                1,
+                                idx_buffer,
+                            )
 
                         of_p.release(1)
                         of_v.release(1)
-                        of_scale.release(1)
+                        if compute_enabled:
+                            of_scale.release(1)
 
                         idx_buffer[0] += 0
 
@@ -2635,27 +2751,30 @@ def fused_mha(
                 if num_kv_seq_blocks > 1:
                     elem_in_p = of_p.acquire(1)
                     elem_in_v = of_v.acquire(1)
-                    elt_of_out_scale3 = of_scale.acquire(1)
+                    elt_of_out_scale3 = of_scale.acquire(1) if compute_enabled else None
 
-                    matmul_PV(
-                        elem_in_p,
-                        elem_in_v,
-                        elem_o_out,
-                        elt_of_out_scale3,
-                        seq_tile,
-                        1,
-                        idx_buffer,
-                    )
-                    rescale_O(elem_o_out, elt_of_out_scale3, seq_tile, idx_buffer)
+                    if compute_enabled:
+                        matmul_PV(
+                            elem_in_p,
+                            elem_in_v,
+                            elem_o_out,
+                            elt_of_out_scale3,
+                            seq_tile,
+                            1,
+                            idx_buffer,
+                        )
+                        rescale_O(elem_o_out, elt_of_out_scale3, seq_tile, idx_buffer)
 
                     of_p.release(1)
                     of_v.release(1)
-                    of_scale.release(1)
+                    if compute_enabled:
+                        of_scale.release(1)
 
                     idx_buffer[0] += 0
                 # else:
                 else:
-                    rescale_O(elem_o_out, elt_of_out_scale, seq_tile, idx_buffer)
+                    if compute_enabled:
+                        rescale_O(elem_o_out, elt_of_out_scale, seq_tile, idx_buffer)
                     idx_buffer[0] += 0
                 ###
 
@@ -2689,6 +2808,7 @@ def fused_mha(
         emit_final_output,
         emit_ln1_stats,
         use_grouped_chain,
+        compute_enabled,
         core_idx,
     ):
         """
@@ -2709,6 +2829,127 @@ def fused_mha(
         """
 
         for _ in range_(sys.maxsize):
+            if not compute_enabled:
+                if emit_ln1_stats:
+                    zero_f32(stats_sum_buf, seq_tile)
+                    zero_f32(stats_sumsq_buf, seq_tile)
+                if not use_grouped_chain:
+                    for _ in range_(proj_acc_depth):
+                        elem_out_o_acc = of_o_acc_out.acquire(1)
+                        zero(elem_out_o_acc)
+                        of_o_acc_out.release(1)
+
+                    for _ in range_(num_qkv_head_block_per_parallel_head):
+                        elem_in_o = of_o_in.acquire(1)
+                        for _ in range_(proj_acc_depth):
+                            elem_in_o_acc = of_o_acc_in.acquire(1)
+                            elem_in_ow = of_ow_in.acquire(1)
+                            elem_out_o_acc = of_o_acc_out.acquire(1)
+                            zero(elem_out_o_acc)
+                            of_o_acc_out.release(1)
+                            of_ow_in.release(1)
+                            of_o_acc_in.release(1)
+                        of_o_in.release(1)
+
+                    tile_indices = (
+                        range(proj_acc_depth)
+                        if of_o_row_store_parts is not None
+                        else range_(proj_acc_depth)
+                    )
+                    for tile_idx in tile_indices:
+                        elem_in_o_acc = of_o_acc_in.acquire(1)
+                        if buffer_to_reduce:
+                            partial_o_acc = buffer_to_reduce.acquire(1)
+                            buffer_to_reduce.release(1)
+                        if of_o_row_store_parts is not None:
+                            elem_out_o = of_o_row_store_parts[tile_idx].acquire(1)
+                            zero(elem_out_o)
+                            of_o_row_store_parts[tile_idx].release(1)
+                        else:
+                            elem_out_o = of_o_out.acquire(1)
+                            zero(elem_out_o)
+                            of_o_out.release(1)
+                        of_o_acc_in.release(1)
+                    if emit_ln1_stats:
+                        elem_stats_pkt = of_o_out.acquire(1)
+                        pack_stats(
+                            stats_sum_buf, stats_sumsq_buf, elem_stats_pkt, seq_tile
+                        )
+                        of_o_out.release(1)
+                else:
+                    group_pos = core_idx % o_proj_acc_group_size
+                    group_idx = core_idx // o_proj_acc_group_size
+                    local_has_input = group_pos > 0
+                    local_has_output = group_pos < (o_proj_acc_group_size - 1)
+                    global_has_input = group_idx > 0
+                    global_has_output = group_reduce_out is not None
+                    if is_group_staging_core:
+                        for _ in range_(proj_acc_depth):
+                            elem_out_o_acc = of_o_acc_out.acquire(1)
+                            zero(elem_out_o_acc)
+                            of_o_acc_out.release(1)
+
+                    for _ in range_(num_qkv_head_block_per_parallel_head):
+                        elem_in_o = of_o_in.acquire(1)
+                        for _ in range_(proj_acc_depth):
+                            elem_in_ow = of_ow_in.acquire(1)
+                            if local_has_input:
+                                elem_group = group_reduce_in.acquire(1)
+                                group_reduce_in.release(1)
+                            if is_group_staging_core:
+                                elem_in_o_acc = of_o_acc_in.acquire(1)
+                                elem_out_o_acc = of_o_acc_out.acquire(1)
+                                zero(elem_out_o_acc)
+                                of_o_acc_out.release(1)
+                                of_o_acc_in.release(1)
+                            elif local_has_output:
+                                elem_group_out = group_reduce_out.acquire(1)
+                                zero(elem_group_out)
+                                group_reduce_out.release(1)
+                            of_ow_in.release(1)
+                        of_o_in.release(1)
+
+                    tile_indices = (
+                        range(proj_acc_depth)
+                        if of_o_row_store_parts is not None
+                        else range_(proj_acc_depth)
+                    )
+                    for tile_idx in tile_indices:
+                        if is_group_staging_core:
+                            elem_in_o_acc = of_o_acc_in.acquire(1)
+                            if global_has_input:
+                                elem_group = group_reduce_in.acquire(1)
+                                group_reduce_in.release(1)
+                            if emit_final_output:
+                                if of_o_row_store_parts is not None:
+                                    elem_out_o = of_o_row_store_parts[tile_idx].acquire(
+                                        1
+                                    )
+                                    zero(elem_out_o)
+                                    of_o_row_store_parts[tile_idx].release(1)
+                                else:
+                                    elem_out_o = of_o_out.acquire(1)
+                                    zero(elem_out_o)
+                                    of_o_out.release(1)
+                            else:
+                                elem_group_out = group_reduce_out.acquire(1)
+                                zero(elem_group_out)
+                                group_reduce_out.release(1)
+                            of_o_acc_in.release(1)
+                        elif global_has_input:
+                            elem_group = group_reduce_in.acquire(1)
+                            elem_group_out = group_reduce_out.acquire(1)
+                            zero(elem_group_out)
+                            group_reduce_out.release(1)
+                            group_reduce_in.release(1)
+                    if emit_ln1_stats:
+                        elem_stats_pkt = of_o_out.acquire(1)
+                        pack_stats(
+                            stats_sum_buf, stats_sumsq_buf, elem_stats_pkt, seq_tile
+                        )
+                        of_o_out.release(1)
+                continue
+
             if not use_grouped_chain:
                 # Baseline O-proj flow: each core accumulates in memtile, then
                 # a stage-level chain reduces to the LN1 input.
@@ -2910,8 +3151,7 @@ def fused_mha(
         zero_f32,
         copy,
         ln_mul_add,
-        addnorm1_mode,
-        stage_only,
+        compute_enabled,
         up_group_count,
         consume_group_count,
     ):
@@ -2920,24 +3160,16 @@ def fused_mha(
                 "LN1 consume_group_count must be >= up_group_count "
                 f"(consume={consume_group_count}, up={up_group_count})"
             )
-        # Mirror down-proj style stage-only semantics: if this stage is not active,
-        # keep FIFO traffic/replay shape but bypass heavy LN statistics/math.
-        ln1_norm_compute_enabled = (stage_only in (None, 4, 5)) and (
-            addnorm1_mode == -1
-        )
-        ln1_post_compute_enabled = (stage_only in (None, 4, 6)) and (
-            addnorm1_mode == -1
-        )
-        use_packed_ln1_stats = ln1_norm_compute_enabled and (emb_tile >= 2 * seq_tile)
+        use_packed_ln1_stats = compute_enabled and (emb_tile >= 2 * seq_tile)
 
         for _ in range_(sys.maxsize):
-            if ln1_norm_compute_enabled and not use_packed_ln1_stats:
+            if compute_enabled and not use_packed_ln1_stats:
                 zero_f32(sum_buf, seq_tile)
                 zero_f32(sumsq_buf, seq_tile)
             # Pass 1 on raw O-proj output: accumulate row-wise statistics and seed replay FIFO.
             for _ in range_(ln_tiles_per_q_block):
                 elem_in = of_in_o_proj.acquire(1)
-                if ln1_norm_compute_enabled and not use_packed_ln1_stats:
+                if compute_enabled and not use_packed_ln1_stats:
                     calc_sum_sumsq(elem_in, sum_buf, sumsq_buf)
                 elem_replay = of_replay_new.acquire(1)
                 copy(elem_in, elem_replay, seq_tile * emb_tile)
@@ -2956,22 +3188,7 @@ def fused_mha(
                 elem_in = of_replay_curr.acquire(1)
                 elem_residual = of_in_residual.acquire(1)
                 elem_out_up = of_out_up.acquire(1)
-                if stage_only == 5:
-                    if ln1_norm_compute_enabled:
-                        fused_layer_norm(
-                            elem_in,
-                            sum_buf,
-                            sumsq_buf,
-                            elem_out_up,
-                            embed_sz,
-                        )
-                    else:
-                        copy(elem_in, elem_out_up, seq_tile * emb_tile)
-                elif addnorm1_mode == 0:
-                    copy(elem_in, elem_out_up, seq_tile * emb_tile)
-                elif addnorm1_mode == 1:
-                    copy(elem_residual, elem_out_up, seq_tile * emb_tile)
-                elif ln1_post_compute_enabled and ln1_norm_compute_enabled:
+                if compute_enabled:
                     fused_add_layer_norm(
                         elem_in,
                         elem_residual,
@@ -2980,14 +3197,6 @@ def fused_mha(
                         sumsq_buf,
                         elem_out_up,
                         embed_sz,
-                        col_i32,
-                    )
-                elif ln1_post_compute_enabled:
-                    ln_mul_add(
-                        elem_in,
-                        elem_residual,
-                        weights,
-                        elem_out_up,
                         col_i32,
                     )
                 else:
@@ -3036,7 +3245,7 @@ def fused_mha(
         copy,
         group_count,
         consume_group_count,
-        stage_only,
+        compute_enabled,
         use_init_matmul,
     ):
         if consume_group_count < group_count:
@@ -3044,13 +3253,12 @@ def fused_mha(
                 "FFN-up consume_group_count must be >= group_count "
                 f"(consume={consume_group_count}, group={group_count})"
             )
-        up_enabled = stage_only in (0, None)
         for _ in range_(sys.maxsize):
             for group_idx in range_(consume_group_count):
                 group_idx_i32 = index.casts(T.i32(), group_idx)
                 with if_(group_idx_i32 < group_count) as if_group_produces:
                     elem_out_matmul = of_out_c.acquire(1)
-                    if up_enabled:
+                    if compute_enabled:
                         for acc_idx in range_(proj_acc_depth):
                             elem_in_a = of_in_a_curr.acquire(1)
                             if of_out_residual:
@@ -3081,7 +3289,7 @@ def fused_mha(
                                     copy(elem_in_a, elem_out_res, seq_tile * emb_tile)
                                     of_out_residual.release(1)
                             of_in_a_curr.release(1)
-                    if up_enabled and gelu:
+                    if compute_enabled and gelu:
                         gelu(elem_out_matmul, elem_out_matmul, seq_tile * emb_tile)
                     of_out_c.release(1)
                 with else_(if_group_produces):
@@ -3108,7 +3316,7 @@ def fused_mha(
         group_count,
         buffer_to_reduce,
         is_final_branch,
-        stage_only,
+        compute_enabled,
         emit_replay_pass,
         of_group_partial_in0,
         partner_group_count0,
@@ -3116,7 +3324,7 @@ def fused_mha(
         partner_group_count1,
         of_group_partial_out,
     ):
-        down_enabled = stage_only in (1, None)
+        down_enabled = compute_enabled
         grouped_leaf_mode = of_group_partial_out is not None
         grouped_stage_mode = (
             of_curr_acc is not None
@@ -3317,8 +3525,8 @@ def fused_mha(
         add_vec,
         zero_f32,
         copy,
-        stage_only,
-        addnorm2_mode,
+        compute_enabled,
+        verify_stage,
         expect_replay_pass,
         of_replay_curr,
         of_replay_new,
@@ -3334,37 +3542,7 @@ def fused_mha(
                 "AddNorm2 replay source must be either FFN-down replay pass or LN2 replay FIFO"
             )
         for _ in range_(sys.maxsize):
-            # Check if second add & norm stage is enabled, None means all stages are enabled.
-            if stage_only not in [
-                2,
-                None,
-            ]:  # Skip computation for second add & norm stage
-                if expect_replay_pass:
-                    for _ in range_(proj_acc_depth):
-                        elem_in1 = of_in1.acquire(1)
-                        if dual_ffn_inputs:
-                            elem_in1_extra = of_in1_extra.acquire(1)
-                            of_in1_extra.release(1)
-                        of_in1.release(1)
-                for _ in range_(proj_acc_depth):
-                    elem_in1 = of_in1.acquire(1)
-                    if dual_ffn_inputs:
-                        elem_in1_extra = of_in1_extra.acquire(1)
-                        add_vec(
-                            elem_in1,
-                            elem_in1_extra,
-                            ffn_merge_buf,
-                            seq_tile * emb_tile,
-                        )
-                    elem_in2 = of_in2.acquire(1)
-                    elem_out = of_out.acquire(1)
-                    copy(elem_in2, elem_out, seq_tile * emb_tile)
-                    of_out.release(1)
-                    if dual_ffn_inputs:
-                        of_in1_extra.release(1)
-                    of_in1.release(1)
-                    of_in2.release(1)
-            elif addnorm2_mode not in [-1]:
+            if not compute_enabled:
                 if expect_replay_pass:
                     for _ in range_(proj_acc_depth):
                         elem_in1 = of_in1.acquire(1)
@@ -3387,7 +3565,7 @@ def fused_mha(
                         elem_ffn = elem_in1
                     elem_in2 = of_in2.acquire(1)
                     elem_out = of_out.acquire(1)
-                    if addnorm2_mode == 0:
+                    if verify_stage == STAGE_DOWN_PROJ:
                         copy(elem_ffn, elem_out, seq_tile * emb_tile)
                     else:
                         copy(elem_in2, elem_out, seq_tile * emb_tile)
@@ -3471,6 +3649,13 @@ def fused_mha(
     softmax_workers = []
     matmul_pv_workers = []
     o_proj_workers = []
+    build_softmax_workers = True
+    build_pv_workers = True
+    build_o_proj_workers = True
+    build_ln1_worker = direct_verify_stage not in {STAGE_O_PROJ}
+    build_ffn_up_workers = direct_verify_stage not in {STAGE_O_PROJ}
+    build_ffn_down_workers = direct_verify_stage is None
+    build_ln2_worker = direct_verify_stage is None
     for i in range(parallel_heads):
         idx_buffer_qk = Buffer(
             initial_value=np.zeros(shape=(2,), dtype=np.int32),
@@ -3487,12 +3672,14 @@ def fused_mha(
                     matmul_QK,
                     i,
                     idx_buffer_qk,
+                    qk_compute_enabled,
                 ],
                 stack_size=0xD00,
                 placement=Tile(col=i, row=2),
                 while_true=False,
             )
         )
+        qk_input_cons = memA[i].cons() if build_softmax_workers else None
         idx_buffer_softmax = Buffer(
             initial_value=np.zeros(shape=(2,), dtype=np.int32),
             name=f"idx_buffer_softmax_{i}",
@@ -3501,48 +3688,64 @@ def fused_mha(
             initial_value=np.zeros(shape=(4 * seq_tile,), dtype=dtype),
             name=f"scale_buffer_softmax_{i}",
         )
-        softmax_workers.append(
-            Worker(
-                softmax,
-                fn_args=[
-                    memA[i].cons(),
-                    memP[i].prod(),
-                    scaleOF[i].prod(),
-                    partial_softmax_kernel,
-                    scale_buffer_init_kernel,
-                    memcopy_kernel_scale,
-                    i,
-                    idx_buffer_softmax,
-                    scale_buffer_softmax,
-                ],
-                stack_size=0xD00,
-                placement=Tile(col=i, row=3),
-                while_true=False,
-            )
+        scale_passthrough_buffer = Buffer(
+            initial_value=np.ones(shape=(4 * seq_tile,), dtype=dtype),
+            name=f"scale_passthrough_buffer_{i}",
         )
+        if build_softmax_workers:
+            softmax_workers.append(
+                Worker(
+                    softmax,
+                    fn_args=[
+                        qk_input_cons,
+                        memP[i].prod(),
+                        scaleOF[i].prod(),
+                        partial_softmax_kernel,
+                        scale_buffer_init_kernel,
+                        memcopy_kernel_scale,
+                        zero_kernel,
+                        i,
+                        idx_buffer_softmax,
+                        scale_buffer_softmax,
+                        scale_passthrough_buffer,
+                        softmax_compute_enabled,
+                        pv_compute_enabled,
+                    ],
+                    stack_size=0xD00,
+                    placement=Tile(col=i, row=3),
+                    while_true=False,
+                )
+            )
+        else:
+            softmax_workers.append(None)
+        softmax_input_cons = memP[i].cons() if build_pv_workers else None
         idx_buffer_pv = Buffer(
             initial_value=np.zeros(shape=(2,), dtype=np.int32),
             name=f"idx_buffer_pv_{i}",
         )
-        matmul_pv_workers.append(
-            Worker(
-                batched_matmul_pv,
-                fn_args=[
-                    memP[i].cons(),
-                    memV[i].cons(),
-                    scaleOF[i].cons(),
-                    outOProj[i].prod(),
-                    zero_kernel,
-                    matmul_PV,
-                    rescale_O,
-                    i,
-                    idx_buffer_pv,
-                ],
-                stack_size=0xD00,
-                placement=Tile(col=i, row=4),
-                while_true=False,
+        if build_pv_workers:
+            matmul_pv_workers.append(
+                Worker(
+                    batched_matmul_pv,
+                    fn_args=[
+                        softmax_input_cons,
+                        memV[i].cons(),
+                        scaleOF[i].cons(),
+                        outOProj[i].prod(),
+                        zero_kernel,
+                        matmul_PV,
+                        rescale_O,
+                        i,
+                        idx_buffer_pv,
+                        pv_compute_enabled,
+                    ],
+                    stack_size=0xD00,
+                    placement=Tile(col=i, row=4),
+                    while_true=False,
+                )
             )
-        )
+        else:
+            matmul_pv_workers.append(None)
         group_reduce_in = (
             outOGroupPart[i - 1].cons()
             if i > 0 and outOGroupPart[i - 1] is not None
@@ -3573,7 +3776,7 @@ def fused_mha(
                 "Non-stage O-proj core is missing neighbor forwarding FIFO: "
                 f"core={i}, group={o_proj_group_idx[i]}"
             )
-        o_proj_in = outOProj[i].cons()
+        o_proj_in = outOProj[i].cons() if build_o_proj_workers else None
         o_proj_ow = memOW[i].cons()
         o_proj_row_store_parts = None
         if is_group_boundary_core:
@@ -3588,11 +3791,18 @@ def fused_mha(
                 o_proj_group_out = group_reduce_out
                 o_proj_reduce_in = None
                 emit_final_output = i == (parallel_heads - 1)
-                o_proj_output = outOProjInput.prod() if emit_final_output else None
+                o_proj_output = (
+                    (
+                        oProjVerifyOut.prod()
+                        if direct_verify_stage == STAGE_O_PROJ
+                        else outOProjInput.prod()
+                    )
+                    if emit_final_output
+                    else None
+                )
                 emit_ln1_stats = (
                     emit_final_output
-                    and (ffn_stage_only in (None, 4, 5))
-                    and (addnorm1_debug_mode == -1)
+                    and ln1_compute_enabled
                     and (emb_tile >= 2 * seq_tile)
                 )
             else:
@@ -3605,14 +3815,17 @@ def fused_mha(
                 emit_final_output = True
                 emit_ln1_stats = (
                     stage_order == (num_o_proj_acc_groups - 1)
-                    and (ffn_stage_only in (None, 4, 5))
-                    and (addnorm1_debug_mode == -1)
+                    and ln1_compute_enabled
                     and (emb_tile >= 2 * seq_tile)
                 )
                 if stage_order < num_o_proj_acc_groups - 1:
                     o_proj_output = outOPart[stage_order].prod()
                 else:
-                    o_proj_output = outOProjInput.prod()
+                    o_proj_output = (
+                        oProjVerifyOut.prod()
+                        if direct_verify_stage == STAGE_O_PROJ
+                        else outOProjInput.prod()
+                    )
         else:
             stage_order = -1
             o_proj_acc_in = None
@@ -3628,44 +3841,48 @@ def fused_mha(
         o_proj_stats_sumsq_buffer = Buffer(
             type=sum_l1_ty, name=f"o_proj_stats_sumsq_{i}"
         )
-        o_proj_worker = Worker(
-            matmul_o_proj,
-            fn_args=[
-                o_proj_in,
-                o_proj_ow,
-                o_proj_acc_in,
-                o_proj_acc_out,
-                o_proj_output,
-                o_proj_row_store_parts,
-                o_proj_reduce_in,
-                group_reduce_in,
-                o_proj_group_out,
-                o_proj_partial_scratch,
-                o_proj_stats_sum_buffer,
-                o_proj_stats_sumsq_buffer,
-                ln_zero_f32_kernel,
-                ln_calc_sum_sumsq_kernel,
-                convert_stats_to_packet_kernel,
-                zero_kernel_o_proj,
-                matmul_init_kernel_o_proj,
-                matmul_kernel_o_proj,
-                eltwise_add_vector,
-                mem_copy_o_proj,
-                is_group_accum_core,
-                emit_final_output,
-                emit_ln1_stats,
-                o_proj_acc_group_size > 1,
-                i,
-            ],
-            stack_size=0xD00,
-            placement=o_proj_worker_tiles[i],
-            while_true=False,
-        )
-        if o_proj_row_store_parts is not None:
-            for handle in o_proj_row_store_parts:
-                handle.endpoint = o_proj_worker
-                o_proj_worker._fifos.append(handle)
-        o_proj_workers.append(o_proj_worker)
+        if build_o_proj_workers:
+            o_proj_worker = Worker(
+                matmul_o_proj,
+                fn_args=[
+                    o_proj_in,
+                    o_proj_ow,
+                    o_proj_acc_in,
+                    o_proj_acc_out,
+                    o_proj_output,
+                    o_proj_row_store_parts,
+                    o_proj_reduce_in,
+                    group_reduce_in,
+                    o_proj_group_out,
+                    o_proj_partial_scratch,
+                    o_proj_stats_sum_buffer,
+                    o_proj_stats_sumsq_buffer,
+                    ln_zero_f32_kernel,
+                    ln_calc_sum_sumsq_kernel,
+                    convert_stats_to_packet_kernel,
+                    zero_kernel_o_proj,
+                    matmul_init_kernel_o_proj,
+                    matmul_kernel_o_proj,
+                    eltwise_add_vector,
+                    mem_copy_o_proj,
+                    is_group_accum_core,
+                    emit_final_output,
+                    emit_ln1_stats,
+                    o_proj_acc_group_size > 1,
+                    oproj_compute_enabled,
+                    i,
+                ],
+                stack_size=0xD00,
+                placement=o_proj_worker_tiles[i],
+                while_true=False,
+            )
+            if o_proj_row_store_parts is not None:
+                for handle in o_proj_row_store_parts:
+                    handle.endpoint = o_proj_worker
+                    o_proj_worker._fifos.append(handle)
+            o_proj_workers.append(o_proj_worker)
+        else:
+            o_proj_workers.append(None)
         logging.debug(
             "Configured o_proj worker %d with acc_depth=%d "
             "(group=%d pos=%d stage_core=%s stage_order=%d emit_final=%s)",
@@ -3686,38 +3903,50 @@ def fused_mha(
     )
     ln1_norm_sum_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sum_buffer")
     ln1_norm_sumsq_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sumsq_buffer")
+    ln1_input_cons = outOProjInput.cons() if build_ln1_worker else None
+    o_proj_verify_cons = (
+        oProjVerifyOut.cons() if direct_verify_stage == STAGE_O_PROJ else None
+    )
+    ln1_output_group_count = ln1_broadcast_groups
+    ln1_consume_group_count = ln1_broadcast_groups
 
-    ln1_worker = Worker(
-        core_fn_ln1_fused,
-        fn_args=[
-            outOProjInput.cons(),
-            ln1Replay.cons(),
-            ln1Replay.prod(),
-            memR.cons(),
-            ln1_norm_sum_buffer,
-            ln1_norm_sumsq_buffer,
-            ln1_weight_buffer,
-            ln1Broadcast.prod(),
-            None,
-            ln_fused_add_layer_norm_kernel,
-            ln_fused_layer_norm_kernel,
-            ln_calc_sum_sumsq_kernel,
-            convert_packet_to_stats_kernel,
-            ln_zero_f32_kernel,
-            mem_copy_o_proj,
-            ln_mul_add_kernel,
-            addnorm1_debug_mode,
-            ffn_stage_only,
-            ln1_broadcast_groups,
-            ln1_broadcast_groups,
-        ],
-        placement=ln1_norm_tile_obj,
-        while_true=False,
+    ln1_worker = (
+        Worker(
+            core_fn_ln1_fused,
+            fn_args=[
+                ln1_input_cons,
+                ln1Replay.cons(),
+                ln1Replay.prod(),
+                memR.cons(),
+                ln1_norm_sum_buffer,
+                ln1_norm_sumsq_buffer,
+                ln1_weight_buffer,
+                ln1Broadcast.prod(),
+                None,
+                ln_fused_add_layer_norm_kernel,
+                ln_fused_layer_norm_kernel,
+                ln_calc_sum_sumsq_kernel,
+                convert_packet_to_stats_kernel,
+                ln_zero_f32_kernel,
+                mem_copy_o_proj,
+                ln_mul_add_kernel,
+                ln1_compute_enabled,
+                ln1_output_group_count,
+                ln1_consume_group_count,
+            ],
+            placement=ln1_norm_tile_obj,
+            while_true=False,
+        )
+        if build_ln1_worker
+        else None
     )
 
     ffn_up_workers = []
+    ffn_up_output_cons = [None] * effective_ffn_branches
     ffn_up_use_init_matmul = True
     for branch_idx in range(effective_ffn_branches):
+        if build_ffn_down_workers:
+            ffn_up_output_cons[branch_idx] = ffnUpOut[branch_idx].cons()
         ffn_up_worker_args = [
             memOutLNCons[branch_idx],
             memBUp[branch_idx].cons() if memBUp[branch_idx] is not None else None,
@@ -3730,21 +3959,24 @@ def fused_mha(
             mem_copy_o_proj,
             ffn_col_group_counts[branch_idx],
             ln1_broadcast_groups,
-            ffn_stage_only,
+            up_compute_enabled,
             ffn_up_use_init_matmul,
         ]
-        ffn_up_workers.append(
-            Worker(
-                core_fn_ffn_up_proj,
-                fn_args=ffn_up_worker_args,
-                placement=Tile(
-                    col=selected_up_tiles[branch_idx][0],
-                    row=selected_up_tiles[branch_idx][1],
-                ),
-                stack_size=0x700,
-                while_true=False,
+        if build_ffn_up_workers:
+            ffn_up_workers.append(
+                Worker(
+                    core_fn_ffn_up_proj,
+                    fn_args=ffn_up_worker_args,
+                    placement=Tile(
+                        col=selected_up_tiles[branch_idx][0],
+                        row=selected_up_tiles[branch_idx][1],
+                    ),
+                    stack_size=0x700,
+                    while_true=False,
+                )
             )
-        )
+        else:
+            ffn_up_workers.append(None)
 
     ffn_down_workers = []
     for branch_idx in range(effective_ffn_branches):
@@ -3791,7 +4023,7 @@ def fused_mha(
             reduce_out = None
             is_output_branch = False
         ffn_down_worker_args = [
-            ffnUpOut[branch_idx].cons(),
+            ffn_up_output_cons[branch_idx],
             memBDown[branch_idx].cons() if memBDown[branch_idx] is not None else None,
             (
                 ffnDownAccum[branch_idx].cons(depth=1)
@@ -3812,7 +4044,7 @@ def fused_mha(
             ffn_col_group_counts[branch_idx],
             reduce_in,
             is_output_branch,
-            ffn_stage_only,
+            down_compute_enabled,
             emit_ln2_replay_from_down and is_output_branch,
             group_partner_in0,
             (
@@ -3828,15 +4060,18 @@ def fused_mha(
             ),
             group_partial_out,
         ]
-        ffn_down_workers.append(
-            Worker(
-                core_fn_ffn_down_proj,
-                fn_args=ffn_down_worker_args,
-                placement=ffn_down_worker_tiles[branch_idx],
-                stack_size=0xF00,
-                while_true=False,
+        if build_ffn_down_workers:
+            ffn_down_workers.append(
+                Worker(
+                    core_fn_ffn_down_proj,
+                    fn_args=ffn_down_worker_args,
+                    placement=ffn_down_worker_tiles[branch_idx],
+                    stack_size=0xF00,
+                    while_true=False,
+                )
             )
-        )
+        else:
+            ffn_down_workers.append(None)
 
     ln2_weight_buffer = Buffer(
         type=ln_weights_ty,
@@ -3874,31 +4109,35 @@ def fused_mha(
         if ln2_ffn_secondary_cons is not None
         else None
     )
-    ln2_worker = Worker(
-        core_fn_add_norm2,
-        fn_args=[
-            ln2_ffn_primary_cons,
-            ln2_ffn_secondary_cons,
-            ffnRIn.cons(),
-            ln2_ffn_merge_buffer,
-            ln2_sum_buffer,
-            ln2_sumsq_buffer,
-            ln2_weight_buffer,
-            outLN2.prod(),
-            ln_fused_add_layer_norm_kernel,
-            ln_calc_sum_sumsq_kernel,
-            eltwise_add_vector if ln2_ffn_secondary_cons is not None else None,
-            ln_zero_f32_kernel,
-            mem_copy_o_proj,
-            ffn_stage_only,
-            addnorm2_debug_mode,
-            emit_ln2_replay_from_down,
-            ln2_replay_curr,
-            ln2_replay_new,
-        ],
-        placement=ln2_tile_obj,
-        stack_size=0xF00,
-        while_true=False,
+    ln2_worker = (
+        Worker(
+            core_fn_add_norm2,
+            fn_args=[
+                ln2_ffn_primary_cons,
+                ln2_ffn_secondary_cons,
+                ffnRIn.cons(),
+                ln2_ffn_merge_buffer,
+                ln2_sum_buffer,
+                ln2_sumsq_buffer,
+                ln2_weight_buffer,
+                outLN2.prod(),
+                ln_fused_add_layer_norm_kernel,
+                ln_calc_sum_sumsq_kernel,
+                eltwise_add_vector if ln2_ffn_secondary_cons is not None else None,
+                ln_zero_f32_kernel,
+                mem_copy_o_proj,
+                ln2_compute_enabled,
+                verify_stage,
+                emit_ln2_replay_from_down,
+                ln2_replay_curr,
+                ln2_replay_new,
+            ],
+            placement=ln2_tile_obj,
+            stack_size=0xF00,
+            while_true=False,
+        )
+        if build_ln2_worker
+        else None
     )
 
     # Define tensor access patterns for inputs/outputs.
@@ -4039,6 +4278,7 @@ def fused_mha(
             raise ValueError(f"Unexpected R tile rank for replay: {tile._sizes}")
         tile._sizes[0] = ln1_broadcast_groups
         tile._strides[0] = 0
+    up_verify_tensor_shape = (seq_len, ffn_intermediate_size)
 
     # FFN weight taps (per branch):
     # - Up projection: [branch_col_group, k_chunk, m_tile, n_tile]
@@ -4549,8 +4789,8 @@ def fused_mha(
         def schedule_ffn_weight_fills(task_group, col_group_idx):
             # Fill all B_Up streams first so every FFN-up branch can start
             # before B_Down transfers contend for shim/memtile bandwidth.
-            schedule_bup = ffn_stage_only in (None, 0)
-            schedule_bdown = ffn_stage_only in (None, 1)
+            schedule_bup = up_compute_enabled
+            schedule_bdown = down_compute_enabled
             if schedule_bup and bup_split_enabled:
                 bup_chunk_order = (
                     list(range(len(branch_split_chunks) - 1, -1, -1))
@@ -4731,204 +4971,314 @@ def fused_mha(
             logging.debug(f"  O tap: {O_tiles[tap_idx]}")
             rt.finish_task_group(tg_out)
 
+        def direct_verify_stage_source(handle):
+            return handle.cons() if hasattr(handle, "cons") else handle
+
+        def schedule_q_fill(task_group, q_block_idx, *, wait):
+            for split_idx in range(mha_stream_split_factor):
+                rt.fill(
+                    inQ_streams[split_idx].prod(),
+                    QKV,
+                    tap=Q_tiles_by_stream[split_idx][q_block_idx],
+                    placement=Tile(col=q_stream_mem_cols[split_idx], row=0),
+                    task_group=task_group,
+                    wait=wait,
+                )
+
+        def schedule_mha_head_fills(
+            task_group,
+            *,
+            head_idx,
+            col_group,
+            include_v,
+            include_wo,
+            wait,
+        ):
+            wo_tap_idx = head_idx * num_o_col_groups + col_group
+            for split_idx in range(mha_stream_split_factor):
+                rt.fill(
+                    inK_streams[split_idx].prod(),
+                    QKV,
+                    tap=K_tiles_by_stream[split_idx][head_idx],
+                    placement=Tile(col=k_stream_mem_cols[split_idx], row=0),
+                    task_group=task_group,
+                    wait=wait,
+                )
+                if include_v:
+                    rt.fill(
+                        inV_streams[split_idx].prod(),
+                        QKV,
+                        tap=V_tiles_by_stream[split_idx][head_idx],
+                        placement=Tile(col=v_stream_mem_cols[split_idx], row=0),
+                        task_group=task_group,
+                        wait=wait,
+                    )
+                if include_wo:
+                    rt.fill(
+                        inOW_streams[split_idx].prod(),
+                        W_O,
+                        tap=WO_tiles_by_stream[split_idx][wo_tap_idx],
+                        placement=Tile(col=ow_stream_mem_cols[split_idx], row=0),
+                        task_group=task_group,
+                        wait=wait,
+                    )
+
+        stage_source_branch = 0
+        direct_verify_output_col = ln_mem_tile_col
+
         pending_ln1_refill_tg = None
         pending_output_tap_idx = None
 
-        for i in range(parallel_heads):
-            rt.start(matmul_workers[i])
-            rt.start(softmax_workers[i])
-            rt.start(matmul_pv_workers[i])
-            rt.start(o_proj_workers[i])
-        rt.start(ln1_worker)
-        for branch_idx in range(effective_ffn_branches):
-            rt.start(ffn_up_workers[branch_idx])
-            rt.start(ffn_down_workers[branch_idx])
-        rt.start(ln2_worker)
+        if direct_verify_stage is not None:
+            for i in range(parallel_heads):
+                rt.start(matmul_workers[i])
+                if build_softmax_workers:
+                    rt.start(softmax_workers[i])
+                if build_pv_workers:
+                    rt.start(matmul_pv_workers[i])
+                if build_o_proj_workers:
+                    rt.start(o_proj_workers[i])
+            if build_ln1_worker:
+                rt.start(ln1_worker)
+            if build_ffn_up_workers:
+                for branch_idx in range(effective_ffn_branches):
+                    rt.start(ffn_up_workers[branch_idx])
+            if direct_verify_stage == STAGE_O_PROJ:
+                for q_block_idx in range(num_q_seq_blocks):
+                    for col_group in range(num_o_col_groups):
+                        tg_q = rt.task_group()
+                        schedule_q_fill(tg_q, q_block_idx, wait=False)
+                        for head_idx in range(num_qkv_head_block_per_parallel_head):
+                            tg_head = rt.task_group()
+                            schedule_mha_head_fills(
+                                tg_head,
+                                head_idx=head_idx,
+                                col_group=col_group,
+                                include_v=True,
+                                include_wo=True,
+                                wait=False,
+                            )
+                            rt.finish_task_group(tg_head)
+                        tap_idx = q_block_idx * num_o_col_groups + col_group
+                        tg_out = rt.task_group()
+                        rt.drain(
+                            o_proj_verify_cons,
+                            OR,
+                            tap=O_tiles[tap_idx],
+                            placement=Tile(col=direct_verify_output_col, row=0),
+                            task_group=tg_out,
+                            wait=True,
+                        )
+                        rt.finish_task_group(tg_out)
+                        rt.finish_task_group(tg_q)
+        else:
+            for i in range(parallel_heads):
+                rt.start(matmul_workers[i])
+                rt.start(softmax_workers[i])
+                rt.start(matmul_pv_workers[i])
+                rt.start(o_proj_workers[i])
+            rt.start(ln1_worker)
+            for branch_idx in range(effective_ffn_branches):
+                rt.start(ffn_up_workers[branch_idx])
+                rt.start(ffn_down_workers[branch_idx])
+            rt.start(ln2_worker)
 
-        for q_block_idx in range(num_q_seq_blocks):
-            for col_group in range(num_o_col_groups):
-                # Main fill group (Q when not pre-staged).
-                tg = rt.task_group()
-                # Tail fill group (R/B_Up/B_Down). Optionally keep this
-                # decoupled so tail drains can make progress before all FFN
-                # weight fills complete.
-                tg_tail_fill = rt.task_group() if decouple_tail_fill else tg
-                if serialize_q_prestage:
-                    # Stage Q tiles first so head-0 compute cannot race ahead of Q load.
-                    tg_q = rt.task_group()
-                    for split_idx in range(mha_stream_split_factor):
-                        rt.fill(
-                            inQ_streams[split_idx].prod(),
-                            QKV,
-                            tap=Q_tiles_by_stream[split_idx][q_block_idx],
-                            placement=Tile(col=q_stream_mem_cols[split_idx], row=0),
-                            task_group=tg_q,
-                        )
-                    rt.finish_task_group(tg_q)
-                else:
-                    for split_idx in range(mha_stream_split_factor):
-                        rt.fill(
-                            inQ_streams[split_idx].prod(),
-                            QKV,
-                            tap=Q_tiles_by_stream[split_idx][q_block_idx],
-                            placement=Tile(col=q_stream_mem_cols[split_idx], row=0),
-                            task_group=tg,
-                            # Non-prestaged Q fills must be awaited at end-of-tap
-                            # to avoid run-to-run drift in persistent worker loops.
-                            wait=True,
-                        )
-                logging.debug(
-                    f"Scheduling fills for q block {q_block_idx}, col group {col_group} for QKV, W_O, and OR"
-                )
-                if mha_stream_split_factor == 1:
-                    logging.debug(f"  Q tap: {Q_tiles_by_stream[0][q_block_idx]}")
-                else:
-                    for split_idx in range(mha_stream_split_factor):
-                        logging.debug(
-                            "  Q tap split[%d]: %s",
-                            split_idx,
-                            Q_tiles_by_stream[split_idx][q_block_idx],
-                        )
-                tap_idx = q_block_idx * num_o_col_groups + col_group
-                o_offsets = enumerate_outer_object_offsets(
-                    O_tiles[tap_idx], inner_rank=2
-                )
-                r_offsets = enumerate_outer_object_offsets(
-                    R_tiles[tap_idx], inner_rank=2
-                )
-                logging.debug(
-                    "  O/R tap mapping for q_block=%d col_group=%d tap_idx=%d: "
-                    "O_outer_offsets=%s R_outer_offsets=%s",
-                    q_block_idx,
-                    col_group,
-                    tap_idx,
-                    o_offsets,
-                    r_offsets,
-                )
-                for pass_idx in range(2):
-                    for acc_idx in range(proj_acc_depth):
-                        logical_col_idx = col_group * proj_acc_depth + acc_idx
-                        o_off = o_offsets[acc_idx] if acc_idx < len(o_offsets) else None
-                        r_off = r_offsets[acc_idx] if acc_idx < len(r_offsets) else None
-                        logging.debug(
-                            "    Expected O-proj emit: pass=%d acc_idx=%d logical_col=%d "
-                            "-> O_offset=%s R_offset=%s",
-                            pass_idx + 1,
-                            acc_idx,
-                            logical_col_idx,
-                            o_off,
-                            r_off,
-                        )
-                for head_idx in range(heads // parallel_heads):
-                    tg_head = rt.task_group()
-                    wo_tap_idx = head_idx * num_o_col_groups + col_group
-                    for split_idx in range(mha_stream_split_factor):
-                        rt.fill(
-                            inK_streams[split_idx].prod(),
-                            QKV,
-                            tap=K_tiles_by_stream[split_idx][head_idx],
-                            placement=Tile(col=k_stream_mem_cols[split_idx], row=0),
-                            task_group=tg_head,
-                            wait=True,
-                        )
-                        rt.fill(
-                            inV_streams[split_idx].prod(),
-                            QKV,
-                            tap=V_tiles_by_stream[split_idx][head_idx],
-                            placement=Tile(col=v_stream_mem_cols[split_idx], row=0),
-                            task_group=tg_head,
-                            wait=True,
-                        )
-                        rt.fill(
-                            inOW_streams[split_idx].prod(),
-                            W_O,
-                            tap=WO_tiles_by_stream[split_idx][wo_tap_idx],
-                            placement=Tile(col=ow_stream_mem_cols[split_idx], row=0),
-                            task_group=tg_head,
-                            wait=True,
-                        )
-                    rt.finish_task_group(tg_head)
+            for q_block_idx in range(num_q_seq_blocks):
+                for col_group in range(num_o_col_groups):
+                    # Main fill group (Q when not pre-staged).
+                    tg = rt.task_group()
+                    # Tail fill group (R/B_Up/B_Down). Optionally keep this
+                    # decoupled so tail drains can make progress before all FFN
+                    # weight fills complete.
+                    tg_tail_fill = rt.task_group() if decouple_tail_fill else tg
+                    if serialize_q_prestage:
+                        # Stage Q tiles first so head-0 compute cannot race ahead of Q load.
+                        tg_q = rt.task_group()
+                        for split_idx in range(mha_stream_split_factor):
+                            rt.fill(
+                                inQ_streams[split_idx].prod(),
+                                QKV,
+                                tap=Q_tiles_by_stream[split_idx][q_block_idx],
+                                placement=Tile(col=q_stream_mem_cols[split_idx], row=0),
+                                task_group=tg_q,
+                            )
+                        rt.finish_task_group(tg_q)
+                    else:
+                        for split_idx in range(mha_stream_split_factor):
+                            rt.fill(
+                                inQ_streams[split_idx].prod(),
+                                QKV,
+                                tap=Q_tiles_by_stream[split_idx][q_block_idx],
+                                placement=Tile(col=q_stream_mem_cols[split_idx], row=0),
+                                task_group=tg,
+                                # Non-prestaged Q fills must be awaited at end-of-tap
+                                # to avoid run-to-run drift in persistent worker loops.
+                                wait=True,
+                            )
+                    logging.debug(
+                        f"Scheduling fills for q block {q_block_idx}, col group {col_group} for QKV, W_O, and OR"
+                    )
                     if mha_stream_split_factor == 1:
-                        logging.debug(f"    K tap: {K_tiles_by_stream[0][head_idx]}")
-                        logging.debug(f"    V tap: {V_tiles_by_stream[0][head_idx]}")
-                        logging.debug(
-                            f"    W_O tap: {WO_tiles_by_stream[0][wo_tap_idx]}"
-                        )
+                        logging.debug(f"  Q tap: {Q_tiles_by_stream[0][q_block_idx]}")
                     else:
                         for split_idx in range(mha_stream_split_factor):
                             logging.debug(
-                                "    K tap split[%d]: %s",
+                                "  Q tap split[%d]: %s",
                                 split_idx,
-                                K_tiles_by_stream[split_idx][head_idx],
+                                Q_tiles_by_stream[split_idx][q_block_idx],
                             )
-                            logging.debug(
-                                "    V tap split[%d]: %s",
-                                split_idx,
-                                V_tiles_by_stream[split_idx][head_idx],
-                            )
-                            logging.debug(
-                                "    W_O tap split[%d]: %s",
-                                split_idx,
-                                WO_tiles_by_stream[split_idx][wo_tap_idx],
-                            )
-                    wo_offsets = enumerate_outer_object_offsets(
-                        WO_tiles[wo_tap_idx], inner_rank=2
+                    tap_idx = q_block_idx * num_o_col_groups + col_group
+                    o_offsets = enumerate_outer_object_offsets(
+                        O_tiles[tap_idx], inner_rank=2
+                    )
+                    r_offsets = enumerate_outer_object_offsets(
+                        R_tiles[tap_idx], inner_rank=2
                     )
                     logging.debug(
-                        "    W_O outer offsets (head_idx=%d, q_block=%d, col_group=%d): %s",
-                        head_idx,
+                        "  O/R tap mapping for q_block=%d col_group=%d tap_idx=%d: "
+                        "O_outer_offsets=%s R_outer_offsets=%s",
                         q_block_idx,
                         col_group,
-                        wo_offsets,
+                        tap_idx,
+                        o_offsets,
+                        r_offsets,
                     )
+                    for pass_idx in range(2):
+                        for acc_idx in range(proj_acc_depth):
+                            logical_col_idx = col_group * proj_acc_depth + acc_idx
+                            o_off = (
+                                o_offsets[acc_idx] if acc_idx < len(o_offsets) else None
+                            )
+                            r_off = (
+                                r_offsets[acc_idx] if acc_idx < len(r_offsets) else None
+                            )
+                            logging.debug(
+                                "    Expected O-proj emit: pass=%d acc_idx=%d logical_col=%d "
+                                "-> O_offset=%s R_offset=%s",
+                                pass_idx + 1,
+                                acc_idx,
+                                logical_col_idx,
+                                o_off,
+                                r_off,
+                            )
+                    for head_idx in range(heads // parallel_heads):
+                        tg_head = rt.task_group()
+                        wo_tap_idx = head_idx * num_o_col_groups + col_group
+                        for split_idx in range(mha_stream_split_factor):
+                            rt.fill(
+                                inK_streams[split_idx].prod(),
+                                QKV,
+                                tap=K_tiles_by_stream[split_idx][head_idx],
+                                placement=Tile(col=k_stream_mem_cols[split_idx], row=0),
+                                task_group=tg_head,
+                                wait=True,
+                            )
+                            rt.fill(
+                                inV_streams[split_idx].prod(),
+                                QKV,
+                                tap=V_tiles_by_stream[split_idx][head_idx],
+                                placement=Tile(col=v_stream_mem_cols[split_idx], row=0),
+                                task_group=tg_head,
+                                wait=True,
+                            )
+                            rt.fill(
+                                inOW_streams[split_idx].prod(),
+                                W_O,
+                                tap=WO_tiles_by_stream[split_idx][wo_tap_idx],
+                                placement=Tile(
+                                    col=ow_stream_mem_cols[split_idx], row=0
+                                ),
+                                task_group=tg_head,
+                                wait=True,
+                            )
+                        rt.finish_task_group(tg_head)
+                        if mha_stream_split_factor == 1:
+                            logging.debug(
+                                f"    K tap: {K_tiles_by_stream[0][head_idx]}"
+                            )
+                            logging.debug(
+                                f"    V tap: {V_tiles_by_stream[0][head_idx]}"
+                            )
+                            logging.debug(
+                                f"    W_O tap: {WO_tiles_by_stream[0][wo_tap_idx]}"
+                            )
+                        else:
+                            for split_idx in range(mha_stream_split_factor):
+                                logging.debug(
+                                    "    K tap split[%d]: %s",
+                                    split_idx,
+                                    K_tiles_by_stream[split_idx][head_idx],
+                                )
+                                logging.debug(
+                                    "    V tap split[%d]: %s",
+                                    split_idx,
+                                    V_tiles_by_stream[split_idx][head_idx],
+                                )
+                                logging.debug(
+                                    "    W_O tap split[%d]: %s",
+                                    split_idx,
+                                    WO_tiles_by_stream[split_idx][wo_tap_idx],
+                                )
+                        wo_offsets = enumerate_outer_object_offsets(
+                            WO_tiles[wo_tap_idx], inner_rank=2
+                        )
+                        logging.debug(
+                            "    W_O outer offsets (head_idx=%d, q_block=%d, col_group=%d): %s",
+                            head_idx,
+                            q_block_idx,
+                            col_group,
+                            wo_offsets,
+                        )
 
-                schedule_residual_fill(
-                    tg_tail_fill,
-                    q_block_idx * (num_o_col_groups) + col_group,
-                )
-                if ln1_mode_hooks.should_prefill_ffn_weights(
-                    runtime_state=runtime_state,
-                ):
-                    schedule_ffn_weight_fills(tg_tail_fill, col_group)
-
-                pending_ln1_refill_tg, pending_output_tap_idx = (
-                    ln1_mode_hooks.schedule_runtime_tap(
-                        rt=rt,
-                        OR=OR,
-                        or_tensor_shape=or_tensor_shape,
-                        seq_len=seq_len,
-                        seq_tile=seq_tile,
-                        embed_sz=embed_sz,
-                        profile_replay_groups=ln1_broadcast_groups,
-                        proj_acc_depth=proj_acc_depth,
-                        emb_tile=emb_tile,
+                    schedule_residual_fill(
+                        tg_tail_fill,
+                        q_block_idx * (num_o_col_groups) + col_group,
+                    )
+                    if ln1_mode_hooks.should_prefill_ffn_weights(
                         runtime_state=runtime_state,
-                        ln1OutStageToDDR=ln1OutStageToDDR,
-                        ln1InFromDDR=ln1InFromDDR,
-                        ffnRFromDDR=ffnRFromDDR,
-                        ffn_a_stage_mem_tile_cols=ffn_a_stage_mem_tile_cols,
-                        ffn_residual_fill_col=ffn_residual_fill_col,
-                        transfer_count_for_fifo_obj=transfer_count_for_fifo_obj,
-                        tensor_access_pattern_cls=TensorAccessPattern,
-                        schedule_ffn_weight_fills=schedule_ffn_weight_fills,
-                        schedule_final_output_for_tap=schedule_final_output_for_tap,
-                        tap_idx=tap_idx,
-                        col_group=col_group,
-                        tg=tg,
-                        tg_tail_fill=tg_tail_fill,
-                        decouple_tail_fill=decouple_tail_fill,
-                        pending_ln1_refill_tg=pending_ln1_refill_tg,
-                        pending_output_tap_idx=pending_output_tap_idx,
-                        tile_ctor=Tile,
-                    )
-                )
+                    ):
+                        schedule_ffn_weight_fills(tg_tail_fill, col_group)
 
-        pending_ln1_refill_tg, pending_output_tap_idx = ln1_mode_hooks.finalize_runtime(
-            rt=rt,
-            schedule_final_output_for_tap=schedule_final_output_for_tap,
-            pending_ln1_refill_tg=pending_ln1_refill_tg,
-            pending_output_tap_idx=pending_output_tap_idx,
-        )
+                    pending_ln1_refill_tg, pending_output_tap_idx = (
+                        ln1_mode_hooks.schedule_runtime_tap(
+                            rt=rt,
+                            OR=OR,
+                            or_tensor_shape=or_tensor_shape,
+                            seq_len=seq_len,
+                            seq_tile=seq_tile,
+                            embed_sz=embed_sz,
+                            profile_replay_groups=ln1_broadcast_groups,
+                            proj_acc_depth=proj_acc_depth,
+                            emb_tile=emb_tile,
+                            runtime_state=runtime_state,
+                            ln1OutStageToDDR=ln1OutStageToDDR,
+                            ln1InFromDDR=ln1InFromDDR,
+                            ffnRFromDDR=ffnRFromDDR,
+                            ffn_a_stage_mem_tile_cols=ffn_a_stage_mem_tile_cols,
+                            ffn_residual_fill_col=ffn_residual_fill_col,
+                            transfer_count_for_fifo_obj=transfer_count_for_fifo_obj,
+                            tensor_access_pattern_cls=TensorAccessPattern,
+                            schedule_ffn_weight_fills=schedule_ffn_weight_fills,
+                            schedule_final_output_for_tap=schedule_final_output_for_tap,
+                            tap_idx=tap_idx,
+                            col_group=col_group,
+                            tg=tg,
+                            tg_tail_fill=tg_tail_fill,
+                            decouple_tail_fill=decouple_tail_fill,
+                            pending_ln1_refill_tg=pending_ln1_refill_tg,
+                            pending_output_tap_idx=pending_output_tap_idx,
+                            tile_ctor=Tile,
+                        )
+                    )
+
+            pending_ln1_refill_tg, pending_output_tap_idx = (
+                ln1_mode_hooks.finalize_runtime(
+                    rt=rt,
+                    schedule_final_output_for_tap=schedule_final_output_for_tap,
+                    pending_ln1_refill_tg=pending_ln1_refill_tg,
+                    pending_output_tap_idx=pending_output_tap_idx,
+                )
+            )
 
     # Create the program from the device type and runtime
     dev_ty = NPU2()

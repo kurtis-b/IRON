@@ -21,7 +21,12 @@ from operators.common import (
     PythonGeneratedMLIRArtifact,
 )
 from operators.common.utils import torch_to_numpy, numpy_to_torch
-from operators.encoder_pipeline_ddr.debug_modes import resolve_pipeline_debug_modes
+from operators.encoder_pipeline_ddr.debug_modes import (
+    STAGE_DOWN_PROJ,
+    STAGE_LN2,
+    STAGE_O_PROJ,
+    resolve_pipeline_debug_modes,
+)
 
 
 class AIEEncoderPipeline(AIEOperatorBase):
@@ -67,14 +72,12 @@ class AIEEncoderPipeline(AIEOperatorBase):
         del ln1_staging_design
         self.ln1_staging_design = "ddr"
         try:
-            (
-                self.mha_debug,
-                self.ffn_stage_only,
-                self.addnorm1_debug_mode,
-                self.addnorm2_debug_mode,
-            ) = resolve_pipeline_debug_modes(debug)
+            debug_config = resolve_pipeline_debug_modes(debug)
         except ValueError as exc:
             raise AIEOperatorConstraintError(str(exc)) from exc
+        self.profile_stage = debug_config.profile_stage
+        self.verify_stage = debug_config.verify_stage
+        self.mha_debug = 0
         self.embed_sz = d * num_heads
         self.ffn_intermediate_size = (
             ffn_intermediate_size
@@ -189,7 +192,6 @@ class AIEEncoderPipeline(AIEOperatorBase):
         return prefix[:4]
 
     def _artifact_stem(self, prefix: str) -> str:
-        ffn_stage = self.ffn_stage_only if self.ffn_stage_only is not None else "all"
         identity = "|".join(
             map(
                 str,
@@ -207,23 +209,21 @@ class AIEEncoderPipeline(AIEOperatorBase):
                     self.nB_tiles_distributed,
                     self.ffn_intermediate_size,
                     self.debug,
-                    self.mha_debug,
-                    ffn_stage,
-                    self.addnorm1_debug_mode,
-                    self.addnorm2_debug_mode,
+                    self.profile_stage,
+                    self.verify_stage,
                     self.ln1_staging_design,
                 ],
             )
         )
         digest = hashlib.blake2s(identity.encode(), digest_size=6).hexdigest()
         prefix_tag = self._short_prefix(prefix)
-        stage_tag = "a" if self.ffn_stage_only is None else ffn_stage
+        profile_tag = "all" if self.profile_stage is None else f"p{self.profile_stage}"
+        verify_tag = "none" if self.verify_stage is None else f"v{self.verify_stage}"
         return (
             f"{prefix_tag}_{self.num_heads}h_{self.seq_len}s_{self.emb_tile}e_"
             f"{self.parallel_heads}ph_{self.proj_acc_depth}pa_"
             f"{self.o_proj_acc_group_size}g_{self.nB_tiles_distributed}pf_"
-            f"d{self.debug}_m{self.mha_debug}_f{stage_tag}_"
-            f"n1{self.addnorm1_debug_mode}_n2{self.addnorm2_debug_mode}_"
+            f"d{self.debug}_{profile_tag}_{verify_tag}_"
             f"{self.ln1_staging_design[:2]}_{digest}"
         )
 
@@ -334,9 +334,8 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "ln2_weight_file": ln2_weight_file_name,
                 "nB_tiles_distributed": self.nB_tiles_distributed,
                 "ffn_intermediate_size": self.ffn_intermediate_size,
-                "ffn_stage_only": self.ffn_stage_only,
-                "addnorm1_debug_mode": self.addnorm1_debug_mode,
-                "addnorm2_debug_mode": self.addnorm2_debug_mode,
+                "profile_stage": self.profile_stage,
+                "verify_stage": self.verify_stage,
             },
         )
 
@@ -474,7 +473,10 @@ class AIEEncoderPipeline(AIEOperatorBase):
             ) * self.seq_tile
         self.add_buffer(
             "OR",
-            (2 * self.seq_len + ln1_stage_rows) * self.embed_sz,
+            max(
+                (2 * self.seq_len + ln1_stage_rows) * self.embed_sz,
+                int(np.prod(self._debug_output_shape())),
+            ),
         )
         self.add_buffer(
             "O",
@@ -594,11 +596,21 @@ class AIEEncoderPipeline(AIEOperatorBase):
 
         self.run_runlist()
 
-        o_np = self.read_buffer(
-            "O", shape=(self.seq_len, self.embed_sz), dtype=bfloat16
-        )
+        o_np = self.read_buffer("O", shape=self._debug_output_shape(), dtype=bfloat16)
         result = numpy_to_torch(o_np)
         return result
+
+    def _debug_output_shape(self):
+        if self.verify_stage in (
+            None,
+            STAGE_O_PROJ,
+            STAGE_DOWN_PROJ,
+            STAGE_LN2,
+        ):
+            return (self.seq_len, self.embed_sz)
+        raise AIEOperatorConstraintError(
+            f"Unsupported verify_stage output shape: {self.verify_stage}"
+        )
 
 
 AIEEncoderPipelineDDR = AIEEncoderPipeline
