@@ -65,7 +65,18 @@ def _is_evenly_partitioned(case):
 
 
 def _high_pacc_seq64_variant(case):
-    seq_len, d, heads, intermediate_size, _, kv_seq_tile, _, parallel_heads, parallel_ffn, _ = case
+    (
+        seq_len,
+        d,
+        heads,
+        intermediate_size,
+        _,
+        kv_seq_tile,
+        _,
+        parallel_heads,
+        parallel_ffn,
+        _,
+    ) = case
     return (
         seq_len,
         d,
@@ -85,7 +96,19 @@ def _case_with_default_opg(case):
 
 
 def _validate_case(case):
-    _, d, heads, intermediate_size, _, _, emb_tile, parallel_heads, parallel_ffn, proj_acc_depth, opg = case
+    (
+        _,
+        d,
+        heads,
+        intermediate_size,
+        _,
+        _,
+        emb_tile,
+        parallel_heads,
+        parallel_ffn,
+        proj_acc_depth,
+        opg,
+    ) = case
     emb_size = d * heads
     if emb_tile * proj_acc_depth != emb_size:
         raise ValueError(case)
@@ -96,7 +119,19 @@ def _validate_case(case):
 
 
 def _case_name(case):
-    seq_len, d, heads, intermediate_size, q_seq_tile, kv_seq_tile, emb_tile, parallel_heads, parallel_ffn, proj_acc_depth, o_proj_acc_group_size = case
+    (
+        seq_len,
+        d,
+        heads,
+        intermediate_size,
+        q_seq_tile,
+        kv_seq_tile,
+        emb_tile,
+        parallel_heads,
+        parallel_ffn,
+        proj_acc_depth,
+        o_proj_acc_group_size,
+    ) = case
     return (
         f"encoder_{seq_len}seq_{d}hdim_{heads}heads_{intermediate_size}ffn_"
         f"{q_seq_tile}qseqtile_{kv_seq_tile}kvtile_{emb_tile}embtile_"
@@ -128,7 +163,19 @@ def _assert_error_budget(errors, case):
 
 def _run_case(case, aie_context):
     _validate_case(case)
-    seq_len, d, heads, intermediate_size, q_seq_tile, kv_seq_tile, emb_tile, parallel_heads, parallel_ffn, proj_acc_depth, o_proj_acc_group_size = case
+    (
+        seq_len,
+        d,
+        heads,
+        intermediate_size,
+        q_seq_tile,
+        kv_seq_tile,
+        emb_tile,
+        parallel_heads,
+        parallel_ffn,
+        proj_acc_depth,
+        o_proj_acc_group_size,
+    ) = case
     ref = _cached_golden_reference(seq_len, d, heads, intermediate_size, DEBUG_MODE)
     op = AIEEncoderPipeline(
         seq_len=seq_len,
@@ -173,7 +220,10 @@ _DDR_ONLY_REGULAR_CASES = {
 }
 MEMTILE_CASES = [
     pytest.param(case, id=_case_name(case))
-    for case in (_case_with_default_opg(c) for c in (*_REGULAR_BASE_CASES, *_COMPARISON_BASE_CASES))
+    for case in (
+        _case_with_default_opg(c)
+        for c in (*_REGULAR_BASE_CASES, *_COMPARISON_BASE_CASES)
+    )
     if case not in _DDR_ONLY_REGULAR_CASES
 ]
 

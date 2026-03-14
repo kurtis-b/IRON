@@ -167,6 +167,7 @@ def fused_mha(
     del ln1_stage_mode
     stage_ln1_to_ddr = False
     from operators.encoder_pipeline_memtile import hooks as ln1_mode_hooks
+
     ln1_mode_hooks = SimpleNamespace(
         choose_ln2_replay_mem_tile_col=getattr(
             ln1_mode_hooks,
@@ -194,13 +195,11 @@ def fused_mha(
         adjust_wait_ffn_weight_fill=getattr(
             ln1_mode_hooks,
             "adjust_wait_ffn_weight_fill",
-            lambda *,
-            wait_ffn_weight_fill,
-            use_ln1_broadcast,
-            effective_ffn_branches,
-            **_unused: True
-            if use_ln1_broadcast and effective_ffn_branches > 1
-            else wait_ffn_weight_fill,
+            lambda *, wait_ffn_weight_fill, use_ln1_broadcast, effective_ffn_branches, **_unused: (
+                True
+                if use_ln1_broadcast and effective_ffn_branches > 1
+                else wait_ffn_weight_fill
+            ),
         ),
         should_prefill_ffn_weights=getattr(
             ln1_mode_hooks,
@@ -215,29 +214,22 @@ def fused_mha(
         schedule_runtime_tap=getattr(
             ln1_mode_hooks,
             "schedule_runtime_tap",
-            lambda *,
-            rt,
-            schedule_final_output_for_tap,
-            tap_idx,
-            tg,
-            tg_tail_fill,
-            decouple_tail_fill,
-            pending_ln1_refill_tg,
-            pending_output_tap_idx,
-            **_unused: (
+            lambda *, rt, schedule_final_output_for_tap, tap_idx, tg, tg_tail_fill, decouple_tail_fill, pending_ln1_refill_tg, pending_output_tap_idx, **_unused: (
                 schedule_final_output_for_tap(tap_idx),
                 rt.finish_task_group(tg),
                 rt.finish_task_group(tg_tail_fill) if decouple_tail_fill else None,
                 (pending_ln1_refill_tg, pending_output_tap_idx),
-            )[-1],
+            )[
+                -1
+            ],
         ),
         finalize_runtime=getattr(
             ln1_mode_hooks,
             "finalize_runtime",
-            lambda *,
-            pending_ln1_refill_tg,
-            pending_output_tap_idx,
-            **_unused: (pending_ln1_refill_tg, pending_output_tap_idx),
+            lambda *, pending_ln1_refill_tg, pending_output_tap_idx, **_unused: (
+                pending_ln1_refill_tg,
+                pending_output_tap_idx,
+            ),
         ),
         **{
             name: getattr(ln1_mode_hooks, name)
@@ -249,11 +241,7 @@ def fused_mha(
             )
         },
     )
-    if (
-        not stage_ln1_to_ddr
-        and parallel_heads == 4
-        and emb_tile <= 96
-    ):
+    if not stage_ln1_to_ddr and parallel_heads == 4 and emb_tile <= 96:
         o_proj_acc_row_store_compute_produce_buffer_count = 2
         o_proj_acc_row_store_compute_consume_buffer_count = 1
     # Keep FFN replay topology identical across debug/non-debug configurations.
@@ -1636,8 +1624,7 @@ def fused_mha(
     ) or high_pacc_direct_ln2_replay_default
     emit_ln2_replay_from_down = emit_ln2_replay_from_down_default
     allow_high_pacc_dual_ln2_direct_replay = (
-        use_dual_ln2_ffn_inputs
-        and high_pacc_direct_ln2_replay_default
+        use_dual_ln2_ffn_inputs and high_pacc_direct_ln2_replay_default
     )
     if (
         use_dual_ln2_ffn_inputs
