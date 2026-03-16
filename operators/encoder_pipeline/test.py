@@ -23,11 +23,15 @@ def generate_test_params():
         (64, 64, 12, 3072, 32, 64, 96, 1, 1, 8, 1, 1),
         (128, 64, 12, 3072, 32, 64, 96, 1, 1, 8, 1, 1),
         (256, 64, 12, 3072, 32, 64, 96, 1, 1, 8, 1, 1),
+        (64, 64, 12, 3072, 32, 64, 96, 1, 2, 8, 1, 1),
+        (64, 64, 12, 3072, 32, 64, 96, 1, 4, 8, 1, 1),
     ]
     names = [
         "encoder_pipeline_64seq_64d_12h_3072ffn_32q_64kv_96emb",
         "encoder_pipeline_128seq_64d_12h_3072ffn_32q_64kv_96emb",
         "encoder_pipeline_256seq_64d_12h_3072ffn_32q_64kv_96emb",
+        "encoder_pipeline_64seq_64d_12h_3072ffn_32q_64kv_96emb_2ph",
+        "encoder_pipeline_64seq_64d_12h_3072ffn_32q_64kv_96emb_4ph",
     ]
     return params, names
 
