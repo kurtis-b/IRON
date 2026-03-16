@@ -19,89 +19,9 @@ from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.controlflow import range_
 from aie.iron.device import NPU2, Tile
 from aie.iron.placers import SequentialPlacer
+from operators.encoder_pipeline.placements import TOPOLOGY_PLACEMENTS
 
 BASE_DIR = Path(__file__).parent
-
-TOPOLOGY_PLACEMENTS = {
-    (12, 64, 64, 32, 64, 96, 1, 1, 8, 1, 1, 3072): {
-        "compute_tiles": {
-            "qk": (0, 2),
-            "softmax": (0, 3),
-            "pv": (0, 4),
-            "o_proj": (0, 5),
-            "ln1": (1, 5),
-            "ffn_up": (5, 5),
-            "ffn_down": (6, 5),
-            "ln2": (7, 5),
-        },
-        "mem_tiles": {
-            "q": 0,
-            "k": 1,
-            "v": 2,
-            "w_o": 3,
-            "o_proj_acc": 4,
-            "b_down": 4,
-            "ln2_replay": 4,
-            "ln1_replay": 5,
-            "b_up": 5,
-            "ffn_down_acc": 6,
-            "ln1_stage": 6,
-            "residual": 7,
-            "ffn_residual": 7,
-            "output": 7,
-        },
-        "shim_tiles": {
-            "q": 0,
-            "k": 1,
-            "v": 2,
-            "w_o": 3,
-            "b_down": 4,
-            "b_up": 5,
-            "ln1_stage": 6,
-            "residual": 7,
-            "output": 7,
-        },
-    },
-    (1, 64, 64, 32, 64, 32, 1, 1, 2, 1, 1, 96): {
-        "compute_tiles": {
-            "qk": (0, 2),
-            "softmax": (0, 3),
-            "pv": (0, 4),
-            "o_proj": (0, 5),
-            "ln1": (1, 5),
-            "ffn_up": (5, 5),
-            "ffn_down": (6, 5),
-            "ln2": (7, 5),
-        },
-        "mem_tiles": {
-            "q": 0,
-            "k": 1,
-            "v": 2,
-            "w_o": 3,
-            "o_proj_acc": 4,
-            "b_down": 4,
-            "ln2_replay": 4,
-            "ln1_replay": 5,
-            "b_up": 5,
-            "ffn_down_acc": 6,
-            "ln1_stage": 6,
-            "residual": 7,
-            "ffn_residual": 7,
-            "output": 7,
-        },
-        "shim_tiles": {
-            "q": 0,
-            "k": 1,
-            "v": 2,
-            "w_o": 3,
-            "b_down": 4,
-            "b_up": 5,
-            "ln1_stage": 6,
-            "residual": 7,
-            "output": 7,
-        },
-    },
-}
 
 
 def main():
@@ -583,12 +503,15 @@ def encoder_pipeline(
             idx_buffer[1] = 0
             for _ in range_(num_qkv_head_block_per_parallel_head):
                 elem_in_q = of_q.acquire(1)
-                elem_in_k = of_k.acquire(1)
-                elem_a_out = of_a_out.acquire(1)
-                zero(elem_a_out)
-                matmul_qk(elem_in_q, elem_in_k, elem_a_out, idx_buffer)
-                of_a_out.release(1)
-                of_k.release(1)
+                for _ in range_(num_kv_seq_blocks):
+                    elem_in_k = of_k.acquire(1)
+                    elem_a_out = of_a_out.acquire(1)
+                    zero(elem_a_out)
+                    matmul_qk(elem_in_q, elem_in_k, elem_a_out, idx_buffer)
+                    of_a_out.release(1)
+                    of_k.release(1)
+                    idx_buffer[0] += 1
+                idx_buffer[0] = 0
                 of_q.release(1)
 
     def softmax(
@@ -606,24 +529,27 @@ def encoder_pipeline(
             idx_buffer[1] = 0
             for _ in range_(num_qkv_head_block_per_parallel_head):
                 init_scale(scale_buffer, seq_tile)
-                elem_in_a = of_in_a.acquire(1)
-                elem_out_p = of_out_p.acquire(1)
-                elem_out_scale = of_out_scale.acquire(1)
-                partial_softmax(
-                    elem_in_a,
-                    elem_out_p,
-                    scale_buffer,
-                    idx_buffer,
-                    inv_scale,
-                    seq_tile,
-                    kv_seq_tile,
-                    seq_len,
-                    seq_len,
-                )
-                copy_scale(scale_buffer, elem_out_scale, 4 * seq_tile)
-                of_out_scale.release(1)
-                of_out_p.release(1)
-                of_in_a.release(1)
+                for _ in range_(num_kv_seq_blocks):
+                    elem_in_a = of_in_a.acquire(1)
+                    elem_out_p = of_out_p.acquire(1)
+                    elem_out_scale = of_out_scale.acquire(1)
+                    partial_softmax(
+                        elem_in_a,
+                        elem_out_p,
+                        scale_buffer,
+                        idx_buffer,
+                        inv_scale,
+                        seq_tile,
+                        kv_seq_tile,
+                        seq_len,
+                        seq_len,
+                    )
+                    copy_scale(scale_buffer, elem_out_scale, 4 * seq_tile)
+                    of_out_scale.release(1)
+                    of_out_p.release(1)
+                    of_in_a.release(1)
+                    idx_buffer[0] += 1
+                idx_buffer[0] = 0
 
     def batched_matmul_pv(
         of_p, of_v, of_scale, of_o_out, zero, matmul_pv, rescale_o, idx_buffer
@@ -646,10 +572,53 @@ def encoder_pipeline(
                     0,
                     idx_buffer,
                 )
-                rescale_o(elem_out_o, elem_scale, seq_tile, idx_buffer)
                 of_scale.release(1)
                 of_v.release(1)
                 of_p.release(1)
+                idx_buffer[0] += 1
+
+                if num_kv_seq_blocks > 2:
+                    for _ in range_(num_kv_seq_blocks - 2):
+                        elem_in_p = of_p.acquire(1)
+                        elem_in_v = of_v.acquire(1)
+                        elem_scale_mid = of_scale.acquire(1)
+                        matmul_pv(
+                            elem_in_p,
+                            elem_in_v,
+                            elem_out_o,
+                            elem_scale_mid,
+                            seq_tile,
+                            1,
+                            idx_buffer,
+                        )
+                        of_scale.release(1)
+                        of_v.release(1)
+                        of_p.release(1)
+                        idx_buffer[0] += 1
+
+                if num_kv_seq_blocks > 1:
+                    elem_in_p = of_p.acquire(1)
+                    elem_in_v = of_v.acquire(1)
+                    elem_scale_last = of_scale.acquire(1)
+                    matmul_pv(
+                        elem_in_p,
+                        elem_in_v,
+                        elem_out_o,
+                        elem_scale_last,
+                        seq_tile,
+                        1,
+                        idx_buffer,
+                    )
+                    rescale_o(elem_out_o, elem_scale_last, seq_tile, idx_buffer)
+                    of_scale.release(1)
+                    of_v.release(1)
+                    of_p.release(1)
+                    idx_buffer[0] += 1
+                else:
+                    rescale_o(elem_out_o, elem_scale, seq_tile, idx_buffer)
+                    idx_buffer[0] += 1
+
+                idx_buffer[0] = 0
                 of_o_out.release(1)
 
     def matmul_o_proj(

@@ -21,11 +21,7 @@ from operators.common import (
     XclbinArtifact,
 )
 from operators.common.utils import numpy_to_torch, torch_to_numpy
-
-SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES = {
-    (12, 64, 64, 32, 64, 96, 1, 1, 8, 1, 1, 3072),
-    (1, 64, 64, 32, 64, 32, 1, 1, 2, 1, 1, 96),
-}
+from operators.encoder_pipeline.placements import SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES
 
 
 class AIEEncoderPipeline(AIEOperatorBase):
