@@ -132,11 +132,6 @@ def encoder_pipeline(
             "encoder_pipeline only supports the non-sequence-parallel path "
             f"(parallel_seq=1, got {parallel_seq})"
         )
-    if nB_tiles_distributed != 1:
-        raise ValueError(
-            "encoder_pipeline only supports nB_tiles_distributed=1 in the "
-            f"hardcoded placement path (got {nB_tiles_distributed})"
-        )
     if o_proj_acc_group_size != 1:
         raise ValueError(
             "encoder_pipeline only supports o_proj_acc_group_size=1 in the "
@@ -186,6 +181,19 @@ def encoder_pipeline(
     inv_scale = (1 / np.sqrt(d)) * 1.4453125
     of_depth = 2
     ln1_broadcast_groups = ffn_intermediate_size // emb_tile
+    effective_ffn_branches = len(placement["tail_tiles"]["ffn_up_by_branch"])
+    if effective_ffn_branches != nB_tiles_distributed:
+        raise ValueError(
+            "encoder_pipeline hardcoded placement must provide one FFN branch per "
+            "requested nB_tiles_distributed "
+            f"(branches={effective_ffn_branches}, requested={nB_tiles_distributed})"
+        )
+    if ln1_broadcast_groups % effective_ffn_branches != 0:
+        raise ValueError(
+            "encoder_pipeline requires FFN branch count to divide ln1_broadcast_groups "
+            f"({ln1_broadcast_groups} % {effective_ffn_branches} != 0)"
+        )
+    ffn_col_group_count = ln1_broadcast_groups // effective_ffn_branches
     ln_tiles_per_q_block = proj_acc_depth
     ln1_dram_stage_rows = ln1_broadcast_groups * seq_tile
     or_tensor_shape = (2 * seq_len + ln1_dram_stage_rows, embed_sz)
@@ -204,21 +212,20 @@ def encoder_pipeline(
     pv_tiles = [Tile(col=col, row=4) for col in placement["mha_cols"]]
     o_proj_tiles = [Tile(col=col, row=5) for col in placement["mha_cols"]]
     ln1_tile = Tile(*placement["tail_tiles"]["ln1"])
-    ffn_up_tile = Tile(*placement["tail_tiles"]["ffn_up"])
-    ffn_down_tile = Tile(*placement["tail_tiles"]["ffn_down"])
+    ffn_up_tiles = [Tile(*tile) for tile in placement["tail_tiles"]["ffn_up_by_branch"]]
+    ffn_down_tiles = [
+        Tile(*tile) for tile in placement["tail_tiles"]["ffn_down_by_branch"]
+    ]
     ln2_tile = Tile(*placement["tail_tiles"]["ln2"])
     accumulation_mem_tiles = placement["accumulation_mem_tiles"]
+    weight_mem_tiles = placement["weight_mem_tiles"]
 
     q_mem_col = placement["mem_tiles"]["q"]
     k_mem_col = placement["mem_tiles"]["k"]
     v_mem_col = placement["mem_tiles"]["v"]
     ow_mem_col = placement["mem_tiles"]["w_o"]
-    o_proj_acc_mem_col = accumulation_mem_tiles["o_proj_acc_by_head"][0]
-    bdown_mem_col = placement["mem_tiles"]["b_down"]
     ln2_replay_mem_col = accumulation_mem_tiles["ln2_replay"]
     ln1_replay_mem_col = accumulation_mem_tiles["ln1_replay"]
-    bup_mem_col = placement["mem_tiles"]["b_up"]
-    ffn_down_acc_mem_col = accumulation_mem_tiles["ffn_down_acc_by_branch"][0]
     ln1_stage_col = placement["mem_tiles"]["ln1_stage"]
     residual_mem_col = placement["mem_tiles"]["residual"]
     ffn_residual_mem_col = placement["mem_tiles"]["ffn_residual"]
@@ -486,7 +493,7 @@ def encoder_pipeline(
     outLNBroadcast = ObjectFifo(o_ty, name="outLNBroadcast", depth=1)
     ln1StageOut = outLNBroadcast.cons(depth=1)
     inLNFromDDR = ObjectFifo(o_ty, name="inLNFromDDR", depth=1)
-    memOutLN = inLNFromDDR.cons(depth=2)
+    memOutLN = [inLNFromDDR.cons(depth=2) for _ in range(effective_ffn_branches)]
 
     ffnRFromDDR = ObjectFifo(o_ty, name="ffnRFromDDR", depth=1)
     ffnRIn = ffnRFromDDR.cons(depth=proj_acc_depth).forward(
@@ -495,30 +502,94 @@ def encoder_pipeline(
         depth=proj_acc_depth,
         placement=Tile(col=ffn_residual_mem_col, row=1),
     )
-    inBUp = ObjectFifo(ffn_b_ty, name="inBUp", depth=1)
-    memBUp = inBUp.cons().forward(
-        obj_type=ffn_b_ty,
-        name="memBUp",
-        dims_to_stream=b_dims,
-        depth=1,
-        placement=Tile(col=bup_mem_col, row=1),
-    )
-    inBDown = ObjectFifo(ffn_b_ty, name="inBDown", depth=1)
-    memBDown = inBDown.cons().forward(
-        obj_type=ffn_b_ty,
-        name="memBDown",
-        dims_to_stream=b_dims,
-        depth=1,
-        placement=Tile(col=bdown_mem_col, row=1),
-    )
-    ffnUpOut = ObjectFifo(o_ty, name="ffnUpOut", depth=2)
-    ffnDownPart = ObjectFifo(o_ty, name="ffnDownPart", depth=1)
-    ffnDownAccum = ffnDownPart.cons(depth=proj_acc_depth).forward(
-        obj_type=o_ty,
-        name="ffnDownAccum",
-        depth=proj_acc_depth,
-        placement=Tile(col=ffn_down_acc_mem_col, row=1),
-    )
+    inBUp = []
+    memBUp = []
+    inBDown = []
+    memBDown = []
+    ffnUpOut = []
+    ffnDownPart = []
+    ffnDownAccum = []
+    for branch_idx in range(effective_ffn_branches):
+        inBUp.append(
+            ObjectFifo(
+                ffn_b_ty,
+                name="inBUp" if branch_idx == 0 else f"inBUp{branch_idx}",
+                depth=1,
+            )
+        )
+        memBUp.append(
+            inBUp[branch_idx]
+            .cons()
+            .forward(
+                obj_type=ffn_b_ty,
+                name="memBUp" if branch_idx == 0 else f"memBUp{branch_idx}",
+                dims_to_stream=b_dims,
+                depth=1,
+                placement=Tile(
+                    col=weight_mem_tiles["b_up_by_branch"][branch_idx],
+                    row=1,
+                ),
+            )
+        )
+        inBDown.append(
+            ObjectFifo(
+                ffn_b_ty,
+                name="inBDown" if branch_idx == 0 else f"inBDown{branch_idx}",
+                depth=1,
+            )
+        )
+        memBDown.append(
+            inBDown[branch_idx]
+            .cons()
+            .forward(
+                obj_type=ffn_b_ty,
+                name="memBDown" if branch_idx == 0 else f"memBDown{branch_idx}",
+                dims_to_stream=b_dims,
+                depth=1,
+                placement=Tile(
+                    col=weight_mem_tiles["b_down_by_branch"][branch_idx],
+                    row=1,
+                ),
+            )
+        )
+        ffnUpOut.append(
+            ObjectFifo(
+                o_ty,
+                name="ffnUpOut" if branch_idx == 0 else f"ffnUpOut{branch_idx}",
+                depth=2,
+            )
+        )
+        ffnDownPart.append(
+            ObjectFifo(
+                o_ty,
+                name="ffnDownPart" if branch_idx == 0 else f"ffnDownPart{branch_idx}",
+                depth=1,
+            )
+        )
+        ffnDownAccum.append(
+            ffnDownPart[branch_idx]
+            .cons(depth=proj_acc_depth)
+            .forward(
+                obj_type=o_ty,
+                name=(
+                    "ffnDownAccum" if branch_idx == 0 else f"ffnDownAccum{branch_idx}"
+                ),
+                depth=proj_acc_depth,
+                placement=Tile(
+                    col=accumulation_mem_tiles["ffn_down_acc_by_branch"][branch_idx],
+                    row=1,
+                ),
+            )
+        )
+    ffn_down_reduce_depth = 1 if emb_tile >= 128 else 2
+    ffnDownReduce = [
+        ObjectFifo(
+            o_ty,
+            name=f"ffnDownReduce{branch_idx}",
+            depth=ffn_down_reduce_depth,
+        )
+        for branch_idx in range(effective_ffn_branches - 1)
+    ]
     ffnDownOut = ObjectFifo(o_ty, name="ffnDownOut", depth=2)
 
     ln2ReplayPart = ObjectFifo(o_ty, name="ln2ReplayPart", depth=1)
@@ -790,10 +861,10 @@ def encoder_pipeline(
                     of_in_residual.release(1)
 
     def core_fn_ffn_up_proj(
-        of_in_a, of_in_b, of_out_c, zero, matmul_init, matmul, gelu
+        of_in_a, of_in_b, of_out_c, zero, matmul_init, matmul, gelu, group_count
     ):
         for _ in range_(sys.maxsize):
-            for _ in range_(ln1_broadcast_groups):
+            for _ in range_(group_count):
                 elem_out = of_out_c.acquire(1)
                 for acc_idx in range_(proj_acc_depth):
                     elem_in_a = of_in_a.acquire(1)
@@ -809,7 +880,17 @@ def encoder_pipeline(
                 of_out_c.release(1)
 
     def core_fn_ffn_down_proj(
-        of_in_a, of_in_b, of_curr_acc, of_new_acc, of_out, matmul_init, matmul, copy
+        of_in_a,
+        of_in_b,
+        of_curr_acc,
+        of_new_acc,
+        reduce_in,
+        of_out,
+        matmul_init,
+        matmul,
+        add,
+        copy,
+        group_count,
     ):
         for _ in range_(sys.maxsize):
             elem_in_a = of_in_a.acquire(1)
@@ -820,7 +901,7 @@ def encoder_pipeline(
                 of_in_b.release(1)
                 of_new_acc.release(1)
             of_in_a.release(1)
-            for _ in range_(ln1_broadcast_groups - 1):
+            for _ in range_(group_count - 1):
                 elem_in_a = of_in_a.acquire(1)
                 for _ in range_(proj_acc_depth):
                     elem_curr_acc = of_curr_acc.acquire(1)
@@ -834,6 +915,10 @@ def encoder_pipeline(
             for _ in range_(proj_acc_depth):
                 elem_out = of_out.acquire(1)
                 elem_curr_acc = of_curr_acc.acquire(1)
+                if reduce_in is not None:
+                    elem_reduce = reduce_in.acquire(1)
+                    add(elem_reduce, elem_curr_acc, elem_curr_acc, seq_tile * emb_tile)
+                    reduce_in.release(1)
                 copy(elem_curr_acc, elem_out, seq_tile * emb_tile)
                 of_curr_acc.release(1)
                 of_out.release(1)
@@ -1035,37 +1120,54 @@ def encoder_pipeline(
         placement=ln1_tile,
         while_true=False,
     )
-    ffn_up_worker = Worker(
-        core_fn_ffn_up_proj,
-        fn_args=[
-            memOutLN,
-            memBUp.cons(),
-            ffnUpOut.prod(),
-            ffn_zero_kernel_up_proj,
-            ffn_matmul_init_kernel_up_proj,
-            ffn_matmul_kernel_up_proj,
-            ffn_gelu_kernel,
-        ],
-        placement=ffn_up_tile,
-        stack_size=0x700,
-        while_true=False,
-    )
-    ffn_down_worker = Worker(
-        core_fn_ffn_down_proj,
-        fn_args=[
-            ffnUpOut.cons(),
-            memBDown.cons(),
-            ffnDownAccum.cons(depth=1),
-            ffnDownPart.prod(),
-            ffnDownOut.prod(2),
-            ffn_matmul_init_kernel_down_proj,
-            ffn_matmul_kernel_down_proj,
-            mem_copy_o_proj,
-        ],
-        placement=ffn_down_tile,
-        stack_size=0xF00,
-        while_true=False,
-    )
+    ffn_up_workers = []
+    ffn_down_workers = []
+    for branch_idx in range(effective_ffn_branches):
+        ffn_up_workers.append(
+            Worker(
+                core_fn_ffn_up_proj,
+                fn_args=[
+                    memOutLN[branch_idx],
+                    memBUp[branch_idx].cons(),
+                    ffnUpOut[branch_idx].prod(),
+                    ffn_zero_kernel_up_proj,
+                    ffn_matmul_init_kernel_up_proj,
+                    ffn_matmul_kernel_up_proj,
+                    ffn_gelu_kernel,
+                    ffn_col_group_count,
+                ],
+                placement=ffn_up_tiles[branch_idx],
+                stack_size=0x700,
+                while_true=False,
+            )
+        )
+        reduce_in = ffnDownReduce[branch_idx - 1].cons() if branch_idx > 0 else None
+        reduce_out = (
+            ffnDownReduce[branch_idx].prod()
+            if branch_idx < (effective_ffn_branches - 1)
+            else ffnDownOut.prod(2)
+        )
+        ffn_down_workers.append(
+            Worker(
+                core_fn_ffn_down_proj,
+                fn_args=[
+                    ffnUpOut[branch_idx].cons(),
+                    memBDown[branch_idx].cons(),
+                    ffnDownAccum[branch_idx].cons(depth=1),
+                    ffnDownPart[branch_idx].prod(),
+                    reduce_in,
+                    reduce_out,
+                    ffn_matmul_init_kernel_down_proj,
+                    ffn_matmul_kernel_down_proj,
+                    eltwise_add_vector_kernel,
+                    mem_copy_o_proj,
+                    ffn_col_group_count,
+                ],
+                placement=ffn_down_tiles[branch_idx],
+                stack_size=0xF00,
+                while_true=False,
+            )
+        )
     ln2_worker = Worker(
         core_fn_add_norm2,
         fn_args=[
@@ -1189,8 +1291,8 @@ def encoder_pipeline(
         [
             TensorAccessPattern(
                 (embed_sz, ffn_intermediate_size),
-                offset=0,
-                sizes=[ln1_broadcast_groups, proj_acc_depth, emb_tile, emb_tile],
+                offset=branch_idx * ffn_col_group_count * emb_tile,
+                sizes=[ffn_col_group_count, proj_acc_depth, emb_tile, emb_tile],
                 strides=[
                     emb_tile,
                     emb_tile * ffn_intermediate_size,
@@ -1198,16 +1300,18 @@ def encoder_pipeline(
                     1,
                 ],
             )
+            for branch_idx in range(effective_ffn_branches)
         ]
     )
     B_Down_tiles = TensorAccessSequence.from_taps(
         [
             TensorAccessPattern(
                 (ffn_intermediate_size, embed_sz),
-                offset=0,
-                sizes=[ln1_broadcast_groups, proj_acc_depth, emb_tile, emb_tile],
+                offset=branch_idx * ffn_col_group_count * emb_tile * embed_sz,
+                sizes=[ffn_col_group_count, proj_acc_depth, emb_tile, emb_tile],
                 strides=[emb_tile * embed_sz, emb_tile, embed_sz, 1],
             )
+            for branch_idx in range(effective_ffn_branches)
         ]
     )
 
@@ -1295,13 +1399,13 @@ def encoder_pipeline(
         (
             B_Up_tiles,
             (emb_tile, emb_tile),
-            ln1_broadcast_groups * proj_acc_depth,
+            ffn_col_group_count * proj_acc_depth,
             "B_Up tap count does not match FFN loop count",
         ),
         (
             B_Down_tiles,
             (emb_tile, emb_tile),
-            ln1_broadcast_groups * proj_acc_depth,
+            ffn_col_group_count * proj_acc_depth,
             "B_Down tap count does not match FFN loop count",
         ),
     ):
@@ -1325,8 +1429,9 @@ def encoder_pipeline(
             rt.start(pv_workers[i])
             rt.start(o_proj_workers[i])
         rt.start(ln1_worker)
-        rt.start(ffn_up_worker)
-        rt.start(ffn_down_worker)
+        for branch_idx in range(effective_ffn_branches):
+            rt.start(ffn_up_workers[branch_idx])
+            rt.start(ffn_down_workers[branch_idx])
         rt.start(ln2_worker)
 
         pending_ln1_refill_tg = None
@@ -1404,6 +1509,12 @@ def encoder_pipeline(
                 sizes=[ln1_broadcast_groups, proj_acc_depth, seq_tile, emb_tile],
                 strides=[0, emb_tile, embed_sz, 1],
             )
+            branch_refill_tap = TensorAccessPattern(
+                or_tensor_shape,
+                offset=ln1_stage_base_offset,
+                sizes=[ffn_col_group_count, proj_acc_depth, seq_tile, emb_tile],
+                strides=[0, emb_tile, embed_sz, 1],
+            )
             residual_stage_tap = TensorAccessPattern(
                 or_tensor_shape,
                 offset=ln1_stage_base_offset,
@@ -1416,6 +1527,12 @@ def encoder_pipeline(
                 != ln1_broadcast_groups * proj_acc_depth
             ):
                 raise ValueError("LN1 stage tap count mismatch")
+            if (
+                math.prod(int(s) for s in branch_refill_tap.sizes)
+                // math.prod((seq_tile, emb_tile))
+                != ffn_col_group_count * proj_acc_depth
+            ):
+                raise ValueError("LN1 branch refill tap count mismatch")
             if (
                 math.prod(int(s) for s in residual_stage_tap.sizes)
                 // math.prod((seq_tile, emb_tile))
@@ -1438,7 +1555,7 @@ def encoder_pipeline(
             rt.fill(
                 inLNFromDDR.prod(),
                 OR,
-                tap=branch_stage_tap,
+                tap=branch_refill_tap,
                 placement=Tile(col=ln1_stage_shim_col, row=0),
                 task_group=tg_ln1_refill_and_weights,
                 wait=True,
@@ -1451,22 +1568,29 @@ def encoder_pipeline(
                 task_group=tg_ln1_refill_and_weights,
                 wait=True,
             )
-            rt.fill(
-                inBUp.prod(),
-                B_Up,
-                tap=B_Up_tiles[0],
-                placement=Tile(col=bup_shim_col, row=0),
-                task_group=tg_ln1_refill_and_weights,
-                wait=False,
-            )
-            rt.fill(
-                inBDown.prod(),
-                B_Down,
-                tap=B_Down_tiles[0],
-                placement=Tile(col=bdown_shim_col, row=0),
-                task_group=tg_ln1_refill_and_weights,
-                wait=False,
-            )
+            for branch_idx in range(effective_ffn_branches):
+                rt.fill(
+                    inBUp[branch_idx].prod(),
+                    B_Up,
+                    tap=B_Up_tiles[branch_idx],
+                    placement=Tile(
+                        col=weight_mem_tiles["b_up_by_branch"][branch_idx],
+                        row=0,
+                    ),
+                    task_group=tg_ln1_refill_and_weights,
+                    wait=effective_ffn_branches > 1,
+                )
+                rt.fill(
+                    inBDown[branch_idx].prod(),
+                    B_Down,
+                    tap=B_Down_tiles[branch_idx],
+                    placement=Tile(
+                        col=weight_mem_tiles["b_down_by_branch"][branch_idx],
+                        row=0,
+                    ),
+                    task_group=tg_ln1_refill_and_weights,
+                    wait=effective_ffn_branches > 1,
+                )
             rt.finish_task_group(tg_tail)
 
             pending_ln1_refill_tg = tg_ln1_refill_and_weights

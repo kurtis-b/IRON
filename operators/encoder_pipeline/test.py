@@ -25,6 +25,10 @@ def generate_test_params():
         (256, 64, 12, 3072, 32, 64, 96, 1, 1, 8, 1, 1),
         (64, 64, 12, 3072, 32, 64, 96, 1, 2, 8, 1, 1),
         (64, 64, 12, 3072, 32, 64, 96, 1, 4, 8, 1, 1),
+        (64, 64, 12, 3072, 32, 64, 96, 1, 1, 8, 1, 2),
+        (64, 64, 12, 3072, 32, 64, 96, 1, 2, 8, 1, 2),
+        (64, 64, 12, 3072, 32, 64, 96, 1, 1, 8, 1, 4),
+        (64, 64, 12, 3072, 32, 64, 96, 1, 2, 8, 1, 4),
     ]
     names = [
         "encoder_pipeline_64seq_64d_12h_3072ffn_32q_64kv_96emb",
@@ -32,6 +36,10 @@ def generate_test_params():
         "encoder_pipeline_256seq_64d_12h_3072ffn_32q_64kv_96emb",
         "encoder_pipeline_64seq_64d_12h_3072ffn_32q_64kv_96emb_2ph",
         "encoder_pipeline_64seq_64d_12h_3072ffn_32q_64kv_96emb_4ph",
+        "encoder_pipeline_64seq_64d_12h_3072ffn_32q_64kv_96emb_2pffn",
+        "encoder_pipeline_64seq_64d_12h_3072ffn_32q_64kv_96emb_2ph_2pffn",
+        "encoder_pipeline_64seq_64d_12h_3072ffn_32q_64kv_96emb_4pffn",
+        "encoder_pipeline_64seq_64d_12h_3072ffn_32q_64kv_96emb_2ph_4pffn",
     ]
     return params, names
 
