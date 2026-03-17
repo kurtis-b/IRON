@@ -3376,6 +3376,27 @@ def encoder_pipeline(
         for tap in tas:
             legalize_tap(tap, 1023)
 
+    def split_fill_tap_on_outer_dim(
+        tap: TensorAccessPattern, tensor_shape: tuple[int, ...], max_outer_dim: int
+    ) -> list[TensorAccessPattern]:
+        outer_size = int(tap.sizes[0])
+        if outer_size <= max_outer_dim:
+            return [tap]
+        chunk_taps = []
+        chunk_start = 0
+        while chunk_start < outer_size:
+            chunk_len = min(max_outer_dim, outer_size - chunk_start)
+            chunk_taps.append(
+                TensorAccessPattern(
+                    tensor_shape,
+                    offset=int(tap.offset) + chunk_start * int(tap.strides[0]),
+                    sizes=[chunk_len, *[int(s) for s in tap.sizes[1:]]],
+                    strides=[int(s) for s in tap.strides],
+                )
+            )
+            chunk_start += chunk_len
+        return chunk_taps
+
     for tas in (
         Q_tiles,
         K_tiles,
@@ -3387,6 +3408,16 @@ def encoder_pipeline(
         B_Down_tiles,
     ):
         legalize_tas(tas)
+
+    max_host_fill_outer_dim = 64
+    K_fill_taps = [
+        split_fill_tap_on_outer_dim(tap, qkv_tensor_shape, max_host_fill_outer_dim)
+        for tap in K_tiles
+    ]
+    V_fill_taps = [
+        split_fill_tap_on_outer_dim(tap, qkv_tensor_shape, max_host_fill_outer_dim)
+        for tap in V_tiles
+    ]
 
     for tap_seq, obj_shape, expected, message in (
         (
@@ -3504,22 +3535,24 @@ def encoder_pipeline(
                     task_group=tg_head,
                     wait=True,
                 )
-                rt.fill(
-                    inK.prod(),
-                    QKV,
-                    tap=K_tiles[head_group_idx],
-                    placement=Tile(col=k_shim_col, row=0),
-                    task_group=tg_head,
-                    wait=True,
-                )
-                rt.fill(
-                    inV.prod(),
-                    QKV,
-                    tap=V_tiles[head_group_idx],
-                    placement=Tile(col=v_shim_col, row=0),
-                    task_group=tg_head,
-                    wait=True,
-                )
+                for k_tap in K_fill_taps[head_group_idx]:
+                    rt.fill(
+                        inK.prod(),
+                        QKV,
+                        tap=k_tap,
+                        placement=Tile(col=k_shim_col, row=0),
+                        task_group=tg_head,
+                        wait=True,
+                    )
+                for v_tap in V_fill_taps[head_group_idx]:
+                    rt.fill(
+                        inV.prod(),
+                        QKV,
+                        tap=v_tap,
+                        placement=Tile(col=v_shim_col, row=0),
+                        task_group=tg_head,
+                        wait=True,
+                    )
                 rt.fill(
                     inOW.prod(),
                     W_O,
