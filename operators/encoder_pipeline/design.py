@@ -240,9 +240,7 @@ def encoder_pipeline(
                 "LN1 replay memtile per sequence lane "
                 f"({len(lane_ln1_replay_mem_cols)} != {parallel_seq})"
             )
-        lane_ffn_down_acc_mem_cols = sequence_parallel.get(
-            "lane_ffn_down_acc_mem_cols"
-        )
+        lane_ffn_down_acc_mem_cols = sequence_parallel.get("lane_ffn_down_acc_mem_cols")
         if (
             lane_ffn_down_acc_mem_cols is not None
             and len(lane_ffn_down_acc_mem_cols) != parallel_seq
@@ -281,9 +279,7 @@ def encoder_pipeline(
     ffn_col_group_count = ln1_broadcast_groups // effective_ffn_branches
     ln_tiles_per_q_block = proj_acc_depth
     ln1_dram_stage_rows = (
-        seq_len
-        if sequence_parallel is not None
-        else ln1_broadcast_groups * seq_tile
+        seq_len if sequence_parallel is not None else ln1_broadcast_groups * seq_tile
     )
     or_tensor_shape = (2 * seq_len + ln1_dram_stage_rows, embed_sz)
 
@@ -1372,7 +1368,9 @@ def encoder_pipeline(
         joined_offsets = [
             lane_idx * seq_tile * emb_tile for lane_idx in range(group_size)
         ]
-        unified_q_offsets = [lane_idx * seq_tile * d for lane_idx in range(parallel_seq)]
+        unified_q_offsets = [
+            lane_idx * seq_tile * d for lane_idx in range(parallel_seq)
+        ]
         unified_joined_offsets = [
             lane_idx * seq_tile * emb_tile for lane_idx in range(parallel_seq)
         ]
@@ -1532,9 +1530,7 @@ def encoder_pipeline(
                 name=f"memKSeq{suffix}",
                 dims_to_stream=k_dims,
                 depth=shared_forward_depth,
-                placement=Tile(
-                    col=transport_group["shared_ingress_cols"]["k"], row=1
-                ),
+                placement=Tile(col=transport_group["shared_ingress_cols"]["k"], row=1),
             )
             group_inKSeq.append(inKSeq)
             group_memKSeq.append(memKSeq)
@@ -1545,9 +1541,7 @@ def encoder_pipeline(
                 name=f"memVSeq{suffix}",
                 dims_to_stream=v_dims,
                 depth=shared_forward_depth,
-                placement=Tile(
-                    col=transport_group["shared_ingress_cols"]["v"], row=1
-                ),
+                placement=Tile(col=transport_group["shared_ingress_cols"]["v"], row=1),
             )
             group_inVSeq.append(inVSeq)
             group_memVSeq.append(memVSeq)
@@ -1593,9 +1587,7 @@ def encoder_pipeline(
                 name=f"memBDownSeq{suffix}",
                 dims_to_stream=b_dims,
                 depth=weight_forward_depth,
-                placement=Tile(
-                    col=transport_group["weight_mem_cols"]["b_down"], row=1
-                ),
+                placement=Tile(col=transport_group["weight_mem_cols"]["b_down"], row=1),
             )
             group_memBDownSeq.append(memBDownSeq)
 
@@ -2331,8 +2323,9 @@ def encoder_pipeline(
                                         + head_group_idx
                                     ],
                                     placement=Tile(
-                                        col=transport_groups[group_idx]
-                                        .get("shim_cols", default_group_shim_cols)["q"],
+                                        col=transport_groups[group_idx].get(
+                                            "shim_cols", default_group_shim_cols
+                                        )["q"],
                                         row=0,
                                     ),
                                     task_group=tg_head,
@@ -2343,8 +2336,9 @@ def encoder_pipeline(
                                 QKV,
                                 tap=k_tiles[head_group_idx],
                                 placement=Tile(
-                                    col=transport_groups[group_idx]
-                                    .get("shim_cols", default_group_shim_cols)["k"],
+                                    col=transport_groups[group_idx].get(
+                                        "shim_cols", default_group_shim_cols
+                                    )["k"],
                                     row=0,
                                 ),
                                 task_group=tg_head,
@@ -2355,8 +2349,9 @@ def encoder_pipeline(
                                 QKV,
                                 tap=v_tiles[head_group_idx],
                                 placement=Tile(
-                                    col=transport_groups[group_idx]
-                                    .get("shim_cols", default_group_shim_cols)["v"],
+                                    col=transport_groups[group_idx].get(
+                                        "shim_cols", default_group_shim_cols
+                                    )["v"],
                                     row=0,
                                 ),
                                 task_group=tg_head,
@@ -2368,8 +2363,9 @@ def encoder_pipeline(
                                     W_O,
                                     tap=wo_tiles[head_group_idx],
                                     placement=Tile(
-                                        col=transport_groups[group_idx]
-                                        .get("shim_cols", default_group_shim_cols)["w_o"],
+                                        col=transport_groups[group_idx].get(
+                                            "shim_cols", default_group_shim_cols
+                                        )["w_o"],
                                         row=0,
                                     ),
                                     task_group=tg_head,
@@ -2398,13 +2394,10 @@ def encoder_pipeline(
                                 OR,
                                 tap=joined_r_tiles[group_batch_idx],
                                 placement=Tile(
-                                    col=transport_groups[group_idx]
-                                    .get(
+                                    col=transport_groups[group_idx].get(
                                         "joined_or_shim_cols",
                                         default_group_joined_or_shim_cols,
-                                    )[
-                                        "residual"
-                                    ],
+                                    )["residual"],
                                     row=0,
                                 ),
                                 task_group=tg_residual,
@@ -2420,13 +2413,10 @@ def encoder_pipeline(
                             OR,
                             tap=joined_i_tiles[group_batch_idx],
                             placement=Tile(
-                                col=transport_groups[group_idx]
-                                .get(
+                                col=transport_groups[group_idx].get(
                                     "joined_or_shim_cols",
                                     default_group_joined_or_shim_cols,
-                                )[
-                                    "ln1_stage"
-                                ],
+                                )["ln1_stage"],
                                 row=0,
                             ),
                             task_group=tg_ln1_drain,
@@ -2462,8 +2452,9 @@ def encoder_pipeline(
                                 B_Up,
                                 tap=b_up_tiles[0],
                                 placement=Tile(
-                                    col=transport_groups[group_idx]
-                                    .get("shim_cols", default_group_shim_cols)["b_up"],
+                                    col=transport_groups[group_idx].get(
+                                        "shim_cols", default_group_shim_cols
+                                    )["b_up"],
                                     row=0,
                                 ),
                                 task_group=tg_tail,
@@ -2474,8 +2465,9 @@ def encoder_pipeline(
                             B_Down,
                             tap=b_down_tiles[0],
                             placement=Tile(
-                                col=transport_groups[group_idx]
-                                .get("shim_cols", default_group_shim_cols)["b_down"],
+                                col=transport_groups[group_idx].get(
+                                    "shim_cols", default_group_shim_cols
+                                )["b_down"],
                                 row=0,
                             ),
                             task_group=tg_tail,
@@ -2487,13 +2479,10 @@ def encoder_pipeline(
                             OR,
                             tap=joined_refill_taps[group_batch_idx],
                             placement=Tile(
-                                col=transport_groups[group_idx]
-                                .get(
+                                col=transport_groups[group_idx].get(
                                     "joined_or_shim_cols",
                                     default_group_joined_or_shim_cols,
-                                )[
-                                    "ln1_refill"
-                                ],
+                                )["ln1_refill"],
                                 row=0,
                             ),
                             task_group=tg_tail,
@@ -2504,13 +2493,10 @@ def encoder_pipeline(
                             OR,
                             tap=joined_i_tiles[group_batch_idx],
                             placement=Tile(
-                                col=transport_groups[group_idx]
-                                .get(
+                                col=transport_groups[group_idx].get(
                                     "joined_or_shim_cols",
                                     default_group_joined_or_shim_cols,
-                                )[
-                                    "ffn_residual_refill"
-                                ],
+                                )["ffn_residual_refill"],
                                 row=0,
                             ),
                             task_group=tg_tail,
@@ -2521,13 +2507,10 @@ def encoder_pipeline(
                             OR,
                             tap=joined_o_tiles[group_batch_idx],
                             placement=Tile(
-                                col=transport_groups[group_idx]
-                                .get(
+                                col=transport_groups[group_idx].get(
                                     "joined_or_shim_cols",
                                     default_group_joined_or_shim_cols,
-                                )[
-                                    "output"
-                                ],
+                                )["output"],
                                 row=0,
                             ),
                             task_group=tg_tail,
@@ -2596,8 +2579,9 @@ def encoder_pipeline(
                                         + head_group_idx
                                     ],
                                     placement=Tile(
-                                        col=transport_groups[group_idx]
-                                        .get("shim_cols", default_group_shim_cols)["q"],
+                                        col=transport_groups[group_idx].get(
+                                            "shim_cols", default_group_shim_cols
+                                        )["q"],
                                         row=0,
                                     ),
                                     task_group=tg_head,
@@ -2608,8 +2592,9 @@ def encoder_pipeline(
                                 QKV,
                                 tap=k_tiles[head_group_idx],
                                 placement=Tile(
-                                    col=transport_groups[group_idx]
-                                    .get("shim_cols", default_group_shim_cols)["k"],
+                                    col=transport_groups[group_idx].get(
+                                        "shim_cols", default_group_shim_cols
+                                    )["k"],
                                     row=0,
                                 ),
                                 task_group=tg_head,
@@ -2620,8 +2605,9 @@ def encoder_pipeline(
                                 QKV,
                                 tap=v_tiles[head_group_idx],
                                 placement=Tile(
-                                    col=transport_groups[group_idx]
-                                    .get("shim_cols", default_group_shim_cols)["v"],
+                                    col=transport_groups[group_idx].get(
+                                        "shim_cols", default_group_shim_cols
+                                    )["v"],
                                     row=0,
                                 ),
                                 task_group=tg_head,
@@ -2633,8 +2619,9 @@ def encoder_pipeline(
                                     W_O,
                                     tap=wo_tiles[head_group_idx],
                                     placement=Tile(
-                                        col=transport_groups[group_idx]
-                                        .get("shim_cols", default_group_shim_cols)["w_o"],
+                                        col=transport_groups[group_idx].get(
+                                            "shim_cols", default_group_shim_cols
+                                        )["w_o"],
                                         row=0,
                                     ),
                                     task_group=tg_head,
@@ -2663,13 +2650,10 @@ def encoder_pipeline(
                                 OR,
                                 tap=joined_r_tiles[group_batch_idx],
                                 placement=Tile(
-                                    col=transport_groups[group_idx]
-                                    .get(
+                                    col=transport_groups[group_idx].get(
                                         "joined_or_shim_cols",
                                         default_group_joined_or_shim_cols,
-                                    )[
-                                        "residual"
-                                    ],
+                                    )["residual"],
                                     row=0,
                                 ),
                                 task_group=tg_residual,
@@ -2685,13 +2669,10 @@ def encoder_pipeline(
                             OR,
                             tap=joined_i_tiles[group_batch_idx],
                             placement=Tile(
-                                col=transport_groups[group_idx]
-                                .get(
+                                col=transport_groups[group_idx].get(
                                     "joined_or_shim_cols",
                                     default_group_joined_or_shim_cols,
-                                )[
-                                    "ln1_stage"
-                                ],
+                                )["ln1_stage"],
                                 row=0,
                             ),
                             task_group=tg_ln1_drain,
@@ -2723,8 +2704,9 @@ def encoder_pipeline(
                                 B_Up,
                                 tap=b_up_tiles[0],
                                 placement=Tile(
-                                    col=transport_groups[group_idx]
-                                    .get("shim_cols", default_group_shim_cols)["b_up"],
+                                    col=transport_groups[group_idx].get(
+                                        "shim_cols", default_group_shim_cols
+                                    )["b_up"],
                                     row=0,
                                 ),
                                 task_group=tg_tail,
@@ -2735,8 +2717,9 @@ def encoder_pipeline(
                             B_Down,
                             tap=b_down_tiles[0],
                             placement=Tile(
-                                col=transport_groups[group_idx]
-                                .get("shim_cols", default_group_shim_cols)["b_down"],
+                                col=transport_groups[group_idx].get(
+                                    "shim_cols", default_group_shim_cols
+                                )["b_down"],
                                 row=0,
                             ),
                             task_group=tg_tail,
@@ -2748,13 +2731,10 @@ def encoder_pipeline(
                             OR,
                             tap=joined_refill_taps[group_batch_idx],
                             placement=Tile(
-                                col=transport_groups[group_idx]
-                                .get(
+                                col=transport_groups[group_idx].get(
                                     "joined_or_shim_cols",
                                     default_group_joined_or_shim_cols,
-                                )[
-                                    "ln1_refill"
-                                ],
+                                )["ln1_refill"],
                                 row=0,
                             ),
                             task_group=tg_tail,
@@ -2765,13 +2745,10 @@ def encoder_pipeline(
                             OR,
                             tap=joined_i_tiles[group_batch_idx],
                             placement=Tile(
-                                col=transport_groups[group_idx]
-                                .get(
+                                col=transport_groups[group_idx].get(
                                     "joined_or_shim_cols",
                                     default_group_joined_or_shim_cols,
-                                )[
-                                    "ffn_residual_refill"
-                                ],
+                                )["ffn_residual_refill"],
                                 row=0,
                             ),
                             task_group=tg_tail,
@@ -2782,13 +2759,10 @@ def encoder_pipeline(
                             OR,
                             tap=joined_o_tiles[group_batch_idx],
                             placement=Tile(
-                                col=transport_groups[group_idx]
-                                .get(
+                                col=transport_groups[group_idx].get(
                                     "joined_or_shim_cols",
                                     default_group_joined_or_shim_cols,
-                                )[
-                                    "output"
-                                ],
+                                )["output"],
                                 row=0,
                             ),
                             task_group=tg_tail,
