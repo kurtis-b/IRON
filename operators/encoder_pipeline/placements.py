@@ -53,7 +53,11 @@ def _placement(
     ln1_replay=5,
     ln2_replay=4,
     sequence_parallel=None,
+    shim_tiles=None,
 ):
+    resolved_shim_tiles = dict(COMMON_SHIM_TILES)
+    if shim_tiles is not None:
+        resolved_shim_tiles.update(shim_tiles)
     return {
         "enabled": True,
         "mha_cols": mha_cols,
@@ -74,7 +78,7 @@ def _placement(
             "b_down_by_branch": b_down_by_branch,
         },
         "mem_tiles": COMMON_MEM_TILES,
-        "shim_tiles": COMMON_SHIM_TILES,
+        "shim_tiles": resolved_shim_tiles,
         "sequence_parallel": sequence_parallel,
     }
 
@@ -315,6 +319,12 @@ for seq_len in SCALED_SEQ_LENS:
                 "ffn_residual_refill": 7,
                 "output": 0,
             },
+            "unified_qr_split": {
+                "q_mem_col": 0,
+                "q_shim_col": 0,
+                "residual_mem_col": 4,
+                "residual_shim_col": 4,
+            },
             "lane_tiles": (
                 {
                     "qk": (0, 2),
@@ -357,8 +367,66 @@ for seq_len in SCALED_SEQ_LENS:
                     "ln2": (7, 4),
                 },
             ),
-            "lane_o_proj_acc_mem_cols": (1, 3, 5, 7),
+            "lane_o_proj_acc_mem_cols": (1, 2, 5, 6),
             "lane_tail_mem_cols": (1, 3, 5, 7),
+            "transport_groups": (
+                {
+                    "lanes": (0, 1),
+                    "joined_q_mem_col": 0,
+                    "shared_ingress_cols": {"k": 1, "v": 2, "w_o": 3},
+                    "shim_cols": {
+                        "q": 0,
+                        "k": 1,
+                        "v": 2,
+                        "w_o": 3,
+                        "b_up": 4,
+                        "b_down": 5,
+                    },
+                    "joined_or_mem_cols": {
+                        "residual": 0,
+                        "ln1_stage": 3,
+                        "ln1_refill": 2,
+                        "ffn_residual_refill": 3,
+                        "output": 0,
+                    },
+                    "joined_or_shim_cols": {
+                        "residual": 4,
+                        "ln1_stage": 5,
+                        "ln1_refill": 6,
+                        "ffn_residual_refill": 7,
+                        "output": 4,
+                    },
+                    "weight_mem_cols": {"b_up": 3, "b_down": 2},
+                },
+                {
+                    "lanes": (2, 3),
+                    "joined_q_mem_col": 4,
+                    "shared_ingress_cols": {"k": 5, "v": 6, "w_o": 7},
+                    "shim_cols": {
+                        "q": 4,
+                        "k": 5,
+                        "v": 6,
+                        "w_o": 7,
+                        "b_up": 0,
+                        "b_down": 1,
+                    },
+                    "joined_or_mem_cols": {
+                        "residual": 4,
+                        "ln1_stage": 7,
+                        "ln1_refill": 6,
+                        "ffn_residual_refill": 7,
+                        "output": 4,
+                    },
+                    "joined_or_shim_cols": {
+                        "residual": 0,
+                        "ln1_stage": 1,
+                        "ln1_refill": 2,
+                        "ffn_residual_refill": 3,
+                        "output": 0,
+                    },
+                    "weight_mem_cols": {"b_up": 7, "b_down": 6},
+                },
+            ),
             "stage_rows_per_lane": (3072 // 96) * 32,
         },
     )
