@@ -50,6 +50,7 @@ def _placement(
     b_down_by_branch,
     ln1_replay=5,
     ln2_replay=4,
+    sequence_parallel=None,
 ):
     return {
         "enabled": True,
@@ -72,6 +73,7 @@ def _placement(
         },
         "mem_tiles": COMMON_MEM_TILES,
         "shim_tiles": COMMON_SHIM_TILES,
+        "sequence_parallel": sequence_parallel,
     }
 
 
@@ -194,6 +196,77 @@ for seq_len in (64, 128, 256):
                 ln1_replay=tail.get("ln1_replay", 5),
                 ln2_replay=tail.get("ln2_replay", 4),
             )
+
+for seq_len in (64, 128, 256):
+    TOPOLOGY_PLACEMENTS[
+        (
+            12,
+            seq_len,
+            64,
+            32,
+            64,
+            96,
+            2,
+            1,
+            8,
+            1,
+            1,
+            3072,
+        )
+    ] = _placement(
+        mha_cols=(0,),
+        ln1_tile=(1, 5),
+        ffn_up_by_branch=((5, 5),),
+        ffn_down_by_branch=((6, 5),),
+        ln2_tile=(7, 5),
+        o_proj_acc_by_head=O_PROJ_ACC_BY_HEAD[1],
+        ffn_down_acc_by_branch=(6,),
+        b_up_by_branch=(5,),
+        b_down_by_branch=(4,),
+        sequence_parallel={
+            "joined_q_mem_col": 0,
+            "shared_ingress_cols": {"k": 1, "v": 2, "w_o": 3},
+            "joined_or_mem_cols": {
+                "residual": 0,
+                "ln1_stage": 2,
+                "ln1_refill": 4,
+                "ffn_residual_refill": 5,
+                "output": 1,
+            },
+            "joined_or_shim_cols": {
+                "residual": 7,
+                "ln1_stage": 6,
+                "ln1_refill": 0,
+                "ffn_residual_refill": 1,
+                "output": 7,
+            },
+            "lane_tiles": (
+                {
+                    "qk": (1, 2),
+                    "softmax": (1, 3),
+                    "pv": (0, 3),
+                    "o_proj": (0, 4),
+                    "ln1": (0, 5),
+                    "ffn_up": (1, 4),
+                    "ffn_down": (2, 4),
+                    "ln2": (3, 4),
+                },
+                {
+                    "qk": (5, 2),
+                    "softmax": (5, 3),
+                    "pv": (4, 3),
+                    "o_proj": (4, 4),
+                    "ln1": (4, 5),
+                    "ffn_up": (5, 5),
+                    "ffn_down": (6, 5),
+                    "ln2": (7, 5),
+                },
+            ),
+            "lane_o_proj_acc_mem_cols": (2, 3),
+            "lane_tail_mem_cols": (7, 6),
+            "stage_rows_per_lane": (3072 // 96) * 32,
+        },
+    )
 
 
 SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES = frozenset(

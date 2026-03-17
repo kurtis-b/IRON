@@ -1001,9 +1001,6 @@ def encoder_pipeline(
         lane_tiles = sequence_parallel["lane_tiles"]
         lane_o_proj_acc_mem_cols = sequence_parallel["lane_o_proj_acc_mem_cols"]
         lane_tail_mem_cols = sequence_parallel["lane_tail_mem_cols"]
-        lane_output_mem_cols = sequence_parallel["lane_output_mem_cols"]
-        lane_residual_shim_cols = sequence_parallel["lane_residual_shim_cols"]
-        lane_output_shim_cols = sequence_parallel["output_shim_cols"]
         shared_forward_depth = max(of_depth, parallel_seq)
 
         inQSeq = ObjectFifo(q_batch_ty, name="inQSeq", depth=of_depth)
