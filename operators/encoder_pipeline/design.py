@@ -287,9 +287,9 @@ def encoder_pipeline(
                 )
     ffn_col_group_count = ln1_broadcast_groups // effective_ffn_branches
     ln_tiles_per_q_block = proj_acc_depth
-    nonseq_ln1_no_replay = sequence_parallel is None and parallel_heads == 1
+    nonseq_ln1_no_replay = sequence_parallel is None
     ln1_dram_stage_rows = (
-        seq_len if sequence_parallel is not None else ln1_broadcast_groups * seq_tile
+        seq_len if sequence_parallel is not None else proj_acc_depth * seq_tile
     )
     or_tensor_shape = (2 * seq_len + ln1_dram_stage_rows, embed_sz)
 
@@ -319,6 +319,7 @@ def encoder_pipeline(
     k_mem_col = placement["mem_tiles"]["k"]
     v_mem_col = placement["mem_tiles"]["v"]
     ow_mem_col = placement["mem_tiles"]["w_o"]
+    o_proj_stage_mem_col = accumulation_mem_tiles["ln1_replay"]
     ln1_stage_col = placement["mem_tiles"]["ln1_stage"]
     residual_mem_col = placement["mem_tiles"]["residual"]
     ffn_residual_mem_col = placement["mem_tiles"]["ffn_residual"]
@@ -584,17 +585,17 @@ def encoder_pipeline(
     ]
     outOProjInput = ObjectFifo(o_ty, name="outOProjInput", depth=2)
 
-    if nonseq_ln1_no_replay:
-        ln1ReplayPart = None
-        ln1Replay = None
-    else:
-        ln1ReplayPart = ObjectFifo(o_ty, name="ln1ReplayPart", depth=1)
-        ln1Replay = ln1ReplayPart.cons(depth=ln_tiles_per_q_block).forward(
+    if nonseq_ln1_no_replay and parallel_heads > 1:
+        oProjStagePart = ObjectFifo(o_ty, name="oProjStagePart", depth=1)
+        oProjStage = oProjStagePart.cons(depth=ln_tiles_per_q_block).forward(
             obj_type=o_ty,
-            name="ln1Replay",
+            name="oProjStage",
             depth=ln_tiles_per_q_block,
-            placement=Tile(col=accumulation_mem_tiles["ln1_replay"], row=1),
+            placement=Tile(col=o_proj_stage_mem_col, row=1),
         )
+    else:
+        oProjStagePart = None
+        oProjStage = None
     inR = ObjectFifo(o_ty, name="inR", depth=of_depth)
     memR = inR.cons().forward(
         obj_type=o_ty,
@@ -959,6 +960,62 @@ def encoder_pipeline(
                 of_o_out.release(1)
                 of_o_acc_in.release(1)
 
+    def matmul_o_proj_stage_then_emit_stats(
+        of_o_in,
+        of_ow_in,
+        of_o_acc_in,
+        of_o_acc_out,
+        buffer_to_reduce,
+        of_stage_out,
+        of_stats_out,
+        stats_sum_buf,
+        stats_sumsq_buf,
+        zero_f32,
+        calc_sum_sumsq,
+        pack_stats,
+        add,
+        zero,
+        matmul,
+        copy,
+    ):
+        for _ in range_(sys.maxsize):
+            zero_f32(stats_sum_buf, seq_tile)
+            zero_f32(stats_sumsq_buf, seq_tile)
+            for _ in range_(proj_acc_depth):
+                elem_out_o_acc = of_o_acc_out.acquire(1)
+                zero(elem_out_o_acc)
+                of_o_acc_out.release(1)
+            for _ in range_(num_qkv_head_block_per_parallel_head):
+                elem_in_o = of_o_in.acquire(1)
+                for _ in range_(proj_acc_depth):
+                    elem_in_o_acc = of_o_acc_in.acquire(1)
+                    elem_in_ow = of_ow_in.acquire(1)
+                    elem_out_o_acc = of_o_acc_out.acquire(1)
+                    matmul(elem_in_o, elem_in_ow, elem_in_o_acc, elem_out_o_acc)
+                    of_o_acc_out.release(1)
+                    of_ow_in.release(1)
+                    of_o_acc_in.release(1)
+                of_o_in.release(1)
+            for _ in range_(proj_acc_depth):
+                elem_in_o_acc = of_o_acc_in.acquire(1)
+                if buffer_to_reduce is not None:
+                    partial_o_acc = buffer_to_reduce.acquire(1)
+                    add(
+                        partial_o_acc,
+                        elem_in_o_acc,
+                        elem_in_o_acc,
+                        seq_tile * emb_tile,
+                    )
+                    buffer_to_reduce.release(1)
+                calc_sum_sumsq(elem_in_o_acc, stats_sum_buf, stats_sumsq_buf)
+                elem_stage = of_stage_out.acquire(1)
+                copy(elem_in_o_acc, elem_stage, seq_tile * emb_tile)
+                of_stage_out.release(1)
+                of_o_acc_in.release(1)
+            elem_stats = of_stats_out.acquire(1)
+            pack_stats(stats_sum_buf, stats_sumsq_buf, elem_stats, seq_tile)
+            of_stats_out.release(1)
+
     def core_fn_ln1_fused(
         of_in_o_proj,
         of_replay_curr,
@@ -1093,6 +1150,40 @@ def encoder_pipeline(
             elem_stats = of_in_o_proj.acquire(1)
             unpack_stats(elem_stats, sum_buf, sumsq_buf, seq_tile)
             of_in_o_proj.release(1)
+            for col_idx in range_(ln_tiles_per_q_block):
+                col_i32 = index.casts(T.i32(), col_idx)
+                elem_in = of_in_o_proj.acquire(1)
+                elem_residual = of_in_residual.acquire(1)
+                elem_out = of_out_stage.acquire(1)
+                fused_add_layer_norm(
+                    elem_in,
+                    elem_residual,
+                    weights,
+                    sum_buf,
+                    sumsq_buf,
+                    elem_out,
+                    embed_sz,
+                    col_i32,
+                )
+                of_out_stage.release(1)
+                of_in_o_proj.release(1)
+                of_in_residual.release(1)
+
+    def core_fn_ln1_stage_from_split_inputs(
+        of_in_stats,
+        of_in_o_proj,
+        of_in_residual,
+        sum_buf,
+        sumsq_buf,
+        weights,
+        of_out_stage,
+        fused_add_layer_norm,
+        unpack_stats,
+    ):
+        for _ in range_(sys.maxsize):
+            elem_stats = of_in_stats.acquire(1)
+            unpack_stats(elem_stats, sum_buf, sumsq_buf, seq_tile)
+            of_in_stats.release(1)
             for col_idx in range_(ln_tiles_per_q_block):
                 col_i32 = index.casts(T.i32(), col_idx)
                 elem_in = of_in_o_proj.acquire(1)
@@ -2902,9 +2993,15 @@ def encoder_pipeline(
         o_proj_workers.append(
             Worker(
                 (
-                    matmul_o_proj_emit_stats_first
-                    if nonseq_ln1_no_replay and i == (parallel_heads - 1)
-                    else matmul_o_proj
+                    matmul_o_proj_stage_then_emit_stats
+                    if nonseq_ln1_no_replay
+                    and parallel_heads > 1
+                    and i == (parallel_heads - 1)
+                    else (
+                        matmul_o_proj_emit_stats_first
+                        if nonseq_ln1_no_replay and i == (parallel_heads - 1)
+                        else matmul_o_proj
+                    )
                 ),
                 fn_args=(
                     [
@@ -2913,6 +3010,7 @@ def encoder_pipeline(
                         outOProjAccumIn[i].cons(depth=1),
                         outOProjAccumOut[i].prod(),
                         outOPart[i - 1].cons() if i > 0 else None,
+                        oProjStagePart.prod(),
                         outOProjInput.prod(),
                         o_proj_stats_sum_buffers[i],
                         o_proj_stats_sumsq_buffers[i],
@@ -2924,29 +3022,51 @@ def encoder_pipeline(
                         matmul_kernel_o_proj,
                         mem_copy_o_proj,
                     ]
-                    if nonseq_ln1_no_replay and i == (parallel_heads - 1)
-                    else [
-                        outOProj[i].cons(),
-                        memOW[i].cons(),
-                        outOProjAccumIn[i].cons(depth=1),
-                        outOProjAccumOut[i].prod(),
-                        outOPart[i - 1].cons() if i > 0 else None,
-                        (
-                            outOPart[i].prod()
-                            if i < (parallel_heads - 1)
-                            else outOProjInput.prod()
-                        ),
-                        o_proj_stats_sum_buffers[i],
-                        o_proj_stats_sumsq_buffers[i],
-                        ln_zero_f32_kernel,
-                        ln_calc_sum_sumsq_kernel,
-                        pack_stats_kernel,
-                        eltwise_add_vector_kernel,
-                        zero_kernel_o_proj,
-                        matmul_kernel_o_proj,
-                        mem_copy_o_proj,
-                        i == (parallel_heads - 1) and emb_tile >= 2 * seq_tile,
-                    ]
+                    if nonseq_ln1_no_replay
+                    and parallel_heads > 1
+                    and i == (parallel_heads - 1)
+                    else (
+                        [
+                            outOProj[i].cons(),
+                            memOW[i].cons(),
+                            outOProjAccumIn[i].cons(depth=1),
+                            outOProjAccumOut[i].prod(),
+                            outOPart[i - 1].cons() if i > 0 else None,
+                            outOProjInput.prod(),
+                            o_proj_stats_sum_buffers[i],
+                            o_proj_stats_sumsq_buffers[i],
+                            ln_zero_f32_kernel,
+                            ln_calc_sum_sumsq_kernel,
+                            pack_stats_kernel,
+                            eltwise_add_vector_kernel,
+                            zero_kernel_o_proj,
+                            matmul_kernel_o_proj,
+                            mem_copy_o_proj,
+                        ]
+                        if nonseq_ln1_no_replay and i == (parallel_heads - 1)
+                        else [
+                            outOProj[i].cons(),
+                            memOW[i].cons(),
+                            outOProjAccumIn[i].cons(depth=1),
+                            outOProjAccumOut[i].prod(),
+                            outOPart[i - 1].cons() if i > 0 else None,
+                            (
+                                outOPart[i].prod()
+                                if i < (parallel_heads - 1)
+                                else outOProjInput.prod()
+                            ),
+                            o_proj_stats_sum_buffers[i],
+                            o_proj_stats_sumsq_buffers[i],
+                            ln_zero_f32_kernel,
+                            ln_calc_sum_sumsq_kernel,
+                            pack_stats_kernel,
+                            eltwise_add_vector_kernel,
+                            zero_kernel_o_proj,
+                            matmul_kernel_o_proj,
+                            mem_copy_o_proj,
+                            i == (parallel_heads - 1) and emb_tile >= 2 * seq_tile,
+                        ]
+                    )
                 ),
                 placement=o_proj_tiles[i],
                 stack_size=0xD00,
@@ -2954,10 +3074,19 @@ def encoder_pipeline(
             )
         )
     ln1_worker = Worker(
-        core_fn_ln1_stage_from_stats if nonseq_ln1_no_replay else core_fn_ln1_fused,
+        (
+            core_fn_ln1_stage_from_split_inputs
+            if nonseq_ln1_no_replay and parallel_heads > 1
+            else (
+                core_fn_ln1_stage_from_stats
+                if nonseq_ln1_no_replay
+                else core_fn_ln1_fused
+            )
+        ),
         fn_args=(
             [
                 outOProjInput.cons(),
+                oProjStage.cons(depth=1),
                 memR.cons(),
                 ln1_norm_sum_buffer,
                 ln1_norm_sumsq_buffer,
@@ -2966,22 +3095,35 @@ def encoder_pipeline(
                 ln_fused_add_layer_norm_kernel,
                 unpack_stats_kernel,
             ]
-            if nonseq_ln1_no_replay
-            else [
-                outOProjInput.cons(),
-                ln1Replay.cons(),
-                ln1ReplayPart.prod(),
-                memR.cons(),
-                ln1_norm_sum_buffer,
-                ln1_norm_sumsq_buffer,
-                ln1_weight_buffer,
-                outLNBroadcast.prod(),
-                ln_fused_add_layer_norm_kernel,
-                ln_calc_sum_sumsq_kernel,
-                unpack_stats_kernel,
-                ln_zero_f32_kernel,
-                mem_copy_o_proj,
-            ]
+            if nonseq_ln1_no_replay and parallel_heads > 1
+            else (
+                [
+                    outOProjInput.cons(),
+                    memR.cons(),
+                    ln1_norm_sum_buffer,
+                    ln1_norm_sumsq_buffer,
+                    ln1_weight_buffer,
+                    outLNBroadcast.prod(1),
+                    ln_fused_add_layer_norm_kernel,
+                    unpack_stats_kernel,
+                ]
+                if nonseq_ln1_no_replay
+                else [
+                    outOProjInput.cons(),
+                    ln1Replay.cons(),
+                    ln1ReplayPart.prod(),
+                    memR.cons(),
+                    ln1_norm_sum_buffer,
+                    ln1_norm_sumsq_buffer,
+                    ln1_weight_buffer,
+                    outLNBroadcast.prod(),
+                    ln_fused_add_layer_norm_kernel,
+                    ln_calc_sum_sumsq_kernel,
+                    unpack_stats_kernel,
+                    ln_zero_f32_kernel,
+                    mem_copy_o_proj,
+                ]
+            )
         ),
         placement=ln1_tile,
         while_true=False,

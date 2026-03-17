@@ -440,11 +440,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         if self.parallel_seq > 1:
             ln1_stage_rows = self.seq_len
         else:
-            ln1_stage_rows = (
-                self.parallel_seq
-                * (self.ffn_intermediate_size // self.ffn_tile)
-                * self.seq_tile
-            )
+            ln1_stage_rows = self.proj_acc_depth * self.seq_tile
         return (2 * self.seq_len + ln1_stage_rows, self.embed_sz)
 
     def set_up_runtime(self):
