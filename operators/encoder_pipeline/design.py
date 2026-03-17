@@ -182,9 +182,7 @@ def encoder_pipeline(
             f"({emb_tile} * {proj_acc_depth} != {embed_sz})"
         )
     if ffn_tile % 16 != 0:
-        raise ValueError(
-            f"ffn_tile must be divisible by 16 ({ffn_tile} % 16 != 0)"
-        )
+        raise ValueError(f"ffn_tile must be divisible by 16 ({ffn_tile} % 16 != 0)")
     if ffn_intermediate_size % ffn_tile != 0:
         raise ValueError(
             "ffn_intermediate_size must be divisible by ffn_tile "
@@ -289,6 +287,7 @@ def encoder_pipeline(
                 )
     ffn_col_group_count = ln1_broadcast_groups // effective_ffn_branches
     ln_tiles_per_q_block = proj_acc_depth
+    nonseq_ln1_no_replay = sequence_parallel is None and parallel_heads == 1
     ln1_dram_stage_rows = (
         seq_len if sequence_parallel is not None else ln1_broadcast_groups * seq_tile
     )
@@ -320,8 +319,6 @@ def encoder_pipeline(
     k_mem_col = placement["mem_tiles"]["k"]
     v_mem_col = placement["mem_tiles"]["v"]
     ow_mem_col = placement["mem_tiles"]["w_o"]
-    ln2_replay_mem_col = accumulation_mem_tiles["ln2_replay"]
-    ln1_replay_mem_col = accumulation_mem_tiles["ln1_replay"]
     ln1_stage_col = placement["mem_tiles"]["ln1_stage"]
     residual_mem_col = placement["mem_tiles"]["residual"]
     ffn_residual_mem_col = placement["mem_tiles"]["ffn_residual"]
@@ -587,13 +584,17 @@ def encoder_pipeline(
     ]
     outOProjInput = ObjectFifo(o_ty, name="outOProjInput", depth=2)
 
-    ln1ReplayPart = ObjectFifo(o_ty, name="ln1ReplayPart", depth=1)
-    ln1Replay = ln1ReplayPart.cons(depth=ln_tiles_per_q_block).forward(
-        obj_type=o_ty,
-        name="ln1Replay",
-        depth=ln_tiles_per_q_block,
-        placement=Tile(col=ln1_replay_mem_col, row=1),
-    )
+    if nonseq_ln1_no_replay:
+        ln1ReplayPart = None
+        ln1Replay = None
+    else:
+        ln1ReplayPart = ObjectFifo(o_ty, name="ln1ReplayPart", depth=1)
+        ln1Replay = ln1ReplayPart.cons(depth=ln_tiles_per_q_block).forward(
+            obj_type=o_ty,
+            name="ln1Replay",
+            depth=ln_tiles_per_q_block,
+            placement=Tile(col=accumulation_mem_tiles["ln1_replay"], row=1),
+        )
     inR = ObjectFifo(o_ty, name="inR", depth=of_depth)
     memR = inR.cons().forward(
         obj_type=o_ty,
@@ -609,10 +610,10 @@ def encoder_pipeline(
     memOutLN = [inLNFromDDR.cons(depth=2) for _ in range(effective_ffn_branches)]
 
     ffnRFromDDR = ObjectFifo(o_ty, name="ffnRFromDDR", depth=1)
-    ffnRIn = ffnRFromDDR.cons(depth=proj_acc_depth).forward(
+    ffnRIn = ffnRFromDDR.cons(depth=2).forward(
         obj_type=o_ty,
         name="ffnRIn",
-        depth=proj_acc_depth,
+        depth=2,
         placement=Tile(col=ffn_residual_mem_col, row=1),
     )
     inBUp = []
@@ -705,13 +706,6 @@ def encoder_pipeline(
     ]
     ffnDownOut = ObjectFifo(o_ty, name="ffnDownOut", depth=2)
 
-    ln2ReplayPart = ObjectFifo(o_ty, name="ln2ReplayPart", depth=1)
-    ln2Replay = ln2ReplayPart.cons(depth=proj_acc_depth).forward(
-        obj_type=o_ty,
-        name="ln2Replay",
-        depth=proj_acc_depth,
-        placement=Tile(col=ln2_replay_mem_col, row=1),
-    )
     outLN2 = ObjectFifo(o_ty, name="outLN2", depth=2)
     memLN2 = outLN2.cons().forward(
         obj_type=o_ty,
@@ -1588,9 +1582,7 @@ def encoder_pipeline(
                 group_memOWSeq.append(unified_memOWSeq)
 
             if unified_memBUpSeq is None:
-                inBUpSeq = ObjectFifo(
-                    ffn_b_up_ty, name=f"inBUpSeq{suffix}", depth=1
-                )
+                inBUpSeq = ObjectFifo(ffn_b_up_ty, name=f"inBUpSeq{suffix}", depth=1)
                 group_inBUpSeq.append(inBUpSeq)
                 memBUpSeq = inBUpSeq.cons().forward(
                     obj_type=ffn_b_up_ty,
@@ -1606,9 +1598,7 @@ def encoder_pipeline(
                 group_inBUpSeq.append(None)
                 group_memBUpSeq.append(unified_memBUpSeq)
 
-            inBDownSeq = ObjectFifo(
-                ffn_b_down_ty, name=f"inBDownSeq{suffix}", depth=1
-            )
+            inBDownSeq = ObjectFifo(ffn_b_down_ty, name=f"inBDownSeq{suffix}", depth=1)
             group_inBDownSeq.append(inBDownSeq)
             memBDownSeq = inBDownSeq.cons().forward(
                 obj_type=ffn_b_down_ty,
@@ -2847,6 +2837,8 @@ def encoder_pipeline(
     )
     ln1_norm_sum_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sum_buffer")
     ln1_norm_sumsq_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sumsq_buffer")
+    ffn_down_sum_buffer = Buffer(type=sum_l1_ty, name="ffn_down_sum_buffer")
+    ffn_down_sumsq_buffer = Buffer(type=sum_l1_ty, name="ffn_down_sumsq_buffer")
     ln2_sum_buffer = Buffer(type=sum_l1_ty, name="ln2_sum_buffer")
     ln2_sumsq_buffer = Buffer(type=sum_l1_ty, name="ln2_sumsq_buffer")
 
@@ -2909,51 +2901,88 @@ def encoder_pipeline(
         )
         o_proj_workers.append(
             Worker(
-                matmul_o_proj,
-                fn_args=[
-                    outOProj[i].cons(),
-                    memOW[i].cons(),
-                    outOProjAccumIn[i].cons(depth=1),
-                    outOProjAccumOut[i].prod(),
-                    outOPart[i - 1].cons() if i > 0 else None,
-                    (
-                        outOPart[i].prod()
-                        if i < (parallel_heads - 1)
-                        else outOProjInput.prod()
-                    ),
-                    o_proj_stats_sum_buffers[i],
-                    o_proj_stats_sumsq_buffers[i],
-                    ln_zero_f32_kernel,
-                    ln_calc_sum_sumsq_kernel,
-                    pack_stats_kernel,
-                    eltwise_add_vector_kernel,
-                    zero_kernel_o_proj,
-                    matmul_kernel_o_proj,
-                    mem_copy_o_proj,
-                    i == (parallel_heads - 1) and emb_tile >= 2 * seq_tile,
-                ],
+                (
+                    matmul_o_proj_emit_stats_first
+                    if nonseq_ln1_no_replay and i == (parallel_heads - 1)
+                    else matmul_o_proj
+                ),
+                fn_args=(
+                    [
+                        outOProj[i].cons(),
+                        memOW[i].cons(),
+                        outOProjAccumIn[i].cons(depth=1),
+                        outOProjAccumOut[i].prod(),
+                        outOPart[i - 1].cons() if i > 0 else None,
+                        outOProjInput.prod(),
+                        o_proj_stats_sum_buffers[i],
+                        o_proj_stats_sumsq_buffers[i],
+                        ln_zero_f32_kernel,
+                        ln_calc_sum_sumsq_kernel,
+                        pack_stats_kernel,
+                        eltwise_add_vector_kernel,
+                        zero_kernel_o_proj,
+                        matmul_kernel_o_proj,
+                        mem_copy_o_proj,
+                    ]
+                    if nonseq_ln1_no_replay and i == (parallel_heads - 1)
+                    else [
+                        outOProj[i].cons(),
+                        memOW[i].cons(),
+                        outOProjAccumIn[i].cons(depth=1),
+                        outOProjAccumOut[i].prod(),
+                        outOPart[i - 1].cons() if i > 0 else None,
+                        (
+                            outOPart[i].prod()
+                            if i < (parallel_heads - 1)
+                            else outOProjInput.prod()
+                        ),
+                        o_proj_stats_sum_buffers[i],
+                        o_proj_stats_sumsq_buffers[i],
+                        ln_zero_f32_kernel,
+                        ln_calc_sum_sumsq_kernel,
+                        pack_stats_kernel,
+                        eltwise_add_vector_kernel,
+                        zero_kernel_o_proj,
+                        matmul_kernel_o_proj,
+                        mem_copy_o_proj,
+                        i == (parallel_heads - 1) and emb_tile >= 2 * seq_tile,
+                    ]
+                ),
                 placement=o_proj_tiles[i],
                 stack_size=0xD00,
                 while_true=False,
             )
         )
     ln1_worker = Worker(
-        core_fn_ln1_fused,
-        fn_args=[
-            outOProjInput.cons(),
-            ln1Replay.cons(),
-            ln1ReplayPart.prod(),
-            memR.cons(),
-            ln1_norm_sum_buffer,
-            ln1_norm_sumsq_buffer,
-            ln1_weight_buffer,
-            outLNBroadcast.prod(),
-            ln_fused_add_layer_norm_kernel,
-            ln_calc_sum_sumsq_kernel,
-            unpack_stats_kernel,
-            ln_zero_f32_kernel,
-            mem_copy_o_proj,
-        ],
+        core_fn_ln1_stage_from_stats if nonseq_ln1_no_replay else core_fn_ln1_fused,
+        fn_args=(
+            [
+                outOProjInput.cons(),
+                memR.cons(),
+                ln1_norm_sum_buffer,
+                ln1_norm_sumsq_buffer,
+                ln1_weight_buffer,
+                outLNBroadcast.prod(1),
+                ln_fused_add_layer_norm_kernel,
+                unpack_stats_kernel,
+            ]
+            if nonseq_ln1_no_replay
+            else [
+                outOProjInput.cons(),
+                ln1Replay.cons(),
+                ln1ReplayPart.prod(),
+                memR.cons(),
+                ln1_norm_sum_buffer,
+                ln1_norm_sumsq_buffer,
+                ln1_weight_buffer,
+                outLNBroadcast.prod(),
+                ln_fused_add_layer_norm_kernel,
+                ln_calc_sum_sumsq_kernel,
+                unpack_stats_kernel,
+                ln_zero_f32_kernel,
+                mem_copy_o_proj,
+            ]
+        ),
         placement=ln1_tile,
         while_true=False,
     )
@@ -2986,40 +3015,61 @@ def encoder_pipeline(
         )
         ffn_down_workers.append(
             Worker(
-                core_fn_ffn_down_proj,
-                fn_args=[
-                    ffnUpOut[branch_idx].cons(),
-                    memBDown[branch_idx].cons(),
-                    ffnDownAccum[branch_idx].cons(depth=1),
-                    ffnDownPart[branch_idx].prod(),
-                    reduce_in,
-                    reduce_out,
-                    ffn_matmul_init_kernel_down_proj,
-                    ffn_matmul_kernel_down_proj,
-                    eltwise_add_vector_kernel,
-                    mem_copy_o_proj,
-                    ffn_col_group_count,
-                ],
+                (
+                    core_fn_ffn_down_proj_emit_stats_first
+                    if branch_idx == (effective_ffn_branches - 1)
+                    else core_fn_ffn_down_proj
+                ),
+                fn_args=(
+                    [
+                        ffnUpOut[branch_idx].cons(),
+                        memBDown[branch_idx].cons(),
+                        ffnDownAccum[branch_idx].cons(depth=1),
+                        ffnDownPart[branch_idx].prod(),
+                        reduce_in,
+                        ffnDownOut.prod(2),
+                        ffn_down_sum_buffer,
+                        ffn_down_sumsq_buffer,
+                        ffn_matmul_init_kernel_down_proj,
+                        ffn_matmul_kernel_down_proj,
+                        eltwise_add_vector_kernel,
+                        ln_calc_sum_sumsq_kernel,
+                        pack_stats_kernel,
+                        ln_zero_f32_kernel,
+                        mem_copy_o_proj,
+                        ffn_col_group_count,
+                    ]
+                    if branch_idx == (effective_ffn_branches - 1)
+                    else [
+                        ffnUpOut[branch_idx].cons(),
+                        memBDown[branch_idx].cons(),
+                        ffnDownAccum[branch_idx].cons(depth=1),
+                        ffnDownPart[branch_idx].prod(),
+                        reduce_in,
+                        reduce_out,
+                        ffn_matmul_init_kernel_down_proj,
+                        ffn_matmul_kernel_down_proj,
+                        eltwise_add_vector_kernel,
+                        mem_copy_o_proj,
+                        ffn_col_group_count,
+                    ]
+                ),
                 placement=ffn_down_tiles[branch_idx],
                 stack_size=0xF00,
                 while_true=False,
             )
         )
     ln2_worker = Worker(
-        core_fn_add_norm2,
+        core_fn_add_norm2_from_stats,
         fn_args=[
             ffnDownOut.cons(),
             ffnRIn.cons(),
-            ln2Replay.cons(depth=1),
-            ln2ReplayPart.prod(),
             ln2_sum_buffer,
             ln2_sumsq_buffer,
             ln2_weight_buffer,
             outLN2.prod(),
             ln_fused_add_layer_norm_kernel,
-            ln_calc_sum_sumsq_kernel,
-            ln_zero_f32_kernel,
-            mem_copy_o_proj,
+            unpack_stats_kernel,
         ],
         placement=ln2_tile,
         stack_size=0xF00,
@@ -3120,10 +3170,10 @@ def encoder_pipeline(
             for tap in r_tiles_base
         ]
     )
-    for tile in R_tiles:
-        tile._sizes[0] = ln1_broadcast_groups
-        tile._strides[0] = 0
-
+    if not nonseq_ln1_no_replay:
+        for tile in R_tiles:
+            tile._sizes[0] = ln1_broadcast_groups
+            tile._strides[0] = 0
     B_Up_tiles = TensorAccessSequence.from_taps(
         [
             TensorAccessPattern(
@@ -3224,8 +3274,12 @@ def encoder_pipeline(
         (
             R_tiles,
             (seq_tile, emb_tile),
-            ln1_broadcast_groups * proj_acc_depth,
-            "Residual tap count does not match LN1 broadcast groups",
+            (
+                proj_acc_depth
+                if nonseq_ln1_no_replay
+                else ln1_broadcast_groups * proj_acc_depth
+            ),
+            "Residual tap count does not match LN1 runtime contract",
         ),
         (
             O_tiles,
@@ -3348,7 +3402,12 @@ def encoder_pipeline(
             branch_stage_tap = TensorAccessPattern(
                 or_tensor_shape,
                 offset=ln1_stage_base_offset,
-                sizes=[ln1_broadcast_groups, proj_acc_depth, seq_tile, emb_tile],
+                sizes=[
+                    1 if nonseq_ln1_no_replay else ln1_broadcast_groups,
+                    proj_acc_depth,
+                    seq_tile,
+                    emb_tile,
+                ],
                 strides=[0, emb_tile, embed_sz, 1],
             )
             branch_refill_tap = TensorAccessPattern(
@@ -3363,10 +3422,12 @@ def encoder_pipeline(
                 sizes=[1, proj_acc_depth, seq_tile, emb_tile],
                 strides=[0, emb_tile, embed_sz, 1],
             )
-            if (
-                math.prod(int(s) for s in branch_stage_tap.sizes)
-                // math.prod((seq_tile, emb_tile))
-                != ln1_broadcast_groups * proj_acc_depth
+            if math.prod(int(s) for s in branch_stage_tap.sizes) // math.prod(
+                (seq_tile, emb_tile)
+            ) != (
+                proj_acc_depth
+                if nonseq_ln1_no_replay
+                else ln1_broadcast_groups * proj_acc_depth
             ):
                 raise ValueError("LN1 stage tap count mismatch")
             if (
