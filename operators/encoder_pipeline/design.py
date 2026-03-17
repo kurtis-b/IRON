@@ -198,12 +198,12 @@ def encoder_pipeline(
             f"(branches={effective_ffn_branches}, requested={nB_tiles_distributed})"
         )
     if sequence_parallel is not None and (
-        parallel_seq != 2 or parallel_heads != 1 or effective_ffn_branches != 1
+        parallel_heads != 1 or effective_ffn_branches != 1
     ):
         raise ValueError(
             "encoder_pipeline native sequence-parallel currently supports only "
-            "parallel_seq=2, parallel_heads=1, and nB_tiles_distributed=1 "
-            f"(got parallel_seq={parallel_seq}, parallel_heads={parallel_heads}, "
+            "parallel_heads=1 and nB_tiles_distributed=1 "
+            f"(got parallel_heads={parallel_heads}, "
             f"nB_tiles_distributed={effective_ffn_branches})"
         )
     if ln1_broadcast_groups % effective_ffn_branches != 0:
@@ -211,6 +211,25 @@ def encoder_pipeline(
             "encoder_pipeline requires FFN branch count to divide ln1_broadcast_groups "
             f"({ln1_broadcast_groups} % {effective_ffn_branches} != 0)"
         )
+    if sequence_parallel is not None:
+        if len(sequence_parallel["lane_tiles"]) != parallel_seq:
+            raise ValueError(
+                "encoder_pipeline sequence-parallel placement must provide one lane "
+                f"tile map per sequence lane ({len(sequence_parallel['lane_tiles'])} "
+                f"!= {parallel_seq})"
+            )
+        if len(sequence_parallel["lane_o_proj_acc_mem_cols"]) != parallel_seq:
+            raise ValueError(
+                "encoder_pipeline sequence-parallel placement must provide one "
+                "O-proj accumulation memtile per sequence lane "
+                f"({len(sequence_parallel['lane_o_proj_acc_mem_cols'])} != {parallel_seq})"
+            )
+        if len(sequence_parallel["lane_tail_mem_cols"]) != parallel_seq:
+            raise ValueError(
+                "encoder_pipeline sequence-parallel placement must provide one tail "
+                f"memtile per sequence lane ({len(sequence_parallel['lane_tail_mem_cols'])} "
+                f"!= {parallel_seq})"
+            )
     ffn_col_group_count = ln1_broadcast_groups // effective_ffn_branches
     ln_tiles_per_q_block = proj_acc_depth
     ln1_dram_stage_rows = (
