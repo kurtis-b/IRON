@@ -7,7 +7,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-
 TILE_REF_RE = re.compile(r"%(?:mem_tile|shim_noc_tile|tile)_\d+_\d+")
 OBJECTFIFO_RE = re.compile(
     r"aie\.objectfifo\s+@(?P<name>\w+)\((?P<src>.*?)\s*,\s*\{(?P<dsts>.*?)\}\s*,\s*(?P<depth>.*?)\)\s*:\s*!aie\.objectfifo<(?P<obj_type>.*?)>",
@@ -71,7 +70,9 @@ def parse_objectfifos(content: str) -> dict[str, ObjectFifo]:
     return objectfifos
 
 
-def parse_objectfifo_links(content: str) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
+def parse_objectfifo_links(
+    content: str,
+) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
     links: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
     for match in OBJECTFIFO_LINK_RE.finditer(content):
         srcs = tuple(re.findall(r"@(\w+)", match.group("srcs")))
@@ -106,8 +107,12 @@ def build_surfaces(
     surfaces: list[Surface] = []
     linked_names: set[str] = set()
     for src_names, dst_names in links:
-        src_fifos = tuple(objectfifos[name] for name in src_names if name in objectfifos)
-        dst_fifos = tuple(objectfifos[name] for name in dst_names if name in objectfifos)
+        src_fifos = tuple(
+            objectfifos[name] for name in src_names if name in objectfifos
+        )
+        dst_fifos = tuple(
+            objectfifos[name] for name in dst_names if name in objectfifos
+        )
         if not src_fifos and not dst_fifos:
             continue
         linked_names.update(fifo.name for fifo in src_fifos + dst_fifos)
@@ -195,7 +200,9 @@ def build_counts(
 def tile_limit(tile_ref: str, direction: str, args: argparse.Namespace) -> int | None:
     tile_kind = classify_tile(tile_ref)
     if tile_kind == "mem_tile":
-        return args.memtile_s2mm_limit if direction == "input" else args.memtile_mm2s_limit
+        return (
+            args.memtile_s2mm_limit if direction == "input" else args.memtile_mm2s_limit
+        )
     if tile_kind == "shim":
         return args.shim_s2mm_limit if direction == "input" else args.shim_mm2s_limit
     return None
@@ -270,9 +277,14 @@ def format_surface_section(surfaces: list[Surface]) -> str:
     lines = ["Logical Transport Surfaces", "==========================", ""]
     for surface in surfaces:
         fifo_names = ", ".join(fifo.name for fifo in surface.fifos)
-        src_tiles = ", ".join(sorted({fifo.src_tile for fifo in surface.fifos}, key=tile_sort_key))
+        src_tiles = ", ".join(
+            sorted({fifo.src_tile for fifo in surface.fifos}, key=tile_sort_key)
+        )
         dst_tiles = ", ".join(
-            sorted({tile for fifo in surface.fifos for tile in fifo.dst_tiles}, key=tile_sort_key)
+            sorted(
+                {tile for fifo in surface.fifos for tile in fifo.dst_tiles},
+                key=tile_sort_key,
+            )
         )
         lines.append(f"{surface.kind}: {surface.name}")
         lines.append(f"  fifos: {fifo_names}")
@@ -299,9 +311,7 @@ def format_kind_mix_section(
             kinds = kind_counts[direction].get(tile, {})
             if not kinds:
                 continue
-            mix = ", ".join(
-                f"{kind}={count}" for kind, count in sorted(kinds.items())
-            )
+            mix = ", ".join(f"{kind}={count}" for kind, count in sorted(kinds.items()))
             limit = tile_limit(tile, direction, args)
             flags = []
             if tile_kind == "mem_tile":
@@ -310,9 +320,7 @@ def format_kind_mix_section(
                 join_count = kinds.get("join", 0)
                 forward_count = kinds.get("forward", 0)
                 non_direct_classes = sum(
-                    1
-                    for kind, count in kinds.items()
-                    if kind != "direct" and count > 0
+                    1 for kind, count in kinds.items() if kind != "direct" and count > 0
                 )
                 if relay_count >= 4:
                     flags.append(f"relay_heavy={relay_count}")
