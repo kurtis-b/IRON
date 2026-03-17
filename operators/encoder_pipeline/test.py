@@ -17,41 +17,43 @@ REL_TOL = 4.0e-2
 ABS_TOL = 1.5e-1
 ERROR_THRESHOLD = 0.005
 SCALED_SEQ_LENS = tuple(1 << exp for exp in range(6, 14))
+BASE_TOPOLOGY = (64, 12, 3072, 32, 64, 96, 64)
 TOPOLOGY_CASES = (
-    ("64d_12h_3072ffn_32q_64kv_96emb", (64, 12, 3072, 32, 64, 96, 1, 1, 8, 1, 1)),
-    ("64d_12h_3072ffn_32q_64kv_96emb_2ps", (64, 12, 3072, 32, 64, 96, 2, 1, 8, 1, 1)),
-    ("64d_12h_3072ffn_32q_64kv_96emb_4ps", (64, 12, 3072, 32, 64, 96, 4, 1, 8, 1, 1)),
-    ("64d_12h_3072ffn_32q_64kv_96emb_2ph", (64, 12, 3072, 32, 64, 96, 1, 2, 8, 1, 1)),
-    ("64d_12h_3072ffn_32q_64kv_96emb_4ph", (64, 12, 3072, 32, 64, 96, 1, 4, 8, 1, 1)),
-    ("64d_12h_3072ffn_32q_64kv_96emb_2pffn", (64, 12, 3072, 32, 64, 96, 1, 1, 8, 1, 2)),
-    (
-        "64d_12h_3072ffn_32q_64kv_96emb_2ph_2pffn",
-        (64, 12, 3072, 32, 64, 96, 1, 2, 8, 1, 2),
-    ),
-    ("64d_12h_3072ffn_32q_64kv_96emb_4pffn", (64, 12, 3072, 32, 64, 96, 1, 1, 8, 1, 4)),
-    (
-        "64d_12h_3072ffn_32q_64kv_96emb_2ph_4pffn",
-        (64, 12, 3072, 32, 64, 96, 1, 2, 8, 1, 4),
-    ),
+    ("", (1, 1, 8, 1, 1)),
+    ("_2ps", (2, 1, 8, 1, 1)),
+    ("_4ps", (4, 1, 8, 1, 1)),
+    ("_2ph", (1, 2, 8, 1, 1)),
+    ("_4ph", (1, 4, 8, 1, 1)),
+    ("_2pffn", (1, 1, 8, 1, 2)),
+    ("_2ph_2pffn", (1, 2, 8, 1, 2)),
+    ("_4pffn", (1, 1, 8, 1, 4)),
+    ("_2ph_4pffn", (1, 2, 8, 1, 4)),
 )
+
+
+def topology_name(suffix: str) -> str:
+    d, num_heads, ffn_intermediate_size, seq_tile, kv_seq_tile, emb_tile, ffn_tile = (
+        BASE_TOPOLOGY
+    )
+    return (
+        f"{d}d_{num_heads}h_{ffn_intermediate_size}ffn_{seq_tile}q_"
+        f"{kv_seq_tile}kv_{emb_tile}emb_{ffn_tile}ffnt{suffix}"
+    )
 
 
 def generate_test_params():
     params = []
-    for topology_name, topology in TOPOLOGY_CASES:
+    d, num_heads, ffn_intermediate_size, seq_tile, kv_seq_tile, emb_tile, ffn_tile = (
+        BASE_TOPOLOGY
+    )
+    for topology_suffix, runtime_topology in TOPOLOGY_CASES:
         (
-            d,
-            num_heads,
-            ffn_intermediate_size,
-            seq_tile,
-            kv_seq_tile,
-            emb_tile,
             parallel_seq,
             parallel_heads,
             proj_acc_depth,
             o_proj_acc_group_size,
             nB_tiles_distributed,
-        ) = topology
+        ) = runtime_topology
         for seq_len in SCALED_SEQ_LENS:
             if seq_len % seq_tile != 0 or (seq_len // seq_tile) % parallel_seq != 0:
                 continue
@@ -64,12 +66,13 @@ def generate_test_params():
                     seq_tile,
                     kv_seq_tile,
                     emb_tile,
+                    ffn_tile,
                     parallel_seq,
                     parallel_heads,
                     proj_acc_depth,
                     o_proj_acc_group_size,
                     nB_tiles_distributed,
-                    id=f"encoder_pipeline_{seq_len}seq_{topology_name}",
+                    id=f"encoder_pipeline_{seq_len}seq_{topology_name(topology_suffix)}",
                 )
             )
     return params
@@ -83,7 +86,7 @@ all_params = generate_test_params()
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "seq_len,d,num_heads,ffn_intermediate_size,seq_tile,kv_seq_tile,emb_tile,parallel_seq,parallel_heads,proj_acc_depth,o_proj_acc_group_size,nB_tiles_distributed",
+    "seq_len,d,num_heads,ffn_intermediate_size,seq_tile,kv_seq_tile,emb_tile,ffn_tile,parallel_seq,parallel_heads,proj_acc_depth,o_proj_acc_group_size,nB_tiles_distributed",
     all_params,
 )
 def test_encoder_pipeline(
@@ -94,6 +97,7 @@ def test_encoder_pipeline(
     seq_tile,
     kv_seq_tile,
     emb_tile,
+    ffn_tile,
     parallel_seq,
     parallel_heads,
     proj_acc_depth,
@@ -108,6 +112,7 @@ def test_encoder_pipeline(
         intermediate_size=ffn_intermediate_size,
         seq_tile=seq_tile,
         emb_tile=emb_tile,
+        ffn_tile=ffn_tile,
         parallel_seq=parallel_seq,
     )
 
@@ -118,6 +123,7 @@ def test_encoder_pipeline(
         seq_tile=seq_tile,
         kv_seq_tile=kv_seq_tile,
         emb_tile=emb_tile,
+        ffn_tile=ffn_tile,
         parallel_seq=parallel_seq,
         parallel_heads=parallel_heads,
         proj_acc_depth=proj_acc_depth,
