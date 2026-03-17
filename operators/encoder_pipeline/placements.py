@@ -36,6 +36,8 @@ O_PROJ_ACC_BY_HEAD = {
     4: (4, 5, 7, 3),
 }
 
+SCALED_SEQ_LENS = tuple(1 << exp for exp in range(6, 14))
+
 
 def _placement(
     *,
@@ -162,7 +164,7 @@ TOPOLOGY_PLACEMENTS = {
     ),
 }
 
-for seq_len in (64, 128, 256):
+for seq_len in SCALED_SEQ_LENS:
     for parallel_heads in (1, 2, 4):
         for parallel_ffn in (1, 2, 4):
             tail = LOW_HEAD_TAILS.get((parallel_heads, parallel_ffn))
@@ -197,7 +199,7 @@ for seq_len in (64, 128, 256):
                 ln2_replay=tail.get("ln2_replay", 4),
             )
 
-for seq_len in (64, 128, 256):
+for seq_len in SCALED_SEQ_LENS:
     TOPOLOGY_PLACEMENTS[
         (
             12,
@@ -264,6 +266,99 @@ for seq_len in (64, 128, 256):
             ),
             "lane_o_proj_acc_mem_cols": (2, 3),
             "lane_tail_mem_cols": (7, 6),
+            "stage_rows_per_lane": (3072 // 96) * 32,
+        },
+    )
+
+for seq_len in SCALED_SEQ_LENS:
+    if (seq_len // 32) % 4 != 0:
+        continue
+    TOPOLOGY_PLACEMENTS[
+        (
+            12,
+            seq_len,
+            64,
+            32,
+            64,
+            96,
+            4,
+            1,
+            8,
+            1,
+            1,
+            3072,
+        )
+    ] = _placement(
+        mha_cols=(0,),
+        ln1_tile=(1, 5),
+        ffn_up_by_branch=((5, 5),),
+        ffn_down_by_branch=((6, 5),),
+        ln2_tile=(7, 5),
+        o_proj_acc_by_head=O_PROJ_ACC_BY_HEAD[1],
+        ffn_down_acc_by_branch=(6,),
+        b_up_by_branch=(5,),
+        b_down_by_branch=(4,),
+        sequence_parallel={
+            "joined_q_mem_col": 0,
+            "shared_ingress_cols": {"k": 1, "v": 2, "w_o": 3},
+            "joined_or_mem_cols": {
+                "residual": 4,
+                "ln1_stage": 5,
+                "ln1_refill": 6,
+                "ffn_residual_refill": 7,
+                "output": 0,
+            },
+            "joined_or_shim_cols": {
+                "residual": 4,
+                "ln1_stage": 5,
+                "ln1_refill": 6,
+                "ffn_residual_refill": 7,
+                "output": 0,
+            },
+            "lane_tiles": (
+                {
+                    "qk": (0, 2),
+                    "softmax": (0, 3),
+                    "pv": (0, 4),
+                    "o_proj": (0, 5),
+                    "ln1": (1, 5),
+                    "ffn_up": (1, 2),
+                    "ffn_down": (1, 3),
+                    "ln2": (1, 4),
+                },
+                {
+                    "qk": (2, 2),
+                    "softmax": (2, 3),
+                    "pv": (2, 4),
+                    "o_proj": (2, 5),
+                    "ln1": (3, 5),
+                    "ffn_up": (3, 2),
+                    "ffn_down": (3, 3),
+                    "ln2": (3, 4),
+                },
+                {
+                    "qk": (4, 2),
+                    "softmax": (4, 3),
+                    "pv": (4, 4),
+                    "o_proj": (4, 5),
+                    "ln1": (5, 5),
+                    "ffn_up": (5, 2),
+                    "ffn_down": (5, 3),
+                    "ln2": (5, 4),
+                },
+                {
+                    "qk": (6, 2),
+                    "softmax": (6, 3),
+                    "pv": (6, 4),
+                    "o_proj": (6, 5),
+                    "ln1": (7, 5),
+                    "ffn_up": (7, 2),
+                    "ffn_down": (7, 3),
+                    "ln2": (7, 4),
+                },
+            ),
+            "lane_o_proj_acc_mem_cols": (1, 3, 5, 7),
+            "lane_tail_mem_cols": (1, 3, 5, 7),
             "stage_rows_per_lane": (3072 // 96) * 32,
         },
     )
