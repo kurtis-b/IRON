@@ -89,7 +89,7 @@ def generate_golden_reference(
             )
         ln1_stage_rows = seq_len
     else:
-        ln1_stage_rows = (intermediate_size // ffn_tile) * seq_tile
+        ln1_stage_rows = (embed_sz // emb_tile) * seq_tile
     or_buf = torch.cat(
         (
             torch.zeros_like(r1),
