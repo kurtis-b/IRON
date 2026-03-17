@@ -37,6 +37,7 @@ O_PROJ_ACC_BY_HEAD = {
 }
 
 SCALED_SEQ_LENS = tuple(1 << exp for exp in range(6, 14))
+FFN_TILE_SIZES = (96, 64)
 
 
 def _placement(
@@ -155,7 +156,7 @@ LOW_HEAD_TAILS = {
 
 
 TOPOLOGY_PLACEMENTS = {
-    (1, 64, 64, 32, 64, 32, 1, 1, 2, 1, 1, 96): _placement(
+    (1, 64, 64, 32, 64, 32, 32, 1, 1, 2, 1, 1, 96): _placement(
         mha_cols=(0,),
         ln1_tile=(1, 5),
         ffn_up_by_branch=((5, 5),),
@@ -169,57 +170,61 @@ TOPOLOGY_PLACEMENTS = {
 }
 
 for seq_len in SCALED_SEQ_LENS:
-    for parallel_heads in (1, 2, 4):
-        for parallel_ffn in (1, 2, 4):
-            tail = LOW_HEAD_TAILS.get((parallel_heads, parallel_ffn))
-            if tail is None:
-                continue
-            TOPOLOGY_PLACEMENTS[
-                (
-                    12,
-                    seq_len,
-                    64,
-                    32,
-                    64,
-                    96,
-                    1,
-                    parallel_heads,
-                    8,
-                    1,
-                    parallel_ffn,
-                    3072,
+    for ffn_tile in FFN_TILE_SIZES:
+        for parallel_heads in (1, 2, 4):
+            for parallel_ffn in (1, 2, 4):
+                tail = LOW_HEAD_TAILS.get((parallel_heads, parallel_ffn))
+                if tail is None:
+                    continue
+                TOPOLOGY_PLACEMENTS[
+                    (
+                        12,
+                        seq_len,
+                        64,
+                        32,
+                        64,
+                        96,
+                        ffn_tile,
+                        1,
+                        parallel_heads,
+                        8,
+                        1,
+                        parallel_ffn,
+                        3072,
+                    )
+                ] = _placement(
+                    mha_cols=tuple(range(parallel_heads)),
+                    ln1_tile=tail["ln1_tile"],
+                    ffn_up_by_branch=tail["ffn_up_by_branch"],
+                    ffn_down_by_branch=tail["ffn_down_by_branch"],
+                    ln2_tile=tail["ln2_tile"],
+                    o_proj_acc_by_head=O_PROJ_ACC_BY_HEAD[parallel_heads],
+                    ffn_down_acc_by_branch=tail["ffn_down_acc_by_branch"],
+                    b_up_by_branch=tail["b_up_by_branch"],
+                    b_down_by_branch=tail["b_down_by_branch"],
+                    ln1_replay=tail.get("ln1_replay", 5),
+                    ln2_replay=tail.get("ln2_replay", 4),
                 )
-            ] = _placement(
-                mha_cols=tuple(range(parallel_heads)),
-                ln1_tile=tail["ln1_tile"],
-                ffn_up_by_branch=tail["ffn_up_by_branch"],
-                ffn_down_by_branch=tail["ffn_down_by_branch"],
-                ln2_tile=tail["ln2_tile"],
-                o_proj_acc_by_head=O_PROJ_ACC_BY_HEAD[parallel_heads],
-                ffn_down_acc_by_branch=tail["ffn_down_acc_by_branch"],
-                b_up_by_branch=tail["b_up_by_branch"],
-                b_down_by_branch=tail["b_down_by_branch"],
-                ln1_replay=tail.get("ln1_replay", 5),
-                ln2_replay=tail.get("ln2_replay", 4),
-            )
 
 for seq_len in SCALED_SEQ_LENS:
-    TOPOLOGY_PLACEMENTS[
-        (
-            12,
-            seq_len,
-            64,
-            32,
-            64,
-            96,
-            2,
-            1,
-            8,
-            1,
-            1,
-            3072,
-        )
-    ] = _placement(
+    for ffn_tile in FFN_TILE_SIZES:
+        TOPOLOGY_PLACEMENTS[
+            (
+                12,
+                seq_len,
+                64,
+                32,
+                64,
+                96,
+                ffn_tile,
+                2,
+                1,
+                8,
+                1,
+                1,
+                3072,
+            )
+        ] = _placement(
         mha_cols=(0,),
         ln1_tile=(1, 5),
         ffn_up_by_branch=((5, 5),),
@@ -270,29 +275,31 @@ for seq_len in SCALED_SEQ_LENS:
             ),
             "lane_o_proj_acc_mem_cols": (2, 3),
             "lane_tail_mem_cols": (7, 6),
-            "stage_rows_per_lane": (3072 // 96) * 32,
+            "stage_rows_per_lane": (3072 // ffn_tile) * 32,
         },
-    )
+        )
 
 for seq_len in SCALED_SEQ_LENS:
     if (seq_len // 32) % 4 != 0:
         continue
-    TOPOLOGY_PLACEMENTS[
-        (
-            12,
-            seq_len,
-            64,
-            32,
-            64,
-            96,
-            4,
-            1,
-            8,
-            1,
-            1,
-            3072,
-        )
-    ] = _placement(
+    for ffn_tile in FFN_TILE_SIZES:
+        TOPOLOGY_PLACEMENTS[
+            (
+                12,
+                seq_len,
+                64,
+                32,
+                64,
+                96,
+                ffn_tile,
+                4,
+                1,
+                8,
+                1,
+                1,
+                3072,
+            )
+        ] = _placement(
         mha_cols=(0,),
         ln1_tile=(1, 5),
         ffn_up_by_branch=((5, 5),),
@@ -427,9 +434,9 @@ for seq_len in SCALED_SEQ_LENS:
                     "weight_mem_cols": {"b_up": 7, "b_down": 6},
                 },
             ),
-            "stage_rows_per_lane": (3072 // 96) * 32,
+            "stage_rows_per_lane": (3072 // ffn_tile) * 32,
         },
-    )
+        )
 
 
 SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES = frozenset(

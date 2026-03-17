@@ -25,6 +25,7 @@ def generate_golden_reference(
     intermediate_size: int | None = None,
     seq_tile: int = 32,
     emb_tile: int = 96,
+    ffn_tile: int | None = None,
     parallel_seq: int = 1,
     seed: int = 42,
 ):
@@ -39,6 +40,8 @@ def generate_golden_reference(
 
     embed_sz = heads * d
     intermediate_size = 4 * embed_sz if intermediate_size is None else intermediate_size
+    if ffn_tile is None:
+        ffn_tile = emb_tile
     dtype = torch.bfloat16
     val_range = 4
 
@@ -86,7 +89,7 @@ def generate_golden_reference(
             )
         ln1_stage_rows = seq_len
     else:
-        ln1_stage_rows = (intermediate_size // emb_tile) * seq_tile
+        ln1_stage_rows = (intermediate_size // ffn_tile) * seq_tile
     or_buf = torch.cat(
         (
             torch.zeros_like(r1),

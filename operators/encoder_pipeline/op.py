@@ -37,6 +37,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         seq_tile: int = 32,
         kv_seq_tile: int = 64,
         emb_tile: int = 96,
+        ffn_tile: int | None = None,
         parallel_seq: int = 1,
         parallel_heads: int = 1,
         proj_acc_depth: int = 1,
@@ -56,6 +57,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.seq_tile = seq_tile
         self.kv_seq_tile = kv_seq_tile
         self.emb_tile = emb_tile
+        self.ffn_tile = emb_tile if ffn_tile is None else ffn_tile
         self.parallel_seq = parallel_seq
         self.parallel_heads = parallel_heads
         self.proj_acc_depth = proj_acc_depth
@@ -119,6 +121,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
             self.seq_tile,
             self.kv_seq_tile,
             self.emb_tile,
+            self.ffn_tile,
             self.parallel_seq,
             self.parallel_heads,
             self.proj_acc_depth,
@@ -163,10 +166,15 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "encoder_pipeline requires emb_tile * proj_acc_depth == embed_sz "
                 f"({self.emb_tile} * {self.proj_acc_depth} != {self.embed_sz})"
             )
-        if self.ffn_intermediate_size % self.emb_tile != 0:
+        if self.ffn_tile % 16 != 0:
             raise AIEOperatorConstraintError(
-                "encoder_pipeline requires ffn_intermediate_size divisible by emb_tile "
-                f"({self.ffn_intermediate_size} % {self.emb_tile} != 0)"
+                "encoder_pipeline requires ffn_tile divisible by 16 "
+                f"({self.ffn_tile} % 16 != 0)"
+            )
+        if self.ffn_intermediate_size % self.ffn_tile != 0:
+            raise AIEOperatorConstraintError(
+                "encoder_pipeline requires ffn_intermediate_size divisible by ffn_tile "
+                f"({self.ffn_intermediate_size} % {self.ffn_tile} != 0)"
             )
         if self.o_proj_acc_group_size <= 0:
             raise AIEOperatorConstraintError(
@@ -192,6 +200,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
                     self.seq_tile,
                     self.kv_seq_tile,
                     self.emb_tile,
+                    self.ffn_tile,
                     self.parallel_seq,
                     self.parallel_heads,
                     self.proj_acc_depth,
@@ -204,6 +213,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         digest = hashlib.blake2s(identity.encode(), digest_size=6).hexdigest()
         return (
             f"{prefix}_{self.num_heads}h_{self.seq_len}s_{self.emb_tile}e_"
+            f"{self.ffn_tile}f_"
             f"{self.parallel_seq}ps_{self.parallel_heads}ph_{self.proj_acc_depth}pa_"
             f"{self.o_proj_acc_group_size}g_{self.nB_tiles_distributed}pf_{digest}"
         )
@@ -285,7 +295,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
             "-DBUILD_ADDNORM",
             f"-DDIM_M={self.seq_tile}",
             f"-DDIM_K={self.emb_tile}",
-            f"-DDIM_N={self.emb_tile}",
+            f"-DDIM_N={self.ffn_tile}",
         ]
 
         kernel_archive = f"{file_name_base}_kernels.a"
@@ -305,6 +315,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "seq_tile": self.seq_tile,
                 "kv_seq_tile": self.kv_seq_tile,
                 "emb_tile": self.emb_tile,
+                "ffn_tile": self.ffn_tile,
                 "parallel_seq": self.parallel_seq,
                 "parallel_heads": self.parallel_heads,
                 "proj_acc_depth": self.proj_acc_depth,
@@ -384,7 +395,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
                             },
                         ),
                         KernelObjectArtifact.new(
-                            f"{prefix}_encoder_{self.seq_tile}x{self.emb_tile}.o",
+                            f"{prefix}_encoder_{self.seq_tile}x{self.emb_tile}x{self.ffn_tile}.o",
                             depends=[SourceArtifact.new(encoder_source)],
                             extra_flags=encoder_kernel_flags,
                         ),
@@ -431,7 +442,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         else:
             ln1_stage_rows = (
                 self.parallel_seq
-                * (self.ffn_intermediate_size // self.emb_tile)
+                * (self.ffn_intermediate_size // self.ffn_tile)
                 * self.seq_tile
             )
         return (2 * self.seq_len + ln1_stage_rows, self.embed_sz)
@@ -599,16 +610,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
             r_np = np.zeros((self.seq_len, self.embed_sz), dtype=bfloat16)
         or_np = np.concatenate((np.zeros_like(r_np), r_np), axis=0)
 
-        ln1_stage_rows = (
-            (self.seq_len // self.seq_tile // self.parallel_seq)
-            * self.parallel_seq
-            * (self.ffn_intermediate_size // self.emb_tile)
-            * self.seq_tile
-            if self._use_seqpar_phase_split()
-            else self.parallel_seq
-            * (self.ffn_intermediate_size // self.emb_tile)
-            * self.seq_tile
-        )
+        ln1_stage_rows = self._or_buffer_shape()[0] - 2 * self.seq_len
         if ln1_stage_rows > 0:
             or_np = np.concatenate(
                 (
