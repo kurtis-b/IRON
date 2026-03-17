@@ -35,6 +35,7 @@ def main():
     argparser.add_argument("--seq-tile", type=int, default=32)
     argparser.add_argument("--kv-seq-tile", type=int, default=64)
     argparser.add_argument("--emb-tile", type=int, default=96)
+    argparser.add_argument("--ffn-tile", type=int, default=None)
     argparser.add_argument("--proj-acc-depth", type=int, default=8)
     argparser.add_argument("--parallel-seq", type=int, default=1)
     argparser.add_argument("--parallel-heads", type=int, default=1)
@@ -65,6 +66,7 @@ def main():
         seq_tile=args.seq_tile,
         kv_seq_tile=args.kv_seq_tile,
         emb_tile=args.emb_tile,
+        ffn_tile=args.ffn_tile,
         proj_acc_depth=args.proj_acc_depth,
         parallel_heads=args.parallel_heads,
         emulate_bf16_mmul_with_bfp16=True,
@@ -91,6 +93,7 @@ def encoder_pipeline(
     seq_tile: int,
     kv_seq_tile: int,
     emb_tile: int,
+    ffn_tile: int | None,
     proj_acc_depth: int,
     parallel_heads: int,
     emulate_bf16_mmul_with_bfp16: bool,
@@ -106,6 +109,8 @@ def encoder_pipeline(
 ):
     if ffn_intermediate_size is None:
         ffn_intermediate_size = 4 * heads * d
+    if ffn_tile is None:
+        ffn_tile = emb_tile
 
     topology_key = (
         heads,
@@ -114,6 +119,7 @@ def encoder_pipeline(
         seq_tile,
         kv_seq_tile,
         emb_tile,
+        ffn_tile,
         parallel_seq,
         parallel_heads,
         proj_acc_depth,
@@ -175,10 +181,14 @@ def encoder_pipeline(
             "emb_tile * proj_acc_depth must equal embed_sz "
             f"({emb_tile} * {proj_acc_depth} != {embed_sz})"
         )
-    if ffn_intermediate_size % emb_tile != 0:
+    if ffn_tile % 16 != 0:
         raise ValueError(
-            "ffn_intermediate_size must be divisible by emb_tile "
-            f"({ffn_intermediate_size} % {emb_tile} != 0)"
+            f"ffn_tile must be divisible by 16 ({ffn_tile} % 16 != 0)"
+        )
+    if ffn_intermediate_size % ffn_tile != 0:
+        raise ValueError(
+            "ffn_intermediate_size must be divisible by ffn_tile "
+            f"({ffn_intermediate_size} % {ffn_tile} != 0)"
         )
     if len(placement["mha_cols"]) != parallel_heads:
         raise ValueError(
@@ -189,7 +199,8 @@ def encoder_pipeline(
     dtype = bfloat16
     inv_scale = (1 / np.sqrt(d)) * 1.4453125
     of_depth = 2
-    ln1_broadcast_groups = ffn_intermediate_size // emb_tile
+    weight_forward_depth = 2 if ffn_tile <= 64 else 1
+    ln1_broadcast_groups = ffn_intermediate_size // ffn_tile
     effective_ffn_branches = len(placement["tail_tiles"]["ffn_up_by_branch"])
     if effective_ffn_branches != nB_tiles_distributed:
         raise ValueError(
@@ -342,7 +353,9 @@ def encoder_pipeline(
     s_ty = np.ndarray[(4 * seq_tile,), np.dtype[dtype]]
     wo_ty = np.ndarray[(d, emb_tile), np.dtype[dtype]]
     o_ty = np.ndarray[(seq_tile, emb_tile), np.dtype[dtype]]
-    ffn_b_ty = np.ndarray[(emb_tile, emb_tile), np.dtype[dtype]]
+    ffn_up_ty = np.ndarray[(seq_tile, ffn_tile), np.dtype[dtype]]
+    ffn_b_up_ty = np.ndarray[(emb_tile, ffn_tile), np.dtype[dtype]]
+    ffn_b_down_ty = np.ndarray[(ffn_tile, emb_tile), np.dtype[dtype]]
     ln_weights_ty = np.ndarray[(embed_sz,), np.dtype[dtype]]
     sum_l1_ty = np.ndarray[(seq_tile,), np.dtype[np.float32]]
 
@@ -426,31 +439,35 @@ def encoder_pipeline(
         kernel_archive,
         [o_ty, o_ty, ln_weights_ty, sum_l1_ty, sum_l1_ty, o_ty, np.int32, np.int32],
     )
-    ffn_zero_kernel_up_proj = Kernel("ffn_zero_bf16_up_proj", kernel_archive, [o_ty])
+    ffn_zero_kernel_up_proj = Kernel(
+        "ffn_zero_bf16_up_proj", kernel_archive, [ffn_up_ty]
+    )
     ffn_zero_kernel_down_proj = Kernel(
         "ffn_zero_bf16_down_proj", kernel_archive, [o_ty]
     )
     ffn_matmul_init_kernel_up_proj = Kernel(
         "ffn_matmul_init_bf16_bf16_up_proj",
         kernel_archive,
-        [o_ty, ffn_b_ty, o_ty],
+        [o_ty, ffn_b_up_ty, ffn_up_ty],
     )
     ffn_matmul_kernel_up_proj = Kernel(
         "ffn_matmul_bf16_bf16_up_proj",
         kernel_archive,
-        [o_ty, ffn_b_ty, o_ty],
+        [o_ty, ffn_b_up_ty, ffn_up_ty],
     )
     ffn_matmul_init_kernel_down_proj = Kernel(
         "ffn_matmul_init_bf16_bf16_down_proj",
         kernel_archive,
-        [o_ty, ffn_b_ty, o_ty],
+        [ffn_up_ty, ffn_b_down_ty, o_ty],
     )
     ffn_matmul_kernel_down_proj = Kernel(
         "ffn_matmul_with_acc_bf16_bf16_down_proj",
         kernel_archive,
-        [o_ty, ffn_b_ty, o_ty, o_ty],
+        [ffn_up_ty, ffn_b_down_ty, o_ty, o_ty],
     )
-    ffn_gelu_kernel = Kernel("ffn_gelu_bf16", kernel_archive, [o_ty, o_ty, np.int32])
+    ffn_gelu_kernel = Kernel(
+        "ffn_gelu_bf16", kernel_archive, [ffn_up_ty, ffn_up_ty, np.int32]
+    )
 
     q_dims = [(seq_tile // 8, 8 * d), (d // 8, 8), (8, d), (8, 1)]
     k_dims = [(kv_seq_tile // 8, 8 * d), (d // 8, 8), (8, d), (8, 1)]
@@ -467,7 +484,18 @@ def encoder_pipeline(
     a_dims_in = [(kv_seq_tile // 8, 8), (seq_tile, kv_seq_tile), (8, 1)]
     p_dims_out = [(kv_seq_tile // 8, 8), (seq_tile, kv_seq_tile), (8, 1)]
     p_dims_in = [(kv_seq_tile // 8, 8 * 8), (seq_tile // 8, kv_seq_tile * 8), (64, 1)]
-    b_dims = [(emb_tile // 8, 8 * emb_tile), (emb_tile // 8, 8), (8, emb_tile), (8, 1)]
+    b_up_dims = [
+        (emb_tile // 8, 8 * ffn_tile),
+        (ffn_tile // 8, 8),
+        (8, ffn_tile),
+        (8, 1),
+    ]
+    b_down_dims = [
+        (ffn_tile // 8, 8 * emb_tile),
+        (emb_tile // 8, 8),
+        (8, emb_tile),
+        (8, 1),
+    ]
 
     inQ = ObjectFifo(q_stream_ty, name="inQ", depth=of_depth)
     memQ = inQ.cons().split(
@@ -597,7 +625,7 @@ def encoder_pipeline(
     for branch_idx in range(effective_ffn_branches):
         inBUp.append(
             ObjectFifo(
-                ffn_b_ty,
+                ffn_b_up_ty,
                 name="inBUp" if branch_idx == 0 else f"inBUp{branch_idx}",
                 depth=1,
             )
@@ -606,10 +634,10 @@ def encoder_pipeline(
             inBUp[branch_idx]
             .cons()
             .forward(
-                obj_type=ffn_b_ty,
+                obj_type=ffn_b_up_ty,
                 name="memBUp" if branch_idx == 0 else f"memBUp{branch_idx}",
-                dims_to_stream=b_dims,
-                depth=1,
+                dims_to_stream=b_up_dims,
+                depth=weight_forward_depth,
                 placement=Tile(
                     col=weight_mem_tiles["b_up_by_branch"][branch_idx],
                     row=1,
@@ -618,7 +646,7 @@ def encoder_pipeline(
         )
         inBDown.append(
             ObjectFifo(
-                ffn_b_ty,
+                ffn_b_down_ty,
                 name="inBDown" if branch_idx == 0 else f"inBDown{branch_idx}",
                 depth=1,
             )
@@ -627,10 +655,10 @@ def encoder_pipeline(
             inBDown[branch_idx]
             .cons()
             .forward(
-                obj_type=ffn_b_ty,
+                obj_type=ffn_b_down_ty,
                 name="memBDown" if branch_idx == 0 else f"memBDown{branch_idx}",
-                dims_to_stream=b_dims,
-                depth=1,
+                dims_to_stream=b_down_dims,
+                depth=weight_forward_depth,
                 placement=Tile(
                     col=weight_mem_tiles["b_down_by_branch"][branch_idx],
                     row=1,
@@ -639,7 +667,7 @@ def encoder_pipeline(
         )
         ffnUpOut.append(
             ObjectFifo(
-                o_ty,
+                ffn_up_ty,
                 name="ffnUpOut" if branch_idx == 0 else f"ffnUpOut{branch_idx}",
                 depth=2,
             )
@@ -1106,7 +1134,7 @@ def encoder_pipeline(
                         matmul(elem_in_a, elem_in_b, elem_out)
                     of_in_b.release(1)
                     of_in_a.release(1)
-                gelu(elem_out, elem_out, seq_tile * emb_tile)
+                gelu(elem_out, elem_out, seq_tile * ffn_tile)
                 of_out_c.release(1)
 
     def core_fn_ffn_down_proj(
@@ -1411,10 +1439,6 @@ def encoder_pipeline(
         group_inLNSeq = []
         group_ffnRFromDDRSeq = []
         group_memLN2Joined = []
-        # Seq-par weight forwards are already lane-group shared; keeping them
-        # single-buffered avoids spilling the tail tiles over local memory.
-        weight_forward_depth = 1
-
         memQ_by_lane = [None] * parallel_seq
         lane_in_r = [None] * parallel_seq
         lane_ln1_stage_out = [None] * parallel_seq
@@ -1491,12 +1515,12 @@ def encoder_pipeline(
         unified_memBUpSeq = None
         if "b_up" in unified_shared_streams:
             b_up_cfg = unified_shared_streams["b_up"]
-            unified_inBUpSeq = ObjectFifo(ffn_b_ty, name="inBUpAll", depth=1)
+            unified_inBUpSeq = ObjectFifo(ffn_b_up_ty, name="inBUpAll", depth=1)
             unified_memBUpSeq = unified_inBUpSeq.cons().forward(
-                obj_type=ffn_b_ty,
+                obj_type=ffn_b_up_ty,
                 name="memBUpSeqAll",
-                dims_to_stream=b_dims,
-                depth=max(1, parallel_seq),
+                dims_to_stream=b_up_dims,
+                depth=weight_forward_depth,
                 placement=Tile(col=b_up_cfg["mem_col"], row=1),
             )
 
@@ -1564,12 +1588,14 @@ def encoder_pipeline(
                 group_memOWSeq.append(unified_memOWSeq)
 
             if unified_memBUpSeq is None:
-                inBUpSeq = ObjectFifo(ffn_b_ty, name=f"inBUpSeq{suffix}", depth=1)
+                inBUpSeq = ObjectFifo(
+                    ffn_b_up_ty, name=f"inBUpSeq{suffix}", depth=1
+                )
                 group_inBUpSeq.append(inBUpSeq)
                 memBUpSeq = inBUpSeq.cons().forward(
-                    obj_type=ffn_b_ty,
+                    obj_type=ffn_b_up_ty,
                     name=f"memBUpSeq{suffix}",
-                    dims_to_stream=b_dims,
+                    dims_to_stream=b_up_dims,
                     depth=weight_forward_depth,
                     placement=Tile(
                         col=transport_group["weight_mem_cols"]["b_up"], row=1
@@ -1580,12 +1606,14 @@ def encoder_pipeline(
                 group_inBUpSeq.append(None)
                 group_memBUpSeq.append(unified_memBUpSeq)
 
-            inBDownSeq = ObjectFifo(ffn_b_ty, name=f"inBDownSeq{suffix}", depth=1)
+            inBDownSeq = ObjectFifo(
+                ffn_b_down_ty, name=f"inBDownSeq{suffix}", depth=1
+            )
             group_inBDownSeq.append(inBDownSeq)
             memBDownSeq = inBDownSeq.cons().forward(
-                obj_type=ffn_b_ty,
+                obj_type=ffn_b_down_ty,
                 name=f"memBDownSeq{suffix}",
-                dims_to_stream=b_dims,
+                dims_to_stream=b_down_dims,
                 depth=weight_forward_depth,
                 placement=Tile(col=transport_group["weight_mem_cols"]["b_down"], row=1),
             )
@@ -1727,7 +1755,7 @@ def encoder_pipeline(
                 )
             )
             lane_ffn_up_out.append(
-                ObjectFifo(o_ty, name=f"ffnUpOutSeqL{lane_idx}", depth=2)
+                ObjectFifo(ffn_up_ty, name=f"ffnUpOutSeqL{lane_idx}", depth=2)
             )
             lane_ffn_down_part.append(
                 ObjectFifo(o_ty, name=f"ffnDownPartSeqL{lane_idx}", depth=1)
@@ -2117,9 +2145,9 @@ def encoder_pipeline(
                 TensorAccessPattern(
                     (embed_sz, ffn_intermediate_size),
                     offset=0,
-                    sizes=[ffn_col_group_count, proj_acc_depth, emb_tile, emb_tile],
+                    sizes=[ffn_col_group_count, proj_acc_depth, emb_tile, ffn_tile],
                     strides=[
-                        emb_tile,
+                        ffn_tile,
                         emb_tile * ffn_intermediate_size,
                         ffn_intermediate_size,
                         1,
@@ -2132,8 +2160,8 @@ def encoder_pipeline(
                 TensorAccessPattern(
                     (ffn_intermediate_size, embed_sz),
                     offset=0,
-                    sizes=[ffn_col_group_count, proj_acc_depth, emb_tile, emb_tile],
-                    strides=[emb_tile * embed_sz, emb_tile, embed_sz, 1],
+                    sizes=[ffn_col_group_count, proj_acc_depth, ffn_tile, emb_tile],
+                    strides=[ffn_tile * embed_sz, emb_tile, embed_sz, 1],
                 )
             ]
         )
@@ -3100,10 +3128,10 @@ def encoder_pipeline(
         [
             TensorAccessPattern(
                 (embed_sz, ffn_intermediate_size),
-                offset=branch_idx * ffn_col_group_count * emb_tile,
-                sizes=[ffn_col_group_count, proj_acc_depth, emb_tile, emb_tile],
+                offset=branch_idx * ffn_col_group_count * ffn_tile,
+                sizes=[ffn_col_group_count, proj_acc_depth, emb_tile, ffn_tile],
                 strides=[
-                    emb_tile,
+                    ffn_tile,
                     emb_tile * ffn_intermediate_size,
                     ffn_intermediate_size,
                     1,
@@ -3116,9 +3144,9 @@ def encoder_pipeline(
         [
             TensorAccessPattern(
                 (ffn_intermediate_size, embed_sz),
-                offset=branch_idx * ffn_col_group_count * emb_tile * embed_sz,
-                sizes=[ffn_col_group_count, proj_acc_depth, emb_tile, emb_tile],
-                strides=[emb_tile * embed_sz, emb_tile, embed_sz, 1],
+                offset=branch_idx * ffn_col_group_count * ffn_tile * embed_sz,
+                sizes=[ffn_col_group_count, proj_acc_depth, ffn_tile, emb_tile],
+                strides=[ffn_tile * embed_sz, emb_tile, embed_sz, 1],
             )
             for branch_idx in range(effective_ffn_branches)
         ]
@@ -3207,13 +3235,13 @@ def encoder_pipeline(
         ),
         (
             B_Up_tiles,
-            (emb_tile, emb_tile),
+            (emb_tile, ffn_tile),
             ffn_col_group_count * proj_acc_depth,
             "B_Up tap count does not match FFN loop count",
         ),
         (
             B_Down_tiles,
-            (emb_tile, emb_tile),
+            (ffn_tile, emb_tile),
             ffn_col_group_count * proj_acc_depth,
             "B_Down tap count does not match FFN loop count",
         ),
