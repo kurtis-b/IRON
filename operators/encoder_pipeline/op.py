@@ -209,7 +209,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         )
 
     def _use_seqpar_phase_split(self) -> bool:
-        return self.parallel_seq > 1
+        return self.parallel_seq > 4
 
     def get_artifacts(self, prefix: str = "encoder_pipeline", phase: str = "all"):
         operator_dir = Path(__file__).parent
@@ -426,16 +426,14 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def _or_buffer_shape(self):
-        ln1_stage_rows = (
-            (self.seq_len // self.seq_tile // self.parallel_seq)
-            * self.parallel_seq
-            * (self.ffn_intermediate_size // self.emb_tile)
-            * self.seq_tile
-            if self._use_seqpar_phase_split()
-            else self.parallel_seq
-            * (self.ffn_intermediate_size // self.emb_tile)
-            * self.seq_tile
-        )
+        if self.parallel_seq > 1:
+            ln1_stage_rows = self.seq_len
+        else:
+            ln1_stage_rows = (
+                self.parallel_seq
+                * (self.ffn_intermediate_size // self.emb_tile)
+                * self.seq_tile
+            )
         return (2 * self.seq_len + ln1_stage_rows, self.embed_sz)
 
     def set_up_runtime(self):
