@@ -427,7 +427,12 @@ class AIEEncoderPipeline(AIEOperatorBase):
 
     def _or_buffer_shape(self):
         ln1_stage_rows = (
-            self.parallel_seq
+            (self.seq_len // self.seq_tile // self.parallel_seq)
+            * self.parallel_seq
+            * (self.ffn_intermediate_size // self.emb_tile)
+            * self.seq_tile
+            if self._use_seqpar_phase_split()
+            else self.parallel_seq
             * (self.ffn_intermediate_size // self.emb_tile)
             * self.seq_tile
         )
@@ -597,7 +602,12 @@ class AIEEncoderPipeline(AIEOperatorBase):
         or_np = np.concatenate((np.zeros_like(r_np), r_np), axis=0)
 
         ln1_stage_rows = (
-            self.parallel_seq
+            (self.seq_len // self.seq_tile // self.parallel_seq)
+            * self.parallel_seq
+            * (self.ffn_intermediate_size // self.emb_tile)
+            * self.seq_tile
+            if self._use_seqpar_phase_split()
+            else self.parallel_seq
             * (self.ffn_intermediate_size // self.emb_tile)
             * self.seq_tile
         )

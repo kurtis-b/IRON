@@ -214,7 +214,7 @@ def encoder_pipeline(
     ffn_col_group_count = ln1_broadcast_groups // effective_ffn_branches
     ln_tiles_per_q_block = proj_acc_depth
     ln1_dram_stage_rows = (
-        parallel_seq * sequence_parallel["stage_rows_per_lane"]
+        q_blocks_per_lane * parallel_seq * sequence_parallel["stage_rows_per_lane"]
         if sequence_parallel is not None
         else ln1_broadcast_groups * seq_tile
     )
@@ -1584,33 +1584,54 @@ def encoder_pipeline(
         )
 
         joined_stage_offset = 2 * seq_len * embed_sz
-        joined_stage_tap = TensorAccessPattern(
-            or_tensor_shape,
-            offset=joined_stage_offset,
-            sizes=[
-                ln1_broadcast_groups,
-                proj_acc_depth,
-                parallel_seq * seq_tile,
-                emb_tile,
-            ],
-            strides=[0, emb_tile, embed_sz, 1],
+        joined_stage_rows_per_batch = (
+            parallel_seq * sequence_parallel["stage_rows_per_lane"]
         )
-        joined_refill_tap = TensorAccessPattern(
-            or_tensor_shape,
-            offset=joined_stage_offset,
-            sizes=[
-                ffn_col_group_count,
-                proj_acc_depth,
-                parallel_seq * seq_tile,
-                emb_tile,
-            ],
-            strides=[0, emb_tile, embed_sz, 1],
+        joined_stage_taps = TensorAccessSequence.from_taps(
+            [
+                TensorAccessPattern(
+                    or_tensor_shape,
+                    offset=joined_stage_offset
+                    + lane_batch_idx * joined_stage_rows_per_batch * embed_sz,
+                    sizes=[
+                        ln1_broadcast_groups,
+                        proj_acc_depth,
+                        parallel_seq * seq_tile,
+                        emb_tile,
+                    ],
+                    strides=[0, emb_tile, embed_sz, 1],
+                )
+                for lane_batch_idx in range(q_blocks_per_lane)
+            ]
         )
-        joined_residual_stage_tap = TensorAccessPattern(
-            or_tensor_shape,
-            offset=joined_stage_offset,
-            sizes=[1, proj_acc_depth, parallel_seq * seq_tile, emb_tile],
-            strides=[0, emb_tile, embed_sz, 1],
+        joined_refill_taps = TensorAccessSequence.from_taps(
+            [
+                TensorAccessPattern(
+                    or_tensor_shape,
+                    offset=joined_stage_offset
+                    + lane_batch_idx * joined_stage_rows_per_batch * embed_sz,
+                    sizes=[
+                        ffn_col_group_count,
+                        proj_acc_depth,
+                        parallel_seq * seq_tile,
+                        emb_tile,
+                    ],
+                    strides=[0, emb_tile, embed_sz, 1],
+                )
+                for lane_batch_idx in range(q_blocks_per_lane)
+            ]
+        )
+        joined_residual_stage_taps = TensorAccessSequence.from_taps(
+            [
+                TensorAccessPattern(
+                    or_tensor_shape,
+                    offset=joined_stage_offset
+                    + lane_batch_idx * joined_stage_rows_per_batch * embed_sz,
+                    sizes=[1, proj_acc_depth, parallel_seq * seq_tile, emb_tile],
+                    strides=[0, emb_tile, embed_sz, 1],
+                )
+                for lane_batch_idx in range(q_blocks_per_lane)
+            ]
         )
 
         def legalize_tap(tap: TensorAccessPattern, max_dim_size: int):
@@ -1656,8 +1677,8 @@ def encoder_pipeline(
             b_down_tiles,
         ):
             legalize_tas(tas)
-        for tap in (joined_stage_tap, joined_refill_tap, joined_residual_stage_tap):
-            legalize_tap(tap, 1023)
+        for tas in (joined_stage_taps, joined_refill_taps, joined_residual_stage_taps):
+            legalize_tas(tas)
 
         if (
             math.prod(int(s) for s in q_batch_tiles[0].sizes)
@@ -1692,6 +1713,24 @@ def encoder_pipeline(
             != proj_acc_depth
         ):
             raise ValueError("Sequence-parallel output tap count mismatch")
+        if (
+            math.prod(int(s) for s in joined_stage_taps[0].sizes)
+            // math.prod((parallel_seq * seq_tile, emb_tile))
+            != ln1_broadcast_groups * proj_acc_depth
+        ):
+            raise ValueError("Sequence-parallel LN1 stage tap count mismatch")
+        if (
+            math.prod(int(s) for s in joined_refill_taps[0].sizes)
+            // math.prod((parallel_seq * seq_tile, emb_tile))
+            != ffn_col_group_count * proj_acc_depth
+        ):
+            raise ValueError("Sequence-parallel LN1 refill tap count mismatch")
+        if (
+            math.prod(int(s) for s in joined_residual_stage_taps[0].sizes)
+            // math.prod((parallel_seq * seq_tile, emb_tile))
+            != proj_acc_depth
+        ):
+            raise ValueError("Sequence-parallel residual stage tap count mismatch")
 
         rt = Runtime()
         if phase == "front":
@@ -1758,7 +1797,7 @@ def encoder_pipeline(
                     rt.drain(
                         ln1StageJoined.cons(),
                         OR,
-                        tap=joined_stage_tap,
+                        tap=joined_stage_taps[lane_batch_idx],
                         placement=Tile(col=joined_or_shim_cols["ln1_stage"], row=0),
                         task_group=tg_ln1_drain,
                         wait=True,
@@ -1777,7 +1816,7 @@ def encoder_pipeline(
                     rt.fill(
                         inLNSeq.prod(),
                         OR,
-                        tap=joined_refill_tap,
+                        tap=joined_refill_taps[lane_batch_idx],
                         placement=Tile(col=joined_or_shim_cols["ln1_refill"], row=0),
                         task_group=tg_tail,
                         wait=True,
@@ -1785,7 +1824,7 @@ def encoder_pipeline(
                     rt.fill(
                         ffnRFromDDRSeq.prod(),
                         OR,
-                        tap=joined_residual_stage_tap,
+                        tap=joined_residual_stage_taps[lane_batch_idx],
                         placement=Tile(
                             col=joined_or_shim_cols["ffn_residual_refill"], row=0
                         ),
@@ -1890,7 +1929,7 @@ def encoder_pipeline(
                     rt.drain(
                         ln1StageJoined.cons(),
                         OR,
-                        tap=joined_stage_tap,
+                        tap=joined_stage_taps[lane_batch_idx],
                         placement=Tile(col=joined_or_shim_cols["ln1_stage"], row=0),
                         task_group=tg_ln1_drain,
                         wait=True,
@@ -1901,7 +1940,7 @@ def encoder_pipeline(
                     rt.fill(
                         inLNSeq.prod(),
                         OR,
-                        tap=joined_refill_tap,
+                        tap=joined_refill_taps[lane_batch_idx],
                         placement=Tile(col=joined_or_shim_cols["ln1_refill"], row=0),
                         task_group=tg_tail,
                         wait=True,
@@ -1909,7 +1948,7 @@ def encoder_pipeline(
                     rt.fill(
                         ffnRFromDDRSeq.prod(),
                         OR,
-                        tap=joined_residual_stage_tap,
+                        tap=joined_residual_stage_taps[lane_batch_idx],
                         placement=Tile(
                             col=joined_or_shim_cols["ffn_residual_refill"], row=0
                         ),
