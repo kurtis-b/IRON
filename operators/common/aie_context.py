@@ -194,6 +194,12 @@ class AIEContext:
                 str(first_xclbin.path), first_xclbin_kernel_name
             )
             if self.use_runlist:
+                if any(
+                    op.xrt_kernels[kernel_name][0] != context
+                    for (kernel_name, *_) in op.runlist
+                ):
+                    op.xrt_runlist = None
+                    continue
                 op.xrt_runlist = pyxrt.runlist(context)
                 for i, (kernel_name, *buffer_args) in enumerate(op.runlist):
                     this_context, xrt_kernel, insts_bo, insts_len = op.xrt_kernels[
