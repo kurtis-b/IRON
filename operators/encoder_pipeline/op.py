@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,7 @@ from operators.common import (
     SourceArtifact,
     XclbinArtifact,
 )
+from operators.common.aie_device_manager import pyxrt
 from operators.common.utils import numpy_to_torch, torch_to_numpy
 from operators.encoder_pipeline.placements import SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES
 
@@ -100,6 +102,10 @@ class AIEEncoderPipeline(AIEOperatorBase):
 
         self.xclbin_artifact = None
         self.insts_artifact = None
+        self.front_xclbin_artifact = None
+        self.front_insts_artifact = None
+        self.tail_xclbin_artifact = None
+        self.tail_insts_artifact = None
 
         AIEOperatorBase.__init__(
             self, context=context, skip_add_to_list=skip_add_to_list
@@ -127,11 +133,6 @@ class AIEEncoderPipeline(AIEOperatorBase):
         if self.parallel_seq <= 0:
             raise AIEOperatorConstraintError(
                 f"encoder_pipeline requires parallel_seq > 0 (got {self.parallel_seq})"
-            )
-        if self.parallel_seq != 1:
-            raise AIEOperatorConstraintError(
-                "encoder_pipeline currently supports only the non-sequence-parallel "
-                f"public path (parallel_seq=1, got {self.parallel_seq})"
             )
         if self.parallel_heads <= 0:
             raise AIEOperatorConstraintError(
@@ -207,7 +208,10 @@ class AIEEncoderPipeline(AIEOperatorBase):
             f"{self.o_proj_acc_group_size}g_{self.nB_tiles_distributed}pf_{digest}"
         )
 
-    def get_artifacts(self, prefix: str = "encoder_pipeline"):
+    def _use_seqpar_phase_split(self) -> bool:
+        return self.parallel_seq > 1
+
+    def get_artifacts(self, prefix: str = "encoder_pipeline", phase: str = "all"):
         operator_dir = Path(__file__).parent
         file_name_base = self._artifact_stem(prefix)
 
@@ -292,6 +296,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
             tracked_paths=[
                 operator_dir / "design.py",
                 operator_dir / "op.py",
+                operator_dir / "placements.py",
             ],
             callback_kwargs={
                 "heads": self.num_heads,
@@ -311,6 +316,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "ln1_weight_file": ln1_weight_file_name,
                 "ln2_weight_file": ln2_weight_file_name,
                 "trace_size": 0,
+                "phase": phase,
             },
         )
 
@@ -395,22 +401,59 @@ class AIEEncoderPipeline(AIEOperatorBase):
         return xclbin_artifact, insts_artifact
 
     def set_up_artifacts(self):
+        if self._use_seqpar_phase_split():
+            (
+                self.front_xclbin_artifact,
+                self.front_insts_artifact,
+            ) = self.get_artifacts(prefix="encoder_pipeline_front", phase="front")
+            (
+                self.tail_xclbin_artifact,
+                self.tail_insts_artifact,
+            ) = self.get_artifacts(prefix="encoder_pipeline_tail", phase="tail")
+            self.add_artifacts(
+                [
+                    self.front_xclbin_artifact,
+                    self.front_insts_artifact,
+                    self.tail_xclbin_artifact,
+                    self.tail_insts_artifact,
+                ]
+            )
+            return
+
         xclbin_artifact, insts_artifact = self.get_artifacts()
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def _or_buffer_shape(self):
-        ln1_stage_rows = (self.ffn_intermediate_size // self.emb_tile) * self.seq_tile
+        ln1_stage_rows = (
+            self.parallel_seq
+            * (self.ffn_intermediate_size // self.emb_tile)
+            * self.seq_tile
+        )
         return (2 * self.seq_len + ln1_stage_rows, self.embed_sz)
 
     def set_up_runtime(self):
-        self.add_kernel(
-            "encoder_pipeline",
-            self.xclbin_artifact,
-            self.xclbin_artifact.kernel_name,
-            self.insts_artifact,
-        )
+        if self._use_seqpar_phase_split():
+            self.add_kernel(
+                "encoder_pipeline_front",
+                self.front_xclbin_artifact,
+                self.front_xclbin_artifact.kernel_name,
+                self.front_insts_artifact,
+            )
+            self.add_kernel(
+                "encoder_pipeline_tail",
+                self.tail_xclbin_artifact,
+                self.tail_xclbin_artifact.kernel_name,
+                self.tail_insts_artifact,
+            )
+        else:
+            self.add_kernel(
+                "encoder_pipeline",
+                self.xclbin_artifact,
+                self.xclbin_artifact.kernel_name,
+                self.insts_artifact,
+            )
 
         static_w_o_proj = None
         if self.w_o_proj is not None:
@@ -445,7 +488,38 @@ class AIEEncoderPipeline(AIEOperatorBase):
             static_data=static_weights_down_proj,
         )
         self.buffer_aliases["O"] = "OR"
-        self.add_to_runlist("encoder_pipeline", "W_O", "QKV", "OR", "B_Up", "B_Down")
+        if self._use_seqpar_phase_split():
+            self.add_to_runlist("encoder_pipeline_front", "W_O", "QKV", "OR")
+            self.add_to_runlist("encoder_pipeline_tail", "OR", "B_Up", "B_Down")
+        else:
+            self.add_to_runlist(
+                "encoder_pipeline", "W_O", "QKV", "OR", "B_Up", "B_Down"
+            )
+
+    def run_runlist(self):
+        if not self._use_seqpar_phase_split():
+            return super().run_runlist()
+
+        elapsed = 0.0
+        for kernel_name, *buffer_args in self.runlist:
+            context, xrt_kernel, insts_bo, insts_len = self.xrt_kernels[kernel_name]
+            insts_bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            bos = [self.buffer_bos[buffer_arg] for buffer_arg in buffer_args]
+            for bo in bos:
+                bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            opcode = 3
+            start = time.perf_counter()
+            run = xrt_kernel(opcode, insts_bo, insts_len, *bos)
+            result = run.wait()
+            stop = time.perf_counter()
+            elapsed += stop - start
+            if result != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+                raise RuntimeError(
+                    f"Kernel {kernel_name} did not complete correctly: {result}"
+                )
+            for bo in bos:
+                bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        return elapsed
 
     def forward(
         self,
@@ -522,7 +596,11 @@ class AIEEncoderPipeline(AIEOperatorBase):
             r_np = np.zeros((self.seq_len, self.embed_sz), dtype=bfloat16)
         or_np = np.concatenate((np.zeros_like(r_np), r_np), axis=0)
 
-        ln1_stage_rows = (self.ffn_intermediate_size // self.emb_tile) * self.seq_tile
+        ln1_stage_rows = (
+            self.parallel_seq
+            * (self.ffn_intermediate_size // self.emb_tile)
+            * self.seq_tile
+        )
         if ln1_stage_rows > 0:
             or_np = np.concatenate(
                 (
