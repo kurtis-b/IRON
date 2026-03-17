@@ -23,6 +23,9 @@ def generate_golden_reference(
     seq_len: int = 64,
     d: int = 64,
     intermediate_size: int | None = None,
+    seq_tile: int = 32,
+    emb_tile: int = 96,
+    parallel_seq: int = 1,
     seed: int = 42,
 ):
     """Generate full-pipeline encoder reference tensors.
@@ -70,7 +73,26 @@ def generate_golden_reference(
     k_2d = k.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     v_2d = v.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     qkv = torch.cat((q_2d, k_2d, v_2d), dim=0)
-    or_buf = torch.cat((torch.zeros_like(r1), r1), dim=0)
+    ln1_stage_rows = (intermediate_size // emb_tile) * seq_tile
+    if parallel_seq > 1:
+        if seq_len % seq_tile != 0:
+            raise ValueError("generate_golden_reference requires seq_len divisible by seq_tile")
+        num_q_seq_blocks = seq_len // seq_tile
+        if num_q_seq_blocks % parallel_seq != 0:
+            raise ValueError(
+                "generate_golden_reference requires num_q_seq_blocks divisible by "
+                f"parallel_seq ({num_q_seq_blocks} % {parallel_seq} != 0)"
+            )
+        q_blocks_per_lane = num_q_seq_blocks // parallel_seq
+        ln1_stage_rows = q_blocks_per_lane * parallel_seq * ln1_stage_rows
+    or_buf = torch.cat(
+        (
+            torch.zeros_like(r1),
+            r1,
+            torch.zeros((ln1_stage_rows, embed_sz), dtype=dtype),
+        ),
+        dim=0,
+    )
 
     return {
         "Q": q_2d,
