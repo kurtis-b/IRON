@@ -1447,6 +1447,8 @@ def encoder_pipeline(
         group_memBUpSeq = []
         group_inBDownSeq = []
         group_memBDownSeq = []
+        group_weight_b_up_shim_cols = []
+        group_weight_b_down_shim_cols = []
         group_inRSeq = []
         group_ln1StageJoined = []
         group_inLNSeq = []
@@ -1682,6 +1684,8 @@ def encoder_pipeline(
                 effective_ffn_branches,
                 f"sequence_parallel.transport_groups[{group_idx}].shim_cols.b_down",
             )
+            group_weight_b_up_shim_cols.append(weight_b_up_shim_cols)
+            group_weight_b_down_shim_cols.append(weight_b_down_shim_cols)
 
             group_inBUpSeq.append([])
             group_memBUpSeq.append([])
@@ -2803,7 +2807,9 @@ def encoder_pipeline(
                                 B_Up,
                                 tap=b_up_tiles[branch_idx],
                                 placement=Tile(
-                                    col=weight_b_up_shim_cols[branch_idx],
+                                    col=group_weight_b_up_shim_cols[group_idx][
+                                        branch_idx
+                                    ],
                                     row=0,
                                 ),
                                 task_group=tg_tail,
@@ -2814,7 +2820,9 @@ def encoder_pipeline(
                             B_Down,
                             tap=b_down_tiles[branch_idx],
                             placement=Tile(
-                                col=weight_b_down_shim_cols[branch_idx],
+                                col=group_weight_b_down_shim_cols[group_idx][
+                                    branch_idx
+                                ],
                                 row=0,
                             ),
                             task_group=tg_tail,

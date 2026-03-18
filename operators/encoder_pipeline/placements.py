@@ -319,6 +319,39 @@ for seq_len in SCALED_SEQ_LENS:
                     "ffn_residual_refill": 1,
                     "output": 7,
                 },
+                "transport_groups": (
+                    {
+                        "lanes": (0, 1),
+                        "joined_q_mem_col": 0,
+                        "shared_ingress_cols": {"k": 1, "v": 2, "w_o": 3},
+                        "joined_or_mem_cols": {
+                            "residual": 0,
+                            "ln1_stage": 2,
+                            "ln1_refill": 4,
+                            "ffn_residual_refill": 5,
+                            "output": 1,
+                        },
+                        "joined_or_shim_cols": {
+                            "residual": 7,
+                            "ln1_stage": 6,
+                            "ln1_refill": 0,
+                            "ffn_residual_refill": 1,
+                            "output": 7,
+                        },
+                        "shim_cols": {
+                            "q": 0,
+                            "k": 1,
+                            "v": 2,
+                            "w_o": 3,
+                            "b_up": (5, 6),
+                            "b_down": (4, 5),
+                        },
+                        "weight_mem_cols": {
+                            "b_up": (5, 6),
+                            "b_down": (4, 5),
+                        },
+                    },
+                ),
                 "lane_tiles": (
                     {
                         "qk": (0, 2),
