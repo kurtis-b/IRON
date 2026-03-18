@@ -23,7 +23,6 @@ from .swiglu_prefill.op import AIESwiGLUPrefill
 from .tanh.op import AIETanh
 from .transpose.op import AIETranspose
 from .encoder.op import AIEBERTEncoder
-from .encoder_pipeline_ddr.op import AIEEncoderPipelineDDR
 from .encoder_pipeline_memtile.op import AIEEncoderPipelineMemtile
 from .ffn.op import AIEFFN
 from .addnorm.op import AIEAddAndNorm
