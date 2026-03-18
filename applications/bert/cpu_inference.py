@@ -15,21 +15,50 @@ from benchmark_common import (
     parse_seq_lens,
     write_results_csv,
 )
+from model_support import (
+    build_hf_encoder_model,
+    canonicalize_app_config_dict,
+    display_name_for_model,
+    extend_or_trim_position_embeddings,
+    extract_backbone_state_dict,
+    model_uses_token_type_ids,
+    resolve_study_paths,
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Benchmark Hugging Face BertModel on CPU across sequence lengths."
+        description="Benchmark a Hugging Face encoder-only model on CPU across sequence lengths."
     )
     parser.add_argument(
         "weights_file_path",
         type=str,
-        help="Path to model.safetensors containing BERT sequence-classification weights.",
+        nargs="?",
+        help="Path to model.safetensors containing encoder backbone weights.",
     )
     parser.add_argument(
         "config_file_path",
         type=str,
+        nargs="?",
         help="Path to the application config JSON that contains model_config.",
+    )
+    parser.add_argument(
+        "--study-id",
+        type=str,
+        default=None,
+        help="Resolve weights/config from the study manifest instead of passing paths.",
+    )
+    parser.add_argument(
+        "--study-manifest",
+        type=str,
+        default=None,
+        help="Optional path to the study manifest JSON.",
+    )
+    parser.add_argument(
+        "--models-root",
+        type=str,
+        default=None,
+        help="Optional root directory that holds downloaded study model artifacts.",
     )
     parser.add_argument(
         "--seq-lens",
@@ -76,62 +105,59 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_input_paths(args):
+    if args.study_id is not None:
+        if args.weights_file_path is not None or args.config_file_path is not None:
+            raise ValueError(
+                "Use either explicit weights/config paths or --study-id, not both"
+            )
+        resolved = resolve_study_paths(
+            args.study_id,
+            manifest_path=args.study_manifest,
+            models_root=args.models_root,
+        )
+        return resolved["weights_file_path"], resolved["config_file_path"]
+
+    if args.weights_file_path is None or args.config_file_path is None:
+        raise ValueError(
+            "Either pass weights_file_path and config_file_path, or use --study-id"
+        )
+    return args.weights_file_path, args.config_file_path
+
+
 def load_app_model_config(config_file_path):
     with open(config_file_path, "r", encoding="utf-8") as f:
         config_json = json.load(f)
-    if "model_config" not in config_json:
-        raise ValueError(f"{config_file_path} does not contain model_config")
-    return config_json["model_config"]
+    return canonicalize_app_config_dict(config_json)["model_config"]
 
 
-def extend_or_trim_position_embeddings(state_dict, seq_len):
-    key = "embeddings.position_embeddings.weight"
-    if key not in state_dict:
-        return
-    weights = state_dict[key]
-    if weights.shape[0] == seq_len:
-        return
-    if weights.shape[0] > seq_len:
-        state_dict[key] = weights[:seq_len, :]
-        return
-    repeats = (seq_len // weights.shape[0]) + 1
-    state_dict[key] = weights.repeat(repeats, 1)[:seq_len, :]
-
-
-def load_hf_bert_model(weights_file_path, config_file_path, seq_len, dtype_name):
+def load_hf_encoder_model(weights_file_path, config_file_path, seq_len, dtype_name):
     import torch
     from safetensors.torch import load_file
-    from transformers import BertConfig, BertModel
 
     model_config = load_app_model_config(config_file_path)
     model_config["max_position_embeddings"] = seq_len
-    hf_config = BertConfig.from_dict(model_config)
-    model = BertModel(hf_config, add_pooling_layer=False)
+    family, _, model = build_hf_encoder_model(model_config)
 
     raw_weights = load_file(weights_file_path)
-    bert_state_dict = {}
-    for key, value in raw_weights.items():
-        if not key.startswith("bert."):
-            continue
-        stripped_key = key[len("bert.") :]
-        if stripped_key.startswith("pooler."):
-            continue
-        stripped_key = stripped_key.replace("LayerNorm.gamma", "LayerNorm.weight")
-        stripped_key = stripped_key.replace("LayerNorm.beta", "LayerNorm.bias")
-        bert_state_dict[stripped_key] = value
+    state_dict = extract_backbone_state_dict(raw_weights, model_config)
 
-    extend_or_trim_position_embeddings(bert_state_dict, seq_len)
+    extend_or_trim_position_embeddings(state_dict, seq_len)
 
     dtype = torch.bfloat16 if dtype_name == "bfloat16" else torch.float32
-    missing, unexpected = model.load_state_dict(bert_state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
-        raise RuntimeError(f"Missing BertModel weights: {missing}")
+        raise RuntimeError(
+            f"Missing {display_name_for_model(model_config)} weights: {missing}"
+        )
     if unexpected:
-        raise RuntimeError(f"Unexpected BertModel weights: {unexpected}")
+        raise RuntimeError(
+            f"Unexpected {display_name_for_model(model_config)} weights: {unexpected}"
+        )
 
     model = model.to(dtype=dtype)
     model.eval()
-    return model
+    return family, model
 
 
 def benchmark_seq_len(
@@ -144,7 +170,7 @@ def benchmark_seq_len(
     runs_per_sample,
     dtype_name,
 ):
-    model = load_hf_bert_model(
+    model_type, model = load_hf_encoder_model(
         weights_file_path=weights_file_path,
         config_file_path=config_file_path,
         seq_len=seq_len,
@@ -156,32 +182,38 @@ def benchmark_seq_len(
         vocab_size=model.config.vocab_size,
         pad_token_id=model.config.pad_token_id,
     )
+    use_token_type_ids = model_uses_token_type_ids(model_config=model.config.to_dict())
 
     import torch
 
     with torch.inference_mode():
         for _ in range(warmup_runs):
             for sample in encoded_samples:
-                _ = model(
-                    input_ids=sample["input_ids"],
-                    token_type_ids=sample["token_type_ids"],
-                    attention_mask=None,
-                ).last_hidden_state
+                kwargs = {
+                    "input_ids": sample["input_ids"],
+                    "attention_mask": None,
+                }
+                if use_token_type_ids:
+                    kwargs["token_type_ids"] = sample["token_type_ids"]
+                _ = model(**kwargs).last_hidden_state
 
         latencies_ms = []
         for sample in encoded_samples:
             for _ in range(runs_per_sample):
                 start = time.perf_counter()
-                output = model(
-                    input_ids=sample["input_ids"],
-                    token_type_ids=sample["token_type_ids"],
-                    attention_mask=None,
-                ).last_hidden_state
+                kwargs = {
+                    "input_ids": sample["input_ids"],
+                    "attention_mask": None,
+                }
+                if use_token_type_ids:
+                    kwargs["token_type_ids"] = sample["token_type_ids"]
+                output = model(**kwargs).last_hidden_state
                 end = time.perf_counter()
                 latencies_ms.append((end - start) * 1000.0)
 
     return {
         "seq_len": seq_len,
+        "model_type": model_type,
         "shape": tuple(output.shape),
         "min_latency_ms": min(latencies_ms),
         "avg_latency_ms": sum(latencies_ms) / len(latencies_ms),
@@ -191,6 +223,7 @@ def benchmark_seq_len(
 
 def main():
     args = parse_args()
+    weights_file_path, config_file_path = resolve_input_paths(args)
     seq_lens = parse_seq_lens(args.seq_lens)
     physical_threads = detect_physical_core_count()
     logical_threads = detect_logical_thread_count()
@@ -206,10 +239,14 @@ def main():
     torch.set_num_interop_threads(1)
 
     texts = build_benchmark_texts(args.num_samples)
+    model_config = load_app_model_config(config_file_path)
 
     print(f"CPU thread comparison set: {thread_counts}", flush=True)
     print(f"torch inter-op threads: {torch.get_num_interop_threads()}", flush=True)
-    print("Benchmarking Hugging Face BertModel(add_pooling_layer=False)", flush=True)
+    print(
+        f"Benchmarking Hugging Face {display_name_for_model(model_config)}",
+        flush=True,
+    )
     print(f"Sequence lengths: {seq_lens}", flush=True)
 
     csv_rows = []
@@ -225,8 +262,8 @@ def main():
                 flush=True,
             )
             result = benchmark_seq_len(
-                weights_file_path=args.weights_file_path,
-                config_file_path=args.config_file_path,
+                weights_file_path=weights_file_path,
+                config_file_path=config_file_path,
                 seq_len=seq_len,
                 texts=texts,
                 warmup_runs=args.warmup_runs,
@@ -250,6 +287,7 @@ def main():
                     "num_samples": args.num_samples,
                     "runs_per_sample": args.runs_per_sample,
                     "warmup_runs": args.warmup_runs,
+                    "model_type": result["model_type"],
                     "shape": result["shape"],
                     "topology_id": "",
                     "parallel_seq": "",

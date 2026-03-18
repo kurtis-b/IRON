@@ -33,6 +33,7 @@ CSV_FIELDNAMES = [
     "num_samples",
     "runs_per_sample",
     "warmup_runs",
+    "model_type",
     "shape",
     "topology_id",
     "parallel_seq",

@@ -17,6 +17,13 @@ from benchmark_common import (
     parse_seq_lens,
     write_results_csv,
 )
+from model_support import (
+    canonicalize_app_config_dict,
+    canonicalize_local_backbone_weights,
+    display_name_for_model,
+    extend_or_trim_position_embeddings,
+    resolve_study_paths,
+)
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -24,17 +31,37 @@ sys.path.insert(0, str(REPO_ROOT))
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Benchmark the encoder_pipeline-backed Bert encoder on NPU."
+        description="Benchmark an encoder_pipeline-backed encoder-only model on NPU."
     )
     parser.add_argument(
         "weights_file_path",
         type=str,
-        help="Path to model.safetensors containing BERT sequence-classification weights.",
+        nargs="?",
+        help="Path to model.safetensors containing encoder backbone weights.",
     )
     parser.add_argument(
         "config_file_path",
         type=str,
+        nargs="?",
         help="Path to the application config JSON that contains model_config.",
+    )
+    parser.add_argument(
+        "--study-id",
+        type=str,
+        default=None,
+        help="Resolve weights/config from the study manifest instead of passing paths.",
+    )
+    parser.add_argument(
+        "--study-manifest",
+        type=str,
+        default=None,
+        help="Optional path to the study manifest JSON.",
+    )
+    parser.add_argument(
+        "--models-root",
+        type=str,
+        default=None,
+        help="Optional root directory that holds downloaded study model artifacts.",
     )
     parser.add_argument(
         "--seq-lens",
@@ -112,6 +139,26 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_input_paths(args):
+    if args.study_id is not None:
+        if args.weights_file_path is not None or args.config_file_path is not None:
+            raise ValueError(
+                "Use either explicit weights/config paths or --study-id, not both"
+            )
+        resolved = resolve_study_paths(
+            args.study_id,
+            manifest_path=args.study_manifest,
+            models_root=args.models_root,
+        )
+        return resolved["weights_file_path"], resolved["config_file_path"]
+
+    if args.weights_file_path is None or args.config_file_path is None:
+        raise ValueError(
+            "Either pass weights_file_path and config_file_path, or use --study-id"
+        )
+    return args.weights_file_path, args.config_file_path
+
+
 def dtype_from_string(inp):
     import torch
 
@@ -126,8 +173,8 @@ def load_encoder_pipeline_config(config_file_path, seq_len):
     with open(config_file_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    data = canonicalize_app_config_dict(data, seq_len=seq_len)
     config = json.loads(json.dumps(data), object_hook=lambda d: SimpleNamespace(**d))
-    config.model_config.max_position_embeddings = seq_len
     config.aie_config.dtype = dtype_from_string(config.aie_config.dtype)
     return config
 
@@ -272,20 +319,6 @@ def supported_topologies_for_seq_len(config, seq_len, candidate_ids=None):
     return matches
 
 
-def extend_or_trim_position_embeddings(weights, seq_len):
-    key = "bert.embeddings.position_embeddings.weight"
-    if key not in weights:
-        return
-    position_weights = weights[key]
-    if position_weights.shape[0] == seq_len:
-        return
-    if position_weights.shape[0] > seq_len:
-        weights[key] = position_weights[:seq_len, :]
-        return
-    repeats = (seq_len // position_weights.shape[0]) + 1
-    weights[key] = position_weights.repeat(repeats, 1)[:seq_len, :]
-
-
 def reset_default_context():
     from operators.common import AIEOperatorBase
     from operators.common.aie_context import AIEContext
@@ -301,15 +334,19 @@ def build_npu_encoder_model(weights_file_path, config):
     from safetensors.torch import load_file
 
     from operators.common import AIEOperatorBase
-    from src.model import BertEncoderBackbone
+    from src.model import EncoderBackbone
 
     seq_len = config.model_config.max_position_embeddings
     reset_default_context()
-    model = BertEncoderBackbone(config, seq_len=seq_len)
+    model = EncoderBackbone(config, seq_len=seq_len)
 
-    combined_weights = load_file(weights_file_path)
-    extend_or_trim_position_embeddings(combined_weights, seq_len)
-    model.assign_backbone_weights(combined_weights)
+    raw_weights = load_file(weights_file_path)
+    canonical_weights = canonicalize_local_backbone_weights(
+        raw_weights,
+        config.model_config,
+    )
+    extend_or_trim_position_embeddings(canonical_weights, seq_len)
+    model.assign_backbone_weights(canonical_weights)
     model.eval()
 
     context = AIEOperatorBase.get_default_context()
@@ -366,6 +403,7 @@ def benchmark_with_config(
 
     return {
         "seq_len": seq_len,
+        "model_type": str(config.model_config.model_type),
         "shape": tuple(output.shape),
         "dtype": str(model.dtype).replace("torch.", ""),
         "topology_id": topology_id(topology),
@@ -453,6 +491,9 @@ def resolve_topology(args, seq_len, texts):
 
 def main():
     args = parse_args()
+    weights_file_path, config_file_path = resolve_input_paths(args)
+    args.weights_file_path = weights_file_path
+    args.config_file_path = config_file_path
     seq_lens = parse_seq_lens(args.seq_lens)
     num_threads = args.num_threads or detect_physical_core_count()
     configure_cpu_thread_env(num_threads)
@@ -467,8 +508,10 @@ def main():
     print(f"Using host CPU threads: {num_threads}", flush=True)
     print(f"torch intra-op threads: {torch.get_num_threads()}", flush=True)
     print(f"torch inter-op threads: {torch.get_num_interop_threads()}", flush=True)
+    base_config = load_encoder_pipeline_config(config_file_path, seq_lens[0])
     print(
-        "Benchmarking local Bert encoder with encoder_pipeline operator",
+        f"Benchmarking local {display_name_for_model(base_config.model_config)} encoder "
+        "with encoder_pipeline operator",
         flush=True,
     )
     print(f"Sequence lengths: {seq_lens}", flush=True)
@@ -482,10 +525,10 @@ def main():
             f"Selected topology: seq_len={seq_len} topology={topology_id(topology)}",
             flush=True,
         )
-        config = load_encoder_pipeline_config(args.config_file_path, seq_len)
+        config = load_encoder_pipeline_config(config_file_path, seq_len)
         apply_topology_to_config(config, topology)
         result = benchmark_with_config(
-            weights_file_path=args.weights_file_path,
+            weights_file_path=weights_file_path,
             config=config,
             seq_len=seq_len,
             texts=texts,
@@ -509,6 +552,7 @@ def main():
                 "num_samples": args.num_samples,
                 "runs_per_sample": args.runs_per_sample,
                 "warmup_runs": args.warmup_runs,
+                "model_type": result["model_type"],
                 "shape": result["shape"],
                 "topology_id": result["topology_id"],
                 "parallel_seq": result["parallel_seq"],

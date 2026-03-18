@@ -19,12 +19,13 @@
 import torch
 import torch.nn as nn
 
+from model_support import model_uses_token_type_ids
 from .block.transformer import BertEncoder
 from .utils import assign
 
 
-class BertEmbeddings(nn.Module):
-    """Construct BERT input embeddings for the NPU encoder benchmark."""
+class EncoderEmbeddings(nn.Module):
+    """Construct encoder input embeddings for the NPU benchmark."""
 
     def __init__(self, config):
         super().__init__()
@@ -37,10 +38,14 @@ class BertEmbeddings(nn.Module):
             config.model_config.max_position_embeddings,
             config.model_config.hidden_size,
         )
-        self.token_type_embeddings = nn.Embedding(
-            config.model_config.type_vocab_size,
-            config.model_config.hidden_size,
-        )
+        self.use_token_type_embeddings = model_uses_token_type_ids(config.model_config)
+        if self.use_token_type_embeddings:
+            self.token_type_embeddings = nn.Embedding(
+                config.model_config.type_vocab_size,
+                config.model_config.hidden_size,
+            )
+        else:
+            self.token_type_embeddings = None
         self.LayerNorm = nn.LayerNorm(
             config.model_config.hidden_size,
             eps=config.model_config.layer_norm_eps,
@@ -52,29 +57,32 @@ class BertEmbeddings(nn.Module):
             persistent=False,
         )
 
-    def forward(self, input_ids, token_type_ids):
+    def forward(self, input_ids, token_type_ids=None):
         seq_len = input_ids.size(1)
         inputs_embeds = self.word_embeddings(input_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
         position_ids = self.position_ids[:, :seq_len]
         position_embeddings = self.position_embeddings(position_ids)
-        embeddings = inputs_embeds + token_type_embeddings + position_embeddings
+        embeddings = inputs_embeds + position_embeddings
+        if self.token_type_embeddings is not None:
+            if token_type_ids is None:
+                token_type_ids = torch.zeros_like(input_ids)
+            embeddings = embeddings + self.token_type_embeddings(token_type_ids)
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
 
 
-class BertEncoderBackbone(nn.Module):
-    """Minimal BERT backbone used by the NPU encoder benchmark."""
+class EncoderBackbone(nn.Module):
+    """Minimal encoder backbone used by the NPU benchmark."""
 
     def __init__(self, config, seq_len=512):
         super().__init__()
         self.config = config
-        self.embeddings = BertEmbeddings(config)
+        self.embeddings = EncoderEmbeddings(config)
         self.encoder = BertEncoder(config, seq_len=seq_len)
         self.dtype = config.aie_config.dtype
 
-    def forward(self, input_ids, token_type_ids, attention_mask=None):
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None):
         embedding_output = self.embeddings(
             input_ids=input_ids,
             token_type_ids=token_type_ids,
@@ -87,27 +95,32 @@ class BertEncoderBackbone(nn.Module):
     def assign_backbone_weights(self, combined_weights):
         self.embeddings.word_embeddings.weight = assign(
             self.embeddings.word_embeddings.weight,
-            combined_weights["bert.embeddings.word_embeddings.weight"],
-            "bert.embeddings.word_embeddings.weight",
+            combined_weights["embeddings.word_embeddings.weight"],
+            "embeddings.word_embeddings.weight",
         )
         self.embeddings.position_embeddings.weight = assign(
             self.embeddings.position_embeddings.weight,
-            combined_weights["bert.embeddings.position_embeddings.weight"],
-            "bert.embeddings.position_embeddings.weight",
+            combined_weights["embeddings.position_embeddings.weight"],
+            "embeddings.position_embeddings.weight",
         )
-        self.embeddings.token_type_embeddings.weight = assign(
-            self.embeddings.token_type_embeddings.weight,
-            combined_weights["bert.embeddings.token_type_embeddings.weight"],
-            "bert.embeddings.token_type_embeddings.weight",
-        )
+        if self.embeddings.token_type_embeddings is not None:
+            self.embeddings.token_type_embeddings.weight = assign(
+                self.embeddings.token_type_embeddings.weight,
+                combined_weights["embeddings.token_type_embeddings.weight"],
+                "embeddings.token_type_embeddings.weight",
+            )
         self.embeddings.LayerNorm.bias = assign(
             self.embeddings.LayerNorm.bias,
-            combined_weights["bert.embeddings.LayerNorm.beta"],
-            "bert.embeddings.LayerNorm.beta",
+            combined_weights["embeddings.LayerNorm.bias"],
+            "embeddings.LayerNorm.bias",
         )
         self.embeddings.LayerNorm.weight = assign(
             self.embeddings.LayerNorm.weight,
-            combined_weights["bert.embeddings.LayerNorm.gamma"],
-            "bert.embeddings.LayerNorm.gamma",
+            combined_weights["embeddings.LayerNorm.weight"],
+            "embeddings.LayerNorm.weight",
         )
         self.encoder.assign_weights(combined_weights)
+
+
+BertEmbeddings = EncoderEmbeddings
+BertEncoderBackbone = EncoderBackbone

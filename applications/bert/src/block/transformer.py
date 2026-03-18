@@ -50,44 +50,44 @@ class BertQKVProjection(nn.Module):
         self.query.weight = assign(
             self.query.weight,
             combined_weights[
-                f"bert.encoder.layer.{layer_idx}.attention.self.query.weight"
+                f"encoder.layer.{layer_idx}.attention.self.query.weight"
             ].to(dtype),
-            f"bert.encoder.layer.{layer_idx}.attention.self.query.weight",
+            f"encoder.layer.{layer_idx}.attention.self.query.weight",
         )
         self.query.bias = assign(
             self.query.bias,
-            combined_weights[
-                f"bert.encoder.layer.{layer_idx}.attention.self.query.bias"
-            ].to(dtype),
-            f"bert.encoder.layer.{layer_idx}.attention.self.query.bias",
+            combined_weights[f"encoder.layer.{layer_idx}.attention.self.query.bias"].to(
+                dtype
+            ),
+            f"encoder.layer.{layer_idx}.attention.self.query.bias",
         )
         self.key.weight = assign(
             self.key.weight,
-            combined_weights[
-                f"bert.encoder.layer.{layer_idx}.attention.self.key.weight"
-            ].to(dtype),
-            f"bert.encoder.layer.{layer_idx}.attention.self.key.weight",
+            combined_weights[f"encoder.layer.{layer_idx}.attention.self.key.weight"].to(
+                dtype
+            ),
+            f"encoder.layer.{layer_idx}.attention.self.key.weight",
         )
         self.key.bias = assign(
             self.key.bias,
-            combined_weights[
-                f"bert.encoder.layer.{layer_idx}.attention.self.key.bias"
-            ].to(dtype),
-            f"bert.encoder.layer.{layer_idx}.attention.self.key.bias",
+            combined_weights[f"encoder.layer.{layer_idx}.attention.self.key.bias"].to(
+                dtype
+            ),
+            f"encoder.layer.{layer_idx}.attention.self.key.bias",
         )
         self.value.weight = assign(
             self.value.weight,
             combined_weights[
-                f"bert.encoder.layer.{layer_idx}.attention.self.value.weight"
+                f"encoder.layer.{layer_idx}.attention.self.value.weight"
             ].to(dtype),
-            f"bert.encoder.layer.{layer_idx}.attention.self.value.weight",
+            f"encoder.layer.{layer_idx}.attention.self.value.weight",
         )
         self.value.bias = assign(
             self.value.bias,
-            combined_weights[
-                f"bert.encoder.layer.{layer_idx}.attention.self.value.bias"
-            ].to(dtype),
-            f"bert.encoder.layer.{layer_idx}.attention.self.value.bias",
+            combined_weights[f"encoder.layer.{layer_idx}.attention.self.value.bias"].to(
+                dtype
+            ),
+            f"encoder.layer.{layer_idx}.attention.self.value.bias",
         )
 
 
@@ -155,19 +155,19 @@ class BertEncoderPipelineLayer(nn.Module):
     def assign_weights(self, layer_idx, combined_weights, dtype):
         self.qkv_projection.assign_weights(layer_idx, combined_weights, dtype)
         self.attn_output_weight = combined_weights[
-            f"bert.encoder.layer.{layer_idx}.attention.output.dense.weight"
+            f"encoder.layer.{layer_idx}.attention.output.dense.weight"
         ].to(dtype)
         self.ffn_up_weight = combined_weights[
-            f"bert.encoder.layer.{layer_idx}.intermediate.dense.weight"
+            f"encoder.layer.{layer_idx}.intermediate.dense.weight"
         ].to(dtype)
         self.ffn_down_weight = combined_weights[
-            f"bert.encoder.layer.{layer_idx}.output.dense.weight"
+            f"encoder.layer.{layer_idx}.output.dense.weight"
         ].to(dtype)
         self.encoder_pipeline.ln1_weight = combined_weights[
-            f"bert.encoder.layer.{layer_idx}.attention.output.LayerNorm.gamma"
+            f"encoder.layer.{layer_idx}.attention.output.LayerNorm.weight"
         ].to(dtype)
         self.encoder_pipeline.ln2_weight = combined_weights[
-            f"bert.encoder.layer.{layer_idx}.output.LayerNorm.gamma"
+            f"encoder.layer.{layer_idx}.output.LayerNorm.weight"
         ].to(dtype)
         self.encoder_pipeline.w_o_proj = self.attn_output_weight.contiguous()
         self.encoder_pipeline.weight_up_proj = self.ffn_up_weight.contiguous()
