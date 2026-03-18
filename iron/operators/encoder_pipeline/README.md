@@ -31,6 +31,18 @@ Useful implementation files:
 - [reference.py](/home/agi-demo/iron/operators/encoder_pipeline/reference.py): golden-reference generation
 - [test.py](/home/agi-demo/iron/operators/encoder_pipeline/test.py): public pytest matrix
 
+## Toolchain Note
+
+`encoder_pipeline` should be used with the specific `mlir_aie` wheel currently validated in `ironenv`:
+
+- `mlir_aie==0.0.1.2026031811+71fb44f147`
+
+This operator is sensitive to `mlir_aie` lowering/allocation behavior. Different wheels can change:
+
+- DMA-BD allocation outcomes
+- compile viability of some topologies
+- runtime behavior of the generated design
+
 ## Test Surface
 
 The public test matrix in [test.py](/home/agi-demo/iron/operators/encoder_pipeline/test.py) currently uses:

@@ -19,19 +19,19 @@ ERROR_THRESHOLD = 0.005
 SCALED_SEQ_LENS = tuple(1 << exp for exp in range(6, 14))
 BASE_TOPOLOGY = (64, 12, 3072, 32, 64, 96, 64)
 TOPOLOGY_CASES = (
-    ("", (1, 1, 8, 1, 1)),
-    ("_2ps", (2, 1, 8, 1, 1)),
-    ("_2ps_2ph", (2, 2, 8, 1, 1)),
-    ("_2ps_2pffn", (2, 1, 8, 1, 2)),
-    ("_2ps_2ph_2pffn", (2, 2, 8, 1, 2)),
-    ("_2ps_4pffn", (2, 1, 8, 1, 4)),
-    ("_4ps", (4, 1, 8, 1, 1)),
-    ("_2ph", (1, 2, 8, 1, 1)),
-    ("_4ph", (1, 4, 8, 1, 1)),
-    ("_2pffn", (1, 1, 8, 1, 2)),
-    ("_2ph_2pffn", (1, 2, 8, 1, 2)),
-    ("_4pffn", (1, 1, 8, 1, 4)),
-    ("_2ph_4pffn", (1, 2, 8, 1, 4)),
+    ("", (1, 1, 8, 1, 1, 1)),
+    ("_2ps", (2, 1, 8, 1, 1, 1)),
+    ("_2ps_2ph", (2, 2, 8, 1, 1, 1)),
+    ("_2ps_2pffn", (2, 1, 8, 1, 1, 2)),
+    ("_2ps_2ph_2pffn", (2, 2, 8, 1, 1, 2)),
+    ("_2ps_4pffn", (2, 1, 8, 1, 1, 4)),
+    ("_4ps", (4, 1, 8, 1, 1, 1)),
+    ("_2ph", (1, 2, 8, 1, 1, 1)),
+    ("_4ph", (1, 4, 8, 1, 1, 1)),
+    ("_2pffn", (1, 1, 8, 1, 1, 2)),
+    ("_2ph_2pffn", (1, 2, 8, 1, 1, 2)),
+    ("_4pffn", (1, 1, 8, 1, 1, 4)),
+    ("_2ph_4pffn", (1, 2, 8, 1, 1, 4)),
 )
 
 
@@ -56,6 +56,7 @@ def generate_test_params():
             parallel_heads,
             proj_acc_depth,
             o_proj_acc_group_size,
+            ffn_down_acc_group_size,
             nB_tiles_distributed,
         ) = runtime_topology
         for seq_len in SCALED_SEQ_LENS:
@@ -75,6 +76,7 @@ def generate_test_params():
                     parallel_heads,
                     proj_acc_depth,
                     o_proj_acc_group_size,
+                    ffn_down_acc_group_size,
                     nB_tiles_distributed,
                     id=f"encoder_pipeline_{seq_len}seq_{topology_name(topology_suffix)}",
                 )
@@ -90,7 +92,7 @@ all_params = generate_test_params()
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "seq_len,d,num_heads,ffn_intermediate_size,seq_tile,kv_seq_tile,emb_tile,ffn_tile,parallel_seq,parallel_heads,proj_acc_depth,o_proj_acc_group_size,nB_tiles_distributed",
+    "seq_len,d,num_heads,ffn_intermediate_size,seq_tile,kv_seq_tile,emb_tile,ffn_tile,parallel_seq,parallel_heads,proj_acc_depth,o_proj_acc_group_size,ffn_down_acc_group_size,nB_tiles_distributed",
     all_params,
 )
 def test_encoder_pipeline(
@@ -106,6 +108,7 @@ def test_encoder_pipeline(
     parallel_heads,
     proj_acc_depth,
     o_proj_acc_group_size,
+    ffn_down_acc_group_size,
     nB_tiles_distributed,
     aie_context,
 ):
@@ -132,6 +135,7 @@ def test_encoder_pipeline(
         parallel_heads=parallel_heads,
         proj_acc_depth=proj_acc_depth,
         o_proj_acc_group_size=o_proj_acc_group_size,
+        ffn_down_acc_group_size=ffn_down_acc_group_size,
         nB_tiles_distributed=nB_tiles_distributed,
         ffn_intermediate_size=ffn_intermediate_size,
         ln1_weight=golden_ref["ln1_weight"],

@@ -40,6 +40,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         parallel_heads: int = 1,
         proj_acc_depth: int = 1,
         o_proj_acc_group_size: int = 1,
+        ffn_down_acc_group_size: int = 1,
         nB_tiles_distributed: int = 1,
         ffn_intermediate_size: int | None = None,
         static_weights: bool = False,
@@ -60,6 +61,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.parallel_heads = parallel_heads
         self.proj_acc_depth = proj_acc_depth
         self.o_proj_acc_group_size = o_proj_acc_group_size
+        self.ffn_down_acc_group_size = ffn_down_acc_group_size
         self.nB_tiles_distributed = nB_tiles_distributed
         self.embed_sz = d * num_heads
         self.ffn_intermediate_size = (
@@ -108,7 +110,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         )
 
     def _validate_configuration(self):
-        topology_key = (
+        placement_topology_key = (
             self.num_heads,
             self.seq_len,
             self.d,
@@ -119,7 +121,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
             self.parallel_seq,
             self.parallel_heads,
             self.proj_acc_depth,
-            self.o_proj_acc_group_size,
+            1,
             self.nB_tiles_distributed,
             self.ffn_intermediate_size,
         )
@@ -175,11 +177,42 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "encoder_pipeline requires o_proj_acc_group_size > 0 "
                 f"(got {self.o_proj_acc_group_size})"
             )
-        if topology_key not in SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES:
+        if self.ffn_down_acc_group_size <= 0:
+            raise AIEOperatorConstraintError(
+                "encoder_pipeline requires ffn_down_acc_group_size > 0 "
+                f"(got {self.ffn_down_acc_group_size})"
+            )
+        if self.parallel_seq > 1 and self.parallel_heads > 1:
+            if self.o_proj_acc_group_size not in (1, self.parallel_heads):
+                raise AIEOperatorConstraintError(
+                    "encoder_pipeline seq-par currently supports "
+                    "o_proj_acc_group_size of 1 or parallel_heads "
+                    f"(got {self.o_proj_acc_group_size}, parallel_heads={self.parallel_heads})"
+                )
+        elif self.o_proj_acc_group_size != 1:
+            raise AIEOperatorConstraintError(
+                "encoder_pipeline currently supports o_proj_acc_group_size=1 "
+                "outside the seq-par multi-head path "
+                f"(got {self.o_proj_acc_group_size})"
+            )
+        if self.parallel_seq > 1 and self.nB_tiles_distributed > 1:
+            if self.ffn_down_acc_group_size not in (1, self.nB_tiles_distributed):
+                raise AIEOperatorConstraintError(
+                    "encoder_pipeline seq-par currently supports "
+                    "ffn_down_acc_group_size of 1 or nB_tiles_distributed "
+                    f"(got {self.ffn_down_acc_group_size}, nB_tiles_distributed={self.nB_tiles_distributed})"
+                )
+        elif self.ffn_down_acc_group_size != 1:
+            raise AIEOperatorConstraintError(
+                "encoder_pipeline currently supports ffn_down_acc_group_size=1 "
+                "outside the seq-par multi-branch path "
+                f"(got {self.ffn_down_acc_group_size})"
+            )
+        if placement_topology_key not in SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES:
             raise AIEOperatorConstraintError(
                 "encoder_pipeline currently supports only hardcoded placement "
                 f"topologies {sorted(SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES)} "
-                f"(got {topology_key})"
+                f"(got placement key {placement_topology_key})"
             )
 
     def _artifact_stem(self, prefix: str) -> str:
@@ -199,6 +232,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
                     self.parallel_heads,
                     self.proj_acc_depth,
                     self.o_proj_acc_group_size,
+                    self.ffn_down_acc_group_size,
                     self.nB_tiles_distributed,
                     self.ffn_intermediate_size,
                 ],
@@ -209,7 +243,8 @@ class AIEEncoderPipeline(AIEOperatorBase):
             f"{prefix}_{self.num_heads}h_{self.seq_len}s_{self.emb_tile}e_"
             f"{self.ffn_tile}f_"
             f"{self.parallel_seq}ps_{self.parallel_heads}ph_{self.proj_acc_depth}pa_"
-            f"{self.o_proj_acc_group_size}g_{self.nB_tiles_distributed}pf_{digest}"
+            f"{self.o_proj_acc_group_size}g_{self.ffn_down_acc_group_size}fg_"
+            f"{self.nB_tiles_distributed}pf_{digest}"
         )
 
     def get_artifacts(self, prefix: str = "encoder_pipeline"):
@@ -311,6 +346,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "parallel_heads": self.parallel_heads,
                 "proj_acc_depth": self.proj_acc_depth,
                 "o_proj_acc_group_size": self.o_proj_acc_group_size,
+                "ffn_down_acc_group_size": self.ffn_down_acc_group_size,
                 "nB_tiles_distributed": self.nB_tiles_distributed,
                 "ffn_intermediate_size": self.ffn_intermediate_size,
                 "emulate_bf16_mmul_with_bfp16": True,
