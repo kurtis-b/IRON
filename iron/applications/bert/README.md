@@ -244,7 +244,12 @@ cd iron/applications/bert
 python3 run_automated_benchmark_job.py systemd/benchmark_job.json --print-command
 ```
 
-4. Install the service:
+4. Edit the example service file:
+
+- replace `<benchmark_user>` with the Linux user that will run the benchmark
+- replace `<repo_root>` with the root of your checkout
+
+5. Install the service:
 
 ```bash
 sudo cp <repo_root>/iron/applications/bert/systemd/bert-automated-benchmark.service /etc/systemd/system/
@@ -253,7 +258,7 @@ sudo systemctl enable bert-automated-benchmark.service
 sudo systemctl start bert-automated-benchmark.service
 ```
 
-5. Watch the service log:
+6. Watch the service log:
 
 ```bash
 tail -f iron/applications/bert/logs/systemd/bert-automated-benchmark.log
@@ -320,7 +325,8 @@ This generates a fresh best-topology entry per sequence length for the current m
 cd <repo_root>/iron/applications/bert
 source /opt/xilinx/xrt/setup.sh
 source <repo_root>/ironenv/bin/activate
-python3 automated_benchmark.py model.safetensors config/config.json \
+python3 automated_benchmark.py \
+  --study-id bert-base-uncased \
   --modes npu \
   --seq-lens 64,128,256,512,1024,2048,4096,8192 \
   --num-samples 1 \
@@ -341,7 +347,8 @@ Use a trimmed sequence-length set first and leave out `--power-cycle-cmd`.
 
 ```bash
 cd <repo_root>/iron/applications/bert
-python3 automated_benchmark.py model.safetensors config/config.json \
+python3 automated_benchmark.py \
+  --study-id bert-base-uncased \
   --modes cpu,npu \
   --seq-lens 64,512 \
   --num-samples 1 \
