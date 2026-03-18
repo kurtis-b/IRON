@@ -1,0 +1,18 @@
+[Unit]
+Description=BERT automated benchmark runner
+After=multi-user.target
+
+[Service]
+Type=simple
+User=agi-demo
+Group=agi-demo
+WorkingDirectory=/home/agi-demo/iron/applications/bert
+Environment=BERT_BENCH_JOB_CONFIG=/home/agi-demo/iron/applications/bert/systemd/benchmark_job.json
+Environment=BERT_BENCH_LOG=/home/agi-demo/iron/applications/bert/logs/systemd/bert-automated-benchmark.log
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash -lc 'mkdir -p "$(dirname "$BERT_BENCH_LOG")" && source /opt/xilinx/xrt/setup.sh && source /home/agi-demo/iron/ironenv/bin/activate && python3 /home/agi-demo/iron/applications/bert/run_automated_benchmark_job.py "$BERT_BENCH_JOB_CONFIG" >> "$BERT_BENCH_LOG" 2>&1'
+Restart=no
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target
