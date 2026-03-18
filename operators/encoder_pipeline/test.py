@@ -150,6 +150,8 @@ def test_encoder_pipeline(
         output_buffers,
         rel_tol=REL_TOL,
         abs_tol=ABS_TOL,
+        warmup_iters=10,
+        timed_iters=100,
     )
 
     max_acceptable_errors = int(seq_len * d * num_heads * ERROR_THRESHOLD)
