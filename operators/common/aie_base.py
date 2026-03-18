@@ -93,13 +93,14 @@ class AIEOperatorBase(ABC):
     def get_bo(self, buffer_name):
         return self.buffer_bos[buffer_name]
 
+    def buffer_view(self, buffer_name, shape, dtype=bfloat16):
+        """Return a mapped numpy view into an existing BO without copying."""
+        mv = self.get_bo(buffer_name).map()
+        return np.frombuffer(mv, dtype=dtype, count=np.prod(shape)).reshape(shape)
+
     def read_buffer(self, buffer_name, shape, copy=False, dtype=bfloat16):
         """Read buffer and return values as a numpy array"""
-        # Create a byte accessible memory view of the buffer object
-        mv = self.get_bo(buffer_name).map()
-
-        # Interpret the buffer as a 1-dimensional array then change its view to the expected shape
-        arr = np.frombuffer(mv, dtype=dtype, count=np.prod(shape)).reshape(shape)
+        arr = self.buffer_view(buffer_name, shape, dtype=dtype)
 
         # Return an independent copy of the array if needed
         return arr.copy() if copy else arr
