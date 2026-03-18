@@ -29,6 +29,7 @@ class AIEMHA(AIEOperatorBase):
         d: int,
         num_KV_heads: int,
         num_of_pipelines: int = 1,
+        skip_add_to_list: bool = False,
         context=None,
     ):
         self.num_heads = num_heads
@@ -44,9 +45,11 @@ class AIEMHA(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
-    def set_up_artifacts(self):
+    def get_artifacts(self, prefix="mha_"):
         # Set up compilation artifacts
         # ---
         operator_dir = Path(__file__).parent
@@ -145,11 +148,13 @@ class AIEMHA(AIEOperatorBase):
             extra_flags=["--dynamic-objFifos"],
         )
 
+        return xclbin_artifact, insts_artifact
+
+    def set_up_artifacts(self):
+        xclbin_artifact, insts_artifact = self.get_artifacts()
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
-
-        artifacts = [xclbin_artifact, insts_artifact]
-        self.add_artifacts(artifacts)
+        self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
         # Set up runtime

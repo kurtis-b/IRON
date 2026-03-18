@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+import torch.nn as nn
 import numpy as np
 from ml_dtypes import bfloat16
-import logging
 from pathlib import Path
 
 from iron.common import (
@@ -17,56 +17,70 @@ from iron.common import (
     SourceArtifact,
     PythonGeneratedMLIRArtifact,
 )
+from iron.common.utils import torch_to_numpy
 
 
-class AIEElementwiseAdd(AIEOperatorBase):
-    """AIE-accelerated element-wise addition"""
+class AIEAddAndNorm(AIEOperatorBase):
+    """AIE-accelerated ADD & LAYER NORM operator"""
 
     def __init__(
         self,
-        size,
+        M=512,
+        K=768,
+        m=4,
+        k=192,
+        s=8,
         num_aie_columns=None,
-        num_channels=None,
-        tile_size=None,
+        weights=None,
+        trace_size=0,
         context=None,
         skip_add_to_list=False,
     ):
-        max_multiple = num_aie_columns * tile_size
-        padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
-        self.orig_size = size
-        self.size = padded_size
-        self.tile_size = tile_size
-
+        self.M = M
+        self.K = K
+        self.m = m
+        self.k = k
+        self.s = s
+        self.trace_size = trace_size
         self.num_aie_columns = num_aie_columns
-        self.num_channels = num_channels
-        # Enforce ShimDMA limits for elementwise_add (uses 2 inputs per core)
-        # Maximum safe configuration: 8 columns × 2 channels = 16 ShimDMA channels
-        total_shimdma_channels = self.num_aie_columns * self.num_channels
-        assert total_shimdma_channels <= 16, "Conservative ShimDMA limit"
 
-        # Artifacts created by set_up_artifacts()
+        used_shimdma_channels = self.num_aie_columns
+        assert used_shimdma_channels <= 16, "Conservative ShimDMA limit"
+
         self.xclbin_artifact = None
         self.insts_artifact = None
+
+        self.weight = weights
 
         AIEOperatorBase.__init__(
             self, context=context, skip_add_to_list=skip_add_to_list
         )
 
-    def get_artifacts(self, prefix="add_"):
+    def get_artifacts(self, prefix="weighted_layer_norm_alt_"):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
-        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
+        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.M}x{self.K}_{self.m}x{self.k}x{self.s}"
+
+        # Save the weight weights to a npy file so that the design.py can load it at compile time
+        weight_file_name = self.context.build_dir / f"{file_name_base}_weights.npy"
+        np.save(weight_file_name, torch_to_numpy(self.weight))
+
+        kernel_archive = f"{file_name_base}_layer_norm_archive.a"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
             import_path=operator_dir / "design.py",
-            callback_fn="my_eltwise_add",
+            callback_fn="my_weighted_layer_norm",
             callback_args=[
                 self.context.device_manager.device_type,
-                self.size,
+                self.M,
+                self.K,
+                self.m,
+                self.k,
+                self.s,
                 self.num_aie_columns,
-                self.num_channels,
-                self.tile_size,
+                weight_file_name,
+                kernel_archive,
                 0,
             ],
         )
@@ -75,12 +89,23 @@ class AIEElementwiseAdd(AIEOperatorBase):
             f"{file_name_base}.xclbin",
             depends=[
                 mlir_artifact,
-                KernelObjectArtifact.new(
-                    f"add.o",
+                KernelArchiveArtifact.new(
+                    kernel_archive,
                     depends=[
-                        SourceArtifact.new(
-                            self.context.base_dir / "aie_kernels" / "generic" / "add.cc"
-                        )
+                        KernelObjectArtifact.new(
+                            f"{file_name_base}_fused_layer_norm.o",
+                            depends=[
+                                SourceArtifact.new(
+                                    self.context.base_dir
+                                    / "aie_kernels"
+                                    / "aie2p"
+                                    / "encoder.cc"
+                                )
+                            ],
+                            extra_flags=[
+                                "-DBUILD_ADDNORM",
+                            ],
+                        ),
                     ],
                 ),
             ],
@@ -90,42 +115,42 @@ class AIEElementwiseAdd(AIEOperatorBase):
             f"{file_name_base}.bin", depends=[mlir_artifact]
         )
 
-        return xclbin_artifact, insts_artifact
+        return (xclbin_artifact, insts_artifact)
 
     def set_up_artifacts(self):
         xclbin_artifact, insts_artifact = self.get_artifacts()
+
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
-        # Runtime setup
-        self.add_buffer("input1", self.size)
-        self.add_buffer("input2", self.size)
-        self.add_buffer("output", self.size)
+        self.add_buffer("input1", self.M * self.K)
+        self.add_buffer("input2", self.M * self.K)
+        self.add_buffer("output", self.M * self.K)
         self.add_kernel(
-            "eltwise_add",
+            "addnorm",
             self.xclbin_artifact,
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_to_runlist("eltwise_add", "input1", "input2", "output")
+        self.add_to_runlist("addnorm", "input1", "input2", "output")
 
     def forward(self, x, y):
         """Forward pass for element-wise addition"""
         applicable = (
             len(x.shape) >= 1
             and len(y.shape) >= 1
-            and x.shape[-1] <= self.size
-            and y.shape[-1] <= self.size
-            and x.numel() <= self.size
-            and y.numel() <= self.size
+            and x.shape[-1] <= self.K
+            and y.shape[-1] <= self.K
+            and x.numel() <= self.M * self.K
+            and y.numel() <= self.M * self.K
             and x.numel() == y.numel()
             and x.shape == y.shape
         )
         if not applicable:
             raise AIEOperatorConstraintError(
-                "AIEElementwiseAdd: incompatible tensor shape(s)"
+                "AIEAddAndNorm: incompatible tensor shape(s)"
             )
 
         # Always flatten to [batch, orig_size]
@@ -134,7 +159,7 @@ class AIEElementwiseAdd(AIEOperatorBase):
         x_flat = x.reshape(batch, -1)
         y_flat = y.reshape(batch, -1)
 
-        pad_len = self.size - x_flat.shape[1]
+        pad_len = self.M * self.K - x_flat.shape[1]
         if pad_len > 0:
             x_flat = torch.nn.functional.pad(x_flat, (0, pad_len))
             y_flat = torch.nn.functional.pad(y_flat, (0, pad_len))
@@ -160,15 +185,13 @@ class AIEElementwiseAdd(AIEOperatorBase):
         y_flat = y.view(-1)
 
         # Verify size matches expected
-        if len(x_flat) != self.size or len(y_flat) != self.size:
+        if len(x_flat) != self.M * self.K or len(y_flat) != self.M * self.K:
             raise AIEOperatorConstraintError(
-                f"Input size x={len(x_flat)}, y={len(y_flat)} doesn't match configured size {self.size}"
+                f"Input size x={len(x_flat)}, y={len(y_flat)} doesn't match configured size {self.M * self.K}"
             )
 
         self.write_buffer("input1", x_flat)
         self.write_buffer("input2", y_flat)
-        test_pattern = np.zeros(len(x_flat), dtype=bfloat16)
-        self.write_buffer("output", test_pattern)
         self.run_runlist()
         result = self.read_buffer_as_torch("output", shape=x_flat.shape, dtype=bfloat16)
 

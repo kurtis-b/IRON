@@ -41,13 +41,14 @@ class AIEContext:
         for op in self.operators:
             op.compile()
 
-    def prepare_runtime(self):
+    def prepare_runtime(self, describe_runtime=True):
         """Setup XRT runtime for all registered operators"""
         if self._runtime_prepared:
             return
 
-        for op in self.operators:
-            op.set_up_runtime()
+        if describe_runtime:
+            for op in self.operators:
+                op.set_up_runtime()
 
         # Pools of preallocated buffer objects; each buffer object is allocated
         # once at program start and then reused across operators where possible.
@@ -229,3 +230,19 @@ class AIEContext:
         )
 
         self._runtime_prepared = True
+
+    def reset_runtime(self):
+        """Drop prepared XRT runtime state so it can be reloaded."""
+        if not self._runtime_prepared:
+            return
+
+        runtime = getattr(self.device_manager, "runtime", None)
+        if runtime is not None and hasattr(runtime, "cleanup"):
+            runtime.cleanup()
+
+        for op in self.operators:
+            op.buffer_bos = {}
+            op.xrt_kernels = {}
+            op.xrt_runlist = None
+
+        self._runtime_prepared = False

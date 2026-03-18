@@ -593,10 +593,9 @@ matmul_vectorized_4x8x8_bf16_bf16(const bfloat16 *__restrict pA, const bfloat16 
 }
 
 template <unsigned m, unsigned k, unsigned n>
-static inline void
-matmul_init_vectorized_4x8x8_bf16_bf16(const bfloat16 *__restrict pA,
-                                       const bfloat16 *__restrict pB,
-                                       bfloat16 *__restrict pC)
+static inline void matmul_init_vectorized_4x8x8_bf16_bf16(const bfloat16 *__restrict pA,
+                                                          const bfloat16 *__restrict pB,
+                                                          bfloat16 *__restrict pC)
 {
     constexpr int r = 4;
     constexpr int s = 8;
@@ -649,10 +648,9 @@ matmul_vectorized_8x8x8_bf16_bf16(const bfloat16 *__restrict pA, const bfloat16 
 }
 
 template <unsigned m, unsigned k, unsigned n>
-static inline void
-matmul_init_vectorized_8x8x8_bf16_bf16(const bfloat16 *__restrict pA,
-                                       const bfloat16 *__restrict pB,
-                                       bfloat16 *__restrict pC)
+static inline void matmul_init_vectorized_8x8x8_bf16_bf16(const bfloat16 *__restrict pA,
+                                                          const bfloat16 *__restrict pB,
+                                                          bfloat16 *__restrict pC)
 {
     constexpr int r = 8;
     constexpr int s = 8;
@@ -1093,7 +1091,7 @@ extern "C" {
     }
 
 #define matmul_init_vectorized_c_func(ctype_in, mlir_type_in, ctype_out, mlir_type_out, r, s, t)                       \
-    void matmul_init_##mlir_type_in##_##mlir_type_out(ctype_in *a_in, ctype_in *b_in, ctype_out *c_out)               \
+    void matmul_init_##mlir_type_in##_##mlir_type_out(ctype_in *a_in, ctype_in *b_in, ctype_out *c_out)                \
     {                                                                                                                  \
         matmul_init_vectorized_##r##x##s##x##t##_##mlir_type_in##_##mlir_type_out<DIM_M, DIM_K, DIM_N>(                \
             a_in, b_in, c_out);                                                                                        \
@@ -1124,7 +1122,7 @@ combos(matmul_vectorized_c_func) combos(matmul_scalar_c_func) combos(zero_vector
 #endif
 
 #ifdef GENERATE_MATMUL_INIT_KERNELS
-    combos(matmul_init_vectorized_c_func)
+        combos(matmul_init_vectorized_c_func)
 #endif
 
 } // extern "C"

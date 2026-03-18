@@ -20,7 +20,18 @@ from iron.common import (
 class AIETranspose(AIEOperatorBase):
     """AIE-accelerated transpose operator"""
 
-    def __init__(self, M, N, num_aie_columns, num_channels, m, n, s, context=None):
+    def __init__(
+        self,
+        M,
+        N,
+        num_aie_columns,
+        num_channels,
+        m,
+        n,
+        s,
+        context=None,
+        skip_add_to_list=False,
+    ):
         self.M = M
         self.N = N
         self.m = m
@@ -40,11 +51,13 @@ class AIETranspose(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
-    def set_up_artifacts(self):
+    def get_artifacts(self, prefix="transpose_"):
         operator_dir = Path(__file__).parent
-        file_name_base = f"transpose_{self.num_columns}c_{self.num_channels}ch_{self.M}x{self.N}_{self.m}x{self.n}_{self.s}s"
+        file_name_base = f"{prefix}{self.num_columns}c_{self.num_channels}ch_{self.M}x{self.N}_{self.m}x{self.n}_{self.s}s"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -89,6 +102,10 @@ class AIETranspose(AIEOperatorBase):
             f"{file_name_base}.bin", depends=[mlir_artifact]
         )
 
+        return xclbin_artifact, insts_artifact
+
+    def set_up_artifacts(self):
+        xclbin_artifact, insts_artifact = self.get_artifacts()
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
         self.add_artifacts([xclbin_artifact, insts_artifact])

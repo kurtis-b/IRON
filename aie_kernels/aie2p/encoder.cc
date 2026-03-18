@@ -937,6 +937,28 @@ void ffn_eltwise_add_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out
 #endif
 
 #ifdef BUILD_ADDNORM
+void ln_passThroughTile_in(const bfloat16 *input,
+                           bfloat16 *output,
+                           const int32_t cols,
+                           const int32_t tileWidth,
+                           const int32_t tileHeight,
+                           const int32_t col_idx)
+{
+    event0();
+    const bfloat16 *pIn = input + col_idx * tileWidth;
+    bfloat16 *pOut = output;
+    AIE_PREPARE_FOR_PIPELINING
+    for (int row = 0; row < tileHeight; ++row) {
+        const bfloat16 *pInRow = pIn + row * cols;
+        for (int col = 0; col < tileWidth; col += 32) {
+            auto reg = ::aie::load_v<32>(pInRow + col);
+            ::aie::store_v(pOut + col, reg);
+        }
+        pOut += tileWidth;
+    }
+    event1();
+}
+
 void fused_add_layer_norm_1outs(const bfloat16 *input,
                                 const bfloat16 *residual,
                                 const bfloat16 *weights,

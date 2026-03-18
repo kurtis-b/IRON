@@ -20,7 +20,15 @@ from iron.common import (
 class AIEGELU(AIEOperatorBase):
     """AIE-accelerated GELU activation function"""
 
-    def __init__(self, size, num_aie_columns, num_channels, tile_size, context=None):
+    def __init__(
+        self,
+        size,
+        num_aie_columns,
+        num_channels,
+        tile_size,
+        context=None,
+        skip_add_to_list=False,
+    ):
         max_multiple = num_aie_columns * tile_size
         padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
         self.orig_size = size
@@ -35,11 +43,13 @@ class AIEGELU(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
-    def set_up_artifacts(self):
+    def get_artifacts(self, prefix="gelu_"):
         operator_dir = Path(__file__).parent
-        file_name_base = f"gelu_{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
+        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -74,11 +84,13 @@ class AIEGELU(AIEOperatorBase):
             f"{file_name_base}.bin", depends=[mlir_artifact]
         )
 
+        return xclbin_artifact, insts_artifact
+
+    def set_up_artifacts(self):
+        xclbin_artifact, insts_artifact = self.get_artifacts()
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
-
-        artifacts = [xclbin_artifact, insts_artifact]
-        self.add_artifacts(artifacts)
+        self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
         self.add_buffer("input", self.size)
