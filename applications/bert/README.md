@@ -200,6 +200,77 @@ agi-demo ALL=(root) NOPASSWD: /usr/bin/turbostat
 agi-demo ALL=(root) NOPASSWD: /usr/sbin/reboot, /usr/bin/systemctl reboot
 ```
 
+## Preflight
+
+Before the first unattended run, do this in order.
+
+1. Verify privileged helpers work non-interactively
+
+```bash
+sudo -n turbostat --Summary --quiet --show PkgWatt,CorWatt,GFXWatt,RAMWatt --interval 0.5 --num_iterations 2 sleep 1
+```
+
+Do not run reboot until you are ready for it, but make sure the sudoers rule exists for the reboot command you plan to use.
+
+2. Warm the NPU topology cache under supervision
+
+This generates a fresh best-topology entry per sequence length for the current machine and software state.
+
+```bash
+cd /home/agi-demo/iron/applications/bert
+source /opt/xilinx/xrt/setup.sh
+source /home/agi-demo/iron/ironenv/bin/activate
+python3 automated_benchmark.py model.safetensors config/config.json \
+  --modes npu \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
+  --num-samples 1 \
+  --warmup-runs 10 \
+  --runs-per-sample 100 \
+  --npu-topology-policy autotune \
+  --npu-autotune-warmup-runs 2 \
+  --npu-autotune-runs 5 \
+  --power-backend none
+```
+
+After that, unattended runs should use:
+- `--npu-topology-policy cache`
+
+3. Run one short supervised suite without reboot
+
+Use a trimmed sequence-length set first and leave out `--power-cycle-cmd`.
+
+```bash
+cd /home/agi-demo/iron/applications/bert
+python3 automated_benchmark.py model.safetensors config/config.json \
+  --modes cpu,npu \
+  --seq-lens 64,512 \
+  --num-samples 1 \
+  --warmup-runs 10 \
+  --runs-per-sample 100 \
+  --npu-topology-policy cache \
+  --power-backend turbostat
+```
+
+4. Verify outputs from the supervised run
+
+Check that these files exist and look sane:
+- [automated_benchmark_latest.csv](/home/agi-demo/iron/applications/bert/automated_benchmark_latest.csv)
+- `automated_benchmark_state.json`
+- `logs/automated_benchmark/*`
+
+For NPU rows in the suite CSV, inspect:
+- `topology_id`
+- `idle_pkg_watt`
+- `avg_pkg_watt`
+- `pseudo_npu_avg_pkg_watt`
+
+5. Enable reboot only after the short supervised run looks correct
+
+At that point:
+- set `power_cycle_cmd` in `benchmark_job.json`
+- install/enable the systemd service
+- start the unattended run
+
 ## Sequence Lengths
 
 Both benchmarks default to:
