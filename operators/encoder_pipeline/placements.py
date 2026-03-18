@@ -8,8 +8,7 @@ COMMON_MEM_TILES = {
     "w_o": 3,
     "o_proj_acc": 4,
     "b_down": 4,
-    "ln2_replay": 4,
-    "ln1_replay": 5,
+    "o_proj_stage": 5,
     "b_up": 5,
     "ffn_down_acc": 6,
     "ln1_stage": 6,
@@ -51,8 +50,7 @@ def _placement(
     ffn_down_acc_by_branch,
     b_up_by_branch,
     b_down_by_branch,
-    ln1_replay=5,
-    ln2_replay=4,
+    o_proj_stage=5,
     sequence_parallel=None,
     shim_tiles=None,
 ):
@@ -70,8 +68,7 @@ def _placement(
         },
         "accumulation_mem_tiles": {
             "o_proj_acc_by_head": o_proj_acc_by_head,
-            "ln1_replay": ln1_replay,
-            "ln2_replay": ln2_replay,
+            "o_proj_stage": o_proj_stage,
             "ffn_down_acc_by_branch": ffn_down_acc_by_branch,
         },
         "weight_mem_tiles": {
@@ -108,8 +105,7 @@ LOW_HEAD_TAILS = {
         "ffn_up_by_branch": ((5, 2), (6, 2), (5, 4), (5, 5)),
         "ffn_down_by_branch": ((5, 3), (6, 3), (6, 4), (6, 5)),
         "ln2_tile": (7, 5),
-        "ln1_replay": 1,
-        "ln2_replay": 3,
+        "o_proj_stage": 1,
         "ffn_down_acc_by_branch": (6, 5, 4, 7),
         "b_up_by_branch": (5, 5, 4, 3),
         "b_down_by_branch": (2, 1, 0, 7),
@@ -137,8 +133,7 @@ LOW_HEAD_TAILS = {
         "ffn_up_by_branch": ((5, 2), (6, 2), (5, 4), (5, 5)),
         "ffn_down_by_branch": ((5, 3), (6, 3), (6, 4), (6, 5)),
         "ln2_tile": (7, 5),
-        "ln1_replay": 1,
-        "ln2_replay": 3,
+        "o_proj_stage": 1,
         "ffn_down_acc_by_branch": (6, 5, 4, 7),
         "b_up_by_branch": (5, 5, 4, 3),
         "b_down_by_branch": (2, 1, 0, 7),
@@ -202,8 +197,7 @@ for seq_len in SCALED_SEQ_LENS:
                     ffn_down_acc_by_branch=tail["ffn_down_acc_by_branch"],
                     b_up_by_branch=tail["b_up_by_branch"],
                     b_down_by_branch=tail["b_down_by_branch"],
-                    ln1_replay=tail.get("ln1_replay", 5),
-                    ln2_replay=tail.get("ln2_replay", 4),
+                    o_proj_stage=tail.get("o_proj_stage", 5),
                 )
 
 for seq_len in SCALED_SEQ_LENS:
@@ -275,7 +269,6 @@ for seq_len in SCALED_SEQ_LENS:
                 ),
                 "lane_o_proj_acc_mem_cols": (2, 3),
                 "lane_tail_mem_cols": (7, 6),
-                "stage_rows_per_lane": (3072 // ffn_tile) * 32,
             },
         )
 
@@ -434,7 +427,6 @@ for seq_len in SCALED_SEQ_LENS:
                         "weight_mem_cols": {"b_up": 7, "b_down": 6},
                     },
                 ),
-                "stage_rows_per_lane": (3072 // ffn_tile) * 32,
             },
         )
 
