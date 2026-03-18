@@ -1,0 +1,59 @@
+{
+  "study_models": [
+    {
+      "study_id": "bert-base-uncased",
+      "hf_model_id": "bert-base-uncased",
+      "family": "bert",
+      "config_file": "config/config.json",
+      "num_hidden_layers": 12,
+      "hidden_size": 768,
+      "num_attention_heads": 12,
+      "intermediate_size": 3072,
+      "npu_ready": true
+    },
+    {
+      "study_id": "bert-large-uncased",
+      "hf_model_id": "bert-large-uncased",
+      "family": "bert",
+      "config_file": "config/config_bert_large.json",
+      "num_hidden_layers": 24,
+      "hidden_size": 1024,
+      "num_attention_heads": 16,
+      "intermediate_size": 4096,
+      "npu_ready": false
+    },
+    {
+      "study_id": "roberta-base",
+      "hf_model_id": "roberta-base",
+      "family": "roberta",
+      "config_file": "config/config_roberta_base.json",
+      "num_hidden_layers": 12,
+      "hidden_size": 768,
+      "num_attention_heads": 12,
+      "intermediate_size": 3072,
+      "npu_ready": true
+    },
+    {
+      "study_id": "roberta-large",
+      "hf_model_id": "roberta-large",
+      "family": "roberta",
+      "config_file": "config/config_roberta_large.json",
+      "num_hidden_layers": 24,
+      "hidden_size": 1024,
+      "num_attention_heads": 16,
+      "intermediate_size": 4096,
+      "npu_ready": false
+    },
+    {
+      "study_id": "distilbert-base-uncased",
+      "hf_model_id": "distilbert-base-uncased",
+      "family": "distilbert",
+      "config_file": "config/config_distilbert_base.json",
+      "num_hidden_layers": 6,
+      "hidden_size": 768,
+      "num_attention_heads": 12,
+      "intermediate_size": 3072,
+      "npu_ready": true
+    }
+  ]
+}
