@@ -3,23 +3,70 @@ SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All righ
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# BERT Encoder Benchmarks
+# Encoder Benchmarks
 
 `applications/bert` now has two explicit benchmark entrypoints:
-- [cpu_inference.py](/home/agi-demo/iron/applications/bert/cpu_inference.py): Hugging Face CPU baseline using `BertModel(add_pooling_layer=False)`
+- [cpu_inference.py](/home/agi-demo/iron/applications/bert/cpu_inference.py): Hugging Face CPU baseline for supported encoder-only families
 - [npu_inference.py](/home/agi-demo/iron/applications/bert/npu_inference.py): local NPU benchmark using the `encoder_pipeline` operator
+- [download_model.py](/home/agi-demo/iron/applications/bert/download_model.py): manifest-driven Hugging Face downloader for supported study models
 - [automated_benchmark.py](/home/agi-demo/iron/applications/bert/automated_benchmark.py): resumable case runner with optional topology autotune, power logging, and power-cycle hooks
 - [run_automated_benchmark_job.py](/home/agi-demo/iron/applications/bert/run_automated_benchmark_job.py): wrapper that runs the automation harness from a JSON job file
 
-The shared code under `src/` is now NPU-only. It exists to build the encoder-pipeline-backed BERT backbone used by `npu_inference.py`. The CPU benchmark uses Hugging Face directly and does not go through `src/`.
+The shared code under `src/` is now NPU-only. It exists to build the encoder-pipeline-backed local backbone used by `npu_inference.py`. The CPU benchmark uses Hugging Face directly and does not go through `src/`.
+
+Currently supported encoder families:
+- `bert`
+- `roberta`
+- `distilbert`
+
+The benchmark family is chosen from `model_config.model_type` in the config JSON.
 
 ## Model Files
 
-Download the base BERT weights and config from Hugging Face:
-- `model.safetensors`
-- `config.json`
+Download `model.safetensors` and `config.json` for one of the supported model configs:
+
+| Local config | Hugging Face model | Weights | Config |
+|---|---|---|---|
+| [config.json](/home/agi-demo/iron/applications/bert/config/config.json) | [`bert-base-uncased`](https://huggingface.co/bert-base-uncased) | [`model.safetensors`](https://huggingface.co/bert-base-uncased/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/bert-base-uncased/resolve/main/config.json) |
+| [config_bert_large.json](/home/agi-demo/iron/applications/bert/config/config_bert_large.json) | [`bert-large-uncased`](https://huggingface.co/bert-large-uncased) | [`model.safetensors`](https://huggingface.co/bert-large-uncased/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/bert-large-uncased/resolve/main/config.json) |
+| [config_roberta_base.json](/home/agi-demo/iron/applications/bert/config/config_roberta_base.json) | [`roberta-base`](https://huggingface.co/roberta-base) | [`model.safetensors`](https://huggingface.co/roberta-base/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/roberta-base/resolve/main/config.json) |
+| [config_roberta_large.json](/home/agi-demo/iron/applications/bert/config/config_roberta_large.json) | [`roberta-large`](https://huggingface.co/roberta-large) | [`model.safetensors`](https://huggingface.co/roberta-large/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/roberta-large/resolve/main/config.json) |
+| [config_distilbert_base.json](/home/agi-demo/iron/applications/bert/config/config_distilbert_base.json) | [`distilbert-base-uncased`](https://huggingface.co/distilbert-base-uncased) | [`model.safetensors`](https://huggingface.co/distilbert-base-uncased/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/distilbert-base-uncased/resolve/main/config.json) |
 
 The scripts expect the safetensors file on the command line. The JSON config passed to the scripts is the local app config under `applications/bert/config/`.
+
+To download supported models into the local benchmark layout automatically:
+
+```bash
+cd applications/bert
+python3 download_model.py --study-id bert-base-uncased
+```
+
+This writes:
+- `applications/bert/models/<study_id>/model.safetensors`
+- `applications/bert/models/<study_id>/config.json`
+
+To download every study target in the manifest:
+
+```bash
+cd applications/bert
+python3 download_model.py --all
+```
+
+Useful options:
+- `--print-plan`: resolve destinations without downloading
+- `--models-root <dir>`: override the local models directory
+- `--force`: overwrite existing local files
+
+Useful config files:
+- [config.json](/home/agi-demo/iron/applications/bert/config/config.json): `bert-base` baseline
+- [config_bert_large.json](/home/agi-demo/iron/applications/bert/config/config_bert_large.json): `bert-large`
+- [config_roberta_base.json](/home/agi-demo/iron/applications/bert/config/config_roberta_base.json): `roberta-base`
+- [config_roberta_large.json](/home/agi-demo/iron/applications/bert/config/config_roberta_large.json): `roberta-large`
+- [config_distilbert_base.json](/home/agi-demo/iron/applications/bert/config/config_distilbert_base.json): `distilbert-base`
+
+Suggested study targets are listed in:
+- [encoder_only_models.json](/home/agi-demo/iron/applications/bert/study/encoder_only_models.json)
 
 ## Installation
 
@@ -52,7 +99,7 @@ python3 cpu_inference.py <weights> <config> \
 ```
 
 Behavior:
-- uses Hugging Face `BertModel(add_pooling_layer=False)`
+- uses the Hugging Face encoder model implied by `model_config.model_type`
 - excludes pooler and classifier head
 - uses a built-in local text corpus
 - generates deterministic local token ids from that corpus, so no tokenizer download is required
@@ -64,6 +111,13 @@ Behavior:
 - `--num-threads` overrides that and forces a single thread-count run
 - writes results to `cpu_benchmark_latest.csv`
 - checkpoints the CSV after each completed sequence length
+
+You can also run by study id after downloading model artifacts:
+
+```bash
+cd applications/bert
+python3 cpu_inference.py --study-id bert-base-uncased
+```
 
 ## NPU Benchmark
 
@@ -88,7 +142,7 @@ python3 npu_inference.py <weights> <config> \
 ```
 
 Behavior:
-- builds a minimal local BERT backbone: embeddings + `encoder_pipeline`
+- builds a minimal local backbone: embeddings + `encoder_pipeline`
 - excludes pooler and classifier head
 - uses the same built-in local text corpus as the CPU benchmark
 - generates the same deterministic local token ids as the CPU benchmark
@@ -99,8 +153,16 @@ Behavior:
   - `fixed`: use the topology encoded in the config
   - `cache`: use a cached topology per sequence length, autotuning cache misses
   - `autotune`: retune every sequence length on each run
+- the NPU path currently expects BERT-like encoder structure; `bert`, `roberta`, and `distilbert` are supported
 - writes results to `npu_benchmark_latest.csv`
 - checkpoints the CSV after each completed sequence length
+
+You can also run by study id after downloading model artifacts:
+
+```bash
+cd applications/bert
+python3 npu_inference.py --study-id bert-base-uncased
+```
 
 ## Automated Benchmarking
 
@@ -115,6 +177,21 @@ Example:
 ```bash
 cd applications/bert
 python3 automated_benchmark.py /path/to/model.safetensors config/config.json \
+  --modes cpu,npu \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
+  --runs-per-sample 100 \
+  --warmup-runs 10 \
+  --npu-topology-policy cache \
+  --power-backend turbostat \
+  --power-cycle-cmd "sudo reboot"
+```
+
+Or resolve the model paths from the study manifest:
+
+```bash
+cd applications/bert
+python3 automated_benchmark.py \
+  --study-id bert-base-uncased \
   --modes cpu,npu \
   --seq-lens 64,128,256,512,1024,2048,4096,8192 \
   --runs-per-sample 100 \
@@ -147,7 +224,7 @@ cp benchmark_job.example.json benchmark_job.json
 ```
 
 2. Review [benchmark_job.example.json](/home/agi-demo/iron/applications/bert/systemd/benchmark_job.example.json) and set:
-- weights/config paths
+- either weights/config paths or `study_id`
 - `modes`
 - sequence lengths
 - CPU thread counts
