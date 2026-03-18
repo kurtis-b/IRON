@@ -26,6 +26,7 @@ SUITE_FIELDNAMES = [
     "num_samples",
     "runs_per_sample",
     "warmup_runs",
+    "model_type",
     "shape",
     "topology_id",
     "parallel_seq",
@@ -60,12 +61,30 @@ SUITE_FIELDNAMES = [
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Automate BERT CPU/NPU benchmark cases with resumable state, optional "
+            "Automate encoder CPU/NPU benchmark cases with resumable state, optional "
             "power logging, and optional power-cycle hooks."
         )
     )
-    parser.add_argument("weights_file_path", type=str)
-    parser.add_argument("config_file_path", type=str)
+    parser.add_argument("weights_file_path", type=str, nargs="?")
+    parser.add_argument("config_file_path", type=str, nargs="?")
+    parser.add_argument(
+        "--study-id",
+        type=str,
+        default=None,
+        help="Resolve weights/config from the study manifest instead of passing paths.",
+    )
+    parser.add_argument(
+        "--study-manifest",
+        type=str,
+        default=None,
+        help="Optional path to the study manifest JSON.",
+    )
+    parser.add_argument(
+        "--models-root",
+        type=str,
+        default=None,
+        help="Optional root directory that holds downloaded study model artifacts.",
+    )
     parser.add_argument(
         "--modes",
         type=str,
@@ -384,8 +403,6 @@ def case_command(args, case, benchmark_csv_path):
             SCRIPT_DIR
             / ("cpu_inference.py" if case["mode"] == "cpu" else "npu_inference.py")
         ),
-        str(Path(args.weights_file_path).resolve()),
-        str(Path(args.config_file_path).resolve()),
         "--seq-lens",
         str(case["seq_len"]),
         "--num-samples",
@@ -399,6 +416,21 @@ def case_command(args, case, benchmark_csv_path):
         "--num-threads",
         str(case["num_threads"]),
     ]
+    if args.study_id is not None:
+        base.extend(["--study-id", args.study_id])
+        if args.study_manifest is not None:
+            base.extend(["--study-manifest", str(Path(args.study_manifest).resolve())])
+        if args.models_root is not None:
+            base.extend(["--models-root", str(Path(args.models_root).resolve())])
+    else:
+        if args.weights_file_path is None or args.config_file_path is None:
+            raise ValueError(
+                "Either pass weights_file_path and config_file_path, or use --study-id"
+            )
+        base[2:2] = [
+            str(Path(args.weights_file_path).resolve()),
+            str(Path(args.config_file_path).resolve()),
+        ]
     if case["mode"] == "npu":
         base.extend(
             [
@@ -498,6 +530,7 @@ def run_case(args, case, logs_dir):
         "num_samples": child_row["num_samples"],
         "runs_per_sample": child_row["runs_per_sample"],
         "warmup_runs": child_row["warmup_runs"],
+        "model_type": child_row.get("model_type", ""),
         "shape": child_row["shape"],
         "topology_id": child_row.get("topology_id", ""),
         "parallel_seq": child_row.get("parallel_seq", ""),

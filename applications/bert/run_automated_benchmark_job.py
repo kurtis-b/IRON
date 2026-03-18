@@ -12,6 +12,9 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 AUTOMATED_BENCHMARK = SCRIPT_DIR / "automated_benchmark.py"
 
 OPTION_MAP = {
+    "study_id": "--study-id",
+    "study_manifest": "--study-manifest",
+    "models_root": "--models-root",
     "modes": "--modes",
     "seq_lens": "--seq-lens",
     "num_samples": "--num-samples",
@@ -35,6 +38,8 @@ OPTION_MAP = {
 PATH_KEYS = {
     "weights_file_path",
     "config_file_path",
+    "study_manifest",
+    "models_root",
     "npu_topology_cache",
     "state_json",
     "output_csv",
@@ -69,17 +74,24 @@ def resolve_path(job_dir, value):
 
 def build_command(job_config_path, job):
     job_dir = Path(job_config_path).resolve().parent
-    if "weights_file_path" not in job or "config_file_path" not in job:
+    has_explicit_paths = "weights_file_path" in job and "config_file_path" in job
+    has_study_id = "study_id" in job
+    if has_explicit_paths == has_study_id:
         raise ValueError(
-            "Job config must include weights_file_path and config_file_path"
+            "Job config must include either weights_file_path/config_file_path or study_id"
         )
 
     command = [
         sys.executable,
         str(AUTOMATED_BENCHMARK),
-        resolve_path(job_dir, job["weights_file_path"]),
-        resolve_path(job_dir, job["config_file_path"]),
     ]
+    if has_explicit_paths:
+        command.extend(
+            [
+                resolve_path(job_dir, job["weights_file_path"]),
+                resolve_path(job_dir, job["config_file_path"]),
+            ]
+        )
 
     for key, flag in OPTION_MAP.items():
         value = job.get(key)
