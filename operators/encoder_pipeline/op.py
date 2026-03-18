@@ -457,6 +457,27 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.buffer_aliases["O"] = "OR"
         self.add_to_runlist("encoder_pipeline", "W_O", "QKV", "OR", "B_Up", "B_Down")
 
+    def _write_qkv_zero_copy(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        q_np = torch_to_numpy(q).reshape(-1)
+        k_np = torch_to_numpy(k).reshape(-1)
+        v_np = torch_to_numpy(v).reshape(-1)
+        qkv_view = self.buffer_view(
+            "QKV",
+            (3 * self.num_heads * self.seq_len * self.d,),
+            dtype=bfloat16,
+        )
+        q_size = q_np.size
+        k_size = k_np.size
+        qkv_view[:q_size] = q_np
+        qkv_view[q_size : q_size + k_size] = k_np
+        qkv_view[q_size + k_size :] = v_np
+
+    def _write_or_zero_copy(self, r: torch.Tensor | None):
+        or_view = self.buffer_view("OR", self._or_buffer_shape(), dtype=bfloat16)
+        or_view.fill(0)
+        if r is not None:
+            or_view[self.seq_len : 2 * self.seq_len, :] = torch_to_numpy(r)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -521,29 +542,8 @@ class AIEEncoderPipeline(AIEOperatorBase):
         b_up: torch.Tensor | None,
         b_down: torch.Tensor | None,
     ):
-        q_np = torch_to_numpy(q)
-        k_np = torch_to_numpy(k)
-        v_np = torch_to_numpy(v)
-        qkv_np = np.concatenate((q_np, k_np, v_np), axis=0)
-
-        if r is not None:
-            r_np = torch_to_numpy(r)
-        else:
-            r_np = np.zeros((self.seq_len, self.embed_sz), dtype=bfloat16)
-        or_np = np.concatenate((np.zeros_like(r_np), r_np), axis=0)
-
-        ln1_stage_rows = self._or_buffer_shape()[0] - 2 * self.seq_len
-        if ln1_stage_rows > 0:
-            or_np = np.concatenate(
-                (
-                    or_np,
-                    np.zeros((ln1_stage_rows, self.embed_sz), dtype=or_np.dtype),
-                ),
-                axis=0,
-            )
-
-        self.write_buffer("QKV", qkv_np)
-        self.write_buffer("OR", or_np)
+        self._write_qkv_zero_copy(q, k, v)
+        self._write_or_zero_copy(r)
         if w_o is not None:
             self.write_buffer("W_O", torch_to_numpy(w_o))
         if b_up is not None:
@@ -555,4 +555,4 @@ class AIEEncoderPipeline(AIEOperatorBase):
         o_np = self.read_buffer(
             "O", shape=(self.seq_len, self.embed_sz), dtype=bfloat16
         )
-        return numpy_to_torch(np.asarray(o_np))
+        return numpy_to_torch(o_np)
