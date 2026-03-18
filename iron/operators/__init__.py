@@ -22,3 +22,5 @@ from .swiglu_decode.op import AIESwiGLUDecode
 from .swiglu_prefill.op import AIESwiGLUPrefill
 from .tanh.op import AIETanh
 from .transpose.op import AIETranspose
+
+from .encoder_pipeline.op import AIEEncoderPipeline

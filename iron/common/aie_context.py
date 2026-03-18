@@ -27,12 +27,13 @@ class AIEContext:
         self.mlir_verbose = bool(mlir_verbose)
         self._runtime_prepared = False
 
-    def register_operator(self, operator):
+    def register_operator(self, operator, skip_add_to_list=False):
         """Register an operator with this context"""
         if self._runtime_prepared:
             raise RuntimeError("Cannot register operators after runtime is prepared")
         operator.context = self
-        self.operators.append(operator)
+        if not skip_add_to_list:
+            self.operators.append(operator)
 
     def compile_all(self):
         """Compile all registered operators"""
@@ -135,7 +136,11 @@ class AIEContext:
 
             # Allocate buffers
             buffer_allocations = {}
+            alias_map = op.buffer_aliases
             for buffer_name, buffer_min_size in op.buffers.items():
+                if buffer_name in alias_map:
+                    # Alias BOs are resolved after target buffers are allocated.
+                    continue
                 if buffer_name in op.buffer_static_data:
                     static_data = op.buffer_static_data[buffer_name]
                     op.buffer_bos[buffer_name] = self.static_data_pool[static_data]
@@ -162,6 +167,14 @@ class AIEContext:
                 buffer_allocations[buffer_name] = (alloc_pool, alloc_idx)
                 op.buffer_bos[buffer_name] = bo_pools[alloc_pool][alloc_idx]
 
+            # Resolve alias BOs after concrete allocations.
+            for alias_name, target_name in alias_map.items():
+                if target_name not in op.buffer_bos:
+                    raise RuntimeError(
+                        f"Alias target buffer '{target_name}' not allocated for alias '{alias_name}'."
+                    )
+                op.buffer_bos[alias_name] = op.buffer_bos[target_name]
+
             # Setup runlist
             _, (first_xclbin, first_xclbin_kernel_name, first_insts) = next(
                 iter(op.kernels.items())
@@ -171,6 +184,12 @@ class AIEContext:
             )
             context = handle.context
             if self.use_runlist:
+                if any(
+                    op.xrt_kernels[kernel_name][0] != context
+                    for (kernel_name, *_) in op.runlist
+                ):
+                    op.xrt_runlist = None
+                    continue
                 op.xrt_runlist = pyxrt.runlist(context)
                 for i, (kernel_name, *buffer_args) in enumerate(op.runlist):
                     this_context, xrt_kernel, insts_bo, insts_len = op.xrt_kernels[

@@ -152,12 +152,16 @@ class PythonGeneratedMLIRArtifact(CompilationArtifact):
         callback_args=None,
         callback_kwargs=None,
         requires_context=False,
+        tracked_paths=None,
     ):
         self.import_path = import_path
         self.callback_fn = callback_fn
         self.callback_args = callback_args if callback_args is not None else []
         self.callback_kwargs = callback_kwargs if callback_kwargs is not None else {}
         self.requires_context = requires_context
+        self.tracked_paths = [Path(import_path)] + [
+            Path(p) for p in (tracked_paths if tracked_paths is not None else [])
+        ]
         super().__init__(path)
 
     def is_available(self):
@@ -165,10 +169,11 @@ class PythonGeneratedMLIRArtifact(CompilationArtifact):
             return True
         is_available = super().is_available()
         if is_available:
-            # Force regeneration if the Python source is changed
-            return os.path.getmtime(str(self.path)) >= os.path.getmtime(
-                self.import_path
+            # Force regeneration if any tracked Python source is changed.
+            newest_input = max(
+                os.path.getmtime(str(path)) for path in self.tracked_paths
             )
+            return os.path.getmtime(str(self.path)) >= newest_input
         return is_available
 
 
@@ -310,6 +315,7 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
 class AieccCompilationRule(CompilationRule):
     def __init__(self, build_dir, peano_dir, mlir_aie_dir, *args, **kwargs):
         self.build_dir = build_dir
+        self.aie_opt_path = Path(mlir_aie_dir) / "bin" / "aie-opt"
         self.aiecc_path = Path(mlir_aie_dir) / "bin" / "aiecc.py"
         self.peano_dir = peano_dir
         super().__init__(*args, **kwargs)
@@ -351,6 +357,7 @@ class AieccCompilationRule(CompilationRule):
 
         # Now we know for each mlir source if we need to generate an xclbin, an insts.bin or both for it
         for mlir_source in mlir_sources:
+            lowered_mlir_source = self._preprocess_mlir_source(mlir_source)
             # Build aiecc command using Peano
             compile_cmd = [
                 "python",
@@ -384,10 +391,10 @@ class AieccCompilationRule(CompilationRule):
                 if not do_compile_xclbin:
                     compile_cmd += ["--no-compile"]
                 compile_cmd += first_insts_bin.extra_flags + [
-                    "--aie-generate-npu",
+                    "--aie-generate-npu-insts",
                     "--npu-insts-name=" + str(first_insts_bin.path),
                 ]
-            compile_cmd += [str(mlir_source.path)]
+            compile_cmd += [str(lowered_mlir_source)]
 
             env = os.environ.copy()
             logging.debug(f"Compiling MLIR with command: {' '.join(compile_cmd)}")
@@ -426,6 +433,39 @@ class AieccCompilationRule(CompilationRule):
 
         # With the newly generated files, is_available() should now return True on the Xclbin and InstsBin targets
         return artifacts
+
+    def _preprocess_mlir_source(self, mlir_source):
+        source_text = mlir_source.path.read_text()
+        if "aie.memtile_row_store" not in source_text:
+            return mlir_source.path
+
+        lowered_mlir_source = (
+            Path(self.build_dir) / f"{mlir_source.path.stem}.row_store_lowered.mlir"
+        )
+        preprocess_cmd = [
+            str(self.aie_opt_path),
+            "--aie-lower-memtile-row-stores",
+            str(mlir_source.path),
+            "-o",
+            str(lowered_mlir_source),
+        ]
+        logging.debug(
+            f"Lowering memtile row stores with command: {' '.join(preprocess_cmd)}"
+        )
+        if self.dry_run is None:
+            result = subprocess.run(
+                preprocess_cmd,
+                cwd=str(self.build_dir),
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env=os.environ.copy(),
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Row-store lowering for {mlir_source.path} failed: {result.stderr}"
+                )
+        return lowered_mlir_source
 
 
 class PeanoCompilationRule(CompilationRule):

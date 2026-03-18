@@ -27,13 +27,17 @@ class AIEOperatorBase(ABC):
             AIEOperatorBase._default_context = AIEContext()
         return AIEOperatorBase._default_context
 
-    def __init__(self, context=None):
+    def __init__(self, context=None, skip_add_to_list=False):
+        # skip_add_to_list is for cases where the operator is a runlist implementation, which puts
+        # togegther a sequence of operators, which also execute this constructor. Those operators should not register
+        # themselves in the context's runlist again, otherwise the runtime setup will create kernels for them again.
         self.artifacts = (
             []
         )  # CompilationArtifact objects are uniqued within the context
         self.kernels = {}  # Name -> (xclbin_path, xclbin_kernel_name, insts_path)
         self.buffers = {}  # Name -> required buffer size in bytes
         self.buffer_static_data = {}
+        self.buffer_aliases = {}  # Alias name -> target buffer name
         self.runlist = (
             []
         )  # List of (kernel_name, buffers_name, buffer_name...), will be executed in sequence
@@ -47,7 +51,7 @@ class AIEOperatorBase(ABC):
 
         if context is None:
             context = self.get_default_context()
-        context.register_operator(self)
+        context.register_operator(self, skip_add_to_list=skip_add_to_list)
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
@@ -89,13 +93,14 @@ class AIEOperatorBase(ABC):
     def get_bo(self, buffer_name):
         return self.buffer_bos[buffer_name]
 
+    def buffer_view(self, buffer_name, shape, dtype=bfloat16):
+        """Return a mapped numpy view into an existing BO without copying."""
+        mv = self.get_bo(buffer_name).map()
+        return np.frombuffer(mv, dtype=dtype, count=np.prod(shape)).reshape(shape)
+
     def read_buffer(self, buffer_name, shape, copy=False, dtype=bfloat16):
         """Read buffer and return values as a numpy array"""
-        # Create a byte accessible memory view of the buffer object
-        mv = self.get_bo(buffer_name).map()
-
-        # Interpret the buffer as a 1-dimensional array then change its view to the expected shape
-        arr = np.frombuffer(mv, dtype=dtype, count=np.prod(shape)).reshape(shape)
+        arr = self.buffer_view(buffer_name, shape, dtype=dtype)
 
         # Return an independent copy of the array if needed
         return arr.copy() if copy else arr
@@ -181,6 +186,13 @@ class AIEOperatorBase(ABC):
             else:
                 artifact.set_path(context.build_dir / artifact.path)
             todo.extend(artifact.depends)
+            logging.debug(
+                f"Moved artifact: {artifact.path}, depends on {len(artifact.depends)}, left {len(todo)}."
+            )
+            if len(artifact.depends) > 1:
+                logging.debug(
+                    f"    Depends on more than 1: {', '.join(str(d.path) for d in artifact.depends)}"
+                )
 
     def run_runlist(self):
         elapsed = 0.0
