@@ -19,7 +19,7 @@ from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.controlflow import range_
 from aie.iron.device import NPU2, Tile
 from aie.iron.placers import SequentialPlacer
-from .placements import TOPOLOGY_PLACEMENTS
+from iron.operators.encoder_pipeline.placements import TOPOLOGY_PLACEMENTS
 
 BASE_DIR = Path(__file__).parent
 
