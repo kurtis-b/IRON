@@ -22,7 +22,6 @@ Current design points:
 - large non-seq multi-head cases chunk host `K`/`V` fills so long sequence lengths fit DMA-BD limits
 - sequence-parallel uses hardcoded lane placements
 - unified sequence-parallel is enabled through `parallel_seq=4`
-- split front/tail fallback is only used for `parallel_seq > 4`
 
 Useful implementation files:
 

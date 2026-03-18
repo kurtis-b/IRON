@@ -50,7 +50,6 @@ def main():
     argparser.add_argument("--trace-size", type=int, default=0)
     argparser.add_argument("--ln1-weight-file", type=str, default=None)
     argparser.add_argument("--ln2-weight-file", type=str, default=None)
-    argparser.add_argument("--phase", type=str, default="all")
     argparser.add_argument(
         "--output-file-path",
         "-o",
@@ -78,7 +77,6 @@ def main():
         nB_tiles_distributed=args.n_b_tiles_distributed,
         ffn_intermediate_size=args.ffn_intermediate_size,
         o_proj_acc_group_size=args.o_proj_acc_group_size,
-        phase=args.phase,
     )
 
     output_file_path = Path(args.output_file_path)
@@ -105,7 +103,6 @@ def encoder_pipeline(
     nB_tiles_distributed: int = 1,
     ffn_intermediate_size: int | None = None,
     o_proj_acc_group_size: int = 1,
-    phase: str = "all",
 ):
     if ffn_intermediate_size is None:
         ffn_intermediate_size = 4 * heads * d
@@ -137,10 +134,6 @@ def encoder_pipeline(
 
     if trace_size != 0:
         raise ValueError("encoder_pipeline does not support tracing")
-    if phase not in ("all", "front", "tail"):
-        raise ValueError(
-            f"encoder_pipeline phase must be one of all/front/tail (got {phase})"
-        )
     if o_proj_acc_group_size != 1:
         raise ValueError(
             "encoder_pipeline only supports o_proj_acc_group_size=1 in the "
@@ -239,16 +232,6 @@ def encoder_pipeline(
                 f"memtile per sequence lane ({len(sequence_parallel['lane_tail_mem_cols'])} "
                 f"!= {parallel_seq})"
             )
-        lane_ln1_replay_mem_cols = sequence_parallel.get("lane_ln1_replay_mem_cols")
-        if (
-            lane_ln1_replay_mem_cols is not None
-            and len(lane_ln1_replay_mem_cols) != parallel_seq
-        ):
-            raise ValueError(
-                "encoder_pipeline sequence-parallel placement must provide one "
-                "LN1 replay memtile per sequence lane "
-                f"({len(lane_ln1_replay_mem_cols)} != {parallel_seq})"
-            )
         lane_ffn_down_acc_mem_cols = sequence_parallel.get("lane_ffn_down_acc_mem_cols")
         if (
             lane_ffn_down_acc_mem_cols is not None
@@ -258,16 +241,6 @@ def encoder_pipeline(
                 "encoder_pipeline sequence-parallel placement must provide one "
                 "FFN-down accumulation memtile per sequence lane "
                 f"({len(lane_ffn_down_acc_mem_cols)} != {parallel_seq})"
-            )
-        lane_ln2_replay_mem_cols = sequence_parallel.get("lane_ln2_replay_mem_cols")
-        if (
-            lane_ln2_replay_mem_cols is not None
-            and len(lane_ln2_replay_mem_cols) != parallel_seq
-        ):
-            raise ValueError(
-                "encoder_pipeline sequence-parallel placement must provide one "
-                "LN2 replay memtile per sequence lane "
-                f"({len(lane_ln2_replay_mem_cols)} != {parallel_seq})"
             )
         transport_groups = sequence_parallel.get("transport_groups")
         if transport_groups is not None:
@@ -287,7 +260,7 @@ def encoder_pipeline(
                 )
     ffn_col_group_count = ln1_broadcast_groups // effective_ffn_branches
     ln_tiles_per_q_block = proj_acc_depth
-    nonseq_ln1_no_replay = sequence_parallel is None
+    use_split_ln1_inputs = sequence_parallel is None and parallel_heads > 1
     ln1_dram_stage_rows = (
         seq_len if sequence_parallel is not None else proj_acc_depth * seq_tile
     )
@@ -319,7 +292,7 @@ def encoder_pipeline(
     k_mem_col = placement["mem_tiles"]["k"]
     v_mem_col = placement["mem_tiles"]["v"]
     ow_mem_col = placement["mem_tiles"]["w_o"]
-    o_proj_stage_mem_col = accumulation_mem_tiles["ln1_replay"]
+    o_proj_stage_mem_col = accumulation_mem_tiles["o_proj_stage"]
     ln1_stage_col = placement["mem_tiles"]["ln1_stage"]
     residual_mem_col = placement["mem_tiles"]["residual"]
     ffn_residual_mem_col = placement["mem_tiles"]["ffn_residual"]
@@ -585,7 +558,7 @@ def encoder_pipeline(
     ]
     outOProjInput = ObjectFifo(o_ty, name="outOProjInput", depth=2)
 
-    if nonseq_ln1_no_replay and parallel_heads > 1:
+    if use_split_ln1_inputs:
         oProjStagePart = ObjectFifo(o_ty, name="oProjStagePart", depth=1)
         oProjStage = oProjStagePart.cons(depth=ln_tiles_per_q_block).forward(
             obj_type=o_ty,
@@ -1016,126 +989,6 @@ def encoder_pipeline(
             pack_stats(stats_sum_buf, stats_sumsq_buf, elem_stats, seq_tile)
             of_stats_out.release(1)
 
-    def core_fn_ln1_fused(
-        of_in_o_proj,
-        of_replay_curr,
-        of_replay_new,
-        of_in_residual,
-        sum_buf,
-        sumsq_buf,
-        weights,
-        of_out_up,
-        fused_add_layer_norm,
-        calc_sum_sumsq,
-        unpack_stats,
-        zero_f32,
-        copy,
-    ):
-        use_packed_ln1_stats = emb_tile >= 2 * seq_tile
-        for _ in range_(sys.maxsize):
-            if not use_packed_ln1_stats:
-                zero_f32(sum_buf, seq_tile)
-                zero_f32(sumsq_buf, seq_tile)
-            for _ in range_(ln_tiles_per_q_block):
-                elem_in = of_in_o_proj.acquire(1)
-                if not use_packed_ln1_stats:
-                    calc_sum_sumsq(elem_in, sum_buf, sumsq_buf)
-                elem_replay = of_replay_new.acquire(1)
-                copy(elem_in, elem_replay, seq_tile * emb_tile)
-                of_replay_new.release(1)
-                of_in_o_proj.release(1)
-            if use_packed_ln1_stats:
-                elem_stats = of_in_o_proj.acquire(1)
-                unpack_stats(elem_stats, sum_buf, sumsq_buf, seq_tile)
-                of_in_o_proj.release(1)
-            for col_idx in range_(ln_tiles_per_q_block):
-                col_i32 = index.casts(T.i32(), col_idx)
-                elem_in = of_replay_curr.acquire(1)
-                elem_residual = of_in_residual.acquire(1)
-                elem_out_up = of_out_up.acquire(1)
-                fused_add_layer_norm(
-                    elem_in,
-                    elem_residual,
-                    weights,
-                    sum_buf,
-                    sumsq_buf,
-                    elem_out_up,
-                    embed_sz,
-                    col_i32,
-                )
-                elem_replay = of_replay_new.acquire(1)
-                copy(elem_out_up, elem_replay, seq_tile * emb_tile)
-                of_replay_new.release(1)
-                of_out_up.release(1)
-                of_replay_curr.release(1)
-                of_in_residual.release(1)
-            for group_idx in range_(ln1_broadcast_groups - 1):
-                group_idx_i32 = index.casts(T.i32(), group_idx)
-                replay_next_group = group_idx_i32 < (ln1_broadcast_groups - 2)
-                for _ in range_(ln_tiles_per_q_block):
-                    elem_in = of_replay_curr.acquire(1)
-                    elem_residual = of_in_residual.acquire(1)
-                    elem_out_up = of_out_up.acquire(1)
-                    copy(elem_in, elem_out_up, seq_tile * emb_tile)
-                    of_out_up.release(1)
-                    with if_(replay_next_group):
-                        elem_replay = of_replay_new.acquire(1)
-                        copy(elem_in, elem_replay, seq_tile * emb_tile)
-                        of_replay_new.release(1)
-                    of_replay_curr.release(1)
-                    of_in_residual.release(1)
-
-    def core_fn_ln1_stage_once(
-        of_in_o_proj,
-        of_replay_curr,
-        of_replay_new,
-        of_in_residual,
-        sum_buf,
-        sumsq_buf,
-        weights,
-        of_out_stage,
-        fused_add_layer_norm,
-        calc_sum_sumsq,
-        unpack_stats,
-        zero_f32,
-        copy,
-    ):
-        use_packed_ln1_stats = emb_tile >= 2 * seq_tile
-        for _ in range_(sys.maxsize):
-            if not use_packed_ln1_stats:
-                zero_f32(sum_buf, seq_tile)
-                zero_f32(sumsq_buf, seq_tile)
-            for _ in range_(ln_tiles_per_q_block):
-                elem_in = of_in_o_proj.acquire(1)
-                if not use_packed_ln1_stats:
-                    calc_sum_sumsq(elem_in, sum_buf, sumsq_buf)
-                elem_replay = of_replay_new.acquire(1)
-                copy(elem_in, elem_replay, seq_tile * emb_tile)
-                of_replay_new.release(1)
-                of_in_o_proj.release(1)
-            if use_packed_ln1_stats:
-                elem_stats = of_in_o_proj.acquire(1)
-                unpack_stats(elem_stats, sum_buf, sumsq_buf, seq_tile)
-                of_in_o_proj.release(1)
-            for col_idx in range_(ln_tiles_per_q_block):
-                col_i32 = index.casts(T.i32(), col_idx)
-                elem_in = of_replay_curr.acquire(1)
-                elem_residual = of_in_residual.acquire(1)
-                elem_out = of_out_stage.acquire(1)
-                fused_add_layer_norm(
-                    elem_in,
-                    elem_residual,
-                    weights,
-                    sum_buf,
-                    sumsq_buf,
-                    elem_out,
-                    embed_sz,
-                    col_i32,
-                )
-                of_out_stage.release(1)
-                of_replay_curr.release(1)
-                of_in_residual.release(1)
-
     def core_fn_ln1_stage_from_stats(
         of_in_o_proj,
         of_in_residual,
@@ -1329,49 +1182,6 @@ def encoder_pipeline(
                 of_curr_acc.release(1)
                 of_out.release(1)
 
-    def core_fn_add_norm2(
-        of_in1,
-        of_in2,
-        of_replay_curr,
-        of_replay_new,
-        sum_buf,
-        sumsq_buf,
-        weights,
-        of_out,
-        fused_add_layer_norm,
-        calc_sum_sumsq,
-        zero_f32,
-        copy,
-    ):
-        for _ in range_(sys.maxsize):
-            zero_f32(sum_buf, seq_tile)
-            zero_f32(sumsq_buf, seq_tile)
-            for _ in range_(proj_acc_depth):
-                elem_in1 = of_in1.acquire(1)
-                calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
-                elem_replay = of_replay_new.acquire(1)
-                copy(elem_in1, elem_replay, seq_tile * emb_tile)
-                of_replay_new.release(1)
-                of_in1.release(1)
-            for col_idx in range_(proj_acc_depth):
-                col_i32 = index.casts(T.i32(), col_idx)
-                elem_ffn = of_replay_curr.acquire(1)
-                elem_residual = of_in2.acquire(1)
-                elem_out = of_out.acquire(1)
-                fused_add_layer_norm(
-                    elem_ffn,
-                    elem_residual,
-                    weights,
-                    sum_buf,
-                    sumsq_buf,
-                    elem_out,
-                    embed_sz,
-                    col_i32,
-                )
-                of_out.release(1)
-                of_in2.release(1)
-                of_replay_curr.release(1)
-
     def core_fn_add_norm2_from_stats(
         of_in1,
         of_in2,
@@ -1490,14 +1300,8 @@ def encoder_pipeline(
         lane_tiles = sequence_parallel["lane_tiles"]
         lane_o_proj_acc_mem_cols = sequence_parallel["lane_o_proj_acc_mem_cols"]
         lane_tail_mem_cols = sequence_parallel["lane_tail_mem_cols"]
-        lane_ln1_replay_mem_cols = sequence_parallel.get(
-            "lane_ln1_replay_mem_cols", lane_tail_mem_cols
-        )
         lane_ffn_down_acc_mem_cols = sequence_parallel.get(
             "lane_ffn_down_acc_mem_cols", lane_tail_mem_cols
-        )
-        lane_ln2_replay_mem_cols = sequence_parallel.get(
-            "lane_ln2_replay_mem_cols", lane_tail_mem_cols
         )
         shared_forward_depth = max(of_depth, group_size)
 
@@ -2379,507 +2183,258 @@ def encoder_pipeline(
             raise ValueError("Sequence-parallel LN1 refill tap count mismatch")
 
         rt = Runtime()
-        if phase == "front":
-            with rt.sequence(W_O_ty, QKV_ty, OR_ty) as (W_O, QKV, OR):
-                for lane_idx in range(parallel_seq):
-                    rt.start(lane_qk_workers[lane_idx])
-                    rt.start(lane_softmax_workers[lane_idx])
-                    rt.start(lane_pv_workers[lane_idx])
-                    rt.start(lane_o_proj_workers[lane_idx])
-                    rt.start(lane_ln1_workers[lane_idx])
+        with rt.sequence(W_O_ty, QKV_ty, OR_ty, B_Up_ty, B_Down_ty) as (
+            W_O,
+            QKV,
+            OR,
+            B_Up,
+            B_Down,
+        ):
+            for lane_idx in range(parallel_seq):
+                rt.start(lane_qk_workers[lane_idx])
+                rt.start(lane_softmax_workers[lane_idx])
+                rt.start(lane_pv_workers[lane_idx])
+                rt.start(lane_o_proj_workers[lane_idx])
+                rt.start(lane_ln1_workers[lane_idx])
+                rt.start(lane_ffn_up_workers[lane_idx])
+                rt.start(lane_ffn_down_workers[lane_idx])
+                rt.start(lane_ln2_workers[lane_idx])
 
-                pending_tail_tg = None
-                for lane_batch_idx in range(q_blocks_per_lane):
-                    for head_group_idx in range(num_qkv_head_block_per_parallel_head):
-                        tg_head = rt.task_group()
-                        if unified_qr_split is not None:
+            pending_tail_tg = None
+            for lane_batch_idx in range(q_blocks_per_lane):
+                for head_group_idx in range(num_qkv_head_block_per_parallel_head):
+                    tg_head = rt.task_group()
+                    if unified_qr_split is not None:
+                        rt.fill(
+                            unified_inQSeq.prod(),
+                            QKV,
+                            tap=unified_q_batch_tiles[
+                                lane_batch_idx * num_qkv_head_block_per_parallel_head
+                                + head_group_idx
+                            ],
+                            placement=Tile(
+                                col=unified_qr_split["q_shim_col"],
+                                row=0,
+                            ),
+                            task_group=tg_head,
+                            wait=True,
+                        )
+                    if unified_inOWSeq is not None:
+                        rt.fill(
+                            unified_inOWSeq.prod(),
+                            W_O,
+                            tap=wo_tiles[head_group_idx],
+                            placement=Tile(
+                                col=unified_shared_streams["w_o"]["shim_col"],
+                                row=0,
+                            ),
+                            task_group=tg_head,
+                            wait=True,
+                        )
+                    for group_idx in range(group_count):
+                        group_batch_idx = lane_batch_idx * group_count + group_idx
+                        if unified_qr_split is None:
                             rt.fill(
-                                unified_inQSeq.prod(),
+                                group_inQSeq[group_idx].prod(),
                                 QKV,
-                                tap=unified_q_batch_tiles[
-                                    lane_batch_idx
+                                tap=q_batch_tiles[
+                                    group_batch_idx
                                     * num_qkv_head_block_per_parallel_head
                                     + head_group_idx
                                 ],
                                 placement=Tile(
-                                    col=unified_qr_split["q_shim_col"],
+                                    col=transport_groups[group_idx].get(
+                                        "shim_cols", default_group_shim_cols
+                                    )["q"],
                                     row=0,
                                 ),
                                 task_group=tg_head,
                                 wait=True,
                             )
-                        if unified_inOWSeq is not None:
+                        rt.fill(
+                            group_inKSeq[group_idx].prod(),
+                            QKV,
+                            tap=k_tiles[head_group_idx],
+                            placement=Tile(
+                                col=transport_groups[group_idx].get(
+                                    "shim_cols", default_group_shim_cols
+                                )["k"],
+                                row=0,
+                            ),
+                            task_group=tg_head,
+                            wait=True,
+                        )
+                        rt.fill(
+                            group_inVSeq[group_idx].prod(),
+                            QKV,
+                            tap=v_tiles[head_group_idx],
+                            placement=Tile(
+                                col=transport_groups[group_idx].get(
+                                    "shim_cols", default_group_shim_cols
+                                )["v"],
+                                row=0,
+                            ),
+                            task_group=tg_head,
+                            wait=True,
+                        )
+                        if unified_inOWSeq is None:
                             rt.fill(
-                                unified_inOWSeq.prod(),
+                                group_inOWSeq[group_idx].prod(),
                                 W_O,
                                 tap=wo_tiles[head_group_idx],
                                 placement=Tile(
-                                    col=unified_shared_streams["w_o"]["shim_col"],
-                                    row=0,
-                                ),
-                                task_group=tg_head,
-                                wait=True,
-                            )
-                        for group_idx in range(group_count):
-                            group_batch_idx = lane_batch_idx * group_count + group_idx
-                            if unified_qr_split is None:
-                                rt.fill(
-                                    group_inQSeq[group_idx].prod(),
-                                    QKV,
-                                    tap=q_batch_tiles[
-                                        group_batch_idx
-                                        * num_qkv_head_block_per_parallel_head
-                                        + head_group_idx
-                                    ],
-                                    placement=Tile(
-                                        col=transport_groups[group_idx].get(
-                                            "shim_cols", default_group_shim_cols
-                                        )["q"],
-                                        row=0,
-                                    ),
-                                    task_group=tg_head,
-                                    wait=True,
-                                )
-                            rt.fill(
-                                group_inKSeq[group_idx].prod(),
-                                QKV,
-                                tap=k_tiles[head_group_idx],
-                                placement=Tile(
                                     col=transport_groups[group_idx].get(
                                         "shim_cols", default_group_shim_cols
-                                    )["k"],
+                                    )["w_o"],
                                     row=0,
                                 ),
                                 task_group=tg_head,
                                 wait=True,
                             )
-                            rt.fill(
-                                group_inVSeq[group_idx].prod(),
-                                QKV,
-                                tap=v_tiles[head_group_idx],
-                                placement=Tile(
-                                    col=transport_groups[group_idx].get(
-                                        "shim_cols", default_group_shim_cols
-                                    )["v"],
-                                    row=0,
-                                ),
-                                task_group=tg_head,
-                                wait=True,
-                            )
-                            if unified_inOWSeq is None:
-                                rt.fill(
-                                    group_inOWSeq[group_idx].prod(),
-                                    W_O,
-                                    tap=wo_tiles[head_group_idx],
-                                    placement=Tile(
-                                        col=transport_groups[group_idx].get(
-                                            "shim_cols", default_group_shim_cols
-                                        )["w_o"],
-                                        row=0,
-                                    ),
-                                    task_group=tg_head,
-                                    wait=True,
-                                )
-                        rt.finish_task_group(tg_head)
+                    rt.finish_task_group(tg_head)
 
-                    tg_residual = rt.task_group()
-                    if unified_qr_split is not None:
+                tg_residual = rt.task_group()
+                if unified_qr_split is not None:
+                    rt.fill(
+                        unified_inRSeq.prod(),
+                        OR,
+                        tap=unified_joined_r_tiles[lane_batch_idx],
+                        placement=Tile(
+                            col=unified_qr_split["residual_shim_col"],
+                            row=0,
+                        ),
+                        task_group=tg_residual,
+                        wait=False,
+                    )
+                else:
+                    for group_idx in range(group_count):
+                        group_batch_idx = lane_batch_idx * group_count + group_idx
                         rt.fill(
-                            unified_inRSeq.prod(),
+                            group_inRSeq[group_idx].prod(),
                             OR,
-                            tap=unified_joined_r_tiles[lane_batch_idx],
+                            tap=joined_r_tiles[group_batch_idx],
                             placement=Tile(
-                                col=unified_qr_split["residual_shim_col"],
+                                col=transport_groups[group_idx].get(
+                                    "joined_or_shim_cols",
+                                    default_group_joined_or_shim_cols,
+                                )["residual"],
                                 row=0,
                             ),
                             task_group=tg_residual,
                             wait=False,
                         )
-                    else:
-                        for group_idx in range(group_count):
-                            group_batch_idx = lane_batch_idx * group_count + group_idx
-                            rt.fill(
-                                group_inRSeq[group_idx].prod(),
-                                OR,
-                                tap=joined_r_tiles[group_batch_idx],
-                                placement=Tile(
-                                    col=transport_groups[group_idx].get(
-                                        "joined_or_shim_cols",
-                                        default_group_joined_or_shim_cols,
-                                    )["residual"],
-                                    row=0,
-                                ),
-                                task_group=tg_residual,
-                                wait=False,
-                            )
-                    rt.finish_task_group(tg_residual)
+                rt.finish_task_group(tg_residual)
 
-                    tg_ln1_drain = rt.task_group()
-                    for group_idx in range(group_count):
-                        group_batch_idx = lane_batch_idx * group_count + group_idx
-                        rt.drain(
-                            group_ln1StageJoined[group_idx].cons(),
-                            OR,
-                            tap=joined_i_tiles[group_batch_idx],
-                            placement=Tile(
-                                col=transport_groups[group_idx].get(
-                                    "joined_or_shim_cols",
-                                    default_group_joined_or_shim_cols,
-                                )["ln1_stage"],
-                                row=0,
-                            ),
-                            task_group=tg_ln1_drain,
-                            wait=True,
-                        )
-                    rt.finish_task_group(tg_ln1_drain)
+                tg_ln1_drain = rt.task_group()
+                for group_idx in range(group_count):
+                    group_batch_idx = lane_batch_idx * group_count + group_idx
+                    rt.drain(
+                        group_ln1StageJoined[group_idx].cons(),
+                        OR,
+                        tap=joined_i_tiles[group_batch_idx],
+                        placement=Tile(
+                            col=transport_groups[group_idx].get(
+                                "joined_or_shim_cols",
+                                default_group_joined_or_shim_cols,
+                            )["ln1_stage"],
+                            row=0,
+                        ),
+                        task_group=tg_ln1_drain,
+                        wait=True,
+                    )
+                rt.finish_task_group(tg_ln1_drain)
 
-        elif phase == "tail":
-            with rt.sequence(OR_ty, B_Up_ty, B_Down_ty) as (OR, B_Up, B_Down):
-                for lane_idx in range(parallel_seq):
-                    rt.start(lane_ffn_up_workers[lane_idx])
-                    rt.start(lane_ffn_down_workers[lane_idx])
-                    rt.start(lane_ln2_workers[lane_idx])
-
-                for lane_batch_idx in range(q_blocks_per_lane):
-                    tg_tail = rt.task_group()
-                    if unified_inBUpSeq is not None:
-                        rt.fill(
-                            unified_inBUpSeq.prod(),
-                            B_Up,
-                            tap=b_up_tiles[0],
-                            placement=Tile(
-                                col=unified_shared_streams["b_up"]["shim_col"],
-                                row=0,
-                            ),
-                            task_group=tg_tail,
-                            wait=True,
-                        )
-                    for group_idx in range(group_count):
-                        if unified_inBUpSeq is None:
-                            rt.fill(
-                                group_inBUpSeq[group_idx].prod(),
-                                B_Up,
-                                tap=b_up_tiles[0],
-                                placement=Tile(
-                                    col=transport_groups[group_idx].get(
-                                        "shim_cols", default_group_shim_cols
-                                    )["b_up"],
-                                    row=0,
-                                ),
-                                task_group=tg_tail,
-                                wait=True,
-                            )
-                        rt.fill(
-                            group_inBDownSeq[group_idx].prod(),
-                            B_Down,
-                            tap=b_down_tiles[0],
-                            placement=Tile(
-                                col=transport_groups[group_idx].get(
-                                    "shim_cols", default_group_shim_cols
-                                )["b_down"],
-                                row=0,
-                            ),
-                            task_group=tg_tail,
-                            wait=True,
-                        )
-                        group_batch_idx = lane_batch_idx * group_count + group_idx
-                        rt.fill(
-                            group_inLNSeq[group_idx].prod(),
-                            OR,
-                            tap=joined_refill_taps[group_batch_idx],
-                            placement=Tile(
-                                col=transport_groups[group_idx].get(
-                                    "joined_or_shim_cols",
-                                    default_group_joined_or_shim_cols,
-                                )["ln1_refill"],
-                                row=0,
-                            ),
-                            task_group=tg_tail,
-                            wait=True,
-                        )
-                        rt.fill(
-                            group_ffnRFromDDRSeq[group_idx].prod(),
-                            OR,
-                            tap=joined_i_tiles[group_batch_idx],
-                            placement=Tile(
-                                col=transport_groups[group_idx].get(
-                                    "joined_or_shim_cols",
-                                    default_group_joined_or_shim_cols,
-                                )["ffn_residual_refill"],
-                                row=0,
-                            ),
-                            task_group=tg_tail,
-                            wait=True,
-                        )
-                        rt.drain(
-                            group_memLN2Joined[group_idx].cons(),
-                            OR,
-                            tap=joined_o_tiles[group_batch_idx],
-                            placement=Tile(
-                                col=transport_groups[group_idx].get(
-                                    "joined_or_shim_cols",
-                                    default_group_joined_or_shim_cols,
-                                )["output"],
-                                row=0,
-                            ),
-                            task_group=tg_tail,
-                            wait=True,
-                        )
-                    rt.finish_task_group(tg_tail)
-        else:
-            with rt.sequence(W_O_ty, QKV_ty, OR_ty, B_Up_ty, B_Down_ty) as (
-                W_O,
-                QKV,
-                OR,
-                B_Up,
-                B_Down,
-            ):
-                for lane_idx in range(parallel_seq):
-                    rt.start(lane_qk_workers[lane_idx])
-                    rt.start(lane_softmax_workers[lane_idx])
-                    rt.start(lane_pv_workers[lane_idx])
-                    rt.start(lane_o_proj_workers[lane_idx])
-                    rt.start(lane_ln1_workers[lane_idx])
-                    rt.start(lane_ffn_up_workers[lane_idx])
-                    rt.start(lane_ffn_down_workers[lane_idx])
-                    rt.start(lane_ln2_workers[lane_idx])
-
-                pending_tail_tg = None
-                for lane_batch_idx in range(q_blocks_per_lane):
-                    for head_group_idx in range(num_qkv_head_block_per_parallel_head):
-                        tg_head = rt.task_group()
-                        if unified_qr_split is not None:
-                            rt.fill(
-                                unified_inQSeq.prod(),
-                                QKV,
-                                tap=unified_q_batch_tiles[
-                                    lane_batch_idx
-                                    * num_qkv_head_block_per_parallel_head
-                                    + head_group_idx
-                                ],
-                                placement=Tile(
-                                    col=unified_qr_split["q_shim_col"],
-                                    row=0,
-                                ),
-                                task_group=tg_head,
-                                wait=True,
-                            )
-                        if unified_inOWSeq is not None:
-                            rt.fill(
-                                unified_inOWSeq.prod(),
-                                W_O,
-                                tap=wo_tiles[head_group_idx],
-                                placement=Tile(
-                                    col=unified_shared_streams["w_o"]["shim_col"],
-                                    row=0,
-                                ),
-                                task_group=tg_head,
-                                wait=True,
-                            )
-                        for group_idx in range(group_count):
-                            group_batch_idx = lane_batch_idx * group_count + group_idx
-                            if unified_qr_split is None:
-                                rt.fill(
-                                    group_inQSeq[group_idx].prod(),
-                                    QKV,
-                                    tap=q_batch_tiles[
-                                        group_batch_idx
-                                        * num_qkv_head_block_per_parallel_head
-                                        + head_group_idx
-                                    ],
-                                    placement=Tile(
-                                        col=transport_groups[group_idx].get(
-                                            "shim_cols", default_group_shim_cols
-                                        )["q"],
-                                        row=0,
-                                    ),
-                                    task_group=tg_head,
-                                    wait=True,
-                                )
-                            rt.fill(
-                                group_inKSeq[group_idx].prod(),
-                                QKV,
-                                tap=k_tiles[head_group_idx],
-                                placement=Tile(
-                                    col=transport_groups[group_idx].get(
-                                        "shim_cols", default_group_shim_cols
-                                    )["k"],
-                                    row=0,
-                                ),
-                                task_group=tg_head,
-                                wait=True,
-                            )
-                            rt.fill(
-                                group_inVSeq[group_idx].prod(),
-                                QKV,
-                                tap=v_tiles[head_group_idx],
-                                placement=Tile(
-                                    col=transport_groups[group_idx].get(
-                                        "shim_cols", default_group_shim_cols
-                                    )["v"],
-                                    row=0,
-                                ),
-                                task_group=tg_head,
-                                wait=True,
-                            )
-                            if unified_inOWSeq is None:
-                                rt.fill(
-                                    group_inOWSeq[group_idx].prod(),
-                                    W_O,
-                                    tap=wo_tiles[head_group_idx],
-                                    placement=Tile(
-                                        col=transport_groups[group_idx].get(
-                                            "shim_cols", default_group_shim_cols
-                                        )["w_o"],
-                                        row=0,
-                                    ),
-                                    task_group=tg_head,
-                                    wait=True,
-                                )
-                        rt.finish_task_group(tg_head)
-
-                    tg_residual = rt.task_group()
-                    if unified_qr_split is not None:
-                        rt.fill(
-                            unified_inRSeq.prod(),
-                            OR,
-                            tap=unified_joined_r_tiles[lane_batch_idx],
-                            placement=Tile(
-                                col=unified_qr_split["residual_shim_col"],
-                                row=0,
-                            ),
-                            task_group=tg_residual,
-                            wait=False,
-                        )
-                    else:
-                        for group_idx in range(group_count):
-                            group_batch_idx = lane_batch_idx * group_count + group_idx
-                            rt.fill(
-                                group_inRSeq[group_idx].prod(),
-                                OR,
-                                tap=joined_r_tiles[group_batch_idx],
-                                placement=Tile(
-                                    col=transport_groups[group_idx].get(
-                                        "joined_or_shim_cols",
-                                        default_group_joined_or_shim_cols,
-                                    )["residual"],
-                                    row=0,
-                                ),
-                                task_group=tg_residual,
-                                wait=False,
-                            )
-                    rt.finish_task_group(tg_residual)
-
-                    tg_ln1_drain = rt.task_group()
-                    for group_idx in range(group_count):
-                        group_batch_idx = lane_batch_idx * group_count + group_idx
-                        rt.drain(
-                            group_ln1StageJoined[group_idx].cons(),
-                            OR,
-                            tap=joined_i_tiles[group_batch_idx],
-                            placement=Tile(
-                                col=transport_groups[group_idx].get(
-                                    "joined_or_shim_cols",
-                                    default_group_joined_or_shim_cols,
-                                )["ln1_stage"],
-                                row=0,
-                            ),
-                            task_group=tg_ln1_drain,
-                            wait=True,
-                        )
-                    rt.finish_task_group(tg_ln1_drain)
-
-                    if pending_tail_tg is not None:
-                        rt.finish_task_group(pending_tail_tg)
-                        pending_tail_tg = None
-
-                    tg_tail = rt.task_group()
-                    if unified_inBUpSeq is not None:
-                        rt.fill(
-                            unified_inBUpSeq.prod(),
-                            B_Up,
-                            tap=b_up_tiles[0],
-                            placement=Tile(
-                                col=unified_shared_streams["b_up"]["shim_col"],
-                                row=0,
-                            ),
-                            task_group=tg_tail,
-                            wait=True,
-                        )
-                    for group_idx in range(group_count):
-                        if unified_inBUpSeq is None:
-                            rt.fill(
-                                group_inBUpSeq[group_idx].prod(),
-                                B_Up,
-                                tap=b_up_tiles[0],
-                                placement=Tile(
-                                    col=transport_groups[group_idx].get(
-                                        "shim_cols", default_group_shim_cols
-                                    )["b_up"],
-                                    row=0,
-                                ),
-                                task_group=tg_tail,
-                                wait=True,
-                            )
-                        rt.fill(
-                            group_inBDownSeq[group_idx].prod(),
-                            B_Down,
-                            tap=b_down_tiles[0],
-                            placement=Tile(
-                                col=transport_groups[group_idx].get(
-                                    "shim_cols", default_group_shim_cols
-                                )["b_down"],
-                                row=0,
-                            ),
-                            task_group=tg_tail,
-                            wait=True,
-                        )
-                        group_batch_idx = lane_batch_idx * group_count + group_idx
-                        rt.fill(
-                            group_inLNSeq[group_idx].prod(),
-                            OR,
-                            tap=joined_refill_taps[group_batch_idx],
-                            placement=Tile(
-                                col=transport_groups[group_idx].get(
-                                    "joined_or_shim_cols",
-                                    default_group_joined_or_shim_cols,
-                                )["ln1_refill"],
-                                row=0,
-                            ),
-                            task_group=tg_tail,
-                            wait=True,
-                        )
-                        rt.fill(
-                            group_ffnRFromDDRSeq[group_idx].prod(),
-                            OR,
-                            tap=joined_i_tiles[group_batch_idx],
-                            placement=Tile(
-                                col=transport_groups[group_idx].get(
-                                    "joined_or_shim_cols",
-                                    default_group_joined_or_shim_cols,
-                                )["ffn_residual_refill"],
-                                row=0,
-                            ),
-                            task_group=tg_tail,
-                            wait=True,
-                        )
-                        rt.drain(
-                            group_memLN2Joined[group_idx].cons(),
-                            OR,
-                            tap=joined_o_tiles[group_batch_idx],
-                            placement=Tile(
-                                col=transport_groups[group_idx].get(
-                                    "joined_or_shim_cols",
-                                    default_group_joined_or_shim_cols,
-                                )["output"],
-                                row=0,
-                            ),
-                            task_group=tg_tail,
-                            wait=True,
-                        )
-                    pending_tail_tg = tg_tail
                 if pending_tail_tg is not None:
                     rt.finish_task_group(pending_tail_tg)
+                    pending_tail_tg = None
+
+                tg_tail = rt.task_group()
+                if unified_inBUpSeq is not None:
+                    rt.fill(
+                        unified_inBUpSeq.prod(),
+                        B_Up,
+                        tap=b_up_tiles[0],
+                        placement=Tile(
+                            col=unified_shared_streams["b_up"]["shim_col"],
+                            row=0,
+                        ),
+                        task_group=tg_tail,
+                        wait=True,
+                    )
+                for group_idx in range(group_count):
+                    if unified_inBUpSeq is None:
+                        rt.fill(
+                            group_inBUpSeq[group_idx].prod(),
+                            B_Up,
+                            tap=b_up_tiles[0],
+                            placement=Tile(
+                                col=transport_groups[group_idx].get(
+                                    "shim_cols", default_group_shim_cols
+                                )["b_up"],
+                                row=0,
+                            ),
+                            task_group=tg_tail,
+                            wait=True,
+                        )
+                    rt.fill(
+                        group_inBDownSeq[group_idx].prod(),
+                        B_Down,
+                        tap=b_down_tiles[0],
+                        placement=Tile(
+                            col=transport_groups[group_idx].get(
+                                "shim_cols", default_group_shim_cols
+                            )["b_down"],
+                            row=0,
+                        ),
+                        task_group=tg_tail,
+                        wait=True,
+                    )
+                    group_batch_idx = lane_batch_idx * group_count + group_idx
+                    rt.fill(
+                        group_inLNSeq[group_idx].prod(),
+                        OR,
+                        tap=joined_refill_taps[group_batch_idx],
+                        placement=Tile(
+                            col=transport_groups[group_idx].get(
+                                "joined_or_shim_cols",
+                                default_group_joined_or_shim_cols,
+                            )["ln1_refill"],
+                            row=0,
+                        ),
+                        task_group=tg_tail,
+                        wait=True,
+                    )
+                    rt.fill(
+                        group_ffnRFromDDRSeq[group_idx].prod(),
+                        OR,
+                        tap=joined_i_tiles[group_batch_idx],
+                        placement=Tile(
+                            col=transport_groups[group_idx].get(
+                                "joined_or_shim_cols",
+                                default_group_joined_or_shim_cols,
+                            )["ffn_residual_refill"],
+                            row=0,
+                        ),
+                        task_group=tg_tail,
+                        wait=True,
+                    )
+                    rt.drain(
+                        group_memLN2Joined[group_idx].cons(),
+                        OR,
+                        tap=joined_o_tiles[group_batch_idx],
+                        placement=Tile(
+                            col=transport_groups[group_idx].get(
+                                "joined_or_shim_cols",
+                                default_group_joined_or_shim_cols,
+                            )["output"],
+                            row=0,
+                        ),
+                        task_group=tg_tail,
+                        wait=True,
+                    )
+                pending_tail_tg = tg_tail
+            if pending_tail_tg is not None:
+                rt.finish_task_group(pending_tail_tg)
 
         program = Program(NPU2(), rt)
         return program.resolve_program(SequentialPlacer())
@@ -2994,12 +2549,10 @@ def encoder_pipeline(
             Worker(
                 (
                     matmul_o_proj_stage_then_emit_stats
-                    if nonseq_ln1_no_replay
-                    and parallel_heads > 1
-                    and i == (parallel_heads - 1)
+                    if parallel_heads > 1 and i == (parallel_heads - 1)
                     else (
                         matmul_o_proj_emit_stats_first
-                        if nonseq_ln1_no_replay and i == (parallel_heads - 1)
+                        if i == (parallel_heads - 1)
                         else matmul_o_proj
                     )
                 ),
@@ -3022,9 +2575,7 @@ def encoder_pipeline(
                         matmul_kernel_o_proj,
                         mem_copy_o_proj,
                     ]
-                    if nonseq_ln1_no_replay
-                    and parallel_heads > 1
-                    and i == (parallel_heads - 1)
+                    if parallel_heads > 1 and i == (parallel_heads - 1)
                     else (
                         [
                             outOProj[i].cons(),
@@ -3043,7 +2594,7 @@ def encoder_pipeline(
                             matmul_kernel_o_proj,
                             mem_copy_o_proj,
                         ]
-                        if nonseq_ln1_no_replay and i == (parallel_heads - 1)
+                        if i == (parallel_heads - 1)
                         else [
                             outOProj[i].cons(),
                             memOW[i].cons(),
@@ -3076,12 +2627,8 @@ def encoder_pipeline(
     ln1_worker = Worker(
         (
             core_fn_ln1_stage_from_split_inputs
-            if nonseq_ln1_no_replay and parallel_heads > 1
-            else (
-                core_fn_ln1_stage_from_stats
-                if nonseq_ln1_no_replay
-                else core_fn_ln1_fused
-            )
+            if parallel_heads > 1
+            else core_fn_ln1_stage_from_stats
         ),
         fn_args=(
             [
@@ -3095,7 +2642,7 @@ def encoder_pipeline(
                 ln_fused_add_layer_norm_kernel,
                 unpack_stats_kernel,
             ]
-            if nonseq_ln1_no_replay and parallel_heads > 1
+            if parallel_heads > 1
             else (
                 [
                     outOProjInput.cons(),
@@ -3106,22 +2653,6 @@ def encoder_pipeline(
                     outLNBroadcast.prod(1),
                     ln_fused_add_layer_norm_kernel,
                     unpack_stats_kernel,
-                ]
-                if nonseq_ln1_no_replay
-                else [
-                    outOProjInput.cons(),
-                    ln1Replay.cons(),
-                    ln1ReplayPart.prod(),
-                    memR.cons(),
-                    ln1_norm_sum_buffer,
-                    ln1_norm_sumsq_buffer,
-                    ln1_weight_buffer,
-                    outLNBroadcast.prod(),
-                    ln_fused_add_layer_norm_kernel,
-                    ln_calc_sum_sumsq_kernel,
-                    unpack_stats_kernel,
-                    ln_zero_f32_kernel,
-                    mem_copy_o_proj,
                 ]
             )
         ),
@@ -3312,10 +2843,6 @@ def encoder_pipeline(
             for tap in r_tiles_base
         ]
     )
-    if not nonseq_ln1_no_replay:
-        for tile in R_tiles:
-            tile._sizes[0] = ln1_broadcast_groups
-            tile._strides[0] = 0
     B_Up_tiles = TensorAccessSequence.from_taps(
         [
             TensorAccessPattern(
@@ -3447,11 +2974,7 @@ def encoder_pipeline(
         (
             R_tiles,
             (seq_tile, emb_tile),
-            (
-                proj_acc_depth
-                if nonseq_ln1_no_replay
-                else ln1_broadcast_groups * proj_acc_depth
-            ),
+            proj_acc_depth,
             "Residual tap count does not match LN1 runtime contract",
         ),
         (
@@ -3577,12 +3100,7 @@ def encoder_pipeline(
             branch_stage_tap = TensorAccessPattern(
                 or_tensor_shape,
                 offset=ln1_stage_base_offset,
-                sizes=[
-                    1 if nonseq_ln1_no_replay else ln1_broadcast_groups,
-                    proj_acc_depth,
-                    seq_tile,
-                    emb_tile,
-                ],
+                sizes=[1, proj_acc_depth, seq_tile, emb_tile],
                 strides=[0, emb_tile, embed_sz, 1],
             )
             branch_refill_tap = TensorAccessPattern(
@@ -3597,12 +3115,10 @@ def encoder_pipeline(
                 sizes=[1, proj_acc_depth, seq_tile, emb_tile],
                 strides=[0, emb_tile, embed_sz, 1],
             )
-            if math.prod(int(s) for s in branch_stage_tap.sizes) // math.prod(
-                (seq_tile, emb_tile)
-            ) != (
-                proj_acc_depth
-                if nonseq_ln1_no_replay
-                else ln1_broadcast_groups * proj_acc_depth
+            if (
+                math.prod(int(s) for s in branch_stage_tap.sizes)
+                // math.prod((seq_tile, emb_tile))
+                != proj_acc_depth
             ):
                 raise ValueError("LN1 stage tap count mismatch")
             if (
