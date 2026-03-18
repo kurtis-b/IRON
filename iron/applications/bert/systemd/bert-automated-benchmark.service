@@ -3,14 +3,15 @@ Description=BERT automated benchmark runner
 After=multi-user.target
 
 [Service]
+# Replace <benchmark_user> and <repo_root> before installing this unit.
 Type=simple
-User=agi-demo
-Group=agi-demo
-WorkingDirectory=/home/agi-demo/iron/iron/applications/bert
-Environment=BERT_BENCH_JOB_CONFIG=/home/agi-demo/iron/iron/applications/bert/systemd/benchmark_job.json
-Environment=BERT_BENCH_LOG=/home/agi-demo/iron/iron/applications/bert/logs/systemd/bert-automated-benchmark.log
+User=<benchmark_user>
+Group=<benchmark_user>
+WorkingDirectory=<repo_root>/iron/applications/bert
+Environment=BERT_BENCH_JOB_CONFIG=<repo_root>/iron/applications/bert/systemd/benchmark_job.json
+Environment=BERT_BENCH_LOG=<repo_root>/iron/applications/bert/logs/systemd/bert-automated-benchmark.log
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/bin/bash -lc 'mkdir -p "$(dirname "$BERT_BENCH_LOG")" && source /opt/xilinx/xrt/setup.sh && source /home/agi-demo/iron/ironenv/bin/activate && python3 /home/agi-demo/iron/iron/applications/bert/run_automated_benchmark_job.py "$BERT_BENCH_JOB_CONFIG" >> "$BERT_BENCH_LOG" 2>&1'
+ExecStart=/bin/bash -lc 'mkdir -p "$(dirname "$BERT_BENCH_LOG")" && source /opt/xilinx/xrt/setup.sh && source <repo_root>/ironenv/bin/activate && python3 <repo_root>/iron/applications/bert/run_automated_benchmark_job.py "$BERT_BENCH_JOB_CONFIG" >> "$BERT_BENCH_LOG" 2>&1'
 Restart=no
 TimeoutStartSec=infinity
 

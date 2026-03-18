@@ -6,13 +6,18 @@ SPDX-License-Identifier: Apache-2.0
 # Encoder Benchmarks
 
 `applications/bert` now has two explicit benchmark entrypoints:
-- [cpu_inference.py](/home/agi-demo/iron/iron/applications/bert/cpu_inference.py): Hugging Face CPU baseline for supported encoder-only families
-- [npu_inference.py](/home/agi-demo/iron/iron/applications/bert/npu_inference.py): local NPU benchmark using the `encoder_pipeline` operator
-- [download_model.py](/home/agi-demo/iron/iron/applications/bert/download_model.py): manifest-driven Hugging Face downloader for supported study models
-- [automated_benchmark.py](/home/agi-demo/iron/iron/applications/bert/automated_benchmark.py): resumable case runner with optional topology autotune, power logging, and power-cycle hooks
-- [run_automated_benchmark_job.py](/home/agi-demo/iron/iron/applications/bert/run_automated_benchmark_job.py): wrapper that runs the automation harness from a JSON job file
+- [cpu_inference.py](cpu_inference.py): Hugging Face CPU baseline for supported encoder-only families
+- [npu_inference.py](npu_inference.py): local NPU benchmark using the `encoder_pipeline` operator
+- [download_model.py](download_model.py): manifest-driven Hugging Face downloader for supported study models
+- [automated_benchmark.py](automated_benchmark.py): resumable case runner with optional topology autotune, power logging, and power-cycle hooks
+- [bringup_checklist.sh](bringup_checklist.sh): guided device preflight for CPU/NPU smokes, topology-cache warmup, and short supervised suite validation
+- [run_automated_benchmark_job.py](run_automated_benchmark_job.py): wrapper that runs the automation harness from a JSON job file
 
 The shared code under `src/` is now NPU-only. It exists to build the encoder-pipeline-backed local backbone used by `npu_inference.py`. The CPU benchmark uses Hugging Face directly and does not go through `src/`.
+
+In shell examples below:
+- replace `<repo_root>` with the root of your local checkout
+- replace `<benchmark_user>` with the Linux account that will run the benchmarks
 
 Currently supported encoder families:
 - `bert`
@@ -27,11 +32,11 @@ Download `model.safetensors` and `config.json` for one of the supported model co
 
 | Local config | Hugging Face model | Weights | Config |
 |---|---|---|---|
-| [config.json](/home/agi-demo/iron/iron/applications/bert/config/config.json) | [`bert-base-uncased`](https://huggingface.co/bert-base-uncased) | [`model.safetensors`](https://huggingface.co/bert-base-uncased/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/bert-base-uncased/resolve/main/config.json) |
-| [config_bert_large.json](/home/agi-demo/iron/iron/applications/bert/config/config_bert_large.json) | [`bert-large-uncased`](https://huggingface.co/bert-large-uncased) | [`model.safetensors`](https://huggingface.co/bert-large-uncased/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/bert-large-uncased/resolve/main/config.json) |
-| [config_roberta_base.json](/home/agi-demo/iron/iron/applications/bert/config/config_roberta_base.json) | [`roberta-base`](https://huggingface.co/roberta-base) | [`model.safetensors`](https://huggingface.co/roberta-base/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/roberta-base/resolve/main/config.json) |
-| [config_roberta_large.json](/home/agi-demo/iron/iron/applications/bert/config/config_roberta_large.json) | [`roberta-large`](https://huggingface.co/roberta-large) | [`model.safetensors`](https://huggingface.co/roberta-large/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/roberta-large/resolve/main/config.json) |
-| [config_distilbert_base.json](/home/agi-demo/iron/iron/applications/bert/config/config_distilbert_base.json) | [`distilbert-base-uncased`](https://huggingface.co/distilbert-base-uncased) | [`model.safetensors`](https://huggingface.co/distilbert-base-uncased/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/distilbert-base-uncased/resolve/main/config.json) |
+| [config.json](config/config.json) | [`bert-base-uncased`](https://huggingface.co/bert-base-uncased) | [`model.safetensors`](https://huggingface.co/bert-base-uncased/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/bert-base-uncased/resolve/main/config.json) |
+| [config_bert_large.json](config/config_bert_large.json) | [`bert-large-uncased`](https://huggingface.co/bert-large-uncased) | [`model.safetensors`](https://huggingface.co/bert-large-uncased/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/bert-large-uncased/resolve/main/config.json) |
+| [config_roberta_base.json](config/config_roberta_base.json) | [`roberta-base`](https://huggingface.co/roberta-base) | [`model.safetensors`](https://huggingface.co/roberta-base/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/roberta-base/resolve/main/config.json) |
+| [config_roberta_large.json](config/config_roberta_large.json) | [`roberta-large`](https://huggingface.co/roberta-large) | [`model.safetensors`](https://huggingface.co/roberta-large/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/roberta-large/resolve/main/config.json) |
+| [config_distilbert_base.json](config/config_distilbert_base.json) | [`distilbert-base-uncased`](https://huggingface.co/distilbert-base-uncased) | [`model.safetensors`](https://huggingface.co/distilbert-base-uncased/resolve/main/model.safetensors) | [`config.json`](https://huggingface.co/distilbert-base-uncased/resolve/main/config.json) |
 
 The scripts expect the safetensors file on the command line. The JSON config passed to the scripts is the local app config under `iron/applications/bert/config/`.
 
@@ -59,14 +64,14 @@ Useful options:
 - `--force`: overwrite existing local files
 
 Useful config files:
-- [config.json](/home/agi-demo/iron/iron/applications/bert/config/config.json): `bert-base` baseline
-- [config_bert_large.json](/home/agi-demo/iron/iron/applications/bert/config/config_bert_large.json): `bert-large`
-- [config_roberta_base.json](/home/agi-demo/iron/iron/applications/bert/config/config_roberta_base.json): `roberta-base`
-- [config_roberta_large.json](/home/agi-demo/iron/iron/applications/bert/config/config_roberta_large.json): `roberta-large`
-- [config_distilbert_base.json](/home/agi-demo/iron/iron/applications/bert/config/config_distilbert_base.json): `distilbert-base`
+- [config.json](config/config.json): `bert-base` baseline
+- [config_bert_large.json](config/config_bert_large.json): `bert-large`
+- [config_roberta_base.json](config/config_roberta_base.json): `roberta-base`
+- [config_roberta_large.json](config/config_roberta_large.json): `roberta-large`
+- [config_distilbert_base.json](config/config_distilbert_base.json): `distilbert-base`
 
 Suggested study targets are listed in:
-- [encoder_only_models.json](/home/agi-demo/iron/iron/applications/bert/study/encoder_only_models.json)
+- [encoder_only_models.json](study/encoder_only_models.json)
 
 ## Installation
 
@@ -223,7 +228,7 @@ cd iron/applications/bert/systemd
 cp benchmark_job.example.json benchmark_job.json
 ```
 
-2. Review [benchmark_job.example.json](/home/agi-demo/iron/iron/applications/bert/systemd/benchmark_job.example.json) and set:
+2. Review [benchmark_job.example.json](systemd/benchmark_job.example.json) and set:
 - either weights/config paths or `study_id`
 - `modes`
 - sequence lengths
@@ -242,7 +247,7 @@ python3 run_automated_benchmark_job.py systemd/benchmark_job.json --print-comman
 4. Install the service:
 
 ```bash
-sudo cp /home/agi-demo/iron/iron/applications/bert/systemd/bert-automated-benchmark.service /etc/systemd/system/
+sudo cp <repo_root>/iron/applications/bert/systemd/bert-automated-benchmark.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable bert-automated-benchmark.service
 sudo systemctl start bert-automated-benchmark.service
@@ -257,7 +262,7 @@ tail -f iron/applications/bert/logs/systemd/bert-automated-benchmark.log
 Notes:
 - the service expects the live job file at:
   - `iron/applications/bert/systemd/benchmark_job.json`
-- the service runs [run_automated_benchmark_job.py](/home/agi-demo/iron/iron/applications/bert/run_automated_benchmark_job.py), which in turn invokes [automated_benchmark.py](/home/agi-demo/iron/iron/applications/bert/automated_benchmark.py)
+- the service runs [run_automated_benchmark_job.py](run_automated_benchmark_job.py), which in turn invokes [automated_benchmark.py](automated_benchmark.py)
 - each completed case is persisted before any reboot is requested
 - after reboot, systemd starts the service again and the suite resumes from the saved state
 
@@ -273,13 +278,31 @@ Power notes:
 Suggested sudoers entries for unattended runs:
 
 ```text
-agi-demo ALL=(root) NOPASSWD: /usr/bin/turbostat
-agi-demo ALL=(root) NOPASSWD: /usr/sbin/reboot, /usr/bin/systemctl reboot
+<benchmark_user> ALL=(root) NOPASSWD: /usr/bin/turbostat
+<benchmark_user> ALL=(root) NOPASSWD: /usr/sbin/reboot, /usr/bin/systemctl reboot
 ```
 
 ## Preflight
 
 Before the first unattended run, do this in order.
+
+Fast path:
+
+```bash
+cd <repo_root>/iron/applications/bert
+./bringup_checklist.sh
+```
+
+Useful variants:
+
+```bash
+./bringup_checklist.sh --dry-run
+./bringup_checklist.sh --start-at npu-smoke --stop-after suite
+./bringup_checklist.sh --study-id bert-base-uncased --models-root ./models
+```
+
+The script runs the same checklist below and writes preflight artifacts under:
+- `iron/applications/bert/logs/preflight`
 
 1. Verify privileged helpers work non-interactively
 
@@ -294,9 +317,9 @@ Do not run reboot until you are ready for it, but make sure the sudoers rule exi
 This generates a fresh best-topology entry per sequence length for the current machine and software state.
 
 ```bash
-cd /home/agi-demo/iron/iron/applications/bert
+cd <repo_root>/iron/applications/bert
 source /opt/xilinx/xrt/setup.sh
-source /home/agi-demo/iron/ironenv/bin/activate
+source <repo_root>/ironenv/bin/activate
 python3 automated_benchmark.py model.safetensors config/config.json \
   --modes npu \
   --seq-lens 64,128,256,512,1024,2048,4096,8192 \
@@ -317,7 +340,7 @@ After that, unattended runs should use:
 Use a trimmed sequence-length set first and leave out `--power-cycle-cmd`.
 
 ```bash
-cd /home/agi-demo/iron/iron/applications/bert
+cd <repo_root>/iron/applications/bert
 python3 automated_benchmark.py model.safetensors config/config.json \
   --modes cpu,npu \
   --seq-lens 64,512 \
@@ -331,7 +354,7 @@ python3 automated_benchmark.py model.safetensors config/config.json \
 4. Verify outputs from the supervised run
 
 Check that these files exist and look sane:
-- [automated_benchmark_latest.csv](/home/agi-demo/iron/iron/applications/bert/automated_benchmark_latest.csv)
+- [automated_benchmark_latest.csv](automated_benchmark_latest.csv)
 - `automated_benchmark_state.json`
 - `logs/automated_benchmark/*`
 
@@ -348,6 +371,68 @@ At that point:
 - install/enable the systemd service
 - start the unattended run
 
+## Second Device Quickstart
+
+Use this exact sequence on a second machine before attempting an unattended run.
+
+1. Inspect the bring-up plan without touching hardware state:
+
+```bash
+cd <repo_root>/iron/applications/bert
+./bringup_checklist.sh --dry-run
+```
+
+2. Verify everything up to the automated benchmark path:
+
+```bash
+./bringup_checklist.sh --stop-after power
+```
+
+This checks:
+- environment and expected `mlir_aie` wheel
+- XRT and `/dev/accel/accel0` access
+- model download/cache
+- CPU smoke
+- NPU smokes at `64` and `512`
+- topology-cache warmup
+- non-interactive `turbostat`
+
+3. Verify the automated benchmark path itself with the short supervised suite:
+
+```bash
+./bringup_checklist.sh
+```
+
+This additionally checks:
+- short `cpu,npu` automated suite
+- suite CSV/state/log outputs
+- resolved job command, if `systemd/benchmark_job.json` exists
+
+4. Create the real job config:
+
+```bash
+cd <repo_root>/iron/applications/bert/systemd
+cp benchmark_job.example.json benchmark_job.json
+```
+
+5. Print the resolved automated-benchmark command:
+
+```bash
+cd <repo_root>/iron/applications/bert
+python3 run_automated_benchmark_job.py systemd/benchmark_job.json --print-command
+```
+
+6. Run the job directly once under supervision:
+
+```bash
+python3 run_automated_benchmark_job.py systemd/benchmark_job.json
+```
+
+7. Only after that, enable unattended reboot/resume:
+- configure sudoers for `turbostat` and reboot
+- install/enable the systemd service
+- set `power_cycle_cmd` in `benchmark_job.json`
+
 ## Sequence Lengths
 
 Both benchmarks default to:
@@ -357,4 +442,4 @@ For lengths above `512`, the scripts extend the learned position embeddings by r
 
 ## Legacy Entry Point
 
-[inference.py](/home/agi-demo/iron/iron/applications/bert/inference.py) is now a legacy stub. Use the CPU and NPU benchmark scripts directly.
+[inference.py](inference.py) is now a legacy stub. Use the CPU and NPU benchmark scripts directly.

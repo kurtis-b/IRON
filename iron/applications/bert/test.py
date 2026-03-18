@@ -290,6 +290,50 @@ def test_download_model_print_plan_smoke(tmp_path):
     assert str(models_root / "bert-base-uncased" / "model.safetensors") in result.stdout
 
 
+def test_bringup_checklist_dry_run_smoke(tmp_path):
+    job_config = tmp_path / "benchmark_job.json"
+    job_config.write_text(
+        (
+            "{\n"
+            '  "study_id": "bert-base-uncased",\n'
+            '  "modes": "cpu",\n'
+            '  "seq_lens": "64",\n'
+            '  "power_backend": "none"\n'
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    command = [
+        "bash",
+        str(TEST_DIR / "bringup_checklist.sh"),
+        "--dry-run",
+        "--skip-download",
+        "--skip-autotune",
+        "--skip-power-check",
+        "--skip-suite",
+        "--job-config",
+        str(job_config),
+    ]
+    result = subprocess.run(
+        command,
+        cwd=TEST_DIR,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert result.returncode == 0, (
+        f"Command failed with return code {result.returncode}\n"
+        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+    assert "Phase: env" in result.stdout
+    assert "cpu_inference.py" in result.stdout
+    assert "npu_inference.py" in result.stdout
+    assert "run_automated_benchmark_job.py" in result.stdout
+
+
 @pytest.mark.parametrize(
     "config_path,expected_family",
     [
