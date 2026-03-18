@@ -442,15 +442,23 @@ def autotune_topology(
         )
         tuned_config = load_encoder_pipeline_config(config_file_path, seq_len)
         apply_topology_to_config(tuned_config, topology)
-        result = benchmark_with_config(
-            weights_file_path=weights_file_path,
-            config=tuned_config,
-            seq_len=seq_len,
-            texts=texts,
-            warmup_runs=warmup_runs,
-            runs_per_sample=runs_per_sample,
-            topology=topology,
-        )
+        try:
+            result = benchmark_with_config(
+                weights_file_path=weights_file_path,
+                config=tuned_config,
+                seq_len=seq_len,
+                texts=texts,
+                warmup_runs=warmup_runs,
+                runs_per_sample=runs_per_sample,
+                topology=topology,
+            )
+        except Exception as exc:
+            print(
+                f"Autotune failed: seq_len={seq_len} "
+                f"topology={topology_id(topology)} error={exc}",
+                flush=True,
+            )
+            continue
         print(
             f"Autotune result: seq_len={seq_len} topology={result['topology_id']} "
             f"avg={result['avg_latency_ms']:.3f} ms",
@@ -459,6 +467,11 @@ def autotune_topology(
         if best_latency_ms is None or result["avg_latency_ms"] < best_latency_ms:
             best_latency_ms = result["avg_latency_ms"]
             best_topology = topology
+
+    if best_topology is None:
+        raise RuntimeError(
+            f"No viable encoder_pipeline topologies for seq_len={seq_len}"
+        )
 
     return best_topology
 
