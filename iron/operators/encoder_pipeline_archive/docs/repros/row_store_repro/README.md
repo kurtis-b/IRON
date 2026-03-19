@@ -3,8 +3,8 @@
 Historical repro for the old shared `operators/encoder_pipeline/` package.
 Current live entrypoints are:
 
-- [encoder_pipeline_ddr](/home/agi-demo/iron/operators/encoder_pipeline_ddr)
-- [encoder_pipeline_memtile](/home/agi-demo/iron/operators/encoder_pipeline_memtile)
+- [encoder_pipeline_ddr](<repo_root>/operators/encoder_pipeline_ddr)
+- [encoder_pipeline_memtile](<repo_root>/operators/encoder_pipeline_memtile)
 
 This folder contains the smallest failing `encoder_pipeline` row-store case found so far.
 
@@ -50,11 +50,11 @@ Phase timings from the isolated run:
 
 ## Files
 
-- [`addnorm1_debug9_pffn1.mlir`](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/row_store_repro/addnorm1_debug9_pffn1.mlir)
+- [`addnorm1_debug9_pffn1.mlir`](<repo_root>/operators/encoder_pipeline_archive/docs/repros/row_store_repro/addnorm1_debug9_pffn1.mlir)
   - source MLIR before row-store lowering
-- [`addnorm1_debug9_pffn1.row_store_lowered.mlir`](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/row_store_repro/addnorm1_debug9_pffn1.row_store_lowered.mlir)
+- [`addnorm1_debug9_pffn1.row_store_lowered.mlir`](<repo_root>/operators/encoder_pipeline_archive/docs/repros/row_store_repro/addnorm1_debug9_pffn1.row_store_lowered.mlir)
   - MLIR after `aie-opt --aie-lower-memtile-row-stores`
-- [`addnorm1_debug9_pffn1.input_with_addresses.mlir`](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/row_store_repro/addnorm1_debug9_pffn1.input_with_addresses.mlir)
+- [`addnorm1_debug9_pffn1.input_with_addresses.mlir`](<repo_root>/operators/encoder_pipeline_archive/docs/repros/row_store_repro/addnorm1_debug9_pffn1.input_with_addresses.mlir)
   - lowered project artifact with concrete addresses, locks, flows, and DMA BD assignments
 
 ## Useful Anchors
@@ -82,7 +82,7 @@ In `addnorm1_debug9_pffn1.input_with_addresses.mlir`:
 
 ## How To Reproduce
 
-From `/home/agi-demo/iron`:
+From `<repo_root>`:
 
 ```bash
 rm -rf ./build

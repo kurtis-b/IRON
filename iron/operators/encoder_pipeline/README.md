@@ -5,11 +5,11 @@
 - front: `MHA + O_PROJ + LN1`
 - tail: `FFN + LN2`
 
-The implementation is placement-driven. Supported runtime/topology combinations are the hardcoded keys in [placements.py](/home/agi-demo/iron/operators/encoder_pipeline/placements.py).
+The implementation is placement-driven. Supported runtime/topology combinations are the hardcoded keys in [placements.py](<repo_root>/operators/encoder_pipeline/placements.py).
 
 ## Design
 
-The operator entry point is [op.py](/home/agi-demo/iron/operators/encoder_pipeline/op.py). The design callback and runtime schedule live in [design.py](/home/agi-demo/iron/operators/encoder_pipeline/design.py).
+The operator entry point is [op.py](<repo_root>/operators/encoder_pipeline/op.py). The design callback and runtime schedule live in [design.py](<repo_root>/operators/encoder_pipeline/design.py).
 
 Current design points:
 
@@ -25,11 +25,11 @@ Current design points:
 
 Useful implementation files:
 
-- [design.py](/home/agi-demo/iron/operators/encoder_pipeline/design.py): worker graph, objectfifos, runtime schedule
-- [op.py](/home/agi-demo/iron/operators/encoder_pipeline/op.py): public operator surface, artifact naming, compile/runtime integration
-- [placements.py](/home/agi-demo/iron/operators/encoder_pipeline/placements.py): hardcoded supported topologies and placements
-- [reference.py](/home/agi-demo/iron/operators/encoder_pipeline/reference.py): golden-reference generation
-- [test.py](/home/agi-demo/iron/operators/encoder_pipeline/test.py): public pytest matrix
+- [design.py](<repo_root>/operators/encoder_pipeline/design.py): worker graph, objectfifos, runtime schedule
+- [op.py](<repo_root>/operators/encoder_pipeline/op.py): public operator surface, artifact naming, compile/runtime integration
+- [placements.py](<repo_root>/operators/encoder_pipeline/placements.py): hardcoded supported topologies and placements
+- [reference.py](<repo_root>/operators/encoder_pipeline/reference.py): golden-reference generation
+- [test.py](<repo_root>/operators/encoder_pipeline/test.py): public pytest matrix
 
 ## Toolchain Note
 
@@ -45,7 +45,7 @@ This operator is sensitive to `mlir_aie` lowering/allocation behavior. Different
 
 ## Test Surface
 
-The public test matrix in [test.py](/home/agi-demo/iron/operators/encoder_pipeline/test.py) currently uses:
+The public test matrix in [test.py](<repo_root>/operators/encoder_pipeline/test.py) currently uses:
 
 - `seq_len`: powers of 2 from `64` through `8192`
 - base topology:
@@ -79,7 +79,7 @@ Set up the environment first:
 
 ```bash
 source /opt/xilinx/xrt/setup.sh
-source /home/agi-demo/iron/ironenv/bin/activate
+source <repo_root>/ironenv/bin/activate
 ```
 
 Run the full public matrix:
@@ -108,7 +108,7 @@ pytest -q operators/encoder_pipeline/test.py --collect-only
 
 Notes:
 
-- default pytest iterations come from [conftest.py](/home/agi-demo/iron/conftest.py)
+- default pytest iterations come from [conftest.py](<repo_root>/conftest.py)
 - running pytest without `-s` writes metrics to `tests_latest.csv`
 - the test prints latency and bandwidth for each case
 
