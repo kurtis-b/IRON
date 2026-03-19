@@ -117,6 +117,8 @@ def fused_mha(
     embed_sz = heads * d
 
     of_depth = 2
+    o_proj_weight_consumer_depth = 1 if emb_tile >= 128 else of_depth
+    o_proj_partial_depth = 1 if emb_tile >= 128 else of_depth
     enable_tracing = True if trace_size > 0 else False
     dtype_str = "bf16"
     dev = "npu2"
@@ -385,7 +387,7 @@ def fused_mha(
         obj_types=[wo_ty] * parallel_heads,
         names=[f"memOW{i}" for i in range(parallel_heads)],
         dims_to_stream=[ow_dims] * parallel_heads,
-        depths=[of_depth] * parallel_heads,
+        depths=[o_proj_weight_consumer_depth] * parallel_heads,
         placement=Tile(col=3, row=1),
     )  # Split between N parallel blocks of heads
 
@@ -395,7 +397,7 @@ def fused_mha(
     outOProjAccumOut = []
     for i in range(parallel_heads):
         outOProj.append(
-            ObjectFifo(q_ty, depth=of_depth, name=f"outOProj{i}")
+            ObjectFifo(q_ty, depth=o_proj_partial_depth, name=f"outOProj{i}")
         )  # Local to 1 parallel block of heads
         outOProjAccumOut.append(ObjectFifo(o_ty, depth=1, name=f"outOProjAccumOut{i}"))
         outOProjAccumIn.append(
@@ -411,7 +413,7 @@ def fused_mha(
     outOPart = []
     for i in range(parallel_heads - 1):
         outOPart.append(
-            ObjectFifo(o_ty, depth=of_depth, name=f"outOPart{i}")
+            ObjectFifo(o_ty, depth=o_proj_partial_depth, name=f"outOPart{i}")
         )  # Local to 1 parallel block of heads
 
     o_dims = [(q_seq_tile // r, r * emb_tile), (r, t), (emb_tile // t, r * t), (t, 1)]

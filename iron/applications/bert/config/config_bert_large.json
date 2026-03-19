@@ -16,6 +16,9 @@
   },
   "aie_config": {
     "device": "npu2",
-    "dtype": "bfloat16"
+    "dtype": "bfloat16",
+    "encoder_pipeline_emb_tile": 128,
+    "encoder_pipeline_ffn_tile": 64,
+    "encoder_pipeline_proj_acc_depth": 8
   }
 }

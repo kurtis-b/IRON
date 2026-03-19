@@ -198,7 +198,10 @@ def encoder_pipeline(
     dtype = bfloat16
     inv_scale = (1 / np.sqrt(d)) * 1.4453125
     of_depth = 2
-    weight_forward_depth = 2 if ffn_tile <= 64 else 1
+    weight_forward_depth = 1 if emb_tile >= 128 else (2 if ffn_tile <= 64 else 1)
+    # Large emb tiles make the O-proj weight consumers the limiting factor on
+    # tile memory, so keep the per-consumer W_O FIFOs single-buffered there.
+    o_proj_weight_consumer_depth = 1 if emb_tile >= 128 else of_depth
     ln1_broadcast_groups = ffn_intermediate_size // ffn_tile
     effective_ffn_branches = len(placement["tail_tiles"]["ffn_up_by_branch"])
     if effective_ffn_branches != nB_tiles_distributed:
@@ -565,7 +568,7 @@ def encoder_pipeline(
         obj_types=[wo_ty] * parallel_heads,
         names=[f"memOW{i}" for i in range(parallel_heads)],
         dims_to_stream=[ow_dims] * parallel_heads,
-        depths=[of_depth] * parallel_heads,
+        depths=[o_proj_weight_consumer_depth] * parallel_heads,
         placement=Tile(col=ow_mem_col, row=1),
     )
 
@@ -1791,7 +1794,7 @@ def encoder_pipeline(
                 obj_type=wo_ty,
                 name="memOWSeqAll",
                 dims_to_stream=ow_dims,
-                depth=max(of_depth, parallel_seq),
+                depth=o_proj_weight_consumer_depth,
                 placement=Tile(col=w_o_cfg["mem_col"], row=1),
             )
 
@@ -1899,7 +1902,7 @@ def encoder_pipeline(
                         obj_type=wo_ty,
                         name=f"memOWSeq{suffix}",
                         dims_to_stream=ow_dims,
-                        depth=shared_forward_depth,
+                        depth=o_proj_weight_consumer_depth,
                         placement=Tile(
                             col=transport_group["shared_ingress_cols"]["w_o"], row=1
                         ),
@@ -1911,7 +1914,7 @@ def encoder_pipeline(
                         obj_types=[wo_ty] * parallel_heads,
                         names=[f"memOWSeq{suffix}H{i}" for i in range(parallel_heads)],
                         dims_to_stream=[ow_dims] * parallel_heads,
-                        depths=[shared_forward_depth] * parallel_heads,
+                        depths=[o_proj_weight_consumer_depth] * parallel_heads,
                         placement=Tile(
                             col=transport_group["shared_ingress_cols"]["w_o"], row=1
                         ),
