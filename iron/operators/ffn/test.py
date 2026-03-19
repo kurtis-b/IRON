@@ -17,12 +17,57 @@ TEST_BERT = True
 INCLUDE_SIMPLE_TESTS = False
 
 
-def generate_test_params(extensive=False):
+def build_test_names(params):
+    names = []
+    for (
+        M,
+        K,
+        N,
+        num_aie_columns,
+        b_col_maj,
+        c_col_maj,
+        m,
+        k,
+        n,
+        trace_size,
+        down_proj_depth,
+        n_a_tiles_distributed,
+        n_b_tiles_distributed,
+        stage_only,
+        gelu_stage,
+    ) in params:
+        name = f"ffn_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
+        if b_col_maj:
+            name += "_bcolmaj"
+        if c_col_maj:
+            name += "_ccolmaj"
+        if trace_size > 0:
+            name += f"_{trace_size}trace"
+        name += f"_dprojdepth{down_proj_depth}_nA{n_a_tiles_distributed}_nB{n_b_tiles_distributed}"
+        if stage_only is not None:
+            name += f"_stageonly{stage_only}"
+        name += f"_gelustage{gelu_stage}"
+        names.append(name)
+    return names
+
+
+def build_test_param_sets():
     if TEST_BERT:
-        params = [
+        benchmark_params = [
+            # Representative full-design BERT-style benchmark workloads.
+            # Only these normal BERT cases should run in the default non-extensive slice.
             #   M,     K,     N,    num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n, trace_size, down_proj_depth, n_a_tiles_distributed, n_b_tiles_distributed, stage_only, gelu_stage
+            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 0),
+            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 0),
+            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 1),
+            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 1),
+        ]
+
+        exploratory_params = [
+            # Full-design exploratory sweeps for broader coverage and comparison.
+            # These stay within the standard BERT-base workload, but sweep tiling/distribution choices.
+            # They are broader than the benchmark slice, so they remain extensive-only.
             # GeLU fused with up projection
-            # Scaling within 8 columns (total cores utilized vary)
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 0),
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 0),
             (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 0),
@@ -31,36 +76,9 @@ def generate_test_params(extensive=False):
             (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 0),
             (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 0),
             (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 0),
-            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 0),
-            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 0),
             (512, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 8, 2, None, 0),
             (512, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 4, 4, None, 0),
-            (1024, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 0),
-            (1024, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 0),
-            (1024, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 0),
-            (1024, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, None, 0),
-            (1024, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, None, 0),
-            (1024, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 0),
-            (1024, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 0),
-            (1024, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 0),
-            (1024, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 0),
-            (1024, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 0),
-            (1024, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 8, 2, None, 0),
-            (1024, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 4, 4, None, 0),
-            (2048, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 0),
-            (2048, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 0),
-            (2048, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 0),
-            (2048, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, None, 0),
-            (2048, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, None, 0),
-            (2048, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 0),
-            (2048, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 0),
-            (2048, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 0),
-            (2048, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 0),
-            (2048, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 0),
-            (2048, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 8, 2, None, 0),
-            (2048, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 4, 4, None, 0),
             # GeLU fused with down projection
-            # Scaling within 8 columns (total cores utilized vary)
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 1),
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 1),
             (512, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 1),
@@ -69,37 +87,20 @@ def generate_test_params(extensive=False):
             (512, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 1),
             (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 1),
             (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 1),
-            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 1),
-            (512, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 1),
             (512, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 8, 2, None, 1),
             (512, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 4, 4, None, 1),
-            (1024, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 1),
-            (1024, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 1),
-            (1024, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 1),
-            (1024, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, None, 1),
-            (1024, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, None, 1),
-            (1024, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 1),
-            (1024, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 1),
-            (1024, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 1),
-            (1024, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 1),
+        ]
+        params = benchmark_params
+        debug_params = [
+            # Scaling/debug coverage that is still useful, but should not run by default.
             (1024, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 1),
-            (1024, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 8, 2, None, 1),
-            (1024, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 4, 4, None, 1),
-            (2048, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 1),
-            (2048, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 1),
-            (2048, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 8, 2, None, 1),
-            (2048, 768, 3072, 8, False, False, 32, 96, 48, 0, 8, 4, 4, None, 1),
-            (2048, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 8, 2, None, 1),
-            (2048, 768, 3072, 8, False, False, 64, 64, 64, 0, 6, 4, 4, None, 1),
-            (2048, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, None, 1),
-            (2048, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, None, 1),
-            (2048, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 8, 2, None, 1),
             (2048, 768, 3072, 8, False, False, 64, 96, 48, 0, 8, 4, 4, None, 1),
-            (2048, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 8, 2, None, 1),
-            (2048, 768, 3072, 8, False, False, 64, 96, 32, 0, 8, 4, 4, None, 1),
+            (512, 1024, 4096, 8, False, False, 32, 128, 32, 0, 8, 4, 2, None, 1),
+            (1024, 1024, 4096, 8, False, False, 32, 128, 32, 0, 8, 4, 2, None, 1),
+            (2048, 1024, 4096, 8, False, False, 32, 128, 32, 0, 8, 4, 2, None, 1),
         ]
         if INCLUDE_SIMPLE_TESTS:
-            params += [
+            debug_params += [
                 # GeLU fused with up projection
                 # baseline
                 (64, 48, 96, 2, False, False, 64, 48, 96, 0, 1, 1, 1, None, 0),
@@ -181,58 +182,30 @@ def generate_test_params(extensive=False):
                 (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 8, 2, 1, 1),
                 (512, 768, 3072, 8, False, False, 32, 128, 32, 0, 6, 4, 4, 1, 1),
             ]
-        extensive_params = []
+        return benchmark_params, exploratory_params, debug_params
     else:
-        params = []
-        extensive_params = []
-
-    if extensive:
-        params = extensive_params
-
-    names = []
-    for (
-        M,
-        K,
-        N,
-        num_aie_columns,
-        b_col_maj,
-        c_col_maj,
-        m,
-        k,
-        n,
-        trace_size,
-        down_proj_depth,
-        n_a_tiles_distributed,
-        n_b_tiles_distributed,
-        stage_only,
-        gelu_stage,
-    ) in params:
-        name = f"ffn_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
-        if b_col_maj:
-            name += "_bcolmaj"
-        if c_col_maj:
-            name += "_ccolmaj"
-        if trace_size > 0:
-            name += f"_{trace_size}trace"
-        name += f"_dprojdepth{down_proj_depth}_nA{n_a_tiles_distributed}_nB{n_b_tiles_distributed}"
-        if stage_only is not None:
-            name += f"_stageonly{stage_only}"
-        name += f"_gelustage{gelu_stage}"
-        names.append(name)
-
-    return params, names
+        return [], [], []
 
 
-regular_params, regular_names = generate_test_params(extensive=False)
-extensive_params, extensive_names = generate_test_params(extensive=True)
+benchmark_params, extensive_params, debug_params = build_test_param_sets()
+benchmark_names = build_test_names(benchmark_params)
+extensive_names = build_test_names(extensive_params)
+debug_names = build_test_names(debug_params)
 
-# Combine params with marks - extensive params get pytest.mark.extensive
+# Combine params with marks:
+# - regular params are the benchmark-facing default slice
+# - extensive params are broader exploratory sweeps
+# - debug params isolate stages or use synthetic coverage shapes
 all_params = [
     pytest.param(*params, id=name)
-    for params, name in zip(regular_params, regular_names)
+    for params, name in zip(benchmark_params, benchmark_names)
 ] + [
     pytest.param(*params, marks=pytest.mark.extensive, id=name)
     for params, name in zip(extensive_params, extensive_names)
+]
+all_params += [
+    pytest.param(*params, marks=[pytest.mark.extensive, pytest.mark.debug], id=name)
+    for params, name in zip(debug_params, debug_names)
 ]
 
 

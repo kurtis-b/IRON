@@ -246,3 +246,8 @@ class AIEContext:
             op.xrt_runlist = None
 
         self._runtime_prepared = False
+
+    def cleanup(self):
+        """Release prepared runtime state and reset the underlying device manager."""
+        self.reset_runtime()
+        self.device_manager.reset()

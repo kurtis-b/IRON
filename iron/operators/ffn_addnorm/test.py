@@ -40,11 +40,46 @@ TODO:
 """
 
 
-def generate_test_params(extensive=False):
+def build_test_names(params):
+    names = []
+    for (
+        M,
+        K,
+        N,
+        num_aie_columns,
+        m,
+        k,
+        n,
+        trace_size,
+        down_proj_depth,
+        nA_tiles_distributed,
+        nB_tiles_distributed,
+        stage_only,
+        gelu_stage,
+    ) in params:
+        name = f"an_ffn_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
+        if trace_size > 0:
+            name += f"_{trace_size}trace"
+        name += f"_dprojdepth{down_proj_depth}_nA{nA_tiles_distributed}_nB{nB_tiles_distributed}"
+        if stage_only is not None:
+            name += f"_stageonly{stage_only}"
+        name += f"_gelustage{gelu_stage}"
+        names.append(name)
+    return names
+
+
+def build_test_param_sets():
     if TEST_BERT:
-        params_simple = []
+        debug_params = [
+            # Scaling coverage: useful for debug and bring-up, not default benchmark runs.
+            (1024, 768, 3072, 8, 32, 96, 64, 0, 8, 4, 3, None, 1),
+            (2048, 768, 3072, 8, 32, 96, 64, 0, 8, 4, 3, None, 1),
+            (512, 1024, 4096, 8, 32, 128, 32, 0, 8, 4, 2, None, 1),
+            (1024, 1024, 4096, 8, 32, 128, 32, 0, 8, 4, 2, None, 1),
+            (2048, 1024, 4096, 8, 32, 128, 32, 0, 8, 4, 2, None, 1),
+        ]
         if INCLUDE_SIMPLE_TESTS:
-            params_simple = [
+            debug_params += [
                 #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
                 # GeLU fused with up projection
                 ## Baselines
@@ -120,7 +155,8 @@ def generate_test_params(extensive=False):
                 (512, 768, 3072, 8, 32, 96, 64, 0, 8, 2, 6, 2, 1),
                 (512, 768, 3072, 8, 32, 96, 64, 0, 8, 4, 3, 2, 1),
             ]
-        params = params_simple + [
+        benchmark_params = [
+            # Representative full-design BERT-style benchmark workloads.
             #   M,     K,     N,    num_aie_columns,   m,   k,   n, trace_size, down_proj_depth, nA_tiles_distributed, nB_tiles_distributed, stage_only, gelu_stage
             # GeLU fused with up projection
             (512, 768, 3072, 8, 32, 96, 64, 0, 8, 2, 6, None, 0),
@@ -128,61 +164,32 @@ def generate_test_params(extensive=False):
             # GeLU fused with down projection
             (512, 768, 3072, 8, 32, 96, 64, 0, 8, 2, 6, None, 1),
             (512, 768, 3072, 8, 32, 96, 64, 0, 8, 4, 3, None, 1),
-            # Scale sequence length
-            (1024, 768, 3072, 8, 32, 96, 64, 0, 8, 4, 3, None, 1),
-            (2048, 768, 3072, 8, 32, 96, 64, 0, 8, 4, 3, None, 1),
-            # Scale hidden size (with matching scaling of down_proj_depth)
-            (512, 1024, 4096, 8, 32, 128, 32, 0, 8, 4, 2, None, 1),
-            (1024, 1024, 4096, 8, 32, 128, 32, 0, 8, 4, 2, None, 1),
-            (2048, 1024, 4096, 8, 32, 128, 32, 0, 8, 4, 2, None, 1),
         ]
         extensive_params = []
+        return benchmark_params, extensive_params, debug_params
     else:
-        params = []
-        extensive_params = []
-
-    if extensive:
-        params = extensive_params
-
-    names = []
-    for (
-        M,
-        K,
-        N,
-        num_aie_columns,
-        m,
-        k,
-        n,
-        trace_size,
-        down_proj_depth,
-        nA_tiles_distributed,
-        nB_tiles_distributed,
-        stage_only,
-        gelu_stage,
-    ) in params:
-        name = f"an_ffn_{M}x{K}x{N}_{m}x{k}x{n}_{num_aie_columns}cols"
-        if trace_size > 0:
-            name += f"_{trace_size}trace"
-        name += f"_dprojdepth{down_proj_depth}_nA{nA_tiles_distributed}_nB{nB_tiles_distributed}"
-        if stage_only is not None:
-            name += f"_stageonly{stage_only}"
-        name += f"_gelustage{gelu_stage}"
-        names.append(name)
-
-    return params, names
+        return [], [], []
 
 
-regular_params, regular_names = generate_test_params(extensive=False)
-extensive_params, extensive_names = generate_test_params(extensive=True)
+benchmark_params, extensive_params, debug_params = build_test_param_sets()
+benchmark_names = build_test_names(benchmark_params)
+extensive_names = build_test_names(extensive_params)
+debug_names = build_test_names(debug_params)
 
-# Combine params with marks - extensive params get pytest.mark.extensive
-all_params = [
-    pytest.param(*params, id=name)
-    for params, name in zip(regular_params, regular_names)
-] + [
-    pytest.param(*params, marks=pytest.mark.extensive, id=name)
-    for params, name in zip(extensive_params, extensive_names)
-]
+all_params = (
+    [
+        pytest.param(*params, id=name)
+        for params, name in zip(benchmark_params, benchmark_names)
+    ]
+    + [
+        pytest.param(*params, marks=pytest.mark.extensive, id=name)
+        for params, name in zip(extensive_params, extensive_names)
+    ]
+    + [
+        pytest.param(*params, marks=[pytest.mark.extensive, pytest.mark.debug], id=name)
+        for params, name in zip(debug_params, debug_names)
+    ]
+)
 
 
 @pytest.mark.metrics(

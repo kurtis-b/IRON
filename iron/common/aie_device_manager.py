@@ -8,9 +8,11 @@ Global AIE Device Manager for resource sharing and cleanup
 import logging
 import os
 import sys
+import gc
 from pathlib import Path
 from typing import Dict, Optional, Any
 import pyxrt
+import aie.utils
 from aie.utils import DefaultNPURuntime
 from aie.utils.npukernel import NPUKernel
 from aie.iron.device import NPU1, NPU2
@@ -27,6 +29,9 @@ class AIEDeviceManager:
         return cls._instance
 
     def __init__(self):
+        self._refresh_runtime()
+
+    def _refresh_runtime(self):
         self.runtime = DefaultNPURuntime
         # Expose device for AIEContext buffer allocation
         # Accessing protected member _device as AIEContext needs pyxrt.device
@@ -45,9 +50,19 @@ class AIEDeviceManager:
 
     def cleanup(self):
         """Clean up all XRT resources"""
-        # HostRuntime handles cleanup
-        pass
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None and hasattr(runtime, "cleanup"):
+            runtime.cleanup()
 
     def reset(self):
-        """Reset the device manager (for debugging)"""
-        pass
+        """Reset the cached XRT runtime and reacquire the device."""
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None and hasattr(runtime, "cleanup"):
+            runtime.cleanup()
+
+        # Drop the cached mlir_aie runtime so the next access recreates contexts.
+        if hasattr(aie.utils, "_DefaultNPURuntime"):
+            aie.utils._DefaultNPURuntime = None
+
+        gc.collect()
+        self._refresh_runtime()
