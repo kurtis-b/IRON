@@ -5,6 +5,7 @@
 import argparse
 import csv
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -295,7 +296,7 @@ def parse_turbostat_log(log_path):
             line = raw_line.strip()
             if not line:
                 continue
-            if line.startswith("PkgWatt"):
+            if "PkgWatt" in line.split():
                 header = line.split()
                 continue
             if header is None:
@@ -353,6 +354,17 @@ def empty_power_stats(sample_count_key="power_sample_count"):
         "avg_ram_watt": "",
         "max_ram_watt": "",
     }
+
+
+def wrap_command_with_xrt_setup(command):
+    xrt_root = Path(os.environ.get("XILINX_XRT", "/opt/xilinx/xrt"))
+    xrt_setup = xrt_root / "setup.sh"
+    quoted_command = " ".join(shlex.quote(part) for part in command)
+    shell_parts = []
+    if xrt_setup.exists():
+        shell_parts.append(f". {shlex.quote(str(xrt_setup))} >/dev/null 2>&1")
+    shell_parts.append(f"exec {quoted_command}")
+    return ["/bin/bash", "-lc", " && ".join(shell_parts)]
 
 
 def measure_idle_power(args, case, logs_dir):
@@ -465,6 +477,7 @@ def run_case(args, case, logs_dir):
         idle_stats, idle_log_path = measure_idle_power(args, case, logs_dir)
 
     if args.power_backend == "turbostat":
+        wrapped_command = wrap_command_with_xrt_setup(command)
         wrapped = [
             "sudo",
             "-n",
@@ -477,7 +490,7 @@ def run_case(args, case, logs_dir):
             str(args.power_interval_sec),
             "--out",
             str(power_log_path),
-            *command,
+            *wrapped_command,
         ]
         result = subprocess.run(
             wrapped,
