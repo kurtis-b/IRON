@@ -4,9 +4,11 @@
 
 import csv
 import hashlib
+import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 SAMPLE_TEXT = """
@@ -27,14 +29,20 @@ duties back as are right fit, obey you, love you, and most honour you.
 """
 
 CSV_FIELDNAMES = [
+    "study_id",
     "seq_len",
     "num_threads",
     "dtype",
     "num_samples",
     "runs_per_sample",
     "warmup_runs",
+    "measured_inference_count",
+    "timed_total_sec",
+    "throughput_inferences_per_sec",
     "model_type",
     "shape",
+    "estimated_flops_per_inference",
+    "throughput_flops_per_sec",
     "topology_id",
     "parallel_seq",
     "parallel_heads",
@@ -45,15 +53,17 @@ CSV_FIELDNAMES = [
 ]
 
 
-def _detect_physical_cores_from_sysfs():
+def _detect_physical_cores_from_sysfs(respect_affinity=True):
     cpu_root = Path("/sys/devices/system/cpu")
     if not cpu_root.exists():
         return None
 
-    try:
-        allowed_cpus = os.sched_getaffinity(0)
-    except AttributeError:
-        allowed_cpus = None
+    allowed_cpus = None
+    if respect_affinity:
+        try:
+            allowed_cpus = os.sched_getaffinity(0)
+        except AttributeError:
+            allowed_cpus = None
 
     physical_cores = set()
     for cpu_dir in cpu_root.glob("cpu[0-9]*"):
@@ -74,7 +84,7 @@ def _detect_physical_cores_from_sysfs():
     return len(physical_cores) if physical_cores else None
 
 
-def _detect_physical_cores_from_lscpu():
+def _detect_physical_cores_from_lscpu(respect_affinity=True):
     try:
         output = subprocess.check_output(
             ["lscpu", "-p=CPU,CORE,SOCKET"], text=True, stderr=subprocess.DEVNULL
@@ -82,10 +92,12 @@ def _detect_physical_cores_from_lscpu():
     except (FileNotFoundError, subprocess.CalledProcessError):
         return None
 
-    try:
-        allowed_cpus = os.sched_getaffinity(0)
-    except AttributeError:
-        allowed_cpus = None
+    allowed_cpus = None
+    if respect_affinity:
+        try:
+            allowed_cpus = os.sched_getaffinity(0)
+        except AttributeError:
+            allowed_cpus = None
 
     physical_cores = set()
     for line in output.splitlines():
@@ -100,14 +112,24 @@ def _detect_physical_cores_from_lscpu():
 
 
 def detect_physical_core_count():
-    detected = _detect_physical_cores_from_sysfs()
+    detected = _detect_physical_cores_from_sysfs(respect_affinity=True)
     if detected:
         return detected
-    detected = _detect_physical_cores_from_lscpu()
+    detected = _detect_physical_cores_from_lscpu(respect_affinity=True)
     if detected:
         return detected
     logical = os.cpu_count() or 1
     return max(1, logical // 2)
+
+
+def detect_max_physical_core_count():
+    detected = _detect_physical_cores_from_sysfs(respect_affinity=False)
+    if detected:
+        return detected
+    detected = _detect_physical_cores_from_lscpu(respect_affinity=False)
+    if detected:
+        return detected
+    return detect_physical_core_count()
 
 
 def detect_logical_thread_count():
@@ -133,6 +155,72 @@ def configure_cpu_thread_env(num_threads):
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
+def add_cooldown_args(parser):
+    parser.add_argument(
+        "--cooldown-sec",
+        type=float,
+        default=0.0,
+        help="Optional fixed wait inserted before each benchmark segment.",
+    )
+    parser.add_argument(
+        "--cooldown-until-temp-c",
+        type=float,
+        default=None,
+        help=(
+            "Optional temperature threshold. When set, wait until the selected "
+            "temperature source drops to or below this value before each benchmark "
+            "segment."
+        ),
+    )
+    parser.add_argument(
+        "--cooldown-temp-source",
+        choices=("auto", "cpu", "gpu"),
+        default="auto",
+        help=(
+            "Temperature source family used by --cooldown-until-temp-c. auto picks "
+            "CPU/package sensors for cpu/npu and GPU sensors for igpu."
+        ),
+    )
+    parser.add_argument(
+        "--cooldown-poll-sec",
+        type=float,
+        default=2.0,
+        help="Polling interval while waiting for a temperature threshold.",
+    )
+    parser.add_argument(
+        "--cooldown-timeout-sec",
+        type=float,
+        default=900.0,
+        help="Maximum time to wait for a temperature threshold before failing.",
+    )
+
+
+def summarize_latency_measurements(latencies_ms, estimated_flops_per_inference):
+    if not latencies_ms:
+        raise ValueError("Expected at least one latency sample")
+
+    timed_total_sec = sum(latencies_ms) / 1000.0
+    measured_inference_count = len(latencies_ms)
+    throughput_inferences_per_sec = (
+        measured_inference_count / timed_total_sec if timed_total_sec > 0 else 0.0
+    )
+    throughput_flops_per_sec = (
+        (estimated_flops_per_inference * measured_inference_count) / timed_total_sec
+        if timed_total_sec > 0
+        else 0.0
+    )
+    return {
+        "measured_inference_count": measured_inference_count,
+        "timed_total_sec": timed_total_sec,
+        "throughput_inferences_per_sec": throughput_inferences_per_sec,
+        "estimated_flops_per_inference": estimated_flops_per_inference,
+        "throughput_flops_per_sec": throughput_flops_per_sec,
+        "min_latency_ms": min(latencies_ms),
+        "avg_latency_ms": sum(latencies_ms) / measured_inference_count,
+        "max_latency_ms": max(latencies_ms),
+    }
+
+
 def parse_seq_lens(seq_lens_arg):
     seq_lens = []
     for token in seq_lens_arg.split(","):
@@ -146,6 +234,139 @@ def parse_seq_lens(seq_lens_arg):
     if not seq_lens:
         raise ValueError("At least one sequence length must be provided")
     return seq_lens
+
+
+def _load_sensors_json():
+    result = subprocess.run(
+        ["sensors", "-j"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to read sensors JSON\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Failed to parse sensors JSON output: {exc}") from exc
+
+
+def _sensor_temp_candidates():
+    candidates = []
+    for chip_name, chip_data in _load_sensors_json().items():
+        if not isinstance(chip_data, dict):
+            continue
+        for label, values in chip_data.items():
+            if not isinstance(values, dict):
+                continue
+            for key, value in values.items():
+                if not key.startswith("temp") or not key.endswith("_input"):
+                    continue
+                if not isinstance(value, (int, float)):
+                    continue
+                candidates.append(
+                    {
+                        "chip": chip_name,
+                        "label": label,
+                        "key": key,
+                        "source": f"{chip_name}:{label}:{key}",
+                        "temperature_c": float(value),
+                    }
+                )
+    return candidates
+
+
+def _pick_temp_candidate(candidates, preference):
+    if preference == "gpu":
+        selectors = (
+            lambda c: c["chip"].startswith("amdgpu") and c["label"] == "edge",
+            lambda c: c["chip"].startswith("amdgpu") and c["label"] == "junction",
+            lambda c: c["chip"].startswith("amdgpu"),
+            lambda c: c["chip"].startswith("k10temp") and c["label"] == "Tctl",
+            lambda c: c["chip"].startswith("acpitz"),
+        )
+    else:
+        selectors = (
+            lambda c: c["chip"].startswith("k10temp") and c["label"] == "Tctl",
+            lambda c: c["chip"].startswith("k10temp"),
+            lambda c: c["chip"].startswith("acpitz"),
+            lambda c: c["chip"].startswith("amdgpu") and c["label"] == "edge",
+            lambda c: c["chip"].startswith("amdgpu"),
+        )
+
+    for selector in selectors:
+        for candidate in candidates:
+            if selector(candidate):
+                return candidate
+    return candidates[0] if candidates else None
+
+
+def read_temperature_reading(mode, requested_source):
+    preference = requested_source
+    if preference == "auto":
+        preference = "gpu" if mode == "igpu" else "cpu"
+    candidate = _pick_temp_candidate(_sensor_temp_candidates(), preference)
+    if candidate is None:
+        raise RuntimeError("No temperature sensors are available for cooldown polling")
+    return candidate
+
+
+def cooldown_before_benchmark(args, *, mode, label):
+    if args.cooldown_sec <= 0 and args.cooldown_until_temp_c is None:
+        return {
+            "cooldown_wait_sec": 0.0,
+            "cooldown_start_temp_c": None,
+            "cooldown_end_temp_c": None,
+            "cooldown_temp_source": "",
+        }
+
+    start_time = time.perf_counter()
+    start_temp_c = None
+    end_temp_c = None
+    temp_source = ""
+
+    if args.cooldown_until_temp_c is not None:
+        reading = read_temperature_reading(mode, args.cooldown_temp_source)
+        start_temp_c = reading["temperature_c"]
+        temp_source = reading["source"]
+        print(
+            f"Cooldown before {label}: waiting for temperature <= "
+            f"{args.cooldown_until_temp_c:.1f} C from {temp_source}",
+            flush=True,
+        )
+
+    if args.cooldown_sec > 0:
+        print(
+            f"Cooldown before {label}: sleeping for {args.cooldown_sec:.3f} sec",
+            flush=True,
+        )
+        time.sleep(args.cooldown_sec)
+
+    if args.cooldown_until_temp_c is not None:
+        deadline = time.perf_counter() + args.cooldown_timeout_sec
+        while True:
+            reading = read_temperature_reading(mode, args.cooldown_temp_source)
+            temp_source = reading["source"]
+            end_temp_c = reading["temperature_c"]
+            if end_temp_c <= args.cooldown_until_temp_c:
+                break
+            if time.perf_counter() >= deadline:
+                raise RuntimeError(
+                    f"Timed out waiting for {temp_source} to cool below "
+                    f"{args.cooldown_until_temp_c:.1f} C; last reading was "
+                    f"{end_temp_c:.1f} C"
+                )
+            time.sleep(max(0.1, args.cooldown_poll_sec))
+
+    wait_sec = time.perf_counter() - start_time
+    return {
+        "cooldown_wait_sec": wait_sec,
+        "cooldown_start_temp_c": start_temp_c,
+        "cooldown_end_temp_c": end_temp_c,
+        "cooldown_temp_source": temp_source,
+    }
 
 
 def build_benchmark_texts(num_samples):

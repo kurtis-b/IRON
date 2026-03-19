@@ -19,7 +19,7 @@
 import torch
 import torch.nn as nn
 
-from model_support import model_uses_token_type_ids
+from model_support import model_uses_token_type_ids, normalize_model_family
 from .block.transformer import BertEncoder
 from .utils import assign
 
@@ -29,10 +29,12 @@ class EncoderEmbeddings(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.model_family = normalize_model_family(config.model_config.model_type)
+        self.padding_idx = int(config.model_config.pad_token_id)
         self.word_embeddings = nn.Embedding(
             config.model_config.vocab_size,
             config.model_config.hidden_size,
-            padding_idx=config.model_config.pad_token_id,
+            padding_idx=self.padding_idx,
         )
         self.position_embeddings = nn.Embedding(
             config.model_config.max_position_embeddings,
@@ -60,7 +62,11 @@ class EncoderEmbeddings(nn.Module):
     def forward(self, input_ids, token_type_ids=None):
         seq_len = input_ids.size(1)
         inputs_embeds = self.word_embeddings(input_ids)
-        position_ids = self.position_ids[:, :seq_len]
+        if self.model_family == "roberta":
+            mask = input_ids.ne(self.padding_idx).long()
+            position_ids = (torch.cumsum(mask, dim=1) * mask) + self.padding_idx
+        else:
+            position_ids = self.position_ids[:, :seq_len]
         position_embeddings = self.position_embeddings(position_ids)
         embeddings = inputs_embeds + position_embeddings
         if self.token_type_embeddings is not None:

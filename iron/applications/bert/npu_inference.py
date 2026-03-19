@@ -10,17 +10,21 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from benchmark_common import (
+    add_cooldown_args,
     build_benchmark_texts,
+    cooldown_before_benchmark,
     configure_cpu_thread_env,
-    detect_physical_core_count,
+    detect_max_physical_core_count,
     encode_benchmark_texts,
     parse_seq_lens,
+    summarize_latency_measurements,
     write_results_csv,
 )
 from model_support import (
     canonicalize_app_config_dict,
     canonicalize_local_backbone_weights,
     display_name_for_model,
+    estimate_encoder_forward_flops,
     extend_or_trim_position_embeddings,
     resolve_study_paths,
 )
@@ -91,7 +95,10 @@ def parse_args():
         "--num-threads",
         type=int,
         default=None,
-        help="Override the host CPU thread count. Defaults to detected physical cores.",
+        help=(
+            "Override the host CPU thread count. Defaults to the machine's maximum "
+            "physical core count."
+        ),
     )
     parser.add_argument(
         "--output-csv",
@@ -136,6 +143,7 @@ def parse_args():
         default=5,
         help="Timed runs per candidate topology during autotune.",
     )
+    add_cooldown_args(parser)
     return parser.parse_args()
 
 
@@ -330,13 +338,12 @@ def reset_default_context():
     return AIEOperatorBase._default_context
 
 
-def build_npu_encoder_model(weights_file_path, config):
+def build_npu_encoder_model(weights_file_path, config, seq_len):
     from safetensors.torch import load_file
 
     from iron.common import AIEOperatorBase
     from src.model import EncoderBackbone
 
-    seq_len = config.model_config.max_position_embeddings
     reset_default_context()
     model = EncoderBackbone(config, seq_len=seq_len)
 
@@ -345,7 +352,10 @@ def build_npu_encoder_model(weights_file_path, config):
         raw_weights,
         config.model_config,
     )
-    extend_or_trim_position_embeddings(canonical_weights, seq_len)
+    extend_or_trim_position_embeddings(
+        canonical_weights,
+        int(config.model_config.max_position_embeddings),
+    )
     model.assign_backbone_weights(canonical_weights)
     model.eval()
 
@@ -370,6 +380,7 @@ def benchmark_with_config(
     model, context = build_npu_encoder_model(
         weights_file_path=weights_file_path,
         config=config,
+        seq_len=seq_len,
     )
     encoded_samples = encode_benchmark_texts(
         texts=texts,
@@ -400,6 +411,10 @@ def benchmark_with_config(
                 latencies_ms.append((end - start) * 1000.0)
 
     context.device_manager.reset()
+    latency_stats = summarize_latency_measurements(
+        latencies_ms,
+        estimate_encoder_forward_flops(vars(config.model_config), seq_len),
+    )
 
     return {
         "seq_len": seq_len,
@@ -410,14 +425,13 @@ def benchmark_with_config(
         "parallel_seq": topology["parallel_seq"],
         "parallel_heads": topology["parallel_heads"],
         "parallel_ffn": topology["parallel_ffn"],
-        "min_latency_ms": min(latencies_ms),
-        "avg_latency_ms": sum(latencies_ms) / len(latencies_ms),
-        "max_latency_ms": max(latencies_ms),
+        **latency_stats,
     }
 
 
 def autotune_topology(
     *,
+    args,
     weights_file_path,
     config_file_path,
     seq_len,
@@ -436,6 +450,11 @@ def autotune_topology(
     best_topology = None
     best_latency_ms = None
     for topology in candidates:
+        cooldown_before_benchmark(
+            args=args,
+            mode="npu",
+            label=f"NPU autotune seq_len={seq_len} topology={topology_id(topology)}",
+        )
         print(
             f"Autotune candidate: seq_len={seq_len} topology={topology_id(topology)}",
             flush=True,
@@ -489,6 +508,7 @@ def resolve_topology(args, seq_len, texts):
         return cache_data[cache_key]
 
     selected = autotune_topology(
+        args=args,
         weights_file_path=args.weights_file_path,
         config_file_path=args.config_file_path,
         seq_len=seq_len,
@@ -508,7 +528,7 @@ def main():
     args.weights_file_path = weights_file_path
     args.config_file_path = config_file_path
     seq_lens = parse_seq_lens(args.seq_lens)
-    num_threads = args.num_threads or detect_physical_core_count()
+    num_threads = args.num_threads or detect_max_physical_core_count()
     configure_cpu_thread_env(num_threads)
 
     import torch
@@ -531,7 +551,13 @@ def main():
     print(f"Topology policy: {args.topology_policy}", flush=True)
 
     csv_rows = []
+    study_id = args.study_id or ""
     for seq_len in seq_lens:
+        cooldown_before_benchmark(
+            args,
+            mode="npu",
+            label=f"NPU seq_len={seq_len}",
+        )
         print(f"Starting NPU benchmark: seq_len={seq_len}", flush=True)
         topology = resolve_topology(args, seq_len, texts)
         print(
@@ -559,14 +585,26 @@ def main():
         )
         csv_rows.append(
             {
+                "study_id": study_id,
                 "seq_len": seq_len,
                 "num_threads": num_threads,
                 "dtype": result["dtype"],
                 "num_samples": args.num_samples,
                 "runs_per_sample": args.runs_per_sample,
                 "warmup_runs": args.warmup_runs,
+                "measured_inference_count": result["measured_inference_count"],
+                "timed_total_sec": f"{result['timed_total_sec']:.6f}",
+                "throughput_inferences_per_sec": (
+                    f"{result['throughput_inferences_per_sec']:.6f}"
+                ),
                 "model_type": result["model_type"],
                 "shape": result["shape"],
+                "estimated_flops_per_inference": (
+                    f"{result['estimated_flops_per_inference']:.6e}"
+                ),
+                "throughput_flops_per_sec": (
+                    f"{result['throughput_flops_per_sec']:.6e}"
+                ),
                 "topology_id": result["topology_id"],
                 "parallel_seq": result["parallel_seq"],
                 "parallel_heads": result["parallel_heads"],

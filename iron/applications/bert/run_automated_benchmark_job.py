@@ -13,6 +13,7 @@ AUTOMATED_BENCHMARK = SCRIPT_DIR / "automated_benchmark.py"
 
 OPTION_MAP = {
     "study_id": "--study-id",
+    "study_ids": "--study-ids",
     "study_manifest": "--study-manifest",
     "models_root": "--models-root",
     "modes": "--modes",
@@ -22,6 +23,9 @@ OPTION_MAP = {
     "runs_per_sample": "--runs-per-sample",
     "cpu_thread_counts": "--cpu-thread-counts",
     "npu_num_threads": "--npu-num-threads",
+    "igpu_num_threads": "--igpu-num-threads",
+    "igpu_dtype": "--igpu-dtype",
+    "igpu_device_index": "--igpu-device-index",
     "npu_topology_policy": "--npu-topology-policy",
     "npu_topology_cache": "--npu-topology-cache",
     "npu_candidate_topologies": "--npu-candidate-topologies",
@@ -30,6 +34,11 @@ OPTION_MAP = {
     "power_backend": "--power-backend",
     "power_interval_sec": "--power-interval-sec",
     "npu_idle_baseline_sec": "--npu-idle-baseline-sec",
+    "cooldown_sec": "--cooldown-sec",
+    "cooldown_until_temp_c": "--cooldown-until-temp-c",
+    "cooldown_temp_source": "--cooldown-temp-source",
+    "cooldown_poll_sec": "--cooldown-poll-sec",
+    "cooldown_timeout_sec": "--cooldown-timeout-sec",
     "power_cycle_cmd": "--power-cycle-cmd",
     "state_json": "--state-json",
     "output_csv": "--output-csv",
@@ -76,9 +85,10 @@ def build_command(job_config_path, job):
     job_dir = Path(job_config_path).resolve().parent
     has_explicit_paths = "weights_file_path" in job and "config_file_path" in job
     has_study_id = "study_id" in job
-    if has_explicit_paths == has_study_id:
+    has_study_ids = "study_ids" in job
+    if sum((has_explicit_paths, has_study_id, has_study_ids)) != 1:
         raise ValueError(
-            "Job config must include either weights_file_path/config_file_path or study_id"
+            "Job config must include exactly one of weights_file_path/config_file_path, study_id, or study_ids"
         )
 
     command = [

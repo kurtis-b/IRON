@@ -66,6 +66,8 @@ def canonicalize_model_config(model_config):
         )
         cfg.setdefault("hidden_act", cfg.get("activation", "gelu"))
         cfg.setdefault("type_vocab_size", 0)
+    elif family == "roberta":
+        cfg["type_vocab_size"] = 1
     else:
         cfg.setdefault("type_vocab_size", 2)
 
@@ -92,7 +94,9 @@ def canonicalize_app_config_dict(config_json, seq_len=None):
         raise ValueError("Config JSON does not contain model_config")
     canonical["model_config"] = canonicalize_model_config(canonical["model_config"])
     if seq_len is not None:
-        canonical["model_config"]["max_position_embeddings"] = seq_len
+        canonical["model_config"]["max_position_embeddings"] = (
+            runtime_max_position_embeddings(canonical["model_config"], seq_len)
+        )
     return canonical
 
 
@@ -108,6 +112,30 @@ def display_name_for_model(model_config):
         _model_config_to_dict(model_config).get("model_type")
     )
     return DISPLAY_NAME_BY_FAMILY[family]
+
+
+def runtime_max_position_embeddings(model_config, seq_len):
+    cfg = canonicalize_model_config(model_config)
+    seq_len = int(seq_len)
+    if cfg["model_type"] == "roberta":
+        return seq_len + int(cfg["pad_token_id"]) + 1
+    return seq_len
+
+
+def estimate_encoder_forward_flops(model_config, seq_len, batch_size=1):
+    cfg = canonicalize_model_config(model_config)
+    seq_len = int(seq_len)
+    batch_size = int(batch_size)
+    hidden_size = int(cfg["hidden_size"])
+    intermediate_size = int(cfg["intermediate_size"])
+    num_hidden_layers = int(cfg["num_hidden_layers"])
+
+    # Dominant forward-pass GEMM estimate for encoder-only transformers.
+    # Multiply-add pairs count as 2 FLOPs.
+    projection_flops = 8 * batch_size * seq_len * hidden_size * hidden_size
+    attention_matmul_flops = 4 * batch_size * seq_len * seq_len * hidden_size
+    ffn_flops = 4 * batch_size * seq_len * hidden_size * intermediate_size
+    return num_hidden_layers * (projection_flops + attention_matmul_flops + ffn_flops)
 
 
 def build_hf_encoder_model(model_config):
@@ -189,6 +217,8 @@ def extract_backbone_state_dict(raw_weights, model_config):
                 continue
 
         candidate = normalize_layernorm_key(candidate)
+        if candidate == "embeddings.position_ids":
+            continue
         if family in ("bert", "roberta") and candidate.startswith("pooler."):
             continue
         stripped[candidate] = value
