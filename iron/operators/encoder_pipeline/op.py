@@ -49,6 +49,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         ln_weight=None,
         context=None,
         skip_add_to_list: bool = False,
+        artifact_prefix: str | None = None,
     ):
         self.num_heads = num_heads
         self.seq_len = seq_len
@@ -63,6 +64,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.o_proj_acc_group_size = o_proj_acc_group_size
         self.ffn_down_acc_group_size = ffn_down_acc_group_size
         self.nB_tiles_distributed = nB_tiles_distributed
+        self.artifact_prefix = artifact_prefix or "encoder_pipeline"
         self.embed_sz = d * num_heads
         self.ffn_intermediate_size = (
             4 * self.embed_sz
@@ -250,6 +252,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
     def get_artifacts(self, prefix: str = "encoder_pipeline"):
         operator_dir = Path(__file__).parent
         file_name_base = self._artifact_stem(prefix)
+        kernel_instance_name = f"encoder_pipeline_{hashlib.blake2s(file_name_base.encode(), digest_size=4).hexdigest()}"
 
         ln1_weight_file_name = (
             self.context.build_dir / f"{file_name_base}_ln1_weight_{self.embed_sz}.npy"
@@ -359,6 +362,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_base}.xclbin",
+            kernel_name=kernel_instance_name,
             depends=[
                 mlir_artifact,
                 KernelArchiveArtifact.new(
@@ -428,7 +432,10 @@ class AIEEncoderPipeline(AIEOperatorBase):
                     ],
                 ),
             ],
-            extra_flags=["--dynamic-objFifos"],
+            extra_flags=[
+                "--dynamic-objFifos",
+                f"--xclbin-instance-name={kernel_instance_name}",
+            ],
         )
         insts_artifact = InstsBinArtifact.new(
             f"{file_name_base}.bin",
@@ -438,7 +445,9 @@ class AIEEncoderPipeline(AIEOperatorBase):
         return xclbin_artifact, insts_artifact
 
     def set_up_artifacts(self):
-        xclbin_artifact, insts_artifact = self.get_artifacts()
+        xclbin_artifact, insts_artifact = self.get_artifacts(
+            prefix=self.artifact_prefix
+        )
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
         self.add_artifacts([xclbin_artifact, insts_artifact])
@@ -494,9 +503,10 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.add_to_runlist("encoder_pipeline", "W_O", "QKV", "OR", "B_Up", "B_Down")
 
     def _write_qkv_zero_copy(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        q_np = torch_to_numpy(q).reshape(-1)
-        k_np = torch_to_numpy(k).reshape(-1)
-        v_np = torch_to_numpy(v).reshape(-1)
+        # The kernel consumes per-sequence rows with all heads packed contiguously.
+        q_np = torch_to_numpy(q.transpose(0, 1).contiguous()).reshape(-1)
+        k_np = torch_to_numpy(k.transpose(0, 1).contiguous()).reshape(-1)
+        v_np = torch_to_numpy(v.transpose(0, 1).contiguous()).reshape(-1)
         qkv_view = self.buffer_view(
             "QKV",
             (3 * self.num_heads * self.seq_len * self.d,),

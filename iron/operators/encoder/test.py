@@ -1,138 +1,129 @@
-# SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
-import pytest
-import logging
+import time
 from pathlib import Path
+
+import torch
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from iron.operators.encoder.op import AIEBERTEncoder
 from iron.operators.encoder.reference import generate_golden_reference
-from iron.common.test_utils import run_test, verify_buffer
+
+REL_TOL = 4.0e-2
+ABS_TOL = 1.5e-1
+ERROR_THRESHOLD = 0.005
+WARMUP_ITERS = 10
+TIMED_ITERS = 20
 
 
-def generate_test_params(extensive=False):
-    params = [
-        # seq_len,embedding_dim,ffn_dim,num_heads,use_pip_ffn,use_pip_addnorm,use_pip_mha,use_pip_anffn
-        (512, 768, 3072, 12, False, False, False, False),
-        (512, 768, 3072, 12, True, False, False, False),
-        (512, 768, 3072, 12, False, True, False, False),
-        (512, 768, 3072, 12, False, False, True, False),
-        (512, 768, 3072, 12, True, True, False, False),
-        (512, 768, 3072, 12, True, False, True, False),
-        (512, 768, 3072, 12, False, True, True, False),
-        (512, 768, 3072, 12, True, True, True, False),
-        (512, 768, 3072, 12, False, False, False, True),
-        (512, 768, 3072, 12, False, False, True, True),
-    ]
-    extensive_params = []
-
-    if extensive:
-        params = extensive_params
-
-    names = []
-    for (
-        seq_len,
-        embedding_dim,
-        ffn_dim,
-        num_heads,
-        use_pip_ffn,
-        use_pip_addnorm,
-        use_pip_mha,
-        use_pip_an_ffn,
-    ) in params:
-        name = f"bert_encoder_{seq_len}x{embedding_dim}x{ffn_dim}x{num_heads}xpipffn_{use_pip_ffn}_pipaddnorm_{use_pip_addnorm}_pipmha_{use_pip_mha}_pipanffn_{use_pip_an_ffn}"
-        names.append(name)
-
-    return params, names
-
-
-regular_params, regular_names = generate_test_params()
-
-# Combine params with marks - extensive params get pytest.mark.extensive
-all_params = [
-    pytest.param(*params, id=name)
-    for params, name in zip(regular_params, regular_names)
-]
-
-
-@pytest.mark.metrics(
-    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
-    Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
+BENCHMARK_CASES = (
+    pytest.param(
+        512,
+        768,
+        3072,
+        12,
+        1,
+        "bert",
+        id="bert_encoder_1layer_512seq_768hidden_3072ffn_12heads",
+    ),
+    pytest.param(
+        512,
+        768,
+        3072,
+        12,
+        2,
+        "bert",
+        id="bert_encoder_2layer_512seq_768hidden_3072ffn_12heads",
+    ),
+    pytest.param(
+        512,
+        768,
+        3072,
+        12,
+        1,
+        "roberta",
+        id="roberta_encoder_1layer_512seq_768hidden_3072ffn_12heads",
+    ),
+    pytest.param(
+        512,
+        768,
+        3072,
+        12,
+        1,
+        "distilbert",
+        id="distilbert_encoder_1layer_512seq_768hidden_3072ffn_12heads",
+    ),
 )
+
+
+def _count_errors(actual: torch.Tensor, expected: torch.Tensor) -> int:
+    actual_f32 = actual.to(torch.float32).reshape(-1)
+    expected_f32 = expected.to(torch.float32).reshape(-1)
+    matches = torch.isclose(actual_f32, expected_f32, rtol=REL_TOL, atol=ABS_TOL)
+    return int((~matches).sum().item())
+
+
+def _run_encoder_stack(operator: AIEBERTEncoder, input_tensor: torch.Tensor):
+    operator.compile_all()
+    operator.prepare_runtime()
+
+    try:
+        for _ in range(WARMUP_ITERS):
+            operator(input_tensor)
+
+        elapsed_total = 0.0
+        output = None
+        for _ in range(TIMED_ITERS):
+            start = time.perf_counter()
+            output = operator(input_tensor).clone()
+            elapsed_total += time.perf_counter() - start
+        assert output is not None
+        return output, (elapsed_total / TIMED_ITERS) * 1e6
+    finally:
+        operator.cleanup()
+
+
+@pytest.mark.metrics(Latency=r"Latency \(us\): (?P<value>[\d\.]+)")
 @pytest.mark.parametrize(
-    "seq_len,embedding_dim,ffn_dim,num_heads,use_pip_ffn,use_pip_addnorm,use_pip_mha,use_pip_an_ffn",
-    all_params,
+    "seq_len,hidden_size,intermediate_size,num_heads,num_hidden_layers,model_type",
+    BENCHMARK_CASES,
 )
 def test_bert_encoder(
     seq_len,
-    embedding_dim,
-    ffn_dim,
+    hidden_size,
+    intermediate_size,
     num_heads,
-    use_pip_ffn,
-    use_pip_addnorm,
-    use_pip_mha,
-    use_pip_an_ffn,
-    aie_context,
+    num_hidden_layers,
+    model_type,
 ):
-    golden_ref = generate_golden_reference(seq_len, embedding_dim, ffn_dim, num_heads)
+    golden_ref = generate_golden_reference(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_heads=num_heads,
+        num_hidden_layers=num_hidden_layers,
+        model_type=model_type,
+    )
 
     operator = AIEBERTEncoder(
         seq_len=seq_len,
-        hidden_size=embedding_dim,
-        intermediate_size=ffn_dim,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
         num_heads=num_heads,
-        use_pip_ffn=use_pip_ffn,
-        use_pip_addnorm=use_pip_addnorm,
-        use_pip_mha=use_pip_mha,
-        use_pip_an_ffn=use_pip_an_ffn,
-        ln1_weight=golden_ref["weights"]["ln1_weight"],
-        ln2_weight=golden_ref["weights"]["ln2_weight"],
-        context=aie_context,
+        num_hidden_layers=num_hidden_layers,
+        model_type=model_type,
     )
+    operator.assign_weights(golden_ref["weights"])
 
-    operator.q_weight = golden_ref["weights"]["q_weight"]
-    operator.k_weight = golden_ref["weights"]["k_weight"]
-    operator.v_weight = golden_ref["weights"]["v_weight"]
-    operator.attn_output_weight = golden_ref["weights"]["attn_output_weight"]
-    operator.ffn_up_weight = golden_ref["weights"]["ffn_up_weight"]
-    operator.ffn_down_weight = golden_ref["weights"]["ffn_down_weight"]
-
-    input_buffers = {
-        "input": golden_ref["input"],
-    }
-    output_buffers = {
-        "output": golden_ref["output"],
-    }
-    intermediate_buffers = {}
-
-    errors, latency_us, bandwidth_gbps = run_test(
-        operator,
-        input_buffers,
-        output_buffers,
-        intermediate_buffers,
-        rel_tol=0.05,
-        abs_tol=0.5,
-        warmup_iters=10,
-        timed_iters=100,
-    )
-
-    # Use batch_size of C for total operations
-    total_macs = seq_len * embedding_dim * embedding_dim * 4
-    total_macs += seq_len * (embedding_dim // num_heads) * seq_len * num_heads * 2
-    total_macs += seq_len * embedding_dim * ffn_dim * 2
-    total_ops = total_macs * 2  # 2 operations per MAC
-    gflops = total_ops / (latency_us * 1e-6) / 1e9
+    output, latency_us = _run_encoder_stack(operator, golden_ref["input"])
+    errors = _count_errors(output, golden_ref["output"])
+    max_acceptable_errors = int(seq_len * hidden_size * ERROR_THRESHOLD)
 
     print(f"\nLatency (us): {latency_us:.1f}")
-    # print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s")
-    print(f"Throughput: {gflops:.6e} GFLOP/s\n")
+    print(f"({errors} errors out of {max_acceptable_errors} max allowable)\n")
 
-    error_threshold = 0.05
-    max_acceptable_errors = int(seq_len * embedding_dim * error_threshold)
-
-    assert (
-        len(errors["output"]) <= max_acceptable_errors
-    ), f"Test failed with {len(errors['output'])} errors (max allowable: {max_acceptable_errors})"
+    assert errors <= max_acceptable_errors
