@@ -16,11 +16,30 @@ import torch
 TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(TEST_DIR))
 
-from automated_benchmark import enumerate_cases, parse_turbostat_log
+import benchmark_common
+from automated_benchmark import (
+    enumerate_cases,
+    parse_turbostat_log,
+    resolve_power_backend,
+)
+from benchmark_common import (
+    DEFAULT_BENCHMARK_SEQ_LENS,
+    acceptable_cooldown_temp,
+    cooldown_before_benchmark,
+    parse_seq_lens,
+)
 from model_support import (
     canonicalize_app_config_dict,
     canonicalize_local_backbone_weights,
     estimate_encoder_forward_flops,
+)
+from npu_inference import (
+    current_topology_from_config,
+    find_cached_topology,
+    load_encoder_pipeline_config,
+    supported_topologies_for_seq_len,
+    topology_cache_key,
+    topology_id,
 )
 
 WEIGHTS_FILE = TEST_DIR / "model.safetensors"
@@ -427,6 +446,105 @@ def test_encoder_forward_flops_estimate_grows_with_seq_len():
     assert seq512 > seq64
 
 
+def test_default_benchmark_seq_lens_extend_to_16384():
+    assert parse_seq_lens(DEFAULT_BENCHMARK_SEQ_LENS) == [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+    ]
+
+
+def test_acceptable_cooldown_temp_applies_fractional_slack():
+    assert acceptable_cooldown_temp(50.0, 0.05) == pytest.approx(52.5)
+    assert acceptable_cooldown_temp(50.0, 0.0) == pytest.approx(50.0)
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def perf_counter(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(0.0, float(seconds))
+
+
+def test_cooldown_before_benchmark_accepts_temperature_within_tolerance(monkeypatch):
+    clock = _FakeClock()
+    readings = iter(
+        [
+            {"temperature_c": 55.0, "source": "fake:cpu"},
+            {"temperature_c": 52.4, "source": "fake:cpu"},
+        ]
+    )
+
+    monkeypatch.setattr(benchmark_common.time, "perf_counter", clock.perf_counter)
+    monkeypatch.setattr(benchmark_common.time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        benchmark_common,
+        "read_temperature_reading",
+        lambda mode, requested_source: next(readings),
+    )
+
+    args = SimpleNamespace(
+        cooldown_sec=0.0,
+        cooldown_until_temp_c=50.0,
+        cooldown_temp_source="cpu",
+        cooldown_temp_tolerance_frac=0.05,
+        cooldown_poll_sec=2.0,
+        cooldown_timeout_sec=300.0,
+    )
+    stats = cooldown_before_benchmark(args, mode="cpu", label="toy-case")
+
+    assert stats["cooldown_start_temp_c"] == pytest.approx(55.0)
+    assert stats["cooldown_end_temp_c"] == pytest.approx(52.4)
+    assert stats["cooldown_temp_source"] == "fake:cpu"
+    assert stats["cooldown_wait_sec"] == pytest.approx(0.0)
+
+
+def test_cooldown_before_benchmark_continues_after_timeout(monkeypatch):
+    clock = _FakeClock()
+    readings = iter(
+        [
+            {"temperature_c": 60.0, "source": "fake:cpu"},
+            {"temperature_c": 55.0, "source": "fake:cpu"},
+            {"temperature_c": 55.0, "source": "fake:cpu"},
+            {"temperature_c": 55.0, "source": "fake:cpu"},
+            {"temperature_c": 55.0, "source": "fake:cpu"},
+        ]
+    )
+
+    monkeypatch.setattr(benchmark_common.time, "perf_counter", clock.perf_counter)
+    monkeypatch.setattr(benchmark_common.time, "sleep", clock.sleep)
+    monkeypatch.setattr(
+        benchmark_common,
+        "read_temperature_reading",
+        lambda mode, requested_source: next(readings),
+    )
+
+    args = SimpleNamespace(
+        cooldown_sec=0.0,
+        cooldown_until_temp_c=50.0,
+        cooldown_temp_source="cpu",
+        cooldown_temp_tolerance_frac=0.05,
+        cooldown_poll_sec=2.0,
+        cooldown_timeout_sec=5.0,
+    )
+    stats = cooldown_before_benchmark(args, mode="cpu", label="toy-case")
+
+    assert stats["cooldown_start_temp_c"] == pytest.approx(60.0)
+    assert stats["cooldown_end_temp_c"] == pytest.approx(55.0)
+    assert stats["cooldown_wait_sec"] == pytest.approx(6.0)
+    assert stats["cooldown_temp_source"] == "fake:cpu"
+
+
 def test_parse_turbostat_log_accepts_periodic_samples(tmp_path):
     log_path = tmp_path / "turbostat.log"
     log_path.write_text(
@@ -441,6 +559,36 @@ def test_parse_turbostat_log_accepts_periodic_samples(tmp_path):
     assert stats["avg_pkg_watt"] == "15.000000"
     assert stats["max_pkg_watt"] == "20.000000"
     assert stats["avg_cor_watt"] == "1.500000"
+
+
+def test_parse_turbostat_log_accepts_rocm_smi_style_samples(tmp_path):
+    log_path = tmp_path / "rocm_smi.log"
+    log_path.write_text(
+        "2.500000 sec\n" "GFXWatt\tPkgWatt\n" "3.00\t3.00\n" "5.00\t5.00\n",
+        encoding="utf-8",
+    )
+
+    stats = parse_turbostat_log(log_path)
+
+    assert stats["power_sample_count"] == 2
+    assert stats["power_window_sec"] == "2.500000"
+    assert stats["avg_pkg_watt"] == "4.000000"
+    assert stats["avg_gfx_watt"] == "4.000000"
+
+
+def test_resolve_power_backend_uses_rocm_smi_for_igpu_auto():
+    args = SimpleNamespace(power_backend="auto")
+
+    assert resolve_power_backend(args, {"mode": "cpu"}) == "turbostat"
+    assert resolve_power_backend(args, {"mode": "npu"}) == "turbostat"
+    assert resolve_power_backend(args, {"mode": "igpu"}) == "rocm-smi"
+
+
+def test_resolve_power_backend_rejects_rocm_smi_for_cpu():
+    args = SimpleNamespace(power_backend="rocm-smi")
+
+    with pytest.raises(ValueError, match="igpu"):
+        resolve_power_backend(args, {"mode": "cpu"})
 
 
 def test_automated_benchmark_enumerate_cases_multi_study_skips_npu_unready():
@@ -465,9 +613,52 @@ def test_automated_benchmark_enumerate_cases_multi_study_skips_npu_unready():
     assert "bert-base-uncased_cpu_seq64_1t" in case_ids
     assert "bert-base-uncased_npu_seq64" in case_ids
     assert "bert-base-uncased_igpu_seq64" in case_ids
-    assert "bert-large-uncased_npu_seq64" not in case_ids
-    assert "roberta-large_npu_seq64" not in case_ids
-    assert skipped_ids == {"bert-large-uncased", "roberta-large"}
+    assert "bert-large-uncased_npu_seq64" in case_ids
+    assert "roberta-large_npu_seq64" in case_ids
+    assert skipped_ids == set()
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    [
+        TEST_DIR / "config" / "config_bert_large.json",
+        TEST_DIR / "config" / "config_roberta_large.json",
+    ],
+    ids=["bert_large", "roberta_large"],
+)
+def test_large_model_npu_topologies_are_discoverable(config_path):
+    seq64_config = load_encoder_pipeline_config(str(config_path), 64)
+    seq128_config = load_encoder_pipeline_config(str(config_path), 128)
+
+    topo_ids_64 = {
+        topology_id(topology)
+        for topology in supported_topologies_for_seq_len(seq64_config, 64)
+    }
+    topo_ids_128 = {
+        topology_id(topology)
+        for topology in supported_topologies_for_seq_len(seq128_config, 128)
+    }
+
+    assert "1ps" in topo_ids_64
+    assert "1ps_4ph" in topo_ids_64
+    assert "4ps" in topo_ids_128
+
+
+def test_topology_cache_is_shape_aware_for_large_models():
+    base_config = load_encoder_pipeline_config(str(CONFIG_FILE), 64)
+    large_config = load_encoder_pipeline_config(
+        str(TEST_DIR / "config" / "config_bert_large.json"), 64
+    )
+
+    legacy_cache = {"64": current_topology_from_config(base_config)}
+    assert find_cached_topology(legacy_cache, large_config, 64) is None
+
+    large_topology = current_topology_from_config(large_config)
+    shape_aware_cache = {topology_cache_key(large_config, 64): large_topology}
+    cached = find_cached_topology(shape_aware_cache, large_config, 64)
+
+    assert cached is not None
+    assert topology_id(cached) == topology_id(large_topology)
 
 
 def test_bert_automated_benchmark_job_wrapper_study_ids_smoke(tmp_path):
@@ -656,7 +847,7 @@ def test_plot_benchmark_results_smoke(tmp_path):
             "cooldown_start_temp_c": "",
             "cooldown_end_temp_c": "",
             "cooldown_temp_source": "",
-            "power_backend": "turbostat",
+            "power_backend": "rocm-smi",
             "power_sample_count": "1",
             "power_window_sec": "0.030000",
             "idle_power_sample_count": "1",

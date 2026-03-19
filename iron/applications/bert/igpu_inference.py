@@ -8,6 +8,7 @@ import os
 import time
 
 from benchmark_common import (
+    DEFAULT_BENCHMARK_SEQ_LENS,
     add_cooldown_args,
     build_benchmark_texts,
     cooldown_before_benchmark,
@@ -61,7 +62,7 @@ def parse_args():
     parser.add_argument(
         "--seq-lens",
         type=str,
-        default="64,128,256,512,1024,2048,4096,8192",
+        default=DEFAULT_BENCHMARK_SEQ_LENS,
         help="Comma-separated sequence lengths to benchmark.",
     )
     parser.add_argument(

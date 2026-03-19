@@ -20,7 +20,7 @@
       "hidden_size": 1024,
       "num_attention_heads": 16,
       "intermediate_size": 4096,
-      "npu_ready": false
+      "npu_ready": true
     },
     {
       "study_id": "roberta-base",
@@ -42,7 +42,7 @@
       "hidden_size": 1024,
       "num_attention_heads": 16,
       "intermediate_size": 4096,
-      "npu_ready": false
+      "npu_ready": true
     },
     {
       "study_id": "distilbert-base-uncased",

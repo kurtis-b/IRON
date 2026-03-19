@@ -52,6 +52,8 @@ CSV_FIELDNAMES = [
     "max_latency_ms",
 ]
 
+DEFAULT_BENCHMARK_SEQ_LENS = "64,128,256,512,1024,2048,4096,8192,16384"
+
 
 def _detect_physical_cores_from_sysfs(respect_affinity=True):
     cpu_root = Path("/sys/devices/system/cpu")
@@ -182,6 +184,16 @@ def add_cooldown_args(parser):
         ),
     )
     parser.add_argument(
+        "--cooldown-temp-tolerance-frac",
+        type=float,
+        default=0.05,
+        help=(
+            "Relative slack above --cooldown-until-temp-c that is still accepted "
+            "as cooled enough. For example, 0.05 with a 50 C threshold allows the "
+            "benchmark to proceed at or below 52.5 C."
+        ),
+    )
+    parser.add_argument(
         "--cooldown-poll-sec",
         type=float,
         default=2.0,
@@ -190,8 +202,11 @@ def add_cooldown_args(parser):
     parser.add_argument(
         "--cooldown-timeout-sec",
         type=float,
-        default=900.0,
-        help="Maximum time to wait for a temperature threshold before failing.",
+        default=300.0,
+        help=(
+            "Maximum time to wait for the temperature target before continuing "
+            "with the benchmark anyway."
+        ),
     )
 
 
@@ -313,6 +328,12 @@ def read_temperature_reading(mode, requested_source):
     return candidate
 
 
+def acceptable_cooldown_temp(threshold_c, tolerance_frac):
+    threshold_c = float(threshold_c)
+    tolerance_frac = max(0.0, float(tolerance_frac))
+    return threshold_c * (1.0 + tolerance_frac)
+
+
 def cooldown_before_benchmark(args, *, mode, label):
     if args.cooldown_sec <= 0 and args.cooldown_until_temp_c is None:
         return {
@@ -331,9 +352,15 @@ def cooldown_before_benchmark(args, *, mode, label):
         reading = read_temperature_reading(mode, args.cooldown_temp_source)
         start_temp_c = reading["temperature_c"]
         temp_source = reading["source"]
+        accepted_temp_c = acceptable_cooldown_temp(
+            args.cooldown_until_temp_c,
+            args.cooldown_temp_tolerance_frac,
+        )
         print(
             f"Cooldown before {label}: waiting for temperature <= "
-            f"{args.cooldown_until_temp_c:.1f} C from {temp_source}",
+            f"{accepted_temp_c:.1f} C from {temp_source} "
+            f"(target {args.cooldown_until_temp_c:.1f} C, "
+            f"tolerance {args.cooldown_temp_tolerance_frac * 100.0:.1f}%)",
             flush=True,
         )
 
@@ -346,18 +373,24 @@ def cooldown_before_benchmark(args, *, mode, label):
 
     if args.cooldown_until_temp_c is not None:
         deadline = time.perf_counter() + args.cooldown_timeout_sec
+        accepted_temp_c = acceptable_cooldown_temp(
+            args.cooldown_until_temp_c,
+            args.cooldown_temp_tolerance_frac,
+        )
         while True:
             reading = read_temperature_reading(mode, args.cooldown_temp_source)
             temp_source = reading["source"]
             end_temp_c = reading["temperature_c"]
-            if end_temp_c <= args.cooldown_until_temp_c:
+            if end_temp_c <= accepted_temp_c:
                 break
             if time.perf_counter() >= deadline:
-                raise RuntimeError(
-                    f"Timed out waiting for {temp_source} to cool below "
-                    f"{args.cooldown_until_temp_c:.1f} C; last reading was "
-                    f"{end_temp_c:.1f} C"
+                print(
+                    f"Cooldown before {label}: continuing after "
+                    f"{args.cooldown_timeout_sec:.1f} sec even though {temp_source} "
+                    f"is still {end_temp_c:.1f} C (accepted <= {accepted_temp_c:.1f} C)",
+                    flush=True,
                 )
+                break
             time.sleep(max(0.1, args.cooldown_poll_sec))
 
     wait_sec = time.perf_counter() - start_time

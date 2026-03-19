@@ -37,6 +37,7 @@ OPTION_MAP = {
     "cooldown_sec": "--cooldown-sec",
     "cooldown_until_temp_c": "--cooldown-until-temp-c",
     "cooldown_temp_source": "--cooldown-temp-source",
+    "cooldown_temp_tolerance_frac": "--cooldown-temp-tolerance-frac",
     "cooldown_poll_sec": "--cooldown-poll-sec",
     "cooldown_timeout_sec": "--cooldown-timeout-sec",
     "power_cycle_cmd": "--power-cycle-cmd",

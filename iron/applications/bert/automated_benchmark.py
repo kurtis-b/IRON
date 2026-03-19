@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import time
 from pathlib import Path
 
 from benchmark_common import (
+    DEFAULT_BENCHMARK_SEQ_LENS,
     add_cooldown_args,
     cooldown_before_benchmark,
     detect_logical_thread_count,
@@ -127,7 +129,7 @@ def parse_args():
     parser.add_argument(
         "--seq-lens",
         type=str,
-        default="64,128,256,512,1024,2048,4096,8192",
+        default=DEFAULT_BENCHMARK_SEQ_LENS,
     )
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--warmup-runs", type=int, default=10)
@@ -185,9 +187,12 @@ def parse_args():
     parser.add_argument("--npu-autotune-runs", type=int, default=5)
     parser.add_argument(
         "--power-backend",
-        choices=("none", "turbostat"),
-        default="turbostat",
-        help="Per-case power measurement backend. turbostat requires privileged access.",
+        choices=("none", "auto", "turbostat", "rocm-smi"),
+        default="auto",
+        help=(
+            "Per-case power measurement backend. auto uses turbostat for cpu/npu "
+            "and rocm-smi for igpu. turbostat requires privileged access."
+        ),
     )
     parser.add_argument("--power-interval-sec", type=float, default=0.5)
     parser.add_argument(
@@ -444,9 +449,9 @@ def parse_child_row(csv_path):
     return rows[0]
 
 
-def parse_turbostat_log(log_path):
+def parse_power_log(log_path):
     if not Path(log_path).exists():
-        raise RuntimeError(f"Missing turbostat log: {log_path}")
+        raise RuntimeError(f"Missing power log: {log_path}")
 
     duration_sec = None
     header = None
@@ -515,6 +520,10 @@ def parse_turbostat_log(log_path):
     return stats
 
 
+def parse_turbostat_log(log_path):
+    return parse_power_log(log_path)
+
+
 def empty_power_stats(
     sample_count_key="power_sample_count",
     window_key="power_window_sec",
@@ -554,24 +563,31 @@ def needs_idle_baseline(case):
     return case["mode"] in ("npu", "igpu")
 
 
-def measure_idle_power(args, case, logs_dir):
-    idle_log_path = logs_dir / f"{case['case_id']}_idle_power.log"
-    wrapped = [
-        "sudo",
-        "-n",
-        "turbostat",
-        "--quiet",
-        "--show",
-        "PkgWatt,CorWatt,GFXWatt,RAMWatt",
-        "--interval",
-        str(args.power_interval_sec),
-        "--out",
-        str(idle_log_path),
-        "sleep",
-        str(args.npu_idle_baseline_sec),
-    ]
+def resolve_power_backend(args, case):
+    if args.power_backend == "auto":
+        return "rocm-smi" if case["mode"] == "igpu" else "turbostat"
+    if args.power_backend == "rocm-smi" and case["mode"] != "igpu":
+        raise ValueError(
+            "power_backend=rocm-smi is only supported for igpu cases; use "
+            "power_backend=auto for mixed cpu/npu/igpu suites"
+        )
+    return args.power_backend
+
+
+def _extract_power_value(raw_value):
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, (int, float)):
+        return float(raw_value)
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", str(raw_value))
+    if match is None:
+        return None
+    return float(match.group(0))
+
+
+def read_rocm_smi_power(device_index):
     result = subprocess.run(
-        wrapped,
+        ["rocm-smi", "--showpower", "--json"],
         cwd=SCRIPT_DIR,
         text=True,
         capture_output=True,
@@ -579,10 +595,144 @@ def measure_idle_power(args, case, logs_dir):
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"Idle power measurement failed for {case['case_id']}\n"
+            "rocm-smi power query failed\n"
             f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
-    idle_stats = parse_turbostat_log(idle_log_path)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Failed to parse rocm-smi JSON power output: {exc}\n"
+            f"STDOUT:\n{result.stdout}"
+        ) from exc
+
+    card_key = f"card{device_index}"
+    card_data = payload.get(card_key)
+    if card_data is None and device_index == 0:
+        card_entries = [
+            (key, value)
+            for key, value in payload.items()
+            if re.fullmatch(r"card\d+", key)
+        ]
+        if len(card_entries) == 1:
+            _, card_data = card_entries[0]
+    if not isinstance(card_data, dict):
+        raise RuntimeError(
+            f"rocm-smi JSON output did not include power data for device index "
+            f"{device_index}: keys={sorted(payload.keys())}"
+        )
+
+    for key, raw_value in card_data.items():
+        if "power" not in key.lower():
+            continue
+        power_value = _extract_power_value(raw_value)
+        if power_value is not None:
+            return power_value
+    raise RuntimeError(
+        f"rocm-smi JSON output did not include a usable power reading for {card_key}: "
+        f"{card_data}"
+    )
+
+
+def write_rocm_smi_log(log_path, duration_sec, samples):
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(f"{duration_sec:.6f} sec\n")
+        f.write("GFXWatt\tPkgWatt\n")
+        for sample in samples:
+            f.write(f"{sample:.6f}\t{sample:.6f}\n")
+
+
+def collect_rocm_smi_samples(duration_sec, interval_sec, device_index):
+    samples = []
+    start = time.perf_counter()
+    deadline = start + max(0.0, duration_sec)
+    next_sample_at = start
+    while True:
+        now = time.perf_counter()
+        if now >= deadline and samples:
+            break
+        if now >= next_sample_at:
+            samples.append(read_rocm_smi_power(device_index))
+            next_sample_at = now + max(interval_sec, 0.05)
+            continue
+        time.sleep(min(next_sample_at - now, deadline - now))
+    return samples, time.perf_counter() - start
+
+
+def run_command_with_rocm_smi_logging(command, log_path, interval_sec, device_index):
+    process = subprocess.Popen(
+        command,
+        cwd=SCRIPT_DIR,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    samples = []
+    start = time.perf_counter()
+    next_sample_at = start
+    try:
+        while True:
+            now = time.perf_counter()
+            if not samples or now >= next_sample_at:
+                samples.append(read_rocm_smi_power(device_index))
+                next_sample_at = now + max(interval_sec, 0.05)
+                if process.poll() is not None:
+                    break
+                continue
+            if process.poll() is not None:
+                break
+            time.sleep(min(next_sample_at - now, 0.1))
+        stdout, stderr = process.communicate()
+    except Exception:
+        process.kill()
+        process.communicate()
+        raise
+
+    duration_sec = time.perf_counter() - start
+    write_rocm_smi_log(log_path, duration_sec, samples)
+    return process.returncode, stdout, stderr
+
+
+def measure_idle_power(args, case, logs_dir, power_backend):
+    idle_log_path = logs_dir / f"{case['case_id']}_idle_power.log"
+    if power_backend == "turbostat":
+        wrapped = [
+            "sudo",
+            "-n",
+            "turbostat",
+            "--quiet",
+            "--show",
+            "PkgWatt,CorWatt,GFXWatt,RAMWatt",
+            "--interval",
+            str(args.power_interval_sec),
+            "--out",
+            str(idle_log_path),
+            "sleep",
+            str(args.npu_idle_baseline_sec),
+        ]
+        result = subprocess.run(
+            wrapped,
+            cwd=SCRIPT_DIR,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Idle power measurement failed for {case['case_id']}\n"
+                f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+            )
+    elif power_backend == "rocm-smi":
+        samples, duration_sec = collect_rocm_smi_samples(
+            duration_sec=args.npu_idle_baseline_sec,
+            interval_sec=args.power_interval_sec,
+            device_index=args.igpu_device_index,
+        )
+        write_rocm_smi_log(idle_log_path, duration_sec, samples)
+    else:
+        raise ValueError(f"Unsupported idle power backend: {power_backend}")
+
+    idle_stats = parse_power_log(idle_log_path)
     idle_stats["idle_power_sample_count"] = idle_stats.pop("power_sample_count")
     idle_stats["idle_power_window_sec"] = idle_stats.pop("power_window_sec")
     return idle_stats, idle_log_path
@@ -683,6 +833,7 @@ def run_case(args, case, logs_dir, cooldown_stats):
     power_log_path = logs_dir / f"{case['case_id']}_power.log"
     idle_log_path = None
     command = case_command(args, case, benchmark_csv_path)
+    power_backend = resolve_power_backend(args, case)
     print(
         f"Running case {case['case_id']}: {' '.join(shlex.quote(part) for part in command)}",
         flush=True,
@@ -692,10 +843,12 @@ def run_case(args, case, logs_dir, cooldown_stats):
         sample_count_key="idle_power_sample_count",
         window_key="idle_power_window_sec",
     )
-    if args.power_backend == "turbostat" and needs_idle_baseline(case):
-        idle_stats, idle_log_path = measure_idle_power(args, case, logs_dir)
+    if power_backend != "none" and needs_idle_baseline(case):
+        idle_stats, idle_log_path = measure_idle_power(
+            args, case, logs_dir, power_backend
+        )
 
-    if args.power_backend == "turbostat":
+    if power_backend == "turbostat":
         wrapped_command = wrap_command_for_case(case, command)
         wrapped = [
             "sudo",
@@ -722,7 +875,21 @@ def run_case(args, case, logs_dir, cooldown_stats):
                 f"Power-logged benchmark failed for {case['case_id']}\n"
                 f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
             )
-        power_stats = parse_turbostat_log(power_log_path)
+        power_stats = parse_power_log(power_log_path)
+    elif power_backend == "rocm-smi":
+        wrapped_command = wrap_command_for_case(case, command)
+        returncode, stdout, stderr = run_command_with_rocm_smi_logging(
+            wrapped_command,
+            power_log_path,
+            args.power_interval_sec,
+            args.igpu_device_index,
+        )
+        if returncode != 0:
+            raise RuntimeError(
+                f"Power-logged benchmark failed for {case['case_id']}\n"
+                f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            )
+        power_stats = parse_power_log(power_log_path)
     else:
         result = subprocess.run(
             command,
@@ -737,7 +904,7 @@ def run_case(args, case, logs_dir, cooldown_stats):
                 f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
             )
         power_stats = (
-            parse_turbostat_log(power_log_path)
+            parse_power_log(power_log_path)
             if power_log_path.exists()
             else empty_power_stats()
         )
@@ -823,7 +990,7 @@ def run_case(args, case, logs_dir, cooldown_stats):
             else ""
         ),
         "cooldown_temp_source": cooldown_stats["cooldown_temp_source"],
-        "power_backend": args.power_backend,
+        "power_backend": power_backend,
         "power_sample_count": power_stats["power_sample_count"],
         "power_window_sec": power_stats["power_window_sec"],
         "idle_power_sample_count": idle_stats["idle_power_sample_count"],

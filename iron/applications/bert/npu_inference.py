@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from benchmark_common import (
+    DEFAULT_BENCHMARK_SEQ_LENS,
     add_cooldown_args,
     build_benchmark_texts,
     cooldown_before_benchmark,
@@ -70,7 +71,7 @@ def parse_args():
     parser.add_argument(
         "--seq-lens",
         type=str,
-        default="64,128,256,512,1024,2048,4096,8192",
+        default=DEFAULT_BENCHMARK_SEQ_LENS,
         help="Comma-separated sequence lengths to benchmark.",
     )
     parser.add_argument(
@@ -274,6 +275,42 @@ def save_topology_cache(cache_path, cache_data):
         f.write("\n")
 
 
+def topology_signature(topology):
+    try:
+        return (
+            int(topology["parallel_seq"]),
+            int(topology["parallel_heads"]),
+            int(topology["parallel_ffn"]),
+            int(topology["seq_tile"]),
+            int(topology["kv_seq_tile"]),
+            int(topology["emb_tile"]),
+            int(topology["ffn_tile"]),
+            int(topology["proj_acc_depth"]),
+            int(topology["o_proj_acc_group_size"]),
+            int(topology["ffn_intermediate_size"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def topology_cache_key(config, seq_len):
+    current = current_topology_from_config(config)
+    d = config.model_config.hidden_size // config.model_config.num_attention_heads
+    return (
+        "shape:"
+        f"h{int(config.model_config.num_attention_heads)}"
+        f"_s{int(seq_len)}"
+        f"_d{int(d)}"
+        f"_st{current['seq_tile']}"
+        f"_kt{current['kv_seq_tile']}"
+        f"_et{current['emb_tile']}"
+        f"_ft{current['ffn_tile']}"
+        f"_pa{current['proj_acc_depth']}"
+        f"_og{current['o_proj_acc_group_size']}"
+        f"_is{current['ffn_intermediate_size']}"
+    )
+
+
 def supported_topologies_for_seq_len(config, seq_len, candidate_ids=None):
     from iron.operators.encoder_pipeline.placements import TOPOLOGY_PLACEMENTS
 
@@ -325,6 +362,21 @@ def supported_topologies_for_seq_len(config, seq_len, candidate_ids=None):
             f"with candidate filter {requested}"
         )
     return matches
+
+
+def find_cached_topology(cache_data, config, seq_len, candidate_ids=None):
+    supported = supported_topologies_for_seq_len(
+        config, seq_len, candidate_ids=candidate_ids
+    )
+    supported_by_signature = {
+        topology_signature(topology): topology for topology in supported
+    }
+    for cache_key in (topology_cache_key(config, seq_len), str(seq_len)):
+        cached = cache_data.get(cache_key)
+        signature = topology_signature(cached)
+        if signature in supported_by_signature:
+            return supported_by_signature[signature]
+    return None
 
 
 def reset_default_context():
@@ -503,9 +555,13 @@ def resolve_topology(args, seq_len, texts):
 
     candidate_ids = parse_candidate_topology_ids(args.candidate_topologies)
     cache_data = load_topology_cache(args.topology_cache)
-    cache_key = str(seq_len)
-    if args.topology_policy == "cache" and cache_key in cache_data:
-        return cache_data[cache_key]
+    cache_key = topology_cache_key(base_config, seq_len)
+    if args.topology_policy == "cache":
+        cached_topology = find_cached_topology(
+            cache_data, base_config, seq_len, candidate_ids=candidate_ids
+        )
+        if cached_topology is not None:
+            return cached_topology
 
     selected = autotune_topology(
         args=args,
