@@ -13,6 +13,7 @@ SPDX-License-Identifier: Apache-2.0
 - [automated_benchmark.py](automated_benchmark.py): resumable case runner with optional topology autotune, power logging, and power-cycle hooks
 - [bringup_checklist.sh](bringup_checklist.sh): guided device preflight for CPU/NPU smokes, topology-cache warmup, and short supervised suite validation
 - [run_automated_benchmark_job.py](run_automated_benchmark_job.py): wrapper that runs the automation harness from a JSON job file
+- [plot_benchmark_results.py](plot_benchmark_results.py): headless plot renderer for suite CSVs
 
 The shared code under `src/` is now NPU-only. It exists to build the encoder-pipeline-backed local backbone used by `npu_inference.py`. The CPU benchmark uses Hugging Face directly and does not go through `src/`.
 
@@ -236,8 +237,32 @@ Behavior:
 - suite rows additionally include:
   - `cooldown_wait_sec`
   - `power_window_sec`
-  - `estimated_flops_per_joule`
-  - `pseudo_device_estimated_flops_per_joule`
+  - `estimated_gflops_per_watt_sec`
+  - `pseudo_device_estimated_gflops_per_watt_sec`
+
+## Plotting Results
+
+Render summary plots and per-study dashboards from a completed suite CSV:
+
+```bash
+cd iron/applications/bert
+python3 plot_benchmark_results.py automated_benchmark_all_studies.csv
+```
+
+Useful options:
+
+```bash
+python3 plot_benchmark_results.py <suite_csv> \
+  --output-dir plots/<name> \
+  --dpi 180
+```
+
+Behavior:
+- writes a summary overview plot across studies/backends
+- writes grouped cross-model comparison plots for latency, throughput, power, and efficiency
+- writes one dashboard per study with latency, throughput, effective power, and effective efficiency
+- writes CPU thread-comparison plots when multiple CPU thread counts are present
+- writes an `index.html` file so the plots are easy to browse
 
 ## Systemd Resume Flow
 
@@ -399,8 +424,8 @@ For cross-device comparisons, also inspect:
 - `throughput_flops_per_sec`
 - `power_sample_count`
 - `power_window_sec`
-- `estimated_flops_per_joule`
-- `pseudo_device_estimated_flops_per_joule`
+- `estimated_gflops_per_watt_sec`
+- `pseudo_device_estimated_gflops_per_watt_sec`
 
 5. Enable reboot only after the short supervised run looks correct
 

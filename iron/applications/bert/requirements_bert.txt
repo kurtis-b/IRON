@@ -9,6 +9,7 @@ tiktoken
 safetensors
 blobfile
 packaging
+matplotlib
 torchtune==0.6.1
 torchao==0.13.0
 transformers==4.57.1

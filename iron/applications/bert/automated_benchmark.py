@@ -73,9 +73,9 @@ SUITE_FIELDNAMES = [
     "pseudo_npu_avg_pkg_watt",
     "pseudo_npu_max_pkg_watt",
     "estimated_total_timed_flops",
-    "estimated_flops_per_joule",
-    "pseudo_device_estimated_flops_per_joule",
-    "pseudo_npu_estimated_flops_per_joule",
+    "estimated_gflops_per_watt_sec",
+    "pseudo_device_estimated_gflops_per_watt_sec",
+    "pseudo_npu_estimated_gflops_per_watt_sec",
     "idle_power_log",
     "power_log",
     "benchmark_csv",
@@ -601,13 +601,13 @@ def multiply_optional(left_value, right_value, fmt=".6e"):
     return format(float(left_value) * float(right_value), fmt)
 
 
-def divide_optional(numerator, denominator, fmt=".6e"):
+def divide_optional(numerator, denominator, fmt=".6f", scale=1.0):
     if numerator == "" or denominator == "":
         return ""
     denominator_value = float(denominator)
     if denominator_value <= 0:
         return ""
-    return format(float(numerator) / denominator_value, fmt)
+    return format((float(numerator) / denominator_value) * scale, fmt)
 
 
 def case_command(args, case, benchmark_csv_path):
@@ -770,16 +770,18 @@ def run_case(args, case, logs_dir, cooldown_stats):
         pseudo_device_avg_pkg_watt,
         power_stats["power_window_sec"],
     )
-    estimated_flops_per_joule = divide_optional(
+    estimated_gflops_per_watt_sec = divide_optional(
         estimated_total_timed_flops,
         package_energy_joules,
+        scale=1e-9,
     )
-    pseudo_device_estimated_flops_per_joule = divide_optional(
+    pseudo_device_estimated_gflops_per_watt_sec = divide_optional(
         estimated_total_timed_flops,
         pseudo_device_energy_joules,
+        scale=1e-9,
     )
-    pseudo_npu_estimated_flops_per_joule = (
-        pseudo_device_estimated_flops_per_joule if case["mode"] == "npu" else ""
+    pseudo_npu_estimated_gflops_per_watt_sec = (
+        pseudo_device_estimated_gflops_per_watt_sec if case["mode"] == "npu" else ""
     )
     suite_row = {
         "case_id": case["case_id"],
@@ -843,11 +845,13 @@ def run_case(args, case, logs_dir, cooldown_stats):
         "pseudo_npu_avg_pkg_watt": pseudo_npu_avg_pkg_watt,
         "pseudo_npu_max_pkg_watt": pseudo_npu_max_pkg_watt,
         "estimated_total_timed_flops": estimated_total_timed_flops,
-        "estimated_flops_per_joule": estimated_flops_per_joule,
-        "pseudo_device_estimated_flops_per_joule": (
-            pseudo_device_estimated_flops_per_joule
+        "estimated_gflops_per_watt_sec": estimated_gflops_per_watt_sec,
+        "pseudo_device_estimated_gflops_per_watt_sec": (
+            pseudo_device_estimated_gflops_per_watt_sec
         ),
-        "pseudo_npu_estimated_flops_per_joule": (pseudo_npu_estimated_flops_per_joule),
+        "pseudo_npu_estimated_gflops_per_watt_sec": (
+            pseudo_npu_estimated_gflops_per_watt_sec
+        ),
         "idle_power_log": str(idle_log_path) if idle_log_path is not None else "",
         "power_log": str(power_log_path) if power_log_path.exists() else "",
         "benchmark_csv": str(benchmark_csv_path),
