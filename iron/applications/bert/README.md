@@ -99,7 +99,7 @@ Useful options:
 
 ```bash
 python3 cpu_inference.py <weights> <config> \
-  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192,16384 \
   --num-samples 1 \
   --warmup-runs 10 \
   --runs-per-sample 100 \
@@ -141,7 +141,7 @@ Useful options:
 
 ```bash
 python3 npu_inference.py <weights> <config> \
-  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192,16384 \
   --num-samples 1 \
   --warmup-runs 10 \
   --runs-per-sample 100 \
@@ -190,12 +190,12 @@ Example:
 cd iron/applications/bert
 python3 automated_benchmark.py /path/to/model.safetensors config/config.json \
   --modes cpu,npu,igpu \
-  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192,16384 \
   --runs-per-sample 100 \
   --warmup-runs 10 \
   --cooldown-until-temp-c 50 \
   --npu-topology-policy cache \
-  --power-backend turbostat \
+  --power-backend auto \
   --power-cycle-cmd "sudo reboot"
 ```
 
@@ -206,12 +206,12 @@ cd iron/applications/bert
 python3 automated_benchmark.py \
   --study-ids all \
   --modes cpu,npu,igpu \
-  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192,16384 \
   --runs-per-sample 100 \
   --warmup-runs 10 \
   --cooldown-until-temp-c 50 \
   --npu-topology-policy cache \
-  --power-backend turbostat \
+  --power-backend auto \
   --power-cycle-cmd "sudo reboot"
 ```
 
@@ -219,10 +219,14 @@ Behavior:
 - writes a resumable state file
 - writes one master CSV summarizing all completed cases
 - writes per-case child benchmark CSVs and power logs under `logs/automated_benchmark`
+- when `power_backend=auto`, the suite uses `turbostat` for CPU/NPU cases and `rocm-smi` for iGPU cases
 - when `power_backend=turbostat`, logs periodic package-power samples for the full case window instead of a single summary-only row
+- when `power_backend=rocm-smi`, logs periodic graphics-package power samples for iGPU cases without requiring `sudo`
+- when `--cooldown-until-temp-c` is set, the suite accepts temperatures within the default 5% band above the target
+- when that temperature target is still not met after the max cooldown wait, the suite continues instead of failing
 - if `--power-cycle-cmd` is set, it runs one case, records results, invokes the hook, and exits
 - after the machine comes back, rerun the same command to continue from the saved state
-- for non-CPU accelerator cases with `turbostat`, it also measures an idle baseline before each case and writes:
+- for non-CPU accelerator cases with power logging enabled, it also measures an idle baseline before each case and writes:
   - `idle_pkg_watt`
   - `pseudo_device_avg_pkg_watt`
   - `pseudo_device_max_pkg_watt`
@@ -239,6 +243,12 @@ Behavior:
   - `power_window_sec`
   - `estimated_gflops_per_watt_sec`
   - `pseudo_device_estimated_gflops_per_watt_sec`
+
+Cooldown notes:
+- default temperature tolerance is `5%`, so a `50 C` target is treated as acceptable once the selected sensor reaches `52.5 C` or lower
+- default max cooldown wait is `300` seconds
+- set `--cooldown-temp-tolerance-frac 0` if you want an exact threshold
+- set `--cooldown-timeout-sec` higher if you want stricter thermal settling
 
 ## Plotting Results
 
@@ -321,11 +331,17 @@ Notes:
 
 Power notes:
 - `powertop` is not used here because it is weaker for scripted benchmarking
-- `turbostat` is the preferred local backend for package-power logging
+- `auto` is the preferred mixed backend: `turbostat` for CPU/NPU and `rocm-smi` for iGPU
+- `turbostat` remains the preferred local backend for whole-package CPU/NPU logging
+- `rocm-smi` is the preferred local backend for iGPU graphics-package logging
 - `turbostat` needs privileged access to MSRs on this machine
+- `rocm-smi` does not need `sudo`, but it only applies to iGPU cases
 - for NPU runs, the suite treats pseudo-NPU power as:
   - `measured package power - idle package power`
+- for iGPU runs under `rocm-smi`, the suite treats pseudo-device power as:
+  - `measured graphics-package power - idle graphics-package power`
 - the idle package power is measured immediately before each NPU case
+- the idle graphics-package power is measured immediately before each iGPU case
 - for total wall-power comparison across CPU and NPU runs, an external meter or smart PDU is still better than host-local telemetry
 
 Suggested sudoers entries for unattended runs:
@@ -376,7 +392,7 @@ source <repo_root>/ironenv/bin/activate
 python3 automated_benchmark.py \
   --study-id bert-base-uncased \
   --modes npu \
-  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192,16384 \
   --num-samples 1 \
   --warmup-runs 10 \
   --runs-per-sample 100 \
@@ -403,7 +419,7 @@ python3 automated_benchmark.py \
   --warmup-runs 10 \
   --runs-per-sample 100 \
   --npu-topology-policy cache \
-  --power-backend turbostat
+  --power-backend auto
 ```
 
 4. Verify outputs from the supervised run
@@ -498,8 +514,8 @@ python3 run_automated_benchmark_job.py systemd/benchmark_job.json
 
 ## Sequence Lengths
 
-Both benchmarks default to:
-- `64,128,256,512,1024,2048,4096,8192`
+All benchmark entrypoints default to:
+- `64,128,256,512,1024,2048,4096,8192,16384`
 
 For lengths above `512`, the scripts extend the learned position embeddings by repeating them so CPU and NPU benchmark the same effective backbone shape.
 
