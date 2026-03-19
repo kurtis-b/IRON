@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,9 +15,11 @@ import torch
 TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(TEST_DIR))
 
+from automated_benchmark import enumerate_cases, parse_turbostat_log
 from model_support import (
     canonicalize_app_config_dict,
     canonicalize_local_backbone_weights,
+    estimate_encoder_forward_flops,
 )
 
 WEIGHTS_FILE = TEST_DIR / "model.safetensors"
@@ -407,3 +410,96 @@ def test_encoder_study_manifest_references_existing_configs():
         assert (
             config_path.exists()
         ), f"Missing config referenced by manifest: {config_path}"
+
+
+def test_encoder_forward_flops_estimate_grows_with_seq_len():
+    import json
+
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        config_json = json.load(f)
+    model_config = canonicalize_app_config_dict(config_json)["model_config"]
+
+    seq64 = estimate_encoder_forward_flops(model_config, 64)
+    seq512 = estimate_encoder_forward_flops(model_config, 512)
+
+    assert seq64 > 0
+    assert seq512 > seq64
+
+
+def test_parse_turbostat_log_accepts_periodic_samples(tmp_path):
+    log_path = tmp_path / "turbostat.log"
+    log_path.write_text(
+        "2.000000 sec\n" "CorWatt\tPkgWatt\n" "1.00\t10.00\n" "2.00\t20.00\n" "0.00\n",
+        encoding="utf-8",
+    )
+
+    stats = parse_turbostat_log(log_path)
+
+    assert stats["power_sample_count"] == 2
+    assert stats["power_window_sec"] == "2.000000"
+    assert stats["avg_pkg_watt"] == "15.000000"
+    assert stats["max_pkg_watt"] == "20.000000"
+    assert stats["avg_cor_watt"] == "1.500000"
+
+
+def test_automated_benchmark_enumerate_cases_multi_study_skips_npu_unready():
+    args = SimpleNamespace(
+        weights_file_path=None,
+        config_file_path=None,
+        study_id=None,
+        study_ids="all",
+        study_manifest=str(STUDY_MANIFEST),
+        models_root=None,
+        modes="cpu,npu,igpu",
+        seq_lens="64",
+        cpu_thread_counts="1",
+        npu_num_threads=1,
+        igpu_num_threads=1,
+    )
+
+    cases, skipped = enumerate_cases(args)
+    case_ids = {case["case_id"] for case in cases}
+    skipped_ids = {study_id for study_id, mode, _ in skipped if mode == "npu"}
+
+    assert "bert-base-uncased_cpu_seq64_1t" in case_ids
+    assert "bert-base-uncased_npu_seq64" in case_ids
+    assert "bert-base-uncased_igpu_seq64" in case_ids
+    assert "bert-large-uncased_npu_seq64" not in case_ids
+    assert "roberta-large_npu_seq64" not in case_ids
+    assert skipped_ids == {"bert-large-uncased", "roberta-large"}
+
+
+def test_bert_automated_benchmark_job_wrapper_study_ids_smoke(tmp_path):
+    job_config = tmp_path / "benchmark_job.json"
+    job_config.write_text(
+        (
+            "{\n"
+            '  "study_ids": "all",\n'
+            '  "modes": "cpu",\n'
+            '  "seq_lens": "64",\n'
+            '  "power_backend": "none"\n'
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    command = [
+        "python3",
+        str(TEST_DIR / "run_automated_benchmark_job.py"),
+        str(job_config),
+        "--print-command",
+    ]
+    result = subprocess.run(
+        command,
+        cwd=TEST_DIR,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert result.returncode == 0, (
+        f"Command failed with return code {result.returncode}\n"
+        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+    assert "--study-ids all" in result.stdout

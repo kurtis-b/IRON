@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Base BERT application dependencies.
+# For Ryzen APU iGPU benchmarking with ROCm, install
+# `requirements_bert_ryzen_rocm.txt` first, then install this file.
+
 tiktoken
 safetensors
 blobfile

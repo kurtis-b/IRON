@@ -5,8 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # Encoder Benchmarks
 
-`applications/bert` now has two explicit benchmark entrypoints:
+`applications/bert` now has three explicit benchmark entrypoints:
 - [cpu_inference.py](cpu_inference.py): Hugging Face CPU baseline for supported encoder-only families
+- [igpu_inference.py](igpu_inference.py): Hugging Face iGPU baseline through a GPU-enabled PyTorch runtime
 - [npu_inference.py](npu_inference.py): local NPU benchmark using the `encoder_pipeline` operator
 - [download_model.py](download_model.py): manifest-driven Hugging Face downloader for supported study models
 - [automated_benchmark.py](automated_benchmark.py): resumable case runner with optional topology autotune, power logging, and power-cycle hooks
@@ -14,6 +15,8 @@ SPDX-License-Identifier: Apache-2.0
 - [run_automated_benchmark_job.py](run_automated_benchmark_job.py): wrapper that runs the automation harness from a JSON job file
 
 The shared code under `src/` is now NPU-only. It exists to build the encoder-pipeline-backed local backbone used by `npu_inference.py`. The CPU benchmark uses Hugging Face directly and does not go through `src/`.
+
+`igpu_inference.py` uses the `torch.cuda` API, which means it requires a GPU-enabled PyTorch build. On AMD systems that usually means a ROCm-enabled wheel rather than the CPU-only wheel used by the CPU/NPU flow.
 
 In shell examples below:
 - replace `<repo_root>` with the root of your local checkout
@@ -175,17 +178,21 @@ Use the automation harness when you want:
 - a case-by-case CPU/NPU sweep
 - resumable state across reboots
 - optional per-case power logging
+- optional pre-case cooldown by fixed interval or temperature threshold
 - optional NPU topology autotuning
+- optional `igpu` comparison mode
+- optional multi-study runs through `--study-ids`
 
 Example:
 
 ```bash
 cd iron/applications/bert
 python3 automated_benchmark.py /path/to/model.safetensors config/config.json \
-  --modes cpu,npu \
+  --modes cpu,npu,igpu \
   --seq-lens 64,128,256,512,1024,2048,4096,8192 \
   --runs-per-sample 100 \
   --warmup-runs 10 \
+  --cooldown-until-temp-c 50 \
   --npu-topology-policy cache \
   --power-backend turbostat \
   --power-cycle-cmd "sudo reboot"
@@ -196,11 +203,12 @@ Or resolve the model paths from the study manifest:
 ```bash
 cd iron/applications/bert
 python3 automated_benchmark.py \
-  --study-id bert-base-uncased \
-  --modes cpu,npu \
+  --study-ids all \
+  --modes cpu,npu,igpu \
   --seq-lens 64,128,256,512,1024,2048,4096,8192 \
   --runs-per-sample 100 \
   --warmup-runs 10 \
+  --cooldown-until-temp-c 50 \
   --npu-topology-policy cache \
   --power-backend turbostat \
   --power-cycle-cmd "sudo reboot"
@@ -210,12 +218,26 @@ Behavior:
 - writes a resumable state file
 - writes one master CSV summarizing all completed cases
 - writes per-case child benchmark CSVs and power logs under `logs/automated_benchmark`
+- when `power_backend=turbostat`, logs periodic package-power samples for the full case window instead of a single summary-only row
 - if `--power-cycle-cmd` is set, it runs one case, records results, invokes the hook, and exits
 - after the machine comes back, rerun the same command to continue from the saved state
-- for NPU cases with `turbostat`, it also measures an idle baseline before each case and writes:
+- for non-CPU accelerator cases with `turbostat`, it also measures an idle baseline before each case and writes:
   - `idle_pkg_watt`
+  - `pseudo_device_avg_pkg_watt`
+  - `pseudo_device_max_pkg_watt`
   - `pseudo_npu_avg_pkg_watt`
   - `pseudo_npu_max_pkg_watt`
+- all child CSVs and suite rows also include:
+  - `study_id`
+  - `measured_inference_count`
+  - `timed_total_sec`
+  - `throughput_flops_per_sec`
+  - `estimated_flops_per_inference`
+- suite rows additionally include:
+  - `cooldown_wait_sec`
+  - `power_window_sec`
+  - `estimated_flops_per_joule`
+  - `pseudo_device_estimated_flops_per_joule`
 
 ## Systemd Resume Flow
 
@@ -229,10 +251,11 @@ cp benchmark_job.example.json benchmark_job.json
 ```
 
 2. Review [benchmark_job.example.json](systemd/benchmark_job.example.json) and set:
-- either weights/config paths or `study_id`
+- exactly one of: weights/config paths, `study_id`, or `study_ids`
 - `modes`
 - sequence lengths
 - CPU thread counts
+- optional iGPU thread count / dtype
 - NPU topology policy
 - output/state/log paths
 - `power_cycle_cmd`
@@ -370,6 +393,14 @@ For NPU rows in the suite CSV, inspect:
 - `idle_pkg_watt`
 - `avg_pkg_watt`
 - `pseudo_npu_avg_pkg_watt`
+
+For cross-device comparisons, also inspect:
+- `study_id`
+- `throughput_flops_per_sec`
+- `power_sample_count`
+- `power_window_sec`
+- `estimated_flops_per_joule`
+- `pseudo_device_estimated_flops_per_joule`
 
 5. Enable reboot only after the short supervised run looks correct
 
