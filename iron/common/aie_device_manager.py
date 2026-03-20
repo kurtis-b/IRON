@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Dict, Optional, Any
 import pyxrt
 import aie.utils
-from aie.utils import DefaultNPURuntime
 from aie.utils.npukernel import NPUKernel
 from aie.iron.device import NPU1, NPU2
 
@@ -32,7 +31,8 @@ class AIEDeviceManager:
         self._refresh_runtime()
 
     def _refresh_runtime(self):
-        self.runtime = DefaultNPURuntime
+        # Resolve the runtime lazily so reset() can recreate the mlir_aie singleton.
+        self.runtime = aie.utils.DefaultNPURuntime
         # Expose device for AIEContext buffer allocation
         # Accessing protected member _device as AIEContext needs pyxrt.device
         self.device = self.runtime._device
