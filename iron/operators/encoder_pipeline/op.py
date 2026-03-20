@@ -47,6 +47,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         ln1_weight=None,
         ln2_weight=None,
         ln_weight=None,
+        ln1_staging_design: str | None = None,
         context=None,
         skip_add_to_list: bool = False,
         artifact_prefix: str | None = None,
@@ -65,6 +66,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.ffn_down_acc_group_size = ffn_down_acc_group_size
         self.nB_tiles_distributed = nB_tiles_distributed
         self.artifact_prefix = artifact_prefix or "encoder_pipeline"
+        self.ln1_staging_design = self._resolve_ln1_staging_design(ln1_staging_design)
         self.embed_sz = d * num_heads
         self.ffn_intermediate_size = (
             4 * self.embed_sz
@@ -144,6 +146,11 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "encoder_pipeline requires nB_tiles_distributed > 0 "
                 f"(got {self.nB_tiles_distributed})"
             )
+        if self.ln1_staging_design == "hybrid" and self.parallel_seq < 4:
+            raise AIEOperatorConstraintError(
+                "encoder_pipeline hybrid ln1 staging is currently only supported "
+                f"for parallel_seq >= 4 (got parallel_seq={self.parallel_seq})"
+            )
         if self.seq_len % self.seq_tile != 0:
             raise AIEOperatorConstraintError(
                 "encoder_pipeline requires seq_len divisible by seq_tile "
@@ -217,6 +224,36 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 f"(got placement key {placement_topology_key})"
             )
 
+    @staticmethod
+    def _resolve_ln1_staging_design(ln1_staging_design: str | None) -> str:
+        raw = "ddr" if ln1_staging_design is None else ln1_staging_design
+        mode = raw.strip().lower()
+        if mode in {"ddr", "dram", "host"}:
+            return "ddr"
+        if mode in {"memtile", "mt", "onchip"}:
+            return "memtile"
+        if mode in {"hybrid", "mix", "mixed", "memtile-ddr", "memtile_dram"}:
+            return "hybrid"
+        raise AIEOperatorConstraintError(
+            "encoder_pipeline ln1_staging_design must be one of "
+            "{ddr, dram, host, memtile, mt, onchip, hybrid, mix, mixed} "
+            f"(got '{raw}')"
+        )
+
+    def _design_import_path(self) -> Path:
+        return Path(__file__).with_name("design.py")
+
+    def _design_callback_fn(self) -> str:
+        return "encoder_pipeline"
+
+    def _tracked_design_paths(self) -> list[Path]:
+        operator_dir = Path(__file__).parent
+        return [
+            operator_dir / "design.py",
+            operator_dir / "op.py",
+            operator_dir / "placements.py",
+        ]
+
     def _artifact_stem(self, prefix: str) -> str:
         identity = "|".join(
             map(
@@ -237,6 +274,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
                     self.ffn_down_acc_group_size,
                     self.nB_tiles_distributed,
                     self.ffn_intermediate_size,
+                    self.ln1_staging_design,
                 ],
             )
         )
@@ -246,11 +284,10 @@ class AIEEncoderPipeline(AIEOperatorBase):
             f"{self.ffn_tile}f_"
             f"{self.parallel_seq}ps_{self.parallel_heads}ph_{self.proj_acc_depth}pa_"
             f"{self.o_proj_acc_group_size}g_{self.ffn_down_acc_group_size}fg_"
-            f"{self.nB_tiles_distributed}pf_{digest}"
+            f"{self.nB_tiles_distributed}pf_{self.ln1_staging_design[:2]}_{digest}"
         )
 
     def get_artifacts(self, prefix: str = "encoder_pipeline"):
-        operator_dir = Path(__file__).parent
         file_name_base = self._artifact_stem(prefix)
         kernel_instance_name = f"encoder_pipeline_{hashlib.blake2s(file_name_base.encode(), digest_size=4).hexdigest()}"
 
@@ -330,13 +367,9 @@ class AIEEncoderPipeline(AIEOperatorBase):
         kernel_archive = f"{file_name_base}_kernels.a"
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
-            import_path=operator_dir / "design.py",
-            callback_fn="encoder_pipeline",
-            tracked_paths=[
-                operator_dir / "design.py",
-                operator_dir / "op.py",
-                operator_dir / "placements.py",
-            ],
+            import_path=self._design_import_path(),
+            callback_fn=self._design_callback_fn(),
+            tracked_paths=self._tracked_design_paths(),
             callback_kwargs={
                 "heads": self.num_heads,
                 "seq_len": self.seq_len,
@@ -356,6 +389,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "kernel_archive": kernel_archive,
                 "ln1_weight_file": ln1_weight_file_name,
                 "ln2_weight_file": ln2_weight_file_name,
+                "ln1_staging_design": self.ln1_staging_design,
                 "trace_size": 0,
             },
         )
@@ -412,6 +446,15 @@ class AIEEncoderPipeline(AIEOperatorBase):
                             },
                         ),
                         KernelObjectArtifact.new(
+                            f"{prefix}_passThrough_joined_o_{self.seq_tile}m_{self.seq_tile}n_{self.d}k.o",
+                            extra_flags=["-DBIT_WIDTH=16"],
+                            depends=[SourceArtifact.new(passthrough_source)],
+                            rename_symbols={
+                                "passThroughLine": "passThroughLine_joined_o_proj",
+                                "passThroughTile": "passThroughTile_joined_o_proj",
+                            },
+                        ),
+                        KernelObjectArtifact.new(
                             f"{prefix}_convert_copy.o",
                             depends=[SourceArtifact.new(convert_copy_source)],
                         ),
@@ -453,6 +496,8 @@ class AIEEncoderPipeline(AIEOperatorBase):
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def _or_buffer_shape(self):
+        if self.ln1_staging_design == "memtile":
+            return (2 * self.seq_len, self.embed_sz)
         if self.parallel_seq > 1:
             ln1_stage_rows = self.seq_len
         else:

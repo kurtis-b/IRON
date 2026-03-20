@@ -27,6 +27,7 @@ def generate_golden_reference(
     emb_tile: int = 96,
     ffn_tile: int | None = None,
     parallel_seq: int = 1,
+    ln1_staging_design: str = "ddr",
     seed: int = 42,
 ):
     """Generate full-pipeline encoder reference tensors.
@@ -76,7 +77,22 @@ def generate_golden_reference(
     k_2d = k.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     v_2d = v.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     qkv = torch.cat((q_2d, k_2d, v_2d), dim=0)
-    if parallel_seq > 1:
+    ln1_staging_mode = ln1_staging_design.strip().lower()
+    if ln1_staging_mode in {"dram", "host"}:
+        ln1_staging_mode = "ddr"
+    elif ln1_staging_mode in {"mt", "onchip"}:
+        ln1_staging_mode = "memtile"
+    elif ln1_staging_mode in {"mix", "mixed", "memtile-ddr", "memtile_dram"}:
+        ln1_staging_mode = "hybrid"
+    elif ln1_staging_mode not in {"ddr", "memtile", "hybrid"}:
+        raise ValueError(
+            "generate_golden_reference ln1_staging_design must be one of "
+            "{ddr, dram, host, memtile, mt, onchip, hybrid, mix, mixed} "
+            f"(got {ln1_staging_design!r})"
+        )
+    if ln1_staging_mode == "memtile":
+        ln1_stage_rows = 0
+    elif parallel_seq > 1:
         if seq_len % seq_tile != 0:
             raise ValueError(
                 "generate_golden_reference requires seq_len divisible by seq_tile"

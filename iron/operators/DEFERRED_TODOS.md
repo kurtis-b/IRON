@@ -1,7 +1,14 @@
 # Deferred Operator Work
 
-These operator areas are intentionally deferred for now:
+Deferred follow-up:
 
 - `encoder_pipeline_memtile`
-  - Current implementation is stale.
-  - It should be realigned to follow `encoder_pipeline`, while keeping the `LN1 -> FFN` path on-chip instead of routing through DDR.
+  - Non-sequence-parallel topologies are implemented and validated.
+  - Sequence-parallel `2ps`, `2ps_2ph`, `2ps_2pffn`, and `2ps_2ph_2pffn` are
+    implemented and validated.
+  - Heavier mixed-head sequence-parallel topologies still need follow-up.
+  - Multi-branch seq-par beyond `2ps_2ph_2pffn` still needs follow-up.
+  - `4ps` remains unsupported for memtile mode.
+  - A pure on-chip `4ps` path would need LN1 output to drive FFN-up, replay, and
+    LN2 residual at once, and that exceeds the current channel budget without an
+    extra worker tile or a DDR fallback.
