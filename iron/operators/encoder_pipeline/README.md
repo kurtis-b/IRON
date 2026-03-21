@@ -47,7 +47,7 @@ This operator is sensitive to `mlir_aie` lowering/allocation behavior. Different
 
 The public test matrix in [test.py](/home/agi-demo/iron/operators/encoder_pipeline/test.py) currently uses:
 
-- `seq_len`: powers of 2 from `64` through `8192`
+- `seq_len`: powers of 2 from `64` through `16384`
 - base topology:
   - `d=64`
   - `num_heads=12`

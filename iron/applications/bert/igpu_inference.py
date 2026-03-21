@@ -19,6 +19,14 @@ from benchmark_common import (
     summarize_latency_measurements,
     write_results_csv,
 )
+from benchmark_power import (
+    add_power_measurement_args,
+    create_power_monitor,
+    derive_power_log_path,
+    empty_power_stats,
+    format_power_stats_for_csv,
+    resolve_power_backend,
+)
 from model_support import (
     build_hf_encoder_model,
     canonicalize_app_config_dict,
@@ -107,6 +115,7 @@ def parse_args():
         default="igpu_benchmark_latest.csv",
         help="CSV file to write benchmark results to.",
     )
+    add_power_measurement_args(parser)
     add_cooldown_args(parser)
     return parser.parse_args()
 
@@ -198,6 +207,9 @@ def benchmark_seq_len(
     runs_per_sample,
     dtype_name,
     device_index,
+    power_backend,
+    power_interval_sec,
+    power_log_path,
 ):
     import torch
 
@@ -236,20 +248,26 @@ def benchmark_seq_len(
         torch.cuda.synchronize(device)
 
         latencies_ms = []
-        for sample in encoded_samples:
-            for _ in range(runs_per_sample):
-                torch.cuda.synchronize(device)
-                start = time.perf_counter()
-                kwargs = {
-                    "input_ids": sample["input_ids"],
-                    "attention_mask": None,
-                }
-                if use_token_type_ids:
-                    kwargs["token_type_ids"] = sample["token_type_ids"]
-                output = model(**kwargs).last_hidden_state
-                torch.cuda.synchronize(device)
-                end = time.perf_counter()
-                latencies_ms.append((end - start) * 1000.0)
+        with create_power_monitor(
+            power_backend,
+            power_interval_sec,
+            device_index=device_index,
+            log_path=power_log_path,
+        ) as power_monitor:
+            for sample in encoded_samples:
+                for _ in range(runs_per_sample):
+                    torch.cuda.synchronize(device)
+                    start = time.perf_counter()
+                    kwargs = {
+                        "input_ids": sample["input_ids"],
+                        "attention_mask": None,
+                    }
+                    if use_token_type_ids:
+                        kwargs["token_type_ids"] = sample["token_type_ids"]
+                    output = model(**kwargs).last_hidden_state
+                    torch.cuda.synchronize(device)
+                    end = time.perf_counter()
+                    latencies_ms.append((end - start) * 1000.0)
 
     latency_stats = summarize_latency_measurements(
         latencies_ms,
@@ -262,6 +280,7 @@ def benchmark_seq_len(
         "model_type": model_type,
         "shape": tuple(output.shape),
         "dtype": str(model.dtype).replace("torch.", ""),
+        "power_stats": power_monitor.stats,
         **latency_stats,
     }
 
@@ -288,6 +307,8 @@ def main():
 
     texts = build_benchmark_texts(args.num_samples)
     model_config = load_app_model_config(config_file_path)
+    power_backend = resolve_power_backend(args.power_backend, "igpu")
+    multi_case = len(seq_lens) > 1
 
     print(f"Using host CPU threads: {num_threads}", flush=True)
     print(f"torch intra-op threads: {torch.get_num_threads()}", flush=True)
@@ -308,6 +329,14 @@ def main():
             label=f"iGPU seq_len={seq_len}",
         )
         print(f"Starting iGPU benchmark: seq_len={seq_len}", flush=True)
+        power_log_path = (
+            derive_power_log_path(
+                args.power_log_path,
+                f"seq{seq_len}" if multi_case else None,
+            )
+            if power_backend != "none"
+            else None
+        )
         result = benchmark_seq_len(
             weights_file_path=weights_file_path,
             config_file_path=config_file_path,
@@ -317,6 +346,9 @@ def main():
             runs_per_sample=args.runs_per_sample,
             dtype_name=args.dtype,
             device_index=args.device_index,
+            power_backend=power_backend,
+            power_interval_sec=args.power_interval_sec,
+            power_log_path=power_log_path,
         )
         print(
             f"seq_len={seq_len:<5d} "
@@ -355,6 +387,11 @@ def main():
                 "min_latency_ms": f"{result['min_latency_ms']:.6f}",
                 "avg_latency_ms": f"{result['avg_latency_ms']:.6f}",
                 "max_latency_ms": f"{result['max_latency_ms']:.6f}",
+                **format_power_stats_for_csv(
+                    power_backend,
+                    result.get("power_stats", empty_power_stats()),
+                    power_log_path,
+                ),
             }
         )
         write_results_csv(args.output_csv, csv_rows)

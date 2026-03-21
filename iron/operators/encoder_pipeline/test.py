@@ -16,7 +16,7 @@ from iron.operators.encoder_pipeline.reference import generate_golden_reference
 REL_TOL = 4.0e-2
 ABS_TOL = 1.5e-1
 ERROR_THRESHOLD = 0.005
-SCALED_SEQ_LENS = tuple(1 << exp for exp in range(6, 14))
+SCALED_SEQ_LENS = tuple(1 << exp for exp in range(6, 15))
 BASE_TOPOLOGY = (64, 12, 3072, 32, 64, 96, 64)
 TOPOLOGY_CASES = (
     ("", (1, 1, 8, 1, 1, 1)),

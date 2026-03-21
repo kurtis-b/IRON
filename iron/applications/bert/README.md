@@ -99,7 +99,7 @@ Useful options:
 
 ```bash
 python3 cpu_inference.py <weights> <config> \
-  --seq-lens 64,128,256,512,1024,2048,4096,8192,16384 \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
   --num-samples 1 \
   --warmup-runs 10 \
   --runs-per-sample 100 \
@@ -141,7 +141,7 @@ Useful options:
 
 ```bash
 python3 npu_inference.py <weights> <config> \
-  --seq-lens 64,128,256,512,1024,2048,4096,8192,16384 \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
   --num-samples 1 \
   --warmup-runs 10 \
   --runs-per-sample 100 \
@@ -190,7 +190,7 @@ Example:
 cd iron/applications/bert
 python3 automated_benchmark.py /path/to/model.safetensors config/config.json \
   --modes cpu,npu,igpu \
-  --seq-lens 64,128,256,512,1024,2048,4096,8192,16384 \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
   --runs-per-sample 100 \
   --warmup-runs 10 \
   --cooldown-until-temp-c 50 \
@@ -206,7 +206,7 @@ cd iron/applications/bert
 python3 automated_benchmark.py \
   --study-ids all \
   --modes cpu,npu,igpu \
-  --seq-lens 64,128,256,512,1024,2048,4096,8192,16384 \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
   --runs-per-sample 100 \
   --warmup-runs 10 \
   --cooldown-until-temp-c 50 \
@@ -219,9 +219,11 @@ Behavior:
 - writes a resumable state file
 - writes one master CSV summarizing all completed cases
 - writes per-case child benchmark CSVs and power logs under `logs/automated_benchmark`
-- when `power_backend=auto`, the suite uses `turbostat` for CPU/NPU cases and `rocm-smi` for iGPU cases
-- when `power_backend=turbostat`, logs periodic package-power samples for the full case window instead of a single summary-only row
-- when `power_backend=rocm-smi`, logs periodic graphics-package power samples for iGPU cases without requiring `sudo`
+- `--power-backend auto` uses `powercap-rapl` for CPU, `turbostat` for NPU, and `rocm-smi` for iGPU
+- active power logging now covers only the timed inference region, not model load or warmup
+- CPU child benchmarks log start/end package/core energy snapshots for the timed region and derive average watts from the energy delta
+- NPU child benchmarks log periodic `turbostat` package-power samples for the timed region
+- iGPU child benchmarks log periodic `rocm-smi` graphics-package power samples for the timed region without requiring `sudo`
 - when `--cooldown-until-temp-c` is set, the suite accepts temperatures within the default 5% band above the target
 - when that temperature target is still not met after the max cooldown wait, the suite continues instead of failing
 - if `--power-cycle-cmd` is set, it runs one case, records results, invokes the hook, and exits
@@ -316,6 +318,8 @@ sudo systemctl enable bert-automated-benchmark.service
 sudo systemctl start bert-automated-benchmark.service
 ```
 
+The service file sets `LimitMEMLOCK=65536K`. Keep that limit in place for unattended NPU runs; the default systemd `memlock` limit is too low for reliable `pyxrt.device(0)` startup on this host, while `64 MiB` was sufficient in service-context validation.
+
 6. Watch the service log:
 
 ```bash
@@ -331,15 +335,19 @@ Notes:
 
 Power notes:
 - `powertop` is not used here because it is weaker for scripted benchmarking
-- `auto` is the preferred mixed backend: `turbostat` for CPU/NPU and `rocm-smi` for iGPU
-- `turbostat` remains the preferred local backend for whole-package CPU/NPU logging
-- `rocm-smi` is the preferred local backend for iGPU graphics-package logging
+- `none` and `auto` are the only supported user-facing `--power-backend` values
+- `auto` is the fixed mixed backend: `powercap-rapl` for CPU, `turbostat` for NPU, and `rocm-smi` for iGPU
+- `powercap-rapl` is the preferred local backend for timed-region CPU package/core energy logging
+- `turbostat` remains the preferred local backend for timed-region NPU package logging
+- `rocm-smi` is the preferred local backend for timed-region iGPU graphics-package logging
+- `powercap-rapl` reads `energy_uj` counters under `/sys/class/powercap` and may require either direct read access or a narrowly whitelisted helper
 - `turbostat` needs privileged access to MSRs on this machine
 - `rocm-smi` does not need `sudo`, but it only applies to iGPU cases
 - for NPU runs, the suite treats pseudo-NPU power as:
   - `measured package power - idle package power`
 - for iGPU runs under `rocm-smi`, the suite treats pseudo-device power as:
   - `measured graphics-package power - idle graphics-package power`
+- under `rocm-smi`, the direct iGPU reading is reported in `avg_gfx_watt` / `max_gfx_watt`
 - the idle package power is measured immediately before each NPU case
 - the idle graphics-package power is measured immediately before each iGPU case
 - for total wall-power comparison across CPU and NPU runs, an external meter or smart PDU is still better than host-local telemetry
@@ -347,6 +355,7 @@ Power notes:
 Suggested sudoers entries for unattended runs:
 
 ```text
+<benchmark_user> ALL=(root) NOPASSWD: <repo_root>/iron/applications/bert/read_powercap_rapl.py
 <benchmark_user> ALL=(root) NOPASSWD: /usr/bin/turbostat
 <benchmark_user> ALL=(root) NOPASSWD: /usr/sbin/reboot, /usr/bin/systemctl reboot
 ```
@@ -376,6 +385,7 @@ The script runs the same checklist below and writes preflight artifacts under:
 1. Verify privileged helpers work non-interactively
 
 ```bash
+sudo -n /absolute/path/to/iron/applications/bert/read_powercap_rapl.py --check
 sudo -n turbostat --Summary --quiet --show PkgWatt,CorWatt,GFXWatt,RAMWatt --interval 0.5 --num_iterations 2 sleep 1
 ```
 
@@ -392,7 +402,7 @@ source <repo_root>/ironenv/bin/activate
 python3 automated_benchmark.py \
   --study-id bert-base-uncased \
   --modes npu \
-  --seq-lens 64,128,256,512,1024,2048,4096,8192,16384 \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
   --num-samples 1 \
   --warmup-runs 10 \
   --runs-per-sample 100 \
@@ -435,6 +445,11 @@ For NPU rows in the suite CSV, inspect:
 - `avg_pkg_watt`
 - `pseudo_npu_avg_pkg_watt`
 
+For iGPU rows in the suite CSV, inspect:
+- `avg_gfx_watt`
+- `idle_gfx_watt`
+- `pseudo_device_avg_pkg_watt`
+
 For cross-device comparisons, also inspect:
 - `study_id`
 - `throughput_flops_per_sec`
@@ -474,7 +489,7 @@ This checks:
 - CPU smoke
 - NPU smokes at `64` and `512`
 - topology-cache warmup
-- non-interactive `turbostat`
+- CPU `powercap-rapl` helper access and non-interactive `turbostat`
 
 3. Verify the automated benchmark path itself with the short supervised suite:
 
@@ -508,14 +523,14 @@ python3 run_automated_benchmark_job.py systemd/benchmark_job.json
 ```
 
 7. Only after that, enable unattended reboot/resume:
-- configure sudoers for `turbostat` and reboot
+- configure sudoers for `read_powercap_rapl.py`, `turbostat`, and reboot
 - install/enable the systemd service
 - set `power_cycle_cmd` in `benchmark_job.json`
 
 ## Sequence Lengths
 
 All benchmark entrypoints default to:
-- `64,128,256,512,1024,2048,4096,8192,16384`
+- `64,128,256,512,1024,2048,4096,8192`
 
 For lengths above `512`, the scripts extend the learned position embeddings by repeating them so CPU and NPU benchmark the same effective backbone shape.
 

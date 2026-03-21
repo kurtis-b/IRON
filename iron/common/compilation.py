@@ -32,6 +32,7 @@ list must be made available after calling `compile()`.
 from abc import ABC, abstractmethod
 from pathlib import Path
 import os.path
+import sys
 import zlib
 import logging
 import subprocess
@@ -315,10 +316,40 @@ class GenerateMLIRFromPythonCompilationRule(CompilationRule):
 class AieccCompilationRule(CompilationRule):
     def __init__(self, build_dir, peano_dir, mlir_aie_dir, *args, **kwargs):
         self.build_dir = build_dir
-        self.aie_opt_path = Path(mlir_aie_dir) / "bin" / "aie-opt"
-        self.aiecc_path = Path(mlir_aie_dir) / "bin" / "aiecc.py"
-        self.peano_dir = peano_dir
+        self.mlir_aie_dir = Path(mlir_aie_dir)
+        self.peano_dir = Path(peano_dir)
+        self.aie_bin_dir = self.mlir_aie_dir / "bin"
+        self.aie_opt_path = self.aie_bin_dir / "aie-opt"
+        self.aiecc_bin_path = self.aie_bin_dir / "aiecc"
+        self.aiecc_path = self.aie_bin_dir / "aiecc.py"
         super().__init__(*args, **kwargs)
+
+    def _compile_env(self):
+        env = os.environ.copy()
+        existing_path = env.get("PATH", "")
+        extra_paths = [
+            str(Path(sys.executable).resolve().parent),
+            str(self.aie_bin_dir),
+            str(self.peano_dir / "bin"),
+        ]
+        path_entries = []
+        for path in extra_paths + existing_path.split(os.pathsep):
+            if not path or path in path_entries:
+                continue
+            path_entries.append(path)
+        env["PATH"] = os.pathsep.join(path_entries)
+        return env
+
+    def _aiecc_command_prefix(self):
+        # Prefer the direct C++ driver because the Python wrapper still shells
+        # out to `aiecc` via PATH.
+        if self.aiecc_bin_path.exists():
+            return [str(self.aiecc_bin_path)]
+        if self.aiecc_path.exists():
+            return [sys.executable, str(self.aiecc_path)]
+        raise FileNotFoundError(
+            f"Could not find an aiecc driver under {self.aie_bin_dir}"
+        )
 
     def matches(self, artifacts):
         return any(
@@ -358,10 +389,9 @@ class AieccCompilationRule(CompilationRule):
         # Now we know for each mlir source if we need to generate an xclbin, an insts.bin or both for it
         for mlir_source in mlir_sources:
             lowered_mlir_source = self._preprocess_mlir_source(mlir_source)
-            # Build aiecc command using Peano
-            compile_cmd = [
-                "python",
-                str(self.aiecc_path),
+            # Build an aiecc command using deterministic tool resolution so
+            # unattended runs do not depend on login-shell PATH state.
+            compile_cmd = self._aiecc_command_prefix() + [
                 "--no-compile-host",
                 "--no-xchesscc",
                 "--no-xbridge",
@@ -396,7 +426,7 @@ class AieccCompilationRule(CompilationRule):
                 ]
             compile_cmd += [str(lowered_mlir_source)]
 
-            env = os.environ.copy()
+            env = self._compile_env()
             logging.debug(f"Compiling MLIR with command: {' '.join(compile_cmd)}")
             if not self.dry_run:
                 result = subprocess.run(

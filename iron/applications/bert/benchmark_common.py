@@ -11,6 +11,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from benchmark_power import ACTIVE_POWER_FIELDNAMES
+
 SAMPLE_TEXT = """
 SCENE I. King Lear's palace.
 Enter KENT, GLOUCESTER, and EDMUND
@@ -50,9 +52,9 @@ CSV_FIELDNAMES = [
     "min_latency_ms",
     "avg_latency_ms",
     "max_latency_ms",
-]
+] + ACTIVE_POWER_FIELDNAMES
 
-DEFAULT_BENCHMARK_SEQ_LENS = "64,128,256,512,1024,2048,4096,8192,16384"
+DEFAULT_BENCHMARK_SEQ_LENS = "64,128,256,512,1024,2048,4096,8192"
 
 
 def _detect_physical_cores_from_sysfs(respect_affinity=True):

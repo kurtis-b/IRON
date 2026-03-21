@@ -17,16 +17,28 @@ TEST_DIR = Path(__file__).parent
 sys.path.insert(0, str(TEST_DIR))
 
 import benchmark_common
+import automated_benchmark
 from automated_benchmark import (
+    build_suite_row,
+    case_command,
     enumerate_cases,
-    parse_turbostat_log,
-    resolve_power_backend,
+    is_transient_npu_startup_failure,
+    npu_case_skip_reason,
+    parse_seq_len_int_overrides,
+    run_case,
 )
 from benchmark_common import (
     DEFAULT_BENCHMARK_SEQ_LENS,
     acceptable_cooldown_temp,
     cooldown_before_benchmark,
     parse_seq_lens,
+)
+from benchmark_power import (
+    discover_powercap_rapl_zones,
+    empty_power_stats,
+    parse_power_log,
+    resolve_power_backend,
+    summarize_powercap_rapl,
 )
 from model_support import (
     canonicalize_app_config_dict,
@@ -36,6 +48,7 @@ from model_support import (
 from npu_inference import (
     current_topology_from_config,
     find_cached_topology,
+    load_encoder_pipeline_topology_placements,
     load_encoder_pipeline_config,
     supported_topologies_for_seq_len,
     topology_cache_key,
@@ -199,6 +212,51 @@ def test_bert_automated_benchmark_job_wrapper_smoke(tmp_path):
         f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     )
     assert "automated_benchmark.py" in result.stdout
+
+
+def test_bert_automated_benchmark_job_wrapper_prints_runs_per_sample_overrides(
+    tmp_path,
+):
+    job_config = tmp_path / "benchmark_job.json"
+    job_config.write_text(
+        (
+            "{\n"
+            '  "study_id": "bert-base-uncased",\n'
+            '  "modes": "npu",\n'
+            '  "seq_lens": "2048,4096,8192",\n'
+            '  "runs_per_sample": 100,\n'
+            '  "runs_per_sample_overrides": "2048=50,4096=15,8192=5",\n'
+            '  "npu_autotune_runs": 5,\n'
+            '  "npu_autotune_runs_overrides": "2048=3,4096=2,8192=1",\n'
+            '  "power_backend": "none"\n'
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    command = [
+        "python3",
+        str(TEST_DIR / "run_automated_benchmark_job.py"),
+        str(job_config),
+        "--print-command",
+    ]
+    result = subprocess.run(
+        command,
+        cwd=TEST_DIR,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert result.returncode == 0, (
+        f"Command failed with return code {result.returncode}\n"
+        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+    assert "--runs-per-sample 100" in result.stdout
+    assert "--runs-per-sample-overrides 2048=50,4096=15,8192=5" in result.stdout
+    assert "--npu-autotune-runs 5" in result.stdout
+    assert "--npu-autotune-runs-overrides 2048=3,4096=2,8192=1" in result.stdout
 
 
 def test_bert_automated_benchmark_job_wrapper_study_id_smoke(tmp_path):
@@ -446,7 +504,7 @@ def test_encoder_forward_flops_estimate_grows_with_seq_len():
     assert seq512 > seq64
 
 
-def test_default_benchmark_seq_lens_extend_to_16384():
+def test_default_benchmark_seq_lens_stop_at_8192():
     assert parse_seq_lens(DEFAULT_BENCHMARK_SEQ_LENS) == [
         64,
         128,
@@ -456,7 +514,6 @@ def test_default_benchmark_seq_lens_extend_to_16384():
         2048,
         4096,
         8192,
-        16384,
     ]
 
 
@@ -545,14 +602,14 @@ def test_cooldown_before_benchmark_continues_after_timeout(monkeypatch):
     assert stats["cooldown_temp_source"] == "fake:cpu"
 
 
-def test_parse_turbostat_log_accepts_periodic_samples(tmp_path):
+def test_parse_power_log_accepts_periodic_samples(tmp_path):
     log_path = tmp_path / "turbostat.log"
     log_path.write_text(
         "2.000000 sec\n" "CorWatt\tPkgWatt\n" "1.00\t10.00\n" "2.00\t20.00\n" "0.00\n",
         encoding="utf-8",
     )
 
-    stats = parse_turbostat_log(log_path)
+    stats = parse_power_log(log_path)
 
     assert stats["power_sample_count"] == 2
     assert stats["power_window_sec"] == "2.000000"
@@ -561,34 +618,498 @@ def test_parse_turbostat_log_accepts_periodic_samples(tmp_path):
     assert stats["avg_cor_watt"] == "1.500000"
 
 
-def test_parse_turbostat_log_accepts_rocm_smi_style_samples(tmp_path):
-    log_path = tmp_path / "rocm_smi.log"
+def test_parse_power_log_accepts_explicit_duration_without_header(tmp_path):
+    log_path = tmp_path / "turbostat_no_duration.log"
     log_path.write_text(
-        "2.500000 sec\n" "GFXWatt\tPkgWatt\n" "3.00\t3.00\n" "5.00\t5.00\n",
+        "CorWatt\tPkgWatt\n" "1.00\t10.00\n" "2.00\t20.00\n",
         encoding="utf-8",
     )
 
-    stats = parse_turbostat_log(log_path)
+    stats = parse_power_log(log_path, duration_sec=3.5)
+
+    assert stats["power_sample_count"] == 2
+    assert stats["power_window_sec"] == "3.500000"
+    assert stats["avg_pkg_watt"] == "15.000000"
+    assert stats["avg_cor_watt"] == "1.500000"
+
+
+def test_parse_power_log_accepts_rocm_smi_style_samples(tmp_path):
+    log_path = tmp_path / "rocm_smi.log"
+    log_path.write_text(
+        "2.500000 sec\n" "GFXWatt\n" "3.00\n" "5.00\n",
+        encoding="utf-8",
+    )
+
+    stats = parse_power_log(log_path)
 
     assert stats["power_sample_count"] == 2
     assert stats["power_window_sec"] == "2.500000"
-    assert stats["avg_pkg_watt"] == "4.000000"
     assert stats["avg_gfx_watt"] == "4.000000"
+    assert stats["avg_pkg_watt"] == ""
 
 
-def test_resolve_power_backend_uses_rocm_smi_for_igpu_auto():
-    args = SimpleNamespace(power_backend="auto")
+def test_parse_power_log_accepts_summary_headers_without_pkg_gfx_aliasing(tmp_path):
+    log_path = tmp_path / "summary.log"
+    log_path.write_text(
+        "1.500000 sec\n"
+        "CorWatt\tPkgWatt\n"
+        "0.90\t6.00\n"
+        "CorWatt\tPkgWatt\n"
+        "1.10\t8.00\n",
+        encoding="utf-8",
+    )
 
-    assert resolve_power_backend(args, {"mode": "cpu"}) == "turbostat"
-    assert resolve_power_backend(args, {"mode": "npu"}) == "turbostat"
-    assert resolve_power_backend(args, {"mode": "igpu"}) == "rocm-smi"
+    stats = parse_power_log(log_path)
+
+    assert stats["power_sample_count"] == 2
+    assert stats["avg_pkg_watt"] == "7.000000"
+    assert stats["avg_cor_watt"] == "1.000000"
 
 
-def test_resolve_power_backend_rejects_rocm_smi_for_cpu():
-    args = SimpleNamespace(power_backend="rocm-smi")
+def test_discover_powercap_rapl_zones_reads_package_and_core(tmp_path):
+    package_dir = tmp_path / "intel-rapl:0"
+    core_dir = tmp_path / "intel-rapl:0:0"
+    package_dir.mkdir(parents=True)
+    core_dir.mkdir(parents=True)
+    (package_dir / "name").write_text("package-0\n", encoding="utf-8")
+    (package_dir / "energy_uj").write_text("1000\n", encoding="utf-8")
+    (package_dir / "max_energy_range_uj").write_text("999999\n", encoding="utf-8")
+    (core_dir / "name").write_text("core\n", encoding="utf-8")
+    (core_dir / "energy_uj").write_text("200\n", encoding="utf-8")
+    (core_dir / "max_energy_range_uj").write_text("999999\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="igpu"):
-        resolve_power_backend(args, {"mode": "cpu"})
+    zones = discover_powercap_rapl_zones(tmp_path)
+
+    assert [zone["name"] for zone in zones["package"]] == ["package-0"]
+    assert [zone["name"] for zone in zones["core"]] == ["core"]
+    assert zones["package"][0]["energy_path"].endswith("intel-rapl:0/energy_uj")
+    assert zones["core"][0]["energy_path"].endswith("intel-rapl:0:0/energy_uj")
+
+
+def test_summarize_powercap_rapl_aggregates_package_and_core_energy():
+    zones = {
+        "package": [
+            {
+                "name": "package-0",
+                "energy_path": "/tmp/package0",
+                "max_energy_range_uj": 1_000_000,
+            },
+            {
+                "name": "package-1",
+                "energy_path": "/tmp/package1",
+                "max_energy_range_uj": 1_000_000,
+            },
+        ],
+        "core": [
+            {
+                "name": "core",
+                "energy_path": "/tmp/core0",
+                "max_energy_range_uj": 1_000_000,
+            }
+        ],
+    }
+    start_snapshot = {
+        "/tmp/package0": 10_000,
+        "/tmp/package1": 20_000,
+        "/tmp/core0": 5_000,
+    }
+    end_snapshot = {
+        "/tmp/package0": 210_000,
+        "/tmp/package1": 320_000,
+        "/tmp/core0": 55_000,
+    }
+
+    stats, zone_rows = summarize_powercap_rapl(
+        zones,
+        start_snapshot,
+        end_snapshot,
+        duration_sec=2.0,
+    )
+
+    assert stats["power_sample_count"] == 2
+    assert stats["power_window_sec"] == "2.000000"
+    assert stats["avg_pkg_watt"] == "0.250000"
+    assert stats["avg_cor_watt"] == "0.025000"
+    assert stats["max_pkg_watt"] == ""
+    assert [row["group"] for row in zone_rows] == ["package", "package", "core"]
+
+
+def test_summarize_powercap_rapl_handles_counter_wrap():
+    zones = {
+        "package": [
+            {
+                "name": "package-0",
+                "energy_path": "/tmp/package0",
+                "max_energy_range_uj": 1000,
+            }
+        ],
+        "core": [],
+    }
+    start_snapshot = {"/tmp/package0": 900}
+    end_snapshot = {"/tmp/package0": 100}
+
+    stats, _ = summarize_powercap_rapl(
+        zones,
+        start_snapshot,
+        end_snapshot,
+        duration_sec=0.1,
+    )
+
+    assert stats["avg_pkg_watt"] == "0.002000"
+
+
+def test_supported_topologies_for_seq_len_avoids_operator_package_import(
+    monkeypatch,
+):
+    for module_name in list(sys.modules):
+        if module_name == "iron.operators" or module_name.startswith("iron.operators."):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 64)
+    supported = supported_topologies_for_seq_len(config, 64)
+
+    assert supported
+    assert "iron.operators" not in sys.modules
+    assert "iron.operators.encoder_pipeline.placements" not in sys.modules
+    assert load_encoder_pipeline_topology_placements()
+
+
+def test_is_transient_npu_startup_failure_matches_known_xrt_open_error():
+    case = {"mode": "npu"}
+    result = subprocess.CompletedProcess(
+        args=["python3", "npu_inference.py"],
+        returncode=1,
+        stdout="Selected topology: seq_len=64 topology=2ps_4pffn",
+        stderr=(
+            "RuntimeError: mmap(addr=0x7fa44c000000, len=67108864, prot=3, "
+            "flags=8209, offset=4294967296) failed (err=-11): "
+            "Resource temporarily unavailable\n"
+            "self._device = pyxrt.device(0)\n"
+            "_DefaultNPURuntime = CachedXRTRuntime()\n"
+            "from aie.utils import DefaultNPURuntime\n"
+        ),
+    )
+
+    assert is_transient_npu_startup_failure(case, result) is True
+
+
+def test_run_case_retries_transient_npu_startup_failure_and_remeasures_idle_power(
+    tmp_path, monkeypatch
+):
+    sleep_calls = []
+    idle_calls = []
+    build_calls = []
+    child_csv = tmp_path / "logs" / "toy_npu_seq64.csv"
+    power_log = tmp_path / "logs" / "toy_npu_seq64_power.log"
+    idle_log = tmp_path / "logs" / "toy_npu_seq64_idle_power.log"
+
+    monkeypatch.setattr(
+        automated_benchmark,
+        "case_command",
+        lambda *args, **kwargs: ["python3", "npu_inference.py", "--seq-lens", "64"],
+    )
+    monkeypatch.setattr(
+        automated_benchmark,
+        "resolve_power_backend",
+        lambda requested_backend, mode: "turbostat",
+    )
+    monkeypatch.setattr(
+        automated_benchmark.time,
+        "sleep",
+        lambda seconds: sleep_calls.append(seconds),
+    )
+
+    def fake_measure_idle_power(args, case, logs_dir, power_backend):
+        idle_calls.append((case["case_id"], power_backend))
+        idle_log.parent.mkdir(parents=True, exist_ok=True)
+        idle_log.write_text(f"idle attempt {len(idle_calls)}\n", encoding="utf-8")
+        stats = empty_power_stats(
+            sample_count_key="idle_power_sample_count",
+            window_key="idle_power_window_sec",
+        )
+        stats["idle_power_sample_count"] = 1
+        stats["idle_power_window_sec"] = "5.000000"
+        stats["avg_pkg_watt"] = f"{8 + len(idle_calls):.6f}"
+        return stats, idle_log
+
+    monkeypatch.setattr(
+        automated_benchmark,
+        "measure_idle_power",
+        fake_measure_idle_power,
+    )
+
+    results = iter(
+        [
+            subprocess.CompletedProcess(
+                args=["python3", "npu_inference.py"],
+                returncode=1,
+                stdout="Selected topology: seq_len=64 topology=2ps_4pffn",
+                stderr=(
+                    "RuntimeError: mmap(addr=0x7fa44c000000, len=67108864, prot=3, "
+                    "flags=8209, offset=4294967296) failed (err=-11): "
+                    "Resource temporarily unavailable\n"
+                    "self._device = pyxrt.device(0)\n"
+                    "_DefaultNPURuntime = CachedXRTRuntime()\n"
+                    "from aie.utils import DefaultNPURuntime\n"
+                ),
+            ),
+            subprocess.CompletedProcess(
+                args=["python3", "npu_inference.py"],
+                returncode=0,
+                stdout="ok",
+                stderr="",
+            ),
+        ]
+    )
+
+    def fake_subprocess_run(command, cwd, text, capture_output, check):
+        result = next(results)
+        if result.returncode == 0:
+            child_csv.parent.mkdir(parents=True, exist_ok=True)
+            child_csv.write_text("case_id,avg_latency_ms\n", encoding="utf-8")
+            power_log.write_text("2.000000 sec\nPkgWatt\n20.0\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(automated_benchmark.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(
+        automated_benchmark,
+        "parse_child_row",
+        lambda path: {
+            "study_id": "bert-base-uncased",
+            "seq_len": "64",
+            "num_threads": "12",
+            "dtype": "bfloat16",
+            "num_samples": "1",
+            "runs_per_sample": "100",
+            "warmup_runs": "10",
+            "measured_inference_count": "100",
+            "timed_total_sec": "2.000000",
+            "throughput_inferences_per_sec": "50.000000",
+            "model_type": "bert",
+            "shape": "(1, 64, 768)",
+            "estimated_flops_per_inference": "1.000000e+09",
+            "throughput_flops_per_sec": "5.000000e+10",
+            "topology_id": "2ps_4pffn",
+            "parallel_seq": "2",
+            "parallel_heads": "1",
+            "parallel_ffn": "4",
+            "min_latency_ms": "20.000000",
+            "avg_latency_ms": "20.000000",
+            "max_latency_ms": "20.000000",
+            "power_backend": "turbostat",
+            "power_sample_count": "2",
+            "power_window_sec": "2.000000",
+            "avg_pkg_watt": "20.000000",
+            "max_pkg_watt": "21.000000",
+            "avg_cor_watt": "",
+            "max_cor_watt": "",
+            "avg_gfx_watt": "",
+            "max_gfx_watt": "",
+            "avg_ram_watt": "",
+            "max_ram_watt": "",
+            "power_log": str(power_log),
+        },
+    )
+
+    def fake_build_suite_row(
+        child_row, case, cooldown_stats, power_backend, idle_stats, idle_log_path
+    ):
+        build_calls.append(
+            {
+                "power_backend": power_backend,
+                "idle_pkg_watt": idle_stats["avg_pkg_watt"],
+                "idle_log_path": str(idle_log_path),
+            }
+        )
+        return {
+            "case_id": case["case_id"],
+            "avg_latency_ms": child_row["avg_latency_ms"],
+        }
+
+    monkeypatch.setattr(automated_benchmark, "build_suite_row", fake_build_suite_row)
+
+    args = SimpleNamespace(
+        power_backend="auto",
+        power_interval_sec=0.5,
+        npu_idle_baseline_sec=5.0,
+    )
+    case = {
+        "case_id": "toy_npu_seq64",
+        "mode": "npu",
+        "seq_len": 64,
+        "num_threads": 12,
+        "study_id": "bert-base-uncased",
+    }
+    cooldown_stats = {
+        "cooldown_wait_sec": 0.0,
+        "cooldown_start_temp_c": None,
+        "cooldown_end_temp_c": None,
+        "cooldown_temp_source": "",
+    }
+
+    suite_row = run_case(args, case, tmp_path / "logs", cooldown_stats)
+
+    assert suite_row["case_id"] == "toy_npu_seq64"
+    assert idle_calls == [
+        ("toy_npu_seq64", "turbostat"),
+        ("toy_npu_seq64", "turbostat"),
+    ]
+    assert sleep_calls == [15.0]
+    assert build_calls == [
+        {
+            "power_backend": "turbostat",
+            "idle_pkg_watt": "10.000000",
+            "idle_log_path": str(idle_log),
+        }
+    ]
+
+
+def test_resolve_power_backend_uses_mode_specific_defaults():
+    assert resolve_power_backend("auto", "cpu") == "powercap-rapl"
+    assert resolve_power_backend("auto", "npu") == "turbostat"
+    assert resolve_power_backend("auto", "igpu") == "rocm-smi"
+
+
+@pytest.mark.parametrize("invalid_backend", ["rocm-smi", "powercap-rapl", "turbostat"])
+def test_resolve_power_backend_rejects_explicit_tool_selection(invalid_backend):
+    with pytest.raises(ValueError, match="Unsupported power_backend"):
+        resolve_power_backend(invalid_backend, "cpu")
+
+
+def test_build_suite_row_uses_gfx_power_for_igpu_energy():
+    child_row = {
+        "study_id": "toy-model",
+        "seq_len": "64",
+        "num_threads": "8",
+        "dtype": "float16",
+        "num_samples": "1",
+        "runs_per_sample": "1",
+        "warmup_runs": "0",
+        "measured_inference_count": "1",
+        "timed_total_sec": "0.010000",
+        "throughput_inferences_per_sec": "100.000000",
+        "model_type": "bert",
+        "shape": "(1, 64, 768)",
+        "estimated_flops_per_inference": "1.000000e+09",
+        "throughput_flops_per_sec": "1.000000e+11",
+        "topology_id": "",
+        "parallel_seq": "",
+        "parallel_heads": "",
+        "parallel_ffn": "",
+        "min_latency_ms": "10.000000",
+        "avg_latency_ms": "10.000000",
+        "max_latency_ms": "10.000000",
+        "power_backend": "rocm-smi",
+        "power_sample_count": "2",
+        "power_window_sec": "0.020000",
+        "avg_pkg_watt": "",
+        "max_pkg_watt": "",
+        "avg_cor_watt": "",
+        "max_cor_watt": "",
+        "avg_gfx_watt": "20.000000",
+        "max_gfx_watt": "24.000000",
+        "avg_ram_watt": "",
+        "max_ram_watt": "",
+        "power_log": "toy_igpu_power.log",
+        "benchmark_csv": "toy_igpu.csv",
+    }
+    case = {"case_id": "toy_igpu_seq64", "mode": "igpu"}
+    cooldown_stats = {
+        "cooldown_wait_sec": 0.0,
+        "cooldown_start_temp_c": None,
+        "cooldown_end_temp_c": None,
+        "cooldown_temp_source": "",
+    }
+    idle_stats = empty_power_stats(
+        sample_count_key="idle_power_sample_count",
+        window_key="idle_power_window_sec",
+    )
+    idle_stats["idle_power_sample_count"] = 1
+    idle_stats["idle_power_window_sec"] = "0.010000"
+    idle_stats["avg_gfx_watt"] = "8.000000"
+
+    suite_row = build_suite_row(
+        child_row,
+        case,
+        cooldown_stats,
+        "rocm-smi",
+        idle_stats,
+        None,
+    )
+
+    assert suite_row["avg_pkg_watt"] == ""
+    assert suite_row["avg_gfx_watt"] == "20.000000"
+    assert suite_row["pseudo_device_avg_pkg_watt"] == "12.000000"
+    assert suite_row["estimated_gflops_per_watt_sec"] == "2.500000"
+    assert suite_row["pseudo_device_estimated_gflops_per_watt_sec"] == "4.166667"
+
+
+def test_build_suite_row_uses_pkg_power_for_npu_energy():
+    child_row = {
+        "study_id": "toy-model",
+        "seq_len": "64",
+        "num_threads": "8",
+        "dtype": "bfloat16",
+        "num_samples": "1",
+        "runs_per_sample": "1",
+        "warmup_runs": "0",
+        "measured_inference_count": "1",
+        "timed_total_sec": "0.020000",
+        "throughput_inferences_per_sec": "50.000000",
+        "model_type": "bert",
+        "shape": "(1, 64, 768)",
+        "estimated_flops_per_inference": "1.000000e+09",
+        "throughput_flops_per_sec": "5.000000e+10",
+        "topology_id": "2ps_4pffn",
+        "parallel_seq": "2",
+        "parallel_heads": "1",
+        "parallel_ffn": "4",
+        "min_latency_ms": "20.000000",
+        "avg_latency_ms": "20.000000",
+        "max_latency_ms": "20.000000",
+        "power_backend": "turbostat",
+        "power_sample_count": "2",
+        "power_window_sec": "0.020000",
+        "avg_pkg_watt": "18.000000",
+        "max_pkg_watt": "20.000000",
+        "avg_cor_watt": "",
+        "max_cor_watt": "",
+        "avg_gfx_watt": "",
+        "max_gfx_watt": "",
+        "avg_ram_watt": "",
+        "max_ram_watt": "",
+        "power_log": "toy_npu_power.log",
+        "benchmark_csv": "toy_npu.csv",
+    }
+    case = {"case_id": "toy_npu_seq64", "mode": "npu"}
+    cooldown_stats = {
+        "cooldown_wait_sec": 0.0,
+        "cooldown_start_temp_c": None,
+        "cooldown_end_temp_c": None,
+        "cooldown_temp_source": "",
+    }
+    idle_stats = empty_power_stats(
+        sample_count_key="idle_power_sample_count",
+        window_key="idle_power_window_sec",
+    )
+    idle_stats["idle_power_sample_count"] = 1
+    idle_stats["idle_power_window_sec"] = "0.010000"
+    idle_stats["avg_pkg_watt"] = "8.000000"
+
+    suite_row = build_suite_row(
+        child_row,
+        case,
+        cooldown_stats,
+        "turbostat",
+        idle_stats,
+        None,
+    )
+
+    assert suite_row["avg_pkg_watt"] == "18.000000"
+    assert suite_row["pseudo_device_avg_pkg_watt"] == "10.000000"
+    assert suite_row["pseudo_npu_avg_pkg_watt"] == "10.000000"
+    assert suite_row["estimated_gflops_per_watt_sec"] == "2.777778"
+    assert suite_row["pseudo_npu_estimated_gflops_per_watt_sec"] == "5.000000"
 
 
 def test_automated_benchmark_enumerate_cases_multi_study_skips_npu_unready():
@@ -618,6 +1139,184 @@ def test_automated_benchmark_enumerate_cases_multi_study_skips_npu_unready():
     assert skipped_ids == set()
 
 
+def test_automated_benchmark_enumerate_cases_include_supported_npu_seq_len_16384():
+    args = SimpleNamespace(
+        weights_file_path=str(WEIGHTS_FILE),
+        config_file_path=str(CONFIG_FILE),
+        study_id=None,
+        study_ids=None,
+        study_manifest=None,
+        models_root=None,
+        modes="npu",
+        seq_lens="64,16384",
+        cpu_thread_counts="1",
+        npu_num_threads=1,
+        igpu_num_threads=1,
+        npu_topology_policy="cache",
+        npu_candidate_topologies=None,
+    )
+
+    cases, skipped = enumerate_cases(args)
+    case_ids = {case["case_id"] for case in cases}
+    skipped_reasons = [reason for _, mode, reason in skipped if mode == "npu"]
+
+    assert "npu_seq64" in case_ids
+    assert "npu_seq16384" in case_ids
+    assert not any("seq_len=16384" in reason for reason in skipped_reasons)
+
+
+def test_parse_seq_len_int_overrides_accepts_long_seq_len_map():
+    overrides = parse_seq_len_int_overrides("2048=50,4096=15,8192=5")
+
+    assert overrides == {2048: 50, 4096: 15, 8192: 5}
+
+
+def test_case_command_applies_seq_len_run_overrides_by_seq_len(tmp_path):
+    args = SimpleNamespace(
+        num_samples=1,
+        warmup_runs=10,
+        runs_per_sample=100,
+        runs_per_sample_overrides={2048: 50, 4096: 15, 8192: 5},
+        study_manifest=None,
+        models_root=None,
+        npu_topology_policy="cache",
+        npu_topology_cache=str(tmp_path / "topology_cache.json"),
+        npu_autotune_warmup_runs=2,
+        npu_autotune_runs=5,
+        npu_autotune_runs_overrides={2048: 3, 4096: 2, 8192: 1},
+        npu_candidate_topologies=None,
+        igpu_dtype="float16",
+        igpu_device_index=0,
+        power_interval_sec=0.5,
+    )
+    case_1024 = {
+        "case_id": "npu_seq1024",
+        "study_id": "",
+        "mode": "npu",
+        "seq_len": 1024,
+        "num_threads": 12,
+        "weights_file_path": str(WEIGHTS_FILE),
+        "config_file_path": str(CONFIG_FILE),
+    }
+    case_2048 = {
+        **case_1024,
+        "case_id": "npu_seq2048",
+        "seq_len": 2048,
+    }
+    case_4096 = {
+        **case_1024,
+        "case_id": "npu_seq4096",
+        "seq_len": 4096,
+    }
+    case_8192 = {
+        **case_1024,
+        "case_id": "npu_seq8192",
+        "seq_len": 8192,
+    }
+
+    command_1024 = case_command(
+        args,
+        case_1024,
+        tmp_path / "1024.csv",
+        "auto",
+        tmp_path / "1024_power.log",
+    )
+    command_2048 = case_command(
+        args,
+        case_2048,
+        tmp_path / "2048.csv",
+        "auto",
+        tmp_path / "2048_power.log",
+    )
+    command_4096 = case_command(
+        args,
+        case_4096,
+        tmp_path / "4096.csv",
+        "auto",
+        tmp_path / "4096_power.log",
+    )
+    command_8192 = case_command(
+        args,
+        case_8192,
+        tmp_path / "8192.csv",
+        "auto",
+        tmp_path / "8192_power.log",
+    )
+
+    def value_for_flag(command, flag):
+        return command[command.index(flag) + 1]
+
+    assert value_for_flag(command_1024, "--runs-per-sample") == "100"
+    assert value_for_flag(command_2048, "--runs-per-sample") == "50"
+    assert value_for_flag(command_4096, "--runs-per-sample") == "15"
+    assert value_for_flag(command_8192, "--runs-per-sample") == "5"
+    assert value_for_flag(command_1024, "--autotune-runs") == "5"
+    assert value_for_flag(command_2048, "--autotune-runs") == "3"
+    assert value_for_flag(command_4096, "--autotune-runs") == "2"
+    assert value_for_flag(command_8192, "--autotune-runs") == "1"
+    assert value_for_flag(command_1024, "--power-backend") == "auto"
+    assert value_for_flag(command_1024, "--power-log-path").endswith("1024_power.log")
+
+
+def test_case_command_preserves_auto_power_backend_for_cpu(tmp_path):
+    args = SimpleNamespace(
+        num_samples=1,
+        warmup_runs=10,
+        runs_per_sample=100,
+        runs_per_sample_overrides={},
+        study_manifest=None,
+        models_root=None,
+        npu_topology_policy="cache",
+        npu_topology_cache=str(tmp_path / "topology_cache.json"),
+        npu_autotune_warmup_runs=2,
+        npu_autotune_runs=5,
+        npu_autotune_runs_overrides={},
+        npu_candidate_topologies=None,
+        igpu_dtype="float16",
+        igpu_device_index=0,
+        power_interval_sec=0.5,
+    )
+    case = {
+        "case_id": "cpu_seq1024_12t",
+        "study_id": "",
+        "mode": "cpu",
+        "seq_len": 1024,
+        "num_threads": 12,
+        "weights_file_path": str(WEIGHTS_FILE),
+        "config_file_path": str(CONFIG_FILE),
+    }
+
+    command = case_command(
+        args,
+        case,
+        tmp_path / "cpu.csv",
+        "auto",
+        tmp_path / "cpu_power.log",
+    )
+
+    def value_for_flag(flag):
+        return command[command.index(flag) + 1]
+
+    assert value_for_flag("--power-backend") == "auto"
+    assert value_for_flag("--power-log-path").endswith("cpu_power.log")
+
+
+@pytest.mark.parametrize("seq_len", [64, 16384], ids=["64", "16384"])
+def test_npu_case_skip_reason_accepts_supported_seq_len(seq_len):
+    args = SimpleNamespace(
+        study_manifest=None,
+        models_root=None,
+        npu_topology_policy="cache",
+        npu_candidate_topologies=None,
+    )
+    target = {
+        "study_id": "",
+        "config_file_path": str(CONFIG_FILE),
+    }
+
+    assert npu_case_skip_reason(args, target, seq_len) is None
+
+
 @pytest.mark.parametrize(
     "config_path",
     [
@@ -629,6 +1328,7 @@ def test_automated_benchmark_enumerate_cases_multi_study_skips_npu_unready():
 def test_large_model_npu_topologies_are_discoverable(config_path):
     seq64_config = load_encoder_pipeline_config(str(config_path), 64)
     seq128_config = load_encoder_pipeline_config(str(config_path), 128)
+    seq16384_config = load_encoder_pipeline_config(str(config_path), 16384)
 
     topo_ids_64 = {
         topology_id(topology)
@@ -638,10 +1338,15 @@ def test_large_model_npu_topologies_are_discoverable(config_path):
         topology_id(topology)
         for topology in supported_topologies_for_seq_len(seq128_config, 128)
     }
+    topo_ids_16384 = {
+        topology_id(topology)
+        for topology in supported_topologies_for_seq_len(seq16384_config, 16384)
+    }
 
     assert "1ps" in topo_ids_64
     assert "1ps_4ph" in topo_ids_64
     assert "4ps" in topo_ids_128
+    assert "4ps" in topo_ids_16384
 
 
 def test_topology_cache_is_shape_aware_for_large_models():

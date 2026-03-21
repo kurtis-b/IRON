@@ -11,6 +11,7 @@ DEFAULT_LOGS_DIR="$APP_DIR/logs/preflight"
 DEFAULT_TOPOLOGY_CACHE="$APP_DIR/npu_topology_cache_latest.json"
 DEFAULT_JOB_CONFIG="$APP_DIR/systemd/benchmark_job.json"
 EXPECTED_MLIR_AIE_VERSION_DEFAULT="0.0.1.2026031811+71fb44f147"
+POWERCAP_HELPER="$APP_DIR/read_powercap_rapl.py"
 
 PHASES=(
   "env"
@@ -33,7 +34,7 @@ IRONENV_PATH="$REPO_ROOT/ironenv"
 EXPECTED_MLIR_AIE_VERSION="$EXPECTED_MLIR_AIE_VERSION_DEFAULT"
 CPU_SMOKE_SEQ_LENS="64"
 NPU_SMOKE_SEQ_LENS="64,512"
-AUTOTUNE_SEQ_LENS="64,128,256,512,1024,2048,4096,8192,16384"
+AUTOTUNE_SEQ_LENS="64,128,256,512,1024,2048,4096,8192"
 SUITE_SEQ_LENS="64,512"
 SMOKE_NUM_SAMPLES="1"
 SMOKE_WARMUP_RUNS="0"
@@ -43,7 +44,7 @@ SUITE_WARMUP_RUNS="10"
 SUITE_RUNS_PER_SAMPLE="100"
 CPU_THREAD_COUNTS=""
 NPU_NUM_THREADS=""
-SUITE_POWER_BACKEND="turbostat"
+SUITE_POWER_BACKEND="auto"
 POWER_INTERVAL_SEC="0.5"
 NPU_IDLE_BASELINE_SEC="5.0"
 TOPOLOGY_CACHE="$DEFAULT_TOPOLOGY_CACHE"
@@ -81,7 +82,7 @@ Phases:
   --stop-after PHASE             Stop after phase. One of: ${PHASES[*]}
   --skip-download                Skip model download/cache check phase.
   --skip-autotune                Skip topology-cache warmup phase.
-  --skip-power-check             Skip sudo turbostat preflight.
+  --skip-power-check             Skip CPU/NPU power-backend preflight.
   --skip-suite                   Skip short supervised suite phase.
   --skip-job-print               Skip resolved job command print phase.
   --dry-run                      Print commands without executing them.
@@ -99,7 +100,7 @@ Benchmark knobs:
   --suite-runs-per-sample N      Default: $SUITE_RUNS_PER_SAMPLE
   --cpu-thread-counts CSV        Optional override for automated CPU suite.
   --npu-num-threads N            Optional override for NPU smokes and suite.
-  --suite-power-backend MODE     none|turbostat. Default: $SUITE_POWER_BACKEND
+  --suite-power-backend MODE     none|auto. Default: $SUITE_POWER_BACKEND
   --power-interval-sec SEC       Default: $POWER_INTERVAL_SEC
   --npu-idle-baseline-sec SEC    Default: $NPU_IDLE_BASELINE_SEC
   --topology-cache PATH          Default: $TOPOLOGY_CACHE
@@ -330,6 +331,9 @@ validate_args() {
     [[ -z "$STUDY_ID" || "$STUDY_ID" == "bert-base-uncased" ]] || \
       die "Use either explicit weights/config paths or --study-id, not both"
   fi
+
+  [[ "$SUITE_POWER_BACKEND" == "none" || "$SUITE_POWER_BACKEND" == "auto" ]] || \
+    die "--suite-power-backend must be one of: none, auto"
 }
 
 build_model_args() {
@@ -478,14 +482,25 @@ phase_autotune() {
 
 phase_power() {
   phase_banner "power"
-  local cmd=(
+  if [[ "$SUITE_POWER_BACKEND" == "none" ]]; then
+    log "Skipping power preflight because --suite-power-backend is none"
+    return
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run_cmd "$POWERCAP_HELPER" --check
+  elif ! "$POWERCAP_HELPER" --check; then
+    run_cmd sudo -n "$POWERCAP_HELPER" --check
+  fi
+
+  local turbostat_cmd=(
     sudo -n turbostat --Summary --quiet
     --show PkgWatt,CorWatt,GFXWatt,RAMWatt
     --interval "$POWER_INTERVAL_SEC"
     --num_iterations 2
     sleep 1
   )
-  run_cmd "${cmd[@]}"
+  run_cmd "${turbostat_cmd[@]}"
 }
 
 phase_suite() {

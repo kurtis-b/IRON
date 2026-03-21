@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import importlib.util
 import json
 import sys
 import time
@@ -21,6 +22,14 @@ from benchmark_common import (
     summarize_latency_measurements,
     write_results_csv,
 )
+from benchmark_power import (
+    add_power_measurement_args,
+    create_power_monitor,
+    derive_power_log_path,
+    empty_power_stats,
+    format_power_stats_for_csv,
+    resolve_power_backend,
+)
 from model_support import (
     canonicalize_app_config_dict,
     canonicalize_local_backbone_weights,
@@ -32,6 +41,29 @@ from model_support import (
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
+_TOPOLOGY_PLACEMENTS = None
+
+
+def load_encoder_pipeline_topology_placements():
+    global _TOPOLOGY_PLACEMENTS
+    if _TOPOLOGY_PLACEMENTS is not None:
+        return _TOPOLOGY_PLACEMENTS
+
+    placements_path = (
+        REPO_ROOT / "iron" / "operators" / "encoder_pipeline" / "placements.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_iron_encoder_pipeline_placements",
+        placements_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(
+            f"Could not load encoder_pipeline placements from {placements_path}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _TOPOLOGY_PLACEMENTS = module.TOPOLOGY_PLACEMENTS
+    return _TOPOLOGY_PLACEMENTS
 
 
 def parse_args():
@@ -144,6 +176,7 @@ def parse_args():
         default=5,
         help="Timed runs per candidate topology during autotune.",
     )
+    add_power_measurement_args(parser)
     add_cooldown_args(parser)
     return parser.parse_args()
 
@@ -312,12 +345,11 @@ def topology_cache_key(config, seq_len):
 
 
 def supported_topologies_for_seq_len(config, seq_len, candidate_ids=None):
-    from iron.operators.encoder_pipeline.placements import TOPOLOGY_PLACEMENTS
-
+    topology_placements = load_encoder_pipeline_topology_placements()
     current = current_topology_from_config(config)
     d = config.model_config.hidden_size // config.model_config.num_attention_heads
     matches = []
-    for key in TOPOLOGY_PLACEMENTS:
+    for key in topology_placements:
         if (
             key[0] == config.model_config.num_attention_heads
             and key[1] == seq_len
@@ -426,6 +458,9 @@ def benchmark_with_config(
     warmup_runs,
     runs_per_sample,
     topology,
+    power_backend="none",
+    power_interval_sec=0.5,
+    power_log_path=None,
 ):
     import torch
 
@@ -451,16 +486,21 @@ def benchmark_with_config(
                 )
 
         latencies_ms = []
-        for sample in encoded_samples:
-            for _ in range(runs_per_sample):
-                start = time.perf_counter()
-                output = model(
-                    input_ids=sample["input_ids"],
-                    token_type_ids=sample["token_type_ids"],
-                    attention_mask=None,
-                )
-                end = time.perf_counter()
-                latencies_ms.append((end - start) * 1000.0)
+        with create_power_monitor(
+            power_backend,
+            power_interval_sec,
+            log_path=power_log_path,
+        ) as power_monitor:
+            for sample in encoded_samples:
+                for _ in range(runs_per_sample):
+                    start = time.perf_counter()
+                    output = model(
+                        input_ids=sample["input_ids"],
+                        token_type_ids=sample["token_type_ids"],
+                        attention_mask=None,
+                    )
+                    end = time.perf_counter()
+                    latencies_ms.append((end - start) * 1000.0)
 
     context.device_manager.reset()
     latency_stats = summarize_latency_measurements(
@@ -477,6 +517,7 @@ def benchmark_with_config(
         "parallel_seq": topology["parallel_seq"],
         "parallel_heads": topology["parallel_heads"],
         "parallel_ffn": topology["parallel_ffn"],
+        "power_stats": power_monitor.stats,
         **latency_stats,
     }
 
@@ -593,6 +634,8 @@ def main():
     torch.set_num_interop_threads(1)
 
     texts = build_benchmark_texts(args.num_samples)
+    power_backend = resolve_power_backend(args.power_backend, "npu")
+    multi_case = len(seq_lens) > 1
 
     print(f"Using host CPU threads: {num_threads}", flush=True)
     print(f"torch intra-op threads: {torch.get_num_threads()}", flush=True)
@@ -622,6 +665,14 @@ def main():
         )
         config = load_encoder_pipeline_config(config_file_path, seq_len)
         apply_topology_to_config(config, topology)
+        power_log_path = (
+            derive_power_log_path(
+                args.power_log_path,
+                f"seq{seq_len}" if multi_case else None,
+            )
+            if power_backend != "none"
+            else None
+        )
         result = benchmark_with_config(
             weights_file_path=weights_file_path,
             config=config,
@@ -630,6 +681,9 @@ def main():
             warmup_runs=args.warmup_runs,
             runs_per_sample=args.runs_per_sample,
             topology=topology,
+            power_backend=power_backend,
+            power_interval_sec=args.power_interval_sec,
+            power_log_path=power_log_path,
         )
         print(
             f"seq_len={seq_len:<5d} topology={result['topology_id']:<10s} "
@@ -668,6 +722,11 @@ def main():
                 "min_latency_ms": f"{result['min_latency_ms']:.6f}",
                 "avg_latency_ms": f"{result['avg_latency_ms']:.6f}",
                 "max_latency_ms": f"{result['max_latency_ms']:.6f}",
+                **format_power_stats_for_csv(
+                    power_backend,
+                    result.get("power_stats", empty_power_stats()),
+                    power_log_path,
+                ),
             }
         )
         write_results_csv(args.output_csv, csv_rows)

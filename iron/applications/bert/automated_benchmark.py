@@ -5,8 +5,6 @@
 import argparse
 import csv
 import json
-import os
-import re
 import shlex
 import subprocess
 import sys
@@ -22,9 +20,20 @@ from benchmark_common import (
     detect_physical_core_count,
     parse_seq_lens,
 )
-from model_support import load_study_manifest
+from benchmark_power import (
+    empty_power_stats,
+    format_power_stats_for_csv,
+    measure_power_for_duration,
+    power_stats_from_row,
+    resolve_power_backend,
+    effective_device_watt,
+)
+from model_support import load_study_manifest, resolve_study_paths
 
 SCRIPT_DIR = Path(__file__).parent
+DEFAULT_RUNS_PER_SAMPLE_OVERRIDES = "2048=50,4096=15,8192=5"
+DEFAULT_NPU_AUTOTUNE_RUNS_OVERRIDES = "2048=3,4096=2,8192=1"
+TRANSIENT_NPU_STARTUP_RETRY_DELAYS_SEC = (15.0, 30.0, 60.0, 120.0)
 SUITE_FIELDNAMES = [
     "case_id",
     "study_id",
@@ -135,6 +144,15 @@ def parse_args():
     parser.add_argument("--warmup-runs", type=int, default=10)
     parser.add_argument("--runs-per-sample", type=int, default=100)
     parser.add_argument(
+        "--runs-per-sample-overrides",
+        type=str,
+        default=DEFAULT_RUNS_PER_SAMPLE_OVERRIDES,
+        help=(
+            "Optional comma-separated seq_len=runs overrides applied on top of "
+            "--runs-per-sample. Use an empty string to disable overrides."
+        ),
+    )
+    parser.add_argument(
         "--cpu-thread-counts",
         type=str,
         default=None,
@@ -186,12 +204,22 @@ def parse_args():
     parser.add_argument("--npu-autotune-warmup-runs", type=int, default=2)
     parser.add_argument("--npu-autotune-runs", type=int, default=5)
     parser.add_argument(
+        "--npu-autotune-runs-overrides",
+        type=str,
+        default=DEFAULT_NPU_AUTOTUNE_RUNS_OVERRIDES,
+        help=(
+            "Optional comma-separated seq_len=runs overrides applied on top of "
+            "--npu-autotune-runs. Use an empty string to disable overrides."
+        ),
+    )
+    parser.add_argument(
         "--power-backend",
-        choices=("none", "auto", "turbostat", "rocm-smi"),
+        choices=("none", "auto"),
         default="auto",
         help=(
-            "Per-case power measurement backend. auto uses turbostat for cpu/npu "
-            "and rocm-smi for igpu. turbostat requires privileged access."
+            "Per-case power measurement backend. auto uses powercap-rapl for cpu, "
+            "turbostat for npu, and rocm-smi for igpu. powercap-rapl and turbostat "
+            "may require elevated access."
         ),
     )
     parser.add_argument("--power-interval-sec", type=float, default=0.5)
@@ -226,7 +254,14 @@ def parse_args():
         default="logs/automated_benchmark",
     )
     add_cooldown_args(parser)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.runs_per_sample_overrides = parse_seq_len_int_overrides(
+        args.runs_per_sample_overrides
+    )
+    args.npu_autotune_runs_overrides = parse_seq_len_int_overrides(
+        args.npu_autotune_runs_overrides
+    )
+    return args
 
 
 def parse_modes(raw_modes):
@@ -264,6 +299,52 @@ def parse_thread_counts(raw_thread_counts):
     if not parsed:
         raise ValueError("At least one CPU thread count must be provided")
     return parsed
+
+
+def parse_seq_len_int_overrides(raw_overrides):
+    if raw_overrides is None:
+        return {}
+
+    overrides = {}
+    for token in raw_overrides.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "=" not in token:
+            raise ValueError(
+                "runs_per_sample overrides must use seq_len=runs entries "
+                f"(got {token!r})"
+            )
+        seq_len_token, runs_token = token.split("=", 1)
+        try:
+            seq_len = int(seq_len_token)
+            runs_per_sample = int(runs_token)
+        except ValueError as exc:
+            raise ValueError(
+                "runs_per_sample overrides must use integer seq_len=runs entries "
+                f"(got {token!r})"
+            ) from exc
+        if seq_len <= 0 or runs_per_sample <= 0:
+            raise ValueError(
+                "runs_per_sample overrides must use positive integers "
+                f"(got {token!r})"
+            )
+        overrides[seq_len] = runs_per_sample
+    return overrides
+
+
+def resolve_seq_len_override(default_value, overrides, seq_len):
+    return overrides.get(seq_len, default_value)
+
+
+def resolve_runs_per_sample(args, seq_len):
+    overrides = getattr(args, "runs_per_sample_overrides", {})
+    return resolve_seq_len_override(args.runs_per_sample, overrides, seq_len)
+
+
+def resolve_npu_autotune_runs(args, seq_len):
+    overrides = getattr(args, "npu_autotune_runs_overrides", {})
+    return resolve_seq_len_override(args.npu_autotune_runs, overrides, seq_len)
 
 
 def topology_suffix(case):
@@ -341,6 +422,55 @@ def resolve_model_targets(args):
     ]
 
 
+def resolve_target_config_path(args, target):
+    config_file_path = target.get("config_file_path")
+    if config_file_path:
+        return str(Path(config_file_path).resolve())
+    if target.get("study_id"):
+        resolved = resolve_study_paths(
+            target["study_id"],
+            manifest_path=args.study_manifest,
+            models_root=args.models_root,
+        )
+        return resolved["config_file_path"]
+    raise ValueError("Target does not provide a resolvable config_file_path")
+
+
+def npu_case_skip_reason(args, target, seq_len):
+    from npu_inference import (
+        current_topology_from_config,
+        load_encoder_pipeline_config,
+        parse_candidate_topology_ids,
+        supported_topologies_for_seq_len,
+        topology_id,
+        topology_signature,
+    )
+
+    config_file_path = resolve_target_config_path(args, target)
+    config = load_encoder_pipeline_config(config_file_path, seq_len)
+    candidate_ids = parse_candidate_topology_ids(
+        getattr(args, "npu_candidate_topologies", None)
+    )
+    try:
+        supported = supported_topologies_for_seq_len(
+            config,
+            seq_len,
+            candidate_ids=candidate_ids,
+        )
+    except RuntimeError as exc:
+        return str(exc)
+
+    if getattr(args, "npu_topology_policy", "cache") == "fixed":
+        current_topology = current_topology_from_config(config)
+        supported_signatures = {topology_signature(topology) for topology in supported}
+        if topology_signature(current_topology) not in supported_signatures:
+            return (
+                f"Fixed topology {topology_id(current_topology)} is not supported "
+                f"for seq_len={seq_len}"
+            )
+    return None
+
+
 def enumerate_cases(args):
     seq_lens = parse_seq_lens(args.seq_lens)
     modes = parse_modes(args.modes)
@@ -389,6 +519,16 @@ def enumerate_cases(args):
                 )
             else:
                 for seq_len in seq_lens:
+                    skip_reason = npu_case_skip_reason(args, target, seq_len)
+                    if skip_reason is not None:
+                        skipped.append(
+                            (
+                                target["study_id"] or "<explicit-path-model>",
+                                "npu",
+                                skip_reason,
+                            )
+                        )
+                        continue
                     cases.append(
                         {
                             "case_id": f"{study_prefix}npu_seq{seq_len}",
@@ -449,292 +589,33 @@ def parse_child_row(csv_path):
     return rows[0]
 
 
-def parse_power_log(log_path):
-    if not Path(log_path).exists():
-        raise RuntimeError(f"Missing power log: {log_path}")
-
-    duration_sec = None
-    header = None
-    samples = []
-    with open(log_path, "r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line:
-                continue
-            if duration_sec is None and line.endswith(" sec"):
-                try:
-                    duration_sec = float(line.split()[0])
-                except (IndexError, ValueError):
-                    duration_sec = None
-                continue
-            if "PkgWatt" in line.split():
-                header = line.split()
-                continue
-            if header is None:
-                continue
-            parts = line.split()
-            if len(parts) != len(header):
-                continue
-            sample = {}
-            all_zero = True
-            for name, value in zip(header, parts):
-                try:
-                    sample[name] = float(value)
-                    if sample[name] != 0.0:
-                        all_zero = False
-                except ValueError:
-                    sample[name] = None
-                    all_zero = False
-            if all_zero:
-                continue
-            samples.append(sample)
-
-    stats = {
-        "power_sample_count": len(samples),
-        "power_window_sec": (f"{duration_sec:.6f}" if duration_sec is not None else ""),
-        "avg_pkg_watt": "",
-        "max_pkg_watt": "",
-        "avg_cor_watt": "",
-        "max_cor_watt": "",
-        "avg_gfx_watt": "",
-        "max_gfx_watt": "",
-        "avg_ram_watt": "",
-        "max_ram_watt": "",
-    }
-    if not samples:
-        return stats
-
-    def summarize(column, avg_key, max_key):
-        values = [
-            sample[column] for sample in samples if sample.get(column) is not None
-        ]
-        if not values:
-            return
-        stats[avg_key] = f"{sum(values) / len(values):.6f}"
-        stats[max_key] = f"{max(values):.6f}"
-
-    summarize("PkgWatt", "avg_pkg_watt", "max_pkg_watt")
-    summarize("CorWatt", "avg_cor_watt", "max_cor_watt")
-    summarize("GFXWatt", "avg_gfx_watt", "max_gfx_watt")
-    summarize("RAMWatt", "avg_ram_watt", "max_ram_watt")
-    return stats
-
-
-def parse_turbostat_log(log_path):
-    return parse_power_log(log_path)
-
-
-def empty_power_stats(
-    sample_count_key="power_sample_count",
-    window_key="power_window_sec",
-):
-    return {
-        sample_count_key: 0,
-        window_key: "",
-        "avg_pkg_watt": "",
-        "max_pkg_watt": "",
-        "avg_cor_watt": "",
-        "max_cor_watt": "",
-        "avg_gfx_watt": "",
-        "max_gfx_watt": "",
-        "avg_ram_watt": "",
-        "max_ram_watt": "",
-    }
-
-
-def wrap_command_with_xrt_setup(command):
-    xrt_root = Path(os.environ.get("XILINX_XRT", "/opt/xilinx/xrt"))
-    xrt_setup = xrt_root / "setup.sh"
-    quoted_command = " ".join(shlex.quote(part) for part in command)
-    shell_parts = []
-    if xrt_setup.exists():
-        shell_parts.append(f". {shlex.quote(str(xrt_setup))} >/dev/null 2>&1")
-    shell_parts.append(f"exec {quoted_command}")
-    return ["/bin/bash", "-lc", " && ".join(shell_parts)]
-
-
-def wrap_command_for_case(case, command):
-    if case["mode"] == "npu":
-        return wrap_command_with_xrt_setup(command)
-    return command
-
-
 def needs_idle_baseline(case):
     return case["mode"] in ("npu", "igpu")
 
 
-def resolve_power_backend(args, case):
-    if args.power_backend == "auto":
-        return "rocm-smi" if case["mode"] == "igpu" else "turbostat"
-    if args.power_backend == "rocm-smi" and case["mode"] != "igpu":
-        raise ValueError(
-            "power_backend=rocm-smi is only supported for igpu cases; use "
-            "power_backend=auto for mixed cpu/npu/igpu suites"
-        )
-    return args.power_backend
-
-
-def _extract_power_value(raw_value):
-    if raw_value is None:
-        return None
-    if isinstance(raw_value, (int, float)):
-        return float(raw_value)
-    match = re.search(r"[-+]?\d+(?:\.\d+)?", str(raw_value))
-    if match is None:
-        return None
-    return float(match.group(0))
-
-
-def read_rocm_smi_power(device_index):
-    result = subprocess.run(
-        ["rocm-smi", "--showpower", "--json"],
-        cwd=SCRIPT_DIR,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            "rocm-smi power query failed\n"
-            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-        )
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"Failed to parse rocm-smi JSON power output: {exc}\n"
-            f"STDOUT:\n{result.stdout}"
-        ) from exc
-
-    card_key = f"card{device_index}"
-    card_data = payload.get(card_key)
-    if card_data is None and device_index == 0:
-        card_entries = [
-            (key, value)
-            for key, value in payload.items()
-            if re.fullmatch(r"card\d+", key)
-        ]
-        if len(card_entries) == 1:
-            _, card_data = card_entries[0]
-    if not isinstance(card_data, dict):
-        raise RuntimeError(
-            f"rocm-smi JSON output did not include power data for device index "
-            f"{device_index}: keys={sorted(payload.keys())}"
-        )
-
-    for key, raw_value in card_data.items():
-        if "power" not in key.lower():
-            continue
-        power_value = _extract_power_value(raw_value)
-        if power_value is not None:
-            return power_value
-    raise RuntimeError(
-        f"rocm-smi JSON output did not include a usable power reading for {card_key}: "
-        f"{card_data}"
-    )
-
-
-def write_rocm_smi_log(log_path, duration_sec, samples):
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write(f"{duration_sec:.6f} sec\n")
-        f.write("GFXWatt\tPkgWatt\n")
-        for sample in samples:
-            f.write(f"{sample:.6f}\t{sample:.6f}\n")
-
-
-def collect_rocm_smi_samples(duration_sec, interval_sec, device_index):
-    samples = []
-    start = time.perf_counter()
-    deadline = start + max(0.0, duration_sec)
-    next_sample_at = start
-    while True:
-        now = time.perf_counter()
-        if now >= deadline and samples:
-            break
-        if now >= next_sample_at:
-            samples.append(read_rocm_smi_power(device_index))
-            next_sample_at = now + max(interval_sec, 0.05)
-            continue
-        time.sleep(min(next_sample_at - now, deadline - now))
-    return samples, time.perf_counter() - start
-
-
-def run_command_with_rocm_smi_logging(command, log_path, interval_sec, device_index):
-    process = subprocess.Popen(
-        command,
-        cwd=SCRIPT_DIR,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    samples = []
-    start = time.perf_counter()
-    next_sample_at = start
-    try:
-        while True:
-            now = time.perf_counter()
-            if not samples or now >= next_sample_at:
-                samples.append(read_rocm_smi_power(device_index))
-                next_sample_at = now + max(interval_sec, 0.05)
-                if process.poll() is not None:
-                    break
-                continue
-            if process.poll() is not None:
-                break
-            time.sleep(min(next_sample_at - now, 0.1))
-        stdout, stderr = process.communicate()
-    except Exception:
-        process.kill()
-        process.communicate()
-        raise
-
-    duration_sec = time.perf_counter() - start
-    write_rocm_smi_log(log_path, duration_sec, samples)
-    return process.returncode, stdout, stderr
-
-
 def measure_idle_power(args, case, logs_dir, power_backend):
     idle_log_path = logs_dir / f"{case['case_id']}_idle_power.log"
-    if power_backend == "turbostat":
-        wrapped = [
-            "sudo",
-            "-n",
-            "turbostat",
-            "--quiet",
-            "--show",
-            "PkgWatt,CorWatt,GFXWatt,RAMWatt",
-            "--interval",
-            str(args.power_interval_sec),
-            "--out",
-            str(idle_log_path),
-            "sleep",
-            str(args.npu_idle_baseline_sec),
-        ]
-        result = subprocess.run(
-            wrapped,
-            cwd=SCRIPT_DIR,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Idle power measurement failed for {case['case_id']}\n"
-                f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-            )
-    elif power_backend == "rocm-smi":
-        samples, duration_sec = collect_rocm_smi_samples(
-            duration_sec=args.npu_idle_baseline_sec,
-            interval_sec=args.power_interval_sec,
-            device_index=args.igpu_device_index,
-        )
-        write_rocm_smi_log(idle_log_path, duration_sec, samples)
-    else:
-        raise ValueError(f"Unsupported idle power backend: {power_backend}")
-
-    idle_stats = parse_power_log(idle_log_path)
-    idle_stats["idle_power_sample_count"] = idle_stats.pop("power_sample_count")
-    idle_stats["idle_power_window_sec"] = idle_stats.pop("power_window_sec")
+    stats = measure_power_for_duration(
+        power_backend,
+        args.npu_idle_baseline_sec,
+        args.power_interval_sec,
+        device_index=args.igpu_device_index,
+        log_path=idle_log_path,
+    )
+    idle_stats = empty_power_stats(
+        sample_count_key="idle_power_sample_count",
+        window_key="idle_power_window_sec",
+    )
+    idle_stats["idle_power_sample_count"] = stats["power_sample_count"]
+    idle_stats["idle_power_window_sec"] = stats["power_window_sec"]
+    idle_stats["avg_pkg_watt"] = stats["avg_pkg_watt"]
+    idle_stats["max_pkg_watt"] = stats["max_pkg_watt"]
+    idle_stats["avg_cor_watt"] = stats["avg_cor_watt"]
+    idle_stats["max_cor_watt"] = stats["max_cor_watt"]
+    idle_stats["avg_gfx_watt"] = stats["avg_gfx_watt"]
+    idle_stats["max_gfx_watt"] = stats["max_gfx_watt"]
+    idle_stats["avg_ram_watt"] = stats["avg_ram_watt"]
+    idle_stats["max_ram_watt"] = stats["max_ram_watt"]
     return idle_stats, idle_log_path
 
 
@@ -760,167 +641,44 @@ def divide_optional(numerator, denominator, fmt=".6f", scale=1.0):
     return format((float(numerator) / denominator_value) * scale, fmt)
 
 
-def case_command(args, case, benchmark_csv_path):
-    script_name = {
-        "cpu": "cpu_inference.py",
-        "npu": "npu_inference.py",
-        "igpu": "igpu_inference.py",
-    }[case["mode"]]
-    base = [
-        sys.executable,
-        str(SCRIPT_DIR / script_name),
-        "--seq-lens",
-        str(case["seq_len"]),
-        "--num-samples",
-        str(args.num_samples),
-        "--warmup-runs",
-        str(args.warmup_runs),
-        "--runs-per-sample",
-        str(args.runs_per_sample),
-        "--output-csv",
-        str(benchmark_csv_path),
-        "--num-threads",
-        str(case["num_threads"]),
-    ]
-    if case.get("study_id"):
-        base.extend(["--study-id", case["study_id"]])
-        if args.study_manifest is not None:
-            base.extend(["--study-manifest", str(Path(args.study_manifest).resolve())])
-        if args.models_root is not None:
-            base.extend(["--models-root", str(Path(args.models_root).resolve())])
-    else:
-        if (
-            case.get("weights_file_path") is None
-            or case.get("config_file_path") is None
-        ):
-            raise ValueError(
-                "Either pass weights_file_path and config_file_path, or use --study-id"
-            )
-        base[2:2] = [
-            str(Path(case["weights_file_path"]).resolve()),
-            str(Path(case["config_file_path"]).resolve()),
-        ]
-    if case["mode"] == "npu":
-        base.extend(
-            [
-                "--topology-policy",
-                args.npu_topology_policy,
-                "--topology-cache",
-                str(Path(args.npu_topology_cache).resolve()),
-                "--autotune-warmup-runs",
-                str(args.npu_autotune_warmup_runs),
-                "--autotune-runs",
-                str(args.npu_autotune_runs),
-            ]
-        )
-        if args.npu_candidate_topologies:
-            base.extend(["--candidate-topologies", args.npu_candidate_topologies])
-    if case["mode"] == "igpu":
-        base.extend(
-            [
-                "--dtype",
-                args.igpu_dtype,
-                "--device-index",
-                str(args.igpu_device_index),
-            ]
-        )
-    return base
+def child_power_log_path(child_row, fallback_path):
+    child_path = child_row.get("power_log", "")
+    if child_path:
+        return child_path
+    return str(fallback_path) if fallback_path is not None else ""
 
 
-def run_case(args, case, logs_dir, cooldown_stats):
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    benchmark_csv_path = logs_dir / f"{case['case_id']}.csv"
-    power_log_path = logs_dir / f"{case['case_id']}_power.log"
-    idle_log_path = None
-    command = case_command(args, case, benchmark_csv_path)
-    power_backend = resolve_power_backend(args, case)
-    print(
-        f"Running case {case['case_id']}: {' '.join(shlex.quote(part) for part in command)}",
-        flush=True,
-    )
+def is_transient_npu_startup_failure(case, result):
+    if case["mode"] != "npu":
+        return False
+    combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    if "Resource temporarily unavailable" not in combined_output:
+        return False
+    return "pyxrt.device(0)" in combined_output or "mmap(" in combined_output
 
-    idle_stats = empty_power_stats(
-        sample_count_key="idle_power_sample_count",
-        window_key="idle_power_window_sec",
-    )
-    if power_backend != "none" and needs_idle_baseline(case):
-        idle_stats, idle_log_path = measure_idle_power(
-            args, case, logs_dir, power_backend
-        )
 
-    if power_backend == "turbostat":
-        wrapped_command = wrap_command_for_case(case, command)
-        wrapped = [
-            "sudo",
-            "-n",
-            "turbostat",
-            "--quiet",
-            "--show",
-            "PkgWatt,CorWatt,GFXWatt,RAMWatt",
-            "--interval",
-            str(args.power_interval_sec),
-            "--out",
-            str(power_log_path),
-            *wrapped_command,
-        ]
-        result = subprocess.run(
-            wrapped,
-            cwd=SCRIPT_DIR,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Power-logged benchmark failed for {case['case_id']}\n"
-                f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-            )
-        power_stats = parse_power_log(power_log_path)
-    elif power_backend == "rocm-smi":
-        wrapped_command = wrap_command_for_case(case, command)
-        returncode, stdout, stderr = run_command_with_rocm_smi_logging(
-            wrapped_command,
-            power_log_path,
-            args.power_interval_sec,
-            args.igpu_device_index,
-        )
-        if returncode != 0:
-            raise RuntimeError(
-                f"Power-logged benchmark failed for {case['case_id']}\n"
-                f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-            )
-        power_stats = parse_power_log(power_log_path)
-    else:
-        result = subprocess.run(
-            command,
-            cwd=SCRIPT_DIR,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Benchmark failed for {case['case_id']}\n"
-                f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-            )
-        power_stats = (
-            parse_power_log(power_log_path)
-            if power_log_path.exists()
-            else empty_power_stats()
-        )
+def clear_case_artifacts(benchmark_csv_path, power_log_path, idle_log_path):
+    for path in (benchmark_csv_path, power_log_path, idle_log_path):
+        if path is None:
+            continue
+        Path(path).unlink(missing_ok=True)
 
-    child_row = parse_child_row(benchmark_csv_path)
+
+def build_suite_row(
+    child_row, case, cooldown_stats, power_backend, idle_stats, idle_log_path
+):
+    power_stats = power_stats_from_row(child_row)
+    active_avg_watt = effective_device_watt(power_stats, case["mode"], "avg")
+    active_max_watt = effective_device_watt(power_stats, case["mode"], "max")
+    idle_avg_watt = effective_device_watt(idle_stats, case["mode"], "avg")
+
     pseudo_device_avg_pkg_watt = ""
     pseudo_device_max_pkg_watt = ""
     pseudo_npu_avg_pkg_watt = ""
     pseudo_npu_max_pkg_watt = ""
     if needs_idle_baseline(case):
-        pseudo_device_avg_pkg_watt = subtract_idle(
-            power_stats["avg_pkg_watt"], idle_stats["avg_pkg_watt"]
-        )
-        pseudo_device_max_pkg_watt = subtract_idle(
-            power_stats["max_pkg_watt"], idle_stats["avg_pkg_watt"]
-        )
+        pseudo_device_avg_pkg_watt = subtract_idle(active_avg_watt, idle_avg_watt)
+        pseudo_device_max_pkg_watt = subtract_idle(active_max_watt, idle_avg_watt)
     if case["mode"] == "npu":
         pseudo_npu_avg_pkg_watt = pseudo_device_avg_pkg_watt
         pseudo_npu_max_pkg_watt = pseudo_device_max_pkg_watt
@@ -929,8 +687,8 @@ def run_case(args, case, logs_dir, cooldown_stats):
         child_row.get("estimated_flops_per_inference", ""),
         child_row.get("measured_inference_count", ""),
     )
-    package_energy_joules = multiply_optional(
-        power_stats["avg_pkg_watt"],
+    active_energy_joules = multiply_optional(
+        active_avg_watt,
         power_stats["power_window_sec"],
     )
     pseudo_device_energy_joules = multiply_optional(
@@ -939,7 +697,7 @@ def run_case(args, case, logs_dir, cooldown_stats):
     )
     estimated_gflops_per_watt_sec = divide_optional(
         estimated_total_timed_flops,
-        package_energy_joules,
+        active_energy_joules,
         scale=1e-9,
     )
     pseudo_device_estimated_gflops_per_watt_sec = divide_optional(
@@ -950,7 +708,8 @@ def run_case(args, case, logs_dir, cooldown_stats):
     pseudo_npu_estimated_gflops_per_watt_sec = (
         pseudo_device_estimated_gflops_per_watt_sec if case["mode"] == "npu" else ""
     )
-    suite_row = {
+
+    return {
         "case_id": case["case_id"],
         "study_id": child_row.get("study_id", case.get("study_id", "")),
         "mode": case["mode"],
@@ -990,23 +749,17 @@ def run_case(args, case, logs_dir, cooldown_stats):
             else ""
         ),
         "cooldown_temp_source": cooldown_stats["cooldown_temp_source"],
-        "power_backend": power_backend,
-        "power_sample_count": power_stats["power_sample_count"],
-        "power_window_sec": power_stats["power_window_sec"],
+        **format_power_stats_for_csv(
+            child_row.get("power_backend", power_backend),
+            power_stats,
+            child_power_log_path(child_row, None),
+        ),
         "idle_power_sample_count": idle_stats["idle_power_sample_count"],
         "idle_power_window_sec": idle_stats["idle_power_window_sec"],
         "idle_pkg_watt": idle_stats["avg_pkg_watt"],
         "idle_cor_watt": idle_stats["avg_cor_watt"],
         "idle_gfx_watt": idle_stats["avg_gfx_watt"],
         "idle_ram_watt": idle_stats["avg_ram_watt"],
-        "avg_pkg_watt": power_stats["avg_pkg_watt"],
-        "max_pkg_watt": power_stats["max_pkg_watt"],
-        "avg_cor_watt": power_stats["avg_cor_watt"],
-        "max_cor_watt": power_stats["max_cor_watt"],
-        "avg_gfx_watt": power_stats["avg_gfx_watt"],
-        "max_gfx_watt": power_stats["max_gfx_watt"],
-        "avg_ram_watt": power_stats["avg_ram_watt"],
-        "max_ram_watt": power_stats["max_ram_watt"],
         "pseudo_device_avg_pkg_watt": pseudo_device_avg_pkg_watt,
         "pseudo_device_max_pkg_watt": pseudo_device_max_pkg_watt,
         "pseudo_npu_avg_pkg_watt": pseudo_npu_avg_pkg_watt,
@@ -1020,10 +773,180 @@ def run_case(args, case, logs_dir, cooldown_stats):
             pseudo_npu_estimated_gflops_per_watt_sec
         ),
         "idle_power_log": str(idle_log_path) if idle_log_path is not None else "",
-        "power_log": str(power_log_path) if power_log_path.exists() else "",
-        "benchmark_csv": str(benchmark_csv_path),
+        "benchmark_csv": child_row.get("benchmark_csv", ""),
     }
-    return suite_row
+
+
+def case_command(
+    args,
+    case,
+    benchmark_csv_path,
+    requested_power_backend,
+    power_log_path,
+):
+    runs_per_sample = resolve_runs_per_sample(args, case["seq_len"])
+    npu_autotune_runs = resolve_npu_autotune_runs(args, case["seq_len"])
+    script_name = {
+        "cpu": "cpu_inference.py",
+        "npu": "npu_inference.py",
+        "igpu": "igpu_inference.py",
+    }[case["mode"]]
+    base = [
+        sys.executable,
+        str(SCRIPT_DIR / script_name),
+        "--seq-lens",
+        str(case["seq_len"]),
+        "--num-samples",
+        str(args.num_samples),
+        "--warmup-runs",
+        str(args.warmup_runs),
+        "--runs-per-sample",
+        str(runs_per_sample),
+        "--output-csv",
+        str(benchmark_csv_path),
+        "--num-threads",
+        str(case["num_threads"]),
+    ]
+    if case.get("study_id"):
+        base.extend(["--study-id", case["study_id"]])
+        if args.study_manifest is not None:
+            base.extend(["--study-manifest", str(Path(args.study_manifest).resolve())])
+        if args.models_root is not None:
+            base.extend(["--models-root", str(Path(args.models_root).resolve())])
+    else:
+        if (
+            case.get("weights_file_path") is None
+            or case.get("config_file_path") is None
+        ):
+            raise ValueError(
+                "Either pass weights_file_path and config_file_path, or use --study-id"
+            )
+        base[2:2] = [
+            str(Path(case["weights_file_path"]).resolve()),
+            str(Path(case["config_file_path"]).resolve()),
+        ]
+    if case["mode"] == "npu":
+        base.extend(
+            [
+                "--topology-policy",
+                args.npu_topology_policy,
+                "--topology-cache",
+                str(Path(args.npu_topology_cache).resolve()),
+                "--autotune-warmup-runs",
+                str(args.npu_autotune_warmup_runs),
+                "--autotune-runs",
+                str(npu_autotune_runs),
+            ]
+        )
+        if args.npu_candidate_topologies:
+            base.extend(["--candidate-topologies", args.npu_candidate_topologies])
+    if case["mode"] == "igpu":
+        base.extend(
+            [
+                "--dtype",
+                args.igpu_dtype,
+                "--device-index",
+                str(args.igpu_device_index),
+            ]
+        )
+    base.extend(["--power-backend", requested_power_backend])
+    if requested_power_backend != "none":
+        base.extend(["--power-interval-sec", str(args.power_interval_sec)])
+        if power_log_path is not None:
+            base.extend(["--power-log-path", str(power_log_path)])
+    return base
+
+
+def run_case(args, case, logs_dir, cooldown_stats):
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    benchmark_csv_path = logs_dir / f"{case['case_id']}.csv"
+    requested_power_backend = args.power_backend
+    power_backend = resolve_power_backend(requested_power_backend, case["mode"])
+    power_log_path = (
+        logs_dir / f"{case['case_id']}_power.log"
+        if requested_power_backend != "none"
+        else None
+    )
+    idle_log_path = (
+        logs_dir / f"{case['case_id']}_idle_power.log"
+        if needs_idle_baseline(case)
+        else None
+    )
+    command = case_command(
+        args,
+        case,
+        benchmark_csv_path,
+        requested_power_backend,
+        power_log_path,
+    )
+    print(
+        f"Running case {case['case_id']}: {' '.join(shlex.quote(part) for part in command)}",
+        flush=True,
+    )
+
+    max_attempts = (
+        len(TRANSIENT_NPU_STARTUP_RETRY_DELAYS_SEC) + 1 if case["mode"] == "npu" else 1
+    )
+    for attempt_index in range(max_attempts):
+        clear_case_artifacts(benchmark_csv_path, power_log_path, idle_log_path)
+        idle_stats = empty_power_stats(
+            sample_count_key="idle_power_sample_count",
+            window_key="idle_power_window_sec",
+        )
+        if power_backend != "none" and needs_idle_baseline(case):
+            idle_stats, idle_log_path = measure_idle_power(
+                args, case, logs_dir, power_backend
+            )
+
+        result = subprocess.run(
+            command,
+            cwd=SCRIPT_DIR,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            child_row = parse_child_row(benchmark_csv_path)
+            child_row["benchmark_csv"] = str(benchmark_csv_path)
+            if not child_row.get("power_log"):
+                child_row["power_log"] = child_power_log_path(child_row, power_log_path)
+            return build_suite_row(
+                child_row,
+                case,
+                cooldown_stats,
+                power_backend,
+                idle_stats,
+                idle_log_path,
+            )
+
+        if attempt_index + 1 < max_attempts and is_transient_npu_startup_failure(
+            case, result
+        ):
+            retry_delay_sec = TRANSIENT_NPU_STARTUP_RETRY_DELAYS_SEC[attempt_index]
+            print(
+                (
+                    f"Transient NPU startup failure for {case['case_id']} "
+                    f"on attempt {attempt_index + 1}/{max_attempts}; "
+                    f"retrying in {retry_delay_sec:.1f} sec"
+                ),
+                flush=True,
+            )
+            time.sleep(retry_delay_sec)
+            continue
+
+        failure_label = (
+            "Power-logged benchmark failed"
+            if power_backend != "none"
+            else "Benchmark failed"
+        )
+        raise RuntimeError(
+            f"{failure_label} for {case['case_id']}\n"
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+
+    raise RuntimeError(
+        f"Benchmark failed for {case['case_id']} with no subprocess result"
+    )
 
 
 def main():

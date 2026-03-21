@@ -35,7 +35,7 @@ O_PROJ_ACC_BY_HEAD = {
     4: (4, 5, 7, 3),
 }
 
-SCALED_SEQ_LENS = tuple(1 << exp for exp in range(6, 14))
+SCALED_SEQ_LENS = tuple(1 << exp for exp in range(6, 15))
 FFN_TILE_SIZES = (96, 64)
 
 
