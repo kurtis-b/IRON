@@ -32,6 +32,8 @@ duties back as are right fit, obey you, love you, and most honour you.
 
 CSV_FIELDNAMES = [
     "study_id",
+    "benchmark_mode",
+    "execution_mode",
     "seq_len",
     "num_threads",
     "dtype",
@@ -49,12 +51,24 @@ CSV_FIELDNAMES = [
     "parallel_seq",
     "parallel_heads",
     "parallel_ffn",
+    "compute_tile_count",
+    "compute_tile_utilization_fraction",
+    "compile_setup_time_ms",
+    "topology_selection_time_ms",
+    "topology_cache_status",
+    "cached_steady_state_avg_latency_ms",
+    "avg_embedding_latency_ms",
+    "avg_qkv_projection_latency_ms",
+    "avg_encoder_pipeline_latency_ms",
     "min_latency_ms",
     "avg_latency_ms",
     "max_latency_ms",
 ] + ACTIVE_POWER_FIELDNAMES
 
 DEFAULT_BENCHMARK_SEQ_LENS = "64,128,256,512,1024,2048,4096,8192"
+DEFAULT_BENCHMARK_MODE = "synthetic_dense"
+SUPPORTED_BENCHMARK_MODES = ("synthetic_dense", "model_valid", "task_eval")
+MODEL_VALID_MAX_SEQ_LEN = 512
 
 
 def _detect_physical_cores_from_sysfs(respect_affinity=True):
@@ -210,6 +224,52 @@ def add_cooldown_args(parser):
             "with the benchmark anyway."
         ),
     )
+
+
+def add_benchmark_mode_args(parser):
+    parser.add_argument(
+        "--benchmark-mode",
+        choices=SUPPORTED_BENCHMARK_MODES,
+        default=DEFAULT_BENCHMARK_MODE,
+        help=(
+            "Benchmark workload mode. synthetic_dense uses deterministic synthetic "
+            "token ids. model_valid uses a real local tokenizer and attention masks. "
+            "task_eval is reserved for task-level evaluation and is not implemented "
+            "in the timing CLIs yet."
+        ),
+    )
+
+
+def benchmark_mode_case_suffix(benchmark_mode):
+    if benchmark_mode == DEFAULT_BENCHMARK_MODE:
+        return ""
+    return f"_{benchmark_mode}"
+
+
+def default_execution_mode_for_backend(backend_mode):
+    return {
+        "cpu": "host_hf",
+        "igpu": "host_hf",
+        "npu": "encoder_pipeline",
+    }[backend_mode]
+
+
+def validate_benchmark_mode_request(benchmark_mode, *, backend_mode, seq_lens):
+    if benchmark_mode == "task_eval":
+        raise NotImplementedError(
+            "benchmark-mode task_eval is reserved for task-level evaluation scripts "
+            "and is not implemented in the timing CLIs yet"
+        )
+    if benchmark_mode == "model_valid":
+        if any(int(seq_len) > MODEL_VALID_MAX_SEQ_LEN for seq_len in seq_lens):
+            raise ValueError(
+                f"benchmark-mode model_valid only supports seq_len <= {MODEL_VALID_MAX_SEQ_LEN}"
+            )
+        if backend_mode == "npu":
+            raise ValueError(
+                "benchmark-mode model_valid is not supported for npu because the "
+                "encoder_pipeline path currently requires attention_mask=None"
+            )
 
 
 def summarize_latency_measurements(latencies_ms, estimated_flops_per_inference):
@@ -457,6 +517,115 @@ def encode_benchmark_texts(texts, seq_len, vocab_size, pad_token_id=0):
             }
         )
     return encoded_samples
+
+
+def _tensorize_tokenizer_field(values):
+    import torch
+
+    if hasattr(values, "shape"):
+        tensor = values
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        return tensor.to(dtype=torch.long)
+    if values and isinstance(values[0], (list, tuple)):
+        return torch.tensor(values, dtype=torch.long)
+    return torch.tensor([values], dtype=torch.long)
+
+
+def load_local_benchmark_tokenizer(weights_file_path, config_file_path):
+    from transformers import AutoTokenizer
+
+    candidate_dirs = []
+    for path_like in (weights_file_path, config_file_path):
+        parent = Path(path_like).resolve().parent
+        if parent not in candidate_dirs:
+            candidate_dirs.append(parent)
+
+    errors = []
+    for candidate_dir in candidate_dirs:
+        try:
+            return AutoTokenizer.from_pretrained(
+                str(candidate_dir),
+                local_files_only=True,
+                use_fast=True,
+            )
+        except Exception as exc:
+            errors.append(f"{candidate_dir}: {exc}")
+
+    checked = ", ".join(str(path) for path in candidate_dirs)
+    raise RuntimeError(
+        "benchmark-mode model_valid requires local tokenizer assets. "
+        f"Checked: {checked}. Re-run download_model.py for the study or place "
+        "tokenizer files next to the local model weights."
+        + (f" Errors: {' | '.join(errors)}" if errors else "")
+    )
+
+
+def encode_model_valid_texts(texts, seq_len, tokenizer):
+    encoded_samples = []
+    for text in texts:
+        encoded = tokenizer(
+            text,
+            truncation=True,
+            padding="max_length",
+            max_length=int(seq_len),
+            return_attention_mask=True,
+        )
+        if "input_ids" not in encoded or "attention_mask" not in encoded:
+            raise RuntimeError(
+                "Tokenizer output must include input_ids and attention_mask for "
+                "benchmark-mode model_valid"
+            )
+        input_ids = _tensorize_tokenizer_field(encoded["input_ids"])
+        attention_mask = _tensorize_tokenizer_field(encoded["attention_mask"])
+        token_type_values = encoded.get("token_type_ids")
+        if token_type_values is None:
+            token_type_ids = input_ids.new_zeros(input_ids.shape)
+        else:
+            token_type_ids = _tensorize_tokenizer_field(token_type_values)
+        encoded_samples.append(
+            {
+                "input_ids": input_ids,
+                "token_type_ids": token_type_ids,
+                "attention_mask": attention_mask,
+            }
+        )
+    return encoded_samples
+
+
+def prepare_benchmark_samples(
+    *,
+    benchmark_mode,
+    texts,
+    seq_len,
+    vocab_size,
+    pad_token_id,
+    weights_file_path,
+    config_file_path,
+):
+    if benchmark_mode == "synthetic_dense":
+        return encode_benchmark_texts(
+            texts=texts,
+            seq_len=seq_len,
+            vocab_size=vocab_size,
+            pad_token_id=pad_token_id,
+        )
+    if benchmark_mode == "model_valid":
+        tokenizer = load_local_benchmark_tokenizer(
+            weights_file_path,
+            config_file_path,
+        )
+        return encode_model_valid_texts(
+            texts=texts,
+            seq_len=seq_len,
+            tokenizer=tokenizer,
+        )
+    if benchmark_mode == "task_eval":
+        raise NotImplementedError(
+            "benchmark-mode task_eval is reserved for task-level evaluation scripts "
+            "and is not implemented in the timing CLIs yet"
+        )
+    raise ValueError(f"Unsupported benchmark_mode {benchmark_mode!r}")
 
 
 def write_results_csv(output_csv, rows):

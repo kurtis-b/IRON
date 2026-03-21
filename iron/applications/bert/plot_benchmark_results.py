@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import ticker
+from matplotlib.lines import Line2D
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT_CSV = SCRIPT_DIR / "automated_benchmark_all_studies.csv"
@@ -118,6 +119,12 @@ def load_rows(csv_path):
                 "pseudo_device_estimated_gflops_per_watt_sec",
                 "estimated_flops_per_joule",
                 "pseudo_device_estimated_flops_per_joule",
+                "backend_pct_of_peak",
+                "operational_intensity_flops_per_byte",
+                "roofline_pct",
+                "backend_peak_ops_per_sec",
+                "ddr_peak_bytes_per_sec",
+                "roofline_bound_ops_per_sec",
             ):
                 row[key] = parse_numeric(raw.get(key), float)
             rows.append(row)
@@ -210,6 +217,18 @@ def effective_efficiency_gflops_per_watt_sec(row):
     return row["estimated_gflops_per_watt_sec"]
 
 
+def backend_pct_of_peak_percent(row):
+    if row.get("backend_pct_of_peak") is None:
+        return None
+    return row["backend_pct_of_peak"] * 100.0
+
+
+def roofline_pct_percent(row):
+    if row.get("roofline_pct") is None:
+        return None
+    return row["roofline_pct"] * 100.0
+
+
 def finite_series(rows, value_fn):
     xs = []
     ys = []
@@ -273,7 +292,9 @@ def plot_mode_lines(ax, study_rows, value_fn, ylabel, title, *, legend=True):
     ax.set_title(title)
     beautify_axes(ax)
     if legend:
-        ax.legend(loc="best")
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(loc="best")
 
 
 def geometric_mean(values):
@@ -282,8 +303,18 @@ def geometric_mean(values):
     return math.exp(sum(math.log(value) for value in values) / len(values))
 
 
+def has_metric(rows, value_fn):
+    for row in rows:
+        value = value_fn(row)
+        if value is not None:
+            return True
+    return False
+
+
 def plot_cross_model_metric(rows, out_dir, dpi, *, filename, title, value_fn, ylabel):
     rep_rows = representative_rows(rows)
+    if not has_metric(rep_rows, value_fn):
+        return None
     study_colors = model_color_map(rep_rows)
     seq_lens = sorted({row["seq_len"] for row in rep_rows})
 
@@ -507,7 +538,7 @@ def plot_summary(rows, out_dir, dpi):
 
 
 def plot_grouped_comparisons(rows, out_dir, dpi):
-    return [
+    image_paths = [
         plot_cross_model_metric(
             rows,
             out_dir,
@@ -544,7 +575,126 @@ def plot_grouped_comparisons(rows, out_dir, dpi):
             value_fn=effective_efficiency_gflops_per_watt_sec,
             ylabel="Efficiency (GFLOPs/W*s)",
         ),
+        plot_cross_model_metric(
+            rows,
+            out_dir,
+            dpi,
+            filename="grouped_pct_of_peak_by_backend.png",
+            title="Cross-Model Percent-of-Peak Comparison",
+            value_fn=backend_pct_of_peak_percent,
+            ylabel="Percent of Peak (%)",
+        ),
+        plot_cross_model_metric(
+            rows,
+            out_dir,
+            dpi,
+            filename="grouped_roofline_pct_by_backend.png",
+            title="Cross-Model Roofline Utilization Comparison",
+            value_fn=roofline_pct_percent,
+            ylabel="Roofline Utilization (%)",
+        ),
     ]
+    return [path for path in image_paths if path is not None]
+
+
+def plot_roofline_overview(rows, out_dir, dpi):
+    rep_rows = representative_rows(rows)
+    eligible_rows = [
+        row
+        for row in rep_rows
+        if row.get("operational_intensity_flops_per_byte") is not None
+        and row.get("throughput_flops_per_sec") is not None
+    ]
+    if not eligible_rows:
+        return None
+
+    study_colors = model_color_map(rep_rows)
+    fig, axes = plt.subplots(1, len(MODE_ORDER), figsize=(18, 6.2), sharey=True)
+    fig.suptitle("Roofline Overview", fontsize=18, fontweight="bold", x=0.06, ha="left")
+
+    for ax, mode in zip(axes, MODE_ORDER):
+        mode_rows = [row for row in eligible_rows if row["mode"] == mode]
+        if not mode_rows:
+            continue
+        for row in mode_rows:
+            ax.scatter(
+                row["operational_intensity_flops_per_byte"],
+                throughput_gflops_per_sec(row),
+                color=study_colors[row["study_id"]],
+                s=48,
+                alpha=0.9,
+                edgecolors="none",
+            )
+
+        peak_ops = max(
+            (
+                row["backend_peak_ops_per_sec"]
+                for row in mode_rows
+                if row.get("backend_peak_ops_per_sec") is not None
+            ),
+            default=None,
+        )
+        ddr_bytes = max(
+            (
+                row["ddr_peak_bytes_per_sec"]
+                for row in mode_rows
+                if row.get("ddr_peak_bytes_per_sec") is not None
+            ),
+            default=None,
+        )
+        if peak_ops is not None and ddr_bytes is not None:
+            oi_values = [
+                row["operational_intensity_flops_per_byte"]
+                for row in mode_rows
+                if row.get("operational_intensity_flops_per_byte") is not None
+                and row["operational_intensity_flops_per_byte"] > 0.0
+            ]
+            if oi_values:
+                min_oi = min(oi_values) / 2.0
+                max_oi = max(oi_values) * 2.0
+                if min_oi <= 0.0:
+                    min_oi = min(oi_values)
+                roof_xs = [
+                    min_oi * ((max_oi / min_oi) ** (index / 63.0))
+                    for index in range(64)
+                ]
+                peak_gflops = peak_ops * 1e-9
+                ddr_gbytes = ddr_bytes * 1e-9
+                roof_ys = [min(peak_gflops, ddr_gbytes * value) for value in roof_xs]
+                ax.plot(
+                    roof_xs,
+                    roof_ys,
+                    linestyle="--",
+                    linewidth=2.0,
+                    color=MODE_COLORS[mode],
+                )
+
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_title(MODE_LABELS[mode])
+        ax.set_xlabel("Operational Intensity (FLOPs/byte)")
+        if ax is axes[0]:
+            ax.set_ylabel("Throughput (GFLOPs/s)")
+        beautify_axes(ax)
+
+    handles = [
+        Line2D([0], [0], marker="o", linestyle="", color=color, label=study_id)
+        for study_id, color in study_colors.items()
+    ]
+    if handles:
+        fig.legend(
+            handles,
+            [handle.get_label() for handle in handles],
+            loc="upper center",
+            ncol=min(3, len(handles)),
+            bbox_to_anchor=(0.5, 0.98),
+        )
+
+    output_path = out_dir / "roofline_overview.png"
+    fig.tight_layout(rect=(0, 0, 1, 0.90))
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
+    return output_path
 
 
 def write_html_index(out_dir, image_paths):
@@ -565,7 +715,8 @@ def write_html_index(out_dir, image_paths):
         "<body>",
         "  <h1>BERT Benchmark Plot Report</h1>",
         "  <p>Rendered from the automated benchmark suite CSV. CPU uses package power/efficiency. "
-        "NPU and iGPU use idle-subtracted pseudo-device values when available.</p>",
+        "NPU and iGPU use idle-subtracted pseudo-device values when available. Percent-of-peak and "
+        "roofline views appear when the suite CSV includes peak-reference annotations.</p>",
     ]
     for image_path in image_paths:
         lines.extend(
@@ -604,6 +755,9 @@ def main():
     summary_path = plot_summary(rows, output_dir, args.dpi)
     image_paths.append(summary_path)
     image_paths.extend(plot_grouped_comparisons(rows, output_dir, args.dpi))
+    roofline_path = plot_roofline_overview(rows, output_dir, args.dpi)
+    if roofline_path is not None:
+        image_paths.append(roofline_path)
 
     for study_id in sorted({row["study_id"] for row in rows}):
         overview_path = plot_study_dashboard(study_id, rows, output_dir, args.dpi)

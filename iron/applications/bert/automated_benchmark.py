@@ -13,12 +13,17 @@ from pathlib import Path
 
 from benchmark_common import (
     DEFAULT_BENCHMARK_SEQ_LENS,
+    DEFAULT_BENCHMARK_MODE,
+    add_benchmark_mode_args,
     add_cooldown_args,
+    benchmark_mode_case_suffix,
     cooldown_before_benchmark,
+    default_execution_mode_for_backend,
     detect_logical_thread_count,
     detect_max_physical_core_count,
     detect_physical_core_count,
     parse_seq_lens,
+    validate_benchmark_mode_request,
 )
 from benchmark_power import (
     empty_power_stats,
@@ -28,7 +33,16 @@ from benchmark_power import (
     resolve_power_backend,
     effective_device_watt,
 )
-from model_support import load_study_manifest, resolve_study_paths
+from model_support import (
+    canonicalize_app_config_dict,
+    load_study_manifest,
+    resolve_study_paths,
+)
+from roofline import (
+    RESULT_METRIC_FIELDNAMES,
+    annotate_benchmark_row,
+    load_peak_reference_artifact,
+)
 
 SCRIPT_DIR = Path(__file__).parent
 DEFAULT_RUNS_PER_SAMPLE_OVERRIDES = "2048=50,4096=15,8192=5"
@@ -38,6 +52,8 @@ SUITE_FIELDNAMES = [
     "case_id",
     "study_id",
     "mode",
+    "benchmark_mode",
+    "execution_mode",
     "seq_len",
     "num_threads",
     "dtype",
@@ -55,6 +71,15 @@ SUITE_FIELDNAMES = [
     "parallel_seq",
     "parallel_heads",
     "parallel_ffn",
+    "compute_tile_count",
+    "compute_tile_utilization_fraction",
+    "compile_setup_time_ms",
+    "topology_selection_time_ms",
+    "topology_cache_status",
+    "cached_steady_state_avg_latency_ms",
+    "avg_embedding_latency_ms",
+    "avg_qkv_projection_latency_ms",
+    "avg_encoder_pipeline_latency_ms",
     "min_latency_ms",
     "avg_latency_ms",
     "max_latency_ms",
@@ -90,7 +115,7 @@ SUITE_FIELDNAMES = [
     "idle_power_log",
     "power_log",
     "benchmark_csv",
-]
+] + RESULT_METRIC_FIELDNAMES
 
 
 def parse_args():
@@ -176,7 +201,7 @@ def parse_args():
     parser.add_argument(
         "--igpu-dtype",
         choices=("float32", "float16", "bfloat16"),
-        default="float16",
+        default="bfloat16",
         help="Execution dtype for the iGPU benchmark mode.",
     )
     parser.add_argument(
@@ -247,6 +272,39 @@ def parse_args():
         "--output-csv",
         type=str,
         default="automated_benchmark_latest.csv",
+    )
+    parser.add_argument(
+        "--disable-all-biases",
+        action="store_true",
+        help=(
+            "Pass --disable-all-biases through to CPU and iGPU child benchmarks. "
+            "NPU cases are unchanged."
+        ),
+    )
+    add_benchmark_mode_args(parser)
+    parser.add_argument(
+        "--peak-reference",
+        type=str,
+        default=None,
+        help=(
+            "Optional peak-reference artifact JSON used to add dtype-aware percent-of-peak "
+            "and roofline fields to the suite CSV."
+        ),
+    )
+    parser.add_argument(
+        "--bytes-model-version",
+        type=str,
+        default="v1",
+        help="Analytical bytes-model version used for roofline fields.",
+    )
+    parser.add_argument(
+        "--bytes-model-weights-policy",
+        choices=("resident", "streamed"),
+        default="resident",
+        help=(
+            "Whether the bytes model treats weights as resident or streamed-from-DDR "
+            "per inference."
+        ),
     )
     parser.add_argument(
         "--logs-dir",
@@ -437,6 +495,16 @@ def resolve_target_config_path(args, target):
 
 
 def npu_case_skip_reason(args, target, seq_len):
+    benchmark_mode = getattr(args, "benchmark_mode", DEFAULT_BENCHMARK_MODE)
+    try:
+        validate_benchmark_mode_request(
+            benchmark_mode,
+            backend_mode="npu",
+            seq_lens=[seq_len],
+        )
+    except (ValueError, NotImplementedError) as exc:
+        return str(exc)
+
     from npu_inference import (
         current_topology_from_config,
         load_encoder_pipeline_config,
@@ -461,7 +529,7 @@ def npu_case_skip_reason(args, target, seq_len):
         return str(exc)
 
     if getattr(args, "npu_topology_policy", "cache") == "fixed":
-        current_topology = current_topology_from_config(config)
+        current_topology = current_topology_from_config(config, seq_len)
         supported_signatures = {topology_signature(topology) for topology in supported}
         if topology_signature(current_topology) not in supported_signatures:
             return (
@@ -480,6 +548,9 @@ def enumerate_cases(args):
     cpu_thread_counts = parse_thread_counts(args.cpu_thread_counts)
     npu_threads = args.npu_num_threads or detect_max_physical_core_count()
     igpu_threads = args.igpu_num_threads or detect_physical_core_count()
+    benchmark_mode = getattr(args, "benchmark_mode", DEFAULT_BENCHMARK_MODE)
+    case_mode_suffix = benchmark_mode_case_suffix(benchmark_mode)
+    bias_case_suffix = "_nobias" if getattr(args, "disable_all_biases", False) else ""
 
     for target in targets:
         study_prefix = f"{target['study_id']}_" if target["study_id"] else ""
@@ -488,9 +559,12 @@ def enumerate_cases(args):
                 for seq_len in seq_lens:
                     cases.append(
                         {
-                            "case_id": f"{study_prefix}cpu_seq{seq_len}_{num_threads}t",
+                            "case_id": (
+                                f"{study_prefix}cpu{case_mode_suffix}{bias_case_suffix}_seq{seq_len}_{num_threads}t"
+                            ),
                             "study_id": target["study_id"],
                             "mode": "cpu",
+                            "benchmark_mode": benchmark_mode,
                             "seq_len": seq_len,
                             "num_threads": num_threads,
                             **target,
@@ -500,9 +574,12 @@ def enumerate_cases(args):
             for seq_len in seq_lens:
                 cases.append(
                     {
-                        "case_id": f"{study_prefix}igpu_seq{seq_len}",
+                        "case_id": (
+                            f"{study_prefix}igpu{case_mode_suffix}{bias_case_suffix}_seq{seq_len}"
+                        ),
                         "study_id": target["study_id"],
                         "mode": "igpu",
+                        "benchmark_mode": benchmark_mode,
                         "seq_len": seq_len,
                         "num_threads": igpu_threads,
                         **target,
@@ -531,9 +608,10 @@ def enumerate_cases(args):
                         continue
                     cases.append(
                         {
-                            "case_id": f"{study_prefix}npu_seq{seq_len}",
+                            "case_id": f"{study_prefix}npu{case_mode_suffix}_seq{seq_len}",
                             "study_id": target["study_id"],
                             "mode": "npu",
+                            "benchmark_mode": benchmark_mode,
                             "seq_len": seq_len,
                             "num_threads": npu_threads,
                             **target,
@@ -713,6 +791,14 @@ def build_suite_row(
         "case_id": case["case_id"],
         "study_id": child_row.get("study_id", case.get("study_id", "")),
         "mode": case["mode"],
+        "benchmark_mode": child_row.get(
+            "benchmark_mode",
+            case.get("benchmark_mode", DEFAULT_BENCHMARK_MODE),
+        ),
+        "execution_mode": child_row.get(
+            "execution_mode",
+            default_execution_mode_for_backend(case["mode"]),
+        ),
         "seq_len": child_row["seq_len"],
         "num_threads": child_row["num_threads"],
         "dtype": child_row["dtype"],
@@ -734,6 +820,23 @@ def build_suite_row(
         "parallel_seq": child_row.get("parallel_seq", ""),
         "parallel_heads": child_row.get("parallel_heads", ""),
         "parallel_ffn": child_row.get("parallel_ffn", ""),
+        "compute_tile_count": child_row.get("compute_tile_count", ""),
+        "compute_tile_utilization_fraction": child_row.get(
+            "compute_tile_utilization_fraction", ""
+        ),
+        "compile_setup_time_ms": child_row.get("compile_setup_time_ms", ""),
+        "topology_selection_time_ms": child_row.get("topology_selection_time_ms", ""),
+        "topology_cache_status": child_row.get("topology_cache_status", ""),
+        "cached_steady_state_avg_latency_ms": child_row.get(
+            "cached_steady_state_avg_latency_ms", ""
+        ),
+        "avg_embedding_latency_ms": child_row.get("avg_embedding_latency_ms", ""),
+        "avg_qkv_projection_latency_ms": child_row.get(
+            "avg_qkv_projection_latency_ms", ""
+        ),
+        "avg_encoder_pipeline_latency_ms": child_row.get(
+            "avg_encoder_pipeline_latency_ms", ""
+        ),
         "min_latency_ms": child_row["min_latency_ms"],
         "avg_latency_ms": child_row["avg_latency_ms"],
         "max_latency_ms": child_row["max_latency_ms"],
@@ -775,6 +878,54 @@ def build_suite_row(
         "idle_power_log": str(idle_log_path) if idle_log_path is not None else "",
         "benchmark_csv": child_row.get("benchmark_csv", ""),
     }
+
+
+def load_case_model_config(args, case, model_config_cache):
+    config_key = case.get("study_id") or case.get("config_file_path") or case["case_id"]
+    cached = model_config_cache.get(config_key)
+    if cached is not None:
+        return cached
+
+    config_path = resolve_target_config_path(args, case)
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        config_json = json.load(config_file)
+    model_config = canonicalize_app_config_dict(config_json)["model_config"]
+    model_config_cache[config_key] = model_config
+    return model_config
+
+
+def annotate_suite_row(
+    args,
+    suite_row,
+    case,
+    peak_reference_artifact,
+    model_config_cache,
+):
+    required_fields = (
+        "seq_len",
+        "dtype",
+        "estimated_flops_per_inference",
+        "throughput_flops_per_sec",
+    )
+    if any(field not in suite_row for field in required_fields):
+        return suite_row
+
+    model_config = load_case_model_config(args, case, model_config_cache)
+    annotation = annotate_benchmark_row(
+        {
+            "mode": case["mode"],
+            "seq_len": int(suite_row["seq_len"]),
+            "dtype": suite_row["dtype"],
+            "estimated_flops_per_inference": suite_row["estimated_flops_per_inference"],
+            "throughput_flops_per_sec": suite_row["throughput_flops_per_sec"],
+        },
+        model_config=model_config,
+        peak_reference_artifact=peak_reference_artifact,
+        bytes_model_version=getattr(args, "bytes_model_version", "v1"),
+        weights_policy=getattr(args, "bytes_model_weights_policy", "resident"),
+    )
+    suite_row.update(annotation)
+    return suite_row
 
 
 def case_command(
@@ -849,6 +1000,11 @@ def case_command(
                 str(args.igpu_device_index),
             ]
         )
+    if case["mode"] in {"cpu", "igpu"} and getattr(args, "disable_all_biases", False):
+        base.append("--disable-all-biases")
+    base.extend(
+        ["--benchmark-mode", getattr(args, "benchmark_mode", DEFAULT_BENCHMARK_MODE)]
+    )
     base.extend(["--power-backend", requested_power_backend])
     if requested_power_backend != "none":
         base.extend(["--power-interval-sec", str(args.power_interval_sec)])
@@ -857,7 +1013,14 @@ def case_command(
     return base
 
 
-def run_case(args, case, logs_dir, cooldown_stats):
+def run_case(
+    args,
+    case,
+    logs_dir,
+    cooldown_stats,
+    peak_reference_artifact=None,
+    model_config_cache=None,
+):
     logs_dir.mkdir(parents=True, exist_ok=True)
     benchmark_csv_path = logs_dir / f"{case['case_id']}.csv"
     requested_power_backend = args.power_backend
@@ -910,13 +1073,22 @@ def run_case(args, case, logs_dir, cooldown_stats):
             child_row["benchmark_csv"] = str(benchmark_csv_path)
             if not child_row.get("power_log"):
                 child_row["power_log"] = child_power_log_path(child_row, power_log_path)
-            return build_suite_row(
+            suite_row = build_suite_row(
                 child_row,
                 case,
                 cooldown_stats,
                 power_backend,
                 idle_stats,
                 idle_log_path,
+            )
+            if model_config_cache is None:
+                model_config_cache = {}
+            return annotate_suite_row(
+                args,
+                suite_row,
+                case,
+                peak_reference_artifact,
+                model_config_cache,
             )
 
         if attempt_index + 1 < max_attempts and is_transient_npu_startup_failure(
@@ -951,6 +1123,8 @@ def run_case(args, case, logs_dir, cooldown_stats):
 
 def main():
     args = parse_args()
+    peak_reference_artifact = load_peak_reference_artifact(args.peak_reference)
+    model_config_cache = {}
     cases, skipped = enumerate_cases(args)
     state = load_state(args.state_json)
     completed = set(state.get("completed_case_ids", []))
@@ -972,7 +1146,14 @@ def main():
             mode=case["mode"],
             label=case["case_id"],
         )
-        suite_row = run_case(args, case, logs_dir, cooldown_stats)
+        suite_row = run_case(
+            args,
+            case,
+            logs_dir,
+            cooldown_stats,
+            peak_reference_artifact=peak_reference_artifact,
+            model_config_cache=model_config_cache,
+        )
         suite_rows.append(suite_row)
         write_suite_csv(args.output_csv, suite_rows)
         completed.add(case["case_id"])

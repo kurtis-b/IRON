@@ -8,15 +8,18 @@ import time
 
 from benchmark_common import (
     DEFAULT_BENCHMARK_SEQ_LENS,
+    add_benchmark_mode_args,
     add_cooldown_args,
     build_benchmark_texts,
     cooldown_before_benchmark,
     configure_cpu_thread_env,
+    default_execution_mode_for_backend,
     detect_logical_thread_count,
     detect_physical_core_count,
-    encode_benchmark_texts,
     parse_seq_lens,
+    prepare_benchmark_samples,
     summarize_latency_measurements,
+    validate_benchmark_mode_request,
     write_results_csv,
 )
 from benchmark_power import (
@@ -37,6 +40,7 @@ from model_support import (
     model_uses_token_type_ids,
     runtime_max_position_embeddings,
     resolve_study_paths,
+    zero_all_model_biases,
 )
 
 
@@ -101,7 +105,7 @@ def parse_args():
     parser.add_argument(
         "--dtype",
         choices=("float32", "bfloat16"),
-        default="float32",
+        default="bfloat16",
         help="Execution dtype for the CPU model.",
     )
     parser.add_argument(
@@ -116,6 +120,16 @@ def parse_args():
         default="cpu_benchmark_latest.csv",
         help="CSV file to write benchmark results to.",
     )
+    parser.add_argument(
+        "--disable-all-biases",
+        action="store_true",
+        help=(
+            "Zero every model bias tensor after loading weights. This is useful for "
+            "CPU-vs-NPU or iGPU-vs-NPU comparisons against the current fused encoder "
+            "path, which does not yet apply encoder dense or LayerNorm biases."
+        ),
+    )
+    add_benchmark_mode_args(parser)
     add_power_measurement_args(parser)
     add_cooldown_args(parser)
     return parser.parse_args()
@@ -147,7 +161,13 @@ def load_app_model_config(config_file_path):
     return canonicalize_app_config_dict(config_json)["model_config"]
 
 
-def load_hf_encoder_model(weights_file_path, config_file_path, seq_len, dtype_name):
+def load_hf_encoder_model(
+    weights_file_path,
+    config_file_path,
+    seq_len,
+    dtype_name,
+    disable_all_biases=False,
+):
     import torch
     from safetensors.torch import load_file
 
@@ -172,6 +192,9 @@ def load_hf_encoder_model(weights_file_path, config_file_path, seq_len, dtype_na
             f"Unexpected {display_name_for_model(model_config)} weights: {unexpected}"
         )
 
+    if disable_all_biases:
+        zero_all_model_biases(model)
+
     model = model.to(dtype=dtype)
     model.eval()
     return family, model
@@ -186,6 +209,8 @@ def benchmark_seq_len(
     warmup_runs,
     runs_per_sample,
     dtype_name,
+    benchmark_mode,
+    disable_all_biases,
     power_backend,
     power_interval_sec,
     power_log_path,
@@ -195,12 +220,16 @@ def benchmark_seq_len(
         config_file_path=config_file_path,
         seq_len=seq_len,
         dtype_name=dtype_name,
+        disable_all_biases=disable_all_biases,
     )
-    encoded_samples = encode_benchmark_texts(
+    encoded_samples = prepare_benchmark_samples(
+        benchmark_mode=benchmark_mode,
         texts=texts,
         seq_len=seq_len,
         vocab_size=model.config.vocab_size,
         pad_token_id=model.config.pad_token_id,
+        weights_file_path=weights_file_path,
+        config_file_path=config_file_path,
     )
     use_token_type_ids = model_uses_token_type_ids(model_config=model.config.to_dict())
 
@@ -211,7 +240,7 @@ def benchmark_seq_len(
             for sample in encoded_samples:
                 kwargs = {
                     "input_ids": sample["input_ids"],
-                    "attention_mask": None,
+                    "attention_mask": sample.get("attention_mask"),
                 }
                 if use_token_type_ids:
                     kwargs["token_type_ids"] = sample["token_type_ids"]
@@ -228,7 +257,7 @@ def benchmark_seq_len(
                     start = time.perf_counter()
                     kwargs = {
                         "input_ids": sample["input_ids"],
-                        "attention_mask": None,
+                        "attention_mask": sample.get("attention_mask"),
                     }
                     if use_token_type_ids:
                         kwargs["token_type_ids"] = sample["token_type_ids"]
@@ -245,6 +274,8 @@ def benchmark_seq_len(
         "seq_len": seq_len,
         "model_type": model_type,
         "shape": tuple(output.shape),
+        "benchmark_mode": benchmark_mode,
+        "execution_mode": default_execution_mode_for_backend("cpu"),
         "power_stats": power_monitor.stats,
         **latency_stats,
     }
@@ -254,6 +285,11 @@ def main():
     args = parse_args()
     weights_file_path, config_file_path = resolve_input_paths(args)
     seq_lens = parse_seq_lens(args.seq_lens)
+    validate_benchmark_mode_request(
+        args.benchmark_mode,
+        backend_mode="cpu",
+        seq_lens=seq_lens,
+    )
     physical_threads = detect_physical_core_count()
     logical_threads = detect_logical_thread_count()
     if args.num_threads is not None:
@@ -278,6 +314,9 @@ def main():
         f"Benchmarking Hugging Face {display_name_for_model(model_config)}",
         flush=True,
     )
+    print(f"Benchmark mode: {args.benchmark_mode}", flush=True)
+    if args.disable_all_biases:
+        print("Bias handling: all model biases disabled", flush=True)
     print(f"Sequence lengths: {seq_lens}", flush=True)
 
     csv_rows = []
@@ -315,6 +354,8 @@ def main():
                 warmup_runs=args.warmup_runs,
                 runs_per_sample=args.runs_per_sample,
                 dtype_name=args.dtype,
+                benchmark_mode=args.benchmark_mode,
+                disable_all_biases=args.disable_all_biases,
                 power_backend=power_backend,
                 power_interval_sec=args.power_interval_sec,
                 power_log_path=power_log_path,
@@ -331,6 +372,8 @@ def main():
             csv_rows.append(
                 {
                     "study_id": study_id,
+                    "benchmark_mode": result["benchmark_mode"],
+                    "execution_mode": result["execution_mode"],
                     "seq_len": seq_len,
                     "num_threads": num_threads,
                     "dtype": args.dtype,
@@ -354,6 +397,15 @@ def main():
                     "parallel_seq": "",
                     "parallel_heads": "",
                     "parallel_ffn": "",
+                    "compute_tile_count": "",
+                    "compute_tile_utilization_fraction": "",
+                    "compile_setup_time_ms": "",
+                    "topology_selection_time_ms": "",
+                    "topology_cache_status": "",
+                    "cached_steady_state_avg_latency_ms": "",
+                    "avg_embedding_latency_ms": "",
+                    "avg_qkv_projection_latency_ms": "",
+                    "avg_encoder_pipeline_latency_ms": "",
                     "min_latency_ms": f"{result['min_latency_ms']:.6f}",
                     "avg_latency_ms": f"{result['avg_latency_ms']:.6f}",
                     "max_latency_ms": f"{result['max_latency_ms']:.6f}",

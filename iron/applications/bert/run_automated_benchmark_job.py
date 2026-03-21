@@ -33,6 +33,8 @@ OPTION_MAP = {
     "npu_autotune_warmup_runs": "--npu-autotune-warmup-runs",
     "npu_autotune_runs": "--npu-autotune-runs",
     "npu_autotune_runs_overrides": "--npu-autotune-runs-overrides",
+    "disable_all_biases": "--disable-all-biases",
+    "benchmark_mode": "--benchmark-mode",
     "power_backend": "--power-backend",
     "power_interval_sec": "--power-interval-sec",
     "npu_idle_baseline_sec": "--npu-idle-baseline-sec",
@@ -45,6 +47,9 @@ OPTION_MAP = {
     "power_cycle_cmd": "--power-cycle-cmd",
     "state_json": "--state-json",
     "output_csv": "--output-csv",
+    "peak_reference": "--peak-reference",
+    "bytes_model_version": "--bytes-model-version",
+    "bytes_model_weights_policy": "--bytes-model-weights-policy",
     "logs_dir": "--logs-dir",
 }
 PATH_KEYS = {
@@ -55,6 +60,7 @@ PATH_KEYS = {
     "npu_topology_cache",
     "state_json",
     "output_csv",
+    "peak_reference",
     "logs_dir",
 }
 
@@ -109,6 +115,10 @@ def build_command(job_config_path, job):
     for key, flag in OPTION_MAP.items():
         value = job.get(key)
         if value is None:
+            continue
+        if isinstance(value, bool):
+            if value:
+                command.append(flag)
             continue
         if key in PATH_KEYS:
             value = resolve_path(job_dir, value)

@@ -225,6 +225,18 @@ def extract_backbone_state_dict(raw_weights, model_config):
     return stripped
 
 
+def zero_all_model_biases(model):
+    zeroed_bias_names = []
+    for name, parameter in model.named_parameters():
+        if not name.endswith(".bias"):
+            continue
+        if parameter is None:
+            continue
+        parameter.detach().zero_()
+        zeroed_bias_names.append(name)
+    return zeroed_bias_names
+
+
 def extend_or_trim_position_embeddings(state_dict, seq_len):
     key = "embeddings.position_embeddings.weight"
     if key not in state_dict:

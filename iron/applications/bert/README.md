@@ -14,6 +14,9 @@ SPDX-License-Identifier: Apache-2.0
 - [bringup_checklist.sh](bringup_checklist.sh): guided device preflight for CPU/NPU smokes, topology-cache warmup, and short supervised suite validation
 - [run_automated_benchmark_job.py](run_automated_benchmark_job.py): wrapper that runs the automation harness from a JSON job file
 - [plot_benchmark_results.py](plot_benchmark_results.py): headless plot renderer for suite CSVs
+- [validate_npu_parity.py](validate_npu_parity.py): CPU-vs-NPU hidden-state parity validator for canonical synthetic sequence lengths
+- [peak_reference.py](peak_reference.py): host fingerprint / hardware-profile artifact generator for peak-normalization and roofline groundwork
+- [calibrate_backend_peaks.py](calibrate_backend_peaks.py): peak-reference artifact builder that combines the host profile with measured calibration inputs
 
 The shared code under `src/` is now NPU-only. It exists to build the encoder-pipeline-backed local backbone used by `npu_inference.py`. The CPU benchmark uses Hugging Face directly and does not go through `src/`.
 
@@ -54,6 +57,7 @@ python3 download_model.py --study-id bert-base-uncased
 This writes:
 - `iron/applications/bert/models/<study_id>/model.safetensors`
 - `iron/applications/bert/models/<study_id>/config.json`
+- local tokenizer assets such as `tokenizer.json`, `tokenizer_config.json`, and vocab files
 
 To download every study target in the manifest:
 
@@ -76,6 +80,105 @@ Useful config files:
 
 Suggested study targets are listed in:
 - [encoder_only_models.json](study/encoder_only_models.json)
+
+## Hardware Profile
+
+Generate a machine-readable host profile artifact before adding backend peak or roofline analysis:
+
+```bash
+cd iron/applications/bert
+python3 peak_reference.py --output host_profile.json
+```
+
+If firmware inventory does not expose installed memory type or speed, provide a small override JSON:
+
+```json
+{
+  "memory": {
+    "type": "LPDDR5X",
+    "speed_mt_s": 8000,
+    "interface_bits": 128,
+    "source": "manual"
+  }
+}
+```
+
+Then run:
+
+```bash
+python3 peak_reference.py \
+  --memory-override memory_override.json \
+  --output host_profile.json
+```
+
+When the host cannot be matched confidently to one of the seeded HX-class candidates, the artifact keeps `chip_sku` as `unknown` rather than guessing.
+
+Build the peak-reference artifact as a separate step so official, derived, and measured ceilings are auditable:
+
+```bash
+python3 calibrate_backend_peaks.py \
+  --host-profile host_profile.json \
+  --output peak_references.json
+```
+
+Optional measured calibration inputs can be supplied as JSON:
+
+```json
+{
+  "tool_versions": {
+    "benchdnn": "3.5.0",
+    "rocblas-bench": "6.5.0",
+    "stream": "5.10"
+  },
+  "peaks": {
+    "cpu": {
+      "bfloat16": {"measured_peak_ops_per_sec": 1.2e12}
+    },
+    "igpu": {
+      "float32": {"measured_peak_ops_per_sec": 4.9e12}
+    },
+    "npu": {
+      "int8": {"measured_peak_ops_per_sec": 4.7e13},
+      "bfloat16": {"measured_peak_ops_per_sec": 1.7e13}
+    }
+  },
+  "memory_bandwidth": {
+    "copy_bytes_per_sec": 9.8e10,
+    "triad_bytes_per_sec": 8.9e10,
+    "measured_peak_bytes_per_sec": 8.9e10,
+    "note": "STREAM triad"
+  }
+}
+```
+
+Then run:
+
+```bash
+python3 calibrate_backend_peaks.py \
+  --host-profile host_profile.json \
+  --measured-input measured_peaks.json \
+  --output peak_references.json
+```
+
+For a first direct local calibration pass without external benchmark clients:
+
+```bash
+python3 calibrate_backend_peaks.py \
+  --host-profile host_profile.json \
+  --collect-measured \
+  --measured-output measured_peaks.json \
+  --output peak_references.json
+```
+
+The built-in collector currently does the following:
+- CPU: measured `torch.mm` GEMM peaks for `bfloat16` and `float32`
+- iGPU: measured ROCm `torch.mm` GEMM peaks for `bfloat16`, `float16`, and `float32`
+- NPU: measured `xrt-smi validate --run gemm` INT8 reference when the tool can supply it
+- NPU: measured first-pass IRON `bfloat16` peak from the existing deterministic `encoder_pipeline` synthetic-dense path in `npu_inference.py`
+- Memory: built-in STREAM-style copy/triad bandwidth benchmark on shared CPU memory
+
+Current limitation:
+- the first-pass NPU `bfloat16` denominator is an `encoder_pipeline` synthetic-dense calibration, not a pure bf16 GEMM microbenchmark yet. It is still the correct primary denominator for bf16 BERT results, and it is intentionally kept separate from the INT8 `xrt-smi` TOPS reference.
 
 ## Installation
 
@@ -103,7 +206,7 @@ python3 cpu_inference.py <weights> <config> \
   --num-samples 1 \
   --warmup-runs 10 \
   --runs-per-sample 100 \
-  --dtype float32 \
+  --dtype bfloat16 \
   --output-csv cpu_benchmark_latest.csv
 ```
 
@@ -112,6 +215,9 @@ Behavior:
 - excludes pooler and classifier head
 - uses a built-in local text corpus
 - generates deterministic local token ids from that corpus, so no tokenizer download is required
+- `--benchmark-mode synthetic_dense` is the default stress path
+- `--benchmark-mode model_valid` switches to real local tokenizer outputs plus attention masks and currently requires `seq_len <= 512`
+- `--disable-all-biases` zeros every model bias tensor after load for apples-to-apples CPU/iGPU comparisons against the current fused NPU encoder path
 - runs unmasked inference (`attention_mask=None`) to match the NPU path
 - defaults to `10` warmup runs and `100` timed runs per sample
 - by default runs two CPU thread configurations for comparison:
@@ -127,6 +233,38 @@ You can also run by study id after downloading model artifacts:
 cd iron/applications/bert
 python3 cpu_inference.py --study-id bert-base-uncased
 ```
+
+## iGPU Benchmark
+
+Run the Hugging Face iGPU baseline:
+
+```bash
+cd iron/applications/bert
+python3 igpu_inference.py /path/to/model.safetensors config/config.json
+```
+
+Useful options:
+
+```bash
+python3 igpu_inference.py <weights> <config> \
+  --seq-lens 64,128,256,512,1024,2048,4096,8192 \
+  --num-samples 1 \
+  --warmup-runs 10 \
+  --runs-per-sample 100 \
+  --dtype bfloat16 \
+  --output-csv igpu_benchmark_latest.csv
+```
+
+Behavior:
+- uses the Hugging Face encoder model implied by `model_config.model_type`
+- excludes pooler and classifier head
+- uses the same built-in local text corpus as the CPU benchmark
+- defaults to `bfloat16`, while still allowing explicit `float16`, `float32`, or `bfloat16`
+- `--benchmark-mode synthetic_dense` is the default stress path
+- `--benchmark-mode model_valid` switches to real local tokenizer outputs plus attention masks and currently requires `seq_len <= 512`
+- `--disable-all-biases` zeros every model bias tensor after load for apples-to-apples iGPU comparisons against the current fused NPU encoder path
+- writes results to `igpu_benchmark_latest.csv`
+- checkpoints the CSV after each completed sequence length
 
 ## NPU Benchmark
 
@@ -155,13 +293,24 @@ Behavior:
 - excludes pooler and classifier head
 - uses the same built-in local text corpus as the CPU benchmark
 - generates the same deterministic local token ids as the CPU benchmark
+- only supports `--benchmark-mode synthetic_dense` today because the current `encoder_pipeline` path still requires `attention_mask=None`
 - uses the same CSV schema as the CPU benchmark
 - runs unmasked inference (`attention_mask=None`)
+- child CSV rows now also include:
+  - `compile_setup_time_ms`
+  - `topology_selection_time_ms`
+  - `topology_cache_status`
+  - `cached_steady_state_avg_latency_ms`
+  - `avg_embedding_latency_ms`
+  - `avg_qkv_projection_latency_ms`
+  - `avg_encoder_pipeline_latency_ms`
+  so the NPU path can be read as topology selection + compile/setup + embeddings + host QKV + encoder-pipeline + end-to-end latency
 - defaults to `10` warmup runs and `100` timed runs per sample
 - can select encoder-pipeline topology per sequence length:
   - `fixed`: use the topology encoded in the config
-  - `cache`: use a cached topology per sequence length, autotuning cache misses
-  - `autotune`: retune every sequence length on each run
+  - `cache`: use a cached topology per sequence length, autotuning cache misses across both supported tile families when legal
+  - `autotune`: retune every sequence length on each run across both supported tile families when legal
+  - autotune keeps latency as the primary objective; candidates within a 1% latency band are broken by higher compute-tile utilization and then by the config family
 - the NPU path currently expects BERT-like encoder structure; `bert`, `roberta`, and `distilbert` are supported
 - writes results to `npu_benchmark_latest.csv`
 - checkpoints the CSV after each completed sequence length
@@ -172,6 +321,31 @@ You can also run by study id after downloading model artifacts:
 cd iron/applications/bert
 python3 npu_inference.py --study-id bert-base-uncased
 ```
+
+## CPU-vs-NPU Parity Check
+
+Validate final hidden-state parity on the deterministic synthetic path used by the timing harness:
+
+```bash
+cd iron/applications/bert
+python3 validate_npu_parity.py \
+  --study-id bert-base-uncased \
+  --seq-lens 64,128,512 \
+  --output-csv npu_parity_latest.csv
+```
+
+Behavior:
+- uses the same synthetic token generation as the benchmark harness
+- compares CPU final hidden states against the NPU `encoder_pipeline` path
+- records per-sequence parity metrics:
+  - `cosine_similarity`
+  - `max_abs_error`
+  - `mean_abs_error`
+- also records `error_count`, `error_fraction`, `max_acceptable_errors`, and the selected `topology_id`, `topology_cache_status`, `topology_selection_time_ms`, and `compile_setup_time_ms`
+- defaults to a quick `fixed` topology policy; pass `--topology-policy cache` if you want to validate the cached benchmark path instead
+- uses the same default tolerance model as the `encoder_pipeline` operator tests: `--rel-tol 0.04`, `--abs-tol 0.15`, `--max-error-fraction 0.005`
+- exits nonzero if any row exceeds the allowed elementwise error budget after applying the rel/abs tolerance window
+- current branch status: embeddings and host QKV projection parity are close, but divergence still starts in the fused encoder layer. The residual-add / LayerNorm ordering now matches the operator reference, but the fused path still omits encoder dense and LayerNorm biases, so HF-equivalent parity is not expected until those bias terms are carried through the operator interface and kernels.
 
 ## Automated Benchmarking
 
@@ -207,10 +381,12 @@ python3 automated_benchmark.py \
   --study-ids all \
   --modes cpu,npu,igpu \
   --seq-lens 64,128,256,512,1024,2048,4096,8192 \
+  --benchmark-mode synthetic_dense \
   --runs-per-sample 100 \
   --warmup-runs 10 \
   --cooldown-until-temp-c 50 \
   --npu-topology-policy cache \
+  --peak-reference peak_references.json \
   --power-backend auto \
   --power-cycle-cmd "sudo reboot"
 ```
@@ -219,7 +395,14 @@ Behavior:
 - writes a resumable state file
 - writes one master CSV summarizing all completed cases
 - writes per-case child benchmark CSVs and power logs under `logs/automated_benchmark`
+- every child row and suite row now records `benchmark_mode` and `execution_mode`
+- `--benchmark-mode synthetic_dense` is the current default dense stress path
+- `--benchmark-mode model_valid` uses real local tokenizer outputs plus attention masks and currently applies only to CPU and iGPU with `seq_len <= 512`
+- `--benchmark-mode task_eval` is reserved for later task-level evaluation scripts and is not implemented in the timing harness yet
 - `--power-backend auto` uses `powercap-rapl` for CPU, `turbostat` for NPU, and `rocm-smi` for iGPU
+- when `--peak-reference` is set, suite rows also include dtype-aware percent-of-peak and roofline fields derived from the supplied artifact
+- `--bytes-model-version` controls the analytical bytes model used for roofline fields; `v1` is the current encoder-only model
+- `--bytes-model-weights-policy resident` treats model weights as already resident, while `streamed` adds a per-inference DDR weight-read term
 - active power logging now covers only the timed inference region, not model load or warmup
 - CPU child benchmarks log start/end package/core energy snapshots for the timed region and derive average watts from the energy delta
 - NPU child benchmarks log periodic `turbostat` package-power samples for the timed region
@@ -245,6 +428,18 @@ Behavior:
   - `power_window_sec`
   - `estimated_gflops_per_watt_sec`
   - `pseudo_device_estimated_gflops_per_watt_sec`
+  - `compile_setup_time_ms`
+  - `topology_selection_time_ms`
+  - `topology_cache_status`
+  - `cached_steady_state_avg_latency_ms`
+  - `avg_embedding_latency_ms`
+  - `avg_qkv_projection_latency_ms`
+  - `avg_encoder_pipeline_latency_ms`
+  - `estimated_bytes_per_inference`
+  - `backend_pct_of_peak`
+  - `operational_intensity_flops_per_byte`
+  - `roofline_bound_ops_per_sec`
+  - `roofline_pct`
 
 Cooldown notes:
 - default temperature tolerance is `5%`, so a `50 C` target is treated as acceptable once the selected sensor reaches `52.5 C` or lower
@@ -272,6 +467,8 @@ python3 plot_benchmark_results.py <suite_csv> \
 Behavior:
 - writes a summary overview plot across studies/backends
 - writes grouped cross-model comparison plots for latency, throughput, power, and efficiency
+- when peak-reference annotations are present in the suite CSV, also writes grouped percent-of-peak and grouped roofline-utilization plots
+- when peak-reference annotations are present in the suite CSV, also writes a backend-split roofline overview scatter plot
 - writes one dashboard per study with latency, throughput, effective power, and effective efficiency
 - writes CPU thread-comparison plots when multiple CPU thread counts are present
 - writes an `index.html` file so the plots are easy to browse
@@ -291,9 +488,11 @@ cp benchmark_job.example.json benchmark_job.json
 - exactly one of: weights/config paths, `study_id`, or `study_ids`
 - `modes`
 - sequence lengths
+- benchmark mode
 - CPU thread counts
 - optional iGPU thread count / dtype
 - NPU topology policy
+- optional `peak_reference` / `bytes_model_version` / `bytes_model_weights_policy`
 - output/state/log paths
 - `power_cycle_cmd`
 
@@ -439,8 +638,20 @@ Check that these files exist and look sane:
 - `automated_benchmark_state.json`
 - `logs/automated_benchmark/*`
 
+Before trusting CPU-vs-NPU speedup claims, also run:
+
+```bash
+python3 validate_npu_parity.py \
+  --study-id bert-base-uncased \
+  --seq-lens 64,128,512
+```
+
 For NPU rows in the suite CSV, inspect:
 - `topology_id`
+  This is now the canonical family-aware id, for example `seq32_kv64__ps2_ph1_pffn4`.
+  Legacy shorthand filters like `2ps_4pffn` and `4ps` are still accepted on the CLI.
+- `compute_tile_count`
+- `compute_tile_utilization_fraction`
 - `idle_pkg_watt`
 - `avg_pkg_watt`
 - `pseudo_npu_avg_pkg_watt`

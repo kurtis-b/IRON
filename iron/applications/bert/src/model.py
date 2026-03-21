@@ -16,6 +16,8 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import time
+
 import torch
 import torch.nn as nn
 
@@ -88,15 +90,34 @@ class EncoderBackbone(nn.Module):
         self.encoder = BertEncoder(config, seq_len=seq_len)
         self.dtype = config.aie_config.dtype
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None):
+    def forward_with_stage_timings(
+        self,
+        input_ids,
+        token_type_ids=None,
+        attention_mask=None,
+    ):
+        embedding_start = time.perf_counter()
         embedding_output = self.embeddings(
             input_ids=input_ids,
             token_type_ids=token_type_ids,
         )
-        return self.encoder(
+        embedding_end = time.perf_counter()
+        encoder_output, encoder_timings = self.encoder.forward_with_stage_timings(
             embedding_output.to(self.dtype),
             attention_mask=attention_mask,
-        ).to(embedding_output.dtype)
+        )
+        return encoder_output.to(embedding_output.dtype), {
+            "embedding_sec": embedding_end - embedding_start,
+            **encoder_timings,
+        }
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None):
+        output, _ = self.forward_with_stage_timings(
+            input_ids,
+            token_type_ids=token_type_ids,
+            attention_mask=attention_mask,
+        )
+        return output
 
     def assign_backbone_weights(self, combined_weights):
         self.embeddings.word_embeddings.weight = assign(

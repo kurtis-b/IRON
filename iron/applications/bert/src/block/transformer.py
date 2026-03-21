@@ -16,6 +16,8 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import time
+
 import torch
 import torch.nn as nn
 
@@ -137,20 +139,35 @@ class BertEncoderPipelineLayer(nn.Module):
         self.ffn_up_weight = None
         self.ffn_down_weight = None
 
-    def forward(self, hidden_states, attention_mask=None):
+    def forward_with_stage_timings(self, hidden_states, attention_mask=None):
         if attention_mask is not None:
             raise RuntimeError(
                 "encoder_pipeline benchmark path currently requires attention_mask=None"
             )
+        qkv_start = time.perf_counter()
         query_layer, key_layer, value_layer = self.qkv_projection(hidden_states)
+        qkv_end = time.perf_counter()
         if query_layer.shape[0] != 1:
             raise RuntimeError("encoder_pipeline benchmark path supports batch size 1")
-        return self.encoder_pipeline(
+        pipeline_start = time.perf_counter()
+        output = self.encoder_pipeline(
             query_layer.squeeze(0),
             key_layer.squeeze(0),
             value_layer.squeeze(0),
             r=hidden_states.squeeze(0),
         ).unsqueeze(0)
+        pipeline_end = time.perf_counter()
+        return output, {
+            "qkv_projection_sec": qkv_end - qkv_start,
+            "encoder_pipeline_sec": pipeline_end - pipeline_start,
+        }
+
+    def forward(self, hidden_states, attention_mask=None):
+        output, _ = self.forward_with_stage_timings(
+            hidden_states,
+            attention_mask=attention_mask,
+        )
+        return output
 
     def assign_weights(self, layer_idx, combined_weights, dtype):
         self.qkv_projection.assign_weights(layer_idx, combined_weights, dtype)
@@ -184,6 +201,21 @@ class BertEncoder(nn.Module):
                 for _ in range(config.model_config.num_hidden_layers)
             ]
         )
+
+    def forward_with_stage_timings(self, hidden_states, attention_mask=None):
+        qkv_projection_sec = 0.0
+        encoder_pipeline_sec = 0.0
+        for layer_module in self.layer:
+            hidden_states, stage_timings = layer_module.forward_with_stage_timings(
+                hidden_states,
+                attention_mask,
+            )
+            qkv_projection_sec += stage_timings["qkv_projection_sec"]
+            encoder_pipeline_sec += stage_timings["encoder_pipeline_sec"]
+        return hidden_states, {
+            "qkv_projection_sec": qkv_projection_sec,
+            "encoder_pipeline_sec": encoder_pipeline_sec,
+        }
 
     def forward(self, hidden_states, attention_mask=None):
         for layer_module in self.layer:

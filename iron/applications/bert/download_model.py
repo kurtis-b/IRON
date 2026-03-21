@@ -16,6 +16,14 @@ from model_support import (
 )
 
 HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+TOKENIZER_MARKER_FILES = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.txt",
+    "vocab.json",
+    "merges.txt",
+    "special_tokens_map.json",
+)
 
 
 def parse_args():
@@ -102,6 +110,23 @@ def download_file(*, repo_id, filename, destination, token, force):
     return destination, True
 
 
+def download_tokenizer(*, repo_id, destination_dir, token, force):
+    from transformers import AutoTokenizer
+
+    if not force and any(
+        (destination_dir / name).exists() for name in TOKENIZER_MARKER_FILES
+    ):
+        return destination_dir, False
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        repo_id,
+        token=token,
+        use_fast=True,
+    )
+    tokenizer.save_pretrained(destination_dir)
+    return destination_dir, True
+
+
 def main():
     args = parse_args()
     manifest_path, study_ids = parse_requested_study_ids(args)
@@ -139,6 +164,15 @@ def main():
             )
             action = "downloaded" if downloaded else "cached"
             print(f"  {action}: {destination}", flush=True)
+
+        tokenizer_dir, tokenizer_downloaded = download_tokenizer(
+            repo_id=resolved["hf_model_id"],
+            destination_dir=model_dir,
+            token=token,
+            force=args.force,
+        )
+        tokenizer_action = "downloaded" if tokenizer_downloaded else "cached"
+        print(f"  {tokenizer_action} tokenizer: {tokenizer_dir}", flush=True)
 
 
 if __name__ == "__main__":

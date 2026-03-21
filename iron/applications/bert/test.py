@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,10 @@ sys.path.insert(0, str(TEST_DIR))
 
 import benchmark_common
 import automated_benchmark
+import cpu_inference
+import igpu_inference
+import npu_inference
+import run_automated_benchmark_job
 from automated_benchmark import (
     build_suite_row,
     case_command,
@@ -28,10 +33,13 @@ from automated_benchmark import (
     run_case,
 )
 from benchmark_common import (
+    DEFAULT_BENCHMARK_MODE,
     DEFAULT_BENCHMARK_SEQ_LENS,
     acceptable_cooldown_temp,
     cooldown_before_benchmark,
+    encode_model_valid_texts,
     parse_seq_lens,
+    validate_benchmark_mode_request,
 )
 from benchmark_power import (
     discover_powercap_rapl_zones,
@@ -44,12 +52,17 @@ from model_support import (
     canonicalize_app_config_dict,
     canonicalize_local_backbone_weights,
     estimate_encoder_forward_flops,
+    zero_all_model_biases,
 )
 from npu_inference import (
     current_topology_from_config,
     find_cached_topology,
     load_encoder_pipeline_topology_placements,
     load_encoder_pipeline_config,
+    parse_candidate_topology_ids,
+    resolve_topology,
+    select_autotune_topology,
+    supported_topologies_for_config_family,
     supported_topologies_for_seq_len,
     topology_cache_key,
     topology_id,
@@ -257,6 +270,220 @@ def test_bert_automated_benchmark_job_wrapper_prints_runs_per_sample_overrides(
     assert "--runs-per-sample-overrides 2048=50,4096=15,8192=5" in result.stdout
     assert "--npu-autotune-runs 5" in result.stdout
     assert "--npu-autotune-runs-overrides 2048=3,4096=2,8192=1" in result.stdout
+
+
+def test_job_wrapper_print_command_includes_peak_reference_flags(tmp_path):
+    peak_reference = tmp_path / "peak_references.json"
+    peak_reference.write_text('{"references": []}\n', encoding="utf-8")
+    job_config = tmp_path / "benchmark_job.json"
+    job_config.write_text(
+        (
+            "{\n"
+            '  "study_id": "bert-base-uncased",\n'
+            '  "modes": "npu",\n'
+            '  "seq_lens": "64",\n'
+            '  "benchmark_mode": "model_valid",\n'
+            '  "peak_reference": "peak_references.json",\n'
+            '  "bytes_model_version": "v1",\n'
+            '  "bytes_model_weights_policy": "streamed",\n'
+            '  "power_backend": "none"\n'
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    command = run_automated_benchmark_job.build_command(
+        str(job_config), run_automated_benchmark_job.load_job_config(str(job_config))
+    )
+
+    assert "--peak-reference" in command
+    assert command[command.index("--peak-reference") + 1] == str(
+        peak_reference.resolve()
+    )
+    assert "--benchmark-mode" in command
+    assert command[command.index("--benchmark-mode") + 1] == "model_valid"
+    assert "--bytes-model-version" in command
+    assert command[command.index("--bytes-model-version") + 1] == "v1"
+    assert "--bytes-model-weights-policy" in command
+    assert command[command.index("--bytes-model-weights-policy") + 1] == "streamed"
+
+
+def test_cpu_parse_args_defaults_to_bfloat16(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["cpu_inference.py"])
+
+    args = cpu_inference.parse_args()
+
+    assert args.dtype == "bfloat16"
+    assert args.benchmark_mode == DEFAULT_BENCHMARK_MODE
+    assert args.disable_all_biases is False
+
+
+def test_cpu_parse_args_preserves_explicit_float32_override(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["cpu_inference.py", "--dtype", "float32"])
+
+    args = cpu_inference.parse_args()
+
+    assert args.dtype == "float32"
+
+
+def test_cpu_parse_args_accepts_disable_all_biases(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["cpu_inference.py", "--disable-all-biases"])
+
+    args = cpu_inference.parse_args()
+
+    assert args.disable_all_biases is True
+
+
+def test_igpu_parse_args_defaults_to_bfloat16(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["igpu_inference.py"])
+
+    args = igpu_inference.parse_args()
+
+    assert args.dtype == "bfloat16"
+    assert args.benchmark_mode == DEFAULT_BENCHMARK_MODE
+    assert args.disable_all_biases is False
+
+
+def test_npu_parse_args_defaults_benchmark_mode_to_synthetic_dense(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["npu_inference.py"])
+
+    args = npu_inference.parse_args()
+
+    assert args.benchmark_mode == DEFAULT_BENCHMARK_MODE
+
+
+def test_igpu_parse_args_preserves_explicit_float16_override(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["igpu_inference.py", "--dtype", "float16"])
+
+    args = igpu_inference.parse_args()
+
+    assert args.dtype == "float16"
+
+
+def test_igpu_parse_args_accepts_disable_all_biases(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["igpu_inference.py", "--disable-all-biases"])
+
+    args = igpu_inference.parse_args()
+
+    assert args.disable_all_biases is True
+
+
+def test_automated_benchmark_parse_args_defaults_igpu_dtype_to_bfloat16(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["automated_benchmark.py"])
+
+    args = automated_benchmark.parse_args()
+
+    assert args.igpu_dtype == "bfloat16"
+    assert args.benchmark_mode == DEFAULT_BENCHMARK_MODE
+    assert args.disable_all_biases is False
+
+
+def test_zero_all_model_biases_zeroes_linear_and_layernorm_biases_only():
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 4),
+        torch.nn.LayerNorm(4),
+    )
+    original_linear_weight = model[0].weight.detach().clone()
+    original_ln_weight = model[1].weight.detach().clone()
+
+    zeroed = zero_all_model_biases(model)
+
+    assert sorted(zeroed) == ["0.bias", "1.bias"]
+    assert torch.count_nonzero(model[0].bias).item() == 0
+    assert torch.count_nonzero(model[1].bias).item() == 0
+    assert torch.equal(model[0].weight, original_linear_weight)
+    assert torch.equal(model[1].weight, original_ln_weight)
+
+
+def test_validate_benchmark_mode_request_rejects_npu_model_valid():
+    with pytest.raises(ValueError, match="attention_mask=None"):
+        validate_benchmark_mode_request(
+            "model_valid",
+            backend_mode="npu",
+            seq_lens=[64],
+        )
+
+
+def test_validate_benchmark_mode_request_rejects_model_valid_seq_len_above_512():
+    with pytest.raises(ValueError, match="seq_len <= 512"):
+        validate_benchmark_mode_request(
+            "model_valid",
+            backend_mode="cpu",
+            seq_lens=[1024],
+        )
+
+
+def test_encode_model_valid_texts_fills_missing_token_type_ids():
+    class FakeTokenizer:
+        def __call__(
+            self, text, truncation, padding, max_length, return_attention_mask
+        ):
+            assert truncation is True
+            assert padding == "max_length"
+            assert return_attention_mask is True
+            assert text == "sample text"
+            assert max_length == 4
+            return {
+                "input_ids": [101, 2003, 102, 0],
+                "attention_mask": [1, 1, 1, 0],
+            }
+
+    samples = encode_model_valid_texts(
+        ["sample text"],
+        seq_len=4,
+        tokenizer=FakeTokenizer(),
+    )
+
+    assert len(samples) == 1
+    assert samples[0]["input_ids"].tolist() == [[101, 2003, 102, 0]]
+    assert samples[0]["attention_mask"].tolist() == [[1, 1, 1, 0]]
+    assert samples[0]["token_type_ids"].tolist() == [[0, 0, 0, 0]]
+
+
+def test_job_wrapper_print_command_reflects_bfloat16_igpu_dtype(tmp_path):
+    job_config = tmp_path / "benchmark_job.json"
+    job_config.write_text(
+        (
+            "{\n"
+            '  "study_id": "bert-base-uncased",\n'
+            '  "modes": "igpu",\n'
+            '  "seq_lens": "64",\n'
+            '  "igpu_dtype": "bfloat16",\n'
+            '  "power_backend": "none"\n'
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    command = run_automated_benchmark_job.build_command(
+        str(job_config), run_automated_benchmark_job.load_job_config(str(job_config))
+    )
+
+    assert "--igpu-dtype" in command
+    assert command[command.index("--igpu-dtype") + 1] == "bfloat16"
+
+
+def test_job_wrapper_build_command_emits_disable_all_biases_as_bare_flag(tmp_path):
+    job_config = tmp_path / "benchmark_job.json"
+    job_config.write_text(
+        (
+            "{\n"
+            '  "study_id": "bert-base-uncased",\n'
+            '  "modes": "cpu,igpu",\n'
+            '  "seq_lens": "64",\n'
+            '  "disable_all_biases": true,\n'
+            '  "power_backend": "none"\n'
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    command = run_automated_benchmark_job.build_command(
+        str(job_config), run_automated_benchmark_job.load_job_config(str(job_config))
+    )
+
+    assert "--disable-all-biases" in command
+    assert "True" not in command
 
 
 def test_bert_automated_benchmark_job_wrapper_study_id_smoke(tmp_path):
@@ -774,12 +1001,149 @@ def test_supported_topologies_for_seq_len_avoids_operator_package_import(
     assert load_encoder_pipeline_topology_placements()
 
 
+def test_supported_topologies_for_seq_len_accepts_legacy_alias_and_canonical_filters():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 64)
+
+    legacy_filtered = supported_topologies_for_seq_len(
+        config,
+        64,
+        candidate_ids=parse_candidate_topology_ids("2ps_4pffn"),
+    )
+    canonical_filtered = supported_topologies_for_seq_len(
+        config,
+        64,
+        candidate_ids=parse_candidate_topology_ids("seq32_kv64__ps2_ph1_pffn4"),
+    )
+
+    assert {topology_id(topology) for topology in legacy_filtered} == {
+        "seq32_kv64__ps2_ph1_pffn4"
+    }
+    assert {topology_id(topology) for topology in canonical_filtered} == {
+        "seq32_kv64__ps2_ph1_pffn4"
+    }
+
+
+def test_supported_topologies_for_seq_len_discovers_both_families_when_legal():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+
+    families = {
+        topology.family_id for topology in supported_topologies_for_seq_len(config, 128)
+    }
+
+    assert families == {"seq32_kv64", "seq64_kv32"}
+
+
+@pytest.mark.parametrize(
+    "config_path,seq_len",
+    [
+        (CONFIG_FILE, 128),
+        (TEST_DIR / "config" / "config_bert_large.json", 64),
+    ],
+    ids=["bert_base_12h", "bert_large_16h"],
+)
+def test_supported_topologies_for_seq_len_discovers_both_families_for_12_and_16_heads(
+    config_path, seq_len
+):
+    config = load_encoder_pipeline_config(str(config_path), seq_len)
+
+    families = {
+        topology.family_id
+        for topology in supported_topologies_for_seq_len(config, seq_len)
+    }
+
+    assert families == {"seq32_kv64", "seq64_kv32"}
+
+
+def test_supported_topologies_for_config_family_remains_fixed_to_config_family():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+
+    families = {
+        topology.family_id
+        for topology in supported_topologies_for_config_family(config, 128)
+    }
+
+    assert families == {"seq32_kv64"}
+
+
+def test_supported_topologies_for_seq_len_alias_filter_matches_both_families():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+
+    filtered = supported_topologies_for_seq_len(
+        config,
+        128,
+        candidate_ids=parse_candidate_topology_ids("2ps_4pffn"),
+    )
+
+    assert {topology_id(topology) for topology in filtered} == {
+        "seq32_kv64__ps2_ph1_pffn4",
+        "seq64_kv32__ps2_ph1_pffn4",
+    }
+
+
+def test_supported_topologies_for_seq_len_exposes_unique_ids_across_tile_families():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+
+    filtered = supported_topologies_for_seq_len(
+        config,
+        128,
+        candidate_ids=parse_candidate_topology_ids("2ps_4pffn"),
+    )
+
+    assert {topology.family_id for topology in filtered} == {
+        "seq32_kv64",
+        "seq64_kv32",
+    }
+    assert {topology_id(topology) for topology in filtered} == {
+        "seq32_kv64__ps2_ph1_pffn4",
+        "seq64_kv32__ps2_ph1_pffn4",
+    }
+
+
+def test_supported_topologies_expose_compute_tile_utilization_counts():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    supported = supported_topologies_for_seq_len(config, 128)
+
+    one_ps = next(
+        topology
+        for topology in supported
+        if topology.parallel_seq == 1
+        and topology.parallel_heads == 1
+        and topology.parallel_ffn == 1
+        and topology.family_id == "seq32_kv64"
+    )
+    four_ps = next(
+        topology
+        for topology in supported
+        if topology.parallel_seq == 4
+        and topology.parallel_heads == 1
+        and topology.parallel_ffn == 1
+        and topology.family_id == "seq32_kv64"
+    )
+
+    assert one_ps.compute_tile_count == 8
+    assert four_ps.compute_tile_count == 32
+    assert one_ps.utilization_fraction == pytest.approx(0.25)
+    assert four_ps.utilization_fraction == pytest.approx(1.0)
+
+
+def test_supported_topologies_for_seq_len_omits_illegal_mirrored_shapes():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 64)
+
+    ids = {
+        topology_id(topology)
+        for topology in supported_topologies_for_seq_len(config, 64)
+    }
+
+    assert "seq64_kv32__ps1_ph1_pffn1" in ids
+    assert "seq64_kv32__ps4_ph1_pffn1" not in ids
+
+
 def test_is_transient_npu_startup_failure_matches_known_xrt_open_error():
     case = {"mode": "npu"}
     result = subprocess.CompletedProcess(
         args=["python3", "npu_inference.py"],
         returncode=1,
-        stdout="Selected topology: seq_len=64 topology=2ps_4pffn",
+        stdout="Selected topology: seq_len=64 topology=seq32_kv64__ps2_ph1_pffn4",
         stderr=(
             "RuntimeError: mmap(addr=0x7fa44c000000, len=67108864, prot=3, "
             "flags=8209, offset=4294967296) failed (err=-11): "
@@ -843,7 +1207,7 @@ def test_run_case_retries_transient_npu_startup_failure_and_remeasures_idle_powe
             subprocess.CompletedProcess(
                 args=["python3", "npu_inference.py"],
                 returncode=1,
-                stdout="Selected topology: seq_len=64 topology=2ps_4pffn",
+                stdout="Selected topology: seq_len=64 topology=seq32_kv64__ps2_ph1_pffn4",
                 stderr=(
                     "RuntimeError: mmap(addr=0x7fa44c000000, len=67108864, prot=3, "
                     "flags=8209, offset=4294967296) failed (err=-11): "
@@ -889,7 +1253,7 @@ def test_run_case_retries_transient_npu_startup_failure_and_remeasures_idle_powe
             "shape": "(1, 64, 768)",
             "estimated_flops_per_inference": "1.000000e+09",
             "throughput_flops_per_sec": "5.000000e+10",
-            "topology_id": "2ps_4pffn",
+            "topology_id": "seq32_kv64__ps2_ph1_pffn4",
             "parallel_seq": "2",
             "parallel_heads": "1",
             "parallel_ffn": "4",
@@ -1042,11 +1406,15 @@ def test_build_suite_row_uses_gfx_power_for_igpu_energy():
     assert suite_row["pseudo_device_avg_pkg_watt"] == "12.000000"
     assert suite_row["estimated_gflops_per_watt_sec"] == "2.500000"
     assert suite_row["pseudo_device_estimated_gflops_per_watt_sec"] == "4.166667"
+    assert suite_row["benchmark_mode"] == DEFAULT_BENCHMARK_MODE
+    assert suite_row["execution_mode"] == "host_hf"
 
 
 def test_build_suite_row_uses_pkg_power_for_npu_energy():
     child_row = {
         "study_id": "toy-model",
+        "benchmark_mode": "synthetic_dense",
+        "execution_mode": "encoder_pipeline",
         "seq_len": "64",
         "num_threads": "8",
         "dtype": "bfloat16",
@@ -1060,10 +1428,19 @@ def test_build_suite_row_uses_pkg_power_for_npu_energy():
         "shape": "(1, 64, 768)",
         "estimated_flops_per_inference": "1.000000e+09",
         "throughput_flops_per_sec": "5.000000e+10",
-        "topology_id": "2ps_4pffn",
+        "topology_id": "seq32_kv64__ps2_ph1_pffn4",
         "parallel_seq": "2",
         "parallel_heads": "1",
         "parallel_ffn": "4",
+        "compute_tile_count": "16",
+        "compute_tile_utilization_fraction": "0.500000",
+        "compile_setup_time_ms": "123.000000",
+        "topology_selection_time_ms": "45.000000",
+        "topology_cache_status": "cache_hit",
+        "cached_steady_state_avg_latency_ms": "20.000000",
+        "avg_embedding_latency_ms": "1.500000",
+        "avg_qkv_projection_latency_ms": "2.500000",
+        "avg_encoder_pipeline_latency_ms": "12.500000",
         "min_latency_ms": "20.000000",
         "avg_latency_ms": "20.000000",
         "max_latency_ms": "20.000000",
@@ -1110,6 +1487,344 @@ def test_build_suite_row_uses_pkg_power_for_npu_energy():
     assert suite_row["pseudo_npu_avg_pkg_watt"] == "10.000000"
     assert suite_row["estimated_gflops_per_watt_sec"] == "2.777778"
     assert suite_row["pseudo_npu_estimated_gflops_per_watt_sec"] == "5.000000"
+    assert suite_row["compute_tile_count"] == "16"
+    assert suite_row["compute_tile_utilization_fraction"] == "0.500000"
+    assert suite_row["compile_setup_time_ms"] == "123.000000"
+    assert suite_row["topology_selection_time_ms"] == "45.000000"
+    assert suite_row["topology_cache_status"] == "cache_hit"
+    assert suite_row["cached_steady_state_avg_latency_ms"] == "20.000000"
+    assert suite_row["avg_embedding_latency_ms"] == "1.500000"
+    assert suite_row["avg_qkv_projection_latency_ms"] == "2.500000"
+    assert suite_row["avg_encoder_pipeline_latency_ms"] == "12.500000"
+    assert suite_row["benchmark_mode"] == DEFAULT_BENCHMARK_MODE
+    assert suite_row["execution_mode"] == "encoder_pipeline"
+
+
+def test_npu_benchmark_with_config_reports_stage_latency_breakdown(monkeypatch):
+    class FakeTopology(SimpleNamespace):
+        def __getitem__(self, key):
+            return getattr(self, key)
+
+    class FakeContext:
+        def __init__(self):
+            self.device_manager = SimpleNamespace(reset=lambda: None)
+
+    class FakeModel:
+        def __init__(self):
+            self.dtype = torch.bfloat16
+            self.warmup_calls = 0
+            self.timed_calls = 0
+
+        def __call__(self, input_ids, token_type_ids=None, attention_mask=None):
+            self.warmup_calls += 1
+            return torch.zeros((1, input_ids.shape[1], 8), dtype=torch.bfloat16)
+
+        def forward_with_stage_timings(
+            self, input_ids, token_type_ids=None, attention_mask=None
+        ):
+            self.timed_calls += 1
+            return (
+                torch.zeros((1, input_ids.shape[1], 8), dtype=torch.bfloat16),
+                {
+                    "embedding_sec": 0.001,
+                    "qkv_projection_sec": 0.002,
+                    "encoder_pipeline_sec": 0.003,
+                },
+            )
+
+    fake_model = FakeModel()
+
+    monkeypatch.setattr(
+        npu_inference,
+        "build_npu_encoder_model",
+        lambda weights_file_path, config, seq_len: (
+            fake_model,
+            FakeContext(),
+            7.5,
+        ),
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "prepare_benchmark_samples",
+        lambda **kwargs: [
+            {
+                "input_ids": torch.ones((1, 64), dtype=torch.long),
+                "token_type_ids": torch.zeros((1, 64), dtype=torch.long),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "estimate_encoder_forward_flops",
+        lambda model_config, seq_len: 1.0e9,
+    )
+
+    perf_values = iter([0.0, 0.010, 0.020, 0.030])
+    monkeypatch.setattr(npu_inference.time, "perf_counter", lambda: next(perf_values))
+
+    @contextmanager
+    def fake_power_monitor(*args, **kwargs):
+        yield SimpleNamespace(
+            stats=empty_power_stats(),
+        )
+
+    monkeypatch.setattr(npu_inference, "create_power_monitor", fake_power_monitor)
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model_type="bert",
+            vocab_size=30522,
+            pad_token_id=0,
+        ),
+    )
+    topology = FakeTopology(
+        topology_id="seq32_kv64__ps2_ph1_pffn4",
+        family_id="seq32_kv64",
+        seq_tile=32,
+        kv_seq_tile=64,
+        parallel_seq=2,
+        parallel_heads=1,
+        parallel_ffn=4,
+        compute_tile_count=28,
+        utilization_fraction=0.875,
+    )
+
+    result = npu_inference.benchmark_with_config(
+        weights_file_path="model.safetensors",
+        config_file_path="config.json",
+        config=config,
+        seq_len=64,
+        texts=["sample"],
+        warmup_runs=1,
+        runs_per_sample=2,
+        benchmark_mode="synthetic_dense",
+        topology=topology,
+        power_backend="none",
+        power_interval_sec=0.5,
+        power_log_path=None,
+    )
+
+    assert fake_model.warmup_calls == 1
+    assert fake_model.timed_calls == 2
+    assert result["benchmark_mode"] == "synthetic_dense"
+    assert result["execution_mode"] == "encoder_pipeline"
+    assert result["compile_setup_time_ms"] == pytest.approx(7.5)
+    assert result["cached_steady_state_avg_latency_ms"] == pytest.approx(10.0)
+    assert result["topology_selection_time_ms"] == ""
+    assert result["topology_cache_status"] == ""
+    assert result["avg_embedding_latency_ms"] == pytest.approx(1.0)
+    assert result["avg_qkv_projection_latency_ms"] == pytest.approx(2.0)
+    assert result["avg_encoder_pipeline_latency_ms"] == pytest.approx(3.0)
+    assert result["avg_latency_ms"] == pytest.approx(10.0)
+
+
+def test_resolve_topology_reports_cache_hit_metadata(monkeypatch):
+    fake_topology = SimpleNamespace(topology_id="seq32_kv64__ps2_ph1_pffn4")
+    args = SimpleNamespace(
+        config_file_path="config.json",
+        candidate_topologies=None,
+        topology_cache="cache.json",
+        topology_policy="cache",
+        weights_file_path="model.safetensors",
+        benchmark_mode="synthetic_dense",
+    )
+
+    monkeypatch.setattr(
+        npu_inference,
+        "load_encoder_pipeline_config",
+        lambda config_file_path, seq_len: "config",
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "current_topology_from_config",
+        lambda config, seq_len: fake_topology,
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "parse_candidate_topology_ids",
+        lambda raw_ids: None,
+    )
+    monkeypatch.setattr(npu_inference, "load_topology_cache", lambda path: {})
+    monkeypatch.setattr(
+        npu_inference,
+        "topology_cache_key",
+        lambda config, seq_len: "cache-key",
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "find_cached_topology",
+        lambda cache_data, config, seq_len, candidate_ids=None: fake_topology,
+    )
+
+    perf_values = iter([1.0, 1.025])
+    monkeypatch.setattr(npu_inference.time, "perf_counter", lambda: next(perf_values))
+
+    topology, metadata = resolve_topology(args, 64, ["sample"])
+
+    assert topology is fake_topology
+    assert metadata["topology_cache_status"] == "cache_hit"
+    assert metadata["topology_selection_time_ms"] == pytest.approx(25.0)
+
+
+def test_resolve_topology_reports_cache_miss_metadata(monkeypatch):
+    fake_topology = SimpleNamespace(
+        topology_id="seq32_kv64__ps2_ph1_pffn4",
+        to_runtime_dict=lambda: {"topology_id": "seq32_kv64__ps2_ph1_pffn4"},
+    )
+    saved = {}
+    args = SimpleNamespace(
+        config_file_path="config.json",
+        candidate_topologies=None,
+        topology_cache="cache.json",
+        topology_policy="cache",
+        weights_file_path="model.safetensors",
+        benchmark_mode="synthetic_dense",
+        autotune_warmup_runs=2,
+        autotune_runs=5,
+    )
+
+    monkeypatch.setattr(
+        npu_inference,
+        "load_encoder_pipeline_config",
+        lambda config_file_path, seq_len: "config",
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "current_topology_from_config",
+        lambda config, seq_len: fake_topology,
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "parse_candidate_topology_ids",
+        lambda raw_ids: None,
+    )
+    monkeypatch.setattr(npu_inference, "load_topology_cache", lambda path: {})
+    monkeypatch.setattr(
+        npu_inference,
+        "topology_cache_key",
+        lambda config, seq_len: "cache-key",
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "find_cached_topology",
+        lambda cache_data, config, seq_len, candidate_ids=None: None,
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "autotune_topology",
+        lambda **kwargs: fake_topology,
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "save_topology_cache",
+        lambda path, cache_data: saved.update(cache_data),
+    )
+
+    perf_values = iter([2.0, 2.125])
+    monkeypatch.setattr(npu_inference.time, "perf_counter", lambda: next(perf_values))
+
+    topology, metadata = resolve_topology(args, 64, ["sample"])
+
+    assert topology is fake_topology
+    assert metadata["topology_cache_status"] == "cache_miss"
+    assert metadata["topology_selection_time_ms"] == pytest.approx(125.0)
+    assert saved["cache-key"] == {"topology_id": "seq32_kv64__ps2_ph1_pffn4"}
+
+
+def test_select_autotune_topology_prefers_higher_utilization_within_one_percent():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    low_util = next(
+        topology
+        for topology in supported_topologies_for_seq_len(
+            config,
+            128,
+            candidate_ids=parse_candidate_topology_ids("seq32_kv64__ps1_ph1_pffn1"),
+        )
+        if topology.topology_id == "seq32_kv64__ps1_ph1_pffn1"
+    )
+    high_util = next(
+        topology
+        for topology in supported_topologies_for_seq_len(
+            config,
+            128,
+            candidate_ids=parse_candidate_topology_ids("seq32_kv64__ps4_ph1_pffn1"),
+        )
+        if topology.topology_id == "seq32_kv64__ps4_ph1_pffn1"
+    )
+
+    selected = select_autotune_topology(
+        [
+            {"topology": low_util, "avg_latency_ms": 100.0},
+            {"topology": high_util, "avg_latency_ms": 100.8},
+        ],
+        preferred_family_id="seq32_kv64",
+    )
+
+    assert selected["topology"].topology_id == "seq32_kv64__ps4_ph1_pffn1"
+
+
+def test_select_autotune_topology_prefers_latency_outside_one_percent_band():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    low_util = next(
+        topology
+        for topology in supported_topologies_for_seq_len(
+            config,
+            128,
+            candidate_ids=parse_candidate_topology_ids("seq32_kv64__ps1_ph1_pffn1"),
+        )
+        if topology.topology_id == "seq32_kv64__ps1_ph1_pffn1"
+    )
+    high_util = next(
+        topology
+        for topology in supported_topologies_for_seq_len(
+            config,
+            128,
+            candidate_ids=parse_candidate_topology_ids("seq32_kv64__ps4_ph1_pffn1"),
+        )
+        if topology.topology_id == "seq32_kv64__ps4_ph1_pffn1"
+    )
+
+    selected = select_autotune_topology(
+        [
+            {"topology": low_util, "avg_latency_ms": 100.0},
+            {"topology": high_util, "avg_latency_ms": 102.0},
+        ],
+        preferred_family_id="seq32_kv64",
+    )
+
+    assert selected["topology"].topology_id == "seq32_kv64__ps1_ph1_pffn1"
+
+
+def test_select_autotune_topology_prefers_config_family_when_latency_and_utilization_tie():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    default_family_topology = next(
+        topology
+        for topology in supported_topologies_for_seq_len(
+            config,
+            128,
+            candidate_ids=parse_candidate_topology_ids("seq32_kv64__ps2_ph1_pffn4"),
+        )
+        if topology.family_id == "seq32_kv64"
+    )
+    mirrored_family_topology = next(
+        topology
+        for topology in supported_topologies_for_seq_len(
+            config,
+            128,
+            candidate_ids=parse_candidate_topology_ids("seq64_kv32__ps2_ph1_pffn4"),
+        )
+        if topology.family_id == "seq64_kv32"
+    )
+
+    selected = select_autotune_topology(
+        [
+            {"topology": mirrored_family_topology, "avg_latency_ms": 100.0},
+            {"topology": default_family_topology, "avg_latency_ms": 100.0},
+        ],
+        preferred_family_id="seq32_kv64",
+    )
+
+    assert selected["topology"].topology_id == "seq32_kv64__ps2_ph1_pffn4"
 
 
 def test_automated_benchmark_enumerate_cases_multi_study_skips_npu_unready():
@@ -1122,6 +1837,7 @@ def test_automated_benchmark_enumerate_cases_multi_study_skips_npu_unready():
         models_root=None,
         modes="cpu,npu,igpu",
         seq_lens="64",
+        benchmark_mode=DEFAULT_BENCHMARK_MODE,
         cpu_thread_counts="1",
         npu_num_threads=1,
         igpu_num_threads=1,
@@ -1139,6 +1855,58 @@ def test_automated_benchmark_enumerate_cases_multi_study_skips_npu_unready():
     assert skipped_ids == set()
 
 
+def test_automated_benchmark_enumerate_cases_adds_nondefault_benchmark_mode_suffix():
+    args = SimpleNamespace(
+        weights_file_path=None,
+        config_file_path=None,
+        study_id="bert-base-uncased",
+        study_ids=None,
+        study_manifest=str(STUDY_MANIFEST),
+        models_root=None,
+        modes="cpu,igpu",
+        seq_lens="64",
+        benchmark_mode="model_valid",
+        cpu_thread_counts="1",
+        npu_num_threads=1,
+        igpu_num_threads=1,
+    )
+
+    cases, skipped = enumerate_cases(args)
+    case_ids = {case["case_id"] for case in cases}
+
+    assert "bert-base-uncased_cpu_model_valid_seq64_1t" in case_ids
+    assert "bert-base-uncased_igpu_model_valid_seq64" in case_ids
+    assert skipped == []
+
+
+def test_automated_benchmark_enumerate_cases_adds_no_bias_suffix_for_cpu_and_igpu():
+    args = SimpleNamespace(
+        weights_file_path=None,
+        config_file_path=None,
+        study_id="bert-base-uncased",
+        study_ids=None,
+        study_manifest=str(STUDY_MANIFEST),
+        models_root=None,
+        modes="cpu,igpu,npu",
+        seq_lens="64",
+        benchmark_mode=DEFAULT_BENCHMARK_MODE,
+        disable_all_biases=True,
+        cpu_thread_counts="1",
+        npu_num_threads=1,
+        igpu_num_threads=1,
+        npu_topology_policy="cache",
+        npu_candidate_topologies=None,
+    )
+
+    cases, skipped = enumerate_cases(args)
+    case_ids = {case["case_id"] for case in cases}
+
+    assert "bert-base-uncased_cpu_nobias_seq64_1t" in case_ids
+    assert "bert-base-uncased_igpu_nobias_seq64" in case_ids
+    assert "bert-base-uncased_npu_seq64" in case_ids
+    assert skipped == []
+
+
 def test_automated_benchmark_enumerate_cases_include_supported_npu_seq_len_16384():
     args = SimpleNamespace(
         weights_file_path=str(WEIGHTS_FILE),
@@ -1149,6 +1917,7 @@ def test_automated_benchmark_enumerate_cases_include_supported_npu_seq_len_16384
         models_root=None,
         modes="npu",
         seq_lens="64,16384",
+        benchmark_mode=DEFAULT_BENCHMARK_MODE,
         cpu_thread_counts="1",
         npu_num_threads=1,
         igpu_num_threads=1,
@@ -1301,6 +2070,72 @@ def test_case_command_preserves_auto_power_backend_for_cpu(tmp_path):
     assert value_for_flag("--power-log-path").endswith("cpu_power.log")
 
 
+def test_case_command_passes_disable_all_biases_only_to_cpu_and_igpu(tmp_path):
+    args = SimpleNamespace(
+        num_samples=1,
+        warmup_runs=10,
+        runs_per_sample=100,
+        runs_per_sample_overrides={},
+        study_manifest=None,
+        models_root=None,
+        npu_topology_policy="cache",
+        npu_topology_cache=str(tmp_path / "topology_cache.json"),
+        npu_autotune_warmup_runs=2,
+        npu_autotune_runs=5,
+        npu_autotune_runs_overrides={},
+        npu_candidate_topologies=None,
+        igpu_dtype="bfloat16",
+        igpu_device_index=0,
+        disable_all_biases=True,
+        power_interval_sec=0.5,
+    )
+    cpu_case = {
+        "case_id": "cpu_seq64_12t",
+        "study_id": "",
+        "mode": "cpu",
+        "seq_len": 64,
+        "num_threads": 12,
+        "weights_file_path": str(WEIGHTS_FILE),
+        "config_file_path": str(CONFIG_FILE),
+    }
+    igpu_case = {
+        **cpu_case,
+        "case_id": "igpu_seq64",
+        "mode": "igpu",
+    }
+    npu_case = {
+        **cpu_case,
+        "case_id": "npu_seq64",
+        "mode": "npu",
+    }
+
+    cpu_command = case_command(
+        args,
+        cpu_case,
+        tmp_path / "cpu.csv",
+        "none",
+        None,
+    )
+    igpu_command = case_command(
+        args,
+        igpu_case,
+        tmp_path / "igpu.csv",
+        "none",
+        None,
+    )
+    npu_command = case_command(
+        args,
+        npu_case,
+        tmp_path / "npu.csv",
+        "none",
+        None,
+    )
+
+    assert "--disable-all-biases" in cpu_command
+    assert "--disable-all-biases" in igpu_command
+    assert "--disable-all-biases" not in npu_command
+
+
 @pytest.mark.parametrize("seq_len", [64, 16384], ids=["64", "16384"])
 def test_npu_case_skip_reason_accepts_supported_seq_len(seq_len):
     args = SimpleNamespace(
@@ -1343,10 +2178,13 @@ def test_large_model_npu_topologies_are_discoverable(config_path):
         for topology in supported_topologies_for_seq_len(seq16384_config, 16384)
     }
 
-    assert "1ps" in topo_ids_64
-    assert "1ps_4ph" in topo_ids_64
-    assert "4ps" in topo_ids_128
-    assert "4ps" in topo_ids_16384
+    assert "seq32_kv64__ps1_ph1_pffn1" in topo_ids_64
+    assert "seq64_kv32__ps1_ph1_pffn1" in topo_ids_64
+    assert "seq32_kv64__ps1_ph4_pffn1" in topo_ids_64
+    assert "seq32_kv64__ps4_ph1_pffn1" in topo_ids_128
+    assert "seq64_kv32__ps2_ph1_pffn1" in topo_ids_128
+    assert "seq32_kv64__ps4_ph1_pffn1" in topo_ids_16384
+    assert "seq64_kv32__ps4_ph1_pffn1" in topo_ids_16384
 
 
 def test_topology_cache_is_shape_aware_for_large_models():
@@ -1355,15 +2193,55 @@ def test_topology_cache_is_shape_aware_for_large_models():
         str(TEST_DIR / "config" / "config_bert_large.json"), 64
     )
 
-    legacy_cache = {"64": current_topology_from_config(base_config)}
+    legacy_cache = {
+        "64": current_topology_from_config(base_config, 64).to_runtime_dict()
+    }
     assert find_cached_topology(legacy_cache, large_config, 64) is None
 
-    large_topology = current_topology_from_config(large_config)
-    shape_aware_cache = {topology_cache_key(large_config, 64): large_topology}
+    large_topology = current_topology_from_config(large_config, 64)
+    shape_aware_cache = {
+        topology_cache_key(large_config, 64): large_topology.to_runtime_dict()
+    }
     cached = find_cached_topology(shape_aware_cache, large_config, 64)
 
     assert cached is not None
     assert topology_id(cached) == topology_id(large_topology)
+
+
+def test_legacy_seq_len_cache_compatibility_matches_same_shape_signature():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 64)
+    topology = current_topology_from_config(config, 64)
+    legacy_cache = {"64": topology.to_runtime_dict()}
+
+    cached = find_cached_topology(legacy_cache, config, 64)
+
+    assert cached is not None
+    assert topology_id(cached) == topology.topology_id
+
+
+def test_topology_cache_matches_mirrored_family_entries_and_legacy_seq_len_keys():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    mirrored_topology = next(
+        topology
+        for topology in supported_topologies_for_seq_len(
+            config,
+            128,
+            candidate_ids=parse_candidate_topology_ids("seq64_kv32__ps2_ph1_pffn4"),
+        )
+        if topology.family_id == "seq64_kv32"
+    )
+
+    family_aware_cache = {
+        topology_cache_key(config, 128): mirrored_topology.to_runtime_dict()
+    }
+    legacy_cache = {"128": mirrored_topology.to_runtime_dict()}
+
+    assert topology_id(find_cached_topology(family_aware_cache, config, 128)) == (
+        mirrored_topology.topology_id
+    )
+    assert topology_id(find_cached_topology(legacy_cache, config, 128)) == (
+        mirrored_topology.topology_id
+    )
 
 
 def test_bert_automated_benchmark_job_wrapper_study_ids_smoke(tmp_path):
@@ -1598,7 +2476,7 @@ def test_plot_benchmark_results_smoke(tmp_path):
             "shape": "(1, 64, 768)",
             "estimated_flops_per_inference": "1.000000e+09",
             "throughput_flops_per_sec": "5.000000e+10",
-            "topology_id": "2ps_4pffn",
+            "topology_id": "seq32_kv64__ps2_ph1_pffn4",
             "parallel_seq": "2",
             "parallel_heads": "1",
             "parallel_ffn": "4",
@@ -1639,6 +2517,53 @@ def test_plot_benchmark_results_smoke(tmp_path):
             "benchmark_csv": "toy_npu.csv",
         },
     ]
+    peak_fields = {
+        "chip_sku": "AMD Ryzen AI 9 HX 370",
+        "chip_family": "Ryzen AI 9 HX",
+        "chip_codename": "Strix Point",
+        "bytes_model_version": "v1",
+        "bytes_model_weights_policy": "resident",
+        "dtype_bytes": "",
+        "estimated_bytes_per_inference": "1.953125e+07",
+        "backend_peak_ops_per_sec": "",
+        "primary_peak_source_kind": "measured",
+        "backend_peak_source_note": "synthetic calibration",
+        "backend_pct_of_peak": "",
+        "ddr_peak_bytes_per_sec": "1.280000e+11",
+        "ddr_peak_source_kind": "measured",
+        "operational_intensity_flops_per_byte": "51.200000",
+        "roofline_bound_ops_per_sec": "4.000000e+11",
+        "roofline_pct": "",
+        "official_peak_ops_per_sec": "",
+        "derived_theoretical_peak_ops_per_sec": "",
+        "measured_peak_ops_per_sec": "",
+    }
+    per_mode_peak_fields = {
+        "cpu": {
+            "dtype_bytes": "4",
+            "backend_peak_ops_per_sec": "8.000000e+10",
+            "backend_pct_of_peak": "0.277778",
+            "roofline_pct": "0.250000",
+            "measured_peak_ops_per_sec": "8.000000e+10",
+        },
+        "igpu": {
+            "dtype_bytes": "2",
+            "backend_peak_ops_per_sec": "2.500000e+11",
+            "backend_pct_of_peak": "0.400000",
+            "roofline_pct": "0.781250",
+            "measured_peak_ops_per_sec": "2.500000e+11",
+        },
+        "npu": {
+            "dtype_bytes": "2",
+            "backend_peak_ops_per_sec": "4.000000e+11",
+            "backend_pct_of_peak": "0.125000",
+            "roofline_pct": "0.125000",
+            "measured_peak_ops_per_sec": "4.000000e+11",
+        },
+    }
+    for row in rows:
+        row.update(peak_fields)
+        row.update(per_mode_peak_fields[row["mode"]])
 
     with result_csv.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=rows[0].keys())
@@ -1673,6 +2598,9 @@ def test_plot_benchmark_results_smoke(tmp_path):
     assert (output_dir / "grouped_throughput_by_backend.png").exists()
     assert (output_dir / "grouped_power_by_backend.png").exists()
     assert (output_dir / "grouped_efficiency_by_backend.png").exists()
+    assert (output_dir / "grouped_pct_of_peak_by_backend.png").exists()
+    assert (output_dir / "grouped_roofline_pct_by_backend.png").exists()
+    assert (output_dir / "roofline_overview.png").exists()
     assert (output_dir / "toy-model_overview.png").exists()
     assert (output_dir / "toy-model_cpu_threads.png").exists()
     assert (output_dir / "index.html").exists()

@@ -12,14 +12,17 @@ from types import SimpleNamespace
 
 from benchmark_common import (
     DEFAULT_BENCHMARK_SEQ_LENS,
+    add_benchmark_mode_args,
     add_cooldown_args,
     build_benchmark_texts,
     cooldown_before_benchmark,
     configure_cpu_thread_env,
+    default_execution_mode_for_backend,
     detect_max_physical_core_count,
-    encode_benchmark_texts,
     parse_seq_lens,
+    prepare_benchmark_samples,
     summarize_latency_measurements,
+    validate_benchmark_mode_request,
     write_results_csv,
 )
 from benchmark_power import (
@@ -41,29 +44,36 @@ from model_support import (
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
-_TOPOLOGY_PLACEMENTS = None
+_TOPOLOGY_MODULE = None
 
 
-def load_encoder_pipeline_topology_placements():
-    global _TOPOLOGY_PLACEMENTS
-    if _TOPOLOGY_PLACEMENTS is not None:
-        return _TOPOLOGY_PLACEMENTS
+def load_encoder_pipeline_topology_module():
+    global _TOPOLOGY_MODULE
+    if _TOPOLOGY_MODULE is not None:
+        return _TOPOLOGY_MODULE
 
-    placements_path = (
-        REPO_ROOT / "iron" / "operators" / "encoder_pipeline" / "placements.py"
+    topology_path = (
+        REPO_ROOT / "iron" / "operators" / "encoder_pipeline" / "topology.py"
     )
     spec = importlib.util.spec_from_file_location(
-        "_iron_encoder_pipeline_placements",
-        placements_path,
+        "_iron_encoder_pipeline_topology",
+        topology_path,
     )
     if spec is None or spec.loader is None:
         raise ImportError(
-            f"Could not load encoder_pipeline placements from {placements_path}"
+            f"Could not load encoder_pipeline topology helpers from {topology_path}"
         )
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    _TOPOLOGY_PLACEMENTS = module.TOPOLOGY_PLACEMENTS
-    return _TOPOLOGY_PLACEMENTS
+    _TOPOLOGY_MODULE = module
+    return _TOPOLOGY_MODULE
+
+
+def load_encoder_pipeline_topology_placements():
+    return (
+        load_encoder_pipeline_topology_module().load_encoder_pipeline_topology_placements()
+    )
 
 
 def parse_args():
@@ -161,7 +171,8 @@ def parse_args():
         default=None,
         help=(
             "Optional comma-separated topology ids to consider during autotune, "
-            "for example: 2ps,4ps,2ps_2ph,2ps_2pffn"
+            "for example legacy aliases like 2ps,4ps,2ps_2ph or canonical ids "
+            "like seq32_kv64__ps2_ph1_pffn4"
         ),
     )
     parser.add_argument(
@@ -176,6 +187,7 @@ def parse_args():
         default=5,
         help="Timed runs per candidate topology during autotune.",
     )
+    add_benchmark_mode_args(parser)
     add_power_measurement_args(parser)
     add_cooldown_args(parser)
     return parser.parse_args()
@@ -221,75 +233,24 @@ def load_encoder_pipeline_config(config_file_path, seq_len):
     return config
 
 
-def current_topology_from_config(config):
-    aie_cfg = config.aie_config
-    emb_tile = int(getattr(aie_cfg, "encoder_pipeline_emb_tile", 96))
-    ffn_tile = int(getattr(aie_cfg, "encoder_pipeline_ffn_tile", 64))
-    proj_acc_depth = int(
-        getattr(
-            aie_cfg,
-            "encoder_pipeline_proj_acc_depth",
-            config.model_config.hidden_size // emb_tile,
-        )
-    )
-    return {
-        "parallel_seq": int(getattr(aie_cfg, "encoder_pipeline_parallel_seq", 1)),
-        "parallel_heads": int(getattr(aie_cfg, "encoder_pipeline_parallel_heads", 1)),
-        "parallel_ffn": int(getattr(aie_cfg, "encoder_pipeline_parallel_ffn", 1)),
-        "seq_tile": int(getattr(aie_cfg, "encoder_pipeline_seq_tile", 32)),
-        "kv_seq_tile": int(getattr(aie_cfg, "encoder_pipeline_kv_seq_tile", 64)),
-        "emb_tile": emb_tile,
-        "ffn_tile": ffn_tile,
-        "proj_acc_depth": proj_acc_depth,
-        "o_proj_acc_group_size": int(
-            getattr(aie_cfg, "encoder_pipeline_o_proj_acc_group_size", 1)
-        ),
-        "ffn_intermediate_size": int(
-            getattr(
-                aie_cfg,
-                "encoder_pipeline_ffn_intermediate_size",
-                config.model_config.intermediate_size,
-            )
-        ),
-    }
+def current_topology_from_config(config, seq_len):
+    return load_encoder_pipeline_topology_module().topology_from_config(config, seq_len)
 
 
 def topology_id(topology):
-    parts = [f"{topology['parallel_seq']}ps"]
-    if topology["parallel_heads"] > 1:
-        parts.append(f"{topology['parallel_heads']}ph")
-    if topology["parallel_ffn"] > 1:
-        parts.append(f"{topology['parallel_ffn']}pffn")
-    return "_".join(parts)
+    return load_encoder_pipeline_topology_module().topology_id(topology)
 
 
 def parse_candidate_topology_ids(raw_ids):
-    if raw_ids is None:
-        return None
-    parsed = []
-    for token in raw_ids.split(","):
-        token = token.strip()
-        if token:
-            parsed.append(token)
-    return set(parsed) if parsed else None
+    return load_encoder_pipeline_topology_module().parse_candidate_topology_filters(
+        raw_ids
+    )
 
 
 def apply_topology_to_config(config, topology):
-    config.aie_config.encoder_pipeline_seq_tile = topology["seq_tile"]
-    config.aie_config.encoder_pipeline_kv_seq_tile = topology["kv_seq_tile"]
-    config.aie_config.encoder_pipeline_emb_tile = topology["emb_tile"]
-    config.aie_config.encoder_pipeline_ffn_tile = topology["ffn_tile"]
-    config.aie_config.encoder_pipeline_parallel_seq = topology["parallel_seq"]
-    config.aie_config.encoder_pipeline_parallel_heads = topology["parallel_heads"]
-    config.aie_config.encoder_pipeline_proj_acc_depth = topology["proj_acc_depth"]
-    config.aie_config.encoder_pipeline_o_proj_acc_group_size = topology[
-        "o_proj_acc_group_size"
-    ]
-    config.aie_config.encoder_pipeline_parallel_ffn = topology["parallel_ffn"]
-    config.aie_config.encoder_pipeline_ffn_intermediate_size = topology[
-        "ffn_intermediate_size"
-    ]
-    return config
+    return load_encoder_pipeline_topology_module().apply_topology_to_config(
+        config, topology
+    )
 
 
 def load_topology_cache(cache_path):
@@ -309,106 +270,34 @@ def save_topology_cache(cache_path, cache_data):
 
 
 def topology_signature(topology):
-    try:
-        return (
-            int(topology["parallel_seq"]),
-            int(topology["parallel_heads"]),
-            int(topology["parallel_ffn"]),
-            int(topology["seq_tile"]),
-            int(topology["kv_seq_tile"]),
-            int(topology["emb_tile"]),
-            int(topology["ffn_tile"]),
-            int(topology["proj_acc_depth"]),
-            int(topology["o_proj_acc_group_size"]),
-            int(topology["ffn_intermediate_size"]),
-        )
-    except (KeyError, TypeError, ValueError):
-        return None
+    return load_encoder_pipeline_topology_module().topology_signature(topology)
 
 
 def topology_cache_key(config, seq_len):
-    current = current_topology_from_config(config)
-    d = config.model_config.hidden_size // config.model_config.num_attention_heads
-    return (
-        "shape:"
-        f"h{int(config.model_config.num_attention_heads)}"
-        f"_s{int(seq_len)}"
-        f"_d{int(d)}"
-        f"_st{current['seq_tile']}"
-        f"_kt{current['kv_seq_tile']}"
-        f"_et{current['emb_tile']}"
-        f"_ft{current['ffn_tile']}"
-        f"_pa{current['proj_acc_depth']}"
-        f"_og{current['o_proj_acc_group_size']}"
-        f"_is{current['ffn_intermediate_size']}"
-    )
+    return load_encoder_pipeline_topology_module().topology_cache_key(config, seq_len)
 
 
 def supported_topologies_for_seq_len(config, seq_len, candidate_ids=None):
-    topology_placements = load_encoder_pipeline_topology_placements()
-    current = current_topology_from_config(config)
-    d = config.model_config.hidden_size // config.model_config.num_attention_heads
-    matches = []
-    for key in topology_placements:
-        if (
-            key[0] == config.model_config.num_attention_heads
-            and key[1] == seq_len
-            and key[2] == d
-            and key[3] == current["seq_tile"]
-            and key[4] == current["kv_seq_tile"]
-            and key[5] == current["emb_tile"]
-            and key[6] == current["ffn_tile"]
-            and key[9] == current["proj_acc_depth"]
-            and key[10] == current["o_proj_acc_group_size"]
-            and key[12] == current["ffn_intermediate_size"]
-        ):
-            topology = {
-                "parallel_seq": key[7],
-                "parallel_heads": key[8],
-                "parallel_ffn": key[11],
-                "seq_tile": key[3],
-                "kv_seq_tile": key[4],
-                "emb_tile": key[5],
-                "ffn_tile": key[6],
-                "proj_acc_depth": key[9],
-                "o_proj_acc_group_size": key[10],
-                "ffn_intermediate_size": key[12],
-            }
-            if candidate_ids is not None and topology_id(topology) not in candidate_ids:
-                continue
-            matches.append(topology)
+    return load_encoder_pipeline_topology_module().supported_topologies_for_seq_len(
+        config, seq_len, candidate_ids=candidate_ids
+    )
 
-    matches.sort(
-        key=lambda topo: (
-            topo["parallel_seq"],
-            topo["parallel_heads"],
-            topo["parallel_ffn"],
+
+def supported_topologies_for_config_family(config, seq_len):
+    return (
+        load_encoder_pipeline_topology_module().supported_topologies_for_config_family(
+            config, seq_len
         )
     )
-    if not matches:
-        requested = (
-            sorted(candidate_ids) if candidate_ids is not None else "all supported"
-        )
-        raise RuntimeError(
-            f"No supported encoder_pipeline topologies found for seq_len={seq_len} "
-            f"with candidate filter {requested}"
-        )
-    return matches
 
 
 def find_cached_topology(cache_data, config, seq_len, candidate_ids=None):
-    supported = supported_topologies_for_seq_len(
-        config, seq_len, candidate_ids=candidate_ids
+    return load_encoder_pipeline_topology_module().find_cached_topology(
+        cache_data,
+        config,
+        seq_len,
+        candidate_ids=candidate_ids,
     )
-    supported_by_signature = {
-        topology_signature(topology): topology for topology in supported
-    }
-    for cache_key in (topology_cache_key(config, seq_len), str(seq_len)):
-        cached = cache_data.get(cache_key)
-        signature = topology_signature(cached)
-        if signature in supported_by_signature:
-            return supported_by_signature[signature]
-    return None
 
 
 def reset_default_context():
@@ -428,6 +317,7 @@ def build_npu_encoder_model(weights_file_path, config, seq_len):
     from iron.common import AIEOperatorBase
     from src.model import EncoderBackbone
 
+    setup_start = time.perf_counter()
     reset_default_context()
     model = EncoderBackbone(config, seq_len=seq_len)
 
@@ -446,17 +336,20 @@ def build_npu_encoder_model(weights_file_path, config, seq_len):
     context = AIEOperatorBase.get_default_context()
     context.compile_all()
     context.prepare_runtime()
-    return model, context
+    setup_end = time.perf_counter()
+    return model, context, (setup_end - setup_start) * 1000.0
 
 
 def benchmark_with_config(
     *,
     weights_file_path,
+    config_file_path,
     config,
     seq_len,
     texts,
     warmup_runs,
     runs_per_sample,
+    benchmark_mode,
     topology,
     power_backend="none",
     power_interval_sec=0.5,
@@ -464,16 +357,19 @@ def benchmark_with_config(
 ):
     import torch
 
-    model, context = build_npu_encoder_model(
+    model, context, compile_setup_time_ms = build_npu_encoder_model(
         weights_file_path=weights_file_path,
         config=config,
         seq_len=seq_len,
     )
-    encoded_samples = encode_benchmark_texts(
+    encoded_samples = prepare_benchmark_samples(
+        benchmark_mode=benchmark_mode,
         texts=texts,
         seq_len=seq_len,
         vocab_size=config.model_config.vocab_size,
         pad_token_id=config.model_config.pad_token_id,
+        weights_file_path=weights_file_path,
+        config_file_path=config_file_path,
     )
 
     with torch.inference_mode():
@@ -486,6 +382,9 @@ def benchmark_with_config(
                 )
 
         latencies_ms = []
+        embedding_latencies_ms = []
+        qkv_projection_latencies_ms = []
+        encoder_pipeline_latencies_ms = []
         with create_power_monitor(
             power_backend,
             power_interval_sec,
@@ -494,13 +393,22 @@ def benchmark_with_config(
             for sample in encoded_samples:
                 for _ in range(runs_per_sample):
                     start = time.perf_counter()
-                    output = model(
+                    output, stage_timings = model.forward_with_stage_timings(
                         input_ids=sample["input_ids"],
                         token_type_ids=sample["token_type_ids"],
                         attention_mask=None,
                     )
                     end = time.perf_counter()
                     latencies_ms.append((end - start) * 1000.0)
+                    embedding_latencies_ms.append(
+                        stage_timings["embedding_sec"] * 1000.0
+                    )
+                    qkv_projection_latencies_ms.append(
+                        stage_timings["qkv_projection_sec"] * 1000.0
+                    )
+                    encoder_pipeline_latencies_ms.append(
+                        stage_timings["encoder_pipeline_sec"] * 1000.0
+                    )
 
     context.device_manager.reset()
     latency_stats = summarize_latency_measurements(
@@ -513,13 +421,52 @@ def benchmark_with_config(
         "model_type": str(config.model_config.model_type),
         "shape": tuple(output.shape),
         "dtype": str(model.dtype).replace("torch.", ""),
+        "benchmark_mode": benchmark_mode,
+        "execution_mode": default_execution_mode_for_backend("npu"),
         "topology_id": topology_id(topology),
-        "parallel_seq": topology["parallel_seq"],
-        "parallel_heads": topology["parallel_heads"],
-        "parallel_ffn": topology["parallel_ffn"],
+        "parallel_seq": topology.parallel_seq,
+        "parallel_heads": topology.parallel_heads,
+        "parallel_ffn": topology.parallel_ffn,
+        "compute_tile_count": topology.compute_tile_count,
+        "compute_tile_utilization_fraction": topology.utilization_fraction,
+        "compile_setup_time_ms": compile_setup_time_ms,
+        "topology_selection_time_ms": "",
+        "topology_cache_status": "",
+        "cached_steady_state_avg_latency_ms": latency_stats["avg_latency_ms"],
+        "avg_embedding_latency_ms": (
+            sum(embedding_latencies_ms) / len(embedding_latencies_ms)
+        ),
+        "avg_qkv_projection_latency_ms": (
+            sum(qkv_projection_latencies_ms) / len(qkv_projection_latencies_ms)
+        ),
+        "avg_encoder_pipeline_latency_ms": (
+            sum(encoder_pipeline_latencies_ms) / len(encoder_pipeline_latencies_ms)
+        ),
         "power_stats": power_monitor.stats,
         **latency_stats,
     }
+
+
+def select_autotune_topology(candidate_results, preferred_family_id):
+    if not candidate_results:
+        raise RuntimeError("Expected at least one viable autotune candidate")
+
+    best_latency_ms = min(
+        candidate_result["avg_latency_ms"] for candidate_result in candidate_results
+    )
+    latency_band = [
+        candidate_result
+        for candidate_result in candidate_results
+        if candidate_result["avg_latency_ms"] <= (best_latency_ms * 1.01)
+    ]
+    return max(
+        latency_band,
+        key=lambda candidate_result: (
+            candidate_result["topology"].compute_tile_count,
+            int(candidate_result["topology"].family_id == preferred_family_id),
+            candidate_result["topology"].topology_id,
+        ),
+    )
 
 
 def autotune_topology(
@@ -532,6 +479,7 @@ def autotune_topology(
     candidate_ids,
     warmup_runs,
     runs_per_sample,
+    benchmark_mode,
 ):
     base_config = load_encoder_pipeline_config(config_file_path, seq_len)
     candidates = supported_topologies_for_seq_len(
@@ -540,8 +488,8 @@ def autotune_topology(
     if len(candidates) == 1:
         return candidates[0]
 
-    best_topology = None
-    best_latency_ms = None
+    candidate_results = []
+    preferred_family_id = current_topology_from_config(base_config, seq_len).family_id
     for topology in candidates:
         cooldown_before_benchmark(
             args=args,
@@ -549,7 +497,9 @@ def autotune_topology(
             label=f"NPU autotune seq_len={seq_len} topology={topology_id(topology)}",
         )
         print(
-            f"Autotune candidate: seq_len={seq_len} topology={topology_id(topology)}",
+            f"Autotune candidate: seq_len={seq_len} topology={topology_id(topology)} "
+            f"compute_tiles={topology.compute_tile_count} "
+            f"utilization={topology.utilization_fraction:.3f}",
             flush=True,
         )
         tuned_config = load_encoder_pipeline_config(config_file_path, seq_len)
@@ -557,11 +507,13 @@ def autotune_topology(
         try:
             result = benchmark_with_config(
                 weights_file_path=weights_file_path,
+                config_file_path=config_file_path,
                 config=tuned_config,
                 seq_len=seq_len,
                 texts=texts,
                 warmup_runs=warmup_runs,
                 runs_per_sample=runs_per_sample,
+                benchmark_mode=benchmark_mode,
                 topology=topology,
             )
         except Exception as exc:
@@ -573,26 +525,44 @@ def autotune_topology(
             continue
         print(
             f"Autotune result: seq_len={seq_len} topology={result['topology_id']} "
-            f"avg={result['avg_latency_ms']:.3f} ms",
+            f"avg={result['avg_latency_ms']:.3f} ms "
+            f"compute_tiles={result['compute_tile_count']} "
+            f"utilization={result['compute_tile_utilization_fraction']:.3f}",
             flush=True,
         )
-        if best_latency_ms is None or result["avg_latency_ms"] < best_latency_ms:
-            best_latency_ms = result["avg_latency_ms"]
-            best_topology = topology
+        candidate_results.append(
+            {
+                "topology": topology,
+                "avg_latency_ms": result["avg_latency_ms"],
+            }
+        )
 
-    if best_topology is None:
+    if not candidate_results:
         raise RuntimeError(
             f"No viable encoder_pipeline topologies for seq_len={seq_len}"
         )
 
-    return best_topology
+    selected = select_autotune_topology(candidate_results, preferred_family_id)
+    print(
+        f"Autotune selected: seq_len={seq_len} topology={selected['topology'].topology_id} "
+        f"compute_tiles={selected['topology'].compute_tile_count} "
+        f"utilization={selected['topology'].utilization_fraction:.3f} "
+        f"avg={selected['avg_latency_ms']:.3f} ms",
+        flush=True,
+    )
+    return selected["topology"]
 
 
 def resolve_topology(args, seq_len, texts):
+    selection_start = time.perf_counter()
     base_config = load_encoder_pipeline_config(args.config_file_path, seq_len)
-    fixed_topology = current_topology_from_config(base_config)
+    fixed_topology = current_topology_from_config(base_config, seq_len)
     if args.topology_policy == "fixed":
-        return fixed_topology
+        selection_end = time.perf_counter()
+        return fixed_topology, {
+            "topology_selection_time_ms": (selection_end - selection_start) * 1000.0,
+            "topology_cache_status": "fixed",
+        }
 
     candidate_ids = parse_candidate_topology_ids(args.candidate_topologies)
     cache_data = load_topology_cache(args.topology_cache)
@@ -602,7 +572,12 @@ def resolve_topology(args, seq_len, texts):
             cache_data, base_config, seq_len, candidate_ids=candidate_ids
         )
         if cached_topology is not None:
-            return cached_topology
+            selection_end = time.perf_counter()
+            return cached_topology, {
+                "topology_selection_time_ms": (selection_end - selection_start)
+                * 1000.0,
+                "topology_cache_status": "cache_hit",
+            }
 
     selected = autotune_topology(
         args=args,
@@ -613,10 +588,17 @@ def resolve_topology(args, seq_len, texts):
         candidate_ids=candidate_ids,
         warmup_runs=args.autotune_warmup_runs,
         runs_per_sample=args.autotune_runs,
+        benchmark_mode=args.benchmark_mode,
     )
-    cache_data[cache_key] = selected
+    cache_data[cache_key] = selected.to_runtime_dict()
     save_topology_cache(args.topology_cache, cache_data)
-    return selected
+    selection_end = time.perf_counter()
+    return selected, {
+        "topology_selection_time_ms": (selection_end - selection_start) * 1000.0,
+        "topology_cache_status": (
+            "cache_miss" if args.topology_policy == "cache" else "autotune"
+        ),
+    }
 
 
 def main():
@@ -625,6 +607,11 @@ def main():
     args.weights_file_path = weights_file_path
     args.config_file_path = config_file_path
     seq_lens = parse_seq_lens(args.seq_lens)
+    validate_benchmark_mode_request(
+        args.benchmark_mode,
+        backend_mode="npu",
+        seq_lens=seq_lens,
+    )
     num_threads = args.num_threads or detect_max_physical_core_count()
     configure_cpu_thread_env(num_threads)
 
@@ -647,6 +634,7 @@ def main():
         flush=True,
     )
     print(f"Sequence lengths: {seq_lens}", flush=True)
+    print(f"Benchmark mode: {args.benchmark_mode}", flush=True)
     print(f"Topology policy: {args.topology_policy}", flush=True)
 
     csv_rows = []
@@ -658,9 +646,11 @@ def main():
             label=f"NPU seq_len={seq_len}",
         )
         print(f"Starting NPU benchmark: seq_len={seq_len}", flush=True)
-        topology = resolve_topology(args, seq_len, texts)
+        topology, topology_selection = resolve_topology(args, seq_len, texts)
         print(
-            f"Selected topology: seq_len={seq_len} topology={topology_id(topology)}",
+            f"Selected topology: seq_len={seq_len} topology={topology_id(topology)} "
+            f"compute_tiles={topology.compute_tile_count} "
+            f"utilization={topology.utilization_fraction:.3f}",
             flush=True,
         )
         config = load_encoder_pipeline_config(config_file_path, seq_len)
@@ -675,16 +665,22 @@ def main():
         )
         result = benchmark_with_config(
             weights_file_path=weights_file_path,
+            config_file_path=config_file_path,
             config=config,
             seq_len=seq_len,
             texts=texts,
             warmup_runs=args.warmup_runs,
             runs_per_sample=args.runs_per_sample,
+            benchmark_mode=args.benchmark_mode,
             topology=topology,
             power_backend=power_backend,
             power_interval_sec=args.power_interval_sec,
             power_log_path=power_log_path,
         )
+        result["topology_selection_time_ms"] = topology_selection[
+            "topology_selection_time_ms"
+        ]
+        result["topology_cache_status"] = topology_selection["topology_cache_status"]
         print(
             f"seq_len={seq_len:<5d} topology={result['topology_id']:<10s} "
             f"shape={result['shape']} "
@@ -696,6 +692,8 @@ def main():
         csv_rows.append(
             {
                 "study_id": study_id,
+                "benchmark_mode": result["benchmark_mode"],
+                "execution_mode": result["execution_mode"],
                 "seq_len": seq_len,
                 "num_threads": num_threads,
                 "dtype": result["dtype"],
@@ -719,6 +717,27 @@ def main():
                 "parallel_seq": result["parallel_seq"],
                 "parallel_heads": result["parallel_heads"],
                 "parallel_ffn": result["parallel_ffn"],
+                "compute_tile_count": str(result["compute_tile_count"]),
+                "compute_tile_utilization_fraction": (
+                    f"{result['compute_tile_utilization_fraction']:.6f}"
+                ),
+                "compile_setup_time_ms": f"{result['compile_setup_time_ms']:.6f}",
+                "topology_selection_time_ms": (
+                    f"{result['topology_selection_time_ms']:.6f}"
+                ),
+                "topology_cache_status": result["topology_cache_status"],
+                "cached_steady_state_avg_latency_ms": (
+                    f"{result['cached_steady_state_avg_latency_ms']:.6f}"
+                ),
+                "avg_embedding_latency_ms": (
+                    f"{result['avg_embedding_latency_ms']:.6f}"
+                ),
+                "avg_qkv_projection_latency_ms": (
+                    f"{result['avg_qkv_projection_latency_ms']:.6f}"
+                ),
+                "avg_encoder_pipeline_latency_ms": (
+                    f"{result['avg_encoder_pipeline_latency_ms']:.6f}"
+                ),
                 "min_latency_ms": f"{result['min_latency_ms']:.6f}",
                 "avg_latency_ms": f"{result['avg_latency_ms']:.6f}",
                 "max_latency_ms": f"{result['max_latency_ms']:.6f}",
