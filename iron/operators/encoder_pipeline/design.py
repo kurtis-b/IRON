@@ -19,9 +19,406 @@ from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.controlflow import range_
 from aie.iron.device import NPU2, Tile
 from aie.iron.placers import SequentialPlacer
-from iron.operators.encoder_pipeline.placements import TOPOLOGY_PLACEMENTS
+from iron.operators.encoder_pipeline.topology import (
+    load_encoder_pipeline_topology_placements,
+    topology_from_fields,
+)
 
 BASE_DIR = Path(__file__).parent
+
+
+def compute_num_q_seq_blocks(seq_len: int, seq_tile: int) -> int:
+    if seq_len % seq_tile != 0:
+        raise ValueError("seq_len must be divisible by seq_tile")
+    return seq_len // seq_tile
+
+
+def compute_q_blocks_per_lane(seq_len: int, seq_tile: int, parallel_seq: int) -> int:
+    num_q_seq_blocks = compute_num_q_seq_blocks(seq_len, seq_tile)
+    if num_q_seq_blocks % parallel_seq != 0:
+        raise ValueError(
+            "encoder_pipeline requires num_q_seq_blocks divisible by parallel_seq "
+            f"({num_q_seq_blocks} % {parallel_seq} != 0)"
+        )
+    return num_q_seq_blocks // parallel_seq
+
+
+def compute_num_kv_seq_blocks(seq_len: int, kv_seq_tile: int) -> int:
+    if seq_len % kv_seq_tile != 0:
+        raise ValueError("seq_len must be divisible by kv_seq_tile")
+    return seq_len // kv_seq_tile
+
+
+def compute_qkv_head_blocks_per_parallel_head(heads: int, parallel_heads: int) -> int:
+    if heads % parallel_heads != 0:
+        raise ValueError(
+            "encoder_pipeline requires heads divisible by parallel_heads "
+            f"({heads} % {parallel_heads} != 0)"
+        )
+    return heads // parallel_heads
+
+
+def compute_ln1_broadcast_groups(ffn_intermediate_size: int, ffn_tile: int) -> int:
+    if ffn_intermediate_size % ffn_tile != 0:
+        raise ValueError(
+            "ffn_intermediate_size must be divisible by ffn_tile "
+            f"({ffn_intermediate_size} % {ffn_tile} != 0)"
+        )
+    return ffn_intermediate_size // ffn_tile
+
+
+def compute_ffn_col_group_count(
+    ffn_intermediate_size: int, ffn_tile: int, effective_ffn_branches: int
+) -> int:
+    ln1_broadcast_groups = compute_ln1_broadcast_groups(ffn_intermediate_size, ffn_tile)
+    if ln1_broadcast_groups % effective_ffn_branches != 0:
+        raise ValueError(
+            "encoder_pipeline requires FFN branch count to divide "
+            "ln1_broadcast_groups "
+            f"({ln1_broadcast_groups} % {effective_ffn_branches} != 0)"
+        )
+    return ln1_broadcast_groups // effective_ffn_branches
+
+
+def build_q_block_schedule(parallel_seq: int, q_blocks_per_lane: int) -> list[int]:
+    return [
+        lane_idx * q_blocks_per_lane + lane_block_idx
+        for lane_block_idx in range(q_blocks_per_lane)
+        for lane_idx in range(parallel_seq)
+    ]
+
+
+def count_tap_iterations(tap: TensorAccessPattern, obj_shape: tuple[int, ...]) -> int:
+    return math.prod(int(s) for s in tap.sizes) // math.prod(obj_shape)
+
+
+def assert_tap_iteration_count(
+    tap: TensorAccessPattern,
+    obj_shape: tuple[int, ...],
+    expected: int,
+    message: str,
+) -> None:
+    if count_tap_iterations(tap, obj_shape) != expected:
+        raise ValueError(message)
+
+
+def _resolve_topology_placement(
+    heads: int,
+    seq_len: int,
+    d: int,
+    seq_tile: int,
+    kv_seq_tile: int,
+    emb_tile: int,
+    ffn_tile: int,
+    parallel_seq: int,
+    parallel_heads: int,
+    proj_acc_depth: int,
+    nB_tiles_distributed: int,
+    ffn_intermediate_size: int,
+) -> tuple[dict, dict | None]:
+    topology = topology_from_fields(
+        num_heads=heads,
+        seq_len=seq_len,
+        d=d,
+        seq_tile=seq_tile,
+        kv_seq_tile=kv_seq_tile,
+        emb_tile=emb_tile,
+        ffn_tile=ffn_tile,
+        parallel_seq=parallel_seq,
+        parallel_heads=parallel_heads,
+        proj_acc_depth=proj_acc_depth,
+        o_proj_acc_group_size=1,
+        parallel_ffn=nB_tiles_distributed,
+        ffn_intermediate_size=ffn_intermediate_size,
+    )
+    topology_placements = load_encoder_pipeline_topology_placements()
+    if topology.key not in topology_placements:
+        raise ValueError(
+            "encoder_pipeline only supports hardcoded placement topologies "
+            f"{sorted(topology_placements)} (got placement key {topology.key})"
+        )
+    placement = topology_placements[topology.key]
+    return placement, placement["sequence_parallel"]
+
+
+def _validate_sequence_parallel_placement(
+    sequence_parallel: dict | None,
+    parallel_seq: int,
+) -> None:
+    if sequence_parallel is None:
+        return
+    if len(sequence_parallel["lane_tiles"]) != parallel_seq:
+        raise ValueError(
+            "encoder_pipeline sequence-parallel placement must provide one lane "
+            f"tile map per sequence lane ({len(sequence_parallel['lane_tiles'])} "
+            f"!= {parallel_seq})"
+        )
+    if len(sequence_parallel["lane_o_proj_acc_mem_cols"]) != parallel_seq:
+        raise ValueError(
+            "encoder_pipeline sequence-parallel placement must provide one "
+            "O-proj accumulation memtile per sequence lane "
+            f"({len(sequence_parallel['lane_o_proj_acc_mem_cols'])} != {parallel_seq})"
+        )
+    if len(sequence_parallel["lane_tail_mem_cols"]) != parallel_seq:
+        raise ValueError(
+            "encoder_pipeline sequence-parallel placement must provide one tail "
+            f"memtile per sequence lane ({len(sequence_parallel['lane_tail_mem_cols'])} "
+            f"!= {parallel_seq})"
+        )
+    lane_ffn_down_acc_mem_cols = sequence_parallel.get("lane_ffn_down_acc_mem_cols")
+    if (
+        lane_ffn_down_acc_mem_cols is not None
+        and len(lane_ffn_down_acc_mem_cols) != parallel_seq
+    ):
+        raise ValueError(
+            "encoder_pipeline sequence-parallel placement must provide one "
+            "FFN-down accumulation memtile per sequence lane "
+            f"({len(lane_ffn_down_acc_mem_cols)} != {parallel_seq})"
+        )
+    transport_groups = sequence_parallel.get("transport_groups")
+    if transport_groups is None:
+        return
+    grouped_lanes = tuple(
+        lane_idx for group in transport_groups for lane_idx in group["lanes"]
+    )
+    if tuple(sorted(grouped_lanes)) != tuple(range(parallel_seq)):
+        raise ValueError(
+            "encoder_pipeline sequence-parallel transport groups must cover "
+            f"every lane exactly once (got {grouped_lanes})"
+        )
+    group_sizes = {len(group["lanes"]) for group in transport_groups}
+    if len(group_sizes) != 1:
+        raise ValueError(
+            "encoder_pipeline sequence-parallel transport groups must have "
+            f"uniform size (got {sorted(group_sizes)})"
+        )
+
+
+def _derive_encoder_pipeline_layout(
+    heads: int,
+    seq_len: int,
+    d: int,
+    seq_tile: int,
+    kv_seq_tile: int,
+    emb_tile: int,
+    ffn_tile: int,
+    proj_acc_depth: int,
+    parallel_seq: int,
+    parallel_heads: int,
+    trace_size: int,
+    sequence_parallel: dict | None,
+    placement: dict,
+    nB_tiles_distributed: int,
+    ffn_intermediate_size: int,
+    o_proj_acc_group_size: int,
+    ffn_down_acc_group_size: int,
+    emulate_bf16_mmul_with_bfp16: bool,
+) -> dict:
+    if trace_size != 0:
+        raise ValueError("encoder_pipeline does not support tracing")
+    if o_proj_acc_group_size <= 0:
+        raise ValueError(
+            "encoder_pipeline requires o_proj_acc_group_size > 0 "
+            f"(got {o_proj_acc_group_size})"
+        )
+    if ffn_down_acc_group_size <= 0:
+        raise ValueError(
+            "encoder_pipeline requires ffn_down_acc_group_size > 0 "
+            f"(got {ffn_down_acc_group_size})"
+        )
+    if d != 64:
+        raise ValueError(f"encoder_pipeline requires d=64 (got {d})")
+    if not emulate_bf16_mmul_with_bfp16:
+        raise ValueError("encoder_pipeline requires emulate_bf16_mmul_with_bfp16=True")
+
+    embed_sz = heads * d
+    num_q_seq_blocks = compute_num_q_seq_blocks(seq_len, seq_tile)
+    num_kv_seq_blocks = compute_num_kv_seq_blocks(seq_len, kv_seq_tile)
+    q_blocks_per_lane = compute_q_blocks_per_lane(seq_len, seq_tile, parallel_seq)
+    num_qkv_head_block_per_parallel_head = compute_qkv_head_blocks_per_parallel_head(
+        heads, parallel_heads
+    )
+    num_o_col_groups = embed_sz // (emb_tile * proj_acc_depth)
+    if num_o_col_groups != 1:
+        raise ValueError(
+            "encoder_pipeline hardcoded path requires num_o_col_groups == 1 "
+            f"(got {num_o_col_groups})"
+        )
+    if embed_sz != emb_tile * proj_acc_depth:
+        raise ValueError(
+            "emb_tile * proj_acc_depth must equal embed_sz "
+            f"({emb_tile} * {proj_acc_depth} != {embed_sz})"
+        )
+    if ffn_tile % 16 != 0:
+        raise ValueError(f"ffn_tile must be divisible by 16 ({ffn_tile} % 16 != 0)")
+    if len(placement["mha_cols"]) != parallel_heads:
+        raise ValueError(
+            "encoder_pipeline hardcoded placement must provide one MHA column per "
+            f"parallel head (cols={placement['mha_cols']}, parallel_heads={parallel_heads})"
+        )
+
+    dtype = bfloat16
+    inv_scale = (1 / np.sqrt(d)) * 1.4453125
+    of_depth = 2
+    weight_forward_depth = 1 if emb_tile >= 128 else (2 if ffn_tile <= 64 else 1)
+    o_proj_weight_consumer_depth = 1 if emb_tile >= 128 else of_depth
+    ln1_broadcast_groups = compute_ln1_broadcast_groups(ffn_intermediate_size, ffn_tile)
+    effective_ffn_branches = len(placement["tail_tiles"]["ffn_up_by_branch"])
+    if effective_ffn_branches != nB_tiles_distributed:
+        raise ValueError(
+            "encoder_pipeline hardcoded placement must provide one FFN branch per "
+            "requested nB_tiles_distributed "
+            f"(branches={effective_ffn_branches}, requested={nB_tiles_distributed})"
+        )
+    ffn_col_group_count = compute_ffn_col_group_count(
+        ffn_intermediate_size, ffn_tile, effective_ffn_branches
+    )
+
+    if sequence_parallel is not None and parallel_heads > 1:
+        if o_proj_acc_group_size not in (1, parallel_heads):
+            raise ValueError(
+                "encoder_pipeline seq-par currently supports "
+                "o_proj_acc_group_size of 1 or parallel_heads "
+                f"(got {o_proj_acc_group_size}, parallel_heads={parallel_heads})"
+            )
+    elif o_proj_acc_group_size != 1:
+        raise ValueError(
+            "encoder_pipeline currently supports o_proj_acc_group_size=1 "
+            "outside the seq-par multi-head path "
+            f"(got {o_proj_acc_group_size})"
+        )
+    if sequence_parallel is not None and effective_ffn_branches > 1:
+        if ffn_down_acc_group_size not in (1, effective_ffn_branches):
+            raise ValueError(
+                "encoder_pipeline seq-par currently supports "
+                "ffn_down_acc_group_size of 1 or effective_ffn_branches "
+                f"(got {ffn_down_acc_group_size}, effective_ffn_branches={effective_ffn_branches})"
+            )
+    elif ffn_down_acc_group_size != 1:
+        raise ValueError(
+            "encoder_pipeline currently supports ffn_down_acc_group_size=1 "
+            "outside the seq-par multi-branch path "
+            f"(got {ffn_down_acc_group_size})"
+        )
+
+    _validate_sequence_parallel_placement(sequence_parallel, parallel_seq)
+
+    return {
+        "embed_sz": embed_sz,
+        "num_q_seq_blocks": num_q_seq_blocks,
+        "num_kv_seq_blocks": num_kv_seq_blocks,
+        "q_blocks_per_lane": q_blocks_per_lane,
+        "num_qkv_head_block_per_parallel_head": num_qkv_head_block_per_parallel_head,
+        "num_o_col_groups": num_o_col_groups,
+        "dtype": dtype,
+        "inv_scale": inv_scale,
+        "of_depth": of_depth,
+        "weight_forward_depth": weight_forward_depth,
+        "o_proj_weight_consumer_depth": o_proj_weight_consumer_depth,
+        "ln1_broadcast_groups": ln1_broadcast_groups,
+        "effective_ffn_branches": effective_ffn_branches,
+        "ffn_col_group_count": ffn_col_group_count,
+        "ln_tiles_per_q_block": proj_acc_depth,
+        "ln1_dram_stage_rows": (
+            seq_len if sequence_parallel is not None else proj_acc_depth * seq_tile
+        ),
+    }
+
+
+def _normalize_slot_coords(value, expected_count, name):
+    if expected_count == 1:
+        if isinstance(value[0], int):
+            return [tuple(value)]
+        if len(value) != 1:
+            raise ValueError(f"{name} must provide exactly one placement (got {value})")
+        return [tuple(value[0])]
+    if isinstance(value[0], int):
+        raise ValueError(
+            f"{name} must provide {expected_count} placements (got {value})"
+        )
+    if len(value) != expected_count:
+        raise ValueError(
+            f"{name} must provide {expected_count} placements (got {value})"
+        )
+    return [tuple(coord) for coord in value]
+
+
+def _normalize_slot_mem_cols(value, expected_count, name):
+    if expected_count == 1:
+        if isinstance(value, int):
+            return [value]
+        if len(value) != 1:
+            raise ValueError(
+                f"{name} must provide exactly one memtile column (got {value})"
+            )
+        return [int(value[0])]
+    if isinstance(value, int):
+        raise ValueError(
+            f"{name} must provide {expected_count} memtile columns (got {value})"
+        )
+    if len(value) != expected_count:
+        raise ValueError(
+            f"{name} must provide {expected_count} memtile columns (got {value})"
+        )
+    return [int(col) for col in value]
+
+
+def _normalize_base_placement(placement: dict) -> dict:
+    return {
+        "qk_tiles": [Tile(col=col, row=2) for col in placement["mha_cols"]],
+        "softmax_tiles": [Tile(col=col, row=3) for col in placement["mha_cols"]],
+        "pv_tiles": [Tile(col=col, row=4) for col in placement["mha_cols"]],
+        "o_proj_tiles": [Tile(col=col, row=5) for col in placement["mha_cols"]],
+        "ln1_tile": Tile(*placement["tail_tiles"]["ln1"]),
+        "ffn_up_tiles": [
+            Tile(*tile) for tile in placement["tail_tiles"]["ffn_up_by_branch"]
+        ],
+        "ffn_down_tiles": [
+            Tile(*tile) for tile in placement["tail_tiles"]["ffn_down_by_branch"]
+        ],
+        "ln2_tile": Tile(*placement["tail_tiles"]["ln2"]),
+        "accumulation_mem_tiles": placement["accumulation_mem_tiles"],
+        "weight_mem_tiles": placement["weight_mem_tiles"],
+        "q_mem_col": placement["mem_tiles"]["q"],
+        "k_mem_col": placement["mem_tiles"]["k"],
+        "v_mem_col": placement["mem_tiles"]["v"],
+        "ow_mem_col": placement["mem_tiles"]["w_o"],
+        "o_proj_stage_mem_col": placement["accumulation_mem_tiles"]["o_proj_stage"],
+        "ln1_stage_col": placement["mem_tiles"]["ln1_stage"],
+        "residual_mem_col": placement["mem_tiles"]["residual"],
+        "ffn_residual_mem_col": placement["mem_tiles"]["ffn_residual"],
+        "output_mem_col": placement["mem_tiles"]["output"],
+        "q_shim_col": placement["shim_tiles"]["q"],
+        "k_shim_col": placement["shim_tiles"]["k"],
+        "v_shim_col": placement["shim_tiles"]["v"],
+        "ow_shim_col": placement["shim_tiles"]["w_o"],
+        "bdown_shim_col": placement["shim_tiles"]["b_down"],
+        "bup_shim_col": placement["shim_tiles"]["b_up"],
+        "ln1_stage_shim_col": placement["shim_tiles"]["ln1_stage"],
+        "residual_shim_col": placement["shim_tiles"]["residual"],
+        "output_shim_col": placement["shim_tiles"]["output"],
+    }
+
+
+def _load_ln_weights(
+    embed_sz: int, ln1_weight_file: str | None, ln2_weight_file: str | None
+) -> tuple[np.ndarray, np.ndarray]:
+    static_ln1_weights = (
+        np.ones(embed_sz, dtype=bfloat16)
+        if ln1_weight_file is None
+        else np.load(ln1_weight_file)
+    )
+    static_ln2_weights = (
+        np.ones(embed_sz, dtype=bfloat16)
+        if ln2_weight_file is None
+        else np.load(ln2_weight_file)
+    )
+    return static_ln1_weights, static_ln2_weights
+
+
+def _emit_program(rt: Runtime):
+    program = Program(NPU2(), rt)
+    return program.resolve_program(SequentialPlacer())
 
 
 def main():
@@ -112,7 +509,7 @@ def encoder_pipeline(
     if ffn_tile is None:
         ffn_tile = emb_tile
 
-    placement_topology_key = (
+    placement, sequence_parallel = _resolve_topology_placement(
         heads,
         seq_len,
         d,
@@ -123,257 +520,81 @@ def encoder_pipeline(
         parallel_seq,
         parallel_heads,
         proj_acc_depth,
-        1,
         nB_tiles_distributed,
         ffn_intermediate_size,
     )
-    if placement_topology_key not in TOPOLOGY_PLACEMENTS:
-        raise ValueError(
-            "encoder_pipeline only supports hardcoded placement topologies "
-            f"{sorted(TOPOLOGY_PLACEMENTS)} (got placement key {placement_topology_key})"
-        )
-    placement = TOPOLOGY_PLACEMENTS[placement_topology_key]
-    sequence_parallel = placement["sequence_parallel"]
-
-    if trace_size != 0:
-        raise ValueError("encoder_pipeline does not support tracing")
-    if o_proj_acc_group_size <= 0:
-        raise ValueError(
-            "encoder_pipeline requires o_proj_acc_group_size > 0 "
-            f"(got {o_proj_acc_group_size})"
-        )
-    if ffn_down_acc_group_size <= 0:
-        raise ValueError(
-            "encoder_pipeline requires ffn_down_acc_group_size > 0 "
-            f"(got {ffn_down_acc_group_size})"
-        )
-    if d != 64:
-        raise ValueError(f"encoder_pipeline requires d=64 (got {d})")
-    if not emulate_bf16_mmul_with_bfp16:
-        raise ValueError("encoder_pipeline requires emulate_bf16_mmul_with_bfp16=True")
-
-    embed_sz = heads * d
-    num_q_seq_blocks = seq_len // seq_tile
-    num_kv_seq_blocks = seq_len // kv_seq_tile
-    if num_q_seq_blocks % parallel_seq != 0:
-        raise ValueError(
-            "encoder_pipeline requires num_q_seq_blocks divisible by parallel_seq "
-            f"({num_q_seq_blocks} % {parallel_seq} != 0)"
-        )
-    q_blocks_per_lane = num_q_seq_blocks // parallel_seq
-    if heads % parallel_heads != 0:
-        raise ValueError(
-            "encoder_pipeline requires heads divisible by parallel_heads "
-            f"({heads} % {parallel_heads} != 0)"
-        )
-    num_qkv_head_block_per_parallel_head = heads // parallel_heads
-    num_o_col_groups = embed_sz // (emb_tile * proj_acc_depth)
-    if num_o_col_groups != 1:
-        raise ValueError(
-            "encoder_pipeline hardcoded path requires num_o_col_groups == 1 "
-            f"(got {num_o_col_groups})"
-        )
-    if seq_len % seq_tile != 0:
-        raise ValueError("seq_len must be divisible by seq_tile")
-    if seq_len % kv_seq_tile != 0:
-        raise ValueError("seq_len must be divisible by kv_seq_tile")
-    if embed_sz != emb_tile * proj_acc_depth:
-        raise ValueError(
-            "emb_tile * proj_acc_depth must equal embed_sz "
-            f"({emb_tile} * {proj_acc_depth} != {embed_sz})"
-        )
-    if ffn_tile % 16 != 0:
-        raise ValueError(f"ffn_tile must be divisible by 16 ({ffn_tile} % 16 != 0)")
-    if ffn_intermediate_size % ffn_tile != 0:
-        raise ValueError(
-            "ffn_intermediate_size must be divisible by ffn_tile "
-            f"({ffn_intermediate_size} % {ffn_tile} != 0)"
-        )
-    if len(placement["mha_cols"]) != parallel_heads:
-        raise ValueError(
-            "encoder_pipeline hardcoded placement must provide one MHA column per "
-            f"parallel head (cols={placement['mha_cols']}, parallel_heads={parallel_heads})"
-        )
-
-    dtype = bfloat16
-    inv_scale = (1 / np.sqrt(d)) * 1.4453125
-    of_depth = 2
-    weight_forward_depth = 1 if emb_tile >= 128 else (2 if ffn_tile <= 64 else 1)
-    # Large emb tiles make the O-proj weight consumers the limiting factor on
-    # tile memory, so keep the per-consumer W_O FIFOs single-buffered there.
-    o_proj_weight_consumer_depth = 1 if emb_tile >= 128 else of_depth
-    ln1_broadcast_groups = ffn_intermediate_size // ffn_tile
-    effective_ffn_branches = len(placement["tail_tiles"]["ffn_up_by_branch"])
-    if effective_ffn_branches != nB_tiles_distributed:
-        raise ValueError(
-            "encoder_pipeline hardcoded placement must provide one FFN branch per "
-            "requested nB_tiles_distributed "
-            f"(branches={effective_ffn_branches}, requested={nB_tiles_distributed})"
-        )
-    if ln1_broadcast_groups % effective_ffn_branches != 0:
-        raise ValueError(
-            "encoder_pipeline requires FFN branch count to divide ln1_broadcast_groups "
-            f"({ln1_broadcast_groups} % {effective_ffn_branches} != 0)"
-        )
-    if sequence_parallel is not None and parallel_heads > 1:
-        if o_proj_acc_group_size not in (1, parallel_heads):
-            raise ValueError(
-                "encoder_pipeline seq-par currently supports "
-                "o_proj_acc_group_size of 1 or parallel_heads "
-                f"(got {o_proj_acc_group_size}, parallel_heads={parallel_heads})"
-            )
-    elif o_proj_acc_group_size != 1:
-        raise ValueError(
-            "encoder_pipeline currently supports o_proj_acc_group_size=1 "
-            "outside the seq-par multi-head path "
-            f"(got {o_proj_acc_group_size})"
-        )
-    if sequence_parallel is not None and effective_ffn_branches > 1:
-        if ffn_down_acc_group_size not in (1, effective_ffn_branches):
-            raise ValueError(
-                "encoder_pipeline seq-par currently supports "
-                "ffn_down_acc_group_size of 1 or effective_ffn_branches "
-                f"(got {ffn_down_acc_group_size}, effective_ffn_branches={effective_ffn_branches})"
-            )
-    elif ffn_down_acc_group_size != 1:
-        raise ValueError(
-            "encoder_pipeline currently supports ffn_down_acc_group_size=1 "
-            "outside the seq-par multi-branch path "
-            f"(got {ffn_down_acc_group_size})"
-        )
-    if sequence_parallel is not None:
-        if len(sequence_parallel["lane_tiles"]) != parallel_seq:
-            raise ValueError(
-                "encoder_pipeline sequence-parallel placement must provide one lane "
-                f"tile map per sequence lane ({len(sequence_parallel['lane_tiles'])} "
-                f"!= {parallel_seq})"
-            )
-        if len(sequence_parallel["lane_o_proj_acc_mem_cols"]) != parallel_seq:
-            raise ValueError(
-                "encoder_pipeline sequence-parallel placement must provide one "
-                "O-proj accumulation memtile per sequence lane "
-                f"({len(sequence_parallel['lane_o_proj_acc_mem_cols'])} != {parallel_seq})"
-            )
-        if len(sequence_parallel["lane_tail_mem_cols"]) != parallel_seq:
-            raise ValueError(
-                "encoder_pipeline sequence-parallel placement must provide one tail "
-                f"memtile per sequence lane ({len(sequence_parallel['lane_tail_mem_cols'])} "
-                f"!= {parallel_seq})"
-            )
-        lane_ffn_down_acc_mem_cols = sequence_parallel.get("lane_ffn_down_acc_mem_cols")
-        if (
-            lane_ffn_down_acc_mem_cols is not None
-            and len(lane_ffn_down_acc_mem_cols) != parallel_seq
-        ):
-            raise ValueError(
-                "encoder_pipeline sequence-parallel placement must provide one "
-                "FFN-down accumulation memtile per sequence lane "
-                f"({len(lane_ffn_down_acc_mem_cols)} != {parallel_seq})"
-            )
-        transport_groups = sequence_parallel.get("transport_groups")
-        if transport_groups is not None:
-            grouped_lanes = tuple(
-                lane_idx for group in transport_groups for lane_idx in group["lanes"]
-            )
-            if tuple(sorted(grouped_lanes)) != tuple(range(parallel_seq)):
-                raise ValueError(
-                    "encoder_pipeline sequence-parallel transport groups must cover "
-                    f"every lane exactly once (got {grouped_lanes})"
-                )
-            group_sizes = {len(group["lanes"]) for group in transport_groups}
-            if len(group_sizes) != 1:
-                raise ValueError(
-                    "encoder_pipeline sequence-parallel transport groups must have "
-                    f"uniform size (got {sorted(group_sizes)})"
-                )
-    ffn_col_group_count = ln1_broadcast_groups // effective_ffn_branches
-    ln_tiles_per_q_block = proj_acc_depth
-    use_split_ln1_inputs = sequence_parallel is None and parallel_heads > 1
-    ln1_dram_stage_rows = (
-        seq_len if sequence_parallel is not None else proj_acc_depth * seq_tile
+    layout = _derive_encoder_pipeline_layout(
+        heads,
+        seq_len,
+        d,
+        seq_tile,
+        kv_seq_tile,
+        emb_tile,
+        ffn_tile,
+        proj_acc_depth,
+        parallel_seq,
+        parallel_heads,
+        trace_size,
+        sequence_parallel,
+        placement,
+        nB_tiles_distributed,
+        ffn_intermediate_size,
+        o_proj_acc_group_size,
+        ffn_down_acc_group_size,
+        emulate_bf16_mmul_with_bfp16,
     )
+    embed_sz = layout["embed_sz"]
+    num_q_seq_blocks = layout["num_q_seq_blocks"]
+    num_kv_seq_blocks = layout["num_kv_seq_blocks"]
+    q_blocks_per_lane = layout["q_blocks_per_lane"]
+    num_qkv_head_block_per_parallel_head = layout[
+        "num_qkv_head_block_per_parallel_head"
+    ]
+    num_o_col_groups = layout["num_o_col_groups"]
+    dtype = layout["dtype"]
+    inv_scale = layout["inv_scale"]
+    of_depth = layout["of_depth"]
+    weight_forward_depth = layout["weight_forward_depth"]
+    o_proj_weight_consumer_depth = layout["o_proj_weight_consumer_depth"]
+    ln1_broadcast_groups = layout["ln1_broadcast_groups"]
+    effective_ffn_branches = layout["effective_ffn_branches"]
+    ffn_col_group_count = layout["ffn_col_group_count"]
+    ln_tiles_per_q_block = layout["ln_tiles_per_q_block"]
+    ln1_dram_stage_rows = layout["ln1_dram_stage_rows"]
     or_tensor_shape = (2 * seq_len + ln1_dram_stage_rows, embed_sz)
 
-    if ln1_weight_file is None:
-        static_ln1_weights = np.ones(embed_sz, dtype=bfloat16)
-    else:
-        static_ln1_weights = np.load(ln1_weight_file)
-    if ln2_weight_file is None:
-        static_ln2_weights = np.ones(embed_sz, dtype=bfloat16)
-    else:
-        static_ln2_weights = np.load(ln2_weight_file)
+    static_ln1_weights, static_ln2_weights = _load_ln_weights(
+        embed_sz, ln1_weight_file, ln2_weight_file
+    )
 
-    qk_tiles = [Tile(col=col, row=2) for col in placement["mha_cols"]]
-    softmax_tiles = [Tile(col=col, row=3) for col in placement["mha_cols"]]
-    pv_tiles = [Tile(col=col, row=4) for col in placement["mha_cols"]]
-
-    def normalize_slot_coords(value, expected_count, name):
-        if expected_count == 1:
-            if isinstance(value[0], int):
-                return [tuple(value)]
-            if len(value) != 1:
-                raise ValueError(
-                    f"{name} must provide exactly one placement (got {value})"
-                )
-            return [tuple(value[0])]
-        if isinstance(value[0], int):
-            raise ValueError(
-                f"{name} must provide {expected_count} placements (got {value})"
-            )
-        if len(value) != expected_count:
-            raise ValueError(
-                f"{name} must provide {expected_count} placements (got {value})"
-            )
-        return [tuple(coord) for coord in value]
-
-    def normalize_slot_mem_cols(value, expected_count, name):
-        if expected_count == 1:
-            if isinstance(value, int):
-                return [value]
-            if len(value) != 1:
-                raise ValueError(
-                    f"{name} must provide exactly one memtile column (got {value})"
-                )
-            return [int(value[0])]
-        if isinstance(value, int):
-            raise ValueError(
-                f"{name} must provide {expected_count} memtile columns (got {value})"
-            )
-        if len(value) != expected_count:
-            raise ValueError(
-                f"{name} must provide {expected_count} memtile columns (got {value})"
-            )
-        return [int(col) for col in value]
-
-    o_proj_tiles = [Tile(col=col, row=5) for col in placement["mha_cols"]]
-    ln1_tile = Tile(*placement["tail_tiles"]["ln1"])
-    ffn_up_tiles = [Tile(*tile) for tile in placement["tail_tiles"]["ffn_up_by_branch"]]
-    ffn_down_tiles = [
-        Tile(*tile) for tile in placement["tail_tiles"]["ffn_down_by_branch"]
-    ]
-    ln2_tile = Tile(*placement["tail_tiles"]["ln2"])
-    accumulation_mem_tiles = placement["accumulation_mem_tiles"]
-    weight_mem_tiles = placement["weight_mem_tiles"]
-
-    q_mem_col = placement["mem_tiles"]["q"]
-    k_mem_col = placement["mem_tiles"]["k"]
-    v_mem_col = placement["mem_tiles"]["v"]
-    ow_mem_col = placement["mem_tiles"]["w_o"]
-    o_proj_stage_mem_col = accumulation_mem_tiles["o_proj_stage"]
-    ln1_stage_col = placement["mem_tiles"]["ln1_stage"]
-    residual_mem_col = placement["mem_tiles"]["residual"]
-    ffn_residual_mem_col = placement["mem_tiles"]["ffn_residual"]
-    output_mem_col = placement["mem_tiles"]["output"]
-
-    q_shim_col = placement["shim_tiles"]["q"]
-    k_shim_col = placement["shim_tiles"]["k"]
-    v_shim_col = placement["shim_tiles"]["v"]
-    ow_shim_col = placement["shim_tiles"]["w_o"]
-    bdown_shim_col = placement["shim_tiles"]["b_down"]
-    bup_shim_col = placement["shim_tiles"]["b_up"]
-    ln1_stage_shim_col = placement["shim_tiles"]["ln1_stage"]
-    residual_shim_col = placement["shim_tiles"]["residual"]
-    output_shim_col = placement["shim_tiles"]["output"]
+    normalized_placement = _normalize_base_placement(placement)
+    qk_tiles = normalized_placement["qk_tiles"]
+    softmax_tiles = normalized_placement["softmax_tiles"]
+    pv_tiles = normalized_placement["pv_tiles"]
+    o_proj_tiles = normalized_placement["o_proj_tiles"]
+    ln1_tile = normalized_placement["ln1_tile"]
+    ffn_up_tiles = normalized_placement["ffn_up_tiles"]
+    ffn_down_tiles = normalized_placement["ffn_down_tiles"]
+    ln2_tile = normalized_placement["ln2_tile"]
+    accumulation_mem_tiles = normalized_placement["accumulation_mem_tiles"]
+    weight_mem_tiles = normalized_placement["weight_mem_tiles"]
+    q_mem_col = normalized_placement["q_mem_col"]
+    k_mem_col = normalized_placement["k_mem_col"]
+    v_mem_col = normalized_placement["v_mem_col"]
+    ow_mem_col = normalized_placement["ow_mem_col"]
+    ln1_stage_col = normalized_placement["ln1_stage_col"]
+    residual_mem_col = normalized_placement["residual_mem_col"]
+    ffn_residual_mem_col = normalized_placement["ffn_residual_mem_col"]
+    output_mem_col = normalized_placement["output_mem_col"]
+    q_shim_col = normalized_placement["q_shim_col"]
+    k_shim_col = normalized_placement["k_shim_col"]
+    v_shim_col = normalized_placement["v_shim_col"]
+    ow_shim_col = normalized_placement["ow_shim_col"]
+    bdown_shim_col = normalized_placement["bdown_shim_col"]
+    bup_shim_col = normalized_placement["bup_shim_col"]
+    ln1_stage_shim_col = normalized_placement["ln1_stage_shim_col"]
+    residual_shim_col = normalized_placement["residual_shim_col"]
+    output_shim_col = normalized_placement["output_shim_col"]
 
     W_O_ty = np.ndarray[(embed_sz, embed_sz), np.dtype[dtype]]
     QKV_ty = np.ndarray[(3 * seq_len, embed_sz), np.dtype[dtype]]
@@ -460,11 +681,6 @@ def encoder_pipeline(
         "pack_stats_f32_to_bf16_packet",
         kernel_archive,
         [sum_l1_ty, sum_l1_ty, o_ty, np.int32],
-    )
-    unpack_stats_kernel = Kernel(
-        "unpack_stats_bf16_packet_to_f32",
-        kernel_archive,
-        [o_ty, sum_l1_ty, sum_l1_ty, np.int32],
     )
     ln_zero_f32_kernel = Kernel("ln_zero_f32", kernel_archive, [sum_l1_ty, np.int32])
     ln_calc_sum_sumsq_kernel = Kernel(
@@ -624,18 +840,6 @@ def encoder_pipeline(
         for i in range(parallel_heads - 1)
     ]
     outOProjInput = ObjectFifo(o_ty, name="outOProjInput", depth=2)
-
-    if use_split_ln1_inputs:
-        oProjStagePart = ObjectFifo(o_ty, name="oProjStagePart", depth=1)
-        oProjStage = oProjStagePart.cons(depth=ln_tiles_per_q_block).forward(
-            obj_type=o_ty,
-            name="oProjStage",
-            depth=ln_tiles_per_q_block,
-            placement=Tile(col=o_proj_stage_mem_col, row=1),
-        )
-    else:
-        oProjStagePart = None
-        oProjStage = None
     inR = ObjectFifo(o_ty, name="inR", depth=of_depth)
     memR = inR.cons().forward(
         obj_type=o_ty,
@@ -644,13 +848,12 @@ def encoder_pipeline(
         depth=of_depth,
         placement=Tile(col=residual_mem_col, row=1),
     )
-
     outLNBroadcast = ObjectFifo(o_ty, name="outLNBroadcast", depth=1)
     ln1StageOut = outLNBroadcast.cons(depth=1)
     inLNFromDDR = ObjectFifo(o_ty, name="inLNFromDDR", depth=1)
     memOutLN = [inLNFromDDR.cons(depth=2) for _ in range(effective_ffn_branches)]
 
-    ffnRFromDDR = ObjectFifo(o_ty, name="ffnRFromDDR", depth=1)
+    ffnRFromDDR = ObjectFifo(o_ty, name="ffnRFromDDR", depth=2)
     ffnRIn = ffnRFromDDR.cons(depth=2).forward(
         obj_type=o_ty,
         name="ffnRIn",
@@ -939,26 +1142,19 @@ def encoder_pipeline(
                 pack_stats(stats_sum_buf, stats_sumsq_buf, elem_stats, seq_tile)
                 of_o_out.release(1)
 
-    def matmul_o_proj_emit_stats_first(
+    def matmul_o_proj_emit_twice(
         of_o_in,
         of_ow_in,
         of_o_acc_in,
         of_o_acc_out,
         buffer_to_reduce,
         of_o_out,
-        stats_sum_buf,
-        stats_sumsq_buf,
-        zero_f32,
-        calc_sum_sumsq,
-        pack_stats,
         add,
         zero,
         matmul,
         copy,
     ):
         for _ in range_(sys.maxsize):
-            zero_f32(stats_sum_buf, seq_tile)
-            zero_f32(stats_sumsq_buf, seq_tile)
             for _ in range_(proj_acc_depth):
                 elem_out_o_acc = of_o_acc_out.acquire(1)
                 zero(elem_out_o_acc)
@@ -985,76 +1181,19 @@ def encoder_pipeline(
                         seq_tile * emb_tile,
                     )
                     buffer_to_reduce.release(1)
-                calc_sum_sumsq(elem_in_o_acc, stats_sum_buf, stats_sumsq_buf)
                 elem_out_o_acc = of_o_acc_out.acquire(1)
                 copy(elem_in_o_acc, elem_out_o_acc, seq_tile * emb_tile)
                 of_o_acc_out.release(1)
+                elem_out_o = of_o_out.acquire(1)
+                copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                of_o_out.release(1)
                 of_o_acc_in.release(1)
-            elem_stats = of_o_out.acquire(1)
-            pack_stats(stats_sum_buf, stats_sumsq_buf, elem_stats, seq_tile)
-            of_o_out.release(1)
             for _ in range_(proj_acc_depth):
                 elem_in_o_acc = of_o_acc_in.acquire(1)
                 elem_out_o = of_o_out.acquire(1)
                 copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
                 of_o_out.release(1)
                 of_o_acc_in.release(1)
-
-    def matmul_o_proj_stage_then_emit_stats(
-        of_o_in,
-        of_ow_in,
-        of_o_acc_in,
-        of_o_acc_out,
-        buffer_to_reduce,
-        of_stage_out,
-        of_stats_out,
-        stats_sum_buf,
-        stats_sumsq_buf,
-        zero_f32,
-        calc_sum_sumsq,
-        pack_stats,
-        add,
-        zero,
-        matmul,
-        copy,
-    ):
-        for _ in range_(sys.maxsize):
-            zero_f32(stats_sum_buf, seq_tile)
-            zero_f32(stats_sumsq_buf, seq_tile)
-            for _ in range_(proj_acc_depth):
-                elem_out_o_acc = of_o_acc_out.acquire(1)
-                zero(elem_out_o_acc)
-                of_o_acc_out.release(1)
-            for _ in range_(num_qkv_head_block_per_parallel_head):
-                elem_in_o = of_o_in.acquire(1)
-                for _ in range_(proj_acc_depth):
-                    elem_in_o_acc = of_o_acc_in.acquire(1)
-                    elem_in_ow = of_ow_in.acquire(1)
-                    elem_out_o_acc = of_o_acc_out.acquire(1)
-                    matmul(elem_in_o, elem_in_ow, elem_in_o_acc, elem_out_o_acc)
-                    of_o_acc_out.release(1)
-                    of_ow_in.release(1)
-                    of_o_acc_in.release(1)
-                of_o_in.release(1)
-            for _ in range_(proj_acc_depth):
-                elem_in_o_acc = of_o_acc_in.acquire(1)
-                if buffer_to_reduce is not None:
-                    partial_o_acc = buffer_to_reduce.acquire(1)
-                    add(
-                        partial_o_acc,
-                        elem_in_o_acc,
-                        elem_in_o_acc,
-                        seq_tile * emb_tile,
-                    )
-                    buffer_to_reduce.release(1)
-                calc_sum_sumsq(elem_in_o_acc, stats_sum_buf, stats_sumsq_buf)
-                elem_stage = of_stage_out.acquire(1)
-                copy(elem_in_o_acc, elem_stage, seq_tile * emb_tile)
-                of_stage_out.release(1)
-                of_o_acc_in.release(1)
-            elem_stats = of_stats_out.acquire(1)
-            pack_stats(stats_sum_buf, stats_sumsq_buf, elem_stats, seq_tile)
-            of_stats_out.release(1)
 
     def matmul_o_proj_group_head_first(
         of_o_in,
@@ -1147,62 +1286,80 @@ def encoder_pipeline(
             pack_stats(stats_sum_buf, stats_sumsq_buf, elem_stats, seq_tile)
             of_stats_out.release(1)
 
-    def core_fn_ln1_stage_from_stats(
+    def matmul_o_proj_group_head_final_emit_twice(
+        of_o_in,
+        of_ow_in,
+        of_group_acc_in,
+        of_group_acc_out,
+        of_partial_in,
+        of_o_out,
+        zero,
+        matmul,
+        copy,
+    ):
+        for _ in range_(sys.maxsize):
+            for _ in range_(proj_acc_depth):
+                elem_out_o_acc = of_group_acc_out.acquire(1)
+                zero(elem_out_o_acc)
+                of_group_acc_out.release(1)
+            for _ in range_(num_qkv_head_block_per_parallel_head):
+                elem_in_o = of_o_in.acquire(1)
+                for _ in range_(proj_acc_depth):
+                    elem_partial_in = of_partial_in.acquire(1)
+                    elem_in_ow = of_ow_in.acquire(1)
+                    elem_out_o_acc = of_group_acc_out.acquire(1)
+                    matmul(elem_in_o, elem_in_ow, elem_partial_in, elem_out_o_acc)
+                    of_group_acc_out.release(1)
+                    of_ow_in.release(1)
+                    of_partial_in.release(1)
+                of_o_in.release(1)
+            for _ in range_(proj_acc_depth):
+                elem_in_o_acc = of_group_acc_in.acquire(1)
+                elem_out_o_acc = of_group_acc_out.acquire(1)
+                copy(elem_in_o_acc, elem_out_o_acc, seq_tile * emb_tile)
+                of_group_acc_out.release(1)
+                elem_out_o = of_o_out.acquire(1)
+                copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                of_o_out.release(1)
+                of_group_acc_in.release(1)
+            for _ in range_(proj_acc_depth):
+                elem_in_o_acc = of_group_acc_in.acquire(1)
+                elem_out_o = of_o_out.acquire(1)
+                copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                of_o_out.release(1)
+                of_group_acc_in.release(1)
+
+    def core_fn_ln1_from_replayed_inputs(
         of_in_o_proj,
         of_in_residual,
         sum_buf,
         sumsq_buf,
         weights,
         of_out_stage,
+        add,
+        zero_f32,
+        calc_sum_sumsq,
         fused_add_layer_norm,
-        unpack_stats,
     ):
         for _ in range_(sys.maxsize):
-            elem_stats = of_in_o_proj.acquire(1)
-            unpack_stats(elem_stats, sum_buf, sumsq_buf, seq_tile)
-            of_in_o_proj.release(1)
+            zero_f32(sum_buf, seq_tile)
+            zero_f32(sumsq_buf, seq_tile)
             for col_idx in range_(ln_tiles_per_q_block):
-                col_i32 = index.casts(T.i32(), col_idx)
                 elem_in = of_in_o_proj.acquire(1)
                 elem_residual = of_in_residual.acquire(1)
-                elem_out = of_out_stage.acquire(1)
-                fused_add_layer_norm(
-                    elem_in,
-                    elem_residual,
-                    weights,
-                    sum_buf,
-                    sumsq_buf,
-                    elem_out,
-                    embed_sz,
-                    col_i32,
-                )
-                of_out_stage.release(1)
+                add(elem_residual, elem_in, elem_in, seq_tile * emb_tile)
+                calc_sum_sumsq(elem_in, sum_buf, sumsq_buf)
                 of_in_o_proj.release(1)
                 of_in_residual.release(1)
-
-    def core_fn_ln1_stage_from_split_inputs(
-        of_in_stats,
-        of_in_o_proj,
-        of_in_residual,
-        sum_buf,
-        sumsq_buf,
-        weights,
-        of_out_stage,
-        fused_add_layer_norm,
-        unpack_stats,
-    ):
-        for _ in range_(sys.maxsize):
-            elem_stats = of_in_stats.acquire(1)
-            unpack_stats(elem_stats, sum_buf, sumsq_buf, seq_tile)
-            of_in_stats.release(1)
             for col_idx in range_(ln_tiles_per_q_block):
                 col_i32 = index.casts(T.i32(), col_idx)
                 elem_in = of_in_o_proj.acquire(1)
                 elem_residual = of_in_residual.acquire(1)
+                add(elem_residual, elem_in, elem_in, seq_tile * emb_tile)
                 elem_out = of_out_stage.acquire(1)
                 fused_add_layer_norm(
                     elem_in,
-                    elem_residual,
+                    elem_in,
                     weights,
                     sum_buf,
                     sumsq_buf,
@@ -1277,21 +1434,16 @@ def encoder_pipeline(
                 of_curr_acc.release(1)
                 of_out.release(1)
 
-    def core_fn_ffn_down_proj_emit_stats_first(
+    def core_fn_ffn_down_proj_emit_twice(
         of_in_a,
         of_in_b,
         of_curr_acc,
         of_new_acc,
         reduce_in,
         of_out,
-        sum_buf,
-        sumsq_buf,
         matmul_init,
         matmul,
         add,
-        calc_sum_sumsq,
-        pack_stats,
-        zero_f32,
         copy,
         group_count,
     ):
@@ -1316,23 +1468,25 @@ def encoder_pipeline(
                     of_curr_acc.release(1)
                 of_in_a.release(1)
 
-            zero_f32(sum_buf, seq_tile)
-            zero_f32(sumsq_buf, seq_tile)
             for _ in range_(proj_acc_depth):
                 elem_curr_acc = of_curr_acc.acquire(1)
                 if reduce_in is not None:
                     elem_reduce = reduce_in.acquire(1)
                     add(elem_reduce, elem_curr_acc, elem_curr_acc, seq_tile * emb_tile)
                     reduce_in.release(1)
-                calc_sum_sumsq(elem_curr_acc, sum_buf, sumsq_buf)
                 elem_new_acc = of_new_acc.acquire(1)
                 copy(elem_curr_acc, elem_new_acc, seq_tile * emb_tile)
                 of_new_acc.release(1)
                 of_curr_acc.release(1)
-
-            elem_stats = of_out.acquire(1)
-            pack_stats(sum_buf, sumsq_buf, elem_stats, seq_tile)
-            of_out.release(1)
+            for _ in range_(proj_acc_depth):
+                elem_curr_acc = of_curr_acc.acquire(1)
+                elem_new_acc = of_new_acc.acquire(1)
+                copy(elem_curr_acc, elem_new_acc, seq_tile * emb_tile)
+                of_new_acc.release(1)
+                elem_out = of_out.acquire(1)
+                copy(elem_curr_acc, elem_out, seq_tile * emb_tile)
+                of_curr_acc.release(1)
+                of_out.release(1)
             for _ in range_(proj_acc_depth):
                 elem_curr_acc = of_curr_acc.acquire(1)
                 elem_out = of_out.acquire(1)
@@ -1382,7 +1536,7 @@ def encoder_pipeline(
                     reduce_in.release(1)
                 of_in_a.release(1)
 
-    def core_fn_ffn_down_proj_group_final_emit_stats_first(
+    def core_fn_ffn_down_proj_group_final_emit_twice(
         of_in_a,
         of_in_b,
         reduce_in,
@@ -1390,12 +1544,7 @@ def encoder_pipeline(
         of_stage_out,
         of_stage_in,
         of_out,
-        sum_buf,
-        sumsq_buf,
         matmul,
-        calc_sum_sumsq,
-        pack_stats,
-        zero_f32,
         zero,
         copy,
         group_count,
@@ -1418,23 +1567,25 @@ def encoder_pipeline(
                     reduce_in.release(1)
                 of_in_a.release(1)
 
-            zero_f32(sum_buf, seq_tile)
-            zero_f32(sumsq_buf, seq_tile)
             elem_in_a = of_in_a.acquire(1)
             for _ in range_(proj_acc_depth):
                 elem_reduce_in = reduce_in.acquire(1)
                 elem_in_b = of_in_b.acquire(1)
                 elem_stage = of_stage_out.acquire(1)
                 matmul(elem_in_a, elem_in_b, elem_reduce_in, elem_stage)
-                calc_sum_sumsq(elem_stage, sum_buf, sumsq_buf)
                 of_stage_out.release(1)
                 of_in_b.release(1)
                 reduce_in.release(1)
             of_in_a.release(1)
-
-            elem_stats = of_out.acquire(1)
-            pack_stats(sum_buf, sumsq_buf, elem_stats, seq_tile)
-            of_out.release(1)
+            for _ in range_(proj_acc_depth):
+                elem_stage = of_stage_in.acquire(1)
+                elem_stage_out = of_stage_out.acquire(1)
+                copy(elem_stage, elem_stage_out, seq_tile * emb_tile)
+                of_stage_out.release(1)
+                elem_out = of_out.acquire(1)
+                copy(elem_stage, elem_out, seq_tile * emb_tile)
+                of_stage_in.release(1)
+                of_out.release(1)
             for _ in range_(proj_acc_depth):
                 elem_stage = of_stage_in.acquire(1)
                 elem_out = of_out.acquire(1)
@@ -1442,28 +1593,37 @@ def encoder_pipeline(
                 of_stage_in.release(1)
                 of_out.release(1)
 
-    def core_fn_add_norm2_from_stats(
+    def core_fn_add_norm2_from_replayed_inputs(
         of_in1,
         of_in2,
         sum_buf,
         sumsq_buf,
         weights,
         of_out,
+        add,
+        zero_f32,
+        calc_sum_sumsq,
         fused_add_layer_norm,
-        unpack_stats,
     ):
         for _ in range_(sys.maxsize):
-            elem_stats = of_in1.acquire(1)
-            unpack_stats(elem_stats, sum_buf, sumsq_buf, seq_tile)
-            of_in1.release(1)
+            zero_f32(sum_buf, seq_tile)
+            zero_f32(sumsq_buf, seq_tile)
+            for _ in range_(proj_acc_depth):
+                elem_ffn = of_in1.acquire(1)
+                elem_residual = of_in2.acquire(1)
+                add(elem_residual, elem_ffn, elem_ffn, seq_tile * emb_tile)
+                calc_sum_sumsq(elem_ffn, sum_buf, sumsq_buf)
+                of_in2.release(1)
+                of_in1.release(1)
             for col_idx in range_(proj_acc_depth):
                 col_i32 = index.casts(T.i32(), col_idx)
                 elem_ffn = of_in1.acquire(1)
                 elem_residual = of_in2.acquire(1)
+                add(elem_residual, elem_ffn, elem_ffn, seq_tile * emb_tile)
                 elem_out = of_out.acquire(1)
                 fused_add_layer_norm(
                     elem_ffn,
-                    elem_residual,
+                    elem_ffn,
                     weights,
                     sum_buf,
                     sumsq_buf,
@@ -1578,22 +1738,22 @@ def encoder_pipeline(
         for lane_idx, lane_cfg in enumerate(lane_tiles):
             lane_front_tiles.append(
                 {
-                    "qk": normalize_slot_coords(
+                    "qk": _normalize_slot_coords(
                         lane_cfg["qk"],
                         parallel_heads,
                         f"sequence_parallel.lane_tiles[{lane_idx}].qk",
                     ),
-                    "softmax": normalize_slot_coords(
+                    "softmax": _normalize_slot_coords(
                         lane_cfg["softmax"],
                         parallel_heads,
                         f"sequence_parallel.lane_tiles[{lane_idx}].softmax",
                     ),
-                    "pv": normalize_slot_coords(
+                    "pv": _normalize_slot_coords(
                         lane_cfg["pv"],
                         parallel_heads,
                         f"sequence_parallel.lane_tiles[{lane_idx}].pv",
                     ),
-                    "o_proj": normalize_slot_coords(
+                    "o_proj": _normalize_slot_coords(
                         lane_cfg["o_proj"],
                         parallel_heads,
                         f"sequence_parallel.lane_tiles[{lane_idx}].o_proj",
@@ -1603,12 +1763,12 @@ def encoder_pipeline(
             lane_tail_tiles.append(
                 {
                     "ln1": tuple(lane_cfg["ln1"]),
-                    "ffn_up": normalize_slot_coords(
+                    "ffn_up": _normalize_slot_coords(
                         lane_cfg["ffn_up"],
                         effective_ffn_branches,
                         f"sequence_parallel.lane_tiles[{lane_idx}].ffn_up",
                     ),
-                    "ffn_down": normalize_slot_coords(
+                    "ffn_down": _normalize_slot_coords(
                         lane_cfg["ffn_down"],
                         effective_ffn_branches,
                         f"sequence_parallel.lane_tiles[{lane_idx}].ffn_down",
@@ -1617,7 +1777,7 @@ def encoder_pipeline(
                 }
             )
         lane_o_proj_acc_mem_cols = [
-            normalize_slot_mem_cols(
+            _normalize_slot_mem_cols(
                 cols,
                 parallel_heads,
                 f"sequence_parallel.lane_o_proj_acc_mem_cols[{lane_idx}]",
@@ -1626,31 +1786,12 @@ def encoder_pipeline(
                 sequence_parallel["lane_o_proj_acc_mem_cols"]
             )
         ]
-        lane_o_proj_stage_mem_cols = sequence_parallel.get("lane_o_proj_stage_mem_cols")
-        if lane_o_proj_stage_mem_cols is not None:
-            lane_o_proj_stage_mem_cols = [
-                int(col) for col in lane_o_proj_stage_mem_cols
-            ]
-        if parallel_heads > 1 and lane_o_proj_stage_mem_cols is None:
-            raise ValueError(
-                "encoder_pipeline mixed seq-par with parallel_heads > 1 requires "
-                "sequence_parallel.lane_o_proj_stage_mem_cols"
-            )
-        if (
-            lane_o_proj_stage_mem_cols is not None
-            and len(lane_o_proj_stage_mem_cols) != parallel_seq
-        ):
-            raise ValueError(
-                "encoder_pipeline sequence-parallel placement must provide one "
-                "O-proj stage memtile per sequence lane "
-                f"({len(lane_o_proj_stage_mem_cols)} != {parallel_seq})"
-            )
         lane_tail_mem_cols = sequence_parallel["lane_tail_mem_cols"]
         lane_ffn_down_acc_mem_cols = sequence_parallel.get(
             "lane_ffn_down_acc_mem_cols", lane_tail_mem_cols
         )
         lane_ffn_down_acc_mem_cols = [
-            normalize_slot_mem_cols(
+            _normalize_slot_mem_cols(
                 cols,
                 effective_ffn_branches,
                 f"sequence_parallel.lane_ffn_down_acc_mem_cols[{lane_idx}]",
@@ -1662,11 +1803,7 @@ def encoder_pipeline(
             (
                 [cols[0] for cols in lane_o_proj_acc_mem_cols]
                 if parallel_heads > 1
-                else (
-                    lane_o_proj_stage_mem_cols
-                    if lane_o_proj_stage_mem_cols is not None
-                    else lane_tail_mem_cols
-                )
+                else lane_tail_mem_cols
             ),
         )
         lane_ffn_down_stage_mem_cols = [
@@ -1717,8 +1854,6 @@ def encoder_pipeline(
         lane_outOProj = [[None] * parallel_heads for _ in range(parallel_seq)]
         lane_o_proj_acc_in = [[None] * parallel_heads for _ in range(parallel_seq)]
         lane_o_proj_acc_out = [[None] * parallel_heads for _ in range(parallel_seq)]
-        lane_o_proj_stage_part = [None] * parallel_seq
-        lane_o_proj_stage = [None] * parallel_seq
         lane_o_proj_partial = [
             [None] * max(parallel_heads - 1, 0) for _ in range(parallel_seq)
         ]
@@ -1924,22 +2059,22 @@ def encoder_pipeline(
                 group_inOWSeq.append(None)
                 group_memOWSeq.append([unified_memOWSeq])
 
-            weight_b_up_cols = normalize_slot_mem_cols(
+            weight_b_up_cols = _normalize_slot_mem_cols(
                 transport_group["weight_mem_cols"]["b_up"],
                 effective_ffn_branches,
                 f"sequence_parallel.transport_groups[{group_idx}].weight_mem_cols.b_up",
             )
-            weight_b_down_cols = normalize_slot_mem_cols(
+            weight_b_down_cols = _normalize_slot_mem_cols(
                 transport_group["weight_mem_cols"]["b_down"],
                 effective_ffn_branches,
                 f"sequence_parallel.transport_groups[{group_idx}].weight_mem_cols.b_down",
             )
-            weight_b_up_shim_cols = normalize_slot_mem_cols(
+            weight_b_up_shim_cols = _normalize_slot_mem_cols(
                 group_shim_cols["b_up"],
                 effective_ffn_branches,
                 f"sequence_parallel.transport_groups[{group_idx}].shim_cols.b_up",
             )
-            weight_b_down_shim_cols = normalize_slot_mem_cols(
+            weight_b_down_shim_cols = _normalize_slot_mem_cols(
                 group_shim_cols["b_down"],
                 effective_ffn_branches,
                 f"sequence_parallel.transport_groups[{group_idx}].shim_cols.b_down",
@@ -2042,7 +2177,7 @@ def encoder_pipeline(
                 lane_memOutLN[lane_idx] = lane_memOutLN_group[local_idx]
 
             ffnRFromDDRSeq = ObjectFifo(
-                joined_o_ty, name=f"ffnRFromDDRSeq{suffix}", depth=1
+                joined_o_ty, name=f"ffnRFromDDRSeq{suffix}", depth=2
             )
             group_ffnRFromDDRSeq.append(ffnRFromDDRSeq)
             lane_ffn_r_in_group = ffnRFromDDRSeq.cons().split(
@@ -2090,25 +2225,6 @@ def encoder_pipeline(
             lane_ffn_down_out[lane_idx] = ObjectFifo(
                 o_ty, name=f"ffnDownOutSeqL{lane_idx}", depth=2
             )
-            if parallel_heads > 1:
-                lane_o_proj_stage_part[lane_idx] = ObjectFifo(
-                    o_ty,
-                    depth=o_proj_stage_chain_depth,
-                    name=f"oProjStagePartSeqL{lane_idx}",
-                )
-                lane_o_proj_stage[lane_idx] = (
-                    lane_o_proj_stage_part[lane_idx]
-                    .cons(depth=ln_tiles_per_q_block)
-                    .forward(
-                        obj_type=o_ty,
-                        name=f"oProjStageSeqL{lane_idx}",
-                        depth=ln_tiles_per_q_block,
-                        placement=Tile(
-                            col=lane_o_proj_stage_mem_cols[lane_idx],
-                            row=1,
-                        ),
-                    )
-                )
             if grouped_ffn_down_acc:
                 lane_ffn_down_stage_part[lane_idx] = ObjectFifo(
                     o_ty,
@@ -2317,19 +2433,16 @@ def encoder_pipeline(
                     elif head_idx == (parallel_heads - 1):
                         lane_o_proj_workers.append(
                             Worker(
-                                matmul_o_proj_group_head_final_stage_then_emit_stats,
+                                matmul_o_proj_group_head_final_emit_twice,
                                 fn_args=[
                                     lane_outOProj[lane_idx][head_idx].cons(),
                                     group_memOWSeq[lane_group_idx][head_idx].cons(),
-                                    lane_o_proj_partial[lane_idx][head_idx - 1].cons(),
+                                    lane_o_proj_acc_in[lane_idx][head_idx].cons(
+                                        depth=1
+                                    ),
                                     lane_o_proj_acc_out[lane_idx][head_idx].prod(),
-                                    lane_o_proj_stage_part[lane_idx].prod(),
+                                    lane_o_proj_partial[lane_idx][head_idx - 1].cons(),
                                     lane_ln1_input[lane_idx].prod(),
-                                    o_proj_stats_sum_buffer,
-                                    o_proj_stats_sumsq_buffer,
-                                    ln_zero_f32_kernel,
-                                    ln_calc_sum_sumsq_kernel,
-                                    pack_stats_kernel,
                                     zero_kernel_o_proj,
                                     matmul_kernel_o_proj,
                                     mem_copy_o_proj,
@@ -2359,64 +2472,32 @@ def encoder_pipeline(
                                 while_true=False,
                             )
                         )
-                elif parallel_heads > 1 and head_idx == (parallel_heads - 1):
-                    lane_o_proj_workers.append(
-                        Worker(
-                            matmul_o_proj_stage_then_emit_stats,
-                            fn_args=[
-                                lane_outOProj[lane_idx][head_idx].cons(),
-                                group_memOWSeq[lane_group_idx][head_idx].cons(),
-                                lane_o_proj_acc_in[lane_idx][head_idx].cons(depth=1),
-                                lane_o_proj_acc_out[lane_idx][head_idx].prod(),
-                                (
-                                    lane_o_proj_partial[lane_idx][head_idx - 1].cons()
-                                    if head_idx > 0
-                                    else None
-                                ),
-                                lane_o_proj_stage_part[lane_idx].prod(),
-                                lane_ln1_input[lane_idx].prod(),
-                                o_proj_stats_sum_buffer,
-                                o_proj_stats_sumsq_buffer,
-                                ln_zero_f32_kernel,
-                                ln_calc_sum_sumsq_kernel,
-                                pack_stats_kernel,
-                                eltwise_add_vector_kernel,
-                                zero_kernel_o_proj,
-                                matmul_kernel_o_proj,
-                                mem_copy_o_proj,
-                            ],
-                            placement=Tile(
-                                *lane_front_tiles[lane_idx]["o_proj"][head_idx]
-                            ),
-                            stack_size=0xD00,
-                            while_true=False,
-                        )
-                    )
                 elif head_idx == (parallel_heads - 1):
                     lane_o_proj_workers.append(
                         Worker(
-                            matmul_o_proj_emit_stats_first,
-                            fn_args=[
-                                lane_outOProj[lane_idx][head_idx].cons(),
-                                group_memOWSeq[lane_group_idx][head_idx].cons(),
-                                lane_o_proj_acc_in[lane_idx][head_idx].cons(depth=1),
-                                lane_o_proj_acc_out[lane_idx][head_idx].prod(),
-                                (
-                                    lane_o_proj_partial[lane_idx][head_idx - 1].cons()
-                                    if head_idx > 0
-                                    else None
-                                ),
-                                lane_ln1_input[lane_idx].prod(),
-                                o_proj_stats_sum_buffer,
-                                o_proj_stats_sumsq_buffer,
-                                ln_zero_f32_kernel,
-                                ln_calc_sum_sumsq_kernel,
-                                pack_stats_kernel,
-                                eltwise_add_vector_kernel,
-                                zero_kernel_o_proj,
-                                matmul_kernel_o_proj,
-                                mem_copy_o_proj,
-                            ],
+                            matmul_o_proj_emit_twice,
+                            fn_args=(
+                                [
+                                    lane_outOProj[lane_idx][head_idx].cons(),
+                                    group_memOWSeq[lane_group_idx][head_idx].cons(),
+                                    lane_o_proj_acc_in[lane_idx][head_idx].cons(
+                                        depth=1
+                                    ),
+                                    lane_o_proj_acc_out[lane_idx][head_idx].prod(),
+                                    (
+                                        lane_o_proj_partial[lane_idx][
+                                            head_idx - 1
+                                        ].cons()
+                                        if head_idx > 0
+                                        else None
+                                    ),
+                                    lane_ln1_input[lane_idx].prod(),
+                                    eltwise_add_vector_kernel,
+                                    zero_kernel_o_proj,
+                                    matmul_kernel_o_proj,
+                                    mem_copy_o_proj,
+                                ]
+                            ),
                             placement=Tile(
                                 *lane_front_tiles[lane_idx]["o_proj"][head_idx]
                             ),
@@ -2495,35 +2576,19 @@ def encoder_pipeline(
 
             lane_ln1_workers.append(
                 Worker(
-                    (
-                        core_fn_ln1_stage_from_split_inputs
-                        if parallel_heads > 1
-                        else core_fn_ln1_stage_from_stats
-                    ),
-                    fn_args=(
-                        [
-                            lane_ln1_input[lane_idx].cons(),
-                            lane_o_proj_stage[lane_idx].cons(depth=1),
-                            lane_in_r[lane_idx].cons(),
-                            lane_ln1_norm_sum_buffer,
-                            lane_ln1_norm_sumsq_buffer,
-                            lane_ln1_weight_buffer,
-                            lane_ln1_stage_out[lane_idx].prod(),
-                            ln_fused_add_layer_norm_kernel,
-                            unpack_stats_kernel,
-                        ]
-                        if parallel_heads > 1
-                        else [
-                            lane_ln1_input[lane_idx].cons(),
-                            lane_in_r[lane_idx].cons(),
-                            lane_ln1_norm_sum_buffer,
-                            lane_ln1_norm_sumsq_buffer,
-                            lane_ln1_weight_buffer,
-                            lane_ln1_stage_out[lane_idx].prod(),
-                            ln_fused_add_layer_norm_kernel,
-                            unpack_stats_kernel,
-                        ]
-                    ),
+                    core_fn_ln1_from_replayed_inputs,
+                    fn_args=[
+                        lane_ln1_input[lane_idx].cons(),
+                        lane_in_r[lane_idx].cons(),
+                        lane_ln1_norm_sum_buffer,
+                        lane_ln1_norm_sumsq_buffer,
+                        lane_ln1_weight_buffer,
+                        lane_ln1_stage_out[lane_idx].prod(),
+                        eltwise_add_vector_kernel,
+                        ln_zero_f32_kernel,
+                        ln_calc_sum_sumsq_kernel,
+                        ln_fused_add_layer_norm_kernel,
+                    ],
                     placement=Tile(*lane_tail_tiles[lane_idx]["ln1"]),
                     while_true=False,
                 )
@@ -2614,7 +2679,7 @@ def encoder_pipeline(
                     elif branch_idx == (effective_ffn_branches - 1):
                         lane_ffn_down_workers.append(
                             Worker(
-                                core_fn_ffn_down_proj_group_final_emit_stats_first,
+                                core_fn_ffn_down_proj_group_final_emit_twice,
                                 fn_args=[
                                     lane_ffn_up_out[lane_idx][branch_idx].cons(),
                                     group_memBDownSeq[lane_group_idx][
@@ -2627,12 +2692,7 @@ def encoder_pipeline(
                                     lane_ffn_down_stage_part[lane_idx].prod(),
                                     lane_ffn_down_stage[lane_idx].cons(depth=1),
                                     lane_ffn_down_out[lane_idx].prod(2),
-                                    lane_ffn_down_sum_buffer,
-                                    lane_ffn_down_sumsq_buffer,
                                     ffn_matmul_kernel_down_proj,
-                                    ln_calc_sum_sumsq_kernel,
-                                    pack_stats_kernel,
-                                    ln_zero_f32_kernel,
                                     ffn_zero_kernel_down_proj,
                                     mem_copy_o_proj,
                                     ffn_col_group_count,
@@ -2671,7 +2731,7 @@ def encoder_pipeline(
                     lane_ffn_down_workers.append(
                         Worker(
                             (
-                                core_fn_ffn_down_proj_emit_stats_first
+                                core_fn_ffn_down_proj_emit_twice
                                 if branch_idx == (effective_ffn_branches - 1)
                                 else core_fn_ffn_down_proj
                             ),
@@ -2693,14 +2753,9 @@ def encoder_pipeline(
                                         else None
                                     ),
                                     lane_ffn_down_out[lane_idx].prod(2),
-                                    lane_ffn_down_sum_buffer,
-                                    lane_ffn_down_sumsq_buffer,
                                     ffn_matmul_init_kernel_down_proj,
                                     ffn_matmul_kernel_down_proj,
                                     eltwise_add_vector_kernel,
-                                    ln_calc_sum_sumsq_kernel,
-                                    pack_stats_kernel,
-                                    ln_zero_f32_kernel,
                                     mem_copy_o_proj,
                                     ffn_col_group_count,
                                 ]
@@ -2745,7 +2800,7 @@ def encoder_pipeline(
 
             lane_ln2_workers.append(
                 Worker(
-                    core_fn_add_norm2_from_stats,
+                    core_fn_add_norm2_from_replayed_inputs,
                     fn_args=[
                         lane_ffn_down_out[lane_idx].cons(),
                         lane_ffn_r_in[lane_idx].cons(),
@@ -2753,8 +2808,10 @@ def encoder_pipeline(
                         lane_ln2_sumsq_buffer,
                         lane_ln2_weight_buffer,
                         lane_outLN2[lane_idx].prod(),
+                        eltwise_add_vector_kernel,
+                        ln_zero_f32_kernel,
+                        ln_calc_sum_sumsq_kernel,
                         ln_fused_add_layer_norm_kernel,
-                        unpack_stats_kernel,
                     ],
                     placement=Tile(*lane_tail_tiles[lane_idx]["ln2"]),
                     stack_size=0xF00,
@@ -3043,68 +3100,68 @@ def encoder_pipeline(
             for tap in v_tiles
         ]
 
-        if (
-            math.prod(int(s) for s in q_batch_tiles[0].sizes)
-            // math.prod((group_size * seq_tile, d * parallel_heads))
-            != 1
-        ):
-            raise ValueError("Sequence-parallel Q batch tap count mismatch")
-        if (
-            unified_q_batch_tiles is not None
-            and math.prod(int(s) for s in unified_q_batch_tiles[0].sizes)
-            // math.prod((parallel_seq * seq_tile, d * parallel_heads))
-            != 1
-        ):
-            raise ValueError("Sequence-parallel unified Q batch tap count mismatch")
-        if (
-            math.prod(int(s) for s in k_tiles[0].sizes)
-            // math.prod((kv_seq_tile, d * parallel_heads))
-            != num_kv_seq_blocks
-        ):
-            raise ValueError("Sequence-parallel K tap count mismatch")
-        if (
-            math.prod(int(s) for s in v_tiles[0].sizes)
-            // math.prod((kv_seq_tile, d * parallel_heads))
-            != num_kv_seq_blocks
-        ):
-            raise ValueError("Sequence-parallel V tap count mismatch")
-        if (
-            math.prod(int(s) for s in wo_tiles[0].sizes)
-            // math.prod((d * parallel_heads, emb_tile))
-            != proj_acc_depth
-        ):
-            raise ValueError("Sequence-parallel W_O tap count mismatch")
-        if (
-            math.prod(int(s) for s in joined_r_tiles[0].sizes)
-            // math.prod((group_size * seq_tile, emb_tile))
-            != proj_acc_depth
-        ):
-            raise ValueError("Sequence-parallel residual tap count mismatch")
-        if (
-            unified_joined_r_tiles is not None
-            and math.prod(int(s) for s in unified_joined_r_tiles[0].sizes)
-            // math.prod((parallel_seq * seq_tile, emb_tile))
-            != proj_acc_depth
-        ):
-            raise ValueError("Sequence-parallel unified residual tap count mismatch")
-        if (
-            math.prod(int(s) for s in joined_o_tiles[0].sizes)
-            // math.prod((group_size * seq_tile, emb_tile))
-            != proj_acc_depth
-        ):
-            raise ValueError("Sequence-parallel output tap count mismatch")
-        if (
-            math.prod(int(s) for s in joined_i_tiles[0].sizes)
-            // math.prod((group_size * seq_tile, emb_tile))
-            != proj_acc_depth
-        ):
-            raise ValueError("Sequence-parallel intermediate tap count mismatch")
-        if (
-            math.prod(int(s) for s in joined_refill_taps[0].sizes)
-            // math.prod((group_size * seq_tile, emb_tile))
-            != ffn_col_group_count * proj_acc_depth
-        ):
-            raise ValueError("Sequence-parallel LN1 refill tap count mismatch")
+        assert_tap_iteration_count(
+            q_batch_tiles[0],
+            (group_size * seq_tile, d * parallel_heads),
+            1,
+            "Sequence-parallel Q batch tap count mismatch",
+        )
+        if unified_q_batch_tiles is not None:
+            assert_tap_iteration_count(
+                unified_q_batch_tiles[0],
+                (parallel_seq * seq_tile, d * parallel_heads),
+                1,
+                "Sequence-parallel unified Q batch tap count mismatch",
+            )
+        assert_tap_iteration_count(
+            k_tiles[0],
+            (kv_seq_tile, d * parallel_heads),
+            num_kv_seq_blocks,
+            "Sequence-parallel K tap count mismatch",
+        )
+        assert_tap_iteration_count(
+            v_tiles[0],
+            (kv_seq_tile, d * parallel_heads),
+            num_kv_seq_blocks,
+            "Sequence-parallel V tap count mismatch",
+        )
+        assert_tap_iteration_count(
+            wo_tiles[0],
+            (d * parallel_heads, emb_tile),
+            proj_acc_depth,
+            "Sequence-parallel W_O tap count mismatch",
+        )
+        assert_tap_iteration_count(
+            joined_r_tiles[0],
+            (group_size * seq_tile, emb_tile),
+            proj_acc_depth,
+            "Sequence-parallel residual tap count mismatch",
+        )
+        if unified_joined_r_tiles is not None:
+            assert_tap_iteration_count(
+                unified_joined_r_tiles[0],
+                (parallel_seq * seq_tile, emb_tile),
+                proj_acc_depth,
+                "Sequence-parallel unified residual tap count mismatch",
+            )
+        assert_tap_iteration_count(
+            joined_o_tiles[0],
+            (group_size * seq_tile, emb_tile),
+            proj_acc_depth,
+            "Sequence-parallel output tap count mismatch",
+        )
+        assert_tap_iteration_count(
+            joined_i_tiles[0],
+            (group_size * seq_tile, emb_tile),
+            proj_acc_depth,
+            "Sequence-parallel intermediate tap count mismatch",
+        )
+        assert_tap_iteration_count(
+            joined_refill_taps[0],
+            (group_size * seq_tile, emb_tile),
+            ffn_col_group_count * proj_acc_depth,
+            "Sequence-parallel LN1 refill tap count mismatch",
+        )
 
         rt = Runtime()
         with rt.sequence(W_O_ty, QKV_ty, OR_ty, B_Up_ty, B_Down_ty) as (
@@ -3239,9 +3296,34 @@ def encoder_pipeline(
                         task_group=tg_residual,
                         wait=False,
                     )
+                    rt.fill(
+                        unified_inRSeq.prod(),
+                        OR,
+                        tap=unified_joined_r_tiles[lane_batch_idx],
+                        placement=Tile(
+                            col=unified_qr_split["residual_shim_col"],
+                            row=0,
+                        ),
+                        task_group=tg_residual,
+                        wait=False,
+                    )
                 else:
                     for group_idx in range(group_count):
                         group_batch_idx = lane_batch_idx * group_count + group_idx
+                        rt.fill(
+                            group_inRSeq[group_idx].prod(),
+                            OR,
+                            tap=joined_r_tiles[group_batch_idx],
+                            placement=Tile(
+                                col=transport_groups[group_idx].get(
+                                    "joined_or_shim_cols",
+                                    default_group_joined_or_shim_cols,
+                                )["residual"],
+                                row=0,
+                            ),
+                            task_group=tg_residual,
+                            wait=False,
+                        )
                         rt.fill(
                             group_inRSeq[group_idx].prod(),
                             OR,
@@ -3352,6 +3434,20 @@ def encoder_pipeline(
                         task_group=tg_tail,
                         wait=True,
                     )
+                    rt.fill(
+                        group_ffnRFromDDRSeq[group_idx].prod(),
+                        OR,
+                        tap=joined_i_tiles[group_batch_idx],
+                        placement=Tile(
+                            col=transport_groups[group_idx].get(
+                                "joined_or_shim_cols",
+                                default_group_joined_or_shim_cols,
+                            )["ffn_residual_refill"],
+                            row=0,
+                        ),
+                        task_group=tg_tail,
+                        wait=True,
+                    )
                     rt.drain(
                         group_memLN2Joined[group_idx].cons(),
                         OR,
@@ -3370,8 +3466,7 @@ def encoder_pipeline(
             if pending_tail_tg is not None:
                 rt.finish_task_group(pending_tail_tg)
 
-        program = Program(NPU2(), rt)
-        return program.resolve_program(SequentialPlacer())
+        return _emit_program(rt)
 
     idx_buffer_qk = [
         Buffer(
@@ -3482,13 +3577,9 @@ def encoder_pipeline(
         o_proj_workers.append(
             Worker(
                 (
-                    matmul_o_proj_stage_then_emit_stats
-                    if parallel_heads > 1 and i == (parallel_heads - 1)
-                    else (
-                        matmul_o_proj_emit_stats_first
-                        if i == (parallel_heads - 1)
-                        else matmul_o_proj
-                    )
+                    matmul_o_proj_emit_twice
+                    if i == (parallel_heads - 1)
+                    else matmul_o_proj
                 ),
                 fn_args=(
                     [
@@ -3497,8 +3588,24 @@ def encoder_pipeline(
                         outOProjAccumIn[i].cons(depth=1),
                         outOProjAccumOut[i].prod(),
                         outOPart[i - 1].cons() if i > 0 else None,
-                        oProjStagePart.prod(),
                         outOProjInput.prod(),
+                        eltwise_add_vector_kernel,
+                        zero_kernel_o_proj,
+                        matmul_kernel_o_proj,
+                        mem_copy_o_proj,
+                    ]
+                    if i == (parallel_heads - 1)
+                    else [
+                        outOProj[i].cons(),
+                        memOW[i].cons(),
+                        outOProjAccumIn[i].cons(depth=1),
+                        outOProjAccumOut[i].prod(),
+                        outOPart[i - 1].cons() if i > 0 else None,
+                        (
+                            outOPart[i].prod()
+                            if i < (parallel_heads - 1)
+                            else outOProjInput.prod()
+                        ),
                         o_proj_stats_sum_buffers[i],
                         o_proj_stats_sumsq_buffers[i],
                         ln_zero_f32_kernel,
@@ -3508,50 +3615,8 @@ def encoder_pipeline(
                         zero_kernel_o_proj,
                         matmul_kernel_o_proj,
                         mem_copy_o_proj,
+                        i == (parallel_heads - 1) and emb_tile >= 2 * seq_tile,
                     ]
-                    if parallel_heads > 1 and i == (parallel_heads - 1)
-                    else (
-                        [
-                            outOProj[i].cons(),
-                            memOW[i].cons(),
-                            outOProjAccumIn[i].cons(depth=1),
-                            outOProjAccumOut[i].prod(),
-                            outOPart[i - 1].cons() if i > 0 else None,
-                            outOProjInput.prod(),
-                            o_proj_stats_sum_buffers[i],
-                            o_proj_stats_sumsq_buffers[i],
-                            ln_zero_f32_kernel,
-                            ln_calc_sum_sumsq_kernel,
-                            pack_stats_kernel,
-                            eltwise_add_vector_kernel,
-                            zero_kernel_o_proj,
-                            matmul_kernel_o_proj,
-                            mem_copy_o_proj,
-                        ]
-                        if i == (parallel_heads - 1)
-                        else [
-                            outOProj[i].cons(),
-                            memOW[i].cons(),
-                            outOProjAccumIn[i].cons(depth=1),
-                            outOProjAccumOut[i].prod(),
-                            outOPart[i - 1].cons() if i > 0 else None,
-                            (
-                                outOPart[i].prod()
-                                if i < (parallel_heads - 1)
-                                else outOProjInput.prod()
-                            ),
-                            o_proj_stats_sum_buffers[i],
-                            o_proj_stats_sumsq_buffers[i],
-                            ln_zero_f32_kernel,
-                            ln_calc_sum_sumsq_kernel,
-                            pack_stats_kernel,
-                            eltwise_add_vector_kernel,
-                            zero_kernel_o_proj,
-                            matmul_kernel_o_proj,
-                            mem_copy_o_proj,
-                            i == (parallel_heads - 1) and emb_tile >= 2 * seq_tile,
-                        ]
-                    )
                 ),
                 placement=o_proj_tiles[i],
                 stack_size=0xD00,
@@ -3559,37 +3624,19 @@ def encoder_pipeline(
             )
         )
     ln1_worker = Worker(
-        (
-            core_fn_ln1_stage_from_split_inputs
-            if parallel_heads > 1
-            else core_fn_ln1_stage_from_stats
-        ),
-        fn_args=(
-            [
-                outOProjInput.cons(),
-                oProjStage.cons(depth=1),
-                memR.cons(),
-                ln1_norm_sum_buffer,
-                ln1_norm_sumsq_buffer,
-                ln1_weight_buffer,
-                outLNBroadcast.prod(1),
-                ln_fused_add_layer_norm_kernel,
-                unpack_stats_kernel,
-            ]
-            if parallel_heads > 1
-            else (
-                [
-                    outOProjInput.cons(),
-                    memR.cons(),
-                    ln1_norm_sum_buffer,
-                    ln1_norm_sumsq_buffer,
-                    ln1_weight_buffer,
-                    outLNBroadcast.prod(1),
-                    ln_fused_add_layer_norm_kernel,
-                    unpack_stats_kernel,
-                ]
-            )
-        ),
+        core_fn_ln1_from_replayed_inputs,
+        fn_args=[
+            outOProjInput.cons(),
+            memR.cons(),
+            ln1_norm_sum_buffer,
+            ln1_norm_sumsq_buffer,
+            ln1_weight_buffer,
+            outLNBroadcast.prod(1),
+            eltwise_add_vector_kernel,
+            ln_zero_f32_kernel,
+            ln_calc_sum_sumsq_kernel,
+            ln_fused_add_layer_norm_kernel,
+        ],
         placement=ln1_tile,
         while_true=False,
     )
@@ -3623,7 +3670,7 @@ def encoder_pipeline(
         ffn_down_workers.append(
             Worker(
                 (
-                    core_fn_ffn_down_proj_emit_stats_first
+                    core_fn_ffn_down_proj_emit_twice
                     if branch_idx == (effective_ffn_branches - 1)
                     else core_fn_ffn_down_proj
                 ),
@@ -3635,14 +3682,9 @@ def encoder_pipeline(
                         ffnDownPart[branch_idx].prod(),
                         reduce_in,
                         ffnDownOut.prod(2),
-                        ffn_down_sum_buffer,
-                        ffn_down_sumsq_buffer,
                         ffn_matmul_init_kernel_down_proj,
                         ffn_matmul_kernel_down_proj,
                         eltwise_add_vector_kernel,
-                        ln_calc_sum_sumsq_kernel,
-                        pack_stats_kernel,
-                        ln_zero_f32_kernel,
                         mem_copy_o_proj,
                         ffn_col_group_count,
                     ]
@@ -3667,7 +3709,7 @@ def encoder_pipeline(
             )
         )
     ln2_worker = Worker(
-        core_fn_add_norm2_from_stats,
+        core_fn_add_norm2_from_replayed_inputs,
         fn_args=[
             ffnDownOut.cons(),
             ffnRIn.cons(),
@@ -3675,8 +3717,10 @@ def encoder_pipeline(
             ln2_sumsq_buffer,
             ln2_weight_buffer,
             outLN2.prod(),
+            eltwise_add_vector_kernel,
+            ln_zero_f32_kernel,
+            ln_calc_sum_sumsq_kernel,
             ln_fused_add_layer_norm_kernel,
-            unpack_stats_kernel,
         ],
         placement=ln2_tile,
         stack_size=0xF00,
@@ -3930,11 +3974,7 @@ def encoder_pipeline(
             "B_Down tap count does not match FFN loop count",
         ),
     ):
-        if (
-            math.prod(int(s) for s in tap_seq[0].sizes) // math.prod(obj_shape)
-            != expected
-        ):
-            raise ValueError(message)
+        assert_tap_iteration_count(tap_seq[0], obj_shape, expected, message)
 
     rt = Runtime()
     with rt.sequence(W_O_ty, QKV_ty, OR_ty, B_Up_ty, B_Down_ty) as (
@@ -3957,11 +3997,13 @@ def encoder_pipeline(
 
         pending_ln1_refill_tg = None
         pending_output_tap_idx = None
-        q_block_schedule = [
-            lane_idx * q_blocks_per_lane + lane_block_idx
-            for lane_block_idx in range(q_blocks_per_lane)
-            for lane_idx in range(parallel_seq)
-        ]
+        q_block_schedule = build_q_block_schedule(parallel_seq, q_blocks_per_lane)
+        if len(q_block_schedule) != num_q_seq_blocks or sorted(
+            q_block_schedule
+        ) != list(range(num_q_seq_blocks)):
+            raise ValueError(
+                "Q block schedule must visit each sequence block exactly once"
+            )
 
         for tap_idx in q_block_schedule:
             if pending_ln1_refill_tg is not None:
@@ -4029,6 +4071,14 @@ def encoder_pipeline(
                 task_group=tg_tail,
                 wait=False,
             )
+            rt.fill(
+                inR.prod(),
+                OR,
+                tap=R_tiles[tap_idx],
+                placement=Tile(col=residual_shim_col, row=0),
+                task_group=tg_tail,
+                wait=False,
+            )
 
             ln1_stage_base_offset = 2 * seq_len * embed_sz
             branch_stage_tap = TensorAccessPattern(
@@ -4049,24 +4099,24 @@ def encoder_pipeline(
                 sizes=[1, proj_acc_depth, seq_tile, emb_tile],
                 strides=[0, emb_tile, embed_sz, 1],
             )
-            if (
-                math.prod(int(s) for s in branch_stage_tap.sizes)
-                // math.prod((seq_tile, emb_tile))
-                != proj_acc_depth
-            ):
-                raise ValueError("LN1 stage tap count mismatch")
-            if (
-                math.prod(int(s) for s in branch_refill_tap.sizes)
-                // math.prod((seq_tile, emb_tile))
-                != ffn_col_group_count * proj_acc_depth
-            ):
-                raise ValueError("LN1 branch refill tap count mismatch")
-            if (
-                math.prod(int(s) for s in residual_stage_tap.sizes)
-                // math.prod((seq_tile, emb_tile))
-                != proj_acc_depth
-            ):
-                raise ValueError("LN1 residual stage tap count mismatch")
+            assert_tap_iteration_count(
+                branch_stage_tap,
+                (seq_tile, emb_tile),
+                proj_acc_depth,
+                "LN1 stage tap count mismatch",
+            )
+            assert_tap_iteration_count(
+                branch_refill_tap,
+                (seq_tile, emb_tile),
+                ffn_col_group_count * proj_acc_depth,
+                "LN1 branch refill tap count mismatch",
+            )
+            assert_tap_iteration_count(
+                residual_stage_tap,
+                (seq_tile, emb_tile),
+                proj_acc_depth,
+                "LN1 residual stage tap count mismatch",
+            )
 
             tg_ln1_drain = rt.task_group()
             rt.drain(
@@ -4084,6 +4134,14 @@ def encoder_pipeline(
                 inLNFromDDR.prod(),
                 OR,
                 tap=branch_refill_tap,
+                placement=Tile(col=ln1_stage_shim_col, row=0),
+                task_group=tg_ln1_refill_and_weights,
+                wait=True,
+            )
+            rt.fill(
+                ffnRFromDDR.prod(),
+                OR,
+                tap=residual_stage_tap,
                 placement=Tile(col=ln1_stage_shim_col, row=0),
                 task_group=tg_ln1_refill_and_weights,
                 wait=True,
@@ -4138,8 +4196,7 @@ def encoder_pipeline(
         if pending_ln1_refill_tg is not None:
             rt.finish_task_group(pending_ln1_refill_tg)
 
-    program = Program(NPU2(), rt)
-    return program.resolve_program(SequentialPlacer())
+    return _emit_program(rt)
 
 
 if __name__ == "__main__":

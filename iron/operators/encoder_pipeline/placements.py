@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from copy import deepcopy
+
 COMMON_MEM_TILES = {
     "q": 0,
     "k": 1,
@@ -1471,6 +1473,66 @@ for seq_len in SCALED_SEQ_LENS:
                 ),
             },
         )
+
+
+def register_mirrored_family(
+    *,
+    source_seq_tile: int,
+    source_kv_seq_tile: int,
+    target_seq_tile: int,
+    target_kv_seq_tile: int,
+):
+    existing_entries = sorted(TOPOLOGY_PLACEMENTS.items())
+    for key, placement in existing_entries:
+        (
+            num_heads,
+            seq_len,
+            d,
+            seq_tile,
+            kv_seq_tile,
+            emb_tile,
+            ffn_tile,
+            parallel_seq,
+            parallel_heads,
+            proj_acc_depth,
+            o_proj_acc_group_size,
+            parallel_ffn,
+            ffn_intermediate_size,
+        ) = key
+        if num_heads not in (12, 16):
+            continue
+        if (seq_tile, kv_seq_tile) != (source_seq_tile, source_kv_seq_tile):
+            continue
+        if seq_len % target_seq_tile != 0 or seq_len % target_kv_seq_tile != 0:
+            continue
+        if (seq_len // target_seq_tile) % parallel_seq != 0:
+            continue
+        mirrored_key = (
+            num_heads,
+            seq_len,
+            d,
+            target_seq_tile,
+            target_kv_seq_tile,
+            emb_tile,
+            ffn_tile,
+            parallel_seq,
+            parallel_heads,
+            proj_acc_depth,
+            o_proj_acc_group_size,
+            parallel_ffn,
+            ffn_intermediate_size,
+        )
+        if mirrored_key in TOPOLOGY_PLACEMENTS:
+            continue
+        TOPOLOGY_PLACEMENTS[mirrored_key] = deepcopy(placement)
+
+
+register_mirrored_family(
+    source_seq_tile=32,
+    source_kv_seq_tile=64,
+    target_seq_tile=64,
+    target_kv_seq_tile=32,
+)
 
 
 SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES = frozenset(

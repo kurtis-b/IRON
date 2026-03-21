@@ -393,6 +393,7 @@ void fused_add_layer_norm_1(const T *restrict input,
                             const int32_t col_idx) // For offset into weight vector
 {
     event0();
+    (void)residual;
 
     constexpr float epsilon = 1e-5f;
     constexpr unsigned mmul_c_size = r * s; // This is the number of elements in each C tile (microtile)
@@ -402,7 +403,6 @@ void fused_add_layer_norm_1(const T *restrict input,
     for (unsigned z = 0; z < rowA; z += 1) {
 
         const T *__restrict pA1 = input + (z * colA) * mmul_c_size;
-        const T *__restrict pR1 = residual + (z * colA) * mmul_c_size;
         T *__restrict pC1 = output + (z * colA) * mmul_c_size;
 
         // Each row has an accumulator for sum and sum-squared, so offset by z*r to get to the correct row,
@@ -428,12 +428,6 @@ void fused_add_layer_norm_1(const T *restrict input,
                 aie::vector<T, s> A1 = aie::load_v<s>(pA1);
                 pA1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
                 auto A01 = aie::concat(A0, A1);
-                aie::vector<T, s> R0 = aie::load_v<s>(pR1);
-                pR1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
-                aie::vector<T, s> R1 = aie::load_v<s>(pR1);
-                pR1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
-                auto R01 = aie::concat(R0, R1);
-
                 aie::accum<accfloat, 2 * s> a_acc;
                 a_acc.from_vector(A01);
                 aie::accum<accfloat, 2 * s> diff_acc = aie::sub(a_acc, mean);
@@ -441,8 +435,7 @@ void fused_add_layer_norm_1(const T *restrict input,
                 aie::vector<T, 2 * s> weight_v = aie::load_v<2 * s>(pW);
                 pW += 2 * s; // Move weight pointer to the columns
                 aie::vector<T, 2 * s> scaled_acc = aie::mul(norm_acc.template to_vector<T>(), weight_v);
-                // aie::accum<accfloat, 2 * s> out_v = aie::add(scaled_v, beta_v);
-                aie::vector<T, 2 * s> out_acc = aie::add(scaled_acc, R01);
+                aie::vector<T, 2 * s> out_acc = scaled_acc;
 
 #ifndef DEBUG_AIE_KERNELS
                 // Write s elements to one row of four r x s tiles in output
@@ -469,8 +462,6 @@ void fused_add_layer_norm_1(const T *restrict input,
             pSumSq1++;
             pA1 -= colA * mmul_c_size; // Move pointer back to the start of the row
             pA1 += s;                  // Move pointer to the next row within the same microtile
-            pR1 -= colA * mmul_c_size; // Move pointer back to the start of the row
-            pR1 += s;                  // Move pointer to the next row within the same microtile
             pC1 -= colA * mmul_c_size; // Move pointer back to the start of the row
             pC1 += s;                  // Move pointer to the next row within the same microtile
         }
@@ -647,6 +638,7 @@ void fused_add_layer_norm_2(const T *restrict input,
                             const int32_t rows_to_process)
 {
     event0();
+    (void)residual;
 #ifndef DEBUG_AIE_KERNELS
     constexpr float epsilon = 1e-5f;
     int vector_chunks = cols / N;
@@ -685,24 +677,20 @@ void fused_add_layer_norm_2(const T *restrict input,
         ::aie::vector<T, N> inv_std_v = ::aie::broadcast<T, N>(inv_std);
 
         const T *__restrict pW = weight;
-        const T *__restrict pRes = residual + row * cols;
         T *__restrict pOut1 = output1 + row * cols;
         T *__restrict pOut2 = output2 + row * cols;
         for (int i = 0; i < vector_chunks; i++) {
 
             ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_idx);
             ::aie::vector<T, N> reg_weight = ::aie::load_v<N>(pW);
-            ::aie::vector<T, N> reg_res = ::aie::load_v<N>(pRes);
             ::aie::vector<T, N> diff_v = ::aie::sub(reg_a, mean_v);
             ::aie::vector<T, N> norm_v = ::aie::mul(diff_v, inv_std_v);
             ::aie::vector<T, N> scaled_v = aie::mul(norm_v, reg_weight);
-            // ::aie::vector<T, N> out_v = ::aie::add(scaled_v, beta_v);
-            ::aie::vector<T, N> out_v = ::aie::add(scaled_v, reg_res);
+            ::aie::vector<T, N> out_v = scaled_v;
             ::aie::store_v(pOut1, out_v);
             ::aie::store_v(pOut2, out_v);
             input_idx += N;
             pW += N;
-            pRes += N;
             pOut1 += N;
             pOut2 += N;
         }

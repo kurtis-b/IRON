@@ -88,44 +88,47 @@ def run_test(
     )
     logger = logging.getLogger(__name__)
     operator.context.compile_all()
-    operator.context.prepare_runtime()
+    try:
+        operator.context.prepare_runtime()
 
-    # Run warmup iterations before writing to buffers (warmup iters might corrupt the buffers)
-    for _ in range(warmup_iters):
-        operator.run_runlist()  # warmup run to configure
+        # Run warmup iterations before writing to buffers (warmup iters might corrupt the buffers)
+        for _ in range(warmup_iters):
+            operator.run_runlist()  # warmup run to configure
 
-    # Write input buffers and zero outputs
-    for buf_name in output_buffers:
-        buf_size = operator.buffers[buf_name]
-        operator.write_buffer(buf_name, np.zeros(buf_size, dtype=np.uint8))
-    # Operator may share the same buffer object for inputs and outputs; hence, write input after outputs
-    for buf_name, data in input_buffers.items():
-        data_np = torch_to_numpy(data)
-        operator.write_buffer(buf_name, data_np)
+        # Write input buffers and zero outputs
+        for buf_name in output_buffers:
+            buf_size = operator.buffers[buf_name]
+            operator.write_buffer(buf_name, np.zeros(buf_size, dtype=np.uint8))
+        # Operator may share the same buffer object for inputs and outputs; hence, write input after outputs
+        for buf_name, data in input_buffers.items():
+            data_np = torch_to_numpy(data)
+            operator.write_buffer(buf_name, data_np)
 
-    # Run operator
-    elapsed_total = 0
-    for _ in range(timed_iters):
-        elapsed_total += operator.run_runlist()
-    elapsed = elapsed_total / timed_iters
-    latency_us = elapsed * 1e6
+        # Run operator
+        elapsed_total = 0
+        for _ in range(timed_iters):
+            elapsed_total += operator.run_runlist()
+        elapsed = elapsed_total / timed_iters
+        latency_us = elapsed * 1e6
 
-    # Verify outputs
-    errors = {}
-    for buf_name, expected in output_buffers.items():
-        buf_errors = verify_buffer(operator, buf_name, expected, rel_tol, abs_tol)
-        if buf_errors:
-            errors[buf_name] = buf_errors
+        # Verify outputs
+        errors = {}
+        for buf_name, expected in output_buffers.items():
+            buf_errors = verify_buffer(operator, buf_name, expected, rel_tol, abs_tol)
+            if buf_errors:
+                errors[buf_name] = buf_errors
 
-    for buf_name, expected in intermediate_buffers.items():
-        buf_errors = verify_buffer(operator, buf_name, expected, rel_tol, abs_tol)
-        if buf_errors:
-            errors[buf_name] = buf_errors
+        for buf_name, expected in intermediate_buffers.items():
+            buf_errors = verify_buffer(operator, buf_name, expected, rel_tol, abs_tol)
+            if buf_errors:
+                errors[buf_name] = buf_errors
 
-    # Calculate bandwidth
-    input_bytes = sum(operator.buffers[buf_name] for buf_name in input_buffers)
-    output_bytes = sum(operator.buffers[buf_name] for buf_name in output_buffers)
-    total_bytes = input_bytes + output_bytes
-    bandwidth_gbps = total_bytes / (latency_us * 1e-6) / 1e9
+        # Calculate bandwidth
+        input_bytes = sum(operator.buffers[buf_name] for buf_name in input_buffers)
+        output_bytes = sum(operator.buffers[buf_name] for buf_name in output_buffers)
+        total_bytes = input_bytes + output_bytes
+        bandwidth_gbps = total_bytes / (latency_us * 1e-6) / 1e9
 
-    return errors, latency_us, bandwidth_gbps
+        return errors, latency_us, bandwidth_gbps
+    finally:
+        operator.context.reset_runtime()

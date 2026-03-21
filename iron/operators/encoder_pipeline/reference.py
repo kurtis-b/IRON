@@ -66,11 +66,11 @@ def generate_golden_reference(
     )
     pv = attn.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     o_proj = torch.matmul(pv, w_o)
-    ln1 = _layer_norm(o_proj, ln1_w) + r1
+    ln1 = _layer_norm(o_proj + r1, ln1_w)
     up = torch.matmul(ln1, b_up)
     up_gelu = torch.nn.functional.gelu(up)
     down = torch.matmul(up_gelu, b_down)
-    y = _layer_norm(down, ln2_w) + ln1
+    y = _layer_norm(down + ln1, ln2_w)
 
     q_2d = q.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     k_2d = k.transpose(0, 1).contiguous().view(seq_len, embed_sz)

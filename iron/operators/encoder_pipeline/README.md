@@ -48,7 +48,7 @@ This operator is sensitive to `mlir_aie` lowering/allocation behavior. Different
 The public test matrix in [test.py](/home/agi-demo/iron/operators/encoder_pipeline/test.py) currently uses:
 
 - `seq_len`: powers of 2 from `64` through `16384`
-- base topology:
+- default-family base topology:
   - `d=64`
   - `num_heads=12`
   - `ffn_intermediate_size=3072`
@@ -56,6 +56,10 @@ The public test matrix in [test.py](/home/agi-demo/iron/operators/encoder_pipeli
   - `kv_seq_tile=64`
   - `emb_tile=96`
   - `ffn_tile=64`
+- mirrored experimental family:
+  - `seq_tile=64`
+  - `kv_seq_tile=32`
+  - registered for the same supported 12-head and 16-head placement shapes when divisibility constraints allow it
 
 Runtime topology cases:
 
@@ -71,7 +75,7 @@ Constraints that affect which test cases are generated:
 
 - `seq_len` must be divisible by `seq_tile`
 - `(seq_len // seq_tile)` must be divisible by `parallel_seq`
-- so `4ps` starts effectively at `128seq`, not `64seq`
+- so `4ps` starts effectively at `128seq` for the default `32/64` family and `256seq` for the mirrored `64/32` family
 
 ## Running Tests
 

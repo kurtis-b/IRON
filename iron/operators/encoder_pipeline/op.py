@@ -21,7 +21,10 @@ from iron.common import (
     XclbinArtifact,
 )
 from iron.common.utils import numpy_to_torch, torch_to_numpy
-from .placements import SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES
+from .topology import (
+    load_supported_encoder_pipeline_topology_keys,
+    topology_from_fields,
+)
 
 
 class AIEEncoderPipeline(AIEOperatorBase):
@@ -110,21 +113,22 @@ class AIEEncoderPipeline(AIEOperatorBase):
         )
 
     def _validate_configuration(self):
-        placement_topology_key = (
-            self.num_heads,
-            self.seq_len,
-            self.d,
-            self.seq_tile,
-            self.kv_seq_tile,
-            self.emb_tile,
-            self.ffn_tile,
-            self.parallel_seq,
-            self.parallel_heads,
-            self.proj_acc_depth,
-            1,
-            self.nB_tiles_distributed,
-            self.ffn_intermediate_size,
+        requested_topology = topology_from_fields(
+            num_heads=self.num_heads,
+            seq_len=self.seq_len,
+            d=self.d,
+            seq_tile=self.seq_tile,
+            kv_seq_tile=self.kv_seq_tile,
+            emb_tile=self.emb_tile,
+            ffn_tile=self.ffn_tile,
+            parallel_seq=self.parallel_seq,
+            parallel_heads=self.parallel_heads,
+            proj_acc_depth=self.proj_acc_depth,
+            o_proj_acc_group_size=1,
+            parallel_ffn=self.nB_tiles_distributed,
+            ffn_intermediate_size=self.ffn_intermediate_size,
         )
+        supported_topologies = load_supported_encoder_pipeline_topology_keys()
         if self.d != 64:
             raise AIEOperatorConstraintError(
                 f"encoder_pipeline only supports d=64 today (got {self.d})"
@@ -208,11 +212,11 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "outside the seq-par multi-branch path "
                 f"(got {self.ffn_down_acc_group_size})"
             )
-        if placement_topology_key not in SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES:
+        if requested_topology.key not in supported_topologies:
             raise AIEOperatorConstraintError(
                 "encoder_pipeline currently supports only hardcoded placement "
-                f"topologies {sorted(SUPPORTED_ENCODER_PIPELINE_TOPOLOGIES)} "
-                f"(got placement key {placement_topology_key})"
+                f"topologies {sorted(supported_topologies)} "
+                f"(got placement key {requested_topology.key})"
             )
 
     def _artifact_stem(self, prefix: str) -> str:
