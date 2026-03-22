@@ -6,6 +6,7 @@ import sys
 import pytest
 from pathlib import Path
 import logging
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -145,3 +146,49 @@ def test_mha(
         assert (
             len(errors["O"]) <= max_acceptable_errors
         ), f"Test failed with {len(errors['O'])} errors (max allowable: {max_acceptable_errors})"
+
+
+def test_mha_mirrored_debug2_identity_layout(aie_context):
+    seq_len = 64
+    head_dim = 64
+    num_heads = 1
+    q_seq_tile = 64
+    kv_seq_tile = 32
+    emb_tile = 64
+    parallel_heads = 1
+    o_proj_acc_depth = 1
+
+    identity = torch.eye(seq_len, head_dim, dtype=torch.bfloat16)
+    weights = torch.eye(head_dim, head_dim, dtype=torch.bfloat16)
+
+    operator = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        q_seq_tile=q_seq_tile,
+        kv_seq_tile=kv_seq_tile,
+        emb_tile=emb_tile,
+        parallel_heads=parallel_heads,
+        o_proj_acc_depth=o_proj_acc_depth,
+        debug=2,
+        context=aie_context,
+    )
+
+    input_buffers = {
+        "QKV": torch.cat([identity, identity, identity], dim=0).flatten(),
+        "W_O": weights.flatten(),
+    }
+    output_buffers = {"O": identity.flatten()}
+
+    errors, latency_us, bandwidth_gbps = run_test(
+        operator,
+        input_buffers,
+        output_buffers,
+        rel_tol=0.04,
+        abs_tol=1.5e-1,
+    )
+
+    print(f"\nLatency (us): {latency_us:.1f}")
+    print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
+
+    assert not errors, f"Test failed with errors: {errors}"

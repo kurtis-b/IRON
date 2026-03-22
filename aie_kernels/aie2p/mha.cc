@@ -11,6 +11,10 @@
 #define VECTOR_LENGTH 64
 #endif
 
+#ifndef SCALE_VECTOR_LENGTH
+#define SCALE_VECTOR_LENGTH VECTOR_LENGTH
+#endif
+
 #define ROUNDING_MODE aie::rounding_mode::conv_even
 
 extern "C" {
@@ -66,6 +70,31 @@ static inline void copy_O_tile_rows(bfloat16 *out, const int32_t B_q)
                 aie::store_v(out + offset, o_vec);
             }
         }
+    }
+}
+
+static inline void store_row_value(bfloat16 *row, const int32_t cols, const bfloat16 value)
+{
+    using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
+    Vec64bf16 fill_vec = aie::broadcast<bfloat16, VECTOR_LENGTH>(value);
+    int32_t j = 0;
+    for (; j + VECTOR_LENGTH <= cols; j += VECTOR_LENGTH) {
+        aie::store_v(row + j, fill_vec);
+    }
+    for (; j < cols; ++j) {
+        row[j] = value;
+    }
+}
+
+static inline void copy_row_values(const bfloat16 *src, bfloat16 *dst, const int32_t cols)
+{
+    int32_t j = 0;
+    for (; j + VECTOR_LENGTH <= cols; j += VECTOR_LENGTH) {
+        auto vec = aie::load_v<VECTOR_LENGTH>(src + j);
+        aie::store_v(dst + j, vec);
+    }
+    for (; j < cols; ++j) {
+        dst[j] = src[j];
     }
 }
 
@@ -138,9 +167,10 @@ void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_bu
     ::aie::set_rounding(ROUNDING_MODE);
 
 #if DEBUG == 0 || DEBUG == 1
-    for (int32_t i = 0; i < B_q; i += VECTOR_LENGTH) {
-        using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
-        Vec64bf16 l_vec = aie::load_v<VECTOR_LENGTH>(scale_buffer + 2 * B_q + i);
+    for (int32_t i = 0; i < B_q; i += SCALE_VECTOR_LENGTH) {
+        using ScaleVecbf16 = aie::vector<bfloat16, SCALE_VECTOR_LENGTH>;
+        ScaleVecbf16 l_vec =
+            aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + 2 * B_q + i);
         l_vec = aie::inv(l_vec);
         aie::store_v(scale_buffer + 2 * B_q + i, l_vec);
     }
@@ -201,13 +231,10 @@ void partial_softmax(bfloat16 *A,
 #if DEBUG == 0 || DEBUG == 1
     // Tail mask: invalidate padded Q rows
     if (valid_q_rows < B_q) {
-        using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
-        Vec64bf16 lowest_vec = aie::broadcast<bfloat16, VECTOR_LENGTH>(std::numeric_limits<bfloat16>::lowest());
-
         for (int32_t i = valid_q_rows; i < B_q; i++) {
-            for (int32_t j = 0; j < B_kv; j += VECTOR_LENGTH) {
-                aie::store_v(A + i * B_kv + j, lowest_vec);
-            }
+            store_row_value(
+                A + i * B_kv, B_kv, std::numeric_limits<bfloat16>::lowest()
+            );
         }
     }
     // Tail mask: invalidate padded KV cols for valid rows
@@ -248,7 +275,6 @@ void partial_softmax(bfloat16 *A,
     }
 #endif
 
-    using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
     int32_t i = 0;
     for (; i + 4 <= valid_q_rows; i += 4) {
         partial_softmax_bf16(A + B_kv * i, P + B_kv * i, scale_buffer, B_kv, i, B_q, inv_scale);
@@ -261,31 +287,33 @@ void partial_softmax(bfloat16 *A,
     }
     // Zero out P rows corresponding to padded Q rows
     if (valid_q_rows < B_q) {
-        using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
-        Vec64bf16 zeros_vec = aie::broadcast<bfloat16, VECTOR_LENGTH>(0.0f);
-
         for (int32_t i = valid_q_rows; i < B_q; i++) {
-            for (int32_t j = 0; j < B_kv; j += VECTOR_LENGTH) {
-                aie::store_v(P + i * B_kv + j, zeros_vec);
-            }
+            store_row_value(P + i * B_kv, B_kv, 0.0f);
         }
     }
 
-    for (int32_t i = 0; i < B_q; i += VECTOR_LENGTH) {
+    for (int32_t i = 0; i < B_q; i += SCALE_VECTOR_LENGTH) {
 
-        Vec64bf16 m_i_minus_1 = aie::load_v<VECTOR_LENGTH>(scale_buffer + i);
-        Vec64bf16 m_i = aie::load_v<VECTOR_LENGTH>(scale_buffer + B_q + i);
-        Vec64bf16 l_i_minus_1 = aie::load_v<VECTOR_LENGTH>(scale_buffer + 2 * B_q + i);
-        Vec64bf16 accum_exp_val = aie::load_v<VECTOR_LENGTH>(scale_buffer + 3 * B_q + i);
+        using ScaleVecbf16 = aie::vector<bfloat16, SCALE_VECTOR_LENGTH>;
+        ScaleVecbf16 m_i_minus_1 = aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + i);
+        ScaleVecbf16 m_i =
+            aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + B_q + i);
+        ScaleVecbf16 l_i_minus_1 =
+            aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + 2 * B_q + i);
+        ScaleVecbf16 accum_exp_val =
+            aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + 3 * B_q + i);
 
-        aie::accum<accfloat, VECTOR_LENGTH> l_i_accum = aie::zeros<accfloat, VECTOR_LENGTH>();
+        aie::accum<accfloat, SCALE_VECTOR_LENGTH> l_i_accum =
+            aie::zeros<accfloat, SCALE_VECTOR_LENGTH>();
 
-        aie::accum<accfloat, VECTOR_LENGTH> diff = aie::accum<accfloat, VECTOR_LENGTH>(aie::sub(m_i_minus_1, m_i));
+        aie::accum<accfloat, SCALE_VECTOR_LENGTH> diff =
+            aie::accum<accfloat, SCALE_VECTOR_LENGTH>(aie::sub(m_i_minus_1, m_i));
         l_i_accum = aie::exp2<bfloat16>(diff.to_vector<float>());
-        Vec64bf16 max_diff_exp = l_i_accum.to_vector<bfloat16>();
+        ScaleVecbf16 max_diff_exp = l_i_accum.to_vector<bfloat16>();
 
         aie::store_v(scale_buffer + 3 * B_q + i, max_diff_exp);
-        aie::accum<accfloat, VECTOR_LENGTH> l_i = aie::add(aie::mul(max_diff_exp, l_i_minus_1), accum_exp_val);
+        aie::accum<accfloat, SCALE_VECTOR_LENGTH> l_i =
+            aie::add(aie::mul(max_diff_exp, l_i_minus_1), accum_exp_val);
         aie::store_v(scale_buffer + 2 * B_q + i, l_i.to_vector<bfloat16>());
         aie::store_v(scale_buffer + i, m_i);
     }
@@ -294,22 +322,13 @@ void partial_softmax(bfloat16 *A,
     using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
     int32_t i = 0;
     for (; i + 4 <= valid_q_rows; i += 4) {
-        for (int j = 0; j < B_kv; j += VECTOR_LENGTH) {
-            Vec64bf16 a_vec0 = aie::load_v<VECTOR_LENGTH>(A + (i + 0) * B_kv + j);
-            Vec64bf16 a_vec1 = aie::load_v<VECTOR_LENGTH>(A + (i + 1) * B_kv + j);
-            Vec64bf16 a_vec2 = aie::load_v<VECTOR_LENGTH>(A + (i + 2) * B_kv + j);
-            Vec64bf16 a_vec3 = aie::load_v<VECTOR_LENGTH>(A + (i + 3) * B_kv + j);
-            aie::store_v(P + (i + 0) * B_kv + j, a_vec0);
-            aie::store_v(P + (i + 1) * B_kv + j, a_vec1);
-            aie::store_v(P + (i + 2) * B_kv + j, a_vec2);
-            aie::store_v(P + (i + 3) * B_kv + j, a_vec3);
-        }
+        copy_row_values(A + (i + 0) * B_kv, P + (i + 0) * B_kv, B_kv);
+        copy_row_values(A + (i + 1) * B_kv, P + (i + 1) * B_kv, B_kv);
+        copy_row_values(A + (i + 2) * B_kv, P + (i + 2) * B_kv, B_kv);
+        copy_row_values(A + (i + 3) * B_kv, P + (i + 3) * B_kv, B_kv);
     }
     for (; i < valid_q_rows; i++) {
-        for (int j = 0; j < B_kv; j += VECTOR_LENGTH) {
-            Vec64bf16 a_vec = aie::load_v<VECTOR_LENGTH>(A + i * B_kv + j);
-            aie::store_v(P + i * B_kv + j, a_vec);
-        }
+        copy_row_values(A + i * B_kv, P + i * B_kv, B_kv);
     }
 #endif
 }
@@ -318,11 +337,13 @@ void init_scale_buffer(bfloat16 *scale_buffer, int32_t size)
 {
     ::aie::set_rounding(ROUNDING_MODE);
 
-    using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
-    Vec64bf16 lowest_vec = aie::broadcast<bfloat16, VECTOR_LENGTH>(std::numeric_limits<bfloat16>::lowest());
-    Vec64bf16 zeros_vec = aie::broadcast<bfloat16, VECTOR_LENGTH>(0.0f);
+    using ScaleVecbf16 = aie::vector<bfloat16, SCALE_VECTOR_LENGTH>;
+    ScaleVecbf16 lowest_vec =
+        aie::broadcast<bfloat16, SCALE_VECTOR_LENGTH>(std::numeric_limits<bfloat16>::lowest());
+    ScaleVecbf16 zeros_vec =
+        aie::broadcast<bfloat16, SCALE_VECTOR_LENGTH>(0.0f);
 
-    for (int32_t i = 0; i < size; i += VECTOR_LENGTH) {
+    for (int32_t i = 0; i < size; i += SCALE_VECTOR_LENGTH) {
         // VJUNG: m_{i-1} vector
         aie::store_v(scale_buffer + i, lowest_vec);
         // VJUNG: m_{i} vector

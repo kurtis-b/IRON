@@ -67,6 +67,36 @@ all_params = [
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
+def test_softmax_32wide_path(aie_context):
+    rows = 64
+    cols = 32
+    golden_ref = generate_golden_reference(rows=rows, cols=cols)
+    operator = AIESoftmax(
+        rows=rows,
+        cols=cols,
+        num_aie_columns=2,
+        num_channels=2,
+        context=aie_context,
+    )
+
+    errors, latency_us, bandwidth_gbps = run_test(
+        operator,
+        {"in": golden_ref["input"]},
+        {"output": golden_ref["output"]},
+        rel_tol=0.04,
+        abs_tol=1e-6,
+    )
+
+    print(f"\nLatency (us): {latency_us:.1f}")
+    print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
+
+    assert not errors, f"Test failed with errors: {errors}"
+
+
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
+)
 @pytest.mark.parametrize(
     "input_length,num_aie_columns,num_channels,tile_size",
     all_params,

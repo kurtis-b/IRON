@@ -331,9 +331,9 @@ def fused_mha(
     )  # Split between N parallel blocks of heads
 
     v_dims = [
-        (kv_seq_tile // s, s * kv_seq_tile),
+        (kv_seq_tile // s, s * d),
         (d // t, t),
-        (s, kv_seq_tile),
+        (s, d),
         (t, 1),
     ]
 

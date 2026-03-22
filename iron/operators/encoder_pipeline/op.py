@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 
 import numpy as np
@@ -327,6 +328,11 @@ class AIEEncoderPipeline(AIEOperatorBase):
             f"-DDIM_K={self.emb_tile}",
             f"-DDIM_N={self.ffn_tile}",
         ]
+        encoder_debug_value = os.environ.get("IRON_ENCODER_DEBUG_AIE_KERNELS")
+        if encoder_debug_value is not None:
+            encoder_kernel_flags.append(
+                f"-DDEBUG_AIE_KERNELS={int(encoder_debug_value)}"
+            )
 
         kernel_archive = f"{file_name_base}_kernels.a"
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
@@ -388,13 +394,15 @@ class AIEEncoderPipeline(AIEOperatorBase):
                         KernelObjectArtifact.new(
                             f"{prefix}_softmax_{self.seq_tile}m_{self.kv_seq_tile}n_{self.d}k.o",
                             depends=[SourceArtifact.new(softmax_source)],
+                            extra_flags=[f"-DSM_VEC_LEN={self.kv_seq_tile}"],
                         ),
                         KernelObjectArtifact.new(
                             f"{prefix}_mha_{self.seq_tile}m_{self.kv_seq_tile}n_{self.d}k_causal0_0.o",
                             depends=[SourceArtifact.new(mha_source)],
                             extra_flags=[
                                 "-DIS_CAUSAL=0",
-                                f"-DVECTOR_LENGTH={self.seq_tile}",
+                                f"-DVECTOR_LENGTH={min(self.seq_tile, self.kv_seq_tile)}",
+                                f"-DSCALE_VECTOR_LENGTH={self.seq_tile}",
                             ],
                         ),
                         KernelObjectArtifact.new(

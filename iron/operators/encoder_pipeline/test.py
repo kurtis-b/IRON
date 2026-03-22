@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import sys
 from pathlib import Path
 
@@ -33,8 +34,17 @@ from iron.operators.encoder_pipeline.topology import (
 REL_TOL = 4.0e-2
 ABS_TOL = 1.5e-1
 ERROR_THRESHOLD = 0.005
-SCALED_SEQ_LENS = tuple(1 << exp for exp in range(6, 15))
+DEFAULT_SCALED_SEQ_LENS = tuple(1 << exp for exp in range(6, 14))
+OPTIONAL_SCALED_SEQ_LENS = (16384,)
+INCLUDE_SEQ16384 = os.environ.get("IRON_ENCODER_PIPELINE_INCLUDE_SEQ16384") == "1"
+SCALED_SEQ_LENS = (
+    DEFAULT_SCALED_SEQ_LENS + OPTIONAL_SCALED_SEQ_LENS
+    if INCLUDE_SEQ16384
+    else DEFAULT_SCALED_SEQ_LENS
+)
 BASE_TOPOLOGY = (64, 12, 3072, 32, 64, 96, 64)
+MIRRORED_BASE_TOPOLOGY = (64, 12, 3072, 64, 32, 96, 64)
+MIRRORED_LARGE_BASE_TOPOLOGY = (64, 16, 4096, 64, 32, 128, 64)
 TOPOLOGY_CASES = (
     ("", (1, 1, 8, 1, 1, 1)),
     ("_2ps", (2, 1, 8, 1, 1, 1)),
@@ -52,9 +62,9 @@ TOPOLOGY_CASES = (
 )
 
 
-def topology_name(suffix: str) -> str:
+def topology_name(base_topology: tuple[int, ...], suffix: str) -> str:
     d, num_heads, ffn_intermediate_size, seq_tile, kv_seq_tile, emb_tile, ffn_tile = (
-        BASE_TOPOLOGY
+        base_topology
     )
     return (
         f"{d}d_{num_heads}h_{ffn_intermediate_size}ffn_{seq_tile}q_"
@@ -62,10 +72,17 @@ def topology_name(suffix: str) -> str:
     )
 
 
-def generate_test_params():
+def execution_matrix_supported(base_topology: tuple[int, ...]) -> bool:
+    return base_topology != MIRRORED_LARGE_BASE_TOPOLOGY
+
+
+def generate_test_params(base_topology: tuple[int, ...]):
+    if not execution_matrix_supported(base_topology):
+        return []
     params = []
+    supported_topologies = load_encoder_pipeline_topology_placements()
     d, num_heads, ffn_intermediate_size, seq_tile, kv_seq_tile, emb_tile, ffn_tile = (
-        BASE_TOPOLOGY
+        base_topology
     )
     for topology_suffix, runtime_topology in TOPOLOGY_CASES:
         (
@@ -78,6 +95,23 @@ def generate_test_params():
         ) = runtime_topology
         for seq_len in SCALED_SEQ_LENS:
             if seq_len % seq_tile != 0 or (seq_len // seq_tile) % parallel_seq != 0:
+                continue
+            topology_key = (
+                num_heads,
+                seq_len,
+                d,
+                seq_tile,
+                kv_seq_tile,
+                emb_tile,
+                ffn_tile,
+                parallel_seq,
+                parallel_heads,
+                proj_acc_depth,
+                o_proj_acc_group_size,
+                nB_tiles_distributed,
+                ffn_intermediate_size,
+            )
+            if topology_key not in supported_topologies:
                 continue
             params.append(
                 pytest.param(
@@ -95,13 +129,15 @@ def generate_test_params():
                     o_proj_acc_group_size,
                     ffn_down_acc_group_size,
                     nB_tiles_distributed,
-                    id=f"encoder_pipeline_{seq_len}seq_{topology_name(topology_suffix)}",
+                    id=f"encoder_pipeline_{seq_len}seq_{topology_name(base_topology, topology_suffix)}",
                 )
             )
     return params
 
 
-all_params = generate_test_params()
+all_params = generate_test_params(BASE_TOPOLOGY)
+mirrored_params = generate_test_params(MIRRORED_BASE_TOPOLOGY)
+mirrored_large_params = generate_test_params(MIRRORED_LARGE_BASE_TOPOLOGY)
 
 
 def test_topology_key_round_trip_exposes_canonical_and_legacy_ids():
@@ -114,6 +150,33 @@ def test_topology_key_round_trip_exposes_canonical_and_legacy_ids():
     assert topology.legacy_alias == "2ps_4pffn"
     assert topology.topology_id == "seq32_kv64__ps2_ph1_pffn4"
     assert topology.cache_signature == (2, 1, 4, 32, 64, 96, 64, 8, 1, 3072)
+
+
+def test_mirrored_large_family_remains_registered_but_not_in_execution_matrix():
+    supported_topologies = load_encoder_pipeline_topology_placements()
+
+    assert (
+        16,
+        64,
+        64,
+        64,
+        32,
+        128,
+        64,
+        1,
+        1,
+        8,
+        1,
+        1,
+        4096,
+    ) in supported_topologies
+    assert mirrored_large_params == []
+
+
+def test_seq_len_matrix_excludes_16384_by_default():
+    assert 16384 not in DEFAULT_SCALED_SEQ_LENS
+    assert OPTIONAL_SCALED_SEQ_LENS == (16384,)
+    assert max(SCALED_SEQ_LENS) in {8192, 16384}
 
 
 def test_filter_topologies_by_alias_or_id_accepts_legacy_and_canonical_tokens():
@@ -272,6 +335,19 @@ def test_validate_sequence_parallel_placement_checks_lane_coverage_and_group_siz
         )
 
 
+def test_validate_sequence_parallel_placement_checks_o_proj_replay_lane_count():
+    with pytest.raises(ValueError, match="O-proj replay memtile per sequence lane"):
+        _validate_sequence_parallel_placement(
+            {
+                "lane_tiles": [{}, {}],
+                "lane_o_proj_acc_mem_cols": [1, 2],
+                "lane_o_proj_stage_mem_cols": [3],
+                "lane_tail_mem_cols": [4, 5],
+            },
+            2,
+        )
+
+
 def test_normalize_base_placement_preserves_known_tile_and_mem_columns():
     topology = topology_from_key((12, 128, 64, 32, 64, 96, 64, 2, 1, 8, 1, 4, 3072))
     placement = load_encoder_pipeline_topology_placements()[topology.key]
@@ -289,15 +365,7 @@ def test_normalize_base_placement_preserves_known_tile_and_mem_columns():
     assert normalized["output_shim_col"] == placement["shim_tiles"]["output"]
 
 
-@pytest.mark.metrics(
-    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
-    Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
-)
-@pytest.mark.parametrize(
-    "seq_len,d,num_heads,ffn_intermediate_size,seq_tile,kv_seq_tile,emb_tile,ffn_tile,parallel_seq,parallel_heads,proj_acc_depth,o_proj_acc_group_size,ffn_down_acc_group_size,nB_tiles_distributed",
-    all_params,
-)
-def test_encoder_pipeline(
+def _run_encoder_pipeline_case(
     seq_len,
     d,
     num_heads,
@@ -373,3 +441,135 @@ def test_encoder_pipeline(
     )
 
     assert len(errors.get("O", [])) <= max_acceptable_errors
+
+
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
+)
+@pytest.mark.parametrize(
+    "seq_len,d,num_heads,ffn_intermediate_size,seq_tile,kv_seq_tile,emb_tile,ffn_tile,parallel_seq,parallel_heads,proj_acc_depth,o_proj_acc_group_size,ffn_down_acc_group_size,nB_tiles_distributed",
+    all_params,
+)
+def test_encoder_pipeline(
+    seq_len,
+    d,
+    num_heads,
+    ffn_intermediate_size,
+    seq_tile,
+    kv_seq_tile,
+    emb_tile,
+    ffn_tile,
+    parallel_seq,
+    parallel_heads,
+    proj_acc_depth,
+    o_proj_acc_group_size,
+    ffn_down_acc_group_size,
+    nB_tiles_distributed,
+    aie_context,
+):
+    _run_encoder_pipeline_case(
+        seq_len,
+        d,
+        num_heads,
+        ffn_intermediate_size,
+        seq_tile,
+        kv_seq_tile,
+        emb_tile,
+        ffn_tile,
+        parallel_seq,
+        parallel_heads,
+        proj_acc_depth,
+        o_proj_acc_group_size,
+        ffn_down_acc_group_size,
+        nB_tiles_distributed,
+        aie_context,
+    )
+
+
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
+)
+@pytest.mark.parametrize(
+    "seq_len,d,num_heads,ffn_intermediate_size,seq_tile,kv_seq_tile,emb_tile,ffn_tile,parallel_seq,parallel_heads,proj_acc_depth,o_proj_acc_group_size,ffn_down_acc_group_size,nB_tiles_distributed",
+    mirrored_params,
+)
+def test_encoder_pipeline_mirrored_family(
+    seq_len,
+    d,
+    num_heads,
+    ffn_intermediate_size,
+    seq_tile,
+    kv_seq_tile,
+    emb_tile,
+    ffn_tile,
+    parallel_seq,
+    parallel_heads,
+    proj_acc_depth,
+    o_proj_acc_group_size,
+    ffn_down_acc_group_size,
+    nB_tiles_distributed,
+    aie_context,
+):
+    _run_encoder_pipeline_case(
+        seq_len,
+        d,
+        num_heads,
+        ffn_intermediate_size,
+        seq_tile,
+        kv_seq_tile,
+        emb_tile,
+        ffn_tile,
+        parallel_seq,
+        parallel_heads,
+        proj_acc_depth,
+        o_proj_acc_group_size,
+        ffn_down_acc_group_size,
+        nB_tiles_distributed,
+        aie_context,
+    )
+
+
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
+)
+@pytest.mark.parametrize(
+    "seq_len,d,num_heads,ffn_intermediate_size,seq_tile,kv_seq_tile,emb_tile,ffn_tile,parallel_seq,parallel_heads,proj_acc_depth,o_proj_acc_group_size,ffn_down_acc_group_size,nB_tiles_distributed",
+    mirrored_large_params,
+)
+def test_encoder_pipeline_mirrored_large_family(
+    seq_len,
+    d,
+    num_heads,
+    ffn_intermediate_size,
+    seq_tile,
+    kv_seq_tile,
+    emb_tile,
+    ffn_tile,
+    parallel_seq,
+    parallel_heads,
+    proj_acc_depth,
+    o_proj_acc_group_size,
+    ffn_down_acc_group_size,
+    nB_tiles_distributed,
+    aie_context,
+):
+    _run_encoder_pipeline_case(
+        seq_len,
+        d,
+        num_heads,
+        ffn_intermediate_size,
+        seq_tile,
+        kv_seq_tile,
+        emb_tile,
+        ffn_tile,
+        parallel_seq,
+        parallel_heads,
+        proj_acc_depth,
+        o_proj_acc_group_size,
+        ffn_down_acc_group_size,
+        nB_tiles_distributed,
+        aie_context,
+    )

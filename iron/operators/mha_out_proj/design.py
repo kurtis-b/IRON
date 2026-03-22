@@ -195,6 +195,7 @@ def fused_mha(
     bin_name = kernel_archive
 
     zero_kernel = Kernel(f"zero_{dtype_str}", bin_name, [qk_ty])
+    zero_kernel_q = Kernel(f"zero_{dtype_str}_rowmaj", bin_name, [q_ty])
 
     memcopy_kernel_scale = Kernel(f"passThroughLine", bin_name, [s_ty, s_ty, np.int32])
 
@@ -239,7 +240,7 @@ def fused_mha(
     rescale_O = Kernel(
         "rescale_O",
         bin_name,
-        [qk_ty, s_ty, np.int32, np.ndarray[(2,), np.dtype[np.int32]]],
+        [q_ty, s_ty, np.int32, np.ndarray[(2,), np.dtype[np.int32]]],
     )
 
     zero_kernel_o_proj = Kernel(
@@ -300,9 +301,9 @@ def fused_mha(
     )  # Split between N parallel blocks of heads
 
     v_dims = [
-        (kv_seq_tile // s, s * kv_seq_tile),
+        (kv_seq_tile // s, s * d),
         (d // t, t),
-        (s, kv_seq_tile),
+        (s, d),
         (t, 1),
     ]
 
@@ -465,9 +466,8 @@ def fused_mha(
                     of_k.release(1)
                     of_a_out.release(1)
 
-                    idx_buffer[0] += 0
+                    idx_buffer[0] += 1
                 idx_buffer[0] = 0
-                idx_buffer[1] += 0
 
                 of_q.release(1)
 
@@ -519,9 +519,8 @@ def fused_mha(
                     of_out_p.release(1)
                     of_out_scale.release(1)
 
-                    idx_buffer[0] += 0
+                    idx_buffer[0] += 1
                 idx_buffer[0] = 0
-                idx_buffer[1] += 0  # Used to be parameter for seq block parallelism
 
     def batched_matmul_pv(
         of_p,
@@ -541,7 +540,7 @@ def fused_mha(
             idx_buffer[0] = 0
             idx_buffer[1] = 0
 
-            for _ in range_(num_kv_seq_blocks):
+            for _ in range_(num_qkv_head_block_per_parallel_head):
 
                 elem_o_out = of_o_out.acquire(1)
 
@@ -566,7 +565,7 @@ def fused_mha(
                 of_v.release(1)
                 of_scale.release(1)
 
-                idx_buffer[0] += 0
+                idx_buffer[0] += 1
                 ###
 
                 if num_kv_seq_blocks > 2:
@@ -589,7 +588,7 @@ def fused_mha(
                         of_v.release(1)
                         of_scale.release(1)
 
-                        idx_buffer[0] += 0
+                        idx_buffer[0] += 1
 
                 ### Last iteration, final rescaling
                 if num_kv_seq_blocks > 1:
@@ -612,11 +611,11 @@ def fused_mha(
                     of_v.release(1)
                     of_scale.release(1)
 
-                    idx_buffer[0] += 0
+                    idx_buffer[0] += 1
                 # else:
                 else:
                     rescale_O(elem_o_out, elt_of_out_scale, q_seq_tile, idx_buffer)
-                    idx_buffer[0] += 0
+                    idx_buffer[0] += 1
                 ###
 
                 idx_buffer[0] = 0
@@ -768,7 +767,7 @@ def fused_mha(
                     memV[i].cons(),
                     scaleOF[i].cons(),
                     outOProj[i].prod(),
-                    zero_kernel,
+                    zero_kernel_q,
                     matmul_PV,
                     rescale_O,
                     i,

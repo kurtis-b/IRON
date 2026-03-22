@@ -69,6 +69,7 @@ class AIESoftmax(AIEOperatorBase):
                 mlir_artifact,
                 KernelObjectArtifact.new(
                     f"softmax.o",
+                    extra_flags=[f"-DSM_VEC_LEN={self.cols}"],
                     depends=[
                         SourceArtifact.new(
                             self.context.base_dir

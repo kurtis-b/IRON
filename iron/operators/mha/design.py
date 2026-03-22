@@ -307,7 +307,7 @@ def fused_mha(
 
     v_dims = None
     if vectorized:
-        v_dims = [(B_kv // s, s * B_kv), (B_kv // t, t), (s, B_kv), (t, 1)]
+        v_dims = [(B_kv // s, s * d), (d // t, t), (s, d), (t, 1)]
 
     inV = ObjectFifo(
         k_ty,

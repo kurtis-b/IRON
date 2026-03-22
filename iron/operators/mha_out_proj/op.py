@@ -87,16 +87,16 @@ class AIEMHAOutProj(AIEOperatorBase):
         mm_defines_rowmaj = [
             "-Dbf16_bf16_ONLY",
             f"-DDIM_M={self.q_seq_tile}",
-            f"-DDIM_K={self.d}",
-            f"-DDIM_N={self.kv_seq_tile}",
+            f"-DDIM_K={self.kv_seq_tile}",
+            f"-DDIM_N={self.d}",
             "-DROUND_CONV_EVEN",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ]
         mm_defines_colmaj = [
             "-Dbf16_bf16_ONLY",
             f"-DDIM_M={self.q_seq_tile}",
-            f"-DDIM_K={self.kv_seq_tile}",
-            f"-DDIM_N={self.d}",
+            f"-DDIM_K={self.d}",
+            f"-DDIM_N={self.kv_seq_tile}",
             "-DROUND_CONV_EVEN",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
             "-DB_COL_MAJ",
@@ -173,6 +173,7 @@ class AIEMHAOutProj(AIEOperatorBase):
                         KernelObjectArtifact.new(
                             f"mha_o_proj_softmax_{self.q_seq_tile}m_{self.kv_seq_tile}n.o",
                             depends=[SourceArtifact.new(softmax_source)],
+                            extra_flags=[f"-DSM_VEC_LEN={self.kv_seq_tile}"],
                         ),
                         KernelObjectArtifact.new(
                             f"mha_o_proj_mha_{self.q_seq_tile}m_{self.d}k_{self.kv_seq_tile}n_causal0_{self.debug}.o",
@@ -180,7 +181,8 @@ class AIEMHAOutProj(AIEOperatorBase):
                             extra_flags=[
                                 "-DIS_CAUSAL=0",
                                 f"-DDEBUG={self.debug}",
-                                "-DVECTOR_LENGTH=32",
+                                f"-DVECTOR_LENGTH={min(self.q_seq_tile, self.kv_seq_tile)}",
+                                f"-DSCALE_VECTOR_LENGTH={self.q_seq_tile}",
                             ],
                         ),
                         KernelObjectArtifact.new(
