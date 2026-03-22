@@ -317,7 +317,6 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 operator_dir / "hooks.py",
                 operator_dir / "debug_modes.py",
                 operator_dir / "mapping_validation.py",
-                operator_dir / "row_store.py",
             ],
             callback_kwargs={
                 "heads": self.num_heads,

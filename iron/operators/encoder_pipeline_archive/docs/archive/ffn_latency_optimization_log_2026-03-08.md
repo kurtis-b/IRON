@@ -67,7 +67,8 @@ Date: 2026-03-08
 
 ### Later Baseline Check
 
-- After removing the abandoned LN1 row-store / raw-replay path, the same control case still passes.
+- After removing the abandoned LN1 replay experiment, the same control case
+  still passes.
 - Latest clean control rerun:
   - about `16300-16400 us`
   - `229 / 1966` mismatches

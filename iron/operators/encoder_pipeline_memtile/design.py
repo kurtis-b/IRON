@@ -33,7 +33,6 @@ from iron.operators.encoder_pipeline_memtile.mapping_validation import (
     find_ffn_layout,
     manhattan_distance,
 )
-from iron.operators.encoder_pipeline_memtile.row_store import MemTileRowStore
 
 
 def fused_mha(
@@ -80,19 +79,6 @@ def fused_mha(
     enable_tracing = True if trace_size > 0 else False
     dtype_str = "bf16"
     dev = "npu2"
-    ln1_replay_row_store_compute_buffer_count = 2
-    ln1_replay_row_store_compute_produce_buffer_count = 2
-    ln1_replay_row_store_compute_consume_buffer_count = 1
-    ln2_replay_row_store_compute_buffer_count = 2
-    ln2_replay_row_store_compute_produce_buffer_count = 0
-    ln2_replay_row_store_compute_consume_buffer_count = 0
-    o_proj_acc_row_store_compute_buffer_count = 1
-    o_proj_acc_row_store_compute_produce_buffer_count = 0
-    o_proj_acc_row_store_compute_consume_buffer_count = 0
-    ffn_down_acc_row_store_compute_buffer_count = 1
-    ffn_down_acc_row_store_compute_produce_buffer_count = 0
-    ffn_down_acc_row_store_compute_consume_buffer_count = 0
-
     num_q_seq_blocks = seq_len // seq_tile
     num_kv_seq_blocks = seq_len // kv_seq_tile
     num_qkv_head_block_per_parallel_head = heads // parallel_heads
@@ -241,9 +227,6 @@ def fused_mha(
             )
         },
     )
-    if not stage_ln1_to_ddr and parallel_heads == 4 and emb_tile <= 96:
-        o_proj_acc_row_store_compute_produce_buffer_count = 2
-        o_proj_acc_row_store_compute_consume_buffer_count = 1
     # Keep FFN replay topology identical across debug/non-debug configurations.
     # Stage-only modes already bypass compute inside core functions; changing
     # replay-group topology here can cause artificial resource/pruning behavior.
@@ -1088,17 +1071,6 @@ def fused_mha(
         bin_name,
         [o_ty, o_ty, ln_weights_ty, o_ty, np.int32],
     )
-    convert_stats_to_packet_kernel = Kernel(
-        "pack_stats_f32_to_bf16_packet",
-        bin_name,
-        [sum_l1_ty, sum_l1_ty, o_ty, np.int32],
-    )
-    convert_packet_to_stats_kernel = Kernel(
-        "unpack_stats_bf16_packet_to_f32",
-        bin_name,
-        [o_ty, sum_l1_ty, sum_l1_ty, np.int32],
-    )
-
     # FFN + second AddNorm kernels from encoder.cc
     ffn_zero_kernel_up_proj = Kernel(
         f"ffn_zero_{dtype_str}_up_proj",
@@ -1243,9 +1215,9 @@ def fused_mha(
         )  # Split between N parallel blocks of heads
 
     v_dims = [
-        (kv_seq_tile // s, s * kv_seq_tile),
+        (kv_seq_tile // s, s * d),
         (d // t, t),
-        (s, kv_seq_tile),
+        (s, d),
         (t, 1),
     ]
     inV_streams = []
@@ -1372,26 +1344,6 @@ def fused_mha(
     o_proj_accum_core_set = set(o_proj_accum_core_indices)
     outOProjAccumIn = [None] * parallel_heads
     outOProjAccumOut = [None] * parallel_heads
-    use_o_proj_acc_row_store = parallel_heads <= 4
-
-    def _allocate_o_proj_acc_row_store_channels(
-        mem_tile_col: int, slot_idx: int
-    ) -> tuple[int, int] | None:
-        # Keep grouped O-proj row-store traffic off the heavily used low
-        # channels on each memtile. Some columns, such as col3, are already
-        # saturated by W_O/LN replay traffic in common topologies and still
-        # need the old forwarded FIFO path.
-        channel_pairs_by_col = {
-            0: [(5, 5)],
-            4: [(2, 2), (3, 3)],
-            5: [(3, 3), (4, 4)],
-            6: [(3, 3)],
-            7: [(4, 4), (5, 5)],
-        }
-        col_pairs = channel_pairs_by_col.get(mem_tile_col)
-        if col_pairs is None or slot_idx >= len(col_pairs):
-            return None
-        return col_pairs[slot_idx]
 
     # Memtile DMA/BD pressure model (per tile):
     # - col4: memBUp stream pair (low depth), can host 2 O-proj accum FIFOs.
@@ -1402,10 +1354,10 @@ def fused_mha(
     # memtiles can absorb FFN/LN traffic at high seq/head configurations.
     if o_proj_acc_group_size > 1 and parallel_heads >= 6 and proj_acc_depth >= 6:
         # Grouped O-proj staging uses fewer accum streams; prioritize less
-        # contended memtiles while avoiding col3 fanout pressure from W_O
-        # split and reducing col5 pressure from LN1 replay + B streams.
+        # contended memtiles while keeping the FIFO-only LN1 replay off col5
+        # in the high-acc 2-branch layouts.
         acc_mem_tile_order = (
-            [5, 6, 4, 7]
+            [5, 6, 7, 4]
             if effective_ffn_branches <= 2 and proj_acc_depth >= 16
             else [5, 6, 7, 4]
         )
@@ -1458,65 +1410,26 @@ def fused_mha(
     # accumulation step before reuse. Shrinking this depth below proj_acc_depth
     # can deadlock (producer fills FIFO before consumer phase starts).
     o_proj_acc_fifo_depth = proj_acc_depth
-    o_proj_acc_row_store_slots_by_col: dict[int, int] = {}
     for stage_idx, core_idx in enumerate(o_proj_accum_core_indices):
         acc_mem_col = acc_mem_tile_cols[stage_idx]
-        row_store_slot_idx = o_proj_acc_row_store_slots_by_col.get(acc_mem_col, 0)
-        row_store_channels = (
-            _allocate_o_proj_acc_row_store_channels(acc_mem_col, row_store_slot_idx)
-            if use_o_proj_acc_row_store
-            else None
+        outOProjAccumOut[core_idx] = ObjectFifo(
+            o_ty, depth=1, name=f"outOProjAccumOut{core_idx}"
         )
-        if row_store_channels is not None:
-            memtile_ingress_channel, memtile_egress_channel = row_store_channels
-            outOProjAccumIn[core_idx] = outOProjAccumOut[core_idx] = MemTileRowStore(
-                obj_type=o_ty,
-                compute_tile=o_proj_worker_tiles[core_idx],
-                mem_tile=Tile(col=acc_mem_col, row=1),
-                part_count=proj_acc_depth,
-                buffer_count=2,
-                compute_buffer_count=o_proj_acc_row_store_compute_buffer_count,
-                compute_produce_buffer_count=(
-                    o_proj_acc_row_store_compute_produce_buffer_count
-                ),
-                compute_consume_buffer_count=(
-                    o_proj_acc_row_store_compute_consume_buffer_count
-                ),
-                name=f"outOProjAccum{core_idx}",
-                compute_mm2s_channel=0,
-                compute_s2mm_channel=1,
-                memtile_ingress_channel=memtile_ingress_channel,
-                memtile_egress_channel=memtile_egress_channel,
+        outOProjAccumIn[core_idx] = (
+            outOProjAccumOut[core_idx]
+            .cons(depth=o_proj_acc_fifo_depth)
+            .forward(
+                name=f"outOProjAccumIn{core_idx}",
+                depth=o_proj_acc_fifo_depth,
+                placement=Tile(col=acc_mem_col, row=1),
             )
-            o_proj_acc_row_store_slots_by_col[acc_mem_col] = row_store_slot_idx + 1
-            logging.debug(
-                "Placed outOProjAccum[%d] row-store on mem tile (%d,1) "
-                "with channels in=%d out=%d",
-                core_idx,
-                acc_mem_col,
-                memtile_ingress_channel,
-                memtile_egress_channel,
-            )
-        else:
-            outOProjAccumOut[core_idx] = ObjectFifo(
-                o_ty, depth=1, name=f"outOProjAccumOut{core_idx}"
-            )
-            outOProjAccumIn[core_idx] = (
-                outOProjAccumOut[core_idx]
-                .cons(depth=o_proj_acc_fifo_depth)
-                .forward(
-                    name=f"outOProjAccumIn{core_idx}",
-                    depth=o_proj_acc_fifo_depth,
-                    placement=Tile(col=acc_mem_col, row=1),
-                )
-            )
-            logging.debug(
-                "Placed outOProjAccum[%d] FIFO fallback on mem tile (%d,1) "
-                "with fifo_depth=%d",
-                core_idx,
-                acc_mem_col,
-                o_proj_acc_fifo_depth,
-            )
+        )
+        logging.debug(
+            "Placed outOProjAccum[%d] on mem tile (%d,1) with fifo_depth=%d",
+            core_idx,
+            acc_mem_col,
+            o_proj_acc_fifo_depth,
+        )
 
     # Intra-group neighbor chain: each core forwards its partial contribution to
     # the next core in the same group each qkv/acc iteration.
@@ -1586,21 +1499,15 @@ def fused_mha(
         o_proj_acc_group_size=o_proj_acc_group_size,
     )
     ln1_norm_tile_obj = Tile(col=ln1_tile[0], row=ln1_tile[1])
-    ln1Replay = MemTileRowStore(
+    ln1ReplayPart = ObjectFifo(o_ty, name="ln1ReplayPart", depth=1)
+    ln1Replay = ln1ReplayPart.cons(depth=ln_tiles_per_q_block).forward(
         obj_type=o_ty,
-        compute_tile=ln1_norm_tile_obj,
-        mem_tile=Tile(col=ln1_replay_mem_tile_col, row=1),
-        part_count=ln_tiles_per_q_block,
-        buffer_count=2,
-        compute_buffer_count=ln1_replay_row_store_compute_buffer_count,
-        compute_produce_buffer_count=(
-            ln1_replay_row_store_compute_produce_buffer_count
-        ),
-        compute_consume_buffer_count=(
-            ln1_replay_row_store_compute_consume_buffer_count
-        ),
         name="ln1Replay",
+        depth=ln_tiles_per_q_block,
+        placement=Tile(col=ln1_replay_mem_tile_col, row=1),
     )
+    ln1_replay_curr = ln1Replay.cons(depth=1)
+    ln1_replay_new = ln1ReplayPart.prod()
     # LN1 split-stage link (norm output -> mul+resadd input).
     ln1Norm = ObjectFifo(o_ty, name="ln1Norm", depth=ln_input_depth)
     r_dims = [
@@ -1666,6 +1573,15 @@ def fused_mha(
         stage_ln1_to_ddr=stage_ln1_to_ddr,
         default_col=ln2_replay_mem_tile_default,
     )
+    if (
+        (not stage_ln1_to_ddr)
+        and parallel_heads >= 6
+        and proj_acc_depth >= 16
+        and effective_ffn_branches == 2
+        and o_proj_acc_group_size > 1
+        and ln2_replay_mem_tile_col == 4
+    ):
+        ln2_replay_mem_tile_col = 2
     if (
         (not stage_ln1_to_ddr)
         and parallel_heads >= 6
@@ -2138,29 +2054,6 @@ def fused_mha(
         )
         for branch_idx in range(effective_ffn_branches)
     ]
-    use_ffn_down_acc_row_store = effective_ffn_branches <= 4 and (
-        not stage_ln1_to_ddr or parallel_heads >= 4
-    )
-
-    def _allocate_ffn_down_acc_row_store_channels(
-        mem_tile_col: int, slot_idx: int
-    ) -> tuple[int, int] | None:
-        # Keep FFN-down row-store traffic off channels already consumed by
-        # LN1 replay and split B-weight ingress on the same memtile.
-        # Col5 specifically cannot use channel 0 once LN1 replay is lowered
-        # through memtile_row_store there in both memtile and ddr modes.
-        channel_pairs_by_col = {
-            1: [(4, 4)],
-            2: [(4, 4)],
-            4: [(2, 2), (3, 3)],
-            5: [(2, 2), (4, 4)],
-            6: [(2, 2), (3, 3)],
-            7: [(0, 0), (1, 1)],
-        }
-        col_pairs = channel_pairs_by_col.get(mem_tile_col)
-        if col_pairs is None or slot_idx >= len(col_pairs):
-            return None
-        return col_pairs[slot_idx]
 
     ffn_down_acc_mem_tile_cols = ln1_mode_hooks.adjust_ffn_down_acc_mem_tile_cols(
         ffn_down_acc_mem_tile_cols=list(branch_stage_cols[:effective_ffn_branches]),
@@ -2181,7 +2074,6 @@ def fused_mha(
             ffn_down_acc_group_size,
             ffn_down_group_partner_srcs_by_stage,
         )
-    ffn_down_acc_row_store_slots_by_col = dict(o_proj_acc_row_store_slots_by_col)
     for branch_idx in range(effective_ffn_branches):
         ffn_up_out_depth = 1 if emb_tile >= 128 else 2
         ffnUpOut.append(
@@ -2196,62 +2088,23 @@ def fused_mha(
         # Keep FFN-down accumulation in mem tile FIFO(s) so down-proj core L1 stays
         # within limits while replaying for LN2's two-pass consumption.
         ffn_down_acc_mem_col = ffn_down_acc_mem_tile_cols[branch_idx]
-        row_store_slot_idx = ffn_down_acc_row_store_slots_by_col.get(
-            ffn_down_acc_mem_col, 0
+        ffnDownPart[branch_idx] = ObjectFifo(
+            o_ty,
+            name="ffnDownPart" if branch_idx == 0 else f"ffnDownPart{branch_idx}",
+            depth=1,
         )
-        ffn_down_row_store_channels = (
-            _allocate_ffn_down_acc_row_store_channels(
-                ffn_down_acc_mem_col, row_store_slot_idx
-            )
-            if use_ffn_down_acc_row_store
-            else None
-        )
-        if ffn_down_row_store_channels is not None:
-            memtile_ingress_channel, memtile_egress_channel = (
-                ffn_down_row_store_channels
-            )
-            ffnDownPart[branch_idx] = ffnDownAccum[branch_idx] = MemTileRowStore(
+        ffnDownAccum[branch_idx] = (
+            ffnDownPart[branch_idx]
+            .cons(depth=proj_acc_depth)
+            .forward(
                 obj_type=o_ty,
-                compute_tile=ffn_down_worker_tiles[branch_idx],
-                mem_tile=Tile(col=ffn_down_acc_mem_col, row=1),
-                part_count=proj_acc_depth,
-                buffer_count=2,
-                compute_buffer_count=ffn_down_acc_row_store_compute_buffer_count,
-                compute_produce_buffer_count=(
-                    ffn_down_acc_row_store_compute_produce_buffer_count
+                name=(
+                    "ffnDownAccum" if branch_idx == 0 else f"ffnDownAccum{branch_idx}"
                 ),
-                compute_consume_buffer_count=(
-                    ffn_down_acc_row_store_compute_consume_buffer_count
-                ),
-                name="ffnDownAccum" if branch_idx == 0 else f"ffnDownAccum{branch_idx}",
-                compute_mm2s_channel=0,
-                compute_s2mm_channel=0,
-                memtile_ingress_channel=memtile_ingress_channel,
-                memtile_egress_channel=memtile_egress_channel,
+                depth=proj_acc_depth,
+                placement=Tile(col=ffn_down_acc_mem_col, row=1),
             )
-            ffn_down_acc_row_store_slots_by_col[ffn_down_acc_mem_col] = (
-                row_store_slot_idx + 1
-            )
-        else:
-            ffnDownPart[branch_idx] = ObjectFifo(
-                o_ty,
-                name="ffnDownPart" if branch_idx == 0 else f"ffnDownPart{branch_idx}",
-                depth=1,
-            )
-            ffnDownAccum[branch_idx] = (
-                ffnDownPart[branch_idx]
-                .cons(depth=proj_acc_depth)
-                .forward(
-                    obj_type=o_ty,
-                    name=(
-                        "ffnDownAccum"
-                        if branch_idx == 0
-                        else f"ffnDownAccum{branch_idx}"
-                    ),
-                    depth=proj_acc_depth,
-                    placement=Tile(col=ffn_down_acc_mem_col, row=1),
-                )
-            )
+        )
     # Large emb_tile (128) can overflow FFN-down L1 when reduction FIFOs are
     # double-buffered alongside B-down and accumulation buffers.
     ffn_down_reduce_depth = 1 if emb_tile >= 128 else 2
@@ -2378,37 +2231,7 @@ def fused_mha(
     ln2_replay_curr = None
     ln2_replay_new = None
     ln2_tile_obj = Tile(col=ln2_tile[0], row=ln2_tile[1])
-    # The current LN2 row-store lowering is stable on the broader 4/6-head
-    # encoder topologies with <=4 FFN branches. The 6-head and 6-FFN-branch
-    # layouts still regress with the current compiler/runtime path, so keep
-    # those on the forwarded FIFO path for now.
-    use_ln2_row_store = (
-        use_ln2_replay_store
-        and (not stage_ln1_to_ddr)
-        and parallel_heads == 4
-        and effective_ffn_branches <= 4
-    )
-    if use_ln2_row_store:
-        ln2Replay = MemTileRowStore(
-            obj_type=o_ty,
-            compute_tile=ln2_tile_obj,
-            mem_tile=Tile(col=ln2_replay_mem_tile_col, row=1),
-            part_count=proj_acc_depth,
-            buffer_count=2,
-            compute_buffer_count=ln2_replay_row_store_compute_buffer_count,
-            compute_produce_buffer_count=(
-                ln2_replay_row_store_compute_produce_buffer_count
-            ),
-            compute_consume_buffer_count=(
-                ln2_replay_row_store_compute_consume_buffer_count
-            ),
-            name="ln2Replay",
-        )
-        ln2_replay_curr = ln2Replay.cons(depth=1)
-        ln2_replay_new = ln2Replay.prod()
-    elif use_ln2_replay_store:
-        # Keep DDR mode on the forwarded FIFO path until the row-store verifier
-        # accepts the current AddNorm2 placement there.
+    if use_ln2_replay_store:
         ln2ReplayPart = ObjectFifo(o_ty, name="ln2ReplayPart", depth=1)
         ln2Replay = ln2ReplayPart.cons(depth=proj_acc_depth).forward(
             obj_type=o_ty,
@@ -2619,16 +2442,10 @@ def fused_mha(
         of_o_acc_in,
         of_o_acc_out,
         of_o_out,
-        of_o_row_store_parts,
         buffer_to_reduce,
         group_reduce_in,
         group_reduce_out,
         partial_o_scratch,
-        stats_sum_buf,
-        stats_sumsq_buf,
-        zero_f32,
-        calc_sum_sumsq,
-        pack_stats,
         zero,
         matmul_init,
         matmul,
@@ -2636,7 +2453,6 @@ def fused_mha(
         copy,
         is_group_staging_core,
         emit_final_output,
-        emit_ln1_stats,
         use_grouped_chain,
         core_idx,
     ):
@@ -2661,9 +2477,6 @@ def fused_mha(
             if not use_grouped_chain:
                 # Baseline O-proj flow: each core accumulates in memtile, then
                 # a stage-level chain reduces to the LN1 input.
-                if emit_ln1_stats:
-                    zero_f32(stats_sum_buf, seq_tile)
-                    zero_f32(stats_sumsq_buf, seq_tile)
                 for _ in range_(proj_acc_depth):
                     elem_out_o_acc = of_o_acc_out.acquire(1)
                     zero(elem_out_o_acc)
@@ -2681,12 +2494,7 @@ def fused_mha(
                         of_o_acc_in.release(1)
                     of_o_in.release(1)
 
-                tile_indices = (
-                    range(proj_acc_depth)
-                    if of_o_row_store_parts is not None
-                    else range_(proj_acc_depth)
-                )
-                for tile_idx in tile_indices:
+                for _ in range_(proj_acc_depth):
                     elem_in_o_acc = of_o_acc_in.acquire(1)
                     if buffer_to_reduce:
                         partial_o_acc = buffer_to_reduce.acquire(1)
@@ -2697,21 +2505,10 @@ def fused_mha(
                             seq_tile * emb_tile,
                         )
                         buffer_to_reduce.release(1)
-                    if emit_ln1_stats:
-                        calc_sum_sumsq(elem_in_o_acc, stats_sum_buf, stats_sumsq_buf)
-                    if of_o_row_store_parts is not None:
-                        elem_out_o = of_o_row_store_parts[tile_idx].acquire(1)
-                        copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
-                        of_o_row_store_parts[tile_idx].release(1)
-                    else:
-                        elem_out_o = of_o_out.acquire(1)
-                        copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
-                        of_o_out.release(1)
-                    of_o_acc_in.release(1)
-                if emit_ln1_stats:
-                    elem_stats_pkt = of_o_out.acquire(1)
-                    pack_stats(stats_sum_buf, stats_sumsq_buf, elem_stats_pkt, seq_tile)
+                    elem_out_o = of_o_out.acquire(1)
+                    copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
                     of_o_out.release(1)
+                    of_o_acc_in.release(1)
             else:
                 # Grouped flow:
                 #   1) reduce within each O-proj group and accumulate on group
@@ -2724,9 +2521,6 @@ def fused_mha(
                 local_has_output = group_pos < (o_proj_acc_group_size - 1)
                 global_has_input = group_idx > 0
                 global_has_output = group_reduce_out is not None
-                if emit_ln1_stats:
-                    zero_f32(stats_sum_buf, seq_tile)
-                    zero_f32(stats_sumsq_buf, seq_tile)
                 if is_group_staging_core:
                     for _ in range_(proj_acc_depth):
                         elem_out_o_acc = of_o_acc_out.acquire(1)
@@ -2778,12 +2572,7 @@ def fused_mha(
                 # Cross-group reduction after local group accumulation.
                 # Stage cores provide local staged results, while non-stage
                 # cores in later groups pass through global reductions.
-                tile_indices = (
-                    range(proj_acc_depth)
-                    if of_o_row_store_parts is not None
-                    else range_(proj_acc_depth)
-                )
-                for tile_idx in tile_indices:
+                for _ in range_(proj_acc_depth):
                     if is_group_staging_core:
                         elem_in_o_acc = of_o_acc_in.acquire(1)
                         if global_has_input:
@@ -2801,18 +2590,9 @@ def fused_mha(
                             )
                             group_reduce_in.release(1)
                         if emit_final_output:
-                            if emit_ln1_stats:
-                                calc_sum_sumsq(
-                                    elem_in_o_acc, stats_sum_buf, stats_sumsq_buf
-                                )
-                            if of_o_row_store_parts is not None:
-                                elem_out_o = of_o_row_store_parts[tile_idx].acquire(1)
-                                copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
-                                of_o_row_store_parts[tile_idx].release(1)
-                            else:
-                                elem_out_o = of_o_out.acquire(1)
-                                copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
-                                of_o_out.release(1)
+                            elem_out_o = of_o_out.acquire(1)
+                            copy(elem_in_o_acc, elem_out_o, seq_tile * emb_tile)
+                            of_o_out.release(1)
                         else:
                             if not global_has_output:
                                 raise ValueError(
@@ -2837,10 +2617,6 @@ def fused_mha(
                         copy(elem_group, elem_group_out, seq_tile * emb_tile)
                         group_reduce_out.release(1)
                         group_reduce_in.release(1)
-                if emit_ln1_stats:
-                    elem_stats_pkt = of_o_out.acquire(1)
-                    pack_stats(stats_sum_buf, stats_sumsq_buf, elem_stats_pkt, seq_tile)
-                    of_o_out.release(1)
 
     def core_fn_ln1_norm(
         of_in_o_proj,
@@ -2851,7 +2627,6 @@ def fused_mha(
         of_out_norm,
         fused_layer_norm,
         calc_sum_sumsq,
-        unpack_stats,
         zero_f32,
         copy,
         addnorm1_mode,
@@ -2862,24 +2637,19 @@ def fused_mha(
         ln1_norm_compute_enabled = (stage_only in (None, 4, 5)) and (
             addnorm1_mode == -1
         )
-        use_packed_ln1_stats = ln1_norm_compute_enabled and (emb_tile >= 2 * seq_tile)
 
         for _ in range_(sys.maxsize):
-            if ln1_norm_compute_enabled and not use_packed_ln1_stats:
+            if ln1_norm_compute_enabled:
                 zero_f32(sum_buf, seq_tile)
                 zero_f32(sumsq_buf, seq_tile)
             # Pass 1 on raw O-proj output: accumulate row-wise statistics and seed replay FIFO.
             for _ in range_(ln_tiles_per_q_block):
                 elem_in = of_in_o_proj.acquire(1)
-                if ln1_norm_compute_enabled and not use_packed_ln1_stats:
+                if ln1_norm_compute_enabled:
                     calc_sum_sumsq(elem_in, sum_buf, sumsq_buf)
                 elem_replay = of_replay_new.acquire(1)
                 copy(elem_in, elem_replay, seq_tile * emb_tile)
                 of_replay_new.release(1)
-                of_in_o_proj.release(1)
-            if use_packed_ln1_stats:
-                elem_stats_pkt = of_in_o_proj.acquire(1)
-                unpack_stats(elem_stats_pkt, sum_buf, sumsq_buf, seq_tile)
                 of_in_o_proj.release(1)
             # Pass 2: emit normalized tiles in FFN-group-major order.
             # Compute LN once per tile, then replay normalized tiles for later groups.
@@ -3561,7 +3331,6 @@ def fused_mha(
             )
         o_proj_in = outOProj[i].cons()
         o_proj_ow = memOW[i].cons()
-        o_proj_row_store_parts = None
         if is_group_boundary_core:
             stage_order = o_proj_stage_order_by_core[i]
             if o_proj_acc_group_size > 1:
@@ -3575,12 +3344,6 @@ def fused_mha(
                 o_proj_reduce_in = None
                 emit_final_output = i == (parallel_heads - 1)
                 o_proj_output = outOProjInput.prod() if emit_final_output else None
-                emit_ln1_stats = (
-                    emit_final_output
-                    and (ffn_stage_only in (None, 4, 5))
-                    and (addnorm1_debug_mode == -1)
-                    and (emb_tile >= 2 * seq_tile)
-                )
             else:
                 o_proj_acc_in = outOProjAccumIn[i].cons(depth=1)
                 o_proj_acc_out = outOProjAccumOut[i].prod()
@@ -3589,12 +3352,6 @@ def fused_mha(
                     outOPart[stage_order - 1].cons() if stage_order > 0 else None
                 )
                 emit_final_output = True
-                emit_ln1_stats = (
-                    stage_order == (num_o_proj_acc_groups - 1)
-                    and (ffn_stage_only in (None, 4, 5))
-                    and (addnorm1_debug_mode == -1)
-                    and (emb_tile >= 2 * seq_tile)
-                )
                 if stage_order < num_o_proj_acc_groups - 1:
                     o_proj_output = outOPart[stage_order].prod()
                 else:
@@ -3606,14 +3363,8 @@ def fused_mha(
             o_proj_group_out = group_reduce_out
             o_proj_reduce_in = None
             emit_final_output = False
-            emit_ln1_stats = False
             o_proj_output = None
-            o_proj_row_store_parts = None
         o_proj_partial_scratch = Buffer(type=o_ty, name=f"o_proj_partial_scratch_{i}")
-        o_proj_stats_sum_buffer = Buffer(type=sum_l1_ty, name=f"o_proj_stats_sum_{i}")
-        o_proj_stats_sumsq_buffer = Buffer(
-            type=sum_l1_ty, name=f"o_proj_stats_sumsq_{i}"
-        )
         o_proj_worker = Worker(
             matmul_o_proj,
             fn_args=[
@@ -3622,16 +3373,10 @@ def fused_mha(
                 o_proj_acc_in,
                 o_proj_acc_out,
                 o_proj_output,
-                o_proj_row_store_parts,
                 o_proj_reduce_in,
                 group_reduce_in,
                 o_proj_group_out,
                 o_proj_partial_scratch,
-                o_proj_stats_sum_buffer,
-                o_proj_stats_sumsq_buffer,
-                ln_zero_f32_kernel,
-                ln_calc_sum_sumsq_kernel,
-                convert_stats_to_packet_kernel,
                 zero_kernel_o_proj,
                 matmul_init_kernel_o_proj,
                 matmul_kernel_o_proj,
@@ -3639,7 +3384,6 @@ def fused_mha(
                 mem_copy_o_proj,
                 is_group_accum_core,
                 emit_final_output,
-                emit_ln1_stats,
                 o_proj_acc_group_size > 1,
                 i,
             ],
@@ -3647,10 +3391,6 @@ def fused_mha(
             placement=o_proj_worker_tiles[i],
             while_true=False,
         )
-        if o_proj_row_store_parts is not None:
-            for handle in o_proj_row_store_parts:
-                handle.endpoint = o_proj_worker
-                o_proj_worker._fifos.append(handle)
         o_proj_workers.append(o_proj_worker)
         logging.debug(
             "Configured o_proj worker %d with acc_depth=%d "
@@ -3677,14 +3417,13 @@ def fused_mha(
         core_fn_ln1_norm,
         fn_args=[
             outOProjInput.cons(),
-            ln1Replay.cons(),
-            ln1Replay.prod(),
+            ln1_replay_curr,
+            ln1_replay_new,
             ln1_norm_sum_buffer,
             ln1_norm_sumsq_buffer,
             ln1Norm.prod(),
             ln_fused_layer_norm_kernel,
             ln_calc_sum_sumsq_kernel,
-            convert_packet_to_stats_kernel,
             ln_zero_f32_kernel,
             mem_copy_o_proj,
             addnorm1_debug_mode,

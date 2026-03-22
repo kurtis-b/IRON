@@ -19,7 +19,7 @@ def choose_ln1_replay_mem_tile_col(
         return 1
     if parallel_heads >= 6 and proj_acc_depth >= 6:
         if effective_ffn_branches <= 2 and o_proj_acc_group_size > 1:
-            return 5
+            return 4
         return 4
     if parallel_heads >= 4 and proj_acc_depth >= 8 and effective_ffn_branches > 1:
         if o_proj_acc_group_size > 1 and effective_ffn_branches <= 2:

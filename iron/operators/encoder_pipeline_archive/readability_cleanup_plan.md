@@ -100,7 +100,6 @@ Work:
 1. Decide whether [readability_cleanup_plan.md](/home/agi-demo/iron/operators/encoder_pipeline/readability_cleanup_plan.md)
    remains live or is temporary.
 2. Move frozen repro material out of the top-level reading path:
-   - `row_store_repro/`
    - `shim_drain_bd_repro/`
 3. Remove top-level result artifacts if they are not required as checked-in
    reference material:
@@ -119,12 +118,11 @@ Target:
 Work:
 
 1. Remove env overrides that are only useful for closed experiments.
-2. Remove row-store tuning knobs that have already been rejected as defaults
-   and no longer guide live work.
+2. Remove stale tuning knobs that have already been rejected as defaults and no
+   longer guide live work.
 3. Remove stale comments that explain paths no longer present.
 4. Remove old fallback branches that are no longer reachable because:
    - uneven FFN partitioning now errors out
-   - certain row-store scopes are now fixed
    - some topology families are intentionally unsupported
 
 Expected outcome:
@@ -141,7 +139,7 @@ Work:
 
 1. Identify repeated memtile/ddr policy checks and replace them with one shared
    decision point.
-2. Collapse duplicated row-store eligibility conditions.
+2. Collapse duplicated transport eligibility conditions.
 3. Collapse duplicated runtime wait/fill policy checks.
 
 Important:

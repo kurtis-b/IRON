@@ -319,7 +319,6 @@ class AieccCompilationRule(CompilationRule):
         self.mlir_aie_dir = Path(mlir_aie_dir)
         self.peano_dir = Path(peano_dir)
         self.aie_bin_dir = self.mlir_aie_dir / "bin"
-        self.aie_opt_path = self.aie_bin_dir / "aie-opt"
         self.aiecc_bin_path = self.aie_bin_dir / "aiecc"
         self.aiecc_path = self.aie_bin_dir / "aiecc.py"
         super().__init__(*args, **kwargs)
@@ -388,7 +387,6 @@ class AieccCompilationRule(CompilationRule):
 
         # Now we know for each mlir source if we need to generate an xclbin, an insts.bin or both for it
         for mlir_source in mlir_sources:
-            lowered_mlir_source = self._preprocess_mlir_source(mlir_source)
             # Build an aiecc command using deterministic tool resolution so
             # unattended runs do not depend on login-shell PATH state.
             compile_cmd = self._aiecc_command_prefix() + [
@@ -424,7 +422,7 @@ class AieccCompilationRule(CompilationRule):
                     "--aie-generate-npu-insts",
                     "--npu-insts-name=" + str(first_insts_bin.path),
                 ]
-            compile_cmd += [str(lowered_mlir_source)]
+            compile_cmd += [str(mlir_source.path)]
 
             env = self._compile_env()
             logging.debug(f"Compiling MLIR with command: {' '.join(compile_cmd)}")
@@ -463,39 +461,6 @@ class AieccCompilationRule(CompilationRule):
 
         # With the newly generated files, is_available() should now return True on the Xclbin and InstsBin targets
         return artifacts
-
-    def _preprocess_mlir_source(self, mlir_source):
-        source_text = mlir_source.path.read_text()
-        if "aie.memtile_row_store" not in source_text:
-            return mlir_source.path
-
-        lowered_mlir_source = (
-            Path(self.build_dir) / f"{mlir_source.path.stem}.row_store_lowered.mlir"
-        )
-        preprocess_cmd = [
-            str(self.aie_opt_path),
-            "--aie-lower-memtile-row-stores",
-            str(mlir_source.path),
-            "-o",
-            str(lowered_mlir_source),
-        ]
-        logging.debug(
-            f"Lowering memtile row stores with command: {' '.join(preprocess_cmd)}"
-        )
-        if self.dry_run is None:
-            result = subprocess.run(
-                preprocess_cmd,
-                cwd=str(self.build_dir),
-                capture_output=True,
-                text=True,
-                timeout=300,
-                env=os.environ.copy(),
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"Row-store lowering for {mlir_source.path} failed: {result.stderr}"
-                )
-        return lowered_mlir_source
 
 
 class PeanoCompilationRule(CompilationRule):

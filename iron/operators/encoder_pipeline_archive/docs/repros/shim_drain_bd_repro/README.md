@@ -6,13 +6,12 @@ Current live entrypoints are:
 - [encoder_pipeline_ddr](/home/agi-demo/iron/operators/encoder_pipeline_ddr)
 - [encoder_pipeline_memtile](/home/agi-demo/iron/operators/encoder_pipeline_memtile)
 
-This folder freezes two current compiler repros for the remaining
-high-`pacc` memtile failure after converting the same-tile row-staging paths to
-`aie.memtile_row_store`:
+This folder freezes two compiler repros for the old high-`pacc` memtile
+shim-drain allocator boundary:
 
 1. the smallest failing case
 2. the broader `4pheads / 4pffn / 12pacc / 4opg` topology that hits the same
-   remaining shim-drain boundary after the row-store conversions
+   remaining shim-drain boundary
 
 ## Repro 1: smallest failing topology
 
@@ -31,8 +30,8 @@ high-`pacc` memtile failure after converting the same-tile row-staging paths to
   - `o_proj_acc_group_size=1`
 
 This is the smallest failing `64embtile / 12pacc` case. The earlier verifier
-issue on low-head topologies is already avoided by keeping LN2 row-store off
-for the low-head memtile layouts. The remaining failure is compile-time only.
+issue on low-head topologies is already avoided by the narrower stable
+envelope. The remaining failure is compile-time only.
 
 ## Failure
 
@@ -53,14 +52,12 @@ and the runtime-generated drain tasks for it:
   [memln2_drain_1ph_1pf_12pacc.mlir](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/shim_drain_bd_repro/memln2_drain_1ph_1pf_12pacc.mlir)
 
 The important point is that the remaining exposed limit is the final output
-drain path, not LN1/LN2/O-proj/FFN-down row staging.
+drain path.
 
 ## Files
 
 - [memln2_drain_1ph_1pf_12pacc.mlir](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/shim_drain_bd_repro/memln2_drain_1ph_1pf_12pacc.mlir)
   - source MLIR emitted by `encoder_pipeline`
-- [memln2_drain_1ph_1pf_12pacc.row_store_lowered.mlir](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/shim_drain_bd_repro/memln2_drain_1ph_1pf_12pacc.row_store_lowered.mlir)
-  - source after `--aie-lower-memtile-row-stores`
 - [memln2_drain_1ph_1pf_12pacc.aiecc_failure.mlir](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/shim_drain_bd_repro/memln2_drain_1ph_1pf_12pacc.aiecc_failure.mlir)
   - frozen `aiecc` failure input
 - [memln2_drain_1ph_1pf_12pacc.repeater.sh](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/shim_drain_bd_repro/memln2_drain_1ph_1pf_12pacc.repeater.sh)
@@ -82,8 +79,8 @@ drain path, not LN1/LN2/O-proj/FFN-down row staging.
   - `proj_acc_depth=12`
   - `o_proj_acc_group_size=4`
 
-This is the more representative row-store-converted topology. It fails later
-than the old staging design and lands on the same remaining tail drain issue:
+This is the more representative grouped topology. It lands on the same
+remaining tail drain issue:
 
 ```text
 'aie.dma_bd' op Allocator exhausted available BD IDs (maximum 24 available for channel 3).
@@ -92,7 +89,6 @@ than the old staging design and lands on the same remaining tail drain issue:
 Frozen files:
 
 - [memln2_drain_4ph_4pf_12pacc_4opg.mlir](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/shim_drain_bd_repro/memln2_drain_4ph_4pf_12pacc_4opg.mlir)
-- [memln2_drain_4ph_4pf_12pacc_4opg.row_store_lowered.mlir](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/shim_drain_bd_repro/memln2_drain_4ph_4pf_12pacc_4opg.row_store_lowered.mlir)
 - [memln2_drain_4ph_4pf_12pacc_4opg.aiecc_failure.mlir](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/shim_drain_bd_repro/memln2_drain_4ph_4pf_12pacc_4opg.aiecc_failure.mlir)
 - [memln2_drain_4ph_4pf_12pacc_4opg.repeater.sh](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/shim_drain_bd_repro/memln2_drain_4ph_4pf_12pacc_4opg.repeater.sh)
 
@@ -143,5 +139,5 @@ Expected result: compile fails in `aiecc` with the BD-exhaustion error above.
   simplifying `memLN2` from the expanded vectorized `dimensionsToStream` form
   to a direct row-major drain did not change the allocator boundary.
 - That indicates the remaining pressure is the runtime output tap count on the
-  final `32x64` LN2 output stream, not the row-store lowering or the
-  `dimensionsToStream` form of `memLN2`.
+  final `32x64` LN2 output stream, not the `dimensionsToStream` form of
+  `memLN2`.

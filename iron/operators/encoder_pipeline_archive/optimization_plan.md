@@ -18,9 +18,6 @@ Why first:
 Target directions:
 
 - reduce replay traffic around AddNorm1
-- keep the current LN1 replay row-store asymmetry:
-  - memtile `2/1`
-  - ddr `3/1`
 - move more partial-stat work upstream where possible
 - keep full-row layer-norm semantics unchanged
 
@@ -45,7 +42,7 @@ Target directions:
 Why third:
 
 - deeper accumulation-side buffering is blocked by O-proj core L1
-- this is the next best candidate for exploiting row-store better
+- this remains the next best candidate for reducing accumulation-side residency
 
 Target directions:
 
@@ -80,7 +77,7 @@ Target directions:
 
 ## Explicit non-goals for now
 
-- more generic row-store buffer-count tuning
+- more generic buffer-count tuning
 - more memtile-column remapping by itself
 - reviving unsupported uneven FFN partitions
 

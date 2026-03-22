@@ -13,9 +13,5 @@ Archive entrypoints:
 - [readability_cleanup_plan.md](/home/agi-demo/iron/operators/encoder_pipeline_archive/readability_cleanup_plan.md)
 - [docs/history.md](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/history.md)
 
-Historical repros:
-- [row_store_repro](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/row_store_repro/README.md)
-- [shim_drain_bd_repro](/home/agi-demo/iron/operators/encoder_pipeline_archive/docs/repros/shim_drain_bd_repro/README.md)
-
 Use this directory only for historical context. Use the mode-local directories
 for live design work and test runs.

@@ -16,3 +16,15 @@ Run:
 rm -rf ./build
 pytest -q operators/encoder_pipeline_memtile/cases.py
 ```
+
+Known issues after removing the row-store path:
+
+- The direct row-store implementation has been removed from this mode. Replay
+  and accumulation now use FIFO-only forwarding.
+- Two representative numerical regressions are still present in the FIFO-only
+  path:
+  - `encoder_64seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_1pheads_1pffn_8pacc_1opg`
+  - `encoder_64seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_4pheads_4pffn_8pacc_4opg`
+- One representative compile-time memtile DMA-pressure regression is also still
+  present:
+  - `encoder_64seq_64hdim_12heads_3072ffn_64qseqtile_64kvtile_48embtile_6pheads_2pffn_16pacc_2opg`

@@ -26,17 +26,11 @@ Archive contents:
   - hardware limits and past resource pressure notes
 - `design_optimization_plan.md`
   - older optimization roadmap before the current simplified plan
-- `row_store_optimization_plan.md`
-  - older row-store rollout plan
-- `row_store_compute_buffer_test_plan.md`
-  - detailed row-store compute-buffer experiments
 - `ffn_latency_optimization_log_2026-03-08.md`
   - older FFN/LN optimization notes
 
 Frozen repro contents:
 
-- `docs/repros/row_store_repro/`
-  - older row-store runtime/compiler repro artifacts
 - `docs/repros/shim_drain_bd_repro/`
   - frozen shim-drain BD allocator repro artifacts
 

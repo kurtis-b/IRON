@@ -35,13 +35,11 @@ package for core implementation pieces:
 - both local `design.py` files still import shared helpers:
   - `operators.encoder_pipeline.debug_modes`
   - `operators.encoder_pipeline.mapping_validation`
-  - `operators.encoder_pipeline.row_store`
 
 That means the shared directory is still required for:
 - operator construction
 - reference generation
 - debug-mode handling
-- row-store wrapper support
 - mapping validation
 - mode entry hooks
 
@@ -103,10 +101,9 @@ That means the shared directory is still required for:
   - both local `design.py` files import:
     - `operators.encoder_pipeline.debug_modes`
     - `operators.encoder_pipeline.mapping_validation`
-    - `operators.encoder_pipeline.row_store`
 
 - solution:
-  - copy these three files into each mode directory
+  - copy these shared helper files into each mode directory
   - change imports to use local modules only
   - duplicate freely; do not create another shared helper package
 
@@ -153,7 +150,6 @@ Each mode directory should contain everything needed to iterate on that mode:
 - `cases.py`
 - `debug_modes.py`
 - `mapping_validation.py`
-- `row_store.py`
 - `README.md`
 - optional small local helpers only if they reduce reading cost
 
@@ -193,7 +189,6 @@ Result:
 1. Copy these shared helper files into each mode directory:
    - `debug_modes.py`
    - `mapping_validation.py`
-   - `row_store.py`
 2. Update local `design.py` imports to use only local helpers.
 3. Remove any shared-package imports from local `hooks.py`, or inline the hook
    behavior directly into each local `design.py`.
@@ -283,8 +278,8 @@ Implemented:
 Resolved blockers:
 - mode-local `op.py` no longer subclasses `operators.encoder_pipeline.op`
 - mode-local `cases.py` no longer imports shared `reference.py`
-- mode-local `reference.py`, `debug_modes.py`, `mapping_validation.py`, and
-  `row_store.py` now exist in each mode directory
+- mode-local `reference.py`, `debug_modes.py`, and
+  `mapping_validation.py` now exist in each mode directory
 - mode-local `design.py` imports only local helper modules
 - local `hooks.py` no longer imports from the shared package
 
@@ -340,7 +335,6 @@ Still left before deleting `operators/encoder_pipeline/`:
   - `operators/encoder_pipeline/reference.py`
   - `operators/encoder_pipeline/debug_modes.py`
   - `operators/encoder_pipeline/mapping_validation.py`
-  - `operators/encoder_pipeline/row_store.py`
 
 - solution:
   - delete them after `Blocker A` and `Blocker B` are resolved
@@ -415,6 +409,5 @@ Still left before deleting `operators/encoder_pipeline/`:
    - `reference.py`
    - `debug_modes.py`
    - `mapping_validation.py`
-   - `row_store.py`
 6. Delete `operators/encoder_pipeline/` entirely, or leave only a stub README
    if a temporary transition marker is needed.

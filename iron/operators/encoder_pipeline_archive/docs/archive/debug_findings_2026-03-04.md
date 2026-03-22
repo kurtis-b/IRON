@@ -3,14 +3,14 @@
 ## Stable facts
 
 - Layer norm remains two-pass in LN1 and LN2 (row-complete statistics requirement).
-- Same-tile full-row staging uses `aie.memtile_row_store` with `buffer_count=2` where legal.
+- Same-tile full-row staging uses the stable replay path for the current
+  envelope.
 - `memtile` mode: LN1 output broadcasts on-chip to FFN-up branches.
 - `ddr` mode: LN1 output drains to DDR once, refills once, then broadcasts on-chip.
 
 ## Current status
 
-- The live passing path depends on the compiler-side double-buffered row-store lowering.
-- Revalidated control cases after converting additional accumulator paths to row-store:
+- Revalidated current control cases:
   - `memtile`: `encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_4pheads_4pffn_8pacc_4opg`
   - `ddr`: `encoder_512seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_96embtile_4pheads_4pffn_8pacc_4opg`
 - Full-vs-stage profiling on current passing cases:
@@ -33,27 +33,6 @@
     of sequentialized or otherwise non-overlapped work beyond the bottleneck
     stage
 
-## High-pacc row-store experiment
-
-- Experiment goal: check whether row-store lets `emb_tile` drop from `96/128` to `64` while raising `proj_acc_depth` to `12` (`64 * 12 = 768`) without hitting the old memtile forwarded-FIFO BD wall.
-- Topology: `encoder_64seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_64embtile_4pheads_4pffn_12pacc_4opg` (`memtile`).
-- Result: compile reaches `aie-assign-bd-ids`, and the first allocator failure is no longer any of the row-store sites. The failing op is the final `memLN2` shim drain (`aie.objectfifo @memLN2`), with:
-  - `Allocator exhausted available BD IDs (maximum 24 available for channel 3)`
-  - current op: `aie.dma_bd(... memref<32x64xbf16>)` with dimensions `[4,512] [8,8] [8,64] [8,1]`
-- Interpretation: row-store did remove the original part-count-driven LN/O-proj/FFN-down staging bottleneck for this experiment. The next exposed limit is the non-row-store tail drain path.
-- Follow-up check: simplifying `memLN2` itself to the direct row-major drain form (dropping the expanded `o_dims` layout) did not change the allocator outcome. The failure remains on the same shim-drain channel, which means the dominant pressure is the runtime output tap count on the final `32x64` tile stream, not the vectorized `dimensionsToStream` form of `memLN2`.
-
-- Reduced-topology checks with the same `64embtile / 12pacc` split:
-  - `1pheads_1pffn_12pacc`
-  - `2pheads_2pffn_12pacc`
-- Earlier result: both stopped in MLIR verification with:
-  - `'aie.core' op memtile row store accessed by core running on non-compute tile`
-- Current status: guarded LN2 row-store usage to the current stable envelope:
-  - `parallel_heads == 4`
-  - `effective_ffn_branches <= 4`
-- After that guard, the reduced topologies also progress to allocator failure instead of verifier failure.
-- Interpretation: the small-topology row-store placement issue is currently contained by the LN2 guard. The remaining blocker across the `64embtile / 12pacc` experiments is still the final output-drain allocation path, not LN/O-proj/FFN-down row-store staging.
-
 ## Recent resolved issue
 
 - Topology: `encoder_64seq_64hdim_12heads_3072ffn_32qseqtile_64kvtile_128embtile_4pheads_6pffn_6pacc_2opg` (`memtile`).
@@ -74,28 +53,6 @@
   - packed `B_Down` chunk columns `[3,2,1]`
 - Current blocker: runtime timeout (`ERT_CMD_STATE_TIMEOUT`) still occurs in normal mode after the compile constraints are removed.
 
-## Recent row-store scope fix
-
-- Compiler-side double-buffered row-store lowering is now used only where the current runtime path is stable:
-  - LN1 replay: enabled
-  - LN2 replay: only `parallel_heads == 4` and `effective_ffn_branches <= 4`
-  - O-proj accumulation: current stable default is `parallel_heads <= 4`, with
-    slot-based FIFO fallback when a memtile column runs out of safe row-store
-    DMA pairs
-  - FFN-down accumulation: only when `effective_ffn_branches <= 4`, with
-    slot-based allocation and DDR low-head layouts falling back to FIFO
-- Why:
-  - slot-aware channel allocation was needed so FFN-down row-store does not
-    collide with O-proj row-store on the same memtile
-  - DDR low-head FFN-down row-store still times out at runtime on
-    `1pheads_4pffn_8pacc_1opg`, so that layout stays on FIFO fallback
-  - 6-branch FFN-down row-store is still not enabled by default
-- Result:
-  - representative failing cases in both `memtile` and `ddr` now pass again
-  - full tracked selections are green again:
-    - `lnstage_memtile`: `100 passed, 40 skipped`
-    - `lnstage_ddr`: `115 passed, 40 skipped`
-
 ## High-pacc single-branch LN2 tail
 
 - Topology class:
@@ -112,15 +69,10 @@
 - Outcome:
   - `lnstage_memtile-encoder_64seq_64hdim_12heads_3072ffn_64qseqtile_64kvtile_48embtile_6pheads_1pffn_16pacc_2opg`
     now passes
-  - `lnstage_ddr-encoder_64seq_64hdim_12heads_3072ffn_64qseqtile_64kvtile_48embtile_6pheads_1pffn_16pacc_2opg`
+- `lnstage_ddr-encoder_64seq_64hdim_12heads_3072ffn_64qseqtile_64kvtile_48embtile_6pheads_1pffn_16pacc_2opg`
     now passes
   - updated `64qseqtile / 16pacc` comparison matrix:
     - `120 passed, 95 failed, 295 deselected`
-
-## Historical note
-
-- Earlier single-row LN1 row-store integration attempts exposed runtime hangs.
-- Those results are historical now; the current design uses the compiler-side double-buffered lowering.
 
 ## Effective debug patterns
 

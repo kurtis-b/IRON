@@ -5,8 +5,7 @@
 Improve end-to-end latency on the passing `encoder_pipeline` topologies without
 reopening the old memtile-BD/resource failures.
 
-The current design already fixed the original memtile BD wall by moving the
-same-core row staging paths onto `aie.memtile_row_store` where stable. The next
+The current design already moved past the original memtile BD wall. The next
 limits are:
 
 1. accumulation-core L1 pressure
@@ -58,13 +57,11 @@ Observed on the main memtile control:
 
 - `outOProjAccum` deeper compute-side buffering (`2/1`, `1/2`, `2/2`) runs into
   O-proj accumulation core L1 unless other resident buffers are reduced first.
-- The biggest resident O-proj-side non-row-store buffer family is `memOW*_cons`.
+- The biggest resident O-proj-side buffer family is `memOW*_cons`.
 
 Relevant code:
 
 - O-proj weight streams and depths:
-  - [design.py](/home/agi-demo/iron/operators/encoder_pipeline/design.py)
-- O-proj accumulation row-store creation:
   - [design.py](/home/agi-demo/iron/operators/encoder_pipeline/design.py)
 - O-proj BF16 init kernel:
   - [mm.cc](/home/agi-demo/iron/aie_kernels/aie2p/mm.cc)
@@ -74,13 +71,11 @@ Relevant code:
 Observed on the same control:
 
 - `ffnDownAccum` deeper compute-side buffering is still blocked by local L1.
-- The dominant resident non-row-store buffer family there is `memBDown*_cons`.
+- The dominant resident buffer family there is `memBDown*_cons`.
 
 Relevant code:
 
 - FFN-down weight streams and depths:
-  - [design.py](/home/agi-demo/iron/operators/encoder_pipeline/design.py)
-- FFN-down accumulation row-store creation:
   - [design.py](/home/agi-demo/iron/operators/encoder_pipeline/design.py)
 - FFN-down core contract:
   - [design.py](/home/agi-demo/iron/operators/encoder_pipeline/design.py)
@@ -240,7 +235,7 @@ Status:
 Target:
 
 - reduce conservative serialization that is no longer needed after the current
-  row-store and tail changes
+  transport and tail changes
 
 Files:
 
@@ -264,25 +259,23 @@ Status:
 
 Target:
 
-- address the remaining limits that local row-store tuning cannot move:
-  accumulation-core L1 pressure and tail transport pressure
+- address the remaining limits that local tuning cannot move: accumulation-core
+  L1 pressure and tail transport pressure
 
 Files:
 
 - [design.py](/home/agi-demo/iron/operators/encoder_pipeline/design.py)
 - [design_ln1_memtile.py](/home/agi-demo/iron/operators/encoder_pipeline/design_ln1_memtile.py)
 - [design_ln1_ddr.py](/home/agi-demo/iron/operators/encoder_pipeline/design_ln1_ddr.py)
-- [row_store.py](/home/agi-demo/iron/operators/encoder_pipeline/row_store.py)
 
 Compiler-side follow-on:
 
-- row-store lowering / placement in `mlir-aie`
 - tail drain coalescing / channel budgeting in `mlir-aie`
 
 Work:
 
 1. reduce tail stream count structurally rather than by memtile remaps alone
-2. explore accumulation contracts that lower compute-side row-store footprint
+2. explore accumulation contracts that lower compute-side footprint
 3. reduce AddNorm1 cost on the higher-`pacc` passing cases, likely by moving
    more partial-stat work upstream or shortening replay traffic
 4. revisit runtime overlap only after the stream-count, L1, and AddNorm1
@@ -298,7 +291,7 @@ Keep these unless a step above demonstrates a clear improvement:
 
 - `ln1Replay`: producer-heavy `2/1`
 - O-proj real init kernel
-- accumulation row-stores:
+- accumulation staging defaults:
   - O-proj: current default
   - FFN-down: current default
 

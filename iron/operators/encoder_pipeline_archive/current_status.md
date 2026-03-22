@@ -9,29 +9,6 @@
 - `ln1_staging_design="ddr"` stages LN1 output through DDR once, then
   broadcasts on-chip.
 
-## Current row-store envelope
-
-Active row-store use on the current tree:
-
-- `ln1Replay`: always
-  - memtile mode uses producer/consumer compute buffering `2/1`
-  - ddr mode uses producer/consumer compute buffering `3/1`
-  - ddr mode also relaxes residual-fill waits while keeping FFN-weight and
-    output-drain waits intact
-- `outOProjAccum*`: enabled for the current stable `parallel_heads <= 4`
-  envelope, with FIFO fallback when no safe memtile slot exists
-- `ffnDownAccum*`: enabled only when `effective_ffn_branches <= 4`, with
-  low-head DDR layouts falling back to FIFO by default
-- `ln2Replay`: enabled only in `memtile` mode when:
-  - `parallel_heads == 4`
-  - `effective_ffn_branches <= 4`
-
-Special tail case:
-
-- for `parallel_heads >= 6`, `proj_acc_depth >= 16`,
-  `effective_ffn_branches == 1`, AddNorm2 consumes direct FFN-down replay
-  instead of creating `ln2Replay`
-
 ## Supported topology constraints
 
 - `emb_tile * proj_acc_depth == embed_sz`
@@ -96,11 +73,3 @@ Interpretation:
 - tail memtile output-channel pressure on the more aggressive `64q/48e/16pacc`
   families
 - final `memLN2` shim-drain pressure in the `64embtile / 12pacc` experiments
-
-## What is no longer the main blocker
-
-- part-count-driven memtile BD growth on the LN/O-proj/FFN-down row staging
-  paths
-
-That was the old forwarded-FIFO limitation. Current row-store lowering removed
-that as the dominant issue on the stable envelope.
