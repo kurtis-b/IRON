@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+import gc
 import logging
 from pathlib import Path
 import os
@@ -70,6 +71,8 @@ class AIEContext:
             bo.write(np.frombuffer(buffer_data, dtype=np.uint8), 0)
             self.static_data_pool[buffer_data] = bo
 
+        shared_kernel_handles = {}
+
         for op in self.operators:
             if len(op.kernels) == 0:
                 continue
@@ -77,16 +80,30 @@ class AIEContext:
             logging.info(f"Preparing runtime for AIE operator: {op.__class__.__name__}")
 
             # Set up kernels
-            for kernel_name, (xclbin, xclbin_kernel_name, insts) in op.kernels.items():
-                handle = self.device_manager.get_kernel_handle(
-                    str(xclbin.path), xclbin_kernel_name, str(insts.path)
-                )
-                op.xrt_kernels[kernel_name] = (
-                    handle.context,
-                    handle.kernel,
-                    handle.insts_bo,
-                    len(handle.insts),
-                )
+            lazy_kernel_loading = getattr(op, "lazy_kernel_loading", False)
+            if not lazy_kernel_loading:
+                for kernel_name, (
+                    xclbin,
+                    xclbin_kernel_name,
+                    insts,
+                ) in op.kernels.items():
+                    handle = self.device_manager.get_kernel_handle(
+                        str(xclbin.path), xclbin_kernel_name, str(insts.path)
+                    )
+                    shared_key = (str(xclbin.path), xclbin_kernel_name)
+                    if shared_key in shared_kernel_handles:
+                        context, kernel = shared_kernel_handles[shared_key]
+                    else:
+                        context, kernel = handle.context, handle.kernel
+                        shared_kernel_handles[shared_key] = (context, kernel)
+                    op.xrt_kernels[kernel_name] = (
+                        context,
+                        kernel,
+                        handle.insts_bo,
+                        len(handle.insts),
+                    )
+            else:
+                op.xrt_kernels = {}
 
             # If multiple buffers (of the same binned size) are used in the
             # same kernel invocation OR across different invocations with shared
@@ -177,36 +194,33 @@ class AIEContext:
                 op.buffer_bos[alias_name] = op.buffer_bos[target_name]
 
             # Setup runlist
-            _, (first_xclbin, first_xclbin_kernel_name, first_insts) = next(
-                iter(op.kernels.items())
-            )
-            handle = self.device_manager.get_kernel_handle(
-                str(first_xclbin.path), first_xclbin_kernel_name, str(first_insts.path)
-            )
-            context = handle.context
-            if self.use_runlist:
-                if any(
-                    op.xrt_kernels[kernel_name][0] != context
-                    for (kernel_name, *_) in op.runlist
-                ):
-                    op.xrt_runlist = None
-                    continue
-                op.xrt_runlist = pyxrt.runlist(context)
-                for i, (kernel_name, *buffer_args) in enumerate(op.runlist):
-                    this_context, xrt_kernel, insts_bo, insts_len = op.xrt_kernels[
-                        kernel_name
-                    ]
-                    assert this_context == context
-                    opcode = 3
-                    run = pyxrt.run(xrt_kernel)
-                    run.set_arg(0, opcode)
-                    run.set_arg(1, insts_bo)
-                    run.set_arg(2, insts_len)
-                    for j, buffer_arg in enumerate(buffer_args):
-                        run.set_arg(j + 3, op.buffer_bos[buffer_arg])
-                    op.xrt_runlist.add(run)
-            else:
+            if lazy_kernel_loading or not op.xrt_kernels:
                 op.xrt_runlist = None
+            else:
+                context = next(iter(op.xrt_kernels.values()))[0]
+                if self.use_runlist:
+                    if any(
+                        op.xrt_kernels[kernel_name][0] != context
+                        for (kernel_name, *_) in op.runlist
+                    ):
+                        op.xrt_runlist = None
+                        continue
+                    op.xrt_runlist = pyxrt.runlist(context)
+                    for i, (kernel_name, *buffer_args) in enumerate(op.runlist):
+                        this_context, xrt_kernel, insts_bo, insts_len = op.xrt_kernels[
+                            kernel_name
+                        ]
+                        assert this_context == context
+                        opcode = 3
+                        run = pyxrt.run(xrt_kernel)
+                        run.set_arg(0, opcode)
+                        run.set_arg(1, insts_bo)
+                        run.set_arg(2, insts_len)
+                        for j, buffer_arg in enumerate(buffer_args):
+                            run.set_arg(j + 3, op.buffer_bos[buffer_arg])
+                        op.xrt_runlist.add(run)
+                else:
+                    op.xrt_runlist = None
 
         # Log allocation info
         bo_count = sum(len(pool) for pool in bo_pools.values())
@@ -236,13 +250,15 @@ class AIEContext:
         if not self._runtime_prepared:
             return
 
-        runtime = getattr(self.device_manager, "runtime", None)
-        if runtime is not None and hasattr(runtime, "cleanup"):
-            runtime.cleanup()
-
         for op in self.operators:
             op.buffer_bos = {}
             op.xrt_kernels = {}
             op.xrt_runlist = None
+
+        # Drop Python references to XRT objects before the host runtime's
+        # atexit cleanup runs. Calling CachedXRTRuntime.cleanup() here causes
+        # a second cleanup pass later and can double-free when multiple staged
+        # xclbins have been loaded in one process.
+        gc.collect()
 
         self._runtime_prepared = False

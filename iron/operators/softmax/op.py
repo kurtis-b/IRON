@@ -107,11 +107,12 @@ class AIESoftmax(AIEOperatorBase):
         self.add_to_runlist("softmax", "in", "output")
 
     def forward(self, x):
+        x_2d = x.reshape(-1, self.cols)
         applicable = (
-            x.shape[-1] * x.shape[-2] == self.size
-            and x.shape[-1] == self.cols
-            and x.shape[-1] % 16 == 0
-            and x.shape[-2] % 16 == 0
+            x_2d.shape[0] * x_2d.shape[1] == self.size
+            and x_2d.shape[1] == self.cols
+            and x_2d.shape[1] % 16 == 0
+            and x_2d.shape[0] % 16 == 0
         )
         if not applicable:
             raise AIEOperatorConstraintError("AIESoftmax: incompatible tensor shape(s)")
@@ -120,26 +121,14 @@ class AIESoftmax(AIEOperatorBase):
 
     def _execute_aie_operation(self, x):
         original_shape = x.shape
-
-        # Reshape for processing
-        # Split x into a list of H tensors of size [S_q, S_kv]
-        heads = x.shape[1]
-        x_list = [x[0, h, :, :] for h in range(heads)]
-        results = []
-        for i in range(heads):
-            x_iter = x_list[i]
-            input_size = x_iter.nbytes
-            self.write_buffer("in", x_iter)
-            test_pattern = np.zeros(len(x_iter), dtype=bfloat16)
-            self.write_buffer("output", test_pattern)
-            self.run_runlist()
-            result = self.read_buffer_as_torch(
-                "output", shape=x_list[i].shape, dtype=bfloat16
-            )
-            results.append(result)
-
-        result = torch.stack(results, dim=0).unsqueeze(
-            0
-        )  # Shape: (1, heads, S_q, S_kv)
-
-        return result
+        x_2d = x.reshape(-1, self.cols)
+        self.write_buffer("in", x_2d)
+        test_pattern = np.zeros(self.size, dtype=bfloat16)
+        self.write_buffer("output", test_pattern)
+        self.run_runlist()
+        result = self.read_buffer_as_torch(
+            "output",
+            shape=x_2d.shape,
+            dtype=bfloat16,
+        )
+        return result.reshape(original_shape)

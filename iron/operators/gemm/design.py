@@ -344,7 +344,7 @@ def my_matmul(
 
     # Create barriers to synchronize individual workers with the runtime sequence
     workerBarriers = [
-        [WorkerRuntimeBarrier() for col in range(n_aie_cols)]
+        [WorkerRuntimeBarrier(initial_value=0) for col in range(n_aie_cols)]
         for row in range(n_aie_rows)
     ]
 
@@ -441,30 +441,36 @@ def my_matmul(
         barrier,
         elem_out_internal,
     ):
-        barrier.wait_for_value(1)
-        rtp_K_div_k = my_rtp[0]
-        rtp_n_tiles_per_core = my_rtp[1]
-        loop = range(1)  # Workaround for issue #1547
-        if rtp_n_tiles_per_core > 1:
-            loop = range_(rtp_n_tiles_per_core)
-        for _ in loop:
-            if not use_larger_internal_buffer:
-                elem_out_internal = out_c.acquire(1)
-            zero(elem_out_internal)
+        # Persist across dispatches so a shared xclbin can swap instruction
+        # binaries between workloads. The runtime sequence writes fresh RTPs,
+        # flips the barrier to 1, and resets it to 0 when the dispatch ends.
+        for _ in range_(sys.maxsize):
+            barrier.wait_for_value(1)
+            rtp_K_div_k = my_rtp[0]
+            rtp_n_tiles_per_core = my_rtp[1]
+            loop = range(1)  # Workaround for issue #1547
+            if rtp_n_tiles_per_core > 1:
+                loop = range_(rtp_n_tiles_per_core)
+            for _ in loop:
+                if not use_larger_internal_buffer:
+                    elem_out_internal = out_c.acquire(1)
+                zero(elem_out_internal)
 
-            for _ in range_(rtp_K_div_k):
-                elem_in_a = in_a.acquire(1)
-                elem_in_b = in_b.acquire(1)
-                matmul(elem_in_a, elem_in_b, elem_out_internal)
-                in_a.release(1)
-                in_b.release(1)
+                for _ in range_(rtp_K_div_k):
+                    elem_in_a = in_a.acquire(1)
+                    elem_in_b = in_b.acquire(1)
+                    matmul(elem_in_a, elem_in_b, elem_out_internal)
+                    in_a.release(1)
+                    in_b.release(1)
 
-            if use_larger_internal_buffer:
-                elem_out_transfer = out_c.acquire(1)
-                convert_copy(elem_out_internal, elem_out_transfer, m * n)
-                out_c.release(1)
-            else:
-                out_c.release(1)
+                if use_larger_internal_buffer:
+                    elem_out_transfer = out_c.acquire(1)
+                    convert_copy(elem_out_internal, elem_out_transfer, m * n)
+                    out_c.release(1)
+                else:
+                    out_c.release(1)
+
+            barrier.wait_for_value(0)
 
     # Set up compute tiles
     workers = []
@@ -752,6 +758,9 @@ def my_matmul(
                     rt.finish_task_group(tg)
                     tg = rt.task_group()
         rt.finish_task_group(tg)
+        for row in range(n_aie_rows):
+            for col in range(n_aie_cols):
+                rt.set_barrier(workerBarriers[row][col], 0)
 
     if generate_taps:
         # If generate taps is true, return a representation of tensor access patterns

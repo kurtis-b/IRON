@@ -4,7 +4,9 @@
 import sys
 import pytest
 import logging
+import torch
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -56,6 +58,190 @@ all_params = [
     pytest.param(*params, id=name)
     for params, name in zip(regular_params, regular_names)
 ]
+
+
+def test_resolve_k_transpose_num_channels_tracks_seq_len():
+    assert AIEBERTEncoder._resolve_k_transpose_num_channels(64, 64) == 1
+    assert AIEBERTEncoder._resolve_k_transpose_num_channels(128, 64) == 2
+    with pytest.raises(ValueError):
+        AIEBERTEncoder._resolve_k_transpose_num_channels(96, 64)
+
+
+def test_resolve_mha_num_pipelines_tracks_seq_len_blocks():
+    assert AIEBERTEncoder._resolve_mha_num_pipelines(64) == 1
+    assert AIEBERTEncoder._resolve_mha_num_pipelines(128) == 2
+    assert AIEBERTEncoder._resolve_mha_num_pipelines(256) == 4
+    assert AIEBERTEncoder._resolve_mha_num_pipelines(512) == 8
+    assert AIEBERTEncoder._resolve_mha_num_pipelines(1024) == 8
+
+
+def test_forward_accepts_2d_seq_hidden_input(monkeypatch):
+    operator = object.__new__(AIEBERTEncoder)
+    operator.seq_len = 64
+    operator.hidden_size = 768
+    captured = {}
+
+    def fake_write_buffer(name, value):
+        captured[name] = value
+
+    monkeypatch.setattr(operator, "write_buffer", fake_write_buffer)
+    monkeypatch.setattr(operator, "run_runlist", lambda: None)
+    monkeypatch.setattr(
+        operator,
+        "read_buffer_as_torch",
+        lambda name, shape, dtype: torch.zeros(shape, dtype=torch.bfloat16),
+    )
+
+    x = torch.zeros((64, 768), dtype=torch.bfloat16)
+    result = AIEBERTEncoder.forward(operator, x)
+
+    assert result.shape == x.shape
+    assert captured["input"].shape[0] == 64 * 768
+
+
+def test_forward_rejects_non_2d_input():
+    operator = object.__new__(AIEBERTEncoder)
+    operator.seq_len = 64
+    operator.hidden_size = 768
+
+    with pytest.raises(ValueError, match="expects a 2D tensor"):
+        AIEBERTEncoder.forward(operator, torch.zeros((1, 64, 768)))
+
+
+def test_stage_insts_keep_stage_specific_targets():
+    class DummyContext:
+        def __init__(self):
+            self.operators = []
+            self.static_data_pool = {}
+            self.base_dir = Path(__file__).resolve().parents[3]
+            self.device_manager = SimpleNamespace(
+                device_str=lambda: "npu1_4col",
+                device_type="npu1_4col",
+            )
+
+        def register_operator(self, operator, skip_add_to_list=False):
+            operator.context = self
+            if not skip_add_to_list:
+                self.operators.append(operator)
+
+    operator = AIEBERTEncoder(
+        seq_len=64,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_heads=12,
+        use_pip_ffn=False,
+        use_pip_addnorm=False,
+        use_pip_mha=False,
+        use_pip_an_ffn=False,
+        ln1_weight=torch.ones(768, dtype=torch.bfloat16),
+        ln2_weight=torch.ones(768, dtype=torch.bfloat16),
+        context=DummyContext(),
+    )
+    operator.set_up_artifacts()
+
+    stage_insts = [
+        operator.qkvo_proj_insts,
+        operator.k_transpose_insts,
+        operator.attn_scores_insts,
+        operator.attn_scale_insts,
+        operator.attn_softmax_insts,
+        operator.attn_output_insts,
+        operator.ln1_insts,
+        operator.add_insts,
+        operator.up_proj_insts,
+        operator.gelu_insts,
+        operator.down_proj_insts,
+        operator.ln2_insts,
+    ]
+    assert operator.combined_xclbin is not None
+    assert all(insts is not None for insts in stage_insts)
+    assert all(insts.xclbin_input is None for insts in stage_insts)
+    assert (
+        operator.k_transpose_insts.kernel_name
+        == operator.k_transpose_xclbin.kernel_name
+    )
+    assert (
+        operator.attn_scores_insts.kernel_name
+        == operator.attn_scores_xclbin.kernel_name
+    )
+    assert operator.ln2_insts.kernel_name == operator.ln2_xclbin.kernel_name
+
+
+def test_runtime_kernels_bind_stage_specific_xclbins():
+    class DummyContext:
+        def __init__(self):
+            self.operators = []
+            self.static_data_pool = {}
+            self.base_dir = Path(__file__).resolve().parents[3]
+            self.device_manager = SimpleNamespace(
+                device_str=lambda: "npu1_4col",
+                device_type="npu1_4col",
+            )
+
+        def register_operator(self, operator, skip_add_to_list=False):
+            operator.context = self
+            if not skip_add_to_list:
+                self.operators.append(operator)
+
+    operator = AIEBERTEncoder(
+        seq_len=64,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_heads=12,
+        use_pip_ffn=False,
+        use_pip_addnorm=False,
+        use_pip_mha=False,
+        use_pip_an_ffn=False,
+        ln1_weight=torch.ones(768, dtype=torch.bfloat16),
+        ln2_weight=torch.ones(768, dtype=torch.bfloat16),
+        context=DummyContext(),
+    )
+    operator.set_up_artifacts()
+    operator.set_up_runtime()
+
+    assert operator.kernels["encoder_qkvo_proj"][0] is operator.qkvo_proj_xclbin
+    assert operator.kernels["encoder_k_transpose"][0] is operator.k_transpose_xclbin
+    assert operator.kernels["encoder_attn_scores"][0] is operator.attn_scores_xclbin
+    assert operator.kernels["encoder_attn_scale"][0] is operator.attn_scale_xclbin
+    assert operator.kernels["encoder_attn_softmax"][0] is operator.attn_softmax_xclbin
+    assert operator.kernels["encoder_attn_output"][0] is operator.attn_output_xclbin
+    assert operator.kernels["encoder_ln1"][0] is operator.ln1_xclbin
+    assert operator.kernels["encoder_add"][0] is operator.add_xclbin
+    assert operator.kernels["encoder_up_proj"][0] is operator.up_proj_xclbin
+    assert operator.kernels["encoder_gelu"][0] is operator.gelu_xclbin
+    assert operator.kernels["encoder_down_proj"][0] is operator.down_proj_xclbin
+    assert operator.kernels["encoder_ln2"][0] is operator.ln2_xclbin
+
+
+def test_encoder_defaults_to_eager_kernel_loading():
+    class DummyContext:
+        def __init__(self):
+            self.operators = []
+            self.static_data_pool = {}
+            self.base_dir = Path(__file__).resolve().parents[3]
+            self.device_manager = SimpleNamespace(
+                device_str=lambda: "npu1_4col",
+                device_type="npu1_4col",
+            )
+
+        def register_operator(self, operator, skip_add_to_list=False):
+            operator.context = self
+            if not skip_add_to_list:
+                self.operators.append(operator)
+
+    operator = AIEBERTEncoder(
+        seq_len=64,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_heads=12,
+        use_pip_ffn=False,
+        use_pip_addnorm=False,
+        use_pip_mha=False,
+        use_pip_an_ffn=False,
+        context=DummyContext(),
+    )
+
+    assert operator.lazy_kernel_loading is False
 
 
 @pytest.mark.metrics(

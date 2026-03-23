@@ -622,7 +622,7 @@ def encoder_pipeline(
     ln1_stage_shim_col = normalized_placement["ln1_stage_shim_col"]
     residual_shim_col = normalized_placement["residual_shim_col"]
     output_shim_col = normalized_placement["output_shim_col"]
-    use_memtile_o_proj_replay = o_proj_fifo_depth == 1
+    use_memtile_o_proj_replay = o_proj_fifo_depth == 1 and parallel_seq > 1
 
     W_O_ty = np.ndarray[(embed_sz, embed_sz), np.dtype[dtype]]
     QKV_ty = np.ndarray[(3 * seq_len, embed_sz), np.dtype[dtype]]

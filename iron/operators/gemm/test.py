@@ -2,11 +2,31 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import pytest
+from pathlib import Path
 
+import numpy as np
+import pytest
+import torch
 from iron.common.test_utils import run_test
 from iron.operators.gemm.op import AIEGEMM
 from iron.operators.gemm.reference import generate_golden_reference
+
+
+class _DummyContext:
+    def __init__(self):
+        self.operators = []
+        self.static_data_pool = {}
+        self.base_dir = Path(__file__).resolve().parents[3]
+        self.device_manager = type(
+            "_DummyDeviceManager",
+            (),
+            {"device_str": staticmethod(lambda: "npu1_4col")},
+        )()
+
+    def register_operator(self, operator, skip_add_to_list=False):
+        operator.context = self
+        if not skip_add_to_list:
+            self.operators.append(operator)
 
 
 def generate_test_params(extensive=False):
@@ -590,6 +610,113 @@ all_params = [
     pytest.param(*params, marks=pytest.mark.extensive, id=name)
     for params, name in zip(extensive_params, extensive_names)
 ]
+
+
+def test_batched_stride_dim_one_shape_inference_uses_middle_axis():
+    operator = AIEGEMM(
+        M=512,
+        K=64,
+        N=512,
+        tile_m=64,
+        tile_k=64,
+        tile_n=64,
+        num_aie_columns=8,
+        prio_accuracy=False,
+        emulate_bf16_mmul_with_bfp16=True,
+        batch_A=(12, 1),
+        batch_B=(12, 1),
+        batch_C=(12, 0),
+    )
+
+    assert operator._get_gemm_shapes((512, 12, 64), operator.batch_A) == (512, 64)
+    assert operator._get_gemm_shapes((64, 12, 512), operator.batch_B) == (64, 512)
+
+
+def test_batched_gemm_trims_padded_n_for_batch_stride_dim_1():
+    operator = AIEGEMM(
+        M=64,
+        K=64,
+        N=64,
+        tile_m=64,
+        tile_k=64,
+        tile_n=16,
+        num_aie_columns=8,
+        prio_accuracy=False,
+        emulate_bf16_mmul_with_bfp16=True,
+        batch_A=(12, 0),
+        batch_B=(12, 1),
+        batch_C=(12, 1),
+        context=_DummyContext(),
+    )
+
+    operator._execute_batched_aie_operation = lambda _A_np, _B_np=None: np.ones(
+        (64, 12, 128),
+        dtype=np.dtype("bfloat16"),
+    )
+
+    output = operator(
+        torch.zeros((12, 64, 64), dtype=torch.bfloat16),
+        torch.zeros((64, 12, 64), dtype=torch.bfloat16),
+    )
+
+    assert tuple(output.shape) == (64, 12, 64)
+
+
+def test_runtime_xclbin_and_instruction_artifacts_can_be_bound_independently():
+    common_kwargs = dict(
+        tile_m=64,
+        tile_k=64,
+        tile_n=16,
+        num_aie_columns=8,
+        emulate_bf16_mmul_with_bfp16=True,
+    )
+
+    shared_builder = AIEGEMM(
+        M=256,
+        K=64,
+        N=128,
+        context=_DummyContext(),
+        skip_add_to_list=True,
+        **common_kwargs,
+    )
+    shared_xclbin = shared_builder.get_runtime_xclbin_artifact(
+        prefix="gemm_shared_runtime_"
+    )
+    shared_xclbin.kernel_name = "gemm_shared"
+
+    def make_bound_op(prefix, M, K, N, use_static_weight=False):
+        inst_builder = AIEGEMM(
+            M=M,
+            K=K,
+            N=N,
+            use_static_weight=use_static_weight,
+            context=_DummyContext(),
+            skip_add_to_list=True,
+            **common_kwargs,
+        )
+        insts_artifact = inst_builder.get_insts_artifact(prefix=f"{prefix}_")
+        op = AIEGEMM(
+            M=M,
+            K=K,
+            N=N,
+            use_static_weight=use_static_weight,
+            context=_DummyContext(),
+            **common_kwargs,
+        )
+        op.bind_artifacts(
+            shared_xclbin,
+            insts_artifact,
+            runtime_xclbin_artifact=shared_xclbin,
+            runtime_kernel_name=shared_xclbin.kernel_name,
+        )
+        return op
+
+    qkv_op = make_bound_op("gemm_shared_qkv", 64, 768, 2304, use_static_weight=True)
+    scores_op = make_bound_op("gemm_shared_scores", 64, 64, 64)
+
+    assert qkv_op.runtime_xclbin_artifact.path == scores_op.runtime_xclbin_artifact.path
+    assert qkv_op.runtime_kernel_name == scores_op.runtime_kernel_name
+    assert qkv_op.insts_artifact.path != scores_op.insts_artifact.path
 
 
 @pytest.mark.metrics(

@@ -32,13 +32,20 @@ class AIEDeviceManager:
         # Accessing protected member _device as AIEContext needs pyxrt.device
         self.device = self.runtime._device
         self.device_type = self.runtime.device()
+        if not hasattr(self, "_kernel_handle_cache"):
+            self._kernel_handle_cache = {}
 
     def get_kernel_handle(self, xclbin_path: str, kernel_name: str, insts_path: str):
         """Get kernel handle using HostRuntime"""
-        npu_kernel = NPUKernel(
-            xclbin_path=xclbin_path, insts_path=insts_path, kernel_name=kernel_name
-        )
-        return self.runtime.load(npu_kernel)
+        cache_key = (xclbin_path, kernel_name, insts_path)
+        handle = self._kernel_handle_cache.get(cache_key)
+        if handle is None:
+            npu_kernel = NPUKernel(
+                xclbin_path=xclbin_path, insts_path=insts_path, kernel_name=kernel_name
+            )
+            handle = self.runtime.load(npu_kernel)
+            self._kernel_handle_cache[cache_key] = handle
+        return handle
 
     def device_str(self) -> str:
         return self.device_type.resolve().name
@@ -50,4 +57,4 @@ class AIEDeviceManager:
 
     def reset(self):
         """Reset the device manager (for debugging)"""
-        pass
+        self._kernel_handle_cache = {}

@@ -51,6 +51,21 @@ class AIEBERTEncoder(AIEOperatorBase):
     14. Residual connection (Eltwise add)
     """
 
+    @staticmethod
+    def _resolve_k_transpose_num_channels(seq_len, tile_rows):
+        max_channels = 2
+        for num_channels in range(max_channels, 0, -1):
+            if seq_len % (num_channels * tile_rows) == 0:
+                return num_channels
+        raise ValueError(
+            f"K transpose requires seq_len to be divisible by tile_rows={tile_rows}; got seq_len={seq_len}"
+        )
+
+    @staticmethod
+    def _resolve_mha_num_pipelines(seq_len, block_rows=64, max_pipelines=8):
+        max_feasible = max(1, seq_len // block_rows)
+        return min(max_pipelines, max_feasible)
+
     def __init__(
         self,
         seq_len,
@@ -64,6 +79,7 @@ class AIEBERTEncoder(AIEOperatorBase):
         use_pip_an_ffn=True,
         ln1_weight=None,
         ln2_weight=None,
+        use_static_runtime_weights=True,
         context=None,
     ):
         if use_pip_an_ffn and use_pip_ffn:
@@ -96,6 +112,11 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.use_pip_addnorm = use_pip_addnorm
         self.use_pip_mha = use_pip_mha
         self.use_pip_an_ffn = use_pip_an_ffn
+        self.use_static_runtime_weights = use_static_runtime_weights
+        # The stitched encoder backend is stable when its stage handles are
+        # loaded during runtime preparation and then reused. Lazy per-dispatch
+        # loads are prone to XRT host-runtime crashes.
+        self.lazy_kernel_loading = False
 
         # Artifacts created by set_up_artifacts() - one per layer
         self.combined_xclbin = None
@@ -104,9 +125,13 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.qkvo_proj_insts = None
         # Attention
         if self.use_pip_mha:
+            self.mha_num_pipelines = self._resolve_mha_num_pipelines(self.seq_len)
             self.mha_xclbin = None
             self.mha_insts = None
         else:
+            self.k_transpose_num_channels = self._resolve_k_transpose_num_channels(
+                self.seq_len, 64
+            )
             self.k_transpose_xclbin = None
             self.k_transpose_insts = None
             self.attn_scores_xclbin = None
@@ -152,6 +177,30 @@ class AIEBERTEncoder(AIEOperatorBase):
                 self.down_proj_insts = None
 
         AIEOperatorBase.__init__(self, context=context)
+
+    def _runtime_weight_static_data(self, tensor, *, transpose=False):
+        if not self.use_static_runtime_weights or tensor is None:
+            return None
+        weight_tensor = tensor.T if transpose else tensor
+        return torch_to_numpy(weight_tensor)
+
+    def write_runtime_weights(self):
+        self.write_buffer("q_weight", torch_to_numpy(self.q_weight.T))
+        self.write_buffer("k_weight", torch_to_numpy(self.k_weight.T))
+        self.write_buffer("v_weight", torch_to_numpy(self.v_weight.T))
+        self.write_buffer(
+            "attn_output_weight",
+            torch_to_numpy(self.attn_output_weight.T),
+        )
+        if self.use_pip_addnorm or self.use_pip_an_ffn:
+            self.write_buffer("ln1_weight", torch_to_numpy(self.ln1_weight))
+        self.write_buffer("ffn_up_weight", torch_to_numpy(self.ffn_up_weight.T))
+        self.write_buffer(
+            "ffn_down_weight",
+            torch_to_numpy(self.ffn_down_weight.T),
+        )
+        if self.use_pip_addnorm or self.use_pip_an_ffn:
+            self.write_buffer("ln2_weight", torch_to_numpy(self.ln2_weight))
 
     def set_up_artifacts(self):
         """Set up artifacts for the encoder layer components using 13 individual layers."""
@@ -203,7 +252,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 seq_len=self.seq_len,
                 d=self.head_dim,
                 num_KV_heads=self.num_heads,
-                num_of_pipelines=8,
+                num_of_pipelines=self.mha_num_pipelines,
                 skip_add_to_list=True,
             ).get_artifacts(prefix=f"{prefix_base}mha_")
             self.mha_xclbin.xclbin_input = self.qkvo_proj_xclbin
@@ -222,7 +271,7 @@ class AIEBERTEncoder(AIEOperatorBase):
                 M=self.seq_len,
                 N=self.hidden_size,
                 num_aie_columns=self.num_aie_columns,
-                num_channels=2,
+                num_channels=self.k_transpose_num_channels,
                 m=64,
                 n=96,
                 s=8,
@@ -579,6 +628,125 @@ class AIEBERTEncoder(AIEOperatorBase):
                 # Store final xclbin
                 self.combined_xclbin = self.ln2_xclbin
 
+        stage_kernel_pairs = [
+            (self.qkvo_proj_insts, self.qkvo_proj_xclbin.kernel_name),
+            (
+                self.mha_insts if self.use_pip_mha else None,
+                self.mha_xclbin.kernel_name if self.use_pip_mha else None,
+            ),
+            (
+                None if self.use_pip_mha else self.k_transpose_insts,
+                None if self.use_pip_mha else self.k_transpose_xclbin.kernel_name,
+            ),
+            (
+                None if self.use_pip_mha else self.attn_scores_insts,
+                None if self.use_pip_mha else self.attn_scores_xclbin.kernel_name,
+            ),
+            (
+                None if self.use_pip_mha else self.attn_scale_insts,
+                None if self.use_pip_mha else self.attn_scale_xclbin.kernel_name,
+            ),
+            (
+                None if self.use_pip_mha else self.attn_softmax_insts,
+                None if self.use_pip_mha else self.attn_softmax_xclbin.kernel_name,
+            ),
+            (
+                None if self.use_pip_mha else self.attn_output_insts,
+                None if self.use_pip_mha else self.attn_output_xclbin.kernel_name,
+            ),
+            (
+                self.anffn_insts if self.use_pip_an_ffn else None,
+                self.anffn_xclbin.kernel_name if self.use_pip_an_ffn else None,
+            ),
+            (
+                (
+                    None
+                    if self.use_pip_an_ffn or not self.use_pip_addnorm
+                    else self.add_norm1_insts
+                ),
+                (
+                    None
+                    if self.use_pip_an_ffn or not self.use_pip_addnorm
+                    else self.add_norm1_xclbin.kernel_name
+                ),
+            ),
+            (
+                None if self.use_pip_an_ffn or self.use_pip_addnorm else self.ln1_insts,
+                (
+                    None
+                    if self.use_pip_an_ffn or self.use_pip_addnorm
+                    else self.ln1_xclbin.kernel_name
+                ),
+            ),
+            (
+                None if self.use_pip_an_ffn or self.use_pip_addnorm else self.add_insts,
+                (
+                    None
+                    if self.use_pip_an_ffn or self.use_pip_addnorm
+                    else self.add_xclbin.kernel_name
+                ),
+            ),
+            (
+                None if self.use_pip_an_ffn or not self.use_pip_ffn else self.ffn_insts,
+                (
+                    None
+                    if self.use_pip_an_ffn or not self.use_pip_ffn
+                    else self.ffn_xclbin.kernel_name
+                ),
+            ),
+            (
+                None if self.use_pip_an_ffn or self.use_pip_ffn else self.up_proj_insts,
+                (
+                    None
+                    if self.use_pip_an_ffn or self.use_pip_ffn
+                    else self.up_proj_xclbin.kernel_name
+                ),
+            ),
+            (
+                None if self.use_pip_an_ffn or self.use_pip_ffn else self.gelu_insts,
+                (
+                    None
+                    if self.use_pip_an_ffn or self.use_pip_ffn
+                    else self.gelu_xclbin.kernel_name
+                ),
+            ),
+            (
+                (
+                    None
+                    if self.use_pip_an_ffn or self.use_pip_ffn
+                    else self.down_proj_insts
+                ),
+                (
+                    None
+                    if self.use_pip_an_ffn or self.use_pip_ffn
+                    else self.down_proj_xclbin.kernel_name
+                ),
+            ),
+            (
+                (
+                    None
+                    if self.use_pip_an_ffn or not self.use_pip_addnorm
+                    else self.add_norm2_insts
+                ),
+                (
+                    None
+                    if self.use_pip_an_ffn or not self.use_pip_addnorm
+                    else self.add_norm2_xclbin.kernel_name
+                ),
+            ),
+            (
+                None if self.use_pip_an_ffn or self.use_pip_addnorm else self.ln2_insts,
+                (
+                    None
+                    if self.use_pip_an_ffn or self.use_pip_addnorm
+                    else self.ln2_xclbin.kernel_name
+                ),
+            ),
+        ]
+        for insts_artifact, kernel_name in stage_kernel_pairs:
+            if insts_artifact is not None:
+                insts_artifact.kernel_name = kernel_name
+
         self.add_artifacts(artifacts)
         logging.info(f"Finished setting up {len(artifacts)} BERT Encoder artifacts.")
 
@@ -593,70 +761,53 @@ class AIEBERTEncoder(AIEOperatorBase):
         self.add_buffer(
             "q_weight",
             self.hidden_size * self.hidden_size,
-            static_data=(
-                torch_to_numpy(self.q_weight.T) if self.q_weight is not None else None
-            ),
+            static_data=self._runtime_weight_static_data(self.q_weight, transpose=True),
         )
         self.add_buffer(
             "k_weight",
             self.hidden_size * self.hidden_size,
-            static_data=(
-                torch_to_numpy(self.k_weight.T) if self.k_weight is not None else None
-            ),
+            static_data=self._runtime_weight_static_data(self.k_weight, transpose=True),
         )
         self.add_buffer(
             "v_weight",
             self.hidden_size * self.hidden_size,
-            static_data=(
-                torch_to_numpy(self.v_weight.T) if self.v_weight is not None else None
-            ),
+            static_data=self._runtime_weight_static_data(self.v_weight, transpose=True),
         )
         self.add_buffer(
             "attn_output_weight",
             self.hidden_size * self.hidden_size,
-            static_data=(
-                torch_to_numpy(self.attn_output_weight.T)
-                if self.attn_output_weight is not None
-                else None
+            static_data=self._runtime_weight_static_data(
+                self.attn_output_weight,
+                transpose=True,
             ),
         )
         if self.use_pip_addnorm or self.use_pip_an_ffn:
             self.add_buffer(
                 "ln1_weight",
                 self.hidden_size,
-                static_data=(
-                    torch_to_numpy(self.ln1_weight)
-                    if self.ln1_weight is not None
-                    else None
-                ),
+                static_data=self._runtime_weight_static_data(self.ln1_weight),
             )
         self.add_buffer(
             "ffn_up_weight",
             self.hidden_size * self.intermediate_size,
-            static_data=(
-                torch_to_numpy(self.ffn_up_weight.T)
-                if self.ffn_up_weight is not None
-                else None
+            static_data=self._runtime_weight_static_data(
+                self.ffn_up_weight,
+                transpose=True,
             ),
         )
         self.add_buffer(
             "ffn_down_weight",
             self.intermediate_size * self.hidden_size,
-            static_data=(
-                torch_to_numpy(self.ffn_down_weight.T)
-                if self.ffn_down_weight is not None
-                else None
+            static_data=self._runtime_weight_static_data(
+                self.ffn_down_weight,
+                transpose=True,
             ),
         )
         if self.use_pip_addnorm or self.use_pip_an_ffn:
             self.add_buffer(
                 "ln2_weight",
                 self.hidden_size,
-                static_data=(
-                    torch_to_numpy(self.ln2_weight)
-                    if self.ln2_weight is not None
-                    else None
-                ),
+                static_data=self._runtime_weight_static_data(self.ln2_weight),
             )
 
         # Intermediate buffers for all layers
@@ -706,52 +857,52 @@ class AIEBERTEncoder(AIEOperatorBase):
         # Add kernels for all layers
         self.add_kernel(
             "encoder_qkvo_proj",
-            self.combined_xclbin,
+            self.qkvo_proj_xclbin,
             self.qkvo_proj_xclbin.kernel_name,
             self.qkvo_proj_insts,
         )
         if self.use_pip_mha:
             self.add_kernel(
                 "encoder_mha",
-                self.combined_xclbin,
+                self.mha_xclbin,
                 self.mha_xclbin.kernel_name,
                 self.mha_insts,
             )
         else:
             self.add_kernel(
                 "encoder_k_transpose",
-                self.combined_xclbin,
+                self.k_transpose_xclbin,
                 self.k_transpose_xclbin.kernel_name,
                 self.k_transpose_insts,
             )
             self.add_kernel(
                 "encoder_attn_scores",
-                self.combined_xclbin,
+                self.attn_scores_xclbin,
                 self.attn_scores_xclbin.kernel_name,
                 self.attn_scores_insts,
             )
             self.add_kernel(
                 "encoder_attn_scale",
-                self.combined_xclbin,
+                self.attn_scale_xclbin,
                 self.attn_scale_xclbin.kernel_name,
                 self.attn_scale_insts,
             )
             self.add_kernel(
                 "encoder_attn_softmax",
-                self.combined_xclbin,
+                self.attn_softmax_xclbin,
                 self.attn_softmax_xclbin.kernel_name,
                 self.attn_softmax_insts,
             )
             self.add_kernel(
                 "encoder_attn_output",
-                self.combined_xclbin,
+                self.attn_output_xclbin,
                 self.attn_output_xclbin.kernel_name,
                 self.attn_output_insts,
             )
         if self.use_pip_an_ffn:
             self.add_kernel(
                 "encoder_anffn",
-                self.combined_xclbin,
+                self.anffn_xclbin,
                 self.anffn_xclbin.kernel_name,
                 self.anffn_insts,
             )
@@ -759,60 +910,60 @@ class AIEBERTEncoder(AIEOperatorBase):
             if self.use_pip_addnorm:
                 self.add_kernel(
                     "encoder_add_norm1",
-                    self.combined_xclbin,
+                    self.add_norm1_xclbin,
                     self.add_norm1_xclbin.kernel_name,
                     self.add_norm1_insts,
                 )
             else:
                 self.add_kernel(
                     "encoder_ln1",
-                    self.combined_xclbin,
+                    self.ln1_xclbin,
                     self.ln1_xclbin.kernel_name,
                     self.ln1_insts,
                 )
                 self.add_kernel(
                     "encoder_add",
-                    self.combined_xclbin,
+                    self.add_xclbin,
                     self.add_xclbin.kernel_name,
                     self.add_insts,
                 )
             if self.use_pip_ffn:
                 self.add_kernel(
                     "encoder_ffn",
-                    self.combined_xclbin,
+                    self.ffn_xclbin,
                     self.ffn_xclbin.kernel_name,
                     self.ffn_insts,
                 )
             else:
                 self.add_kernel(
                     "encoder_up_proj",
-                    self.combined_xclbin,
+                    self.up_proj_xclbin,
                     self.up_proj_xclbin.kernel_name,
                     self.up_proj_insts,
                 )
                 self.add_kernel(
                     "encoder_gelu",
-                    self.combined_xclbin,
+                    self.gelu_xclbin,
                     self.gelu_xclbin.kernel_name,
                     self.gelu_insts,
                 )
                 self.add_kernel(
                     "encoder_down_proj",
-                    self.combined_xclbin,
+                    self.down_proj_xclbin,
                     self.down_proj_xclbin.kernel_name,
                     self.down_proj_insts,
                 )
             if self.use_pip_addnorm:
                 self.add_kernel(
                     "encoder_add_norm2",
-                    self.combined_xclbin,
+                    self.add_norm2_xclbin,
                     self.add_norm2_xclbin.kernel_name,
                     self.add_norm2_insts,
                 )
             else:
                 self.add_kernel(
                     "encoder_ln2",
-                    self.combined_xclbin,
+                    self.ln2_xclbin,
                     self.ln2_xclbin.kernel_name,
                     self.ln2_insts,
                 )
@@ -941,16 +1092,26 @@ class AIEBERTEncoder(AIEOperatorBase):
         Returns:
             Output tensor of shape (seq_len, hidden_size)
         """
-        # x is [batch, size]
-        batch = x.shape[0] if x.dim() > 1 else 1
+        if x.dim() != 2:
+            raise ValueError(
+                f"AIEBERTEncoder.forward expects a 2D tensor of shape "
+                f"({self.seq_len}, {self.hidden_size}); got shape={tuple(x.shape)}"
+            )
+        if tuple(x.shape) != (self.seq_len, self.hidden_size):
+            raise ValueError(
+                f"AIEBERTEncoder.forward expects shape "
+                f"({self.seq_len}, {self.hidden_size}); got shape={tuple(x.shape)}"
+            )
 
         # Flatten inputs for AIE processing
         x_flat = x.view(-1)
 
         # Verify input size matches expected dimensions
-        expected_size = batch * self.seq_len * self.hidden_size
+        expected_size = self.seq_len * self.hidden_size
         assert x_flat.shape[0] == expected_size
 
+        if not self.use_static_runtime_weights:
+            self.write_runtime_weights()
         self.write_buffer("input", x_flat)
         self.run_runlist()
         result = self.read_buffer_as_torch(

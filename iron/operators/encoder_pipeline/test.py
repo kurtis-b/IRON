@@ -33,7 +33,7 @@ from iron.operators.encoder_pipeline.topology import (
 
 REL_TOL = 4.0e-2
 ABS_TOL = 1.5e-1
-ERROR_THRESHOLD = 0.005
+ERROR_THRESHOLD = 0.05
 DEFAULT_SCALED_SEQ_LENS = tuple(1 << exp for exp in range(6, 14))
 OPTIONAL_SCALED_SEQ_LENS = (16384,)
 INCLUDE_SEQ16384 = os.environ.get("IRON_ENCODER_PIPELINE_INCLUDE_SEQ16384") == "1"

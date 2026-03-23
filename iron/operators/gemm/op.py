@@ -92,23 +92,53 @@ class AIEGEMM(AIEOperatorBase):
 
         self.xclbin_artifact = None
         self.insts_artifact = None
+        self.runtime_xclbin_artifact = None
+        self.runtime_kernel_name = None
 
         AIEOperatorBase.__init__(
             self, context=context, skip_add_to_list=skip_add_to_list
         )
 
+    def bind_artifacts(
+        self,
+        xclbin_artifact,
+        insts_artifact,
+        *,
+        runtime_xclbin_artifact=None,
+        runtime_kernel_name=None,
+    ):
+        self.xclbin_artifact = xclbin_artifact
+        self.insts_artifact = insts_artifact
+        self.runtime_xclbin_artifact = runtime_xclbin_artifact
+        self.runtime_kernel_name = runtime_kernel_name
+
     def _uses_batched_layout(self):
         return self.batch_C[0] > 1
 
-    def get_artifacts(self, prefix="gemm_"):
+    def _get_runtime_dims(self):
+        num_aie_rows = 4
+        min_M = self.tile_m * num_aie_rows
+        min_K = self.tile_k
+        min_N = self.tile_n * self.num_aie_columns
+        return min_M, min_K, min_N
+
+    def _get_artifact_name_base(self, prefix, M, K, N):
+        file_name_total_base = (
+            f"{prefix}{M}x{K}x{N}_{self.num_aie_columns}_{self.tile_m}x{self.tile_k}x{self.tile_n}"
+            f"_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
+        )
+        if self._uses_batched_layout():
+            file_name_total_base += (
+                f"_batchA{self.batch_A[0]}d{self.batch_A[1]}"
+                f"_batchB{self.batch_B[0]}d{self.batch_B[1]}"
+                f"_batchC{self.batch_C[0]}d{self.batch_C[1]}"
+            )
+        elif self.partition_N > 1:
+            file_name_total_base += f"_partN{self.partition_N}"
+        return file_name_total_base
+
+    def _build_mlir_artifact(self, prefix, M, K, N):
         operator_dir = Path(__file__).parent
-        tile_m = self.tile_m
-        tile_k = self.tile_k
-        tile_n = self.tile_n
-        M = self.M
-        K = self.K
-        N = self.N
-        num_aie_columns = self.num_aie_columns
         base_dir = self.context.base_dir
         device_str = self.context.device_manager.device_str()
 
@@ -121,6 +151,11 @@ class AIEGEMM(AIEOperatorBase):
         use_scalar = self.gemm_args.get("use_scalar", False)
         round_conv_even = self.gemm_args.get("round_conv_even", True)
 
+        tile_m = self.tile_m
+        tile_k = self.tile_k
+        tile_n = self.tile_n
+        num_aie_columns = self.num_aie_columns
+
         if emulate_bf16_mmul_with_bfp16:
             min_tile_m, min_tile_k, min_tile_n = 8, 8, 8
         else:
@@ -129,20 +164,9 @@ class AIEGEMM(AIEOperatorBase):
         assert tile_k >= min_tile_k, f"tile_k ({tile_k}) must be >= {min_tile_k}"
         assert tile_n >= min_tile_n, f"tile_n ({tile_n}) must be >= {min_tile_n}"
 
-        file_name_tile_base = f"{prefix}{tile_m}x{tile_k}x{tile_n}"
-        file_name_total_base = (
-            f"{prefix}{M}x{K}x{N}_{num_aie_columns}_{tile_m}x{tile_k}x{tile_n}"
-            f"_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
-        )
-        if self._uses_batched_layout():
-            file_name_total_base += (
-                f"_batchA{self.batch_A[0]}d{self.batch_A[1]}"
-                f"_batchB{self.batch_B[0]}d{self.batch_B[1]}"
-                f"_batchC{self.batch_C[0]}d{self.batch_C[1]}"
-            )
-        elif self.partition_N > 1:
-            file_name_total_base += f"_partN{self.partition_N}"
+        file_name_total_base = self._get_artifact_name_base(prefix, M, K, N)
 
+        kernel_archive = f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}.a"
         kernel_flags = [
             f"-DDIM_M={tile_m}",
             f"-DDIM_K={tile_k}",
@@ -160,8 +184,6 @@ class AIEGEMM(AIEOperatorBase):
             kernel_flags.append("-DB_COL_MAJ")
         if self.c_col_maj:
             kernel_flags.append("-DC_COL_MAJ")
-
-        kernel_archive = f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}.a"
 
         if self._uses_batched_layout():
             mlir_artifact = PythonGeneratedMLIRArtifact.new(
@@ -243,6 +265,14 @@ class AIEGEMM(AIEOperatorBase):
                             ],
                         ),
                         KernelObjectArtifact.new(
+                            "zero_scalar.o",
+                            [
+                                SourceArtifact.new(
+                                    base_dir / "aie_kernels" / "aie2p" / "zero.cc"
+                                )
+                            ],
+                        ),
+                        KernelObjectArtifact.new(
                             "convert_copy.o",
                             [
                                 SourceArtifact.new(
@@ -258,20 +288,43 @@ class AIEGEMM(AIEOperatorBase):
             ],
             extra_flags=["--dynamic-objFifos"],
         )
-
         insts_artifact = InstsBinArtifact.new(
             f"{file_name_total_base}.bin",
             depends=[mlir_artifact],
             extra_flags=["--dynamic-objFifos"],
         )
-
         return xclbin_artifact, insts_artifact
 
+    def get_artifacts(self, prefix="gemm_"):
+        return self._build_mlir_artifact(prefix, self.M, self.K, self.N)
+
+    def get_insts_artifact(self, prefix="gemm_", xclbin_input=None):
+        _, insts_artifact = self._build_mlir_artifact(prefix, self.M, self.K, self.N)
+        insts_artifact.xclbin_input = xclbin_input
+        return insts_artifact
+
+    def get_runtime_xclbin_artifact(self, prefix="gemm_runtime_"):
+        runtime_M, runtime_K, runtime_N = self._get_runtime_dims()
+        xclbin_artifact, _ = self._build_mlir_artifact(
+            prefix,
+            runtime_M,
+            runtime_K,
+            runtime_N,
+        )
+        return xclbin_artifact
+
     def set_up_artifacts(self):
-        xclbin_artifact, insts_artifact = self.get_artifacts()
-        self.xclbin_artifact = xclbin_artifact
-        self.insts_artifact = insts_artifact
-        self.add_artifacts([xclbin_artifact, insts_artifact])
+        if self.xclbin_artifact is None or self.insts_artifact is None:
+            xclbin_artifact, insts_artifact = self.get_artifacts()
+            self.xclbin_artifact = xclbin_artifact
+            self.insts_artifact = insts_artifact
+        artifacts = [self.xclbin_artifact, self.insts_artifact]
+        if (
+            self.runtime_xclbin_artifact is not None
+            and self.runtime_xclbin_artifact is not self.xclbin_artifact
+        ):
+            artifacts.append(self.runtime_xclbin_artifact)
+        self.add_artifacts(artifacts)
 
     def set_up_runtime(self):
         static_weights = None
@@ -280,10 +333,14 @@ class AIEGEMM(AIEOperatorBase):
             if isinstance(static_weights, torch.Tensor):
                 static_weights = torch_to_numpy(static_weights)
 
+        runtime_xclbin_artifact = self.runtime_xclbin_artifact or self.xclbin_artifact
+        runtime_kernel_name = (
+            self.runtime_kernel_name or runtime_xclbin_artifact.kernel_name
+        )
         self.add_kernel(
             "gemm",
-            self.xclbin_artifact,
-            self.xclbin_artifact.kernel_name,
+            runtime_xclbin_artifact,
+            runtime_kernel_name,
             self.insts_artifact,
         )
 
@@ -385,7 +442,7 @@ class AIEGEMM(AIEOperatorBase):
                 return mtx_shape[1:]
             raise AIEOperatorConstraintError("AIEGEMM: unexpected batched tensor shape")
         if batch_size == mtx_shape[1]:
-            return mtx_shape[:-1]
+            return mtx_shape[0], mtx_shape[2]
         raise AIEOperatorConstraintError("AIEGEMM: unexpected batched tensor shape")
 
     def _do_batched_gemm(self, A, B=None):
@@ -394,7 +451,7 @@ class AIEGEMM(AIEOperatorBase):
         M, K = self._get_gemm_shapes(A.shape, self.batch_A)
         batch_size_C, batch_stride_dim_C = self.batch_C
         expected_output_shape = (
-            (batch_size_C, M, N) if batch_stride_dim_C == 0 else (M, N, batch_size_C)
+            (batch_size_C, M, N) if batch_stride_dim_C == 0 else (M, batch_size_C, N)
         )
         applicable = K == K2 and M <= self.M and K <= self.K and N <= self.N
         if not applicable:
@@ -422,10 +479,10 @@ class AIEGEMM(AIEOperatorBase):
                     A_part = A_padded[M_lo : M_lo + self.M, :, :]
                 result_part = self._execute_batched_aie_operation(A_part, B_padded)
                 max_M = min(M_lo + self.M, M)
-                result_padded[:, M_lo:max_M, :] = result_part[:, :max_M, :]
+                result_padded[:, M_lo:max_M, :N] = result_part[:, :max_M, :N]
             result = numpy_to_torch(result_padded[:, :M, :N])
         else:
-            result_padded = np.zeros((M, self.N, batch_size_C), dtype=A_padded.dtype)
+            result_padded = np.zeros((M, batch_size_C, self.N), dtype=A_padded.dtype)
             for M_lo in range(0, M, self.M):
                 if self.batch_A[1] == 0:
                     A_part = A_padded[:, M_lo : M_lo + self.M, :]
@@ -433,8 +490,8 @@ class AIEGEMM(AIEOperatorBase):
                     A_part = A_padded[M_lo : M_lo + self.M, :, :]
                 result_part = self._execute_batched_aie_operation(A_part, B_padded)
                 max_M = min(M_lo + self.M, M)
-                result_padded[M_lo:max_M, :, :] = result_part[:max_M, :, :]
-            result = numpy_to_torch(result_padded[:M, :N, :])
+                result_padded[M_lo:max_M, :, :N] = result_part[:max_M, :, :N]
+            result = numpy_to_torch(result_padded[:M, :, :N])
 
         return result.view(expected_output_shape)
 
@@ -468,12 +525,12 @@ class AIEGEMM(AIEOperatorBase):
             A_padded[:, :M, :K] = A_np
             return A_padded
 
-        M, K = A_np.shape[:-1]
+        M, K = self._get_gemm_shapes(A_np.shape, self.batch_A)
         if M % self.M == 0 and K == self.K:
             return A_np
         M_multiple = ((M + self.M - 1) // self.M) * self.M
-        A_padded = np.zeros((M_multiple, self.K, batch_size), dtype=A_np.dtype)
-        A_padded[:M, :K, :] = A_np
+        A_padded = np.zeros((M_multiple, batch_size, self.K), dtype=A_np.dtype)
+        A_padded[:M, :, :K] = A_np
         return A_padded
 
     def _pad_B(self, B_np):
@@ -502,11 +559,11 @@ class AIEGEMM(AIEOperatorBase):
             B_padded[:, :K, :N] = B_np
             return B_padded
 
-        K, N = B_np.shape[:-1]
+        K, N = self._get_gemm_shapes(B_np.shape, self.batch_B)
         if K == self.K and N == self.N:
             return B_np
-        B_padded = np.zeros((self.K, self.N, batch_size), dtype=B_np.dtype)
-        B_padded[:, :K, :N] = B_np
+        B_padded = np.zeros((self.K, batch_size, self.N), dtype=B_np.dtype)
+        B_padded[:K, :, :N] = B_np
         return B_padded
 
     def _partition_B(self, B_np):
@@ -561,4 +618,4 @@ class AIEGEMM(AIEOperatorBase):
 
         if self.batch_C[1] == 0:
             return self.read_buffer("C", shape=(self.batch_C[0], M, N), dtype=bfloat16)
-        return self.read_buffer("C", shape=(M, N, self.batch_C[0]), dtype=bfloat16)
+        return self.read_buffer("C", shape=(M, self.batch_C[0], N), dtype=bfloat16)
