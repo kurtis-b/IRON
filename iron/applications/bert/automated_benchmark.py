@@ -14,6 +14,7 @@ from pathlib import Path
 from benchmark_common import (
     DEFAULT_BENCHMARK_SEQ_LENS,
     DEFAULT_BENCHMARK_MODE,
+    SUPPORTED_NPU_EXECUTION_MODES,
     add_benchmark_mode_args,
     add_cooldown_args,
     benchmark_mode_case_suffix,
@@ -22,6 +23,7 @@ from benchmark_common import (
     detect_logical_thread_count,
     detect_max_physical_core_count,
     detect_physical_core_count,
+    parse_npu_execution_modes,
     parse_seq_lens,
     validate_benchmark_mode_request,
 )
@@ -48,6 +50,7 @@ SCRIPT_DIR = Path(__file__).parent
 DEFAULT_RUNS_PER_SAMPLE_OVERRIDES = "2048=50,4096=15,8192=5"
 DEFAULT_NPU_AUTOTUNE_RUNS_OVERRIDES = "2048=3,4096=2,8192=1"
 TRANSIENT_NPU_STARTUP_RETRY_DELAYS_SEC = (15.0, 30.0, 60.0, 120.0)
+TRANSIENT_OPERATOR_RUNLIST_RETRY_DELAYS_SEC = (5.0, 15.0)
 SUITE_FIELDNAMES = [
     "case_id",
     "study_id",
@@ -80,6 +83,13 @@ SUITE_FIELDNAMES = [
     "avg_embedding_latency_ms",
     "avg_qkv_projection_latency_ms",
     "avg_encoder_pipeline_latency_ms",
+    "avg_operator_runlist_latency_ms",
+    "avg_host_preprocess_latency_ms",
+    "avg_npu_gemm_latency_ms",
+    "avg_host_postprocess_latency_ms",
+    "avg_device_sync_latency_ms",
+    "npu_dispatch_count",
+    "npu_unique_instruction_binary_count",
     "min_latency_ms",
     "avg_latency_ms",
     "max_latency_ms",
@@ -228,6 +238,15 @@ def parse_args():
     )
     parser.add_argument("--npu-autotune-warmup-runs", type=int, default=2)
     parser.add_argument("--npu-autotune-runs", type=int, default=5)
+    parser.add_argument(
+        "--npu-execution-modes",
+        type=str,
+        default="encoder_pipeline",
+        help=(
+            "Comma-separated NPU execution modes to run. Supported: "
+            + ",".join(SUPPORTED_NPU_EXECUTION_MODES)
+        ),
+    )
     parser.add_argument(
         "--npu-autotune-runs-overrides",
         type=str,
@@ -549,6 +568,10 @@ def enumerate_cases(args):
     npu_threads = args.npu_num_threads or detect_max_physical_core_count()
     igpu_threads = args.igpu_num_threads or detect_physical_core_count()
     benchmark_mode = getattr(args, "benchmark_mode", DEFAULT_BENCHMARK_MODE)
+    npu_execution_modes = parse_npu_execution_modes(
+        getattr(args, "npu_execution_modes", "encoder_pipeline")
+    )
+    include_npu_execution_suffix = len(npu_execution_modes) > 1
     case_mode_suffix = benchmark_mode_case_suffix(benchmark_mode)
     bias_case_suffix = "_nobias" if getattr(args, "disable_all_biases", False) else ""
 
@@ -595,28 +618,39 @@ def enumerate_cases(args):
                     )
                 )
             else:
-                for seq_len in seq_lens:
-                    skip_reason = npu_case_skip_reason(args, target, seq_len)
-                    if skip_reason is not None:
-                        skipped.append(
-                            (
-                                target["study_id"] or "<explicit-path-model>",
-                                "npu",
-                                skip_reason,
-                            )
-                        )
-                        continue
-                    cases.append(
-                        {
-                            "case_id": f"{study_prefix}npu{case_mode_suffix}_seq{seq_len}",
-                            "study_id": target["study_id"],
-                            "mode": "npu",
-                            "benchmark_mode": benchmark_mode,
-                            "seq_len": seq_len,
-                            "num_threads": npu_threads,
-                            **target,
-                        }
+                for execution_mode in npu_execution_modes:
+                    execution_suffix = (
+                        f"_{execution_mode}"
+                        if include_npu_execution_suffix
+                        or execution_mode != default_execution_mode_for_backend("npu")
+                        else ""
                     )
+                    for seq_len in seq_lens:
+                        skip_reason = npu_case_skip_reason(args, target, seq_len)
+                        if skip_reason is not None:
+                            skipped.append(
+                                (
+                                    target["study_id"] or "<explicit-path-model>",
+                                    "npu",
+                                    skip_reason,
+                                )
+                            )
+                            continue
+                        cases.append(
+                            {
+                                "case_id": (
+                                    f"{study_prefix}npu{execution_suffix}"
+                                    f"{case_mode_suffix}_seq{seq_len}"
+                                ),
+                                "study_id": target["study_id"],
+                                "mode": "npu",
+                                "benchmark_mode": benchmark_mode,
+                                "execution_mode": execution_mode,
+                                "seq_len": seq_len,
+                                "num_threads": npu_threads,
+                                **target,
+                            }
+                        )
 
     if not cases:
         raise ValueError("No benchmark cases were generated for the requested inputs")
@@ -735,8 +769,41 @@ def is_transient_npu_startup_failure(case, result):
     return "pyxrt.device(0)" in combined_output or "mmap(" in combined_output
 
 
-def clear_case_artifacts(benchmark_csv_path, power_log_path, idle_log_path):
-    for path in (benchmark_csv_path, power_log_path, idle_log_path):
+def is_transient_operator_runlist_failure(
+    case,
+    result,
+    benchmark_csv_path,
+    child_stdout,
+    child_stderr,
+):
+    if case.get("execution_mode") != "operator_runlist":
+        return False
+    if result.returncode == 0:
+        return False
+    if Path(benchmark_csv_path).exists():
+        return False
+    combined_output = "\n".join(
+        part for part in (child_stdout, child_stderr) if part
+    ).strip()
+    if not combined_output:
+        return True
+    if "Results written to" in combined_output:
+        return False
+    return "Starting NPU benchmark:" in combined_output
+
+
+def clear_case_artifacts(
+    benchmark_csv_path,
+    power_log_path,
+    idle_log_path,
+    process_log_path=None,
+):
+    for path in (
+        benchmark_csv_path,
+        power_log_path,
+        idle_log_path,
+        process_log_path,
+    ):
         if path is None:
             continue
         Path(path).unlink(missing_ok=True)
@@ -836,6 +903,21 @@ def build_suite_row(
         ),
         "avg_encoder_pipeline_latency_ms": child_row.get(
             "avg_encoder_pipeline_latency_ms", ""
+        ),
+        "avg_operator_runlist_latency_ms": child_row.get(
+            "avg_operator_runlist_latency_ms", ""
+        ),
+        "avg_host_preprocess_latency_ms": child_row.get(
+            "avg_host_preprocess_latency_ms", ""
+        ),
+        "avg_npu_gemm_latency_ms": child_row.get("avg_npu_gemm_latency_ms", ""),
+        "avg_host_postprocess_latency_ms": child_row.get(
+            "avg_host_postprocess_latency_ms", ""
+        ),
+        "avg_device_sync_latency_ms": child_row.get("avg_device_sync_latency_ms", ""),
+        "npu_dispatch_count": child_row.get("npu_dispatch_count", ""),
+        "npu_unique_instruction_binary_count": child_row.get(
+            "npu_unique_instruction_binary_count", ""
         ),
         "min_latency_ms": child_row["min_latency_ms"],
         "avg_latency_ms": child_row["avg_latency_ms"],
@@ -937,11 +1019,14 @@ def case_command(
 ):
     runs_per_sample = resolve_runs_per_sample(args, case["seq_len"])
     npu_autotune_runs = resolve_npu_autotune_runs(args, case["seq_len"])
-    script_name = {
-        "cpu": "cpu_inference.py",
-        "npu": "npu_inference.py",
-        "igpu": "igpu_inference.py",
-    }[case["mode"]]
+    if case["mode"] == "npu" and case.get("execution_mode") == "operator_runlist":
+        script_name = "npu_inference_import_main.py"
+    else:
+        script_name = {
+            "cpu": "cpu_inference.py",
+            "npu": "npu_inference.py",
+            "igpu": "igpu_inference.py",
+        }[case["mode"]]
     base = [
         sys.executable,
         str(SCRIPT_DIR / script_name),
@@ -979,6 +1064,8 @@ def case_command(
     if case["mode"] == "npu":
         base.extend(
             [
+                "--execution-mode",
+                case.get("execution_mode", default_execution_mode_for_backend("npu")),
                 "--topology-policy",
                 args.npu_topology_policy,
                 "--topology-cache",
@@ -991,6 +1078,8 @@ def case_command(
         )
         if args.npu_candidate_topologies:
             base.extend(["--candidate-topologies", args.npu_candidate_topologies])
+        if case.get("execution_mode") == "operator_runlist":
+            base.append("--disable-all-biases")
     if case["mode"] == "igpu":
         base.extend(
             [
@@ -1030,6 +1119,7 @@ def run_case(
         if requested_power_backend != "none"
         else None
     )
+    process_log_path = logs_dir / f"{case['case_id']}_process.log"
     idle_log_path = (
         logs_dir / f"{case['case_id']}_idle_power.log"
         if needs_idle_baseline(case)
@@ -1051,7 +1141,12 @@ def run_case(
         len(TRANSIENT_NPU_STARTUP_RETRY_DELAYS_SEC) + 1 if case["mode"] == "npu" else 1
     )
     for attempt_index in range(max_attempts):
-        clear_case_artifacts(benchmark_csv_path, power_log_path, idle_log_path)
+        clear_case_artifacts(
+            benchmark_csv_path,
+            power_log_path,
+            idle_log_path,
+            process_log_path,
+        )
         idle_stats = empty_power_stats(
             sample_count_key="idle_power_sample_count",
             window_key="idle_power_window_sec",
@@ -1068,6 +1163,15 @@ def run_case(
             capture_output=True,
             check=False,
         )
+        child_stdout = result.stdout
+        child_stderr = result.stderr
+        if case.get("execution_mode") == "operator_runlist":
+            combined_output = child_stdout
+            if child_stderr:
+                if combined_output and not combined_output.endswith("\n"):
+                    combined_output += "\n"
+                combined_output += child_stderr
+            process_log_path.write_text(combined_output, encoding="utf-8")
         if result.returncode == 0:
             child_row = parse_child_row(benchmark_csv_path)
             child_row["benchmark_csv"] = str(benchmark_csv_path)
@@ -1106,6 +1210,27 @@ def run_case(
             time.sleep(retry_delay_sec)
             continue
 
+        if attempt_index < len(
+            TRANSIENT_OPERATOR_RUNLIST_RETRY_DELAYS_SEC
+        ) and is_transient_operator_runlist_failure(
+            case,
+            result,
+            benchmark_csv_path,
+            child_stdout,
+            child_stderr,
+        ):
+            retry_delay_sec = TRANSIENT_OPERATOR_RUNLIST_RETRY_DELAYS_SEC[attempt_index]
+            print(
+                (
+                    f"Transient operator_runlist child failure for {case['case_id']} "
+                    f"on attempt {attempt_index + 1}/{max_attempts}; "
+                    f"retrying in {retry_delay_sec:.1f} sec"
+                ),
+                flush=True,
+            )
+            time.sleep(retry_delay_sec)
+            continue
+
         failure_label = (
             "Power-logged benchmark failed"
             if power_backend != "none"
@@ -1113,7 +1238,7 @@ def run_case(
         )
         raise RuntimeError(
             f"{failure_label} for {case['case_id']}\n"
-            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+            f"STDOUT:\n{child_stdout}\nSTDERR:\n{child_stderr}"
         )
 
     raise RuntimeError(
@@ -1159,10 +1284,11 @@ def main():
         completed.add(case["case_id"])
         state["completed_case_ids"] = sorted(completed)
         save_state(args.state_json, state)
+        topology_display = suite_row["topology_id"] or "-"
         print(
             f"Completed case {case['case_id']}: study_id={suite_row['study_id'] or '<explicit-path-model>'} "
             f"avg_latency_ms={suite_row['avg_latency_ms']} "
-            f"topology={suite_row['topology_id'] or 'cpu'}",
+            f"topology={topology_display}",
             flush=True,
         )
 

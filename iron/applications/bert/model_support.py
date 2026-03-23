@@ -237,6 +237,18 @@ def zero_all_model_biases(model):
     return zeroed_bias_names
 
 
+def zero_bias_tensors_in_state_dict(state_dict):
+    zeroed_bias_names = []
+    for name, value in state_dict.items():
+        if not name.endswith(".bias"):
+            continue
+        if value is None:
+            continue
+        value.zero_()
+        zeroed_bias_names.append(name)
+    return zeroed_bias_names
+
+
 def extend_or_trim_position_embeddings(state_dict, seq_len):
     key = "embeddings.position_embeddings.weight"
     if key not in state_dict:

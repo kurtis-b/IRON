@@ -60,6 +60,13 @@ CSV_FIELDNAMES = [
     "avg_embedding_latency_ms",
     "avg_qkv_projection_latency_ms",
     "avg_encoder_pipeline_latency_ms",
+    "avg_operator_runlist_latency_ms",
+    "avg_host_preprocess_latency_ms",
+    "avg_npu_gemm_latency_ms",
+    "avg_host_postprocess_latency_ms",
+    "avg_device_sync_latency_ms",
+    "npu_dispatch_count",
+    "npu_unique_instruction_binary_count",
     "min_latency_ms",
     "avg_latency_ms",
     "max_latency_ms",
@@ -68,6 +75,11 @@ CSV_FIELDNAMES = [
 DEFAULT_BENCHMARK_SEQ_LENS = "64,128,256,512,1024,2048,4096,8192"
 DEFAULT_BENCHMARK_MODE = "synthetic_dense"
 SUPPORTED_BENCHMARK_MODES = ("synthetic_dense", "model_valid", "task_eval")
+SUPPORTED_NPU_EXECUTION_MODES = (
+    "encoder_pipeline",
+    "gemm_only",
+    "operator_runlist",
+)
 MODEL_VALID_MAX_SEQ_LEN = 512
 
 
@@ -252,6 +264,24 @@ def default_execution_mode_for_backend(backend_mode):
         "igpu": "host_hf",
         "npu": "encoder_pipeline",
     }[backend_mode]
+
+
+def parse_npu_execution_modes(raw_modes):
+    parsed = []
+    for token in str(raw_modes or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token not in SUPPORTED_NPU_EXECUTION_MODES:
+            raise ValueError(
+                f"Unsupported NPU execution mode {token!r}. "
+                f"Supported: {SUPPORTED_NPU_EXECUTION_MODES}"
+            )
+        if token not in parsed:
+            parsed.append(token)
+    if not parsed:
+        raise ValueError("At least one NPU execution mode must be selected")
+    return parsed
 
 
 def validate_benchmark_mode_request(benchmark_mode, *, backend_mode, seq_lens):
@@ -519,6 +549,21 @@ def encode_benchmark_texts(texts, seq_len, vocab_size, pad_token_id=0):
     return encoded_samples
 
 
+def encode_arange_benchmark_texts(texts, seq_len, vocab_size):
+    import torch
+
+    token_ids = torch.arange(seq_len, dtype=torch.long) % max(1, vocab_size)
+    input_ids = token_ids.unsqueeze(0)
+    token_type_ids = torch.zeros_like(input_ids)
+    return [
+        {
+            "input_ids": input_ids.clone(),
+            "token_type_ids": token_type_ids.clone(),
+        }
+        for _ in texts
+    ]
+
+
 def _tensorize_tokenizer_field(values):
     import torch
 
@@ -596,6 +641,7 @@ def encode_model_valid_texts(texts, seq_len, tokenizer):
 def prepare_benchmark_samples(
     *,
     benchmark_mode,
+    execution_mode=None,
     texts,
     seq_len,
     vocab_size,
@@ -604,6 +650,12 @@ def prepare_benchmark_samples(
     config_file_path,
 ):
     if benchmark_mode == "synthetic_dense":
+        if execution_mode == "operator_runlist":
+            return encode_arange_benchmark_texts(
+                texts=texts,
+                seq_len=seq_len,
+                vocab_size=vocab_size,
+            )
         return encode_benchmark_texts(
             texts=texts,
             seq_len=seq_len,

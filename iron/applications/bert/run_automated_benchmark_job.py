@@ -30,6 +30,7 @@ OPTION_MAP = {
     "npu_topology_policy": "--npu-topology-policy",
     "npu_topology_cache": "--npu-topology-cache",
     "npu_candidate_topologies": "--npu-candidate-topologies",
+    "npu_execution_modes": "--npu-execution-modes",
     "npu_autotune_warmup_runs": "--npu-autotune-warmup-runs",
     "npu_autotune_runs": "--npu-autotune-runs",
     "npu_autotune_runs_overrides": "--npu-autotune-runs-overrides",

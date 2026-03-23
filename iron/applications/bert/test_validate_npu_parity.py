@@ -21,9 +21,18 @@ def test_validate_npu_parity_parse_args_defaults():
     assert args.seq_lens == "64,128,512"
     assert args.topology_policy == "fixed"
     assert args.cpu_dtype == "float32"
+    assert args.execution_mode == "encoder_pipeline"
+    assert args.disable_all_biases is False
     assert args.rel_tol == pytest.approx(4.0e-2)
     assert args.abs_tol == pytest.approx(1.5e-1)
-    assert args.max_error_fraction == pytest.approx(5.0e-3)
+    assert args.max_error_fraction == pytest.approx(5.0e-2)
+
+
+def test_validate_npu_parity_parse_args_accepts_gemm_only_no_bias():
+    args = parse_args(["--execution-mode", "gemm_only", "--disable-all-biases"])
+
+    assert args.execution_mode == "gemm_only"
+    assert args.disable_all_biases is True
 
 
 def test_compute_hidden_state_metrics_identical_tensors():

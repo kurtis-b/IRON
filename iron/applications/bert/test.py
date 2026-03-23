@@ -38,6 +38,7 @@ from benchmark_common import (
     acceptable_cooldown_temp,
     cooldown_before_benchmark,
     encode_model_valid_texts,
+    parse_npu_execution_modes,
     parse_seq_lens,
     validate_benchmark_mode_request,
 )
@@ -52,6 +53,7 @@ from model_support import (
     canonicalize_app_config_dict,
     canonicalize_local_backbone_weights,
     estimate_encoder_forward_flops,
+    zero_bias_tensors_in_state_dict,
     zero_all_model_biases,
 )
 from npu_inference import (
@@ -350,6 +352,40 @@ def test_npu_parse_args_defaults_benchmark_mode_to_synthetic_dense(monkeypatch):
     args = npu_inference.parse_args()
 
     assert args.benchmark_mode == DEFAULT_BENCHMARK_MODE
+    assert args.execution_mode == "encoder_pipeline"
+    assert args.disable_all_biases is False
+
+
+def test_npu_parse_args_accepts_gemm_only_execution_mode(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["npu_inference.py", "--execution-mode", "gemm_only"],
+    )
+
+    args = npu_inference.parse_args()
+
+    assert args.execution_mode == "gemm_only"
+
+
+def test_npu_parse_args_accepts_operator_runlist_execution_mode(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["npu_inference.py", "--execution-mode", "operator_runlist"],
+    )
+
+    args = npu_inference.parse_args()
+
+    assert args.execution_mode == "operator_runlist"
+
+
+def test_npu_parse_args_accepts_disable_all_biases(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["npu_inference.py", "--disable-all-biases"])
+
+    args = npu_inference.parse_args()
+
+    assert args.disable_all_biases is True
 
 
 def test_igpu_parse_args_preserves_explicit_float16_override(monkeypatch):
@@ -395,6 +431,35 @@ def test_zero_all_model_biases_zeroes_linear_and_layernorm_biases_only():
     assert torch.equal(model[1].weight, original_ln_weight)
 
 
+def test_zero_bias_tensors_in_state_dict_zeroes_bias_entries_only():
+    state_dict = {
+        "encoder.layer.0.attention.self.query.bias": torch.tensor([1.0, -2.0]),
+        "encoder.layer.0.attention.self.query.weight": torch.tensor([[3.0, 4.0]]),
+        "encoder.layer.0.output.LayerNorm.bias": torch.tensor([5.0, 6.0]),
+    }
+
+    zeroed = zero_bias_tensors_in_state_dict(state_dict)
+
+    assert sorted(zeroed) == [
+        "encoder.layer.0.attention.self.query.bias",
+        "encoder.layer.0.output.LayerNorm.bias",
+    ]
+    assert (
+        torch.count_nonzero(
+            state_dict["encoder.layer.0.attention.self.query.bias"]
+        ).item()
+        == 0
+    )
+    assert (
+        torch.count_nonzero(state_dict["encoder.layer.0.output.LayerNorm.bias"]).item()
+        == 0
+    )
+    assert torch.equal(
+        state_dict["encoder.layer.0.attention.self.query.weight"],
+        torch.tensor([[3.0, 4.0]]),
+    )
+
+
 def test_validate_benchmark_mode_request_rejects_npu_model_valid():
     with pytest.raises(ValueError, match="attention_mask=None"):
         validate_benchmark_mode_request(
@@ -402,6 +467,14 @@ def test_validate_benchmark_mode_request_rejects_npu_model_valid():
             backend_mode="npu",
             seq_lens=[64],
         )
+
+
+def test_parse_npu_execution_modes_accepts_multiple_modes():
+    assert parse_npu_execution_modes("encoder_pipeline,gemm_only,operator_runlist") == [
+        "encoder_pipeline",
+        "gemm_only",
+        "operator_runlist",
+    ]
 
 
 def test_validate_benchmark_mode_request_rejects_model_valid_seq_len_above_512():
@@ -438,6 +511,23 @@ def test_encode_model_valid_texts_fills_missing_token_type_ids():
     assert samples[0]["input_ids"].tolist() == [[101, 2003, 102, 0]]
     assert samples[0]["attention_mask"].tolist() == [[1, 1, 1, 0]]
     assert samples[0]["token_type_ids"].tolist() == [[0, 0, 0, 0]]
+
+
+def test_prepare_benchmark_samples_uses_arange_inputs_for_operator_runlist():
+    samples = benchmark_common.prepare_benchmark_samples(
+        benchmark_mode="synthetic_dense",
+        execution_mode="operator_runlist",
+        texts=["sample"],
+        seq_len=8,
+        vocab_size=32,
+        pad_token_id=0,
+        weights_file_path="weights",
+        config_file_path="config",
+    )
+
+    assert len(samples) == 1
+    assert samples[0]["input_ids"].tolist() == [[0, 1, 2, 3, 4, 5, 6, 7]]
+    assert samples[0]["token_type_ids"].tolist() == [[0, 0, 0, 0, 0, 0, 0, 0]]
 
 
 def test_job_wrapper_print_command_reflects_bfloat16_igpu_dtype(tmp_path):
@@ -484,6 +574,31 @@ def test_job_wrapper_build_command_emits_disable_all_biases_as_bare_flag(tmp_pat
 
     assert "--disable-all-biases" in command
     assert "True" not in command
+
+
+def test_job_wrapper_build_command_includes_npu_execution_modes(tmp_path):
+    job_config = tmp_path / "benchmark_job.json"
+    job_config.write_text(
+        (
+            "{\n"
+            '  "study_id": "bert-base-uncased",\n'
+            '  "modes": "npu",\n'
+            '  "seq_lens": "64",\n'
+            '  "npu_execution_modes": "encoder_pipeline,gemm_only,operator_runlist",\n'
+            '  "power_backend": "none"\n'
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    command = run_automated_benchmark_job.build_command(
+        str(job_config), run_automated_benchmark_job.load_job_config(str(job_config))
+    )
+
+    assert "--npu-execution-modes" in command
+    assert command[command.index("--npu-execution-modes") + 1] == (
+        "encoder_pipeline,gemm_only,operator_runlist"
+    )
 
 
 def test_bert_automated_benchmark_job_wrapper_study_id_smoke(tmp_path):
@@ -1334,6 +1449,272 @@ def test_resolve_power_backend_uses_mode_specific_defaults():
     assert resolve_power_backend("auto", "igpu") == "rocm-smi"
 
 
+def test_run_case_operator_runlist_uses_pipe_capture_and_writes_process_log(
+    tmp_path, monkeypatch
+):
+    child_csv = tmp_path / "logs" / "toy_npu_operator_runlist_seq64.csv"
+    process_log = tmp_path / "logs" / "toy_npu_operator_runlist_seq64_process.log"
+    subprocess_calls = []
+
+    monkeypatch.setattr(
+        automated_benchmark,
+        "case_command",
+        lambda *args, **kwargs: [
+            "python3",
+            "npu_inference_import_main.py",
+            "--execution-mode",
+            "operator_runlist",
+        ],
+    )
+    monkeypatch.setattr(
+        automated_benchmark,
+        "resolve_power_backend",
+        lambda requested_backend, mode: "none",
+    )
+
+    def fake_subprocess_run(command, cwd, text, capture_output, check):
+        subprocess_calls.append(
+            {
+                "command": command,
+                "capture_output": capture_output,
+                "check": check,
+            }
+        )
+        child_csv.parent.mkdir(parents=True, exist_ok=True)
+        child_csv.write_text("case_id,avg_latency_ms\n", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="operator stdout\n",
+            stderr="operator stderr\n",
+        )
+
+    monkeypatch.setattr(automated_benchmark.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(
+        automated_benchmark,
+        "parse_child_row",
+        lambda path: {
+            "study_id": "bert-base-uncased",
+            "seq_len": "64",
+            "num_threads": "12",
+            "dtype": "bfloat16",
+            "num_samples": "1",
+            "runs_per_sample": "1",
+            "warmup_runs": "0",
+            "measured_inference_count": "1",
+            "timed_total_sec": "0.100000",
+            "throughput_inferences_per_sec": "10.000000",
+            "model_type": "bert",
+            "shape": "(1, 64, 768)",
+            "estimated_flops_per_inference": "1.000000e+09",
+            "throughput_flops_per_sec": "1.000000e+10",
+            "topology_id": "",
+            "parallel_seq": "",
+            "parallel_heads": "",
+            "parallel_ffn": "",
+            "min_latency_ms": "100.000000",
+            "avg_latency_ms": "100.000000",
+            "max_latency_ms": "100.000000",
+            "power_backend": "none",
+            "power_sample_count": "",
+            "power_window_sec": "",
+            "avg_pkg_watt": "",
+            "max_pkg_watt": "",
+            "avg_cor_watt": "",
+            "max_cor_watt": "",
+            "avg_gfx_watt": "",
+            "max_gfx_watt": "",
+            "avg_ram_watt": "",
+            "max_ram_watt": "",
+            "power_log": "",
+        },
+    )
+    monkeypatch.setattr(
+        automated_benchmark,
+        "build_suite_row",
+        lambda child_row, case, cooldown_stats, power_backend, idle_stats, idle_log_path: {
+            "case_id": case["case_id"],
+            "avg_latency_ms": child_row["avg_latency_ms"],
+        },
+    )
+
+    args = SimpleNamespace(
+        power_backend="none",
+        power_interval_sec=0.5,
+        npu_idle_baseline_sec=5.0,
+    )
+    case = {
+        "case_id": "toy_npu_operator_runlist_seq64",
+        "mode": "npu",
+        "execution_mode": "operator_runlist",
+        "seq_len": 64,
+        "num_threads": 12,
+        "study_id": "bert-base-uncased",
+    }
+    cooldown_stats = {
+        "cooldown_wait_sec": 0.0,
+        "cooldown_start_temp_c": None,
+        "cooldown_end_temp_c": None,
+        "cooldown_temp_source": "",
+    }
+
+    suite_row = run_case(args, case, tmp_path / "logs", cooldown_stats)
+
+    assert suite_row["case_id"] == "toy_npu_operator_runlist_seq64"
+    assert subprocess_calls == [
+        {
+            "command": [
+                "python3",
+                "npu_inference_import_main.py",
+                "--execution-mode",
+                "operator_runlist",
+            ],
+            "capture_output": True,
+            "check": False,
+        }
+    ]
+    assert (
+        process_log.read_text(encoding="utf-8") == "operator stdout\noperator stderr\n"
+    )
+
+
+def test_run_case_retries_transient_operator_runlist_failure(tmp_path, monkeypatch):
+    child_csv = tmp_path / "logs" / "toy_npu_operator_runlist_seq64.csv"
+    sleep_calls = []
+    subprocess_calls = []
+    results = iter(
+        [
+            subprocess.CompletedProcess(
+                args=["python3", "npu_inference_import_main.py"],
+                returncode=1,
+                stdout=(
+                    "Using host CPU threads: 12\n"
+                    "Benchmarking local BertModel(add_pooling_layer=False) encoder "
+                    "with execution mode operator_runlist\n"
+                    "Starting NPU benchmark: seq_len=64\n"
+                ),
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                args=["python3", "npu_inference_import_main.py"],
+                returncode=0,
+                stdout="operator stdout\n",
+                stderr="",
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(
+        automated_benchmark,
+        "case_command",
+        lambda *args, **kwargs: [
+            "python3",
+            "npu_inference_import_main.py",
+            "--execution-mode",
+            "operator_runlist",
+        ],
+    )
+    monkeypatch.setattr(
+        automated_benchmark,
+        "resolve_power_backend",
+        lambda requested_backend, mode: "none",
+    )
+    monkeypatch.setattr(
+        automated_benchmark.time,
+        "sleep",
+        lambda seconds: sleep_calls.append(seconds),
+    )
+
+    def fake_subprocess_run(command, cwd, text, capture_output, check):
+        subprocess_calls.append(
+            {
+                "command": command,
+                "capture_output": capture_output,
+                "check": check,
+            }
+        )
+        result = next(results)
+        if result.returncode == 0:
+            child_csv.parent.mkdir(parents=True, exist_ok=True)
+            child_csv.write_text("case_id,avg_latency_ms\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(automated_benchmark.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(
+        automated_benchmark,
+        "parse_child_row",
+        lambda path: {
+            "study_id": "bert-base-uncased",
+            "seq_len": "64",
+            "num_threads": "12",
+            "dtype": "bfloat16",
+            "num_samples": "1",
+            "runs_per_sample": "1",
+            "warmup_runs": "0",
+            "measured_inference_count": "1",
+            "timed_total_sec": "0.100000",
+            "throughput_inferences_per_sec": "10.000000",
+            "model_type": "bert",
+            "shape": "(1, 64, 768)",
+            "estimated_flops_per_inference": "1.000000e+09",
+            "throughput_flops_per_sec": "1.000000e+10",
+            "topology_id": "",
+            "parallel_seq": "",
+            "parallel_heads": "",
+            "parallel_ffn": "",
+            "min_latency_ms": "100.000000",
+            "avg_latency_ms": "100.000000",
+            "max_latency_ms": "100.000000",
+            "power_backend": "none",
+            "power_sample_count": "",
+            "power_window_sec": "",
+            "avg_pkg_watt": "",
+            "max_pkg_watt": "",
+            "avg_cor_watt": "",
+            "max_cor_watt": "",
+            "avg_gfx_watt": "",
+            "max_gfx_watt": "",
+            "avg_ram_watt": "",
+            "max_ram_watt": "",
+            "power_log": "",
+        },
+    )
+    monkeypatch.setattr(
+        automated_benchmark,
+        "build_suite_row",
+        lambda child_row, case, cooldown_stats, power_backend, idle_stats, idle_log_path: {
+            "case_id": case["case_id"],
+            "avg_latency_ms": child_row["avg_latency_ms"],
+        },
+    )
+
+    args = SimpleNamespace(
+        power_backend="none",
+        power_interval_sec=0.5,
+        npu_idle_baseline_sec=5.0,
+    )
+    case = {
+        "case_id": "toy_npu_operator_runlist_seq64",
+        "mode": "npu",
+        "execution_mode": "operator_runlist",
+        "seq_len": 64,
+        "num_threads": 12,
+        "study_id": "bert-base-uncased",
+    }
+    cooldown_stats = {
+        "cooldown_wait_sec": 0.0,
+        "cooldown_start_temp_c": None,
+        "cooldown_end_temp_c": None,
+        "cooldown_temp_source": "",
+    }
+
+    suite_row = run_case(args, case, tmp_path / "logs", cooldown_stats)
+
+    assert suite_row["case_id"] == "toy_npu_operator_runlist_seq64"
+    assert len(subprocess_calls) == 2
+    assert sleep_calls == [5.0]
+
+
 @pytest.mark.parametrize("invalid_backend", ["rocm-smi", "powercap-rapl", "turbostat"])
 def test_resolve_power_backend_rejects_explicit_tool_selection(invalid_backend):
     with pytest.raises(ValueError, match="Unsupported power_backend"):
@@ -1441,6 +1822,13 @@ def test_build_suite_row_uses_pkg_power_for_npu_energy():
         "avg_embedding_latency_ms": "1.500000",
         "avg_qkv_projection_latency_ms": "2.500000",
         "avg_encoder_pipeline_latency_ms": "12.500000",
+        "avg_operator_runlist_latency_ms": "",
+        "avg_host_preprocess_latency_ms": "",
+        "avg_npu_gemm_latency_ms": "",
+        "avg_host_postprocess_latency_ms": "",
+        "avg_device_sync_latency_ms": "",
+        "npu_dispatch_count": "",
+        "npu_unique_instruction_binary_count": "",
         "min_latency_ms": "20.000000",
         "avg_latency_ms": "20.000000",
         "max_latency_ms": "20.000000",
@@ -1496,6 +1884,8 @@ def test_build_suite_row_uses_pkg_power_for_npu_energy():
     assert suite_row["avg_embedding_latency_ms"] == "1.500000"
     assert suite_row["avg_qkv_projection_latency_ms"] == "2.500000"
     assert suite_row["avg_encoder_pipeline_latency_ms"] == "12.500000"
+    assert suite_row["avg_operator_runlist_latency_ms"] == ""
+    assert suite_row["avg_npu_gemm_latency_ms"] == ""
     assert suite_row["benchmark_mode"] == DEFAULT_BENCHMARK_MODE
     assert suite_row["execution_mode"] == "encoder_pipeline"
 
@@ -1507,7 +1897,10 @@ def test_npu_benchmark_with_config_reports_stage_latency_breakdown(monkeypatch):
 
     class FakeContext:
         def __init__(self):
-            self.device_manager = SimpleNamespace(reset=lambda: None)
+            self.reset_runtime_calls = 0
+
+        def reset_runtime(self):
+            self.reset_runtime_calls += 1
 
     class FakeModel:
         def __init__(self):
@@ -1533,13 +1926,14 @@ def test_npu_benchmark_with_config_reports_stage_latency_breakdown(monkeypatch):
             )
 
     fake_model = FakeModel()
+    fake_context = FakeContext()
 
     monkeypatch.setattr(
         npu_inference,
         "build_npu_encoder_model",
-        lambda weights_file_path, config, seq_len: (
+        lambda weights_file_path, config, seq_len, execution_mode="encoder_pipeline", disable_all_biases=False: (
             fake_model,
-            FakeContext(),
+            fake_context,
             7.5,
         ),
     )
@@ -1598,6 +1992,7 @@ def test_npu_benchmark_with_config_reports_stage_latency_breakdown(monkeypatch):
         warmup_runs=1,
         runs_per_sample=2,
         benchmark_mode="synthetic_dense",
+        execution_mode="encoder_pipeline",
         topology=topology,
         power_backend="none",
         power_interval_sec=0.5,
@@ -1615,7 +2010,685 @@ def test_npu_benchmark_with_config_reports_stage_latency_breakdown(monkeypatch):
     assert result["avg_embedding_latency_ms"] == pytest.approx(1.0)
     assert result["avg_qkv_projection_latency_ms"] == pytest.approx(2.0)
     assert result["avg_encoder_pipeline_latency_ms"] == pytest.approx(3.0)
+    assert result["avg_operator_runlist_latency_ms"] == ""
+    assert result["avg_host_preprocess_latency_ms"] == ""
+    assert result["avg_npu_gemm_latency_ms"] == ""
+    assert result["avg_host_postprocess_latency_ms"] == ""
+    assert result["npu_dispatch_count"] == ""
     assert result["avg_latency_ms"] == pytest.approx(10.0)
+    assert fake_context.reset_runtime_calls == 1
+
+
+def test_npu_benchmark_with_config_reports_gemm_only_breakdown(monkeypatch):
+    class FakeContext:
+        def __init__(self):
+            self.reset_runtime_calls = 0
+
+        def reset_runtime(self):
+            self.reset_runtime_calls += 1
+
+    class FakeModel:
+        def __init__(self):
+            self.dtype = torch.bfloat16
+
+        def __call__(self, input_ids, token_type_ids=None, attention_mask=None):
+            return torch.zeros((1, input_ids.shape[1], 8), dtype=torch.bfloat16)
+
+        def forward_with_stage_timings(
+            self, input_ids, token_type_ids=None, attention_mask=None
+        ):
+            return (
+                torch.zeros((1, input_ids.shape[1], 8), dtype=torch.bfloat16),
+                {
+                    "embedding_sec": 0.001,
+                    "qkv_projection_sec": 0.002,
+                    "host_preprocess_sec": 0.0005,
+                    "npu_gemm_sec": 0.006,
+                    "host_postprocess_sec": 0.0015,
+                    "device_sync_sec": 0.00025,
+                    "npu_dispatch_count": 28,
+                    "npu_unique_instruction_binary_count": 6,
+                },
+            )
+
+    monkeypatch.setattr(
+        npu_inference,
+        "build_npu_encoder_model",
+        lambda weights_file_path, config, seq_len, execution_mode="encoder_pipeline", disable_all_biases=False: (
+            FakeModel(),
+            FakeContext(),
+            12.5,
+        ),
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "prepare_benchmark_samples",
+        lambda **kwargs: [
+            {
+                "input_ids": torch.ones((1, 64), dtype=torch.long),
+                "token_type_ids": torch.zeros((1, 64), dtype=torch.long),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "estimate_encoder_forward_flops",
+        lambda model_config, seq_len: 1.0e9,
+    )
+
+    perf_values = iter([0.0, 0.010, 0.020, 0.030])
+    monkeypatch.setattr(npu_inference.time, "perf_counter", lambda: next(perf_values))
+
+    @contextmanager
+    def fake_power_monitor(*args, **kwargs):
+        yield SimpleNamespace(
+            stats=empty_power_stats(),
+        )
+
+    monkeypatch.setattr(npu_inference, "create_power_monitor", fake_power_monitor)
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model_type="bert",
+            vocab_size=30522,
+            pad_token_id=0,
+        ),
+    )
+
+    result = npu_inference.benchmark_with_config(
+        weights_file_path="model.safetensors",
+        config_file_path="config.json",
+        config=config,
+        seq_len=64,
+        texts=["sample"],
+        warmup_runs=1,
+        runs_per_sample=2,
+        benchmark_mode="synthetic_dense",
+        execution_mode="gemm_only",
+        topology=None,
+        power_backend="none",
+        power_interval_sec=0.5,
+        power_log_path=None,
+    )
+
+    assert result["execution_mode"] == "gemm_only"
+    assert result["topology_id"] == ""
+    assert result["avg_qkv_projection_latency_ms"] == pytest.approx(2.0)
+    assert result["avg_encoder_pipeline_latency_ms"] == ""
+    assert result["avg_operator_runlist_latency_ms"] == ""
+    assert result["avg_host_preprocess_latency_ms"] == pytest.approx(0.5)
+    assert result["avg_npu_gemm_latency_ms"] == pytest.approx(6.0)
+    assert result["avg_host_postprocess_latency_ms"] == pytest.approx(1.5)
+    assert result["avg_device_sync_latency_ms"] == pytest.approx(0.25)
+    assert result["npu_dispatch_count"] == 28
+    assert result["npu_unique_instruction_binary_count"] == 6
+
+
+def test_gemm_only_layer_uses_one_runtime_xclbin():
+    from src.block.transformer_gemm_only import BertEncoderGemmOnlyLayer
+
+    class DummyContext:
+        def __init__(self):
+            self.operators = []
+            self.static_data_pool = {}
+            self.base_dir = Path(__file__).resolve().parents[3]
+            self.device_manager = type(
+                "_DummyDeviceManager",
+                (),
+                {"device_str": staticmethod(lambda: "npu1_4col")},
+            )()
+
+        def register_operator(self, operator, skip_add_to_list=False):
+            operator.context = self
+            if not skip_add_to_list:
+                self.operators.append(operator)
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hidden_size=768,
+            intermediate_size=3072,
+            num_attention_heads=12,
+            layer_norm_eps=1.0e-12,
+        ),
+        aie_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    layer = BertEncoderGemmOnlyLayer(config, seq_len=64, context=DummyContext())
+    ops = [
+        layer.qkv_proj,
+        layer.attn_scores,
+        layer.attn_output,
+        layer.out_proj,
+        layer.ffn_up,
+        layer.ffn_down,
+    ]
+
+    runtime_xclbins = {id(op.runtime_xclbin_artifact) for op in ops}
+    declared_xclbins = {id(op.xclbin_artifact) for op in ops}
+    insts_xclbin_inputs = {id(op.insts_artifact.xclbin_input) for op in ops}
+    runtime_paths = {op.runtime_xclbin_artifact.path for op in ops}
+
+    assert layer.UNIQUE_XCLBIN_COUNT == 1
+    assert len(runtime_xclbins) == 1
+    assert len(declared_xclbins) == 1
+    assert len(insts_xclbin_inputs) == 1
+    assert len(runtime_paths) == 1
+
+
+def test_npu_benchmark_with_config_reports_operator_runlist_breakdown(monkeypatch):
+    class FakeContext:
+        def __init__(self):
+            self.reset_runtime_calls = 0
+
+        def reset_runtime(self):
+            self.reset_runtime_calls += 1
+
+    class FakeModel:
+        def __init__(self):
+            self.dtype = torch.bfloat16
+
+        def __call__(self, input_ids, token_type_ids=None, attention_mask=None):
+            return torch.zeros((1, input_ids.shape[1], 8), dtype=torch.bfloat16)
+
+        def forward_with_stage_timings(
+            self, input_ids, token_type_ids=None, attention_mask=None
+        ):
+            return (
+                torch.zeros((1, input_ids.shape[1], 8), dtype=torch.bfloat16),
+                {
+                    "embedding_sec": 0.001,
+                    "operator_runlist_sec": 0.007,
+                    "npu_dispatch_count": 13,
+                    "npu_unique_instruction_binary_count": 10,
+                },
+            )
+
+    fake_context = FakeContext()
+    monkeypatch.setattr(
+        npu_inference,
+        "build_npu_encoder_model",
+        lambda weights_file_path, config, seq_len, execution_mode="encoder_pipeline", disable_all_biases=False: (
+            FakeModel(),
+            fake_context,
+            15.0,
+        ),
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "prepare_benchmark_samples",
+        lambda **kwargs: [
+            {
+                "input_ids": torch.ones((1, 64), dtype=torch.long),
+                "token_type_ids": torch.zeros((1, 64), dtype=torch.long),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "estimate_encoder_forward_flops",
+        lambda model_config, seq_len: 1.0e9,
+    )
+
+    perf_values = iter([0.0, 0.010, 0.020, 0.030])
+    monkeypatch.setattr(npu_inference.time, "perf_counter", lambda: next(perf_values))
+
+    @contextmanager
+    def fake_power_monitor(*args, **kwargs):
+        yield SimpleNamespace(
+            stats=empty_power_stats(),
+        )
+
+    monkeypatch.setattr(npu_inference, "create_power_monitor", fake_power_monitor)
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model_type="bert",
+            vocab_size=30522,
+            pad_token_id=0,
+        ),
+    )
+
+    result = npu_inference.benchmark_with_config(
+        weights_file_path="model.safetensors",
+        config_file_path="config.json",
+        config=config,
+        seq_len=64,
+        texts=["sample"],
+        warmup_runs=1,
+        runs_per_sample=2,
+        benchmark_mode="synthetic_dense",
+        execution_mode="operator_runlist",
+        topology=None,
+        power_backend="none",
+        power_interval_sec=0.5,
+        power_log_path=None,
+    )
+
+    assert result["execution_mode"] == "operator_runlist"
+    assert result["topology_id"] == ""
+    assert result["avg_encoder_pipeline_latency_ms"] == ""
+    assert result["avg_operator_runlist_latency_ms"] == pytest.approx(7.0)
+    assert result["avg_npu_gemm_latency_ms"] == ""
+    assert result["npu_dispatch_count"] == 13
+    assert result["npu_unique_instruction_binary_count"] == 10
+
+
+def test_npu_benchmark_with_config_resets_runtime_after_failure(monkeypatch):
+    class FakeContext:
+        def __init__(self):
+            self.reset_runtime_calls = 0
+
+        def reset_runtime(self):
+            self.reset_runtime_calls += 1
+
+    class FakeModel:
+        def __init__(self):
+            self.dtype = torch.bfloat16
+
+        def __call__(self, input_ids, token_type_ids=None, attention_mask=None):
+            return torch.zeros((1, input_ids.shape[1], 8), dtype=torch.bfloat16)
+
+        def forward_with_stage_timings(
+            self, input_ids, token_type_ids=None, attention_mask=None
+        ):
+            raise RuntimeError("boom")
+
+    fake_context = FakeContext()
+
+    monkeypatch.setattr(
+        npu_inference,
+        "build_npu_encoder_model",
+        lambda weights_file_path, config, seq_len, execution_mode="encoder_pipeline", disable_all_biases=False: (
+            FakeModel(),
+            fake_context,
+            9.0,
+        ),
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "prepare_benchmark_samples",
+        lambda **kwargs: [
+            {
+                "input_ids": torch.ones((1, 64), dtype=torch.long),
+                "token_type_ids": torch.zeros((1, 64), dtype=torch.long),
+            }
+        ],
+    )
+
+    @contextmanager
+    def fake_power_monitor(*args, **kwargs):
+        yield SimpleNamespace(stats=empty_power_stats())
+
+    monkeypatch.setattr(npu_inference, "create_power_monitor", fake_power_monitor)
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model_type="bert",
+            vocab_size=30522,
+            pad_token_id=0,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        npu_inference.benchmark_with_config(
+            weights_file_path="model.safetensors",
+            config_file_path="config.json",
+            config=config,
+            seq_len=64,
+            texts=["sample"],
+            warmup_runs=1,
+            runs_per_sample=2,
+            benchmark_mode="synthetic_dense",
+            execution_mode="encoder_pipeline",
+            topology=None,
+            power_backend="none",
+            power_interval_sec=0.5,
+            power_log_path=None,
+        )
+
+    assert fake_context.reset_runtime_calls == 1
+
+
+def test_build_npu_encoder_model_uses_backend_specific_context(monkeypatch):
+    class FakeContext:
+        def __init__(self, name):
+            self.name = name
+            self.compiled = False
+            self.prepared = False
+
+        def compile_all(self):
+            self.compiled = True
+
+        def prepare_runtime(self):
+            self.prepared = True
+
+    backend_context = FakeContext("backend")
+    default_context = FakeContext("default")
+
+    class FakeModel:
+        def __init__(self):
+            self.encoder_context = backend_context
+            self.eval_called = False
+
+        def assign_backbone_weights(self, weights):
+            self.weights = weights
+
+        def eval(self):
+            self.eval_called = True
+
+    monkeypatch.setattr(
+        npu_inference,
+        "reset_default_context",
+        lambda: default_context,
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "canonicalize_local_backbone_weights",
+        lambda raw_weights, model_config: dict(raw_weights),
+    )
+    monkeypatch.setattr(
+        npu_inference,
+        "extend_or_trim_position_embeddings",
+        lambda weights, max_pos: None,
+    )
+    monkeypatch.setattr(
+        npu_inference.time,
+        "perf_counter",
+        iter([0.0, 0.005]).__next__,
+    )
+
+    import sys
+    import types
+
+    fake_module = types.ModuleType("src.model_operator_runlist")
+    fake_module.EncoderBackboneOperatorRunlist = lambda config, seq_len=512: FakeModel()
+    monkeypatch.setitem(sys.modules, "src.model_operator_runlist", fake_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "safetensors.torch",
+        types.SimpleNamespace(load_file=lambda path: {"w": torch.tensor([1.0])}),
+    )
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_position_embeddings=512),
+    )
+
+    model, context, compile_setup_time_ms = npu_inference.build_npu_encoder_model(
+        weights_file_path="model.safetensors",
+        config=config,
+        seq_len=64,
+        execution_mode="operator_runlist",
+    )
+
+    assert model.eval_called is True
+    assert context is backend_context
+    assert backend_context.compiled is True
+    assert backend_context.prepared is True
+    assert default_context.compiled is False
+    assert default_context.prepared is False
+    assert compile_setup_time_ms == pytest.approx(5.0)
+
+
+def test_operator_runlist_backbone_reuses_single_encoder_operator(monkeypatch):
+    import importlib
+
+    module = importlib.import_module("src.model_operator_runlist")
+
+    class FakeContext:
+        def __init__(self, use_runlist=True):
+            self.use_runlist = use_runlist
+
+    class FakeEmbeddings:
+        def __init__(self, config):
+            self.config = config
+            self.word_embeddings = SimpleNamespace(weight=None)
+            self.position_embeddings = SimpleNamespace(weight=None)
+            self.token_type_embeddings = SimpleNamespace(weight=None)
+            self.LayerNorm = SimpleNamespace(weight=None, bias=None)
+
+        def eval(self):
+            return self
+
+    class FakeEncoder:
+        def __init__(self, **kwargs):
+            self.context = kwargs["context"]
+            self.use_static_runtime_weights = kwargs["use_static_runtime_weights"]
+            self.lazy_kernel_loading = True
+            self.runlist = [1, 2, 3]
+            self.kernels = {"k0": object(), "k1": object()}
+
+    monkeypatch.setattr(module, "AIEContext", FakeContext)
+    monkeypatch.setattr(module, "EncoderEmbeddings", FakeEmbeddings)
+    monkeypatch.setattr(module, "AIEBERTEncoder", FakeEncoder)
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hidden_size=768,
+            intermediate_size=3072,
+            num_attention_heads=12,
+            num_hidden_layers=12,
+        ),
+        aie_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+
+    model = module.EncoderBackboneOperatorRunlist(config, seq_len=64)
+
+    assert isinstance(model.encoder_context, FakeContext)
+    assert isinstance(model.encoder_layer, FakeEncoder)
+    assert model.encoder_context is model.encoder_layer.context
+    assert model.encoder_layer.use_static_runtime_weights is False
+    assert model.encoder_layer.lazy_kernel_loading is False
+    assert model.num_hidden_layers == 12
+
+
+def test_finalize_process_for_execution_mode_is_noop_for_non_operator_runlist(
+    monkeypatch,
+):
+    exit_calls = []
+    monkeypatch.setattr(npu_inference.os, "_exit", lambda code: exit_calls.append(code))
+    monkeypatch.setattr(npu_inference.sys.stdout, "flush", lambda: None)
+    monkeypatch.setattr(npu_inference.sys.stderr, "flush", lambda: None)
+
+    npu_inference.finalize_process_for_execution_mode("encoder_pipeline")
+
+    assert exit_calls == []
+
+
+def test_finalize_process_for_execution_mode_exits_for_operator_runlist(monkeypatch):
+    exit_calls = []
+    flush_calls = []
+    monkeypatch.setattr(npu_inference.os, "_exit", lambda code: exit_calls.append(code))
+    monkeypatch.setattr(
+        npu_inference.sys.stdout,
+        "flush",
+        lambda: flush_calls.append("stdout"),
+    )
+    monkeypatch.setattr(
+        npu_inference.sys.stderr,
+        "flush",
+        lambda: flush_calls.append("stderr"),
+    )
+
+    npu_inference.finalize_process_for_execution_mode("operator_runlist")
+
+    assert flush_calls == ["stdout", "stderr"]
+    assert exit_calls == [0]
+
+
+def test_validate_execution_mode_request_allows_multi_seq_for_encoder_pipeline():
+    npu_inference.validate_execution_mode_request("encoder_pipeline", [64, 128])
+
+
+def test_validate_execution_mode_request_rejects_multi_seq_operator_runlist():
+    with pytest.raises(
+        ValueError,
+        match="operator_runlist currently requires one seq_len per process",
+    ):
+        npu_inference.validate_execution_mode_request("operator_runlist", [64, 128])
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "disable_all_biases", "expected"),
+    [
+        ("encoder_pipeline", False, False),
+        ("encoder_pipeline", True, True),
+        ("gemm_only", False, False),
+        ("operator_runlist", False, True),
+        ("operator_runlist", True, True),
+    ],
+)
+def test_effective_disable_all_biases(execution_mode, disable_all_biases, expected):
+    assert (
+        npu_inference.effective_disable_all_biases(
+            execution_mode,
+            disable_all_biases,
+        )
+        is expected
+    )
+
+
+def test_execution_autograd_context_uses_no_grad_for_operator_runlist(monkeypatch):
+    calls = []
+
+    class DummyContext:
+        def __enter__(self):
+            calls.append("enter")
+
+        def __exit__(self, exc_type, exc, tb):
+            calls.append("exit")
+
+    monkeypatch.setattr(
+        torch,
+        "no_grad",
+        lambda: calls.append("no_grad") or DummyContext(),
+    )
+    monkeypatch.setattr(
+        torch,
+        "inference_mode",
+        lambda: calls.append("inference_mode") or DummyContext(),
+    )
+
+    with npu_inference.execution_autograd_context("operator_runlist"):
+        pass
+    with npu_inference.execution_autograd_context("encoder_pipeline"):
+        pass
+
+    assert calls == [
+        "no_grad",
+        "enter",
+        "exit",
+        "inference_mode",
+        "enter",
+        "exit",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["--execution-mode", "operator_runlist"], True),
+        (["--execution-mode=operator_runlist"], True),
+        (["--execution-mode", "encoder_pipeline"], False),
+        (["--study-id", "bert-base-uncased"], False),
+    ],
+)
+def test_argv_requests_operator_runlist(argv, expected):
+    assert npu_inference.argv_requests_operator_runlist(argv) is expected
+
+
+def test_maybe_reexec_operator_runlist_import_main_noops_without_request(monkeypatch):
+    exec_calls = []
+    monkeypatch.delenv("IRON_NPU_IMPORTED_MAIN", raising=False)
+    monkeypatch.setattr(
+        npu_inference.os, "execve", lambda *args: exec_calls.append(args)
+    )
+
+    npu_inference.maybe_reexec_operator_runlist_import_main(
+        ["npu_inference.py", "--execution-mode", "encoder_pipeline"]
+    )
+
+    assert exec_calls == []
+
+
+def test_maybe_reexec_operator_runlist_import_main_reexecs(monkeypatch):
+    exec_calls = []
+    monkeypatch.delenv("IRON_NPU_IMPORTED_MAIN", raising=False)
+    monkeypatch.setattr(
+        npu_inference.sys,
+        "executable",
+        "/usr/bin/python3",
+    )
+    monkeypatch.setattr(
+        npu_inference.os,
+        "execvpe",
+        lambda executable, argv, env: exec_calls.append((executable, argv, env)),
+    )
+
+    npu_inference.maybe_reexec_operator_runlist_import_main(
+        ["npu_inference.py", "--execution-mode", "operator_runlist", "--seq-lens", "64"]
+    )
+
+    assert len(exec_calls) == 1
+    executable, argv, env = exec_calls[0]
+    assert executable == "/usr/bin/python3"
+    assert argv[:2] == [
+        "/usr/bin/python3",
+        str(TEST_DIR / "npu_inference_import_main.py"),
+    ]
+    assert argv[2:] == ["--execution-mode", "operator_runlist", "--seq-lens", "64"]
+    assert env["IRON_NPU_IMPORTED_MAIN"] == "1"
+
+
+def test_build_npu_csv_row_formats_operator_runlist_fields():
+    row = npu_inference._build_npu_csv_row(
+        study_id="bert-base-uncased",
+        seq_len=64,
+        num_threads=12,
+        num_samples=1,
+        runs_per_sample=1,
+        warmup_runs=0,
+        power_backend="none",
+        power_log_path=None,
+        result={
+            "benchmark_mode": "synthetic_dense",
+            "execution_mode": "operator_runlist",
+            "dtype": "bfloat16",
+            "measured_inference_count": 1,
+            "timed_total_sec": 0.25,
+            "throughput_inferences_per_sec": 4.0,
+            "model_type": "bert",
+            "shape": (1, 64, 768),
+            "estimated_flops_per_inference": 1.0e9,
+            "throughput_flops_per_sec": 4.0e9,
+            "topology_id": "",
+            "parallel_seq": "",
+            "parallel_heads": "",
+            "parallel_ffn": "",
+            "compute_tile_count": "",
+            "compute_tile_utilization_fraction": "",
+            "compile_setup_time_ms": 100.0,
+            "topology_selection_time_ms": "",
+            "topology_cache_status": "",
+            "cached_steady_state_avg_latency_ms": 250.0,
+            "avg_embedding_latency_ms": 1.0,
+            "avg_qkv_projection_latency_ms": "",
+            "avg_encoder_pipeline_latency_ms": "",
+            "avg_operator_runlist_latency_ms": 249.0,
+            "avg_host_preprocess_latency_ms": 0.0,
+            "avg_npu_gemm_latency_ms": "",
+            "avg_host_postprocess_latency_ms": "",
+            "avg_device_sync_latency_ms": 0.0,
+            "npu_dispatch_count": 192,
+            "npu_unique_instruction_binary_count": 12,
+            "min_latency_ms": 250.0,
+            "avg_latency_ms": 250.0,
+            "max_latency_ms": 250.0,
+            "power_stats": empty_power_stats(),
+        },
+    )
+
+    assert row["execution_mode"] == "operator_runlist"
+    assert row["avg_operator_runlist_latency_ms"] == "249.000000"
+    assert row["npu_dispatch_count"] == "192"
 
 
 def test_resolve_topology_reports_cache_hit_metadata(monkeypatch):
@@ -1838,6 +2911,7 @@ def test_automated_benchmark_enumerate_cases_multi_study_skips_npu_unready():
         modes="cpu,npu,igpu",
         seq_lens="64",
         benchmark_mode=DEFAULT_BENCHMARK_MODE,
+        npu_execution_modes="encoder_pipeline",
         cpu_thread_counts="1",
         npu_num_threads=1,
         igpu_num_threads=1,
@@ -1866,6 +2940,7 @@ def test_automated_benchmark_enumerate_cases_adds_nondefault_benchmark_mode_suff
         modes="cpu,igpu",
         seq_lens="64",
         benchmark_mode="model_valid",
+        npu_execution_modes="encoder_pipeline",
         cpu_thread_counts="1",
         npu_num_threads=1,
         igpu_num_threads=1,
@@ -1890,6 +2965,7 @@ def test_automated_benchmark_enumerate_cases_adds_no_bias_suffix_for_cpu_and_igp
         modes="cpu,igpu,npu",
         seq_lens="64",
         benchmark_mode=DEFAULT_BENCHMARK_MODE,
+        npu_execution_modes="encoder_pipeline",
         disable_all_biases=True,
         cpu_thread_counts="1",
         npu_num_threads=1,
@@ -1918,6 +2994,7 @@ def test_automated_benchmark_enumerate_cases_include_supported_npu_seq_len_16384
         modes="npu",
         seq_lens="64,16384",
         benchmark_mode=DEFAULT_BENCHMARK_MODE,
+        npu_execution_modes="encoder_pipeline",
         cpu_thread_counts="1",
         npu_num_threads=1,
         igpu_num_threads=1,
@@ -1932,6 +3009,34 @@ def test_automated_benchmark_enumerate_cases_include_supported_npu_seq_len_16384
     assert "npu_seq64" in case_ids
     assert "npu_seq16384" in case_ids
     assert not any("seq_len=16384" in reason for reason in skipped_reasons)
+
+
+def test_automated_benchmark_enumerate_cases_fans_out_npu_execution_modes():
+    args = SimpleNamespace(
+        weights_file_path=None,
+        config_file_path=None,
+        study_id="bert-base-uncased",
+        study_ids=None,
+        study_manifest=str(STUDY_MANIFEST),
+        models_root=None,
+        modes="npu",
+        seq_lens="64",
+        benchmark_mode=DEFAULT_BENCHMARK_MODE,
+        npu_execution_modes="encoder_pipeline,gemm_only,operator_runlist",
+        cpu_thread_counts="1",
+        npu_num_threads=1,
+        igpu_num_threads=1,
+        npu_topology_policy="cache",
+        npu_candidate_topologies=None,
+    )
+
+    cases, skipped = enumerate_cases(args)
+    case_ids = {case["case_id"] for case in cases}
+
+    assert "bert-base-uncased_npu_encoder_pipeline_seq64" in case_ids
+    assert "bert-base-uncased_npu_gemm_only_seq64" in case_ids
+    assert "bert-base-uncased_npu_operator_runlist_seq64" in case_ids
+    assert skipped == []
 
 
 def test_parse_seq_len_int_overrides_accepts_long_seq_len_map():
@@ -1962,6 +3067,7 @@ def test_case_command_applies_seq_len_run_overrides_by_seq_len(tmp_path):
         "case_id": "npu_seq1024",
         "study_id": "",
         "mode": "npu",
+        "execution_mode": "encoder_pipeline",
         "seq_len": 1024,
         "num_threads": 12,
         "weights_file_path": str(WEIGHTS_FILE),
@@ -2016,6 +3122,7 @@ def test_case_command_applies_seq_len_run_overrides_by_seq_len(tmp_path):
         return command[command.index(flag) + 1]
 
     assert value_for_flag(command_1024, "--runs-per-sample") == "100"
+    assert value_for_flag(command_1024, "--execution-mode") == "encoder_pipeline"
     assert value_for_flag(command_2048, "--runs-per-sample") == "50"
     assert value_for_flag(command_4096, "--runs-per-sample") == "15"
     assert value_for_flag(command_8192, "--runs-per-sample") == "5"
@@ -2107,6 +3214,7 @@ def test_case_command_passes_disable_all_biases_only_to_cpu_and_igpu(tmp_path):
         **cpu_case,
         "case_id": "npu_seq64",
         "mode": "npu",
+        "execution_mode": "gemm_only",
     }
 
     cpu_command = case_command(
@@ -2134,6 +3242,50 @@ def test_case_command_passes_disable_all_biases_only_to_cpu_and_igpu(tmp_path):
     assert "--disable-all-biases" in cpu_command
     assert "--disable-all-biases" in igpu_command
     assert "--disable-all-biases" not in npu_command
+    assert npu_command[npu_command.index("--execution-mode") + 1] == "gemm_only"
+
+
+def test_case_command_uses_import_wrapper_for_operator_runlist(tmp_path):
+    args = SimpleNamespace(
+        num_samples=1,
+        warmup_runs=0,
+        runs_per_sample=1,
+        runs_per_sample_overrides={},
+        study_manifest=None,
+        models_root=None,
+        npu_topology_policy="cache",
+        npu_topology_cache=str(tmp_path / "topology_cache.json"),
+        npu_autotune_warmup_runs=2,
+        npu_autotune_runs=5,
+        npu_autotune_runs_overrides={},
+        npu_candidate_topologies=None,
+        igpu_dtype="bfloat16",
+        igpu_device_index=0,
+        disable_all_biases=False,
+        power_interval_sec=0.5,
+    )
+    case = {
+        "case_id": "npu_operator_runlist_seq64",
+        "study_id": "",
+        "mode": "npu",
+        "seq_len": 64,
+        "num_threads": 12,
+        "weights_file_path": str(WEIGHTS_FILE),
+        "config_file_path": str(CONFIG_FILE),
+        "execution_mode": "operator_runlist",
+    }
+
+    command = case_command(
+        args,
+        case,
+        tmp_path / "npu.csv",
+        "none",
+        None,
+    )
+
+    assert command[1] == str(TEST_DIR / "npu_inference_import_main.py")
+    assert command[command.index("--execution-mode") + 1] == "operator_runlist"
+    assert "--disable-all-biases" in command
 
 
 @pytest.mark.parametrize("seq_len", [64, 16384], ids=["64", "16384"])

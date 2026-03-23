@@ -11,6 +11,7 @@
   "igpu_num_threads": 8,
   "igpu_dtype": "bfloat16",
   "igpu_device_index": 0,
+  "npu_execution_modes": "encoder_pipeline,gemm_only,operator_runlist",
   "npu_topology_policy": "cache",
   "npu_topology_cache": "../npu_topology_cache_latest.json",
   "npu_autotune_warmup_runs": 2,

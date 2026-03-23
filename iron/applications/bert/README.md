@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 `applications/bert` now has three explicit benchmark entrypoints:
 - [cpu_inference.py](cpu_inference.py): Hugging Face CPU baseline for supported encoder-only families
 - [igpu_inference.py](igpu_inference.py): Hugging Face iGPU baseline through a GPU-enabled PyTorch runtime
-- [npu_inference.py](npu_inference.py): local NPU benchmark using the `encoder_pipeline` operator
+- [npu_inference.py](npu_inference.py): local NPU benchmark entrypoint for `encoder_pipeline`, `gemm_only`, and `operator_runlist`
 - [download_model.py](download_model.py): manifest-driven Hugging Face downloader for supported study models
 - [automated_benchmark.py](automated_benchmark.py): resumable case runner with optional topology autotune, power logging, and power-cycle hooks
 - [bringup_checklist.sh](bringup_checklist.sh): guided device preflight for CPU/NPU smokes, topology-cache warmup, and short supervised suite validation
@@ -17,6 +17,7 @@ SPDX-License-Identifier: Apache-2.0
 - [validate_npu_parity.py](validate_npu_parity.py): CPU-vs-NPU hidden-state parity validator for canonical synthetic sequence lengths
 - [peak_reference.py](peak_reference.py): host fingerprint / hardware-profile artifact generator for peak-normalization and roofline groundwork
 - [calibrate_backend_peaks.py](calibrate_backend_peaks.py): peak-reference artifact builder that combines the host profile with measured calibration inputs
+- [BENCHMARKING_METHODOLOGY.md](BENCHMARKING_METHODOLOGY.md): methodology note for CPU, iGPU, `encoder_pipeline`, `gemm_only`, and `operator_runlist` comparisons
 
 The shared code under `src/` is now NPU-only. It exists to build the encoder-pipeline-backed local backbone used by `npu_inference.py`. The CPU benchmark uses Hugging Face directly and does not go through `src/`.
 
@@ -268,7 +269,7 @@ Behavior:
 
 ## NPU Benchmark
 
-Run the NPU benchmark with `encoder_pipeline`:
+Run the NPU benchmark:
 
 ```bash
 cd iron/applications/bert
@@ -283,17 +284,21 @@ python3 npu_inference.py <weights> <config> \
   --num-samples 1 \
   --warmup-runs 10 \
   --runs-per-sample 100 \
+  --execution-mode encoder_pipeline \
   --topology-policy cache \
   --topology-cache npu_topology_cache_latest.json \
   --output-csv npu_benchmark_latest.csv
 ```
 
 Behavior:
-- builds a minimal local backbone: embeddings + `encoder_pipeline`
+- builds a minimal local backbone around embeddings plus the selected NPU execution path
 - excludes pooler and classifier head
 - uses the same built-in local text corpus as the CPU benchmark
-- generates the same deterministic local token ids as the CPU benchmark
-- only supports `--benchmark-mode synthetic_dense` today because the current `encoder_pipeline` path still requires `attention_mask=None`
+- `--execution-mode encoder_pipeline` is the fused topology-aware path and remains the default
+- `--execution-mode gemm_only` offloads only GEMM-shaped work to the NPU and keeps non-GEMM work on the host
+- `--execution-mode operator_runlist` uses the stitched runlist-backed encoder path and currently forces no-bias execution
+- generates deterministic synthetic token ids in `synthetic_dense`; `operator_runlist` currently uses a simpler monotonic synthetic token pattern for stability
+- only supports `--benchmark-mode synthetic_dense` today because the current NPU paths still require `attention_mask=None`
 - uses the same CSV schema as the CPU benchmark
 - runs unmasked inference (`attention_mask=None`)
 - child CSV rows now also include:
@@ -336,16 +341,16 @@ python3 validate_npu_parity.py \
 
 Behavior:
 - uses the same synthetic token generation as the benchmark harness
-- compares CPU final hidden states against the NPU `encoder_pipeline` path
+- compares CPU final hidden states against the selected NPU `--execution-mode`
 - records per-sequence parity metrics:
   - `cosine_similarity`
   - `max_abs_error`
   - `mean_abs_error`
 - also records `error_count`, `error_fraction`, `max_acceptable_errors`, and the selected `topology_id`, `topology_cache_status`, `topology_selection_time_ms`, and `compile_setup_time_ms`
-- defaults to a quick `fixed` topology policy; pass `--topology-policy cache` if you want to validate the cached benchmark path instead
-- uses the same default tolerance model as the `encoder_pipeline` operator tests: `--rel-tol 0.04`, `--abs-tol 0.15`, `--max-error-fraction 0.005`
+- defaults to `--execution-mode encoder_pipeline` with a quick `fixed` topology policy; pass `--execution-mode` and `--topology-policy cache` if you want to validate a different execution path or the cached benchmark path
+- uses the same default tolerance model as the `encoder_pipeline` operator tests: `--rel-tol 0.04`, `--abs-tol 0.15`, `--max-error-fraction 0.05`
 - exits nonzero if any row exceeds the allowed elementwise error budget after applying the rel/abs tolerance window
-- current branch status: embeddings and host QKV projection parity are close, but divergence still starts in the fused encoder layer. The residual-add / LayerNorm ordering now matches the operator reference, but the fused path still omits encoder dense and LayerNorm biases, so HF-equivalent parity is not expected until those bias terms are carried through the operator interface and kernels.
+- `gemm_only` and `operator_runlist` comparisons are intended to be run with `--disable-all-biases` so the CPU reference matches the current NPU no-bias contract for those paths
 
 ## Automated Benchmarking
 
@@ -364,6 +369,7 @@ Example:
 cd iron/applications/bert
 python3 automated_benchmark.py /path/to/model.safetensors config/config.json \
   --modes cpu,npu,igpu \
+  --npu-execution-modes encoder_pipeline,gemm_only,operator_runlist \
   --seq-lens 64,128,256,512,1024,2048,4096,8192 \
   --runs-per-sample 100 \
   --warmup-runs 10 \
@@ -380,6 +386,7 @@ cd iron/applications/bert
 python3 automated_benchmark.py \
   --study-ids all \
   --modes cpu,npu,igpu \
+  --npu-execution-modes encoder_pipeline,gemm_only,operator_runlist \
   --seq-lens 64,128,256,512,1024,2048,4096,8192 \
   --benchmark-mode synthetic_dense \
   --runs-per-sample 100 \
@@ -396,6 +403,8 @@ Behavior:
 - writes one master CSV summarizing all completed cases
 - writes per-case child benchmark CSVs and power logs under `logs/automated_benchmark`
 - every child row and suite row now records `benchmark_mode` and `execution_mode`
+- `--npu-execution-modes` fans out NPU cases across `encoder_pipeline`, `gemm_only`, and `operator_runlist`
+- `operator_runlist` now runs as a stitched runlist-backed NPU backend and is the least stable of the current NPU paths, so keep parity validation and short unattended smokes in the loop as you expand the matrix
 - `--benchmark-mode synthetic_dense` is the current default dense stress path
 - `--benchmark-mode model_valid` uses real local tokenizer outputs plus attention masks and currently applies only to CPU and iGPU with `seq_len <= 512`
 - `--benchmark-mode task_eval` is reserved for later task-level evaluation scripts and is not implemented in the timing harness yet
@@ -411,6 +420,7 @@ Behavior:
 - when that temperature target is still not met after the max cooldown wait, the suite continues instead of failing
 - if `--power-cycle-cmd` is set, it runs one case, records results, invokes the hook, and exits
 - after the machine comes back, rerun the same command to continue from the saved state
+- transient `operator_runlist` child failures that abort before writing a child CSV are retried automatically with short backoff in the unattended harness
 - for non-CPU accelerator cases with power logging enabled, it also measures an idle baseline before each case and writes:
   - `idle_pkg_watt`
   - `pseudo_device_avg_pkg_watt`

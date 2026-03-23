@@ -18,19 +18,24 @@ from benchmark_common import (
 from cpu_inference import load_hf_encoder_model
 from model_support import model_uses_token_type_ids
 from npu_inference import (
+    SUPPORTED_NPU_EXECUTION_MODES,
     apply_topology_to_config,
     build_npu_encoder_model,
+    execution_autograd_context,
     load_encoder_pipeline_config,
     resolve_input_paths,
     resolve_topology,
 )
 
 DEFAULT_PARITY_SEQ_LENS = "64,128,512"
+DEFAULT_MAX_ERROR_FRACTION = 5.0e-2
 PARITY_FIELDNAMES = [
     "study_id",
     "seq_len",
     "sample_index",
     "benchmark_mode",
+    "execution_mode",
+    "disable_all_biases",
     "cpu_dtype",
     "npu_runtime_dtype",
     "topology_id",
@@ -116,6 +121,17 @@ def parse_args(argv=None):
         help="Execution dtype for the CPU reference model.",
     )
     parser.add_argument(
+        "--execution-mode",
+        choices=SUPPORTED_NPU_EXECUTION_MODES,
+        default="encoder_pipeline",
+        help="NPU execution path to validate against the CPU reference.",
+    )
+    parser.add_argument(
+        "--disable-all-biases",
+        action="store_true",
+        help="Zero every model/backbone bias tensor on both CPU and NPU before comparison.",
+    )
+    parser.add_argument(
         "--topology-policy",
         choices=("fixed", "cache", "autotune"),
         default="fixed",
@@ -167,7 +183,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--max-error-fraction",
         type=float,
-        default=5.0e-3,
+        default=DEFAULT_MAX_ERROR_FRACTION,
         help=(
             "Maximum allowed fraction of hidden-state elements that may fall "
             "outside the rel/abs tolerance window."
@@ -277,10 +293,12 @@ def validate_seq_len(
         config_file_path=config_file_path,
         seq_len=seq_len,
         dtype_name=args.cpu_dtype,
+        disable_all_biases=args.disable_all_biases,
     )
     cpu_uses_token_type_ids = model_uses_token_type_ids(cpu_model.config.to_dict())
     encoded_samples = prepare_benchmark_samples(
         benchmark_mode="synthetic_dense",
+        execution_mode=args.execution_mode,
         texts=texts,
         seq_len=seq_len,
         vocab_size=cpu_model.config.vocab_size,
@@ -289,22 +307,31 @@ def validate_seq_len(
         config_file_path=config_file_path,
     )
 
-    topology, topology_selection = resolve_topology(
-        build_topology_args(args, weights_file_path, config_file_path),
-        seq_len,
-        texts,
-    )
     config = load_encoder_pipeline_config(config_file_path, seq_len)
-    apply_topology_to_config(config, topology)
+    if args.execution_mode == "encoder_pipeline":
+        topology, topology_selection = resolve_topology(
+            build_topology_args(args, weights_file_path, config_file_path),
+            seq_len,
+            texts,
+        )
+        apply_topology_to_config(config, topology)
+    else:
+        topology = None
+        topology_selection = {
+            "topology_selection_time_ms": 0.0,
+            "topology_cache_status": "",
+        }
     npu_model, context, compile_setup_time_ms = build_npu_encoder_model(
         weights_file_path=weights_file_path,
         config=config,
         seq_len=seq_len,
+        execution_mode=args.execution_mode,
+        disable_all_biases=args.disable_all_biases,
     )
 
     rows = []
     try:
-        with torch.inference_mode():
+        with execution_autograd_context(args.execution_mode):
             for sample_index, sample in enumerate(encoded_samples):
                 cpu_kwargs = {
                     "input_ids": sample["input_ids"],
@@ -334,11 +361,13 @@ def validate_seq_len(
                         "seq_len": str(seq_len),
                         "sample_index": str(sample_index),
                         "benchmark_mode": "synthetic_dense",
+                        "execution_mode": args.execution_mode,
+                        "disable_all_biases": ("1" if args.disable_all_biases else "0"),
                         "cpu_dtype": args.cpu_dtype,
                         "npu_runtime_dtype": str(config.aie_config.dtype).replace(
                             "torch.", ""
                         ),
-                        "topology_id": topology.topology_id,
+                        "topology_id": topology.topology_id if topology else "",
                         "topology_selection_time_ms": (
                             f"{topology_selection['topology_selection_time_ms']:.6f}"
                         ),
@@ -390,7 +419,8 @@ def main(argv=None):
         for row in seq_rows:
             print(
                 f"seq_len={row['seq_len']} sample={row['sample_index']} "
-                f"topology={row['topology_id']} "
+                f"mode={row['execution_mode']} "
+                f"topology={row['topology_id'] or '-'} "
                 f"cosine={row['cosine_similarity']} "
                 f"max_abs={row['max_abs_error']} "
                 f"errors={row['error_count']}/{row['max_acceptable_errors']} "

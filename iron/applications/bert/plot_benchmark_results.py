@@ -29,6 +29,21 @@ MODE_COLORS = {
     "npu": "#E76F51",
     "igpu": "#2A9D8F",
 }
+NPU_EXECUTION_MODE_ORDER = (
+    "encoder_pipeline",
+    "gemm_only",
+    "operator_runlist",
+)
+NPU_EXECUTION_MODE_LABELS = {
+    "encoder_pipeline": "NPU encoder_pipeline",
+    "gemm_only": "NPU gemm_only",
+    "operator_runlist": "NPU operator_runlist",
+}
+NPU_EXECUTION_MODE_COLORS = {
+    "encoder_pipeline": "#E76F51",
+    "gemm_only": "#F4A261",
+    "operator_runlist": "#E9C46A",
+}
 MODEL_COLORS = [
     "#C1121F",
     "#003049",
@@ -183,6 +198,46 @@ def representative_rows(rows):
     return selected
 
 
+def row_series_key(row):
+    if row["mode"] == "npu":
+        return ("npu", row.get("execution_mode") or "encoder_pipeline")
+    return (row["mode"], "")
+
+
+def ordered_series_keys(rows):
+    present = {row_series_key(row) for row in rows}
+    ordered = []
+    if ("cpu", "") in present:
+        ordered.append(("cpu", ""))
+    for execution_mode in NPU_EXECUTION_MODE_ORDER:
+        key = ("npu", execution_mode)
+        if key in present:
+            ordered.append(key)
+    for key in sorted(present):
+        if key[0] == "npu" and key not in ordered:
+            ordered.append(key)
+    if ("igpu", "") in present:
+        ordered.append(("igpu", ""))
+    return ordered
+
+
+def series_label(series_key):
+    mode, execution_mode = series_key
+    if mode == "npu":
+        return NPU_EXECUTION_MODE_LABELS.get(
+            execution_mode,
+            f"NPU {execution_mode}",
+        )
+    return MODE_LABELS[mode]
+
+
+def series_color(series_key):
+    mode, execution_mode = series_key
+    if mode == "npu":
+        return NPU_EXECUTION_MODE_COLORS.get(execution_mode, MODE_COLORS["npu"])
+    return MODE_COLORS[mode]
+
+
 def cpu_thread_rows_for_study(rows, study_id):
     cpu_rows = [
         row for row in rows if row["study_id"] == study_id and row["mode"] == "cpu"
@@ -269,23 +324,29 @@ def model_color_map(rows):
 
 def plot_mode_lines(ax, study_rows, value_fn, ylabel, title, *, legend=True):
     seq_lens = sorted({row["seq_len"] for row in study_rows})
-    for mode in MODE_ORDER:
-        mode_rows = [row for row in study_rows if row["mode"] == mode]
-        if not mode_rows:
+    for series_key in ordered_series_keys(study_rows):
+        series_rows = [row for row in study_rows if row_series_key(row) == series_key]
+        if not series_rows:
             continue
-        xs, ys = finite_series(mode_rows, value_fn)
+        xs, ys = finite_series(series_rows, value_fn)
         if not xs:
             continue
         ax.plot(
             xs,
             ys,
-            color=MODE_COLORS[mode],
-            label=MODE_LABELS[mode],
+            color=series_color(series_key),
+            label=series_label(series_key),
             linewidth=2.6,
             marker="o",
             markersize=5.5,
         )
-        ax.fill_between(xs, ys, [0] * len(ys), color=MODE_COLORS[mode], alpha=0.08)
+        ax.fill_between(
+            xs,
+            ys,
+            [0] * len(ys),
+            color=series_color(series_key),
+            alpha=0.08,
+        )
     apply_seq_axis(ax, seq_lens)
     ax.set_xlabel("Sequence Length")
     ax.set_ylabel(ylabel)
@@ -317,16 +378,20 @@ def plot_cross_model_metric(rows, out_dir, dpi, *, filename, title, value_fn, yl
         return None
     study_colors = model_color_map(rep_rows)
     seq_lens = sorted({row["seq_len"] for row in rep_rows})
-
-    fig, axes = plt.subplots(1, len(MODE_ORDER), figsize=(18, 6.2), sharex=True)
+    series_keys = ordered_series_keys(rep_rows)
+    fig, axes = plt.subplots(
+        1, len(series_keys), figsize=(6 * len(series_keys), 6.2), sharex=True
+    )
+    if len(series_keys) == 1:
+        axes = [axes]
     fig.suptitle(title, fontsize=18, fontweight="bold", x=0.06, ha="left")
 
-    for ax, mode in zip(axes, MODE_ORDER):
-        mode_rows = [row for row in rep_rows if row["mode"] == mode]
-        studies = sorted({row["study_id"] for row in mode_rows})
+    for ax, series_key in zip(axes, series_keys):
+        series_rows = [row for row in rep_rows if row_series_key(row) == series_key]
+        studies = sorted({row["study_id"] for row in series_rows})
         for study_id in studies:
             study_rows = sort_by_seq(
-                [row for row in mode_rows if row["study_id"] == study_id]
+                [row for row in series_rows if row["study_id"] == study_id]
             )
             xs, ys = finite_series(study_rows, value_fn)
             if not xs:
@@ -341,7 +406,7 @@ def plot_cross_model_metric(rows, out_dir, dpi, *, filename, title, value_fn, yl
                 label=study_id,
             )
         apply_seq_axis(ax, seq_lens)
-        ax.set_title(MODE_LABELS[mode])
+        ax.set_title(series_label(series_key))
         ax.set_xlabel("Sequence Length")
         if ax is axes[0]:
             ax.set_ylabel(ylabel)
@@ -470,15 +535,16 @@ def plot_summary(rows, out_dir, dpi):
     fig.suptitle("Benchmark Summary", fontsize=18, fontweight="bold", x=0.06, ha="left")
 
     latency_ax, efficiency_ax = axes
-    group_width = 0.24
+    series_keys = ordered_series_keys(representative_rows(rows))
+    group_width = 0.8 / max(1, len(series_keys))
     x_positions = list(range(len(studies)))
 
-    for idx, mode in enumerate(MODE_ORDER):
+    for idx, series_key in enumerate(series_keys):
         latency_values = []
         efficiency_values = []
         for study_id in studies:
             study_rows = representative_rows_for_study(rows, study_id)
-            mode_rows = [row for row in study_rows if row["mode"] == mode]
+            mode_rows = [row for row in study_rows if row_series_key(row) == series_key]
             latency_values.append(
                 geometric_mean([row["avg_latency_ms"] for row in mode_rows])
                 if mode_rows
@@ -497,21 +563,22 @@ def plot_summary(rows, out_dir, dpi):
                 else None
             )
 
-        bar_x = [position + (idx - 1) * group_width for position in x_positions]
+        center_offset = (idx - (len(series_keys) - 1) / 2.0) * group_width
+        bar_x = [position + center_offset for position in x_positions]
         latency_ax.bar(
             bar_x,
             [value or 0.0 for value in latency_values],
             width=group_width,
-            color=MODE_COLORS[mode],
-            label=MODE_LABELS[mode],
+            color=series_color(series_key),
+            label=series_label(series_key),
             alpha=0.92,
         )
         efficiency_ax.bar(
             bar_x,
             [value or 0.0 for value in efficiency_values],
             width=group_width,
-            color=MODE_COLORS[mode],
-            label=MODE_LABELS[mode],
+            color=series_color(series_key),
+            label=series_label(series_key),
             alpha=0.92,
         )
 
@@ -609,14 +676,21 @@ def plot_roofline_overview(rows, out_dir, dpi):
         return None
 
     study_colors = model_color_map(rep_rows)
-    fig, axes = plt.subplots(1, len(MODE_ORDER), figsize=(18, 6.2), sharey=True)
+    series_keys = ordered_series_keys(eligible_rows)
+    fig, axes = plt.subplots(
+        1, len(series_keys), figsize=(6 * len(series_keys), 6.2), sharey=True
+    )
+    if len(series_keys) == 1:
+        axes = [axes]
     fig.suptitle("Roofline Overview", fontsize=18, fontweight="bold", x=0.06, ha="left")
 
-    for ax, mode in zip(axes, MODE_ORDER):
-        mode_rows = [row for row in eligible_rows if row["mode"] == mode]
-        if not mode_rows:
+    for ax, series_key in zip(axes, series_keys):
+        series_rows = [
+            row for row in eligible_rows if row_series_key(row) == series_key
+        ]
+        if not series_rows:
             continue
-        for row in mode_rows:
+        for row in series_rows:
             ax.scatter(
                 row["operational_intensity_flops_per_byte"],
                 throughput_gflops_per_sec(row),
@@ -629,7 +703,7 @@ def plot_roofline_overview(rows, out_dir, dpi):
         peak_ops = max(
             (
                 row["backend_peak_ops_per_sec"]
-                for row in mode_rows
+                for row in series_rows
                 if row.get("backend_peak_ops_per_sec") is not None
             ),
             default=None,
@@ -637,7 +711,7 @@ def plot_roofline_overview(rows, out_dir, dpi):
         ddr_bytes = max(
             (
                 row["ddr_peak_bytes_per_sec"]
-                for row in mode_rows
+                for row in series_rows
                 if row.get("ddr_peak_bytes_per_sec") is not None
             ),
             default=None,
@@ -645,7 +719,7 @@ def plot_roofline_overview(rows, out_dir, dpi):
         if peak_ops is not None and ddr_bytes is not None:
             oi_values = [
                 row["operational_intensity_flops_per_byte"]
-                for row in mode_rows
+                for row in series_rows
                 if row.get("operational_intensity_flops_per_byte") is not None
                 and row["operational_intensity_flops_per_byte"] > 0.0
             ]
@@ -666,12 +740,12 @@ def plot_roofline_overview(rows, out_dir, dpi):
                     roof_ys,
                     linestyle="--",
                     linewidth=2.0,
-                    color=MODE_COLORS[mode],
+                    color=series_color(series_key),
                 )
 
         ax.set_xscale("log")
         ax.set_yscale("log")
-        ax.set_title(MODE_LABELS[mode])
+        ax.set_title(series_label(series_key))
         ax.set_xlabel("Operational Intensity (FLOPs/byte)")
         if ax is axes[0]:
             ax.set_ylabel("Throughput (GFLOPs/s)")
