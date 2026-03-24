@@ -5,8 +5,10 @@
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -74,6 +76,60 @@ def topology_name(base_topology: tuple[int, ...], suffix: str) -> str:
 
 def execution_matrix_supported(base_topology: tuple[int, ...]) -> bool:
     return base_topology != MIRRORED_LARGE_BASE_TOPOLOGY
+
+
+def test_artifacts_share_xclbin_across_ln_weight_variants(tmp_path):
+    class DummyContext:
+        def __init__(self):
+            self.operators = []
+            self.static_data_pool = {}
+            self.base_dir = Path(__file__).resolve().parents[3]
+            self.build_dir = tmp_path
+            self.device_manager = SimpleNamespace(
+                device_str=lambda: "npu2",
+                device_type="npu2",
+            )
+
+        def register_operator(self, operator, skip_add_to_list=False):
+            operator.context = self
+            if not skip_add_to_list:
+                self.operators.append(operator)
+
+    common_kwargs = dict(
+        num_heads=12,
+        seq_len=64,
+        d=64,
+        seq_tile=32,
+        kv_seq_tile=64,
+        emb_tile=96,
+        ffn_tile=64,
+        parallel_seq=2,
+        parallel_heads=2,
+        proj_acc_depth=8,
+        o_proj_acc_group_size=1,
+        ffn_down_acc_group_size=1,
+        nB_tiles_distributed=2,
+        ffn_intermediate_size=3072,
+        context=DummyContext(),
+    )
+    op_a = AIEEncoderPipeline(
+        ln1_weight=torch.ones(768, dtype=torch.bfloat16),
+        ln2_weight=torch.ones(768, dtype=torch.bfloat16),
+        **common_kwargs,
+    )
+    op_b = AIEEncoderPipeline(
+        ln1_weight=torch.full((768,), 2, dtype=torch.bfloat16),
+        ln2_weight=torch.full((768,), 3, dtype=torch.bfloat16),
+        **common_kwargs,
+    )
+
+    xclbin_a, insts_a = op_a.get_artifacts(prefix="encoder_pipeline")
+    xclbin_b, insts_b = op_b.get_artifacts(prefix="encoder_pipeline")
+
+    assert xclbin_a.path == xclbin_b.path
+    assert insts_a.path != insts_b.path
+    assert insts_a.xclbin_input is xclbin_a
+    assert insts_b.xclbin_input is xclbin_b
 
 
 def generate_test_params(base_topology: tuple[int, ...]):

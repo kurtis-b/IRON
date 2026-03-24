@@ -630,6 +630,10 @@ class ArchiveCompilationRule(CompilationRule):
             cmd = [str(ar_path), "rcs", archive_path] + object_files
 
             if self.dry_run is None:
+                # Rebuild archives from scratch so renamed object members do not
+                # leave stale symbols behind across incremental recompiles.
+                if os.path.exists(archive_path):
+                    os.remove(archive_path)
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 if result.returncode == 0:
                     logging.debug(

@@ -220,47 +220,86 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 f"(got placement key {requested_topology.key})"
             )
 
-    def _artifact_stem(self, prefix: str) -> str:
-        identity = "|".join(
-            map(
-                str,
+    def _artifact_stem(
+        self, prefix: str, include_ln_weight_digests: bool = True
+    ) -> str:
+        use_addnorm_replay_fastpath = self._use_addnorm_replay_fastpath()
+        identity_parts = [
+            prefix,
+            self.num_heads,
+            self.seq_len,
+            self.d,
+            self.seq_tile,
+            self.kv_seq_tile,
+            self.emb_tile,
+            self.ffn_tile,
+            self.parallel_seq,
+            self.parallel_heads,
+            self.proj_acc_depth,
+            self.o_proj_acc_group_size,
+            self.ffn_down_acc_group_size,
+            self.nB_tiles_distributed,
+            self.ffn_intermediate_size,
+            int(use_addnorm_replay_fastpath),
+        ]
+        if include_ln_weight_digests:
+            identity_parts.extend(
                 [
-                    prefix,
-                    self.num_heads,
-                    self.seq_len,
-                    self.d,
-                    self.seq_tile,
-                    self.kv_seq_tile,
-                    self.emb_tile,
-                    self.ffn_tile,
-                    self.parallel_seq,
-                    self.parallel_heads,
-                    self.proj_acc_depth,
-                    self.o_proj_acc_group_size,
-                    self.ffn_down_acc_group_size,
-                    self.nB_tiles_distributed,
-                    self.ffn_intermediate_size,
-                ],
+                    self._tensor_digest(self.ln1_weight),
+                    self._tensor_digest(self.ln2_weight),
+                ]
             )
-        )
+        identity = "|".join(map(str, identity_parts))
         digest = hashlib.blake2s(identity.encode(), digest_size=6).hexdigest()
         return (
             f"{prefix}_{self.num_heads}h_{self.seq_len}s_{self.emb_tile}e_"
             f"{self.ffn_tile}f_"
             f"{self.parallel_seq}ps_{self.parallel_heads}ph_{self.proj_acc_depth}pa_"
             f"{self.o_proj_acc_group_size}g_{self.ffn_down_acc_group_size}fg_"
-            f"{self.nB_tiles_distributed}pf_{digest}"
+            f"{self.nB_tiles_distributed}pf_fa{int(use_addnorm_replay_fastpath)}_{digest}"
         )
+
+    def _supports_addnorm_replay_fastpath(self) -> bool:
+        return (
+            self.seq_tile == 32
+            and self.kv_seq_tile == 64
+            and self.emb_tile == 96
+            and self.proj_acc_depth == 8
+            and (
+                (
+                    self.parallel_seq == 4
+                    and self.parallel_heads == 1
+                    and self.nB_tiles_distributed == 1
+                )
+                or (
+                    self.parallel_seq == 2
+                    and self.parallel_heads == 2
+                    and self.nB_tiles_distributed == 2
+                )
+            )
+        )
+
+    def _use_addnorm_replay_fastpath(self) -> bool:
+        disable_fastpath = os.environ.get("IRON_ENCODER_DISABLE_FASTADDNORM") == "1"
+        return self._supports_addnorm_replay_fastpath() and not disable_fastpath
+
+    @staticmethod
+    def _tensor_digest(tensor: torch.Tensor) -> str:
+        tensor_bytes = (
+            tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+        )
+        return hashlib.blake2s(tensor_bytes, digest_size=4).hexdigest()
 
     def get_artifacts(self, prefix: str = "encoder_pipeline"):
         operator_dir = Path(__file__).parent
-        file_name_base = self._artifact_stem(prefix)
+        xclbin_file_base = self._artifact_stem(prefix, include_ln_weight_digests=False)
+        insts_file_base = self._artifact_stem(prefix, include_ln_weight_digests=True)
 
         ln1_weight_file_name = (
-            self.context.build_dir / f"{file_name_base}_ln1_weight_{self.embed_sz}.npy"
+            self.context.build_dir / f"{insts_file_base}_ln1_weight_{self.embed_sz}.npy"
         )
         ln2_weight_file_name = (
-            self.context.build_dir / f"{file_name_base}_ln2_weight_{self.embed_sz}.npy"
+            self.context.build_dir / f"{insts_file_base}_ln2_weight_{self.embed_sz}.npy"
         )
         np.save(ln1_weight_file_name, torch_to_numpy(self.ln1_weight))
         np.save(ln2_weight_file_name, torch_to_numpy(self.ln2_weight))
@@ -328,15 +367,60 @@ class AIEEncoderPipeline(AIEOperatorBase):
             f"-DDIM_K={self.emb_tile}",
             f"-DDIM_N={self.ffn_tile}",
         ]
+        use_addnorm_replay_fastpath = self._use_addnorm_replay_fastpath()
+        if use_addnorm_replay_fastpath:
+            encoder_kernel_flags.append("-DBUILD_ADDNORM_REPLAY_FASTPATH")
+        encoder_kernel_object_name = (
+            f"{prefix}_encoder_{self.seq_tile}x{self.emb_tile}x{self.ffn_tile}_fastaddnorm.o"
+            if use_addnorm_replay_fastpath
+            else f"{prefix}_encoder_{self.seq_tile}x{self.emb_tile}x{self.ffn_tile}.o"
+        )
         encoder_debug_value = os.environ.get("IRON_ENCODER_DEBUG_AIE_KERNELS")
         if encoder_debug_value is not None:
             encoder_kernel_flags.append(
                 f"-DDEBUG_AIE_KERNELS={int(encoder_debug_value)}"
             )
 
-        kernel_archive = f"{file_name_base}_kernels.a"
-        mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{file_name_base}.mlir",
+        kernel_archive = (
+            f"{xclbin_file_base}_fastaddnorm_kernels.a"
+            if use_addnorm_replay_fastpath
+            else f"{xclbin_file_base}_kernels.a"
+        )
+        xclbin_mlir_artifact = PythonGeneratedMLIRArtifact.new(
+            f"{xclbin_file_base}.mlir",
+            import_path=operator_dir / "design.py",
+            callback_fn="encoder_pipeline",
+            tracked_paths=[
+                operator_dir / "design.py",
+                operator_dir / "op.py",
+                operator_dir / "placements.py",
+            ],
+            callback_kwargs={
+                "heads": self.num_heads,
+                "seq_len": self.seq_len,
+                "d": self.d,
+                "seq_tile": self.seq_tile,
+                "kv_seq_tile": self.kv_seq_tile,
+                "emb_tile": self.emb_tile,
+                "ffn_tile": self.ffn_tile,
+                "parallel_seq": self.parallel_seq,
+                "parallel_heads": self.parallel_heads,
+                "proj_acc_depth": self.proj_acc_depth,
+                "o_proj_acc_group_size": self.o_proj_acc_group_size,
+                "ffn_down_acc_group_size": self.ffn_down_acc_group_size,
+                "nB_tiles_distributed": self.nB_tiles_distributed,
+                "ffn_intermediate_size": self.ffn_intermediate_size,
+                "emulate_bf16_mmul_with_bfp16": True,
+                "kernel_archive": kernel_archive,
+                "ln1_weight_file": None,
+                "ln2_weight_file": None,
+                "trace_size": 0,
+                "use_fused_replayed_addnorm": use_addnorm_replay_fastpath,
+                "use_runtime_ln_weights": True,
+            },
+        )
+        insts_mlir_artifact = PythonGeneratedMLIRArtifact.new(
+            f"{insts_file_base}.insts.mlir",
             import_path=operator_dir / "design.py",
             callback_fn="encoder_pipeline",
             tracked_paths=[
@@ -364,13 +448,15 @@ class AIEEncoderPipeline(AIEOperatorBase):
                 "ln1_weight_file": ln1_weight_file_name,
                 "ln2_weight_file": ln2_weight_file_name,
                 "trace_size": 0,
+                "use_fused_replayed_addnorm": use_addnorm_replay_fastpath,
+                "use_runtime_ln_weights": True,
             },
         )
 
         xclbin_artifact = XclbinArtifact.new(
-            f"{file_name_base}.xclbin",
+            f"{xclbin_file_base}.xclbin",
             depends=[
-                mlir_artifact,
+                xclbin_mlir_artifact,
                 KernelArchiveArtifact.new(
                     kernel_archive,
                     depends=[
@@ -433,7 +519,7 @@ class AIEEncoderPipeline(AIEOperatorBase):
                             },
                         ),
                         KernelObjectArtifact.new(
-                            f"{prefix}_encoder_{self.seq_tile}x{self.emb_tile}x{self.ffn_tile}.o",
+                            encoder_kernel_object_name,
                             depends=[SourceArtifact.new(encoder_source)],
                             extra_flags=encoder_kernel_flags,
                         ),
@@ -443,9 +529,11 @@ class AIEEncoderPipeline(AIEOperatorBase):
             extra_flags=["--dynamic-objFifos"],
         )
         insts_artifact = InstsBinArtifact.new(
-            f"{file_name_base}.bin",
-            depends=[mlir_artifact],
+            f"{insts_file_base}.bin",
+            depends=[insts_mlir_artifact],
             extra_flags=["--dynamic-objFifos"],
+            xclbin_input=xclbin_artifact,
+            kernel_name=xclbin_artifact.kernel_name,
         )
         return xclbin_artifact, insts_artifact
 

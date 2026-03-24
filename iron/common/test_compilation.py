@@ -229,3 +229,36 @@ def test_xclbin_artifact_invalidates_when_xclbin_input_is_newer(tmp_path):
     os.utime(base_xclbin_path, (newer, newer))
 
     assert not chained_xclbin.is_available()
+
+
+def test_archive_compilation_rule_replaces_stale_members(tmp_path, monkeypatch):
+    peano_dir = tmp_path / "llvm_aie"
+    llvm_ar = peano_dir / "bin" / "llvm-ar"
+    _write_file(llvm_ar)
+
+    old_obj = tmp_path / "old_encoder.o"
+    new_obj = tmp_path / "new_encoder.o"
+    archive_path = tmp_path / "kernels.a"
+    _write_file(old_obj, "old")
+    _write_file(new_obj, "new")
+    _write_file(archive_path, "stale archive")
+
+    archive = comp.KernelArchiveArtifact.new(
+        archive_path,
+        depends=[comp.KernelObjectArtifact.new(new_obj, depends=[])],
+    )
+
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(comp.subprocess, "run", fake_run)
+
+    rule = comp.ArchiveCompilationRule(peano_dir)
+    rule.compile([archive])
+
+    assert not archive_path.exists()
+    assert captured["command"] == [str(llvm_ar), "rcs", str(archive_path), str(new_obj)]

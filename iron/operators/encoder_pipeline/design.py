@@ -425,17 +425,27 @@ def _normalize_base_placement(placement: dict) -> dict:
 def _load_ln_weights(
     embed_sz: int, ln1_weight_file: str | None, ln2_weight_file: str | None
 ) -> tuple[np.ndarray, np.ndarray]:
-    static_ln1_weights = (
-        np.ones(embed_sz, dtype=bfloat16)
-        if ln1_weight_file is None
-        else np.load(ln1_weight_file)
-    )
-    static_ln2_weights = (
-        np.ones(embed_sz, dtype=bfloat16)
-        if ln2_weight_file is None
-        else np.load(ln2_weight_file)
-    )
+    def _load_weight_file(path: str | None) -> np.ndarray:
+        if path is None:
+            return np.ones(embed_sz, dtype=bfloat16)
+        raw = np.load(path)
+        if raw.dtype == np.dtype("V2"):
+            raw = raw.view(bfloat16)
+        return np.asarray(raw, dtype=bfloat16).reshape(embed_sz)
+
+    static_ln1_weights = _load_weight_file(ln1_weight_file)
+    static_ln2_weights = _load_weight_file(ln2_weight_file)
     return static_ln1_weights, static_ln2_weights
+
+
+def _pack_ln_weights_for_runtime(weights: np.ndarray) -> np.ndarray:
+    return np.asarray(weights, dtype=np.float32).view(np.int32).copy()
+
+
+def _emit_runtime_buffer_values(buffer: Buffer, values: np.ndarray) -> None:
+    flat_values = np.asarray(values).reshape(-1)
+    for idx, value in enumerate(flat_values):
+        buffer[idx] = int(value)
 
 
 def _emit_program(rt: Runtime):
@@ -525,6 +535,8 @@ def encoder_pipeline(
     ffn_intermediate_size: int | None = None,
     o_proj_acc_group_size: int = 1,
     ffn_down_acc_group_size: int = 1,
+    use_fused_replayed_addnorm: bool = False,
+    use_runtime_ln_weights: bool = False,
 ):
     if ffn_intermediate_size is None:
         ffn_intermediate_size = 4 * heads * d
@@ -590,9 +602,11 @@ def encoder_pipeline(
     ln1_dram_stage_rows = layout["ln1_dram_stage_rows"]
     or_tensor_shape = (2 * seq_len + ln1_dram_stage_rows, embed_sz)
 
-    static_ln1_weights, static_ln2_weights = _load_ln_weights(
+    static_ln1_weights_bf16, static_ln2_weights_bf16 = _load_ln_weights(
         embed_sz, ln1_weight_file, ln2_weight_file
     )
+    static_ln1_weights = _pack_ln_weights_for_runtime(static_ln1_weights_bf16)
+    static_ln2_weights = _pack_ln_weights_for_runtime(static_ln2_weights_bf16)
 
     normalized_placement = _normalize_base_placement(placement)
     qk_tiles = normalized_placement["qk_tiles"]
@@ -643,7 +657,7 @@ def encoder_pipeline(
     ffn_up_ty = np.ndarray[(seq_tile, ffn_tile), np.dtype[dtype]]
     ffn_b_up_ty = np.ndarray[(emb_tile, ffn_tile), np.dtype[dtype]]
     ffn_b_down_ty = np.ndarray[(ffn_tile, emb_tile), np.dtype[dtype]]
-    ln_weights_ty = np.ndarray[(embed_sz,), np.dtype[dtype]]
+    ln_weights_ty = np.ndarray[(embed_sz,), np.dtype[np.int32]]
     sum_l1_ty = np.ndarray[(seq_tile,), np.dtype[np.float32]]
 
     zero_kernel = Kernel("zero_bf16", kernel_archive, [qk_ty])
@@ -712,8 +726,18 @@ def encoder_pipeline(
         kernel_archive,
         [o_ty, sum_l1_ty, sum_l1_ty],
     )
+    ln_add_calc_sum_sumsq_kernel = Kernel(
+        "ln_add_calc_sum_sumsq",
+        kernel_archive,
+        [o_ty, o_ty, sum_l1_ty, sum_l1_ty],
+    )
     ln_fused_add_layer_norm_kernel = Kernel(
-        "fused_add_layer_norm_1outs",
+        "fused_add_layer_norm_1outs_fp32weights",
+        kernel_archive,
+        [o_ty, o_ty, ln_weights_ty, sum_l1_ty, sum_l1_ty, o_ty, np.int32, np.int32],
+    )
+    ln_fused_add_layer_norm_from_inputs_kernel = Kernel(
+        "fused_add_layer_norm_1outs_from_inputs_fp32weights",
         kernel_archive,
         [o_ty, o_ty, ln_weights_ty, sum_l1_ty, sum_l1_ty, o_ty, np.int32, np.int32],
     )
@@ -1462,6 +1486,45 @@ def encoder_pipeline(
                 of_in_o_proj.release(1)
                 of_in_residual.release(1)
 
+    def core_fn_ln1_from_replayed_inputs_fused_add(
+        of_in_o_proj,
+        of_in_residual,
+        sum_buf,
+        sumsq_buf,
+        weights,
+        of_out_stage,
+        zero_f32,
+        add_calc_sum_sumsq,
+        fused_add_layer_norm_from_inputs,
+    ):
+        for _ in range_(sys.maxsize):
+            zero_f32(sum_buf, seq_tile)
+            zero_f32(sumsq_buf, seq_tile)
+            for col_idx in range_(ln_tiles_per_q_block):
+                elem_in = of_in_o_proj.acquire(1)
+                elem_residual = of_in_residual.acquire(1)
+                add_calc_sum_sumsq(elem_in, elem_residual, sum_buf, sumsq_buf)
+                of_in_o_proj.release(1)
+                of_in_residual.release(1)
+            for col_idx in range_(ln_tiles_per_q_block):
+                col_i32 = index.casts(T.i32(), col_idx)
+                elem_in = of_in_o_proj.acquire(1)
+                elem_residual = of_in_residual.acquire(1)
+                elem_out = of_out_stage.acquire(1)
+                fused_add_layer_norm_from_inputs(
+                    elem_in,
+                    elem_residual,
+                    weights,
+                    sum_buf,
+                    sumsq_buf,
+                    elem_out,
+                    embed_sz,
+                    col_i32,
+                )
+                of_out_stage.release(1)
+                of_in_o_proj.release(1)
+                of_in_residual.release(1)
+
     def core_fn_ffn_up_proj(
         of_in_a, of_in_b, of_out_c, zero, matmul_init, matmul, gelu, group_count
     ):
@@ -1726,6 +1789,47 @@ def encoder_pipeline(
                 of_in2.release(1)
                 of_in1.release(1)
 
+    def core_fn_add_norm2_from_replayed_inputs_fused_add(
+        of_in1,
+        of_in2,
+        sum_buf,
+        sumsq_buf,
+        weights,
+        of_out,
+        zero_f32,
+        add_calc_sum_sumsq,
+        fused_add_layer_norm_from_inputs,
+    ):
+        for _ in range_(sys.maxsize):
+            zero_f32(sum_buf, seq_tile)
+            zero_f32(sumsq_buf, seq_tile)
+            for _ in range_(proj_acc_depth):
+                elem_ffn = of_in1.acquire(1)
+                elem_residual = of_in2.acquire(1)
+                add_calc_sum_sumsq(elem_ffn, elem_residual, sum_buf, sumsq_buf)
+                of_in2.release(1)
+                of_in1.release(1)
+            for col_idx in range_(proj_acc_depth):
+                col_i32 = index.casts(T.i32(), col_idx)
+                elem_ffn = of_in1.acquire(1)
+                elem_residual = of_in2.acquire(1)
+                elem_out = of_out.acquire(1)
+                fused_add_layer_norm_from_inputs(
+                    elem_ffn,
+                    elem_residual,
+                    weights,
+                    sum_buf,
+                    sumsq_buf,
+                    elem_out,
+                    embed_sz,
+                    col_i32,
+                )
+                of_out.release(1)
+                of_in2.release(1)
+                of_in1.release(1)
+
+    use_fused_replayed_addnorm_for_winners = use_fused_replayed_addnorm
+
     if sequence_parallel is not None:
         default_group_shim_cols = sequence_parallel.get(
             "shim_cols",
@@ -1975,6 +2079,8 @@ def encoder_pipeline(
         lane_ffn_up_workers = []
         lane_ffn_down_workers = []
         lane_ln2_workers = []
+        lane_ln1_weight_buffers = [None] * parallel_seq
+        lane_ln2_weight_buffers = [None] * parallel_seq
 
         lane_outLN2 = [None] * parallel_seq
         grouped_o_proj_acc = (
@@ -2628,14 +2734,18 @@ def encoder_pipeline(
 
             lane_ln1_weight_buffer = Buffer(
                 type=ln_weights_ty,
-                initial_value=static_ln1_weights,
+                use_write_rtp=use_runtime_ln_weights,
+                initial_value=None if use_runtime_ln_weights else static_ln1_weights,
                 name=f"static_ln1_weights_seq_l{lane_idx}",
             )
             lane_ln2_weight_buffer = Buffer(
                 type=ln_weights_ty,
-                initial_value=static_ln2_weights,
+                use_write_rtp=use_runtime_ln_weights,
+                initial_value=None if use_runtime_ln_weights else static_ln2_weights,
                 name=f"static_ln2_weights_seq_l{lane_idx}",
             )
+            lane_ln1_weight_buffers[lane_idx] = lane_ln1_weight_buffer
+            lane_ln2_weight_buffers[lane_idx] = lane_ln2_weight_buffer
             lane_ln1_norm_sum_buffer = Buffer(
                 type=sum_l1_ty,
                 name=f"ln1_norm_sum_buffer_seq_l{lane_idx}",
@@ -2667,19 +2777,37 @@ def encoder_pipeline(
                 )
             lane_ln1_workers.append(
                 Worker(
-                    core_fn_ln1_from_replayed_inputs,
-                    fn_args=[
-                        lane_ln1_input[lane_idx].cons(),
-                        lane_in_r[lane_idx].cons(depth=1),
-                        lane_ln1_norm_sum_buffer,
-                        lane_ln1_norm_sumsq_buffer,
-                        lane_ln1_weight_buffer,
-                        lane_ln1_stage_out[lane_idx].prod(),
-                        eltwise_add_vector_kernel,
-                        ln_zero_f32_kernel,
-                        ln_calc_sum_sumsq_kernel,
-                        ln_fused_add_layer_norm_kernel,
-                    ],
+                    (
+                        core_fn_ln1_from_replayed_inputs_fused_add
+                        if use_fused_replayed_addnorm_for_winners
+                        else core_fn_ln1_from_replayed_inputs
+                    ),
+                    fn_args=(
+                        [
+                            lane_ln1_input[lane_idx].cons(),
+                            lane_in_r[lane_idx].cons(depth=1),
+                            lane_ln1_norm_sum_buffer,
+                            lane_ln1_norm_sumsq_buffer,
+                            lane_ln1_weight_buffer,
+                            lane_ln1_stage_out[lane_idx].prod(),
+                            ln_zero_f32_kernel,
+                            ln_add_calc_sum_sumsq_kernel,
+                            ln_fused_add_layer_norm_from_inputs_kernel,
+                        ]
+                        if use_fused_replayed_addnorm_for_winners
+                        else [
+                            lane_ln1_input[lane_idx].cons(),
+                            lane_in_r[lane_idx].cons(depth=1),
+                            lane_ln1_norm_sum_buffer,
+                            lane_ln1_norm_sumsq_buffer,
+                            lane_ln1_weight_buffer,
+                            lane_ln1_stage_out[lane_idx].prod(),
+                            eltwise_add_vector_kernel,
+                            ln_zero_f32_kernel,
+                            ln_calc_sum_sumsq_kernel,
+                            ln_fused_add_layer_norm_kernel,
+                        ]
+                    ),
                     placement=Tile(*lane_tail_tiles[lane_idx]["ln1"]),
                     while_true=False,
                 )
@@ -2898,19 +3026,37 @@ def encoder_pipeline(
 
             lane_ln2_workers.append(
                 Worker(
-                    core_fn_add_norm2_from_replayed_inputs,
-                    fn_args=[
-                        lane_ffn_down_out[lane_idx].cons(),
-                        lane_ffn_r_in[lane_idx].cons(),
-                        lane_ln2_sum_buffer,
-                        lane_ln2_sumsq_buffer,
-                        lane_ln2_weight_buffer,
-                        lane_outLN2[lane_idx].prod(),
-                        eltwise_add_vector_kernel,
-                        ln_zero_f32_kernel,
-                        ln_calc_sum_sumsq_kernel,
-                        ln_fused_add_layer_norm_kernel,
-                    ],
+                    (
+                        core_fn_add_norm2_from_replayed_inputs_fused_add
+                        if use_fused_replayed_addnorm_for_winners
+                        else core_fn_add_norm2_from_replayed_inputs
+                    ),
+                    fn_args=(
+                        [
+                            lane_ffn_down_out[lane_idx].cons(),
+                            lane_ffn_r_in[lane_idx].cons(),
+                            lane_ln2_sum_buffer,
+                            lane_ln2_sumsq_buffer,
+                            lane_ln2_weight_buffer,
+                            lane_outLN2[lane_idx].prod(),
+                            ln_zero_f32_kernel,
+                            ln_add_calc_sum_sumsq_kernel,
+                            ln_fused_add_layer_norm_from_inputs_kernel,
+                        ]
+                        if use_fused_replayed_addnorm_for_winners
+                        else [
+                            lane_ffn_down_out[lane_idx].cons(),
+                            lane_ffn_r_in[lane_idx].cons(),
+                            lane_ln2_sum_buffer,
+                            lane_ln2_sumsq_buffer,
+                            lane_ln2_weight_buffer,
+                            lane_outLN2[lane_idx].prod(),
+                            eltwise_add_vector_kernel,
+                            ln_zero_f32_kernel,
+                            ln_calc_sum_sumsq_kernel,
+                            ln_fused_add_layer_norm_kernel,
+                        ]
+                    ),
                     placement=Tile(*lane_tail_tiles[lane_idx]["ln2"]),
                     stack_size=0xF00,
                     while_true=False,
@@ -3269,6 +3415,16 @@ def encoder_pipeline(
             B_Up,
             B_Down,
         ):
+            if use_runtime_ln_weights:
+                for lane_idx in range(parallel_seq):
+                    rt.inline_ops(
+                        _emit_runtime_buffer_values,
+                        [lane_ln1_weight_buffers[lane_idx], static_ln1_weights],
+                    )
+                    rt.inline_ops(
+                        _emit_runtime_buffer_values,
+                        [lane_ln2_weight_buffers[lane_idx], static_ln2_weights],
+                    )
             for worker in lane_qk_workers:
                 rt.start(worker)
             for worker in lane_softmax_workers:
@@ -3595,10 +3751,16 @@ def encoder_pipeline(
         for i in range(parallel_heads)
     ]
     ln1_weight_buffer = Buffer(
-        type=ln_weights_ty, initial_value=static_ln1_weights, name="static_ln1_weights"
+        type=ln_weights_ty,
+        initial_value=None if use_runtime_ln_weights else static_ln1_weights,
+        name="static_ln1_weights",
+        use_write_rtp=use_runtime_ln_weights,
     )
     ln2_weight_buffer = Buffer(
-        type=ln_weights_ty, initial_value=static_ln2_weights, name="static_ln2_weights"
+        type=ln_weights_ty,
+        initial_value=None if use_runtime_ln_weights else static_ln2_weights,
+        name="static_ln2_weights",
+        use_write_rtp=use_runtime_ln_weights,
     )
     ln1_norm_sum_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sum_buffer")
     ln1_norm_sumsq_buffer = Buffer(type=sum_l1_ty, name="ln1_norm_sumsq_buffer")
@@ -4069,6 +4231,15 @@ def encoder_pipeline(
         B_Up,
         B_Down,
     ):
+        if use_runtime_ln_weights:
+            rt.inline_ops(
+                _emit_runtime_buffer_values,
+                [ln1_weight_buffer, static_ln1_weights],
+            )
+            rt.inline_ops(
+                _emit_runtime_buffer_values,
+                [ln2_weight_buffer, static_ln2_weights],
+            )
         for i in range(parallel_heads):
             rt.start(qk_workers[i])
             rt.start(softmax_workers[i])
