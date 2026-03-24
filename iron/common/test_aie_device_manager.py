@@ -40,3 +40,52 @@ def test_get_kernel_handle_caches_identical_requests(monkeypatch):
         ("shared.xclbin", "a.insts.bin", "kernel"),
         ("shared.xclbin", "b.insts.bin", "kernel"),
     ]
+
+
+def test_reset_recreates_runtime_and_clears_handle_cache(monkeypatch):
+    cleanup_calls = []
+    unregister_calls = []
+
+    class FakeRuntime:
+        next_device_id = 0
+
+        def __init__(self):
+            FakeRuntime.next_device_id += 1
+            self.device_id = FakeRuntime.next_device_id
+            self._device = object()
+            self._cleanup_entry = lambda: None
+            self._cleanup_insts_entry = lambda: None
+
+        def device(self):
+            return SimpleNamespace(resolve=lambda: SimpleNamespace(name="fake"))
+
+        def load(self, npu_kernel):
+            return object()
+
+        def cleanup(self):
+            cleanup_calls.append(self.device_id)
+
+    monkeypatch.setattr(
+        aie_device_manager_module,
+        "DefaultNPURuntime",
+        FakeRuntime(),
+    )
+    monkeypatch.setattr(
+        aie_device_manager_module.atexit,
+        "unregister",
+        lambda callback: unregister_calls.append(callback),
+    )
+    aie_device_manager_module.AIEDeviceManager._instance = None
+
+    manager = aie_device_manager_module.AIEDeviceManager()
+    original_runtime = manager.runtime
+    manager._kernel_handle_cache[("x", "k", "i")] = object()
+
+    manager.reset()
+
+    assert cleanup_calls == [original_runtime.device_id]
+    assert len(unregister_calls) == 2
+    assert manager.runtime is not original_runtime
+    assert manager.device is manager.runtime._device
+    assert manager.device_type.resolve().name == "fake"
+    assert manager._kernel_handle_cache == {}

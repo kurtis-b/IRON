@@ -5,15 +5,11 @@
 Global AIE Device Manager for resource sharing and cleanup
 """
 
+import atexit
 import logging
-import os
-import sys
-from pathlib import Path
-from typing import Dict, Optional, Any
 import pyxrt
 from aie.utils import DefaultNPURuntime
 from aie.utils.npukernel import NPUKernel
-from aie.iron.device import NPU1, NPU2
 
 
 class AIEDeviceManager:
@@ -34,6 +30,18 @@ class AIEDeviceManager:
         self.device_type = self.runtime.device()
         if not hasattr(self, "_kernel_handle_cache"):
             self._kernel_handle_cache = {}
+
+    def _instantiate_runtime(self):
+        """Create a fresh host-runtime instance when possible."""
+        runtime_cls = type(self.runtime)
+        try:
+            candidate = runtime_cls()
+        except Exception:
+            return self.runtime
+
+        if not all(hasattr(candidate, attr) for attr in ("_device", "device", "load")):
+            return self.runtime
+        return candidate
 
     def get_kernel_handle(self, xclbin_path: str, kernel_name: str, insts_path: str):
         """Get kernel handle using HostRuntime"""
@@ -56,5 +64,25 @@ class AIEDeviceManager:
         pass
 
     def reset(self):
-        """Reset the device manager (for debugging)"""
+        """Reset host-runtime state between tests or isolated benchmark runs."""
+        runtime = getattr(self, "runtime", None)
+        if runtime is not None:
+            for attr in ("_cleanup_entry", "_cleanup_insts_entry"):
+                cleanup_entry = getattr(runtime, attr, None)
+                if cleanup_entry is not None:
+                    try:
+                        atexit.unregister(cleanup_entry)
+                    except Exception:
+                        pass
+
+            cleanup = getattr(runtime, "cleanup", None)
+            if callable(cleanup):
+                try:
+                    cleanup()
+                except Exception:
+                    logging.exception("Failed to clean up AIE host runtime cleanly")
+
+        self.runtime = self._instantiate_runtime()
+        self.device = self.runtime._device
+        self.device_type = self.runtime.device()
         self._kernel_handle_cache = {}

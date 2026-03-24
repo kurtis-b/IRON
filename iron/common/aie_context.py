@@ -260,5 +260,6 @@ class AIEContext:
         # a second cleanup pass later and can double-free when multiple staged
         # xclbins have been loaded in one process.
         gc.collect()
+        self.device_manager.reset()
 
         self._runtime_prepared = False
