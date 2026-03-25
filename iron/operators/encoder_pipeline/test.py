@@ -12,6 +12,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from iron.common import AIEOperatorConstraintError
 from iron.common.test_utils import run_test
 from iron.operators.encoder_pipeline.design import (
     _normalize_base_placement,
@@ -23,6 +24,7 @@ from iron.operators.encoder_pipeline.design import (
     compute_num_kv_seq_blocks,
     compute_q_blocks_per_lane,
     compute_qkv_head_blocks_per_parallel_head,
+    encoder_pipeline,
 )
 from iron.operators.encoder_pipeline.op import AIEEncoderPipeline
 from iron.operators.encoder_pipeline.reference import generate_golden_reference
@@ -78,24 +80,25 @@ def execution_matrix_supported(base_topology: tuple[int, ...]) -> bool:
     return base_topology != MIRRORED_LARGE_BASE_TOPOLOGY
 
 
-def test_artifacts_share_xclbin_across_ln_weight_variants(tmp_path):
-    class DummyContext:
-        def __init__(self):
-            self.operators = []
-            self.static_data_pool = {}
-            self.base_dir = Path(__file__).resolve().parents[3]
-            self.build_dir = tmp_path
-            self.device_manager = SimpleNamespace(
-                device_str=lambda: "npu2",
-                device_type="npu2",
-            )
+class DummyContext:
+    def __init__(self, tmp_path):
+        self.operators = []
+        self.static_data_pool = {}
+        self.base_dir = Path(__file__).resolve().parents[3]
+        self.build_dir = tmp_path
+        self.device_manager = SimpleNamespace(
+            device_str=lambda: "npu2",
+            device_type="npu2",
+        )
 
-        def register_operator(self, operator, skip_add_to_list=False):
-            operator.context = self
-            if not skip_add_to_list:
-                self.operators.append(operator)
+    def register_operator(self, operator, skip_add_to_list=False):
+        operator.context = self
+        if not skip_add_to_list:
+            self.operators.append(operator)
 
-    common_kwargs = dict(
+
+def encoder_pipeline_common_kwargs(context, **overrides):
+    kwargs = dict(
         num_heads=12,
         seq_len=64,
         d=64,
@@ -110,8 +113,37 @@ def test_artifacts_share_xclbin_across_ln_weight_variants(tmp_path):
         ffn_down_acc_group_size=1,
         nB_tiles_distributed=2,
         ffn_intermediate_size=3072,
-        context=DummyContext(),
+        context=context,
     )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def render_encoder_pipeline_mlir(**overrides):
+    kwargs = dict(
+        heads=12,
+        seq_len=64,
+        d=64,
+        seq_tile=32,
+        kv_seq_tile=64,
+        emb_tile=96,
+        ffn_tile=64,
+        proj_acc_depth=8,
+        parallel_heads=1,
+        parallel_seq=1,
+        emulate_bf16_mmul_with_bfp16=True,
+        kernel_archive="dummy.a",
+        o_proj_acc_group_size=1,
+        ffn_down_acc_group_size=1,
+        nB_tiles_distributed=1,
+        ffn_intermediate_size=3072,
+    )
+    kwargs.update(overrides)
+    return str(encoder_pipeline(**kwargs))
+
+
+def test_artifacts_share_xclbin_across_ln_weight_variants(tmp_path):
+    common_kwargs = encoder_pipeline_common_kwargs(DummyContext(tmp_path))
     op_a = AIEEncoderPipeline(
         ln1_weight=torch.ones(768, dtype=torch.bfloat16),
         ln2_weight=torch.ones(768, dtype=torch.bfloat16),
@@ -130,6 +162,673 @@ def test_artifacts_share_xclbin_across_ln_weight_variants(tmp_path):
     assert insts_a.path != insts_b.path
     assert insts_a.xclbin_input is xclbin_a
     assert insts_b.xclbin_input is xclbin_b
+
+
+def test_layout_overrides_expand_xclbin_design_space(tmp_path):
+    common_kwargs = encoder_pipeline_common_kwargs(DummyContext(tmp_path))
+    default_op = AIEEncoderPipeline(**common_kwargs)
+    override_op = AIEEncoderPipeline(o_proj_fifo_depth=1, **common_kwargs)
+
+    default_xclbin, _ = default_op.get_artifacts(prefix="encoder_pipeline")
+    override_xclbin, _ = override_op.get_artifacts(prefix="encoder_pipeline")
+
+    assert default_xclbin.path != override_xclbin.path
+    assert default_xclbin.depends[0].callback_kwargs["o_proj_fifo_depth"] == 2
+    assert override_xclbin.depends[0].callback_kwargs["o_proj_fifo_depth"] == 1
+
+
+def test_explicit_addnorm_toggle_expands_xclbin_design_space(tmp_path):
+    common_kwargs = encoder_pipeline_common_kwargs(DummyContext(tmp_path))
+    default_op = AIEEncoderPipeline(**common_kwargs)
+    disabled_op = AIEEncoderPipeline(
+        use_fused_replayed_addnorm=False,
+        **common_kwargs,
+    )
+
+    default_xclbin, _ = default_op.get_artifacts(prefix="encoder_pipeline")
+    disabled_xclbin, _ = disabled_op.get_artifacts(prefix="encoder_pipeline")
+
+    assert default_xclbin.path != disabled_xclbin.path
+    assert default_xclbin.depends[0].callback_kwargs["use_fused_replayed_addnorm"]
+    assert (
+        disabled_xclbin.depends[0].callback_kwargs["use_fused_replayed_addnorm"]
+        is False
+    )
+
+
+def test_data_movement_overrides_expand_xclbin_design_space(tmp_path):
+    common_kwargs = encoder_pipeline_common_kwargs(
+        DummyContext(tmp_path),
+        seq_len=128,
+        parallel_seq=4,
+        parallel_heads=1,
+        nB_tiles_distributed=1,
+    )
+    default_op = AIEEncoderPipeline(**common_kwargs)
+    qr_split_disabled = AIEEncoderPipeline(use_unified_qr_split=False, **common_kwargs)
+    transport_groups_disabled = AIEEncoderPipeline(
+        use_transport_groups=False,
+        **common_kwargs,
+    )
+
+    default_xclbin, _ = default_op.get_artifacts(prefix="encoder_pipeline")
+    qr_split_disabled_xclbin, _ = qr_split_disabled.get_artifacts(
+        prefix="encoder_pipeline"
+    )
+    transport_groups_disabled_xclbin, _ = transport_groups_disabled.get_artifacts(
+        prefix="encoder_pipeline"
+    )
+
+    assert default_xclbin.path != qr_split_disabled_xclbin.path
+    assert default_xclbin.path != transport_groups_disabled_xclbin.path
+    assert (
+        qr_split_disabled_xclbin.depends[0].callback_kwargs["use_unified_qr_split"]
+        is False
+    )
+    assert (
+        transport_groups_disabled_xclbin.depends[0].callback_kwargs[
+            "use_transport_groups"
+        ]
+        is False
+    )
+
+
+def test_combine_qkv_projection_parameters_returns_matmul_ready_weight_and_bias():
+    query_weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    key_weight = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+    value_weight = torch.tensor([[9.0, 10.0], [11.0, 12.0]])
+    query_bias = torch.tensor([0.1, 0.2])
+    key_bias = torch.tensor([0.3, 0.4])
+    value_bias = torch.tensor([0.5, 0.6])
+
+    combined_weight, combined_bias = (
+        AIEEncoderPipeline.combine_qkv_projection_parameters(
+            query_weight,
+            key_weight,
+            value_weight,
+            query_bias,
+            key_bias,
+            value_bias,
+        )
+    )
+
+    assert tuple(combined_weight.shape) == (2, 6)
+    assert tuple(combined_bias.shape) == (6,)
+    assert torch.equal(
+        combined_weight,
+        torch.tensor(
+            [
+                [1.0, 3.0, 5.0, 7.0, 9.0, 11.0],
+                [2.0, 4.0, 6.0, 8.0, 10.0, 12.0],
+            ]
+        ),
+    )
+    assert torch.equal(
+        combined_bias,
+        torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
+    )
+
+
+def test_pack_projected_qkv_rows_matches_runtime_layout():
+    projected_qkv = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        ]
+    )
+
+    packed_qkv = AIEEncoderPipeline.pack_projected_qkv_rows(
+        projected_qkv,
+        seq_len=2,
+        embed_sz=2,
+    )
+
+    assert torch.equal(
+        packed_qkv,
+        torch.tensor(
+            [
+                [1.0, 2.0],
+                [7.0, 8.0],
+                [3.0, 4.0],
+                [9.0, 10.0],
+                [5.0, 6.0],
+                [11.0, 12.0],
+            ]
+        ),
+    )
+
+
+def test_pack_qkv_tensors_matches_runtime_layout():
+    q = torch.tensor(
+        [
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[5.0, 6.0], [7.0, 8.0]],
+        ]
+    )
+    k = q + 10.0
+    v = q + 20.0
+
+    packed_qkv = AIEEncoderPipeline.pack_qkv_tensors(
+        q,
+        k,
+        v,
+        seq_len=2,
+        num_heads=2,
+        d=2,
+    )
+
+    assert torch.equal(
+        packed_qkv,
+        torch.tensor(
+            [
+                [1.0, 2.0, 5.0, 6.0],
+                [3.0, 4.0, 7.0, 8.0],
+                [11.0, 12.0, 15.0, 16.0],
+                [13.0, 14.0, 17.0, 18.0],
+                [21.0, 22.0, 25.0, 26.0],
+                [23.0, 24.0, 27.0, 28.0],
+            ]
+        ),
+    )
+
+
+def test_split_combined_qkv_projection_parameters_recovers_split_weights_and_biases():
+    combined_weight = torch.arange(12, dtype=torch.bfloat16).view(2, 6)
+    combined_bias = torch.arange(6, dtype=torch.bfloat16)
+
+    q_weight, k_weight, v_weight, q_bias, k_bias, v_bias = (
+        AIEEncoderPipeline.split_combined_qkv_projection_parameters(
+            combined_weight,
+            combined_bias,
+        )
+    )
+
+    assert torch.equal(q_weight, combined_weight[:, :2])
+    assert torch.equal(k_weight, combined_weight[:, 2:4])
+    assert torch.equal(v_weight, combined_weight[:, 4:6])
+    assert torch.equal(q_bias, combined_bias[:2])
+    assert torch.equal(k_bias, combined_bias[2:4])
+    assert torch.equal(v_bias, combined_bias[4:6])
+
+
+def test_pack_projection_bias_tiles_match_runtime_shapes():
+    q_bias = torch.arange(4, dtype=torch.bfloat16)
+    k_bias = torch.arange(4, dtype=torch.bfloat16)
+    v_bias = torch.arange(4, dtype=torch.bfloat16)
+
+    q_tiles = AIEEncoderPipeline.pack_q_projection_bias_tiles(
+        q_bias,
+        seq_tile=2,
+        num_heads=2,
+        d=2,
+    )
+    k_tiles = AIEEncoderPipeline.pack_k_projection_bias_tiles(
+        k_bias,
+        kv_seq_tile=4,
+        num_heads=2,
+        d=2,
+    )
+    v_tiles = AIEEncoderPipeline.pack_v_projection_bias_tiles(
+        v_bias,
+        kv_seq_tile=4,
+        num_heads=2,
+        d=2,
+    )
+
+    assert tuple(q_tiles.shape) == (4, 2)
+    assert tuple(k_tiles.shape) == (4, 4)
+    assert tuple(v_tiles.shape) == (8, 2)
+    assert torch.equal(
+        q_tiles[:2], torch.tensor([[0.0, 1.0], [0.0, 1.0]], dtype=torch.bfloat16)
+    )
+    assert torch.equal(
+        k_tiles[:2],
+        torch.tensor(
+            [[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]], dtype=torch.bfloat16
+        ),
+    )
+    assert torch.equal(
+        v_tiles[:4], torch.tensor([[0.0, 1.0]] * 4, dtype=torch.bfloat16)
+    )
+
+
+def test_project_hidden_states_to_packed_qkv_uses_combined_parameters(tmp_path):
+    operator = AIEEncoderPipeline(
+        **encoder_pipeline_common_kwargs(DummyContext(tmp_path)),
+        skip_add_to_list=True,
+    )
+    operator.qkv_proj_weight = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 1.0, 2.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0, 0.0, 2.0],
+        ],
+        dtype=torch.bfloat16,
+    )
+    operator.qkv_proj_bias = torch.tensor(
+        [0.0, 0.0, 1.0, 1.0, 2.0, 2.0],
+        dtype=torch.bfloat16,
+    )
+    operator.embed_sz = 2
+    operator.seq_len = 2
+    hidden_states = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0]],
+        dtype=torch.bfloat16,
+    )
+
+    packed_qkv = operator.project_hidden_states_to_packed_qkv(hidden_states)
+
+    expected_projected = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 2.0, 4.0, 6.0],
+            [3.0, 4.0, 5.0, 4.0, 8.0, 10.0],
+        ],
+        dtype=torch.bfloat16,
+    )
+    expected_packed = AIEEncoderPipeline.pack_projected_qkv_rows(
+        expected_projected,
+        seq_len=2,
+        embed_sz=2,
+    )
+    assert torch.equal(packed_qkv, expected_packed)
+
+
+def test_staged_hidden_states_mode_supports_sequence_parallel_runtime_contract(
+    tmp_path,
+):
+    operator = AIEEncoderPipeline(
+        **encoder_pipeline_common_kwargs(
+            DummyContext(tmp_path),
+            parallel_seq=2,
+            parallel_heads=1,
+            nB_tiles_distributed=1,
+            qkv_projection_mode="staged_hidden_states",
+            static_weights=True,
+        ),
+        skip_add_to_list=True,
+    )
+    operator.xclbin_artifact = SimpleNamespace(kernel_name="encoder_pipeline_kernel")
+    operator.insts_artifact = object()
+
+    operator.set_up_runtime()
+
+    assert "QKV" not in operator.buffers
+    assert "X" in operator.buffers
+    assert operator.runlist == [
+        ("encoder_pipeline", "W_ATTN", "X", "OR", "B_Up", "B_Down")
+    ]
+    assert operator._or_buffer_shape() == (5 * operator.seq_len, operator.embed_sz)
+
+
+def test_staged_hidden_states_mode_supports_sequence_parallel_parallel_heads_two_runtime_contract(
+    tmp_path,
+):
+    operator = AIEEncoderPipeline(
+        **encoder_pipeline_common_kwargs(
+            DummyContext(tmp_path),
+            parallel_seq=2,
+            parallel_heads=2,
+            nB_tiles_distributed=1,
+            qkv_projection_mode="staged_hidden_states",
+            static_weights=True,
+        ),
+        skip_add_to_list=True,
+    )
+    operator.xclbin_artifact = SimpleNamespace(kernel_name="encoder_pipeline_kernel")
+    operator.insts_artifact = object()
+
+    operator.set_up_runtime()
+
+    assert "QKV" not in operator.buffers
+    assert "X" in operator.buffers
+    assert operator.runlist == [
+        ("encoder_pipeline", "W_ATTN", "X", "OR", "B_Up", "B_Down")
+    ]
+    assert operator._or_buffer_shape() == (5 * operator.seq_len, operator.embed_sz)
+
+
+def test_staged_hidden_states_mode_supports_parallel_heads_two_runtime_contract(
+    tmp_path,
+):
+    operator = AIEEncoderPipeline(
+        **encoder_pipeline_common_kwargs(
+            DummyContext(tmp_path),
+            parallel_seq=1,
+            parallel_heads=2,
+            nB_tiles_distributed=1,
+            qkv_projection_mode="staged_hidden_states",
+            static_weights=True,
+        ),
+        skip_add_to_list=True,
+    )
+    operator.xclbin_artifact = SimpleNamespace(kernel_name="encoder_pipeline_kernel")
+    operator.insts_artifact = object()
+
+    operator.set_up_runtime()
+
+    assert "QKV" not in operator.buffers
+    assert "X" in operator.buffers
+    assert operator.runlist == [
+        ("encoder_pipeline", "W_ATTN", "X", "OR", "B_Up", "B_Down")
+    ]
+
+
+def test_staged_hidden_states_mode_supports_two_ffn_branches_runtime_contract(
+    tmp_path,
+):
+    operator = AIEEncoderPipeline(
+        **encoder_pipeline_common_kwargs(
+            DummyContext(tmp_path),
+            parallel_seq=1,
+            parallel_heads=1,
+            nB_tiles_distributed=2,
+            qkv_projection_mode="staged_hidden_states",
+            static_weights=True,
+        ),
+        skip_add_to_list=True,
+    )
+    operator.xclbin_artifact = SimpleNamespace(kernel_name="encoder_pipeline_kernel")
+    operator.insts_artifact = object()
+
+    operator.set_up_runtime()
+
+    assert "QKV" not in operator.buffers
+    assert "X" in operator.buffers
+    assert operator.runlist == [
+        ("encoder_pipeline", "W_ATTN", "X", "OR", "B_Up", "B_Down")
+    ]
+
+
+def test_staged_hidden_states_mode_rejects_parallel_heads_over_two(tmp_path):
+    with pytest.raises(
+        AIEOperatorConstraintError,
+        match="staged_hidden_states QKV projection currently supports parallel_heads <= 2",
+    ):
+        AIEEncoderPipeline(
+            **encoder_pipeline_common_kwargs(
+                DummyContext(tmp_path),
+                parallel_seq=1,
+                parallel_heads=4,
+                nB_tiles_distributed=1,
+                qkv_projection_mode="staged_hidden_states",
+            ),
+            skip_add_to_list=True,
+        )
+
+
+def test_staged_hidden_states_runtime_contract_omits_qkv_bo(tmp_path):
+    operator = AIEEncoderPipeline(
+        **encoder_pipeline_common_kwargs(
+            DummyContext(tmp_path),
+            parallel_seq=1,
+            parallel_heads=1,
+            nB_tiles_distributed=1,
+            qkv_projection_mode="staged_hidden_states",
+            static_weights=True,
+        ),
+        skip_add_to_list=True,
+    )
+    operator.xclbin_artifact = SimpleNamespace(kernel_name="encoder_pipeline_kernel")
+    operator.insts_artifact = object()
+
+    operator.set_up_runtime()
+
+    assert "QKV" not in operator.buffers
+    assert "X" in operator.buffers
+    expected_or_rows_before_ln1_stage = (
+        3 * operator.seq_len
+        if operator._uses_staged_hidden_state_kv_cache()
+        else operator.seq_len
+    )
+    assert operator._or_buffer_shape() == (
+        expected_or_rows_before_ln1_stage + operator.proj_acc_depth * operator.seq_tile,
+        operator.embed_sz,
+    )
+    assert operator.runlist == [
+        ("encoder_pipeline", "W_ATTN", "X", "OR", "B_Up", "B_Down")
+    ]
+
+
+def test_staged_hidden_states_mlir_generation_supports_seq512():
+    mlir = render_encoder_pipeline_mlir(
+        seq_len=512,
+        qkv_projection_mode="staged_hidden_states",
+    )
+
+    assert "memref<512x768xbf16>" in mlir
+
+
+def test_staged_hidden_states_seq8192_splits_long_kv_dma_fills():
+    mlir = render_encoder_pipeline_mlir(
+        seq_len=8192,
+        qkv_projection_mode="staged_hidden_states",
+    )
+
+    assert "<size = 128, stride = 49152>" not in mlir
+    assert "<size = 64, stride = 49152>" in mlir
+
+
+def test_staged_hidden_states_seq8192_supports_parallel_heads_two_mlir_generation():
+    mlir = render_encoder_pipeline_mlir(
+        seq_len=8192,
+        parallel_heads=2,
+        qkv_projection_mode="staged_hidden_states",
+    )
+
+    assert "memref<8192x768xbf16>" in mlir
+
+
+def test_staged_hidden_states_seq128_supports_two_ffn_branches_mlir_generation():
+    mlir = render_encoder_pipeline_mlir(
+        seq_len=128,
+        parallel_seq=1,
+        parallel_heads=1,
+        nB_tiles_distributed=2,
+        qkv_projection_mode="staged_hidden_states",
+    )
+
+    assert "memref<128x768xbf16>" in mlir
+
+
+def test_staged_hidden_states_seq128_supports_sequence_parallel_mlir_generation():
+    mlir = render_encoder_pipeline_mlir(
+        seq_len=128,
+        parallel_seq=2,
+        parallel_heads=1,
+        nB_tiles_distributed=1,
+        qkv_projection_mode="staged_hidden_states",
+    )
+
+    assert "memref<128x768xbf16>" in mlir
+
+
+def test_staged_hidden_states_seq128_supports_sequence_parallel_parallel_heads_two_mlir_generation():
+    mlir = render_encoder_pipeline_mlir(
+        seq_len=128,
+        parallel_seq=2,
+        parallel_heads=2,
+        nB_tiles_distributed=1,
+        qkv_projection_mode="staged_hidden_states",
+    )
+
+    assert "memref<128x768xbf16>" in mlir
+
+
+def test_staged_hidden_states_seq8192_supports_sequence_parallel_mlir_generation():
+    mlir = render_encoder_pipeline_mlir(
+        seq_len=8192,
+        parallel_seq=2,
+        parallel_heads=1,
+        nB_tiles_distributed=1,
+        qkv_projection_mode="staged_hidden_states",
+    )
+
+    assert "memref<8192x768xbf16>" in mlir
+    assert "<size = 64, stride = 49152>" in mlir
+
+
+def test_staged_hidden_states_seq8192_supports_sequence_parallel_parallel_heads_two_mlir_generation():
+    mlir = render_encoder_pipeline_mlir(
+        seq_len=8192,
+        parallel_seq=2,
+        parallel_heads=2,
+        nB_tiles_distributed=1,
+        qkv_projection_mode="staged_hidden_states",
+    )
+
+    assert "memref<8192x768xbf16>" in mlir
+
+
+def test_staged_hidden_states_rejects_external_residual(tmp_path):
+    operator = AIEEncoderPipeline(
+        **encoder_pipeline_common_kwargs(
+            DummyContext(tmp_path),
+            parallel_seq=1,
+            parallel_heads=1,
+            nB_tiles_distributed=1,
+            qkv_projection_mode="staged_hidden_states",
+            static_weights=True,
+        ),
+        skip_add_to_list=True,
+    )
+    hidden_states = torch.zeros(
+        (operator.seq_len, operator.embed_sz), dtype=torch.bfloat16
+    )
+
+    with pytest.raises(
+        AIEOperatorConstraintError,
+        match="derives the initial residual from hidden_states internally",
+    ):
+        operator.forward_hidden_states(hidden_states, r=hidden_states)
+
+
+def test_forward_defaults_to_hidden_states_path(tmp_path, monkeypatch):
+    operator = AIEEncoderPipeline(
+        **encoder_pipeline_common_kwargs(DummyContext(tmp_path)),
+        skip_add_to_list=True,
+    )
+    hidden_states = torch.zeros(
+        (operator.seq_len, operator.embed_sz), dtype=torch.bfloat16
+    )
+    seen = {}
+
+    def fake_forward_hidden_states(tensor, **kwargs):
+        seen["hidden_states"] = tensor
+        seen["kwargs"] = kwargs
+        return "hidden-states-path"
+
+    monkeypatch.setattr(operator, "forward_hidden_states", fake_forward_hidden_states)
+
+    result = operator.forward(hidden_states, r=hidden_states)
+
+    assert result == "hidden-states-path"
+    assert torch.equal(seen["hidden_states"], hidden_states)
+    assert torch.equal(seen["kwargs"]["r"], hidden_states)
+
+
+def test_forward_uses_split_qkv_compatibility_path(tmp_path, monkeypatch):
+    operator = AIEEncoderPipeline(
+        **encoder_pipeline_common_kwargs(DummyContext(tmp_path)),
+        skip_add_to_list=True,
+    )
+    q = torch.zeros(
+        (operator.num_heads, operator.seq_len, operator.d), dtype=torch.bfloat16
+    )
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    residual = torch.zeros((operator.seq_len, operator.embed_sz), dtype=torch.bfloat16)
+    seen = {}
+
+    def fake_forward_split_qkv(q_tensor, k_tensor, v_tensor, **kwargs):
+        seen["q"] = q_tensor
+        seen["k"] = k_tensor
+        seen["v"] = v_tensor
+        seen["kwargs"] = kwargs
+        return "split-qkv-path"
+
+    monkeypatch.setattr(operator, "forward_split_qkv", fake_forward_split_qkv)
+
+    result = operator.forward(q, k, v, r=residual)
+
+    assert result == "split-qkv-path"
+    assert torch.equal(seen["q"], q)
+    assert torch.equal(seen["k"], k)
+    assert torch.equal(seen["v"], v)
+    assert torch.equal(seen["kwargs"]["r"], residual)
+
+
+def test_invalid_layout_override_is_rejected():
+    with pytest.raises(
+        AIEOperatorConstraintError,
+        match="encoder_pipeline requires o_proj_fifo_depth > 0",
+    ):
+        AIEEncoderPipeline(
+            num_heads=12,
+            seq_len=64,
+            d=64,
+            seq_tile=32,
+            kv_seq_tile=64,
+            emb_tile=96,
+            ffn_tile=64,
+            parallel_seq=2,
+            parallel_heads=2,
+            proj_acc_depth=8,
+            o_proj_acc_group_size=1,
+            ffn_down_acc_group_size=1,
+            nB_tiles_distributed=2,
+            ffn_intermediate_size=3072,
+            o_proj_fifo_depth=0,
+            skip_add_to_list=True,
+        )
+
+
+def test_unsupported_explicit_addnorm_replay_is_rejected():
+    with pytest.raises(
+        AIEOperatorConstraintError,
+        match="encoder_pipeline only supports use_fused_replayed_addnorm=True",
+    ):
+        AIEEncoderPipeline(
+            num_heads=12,
+            seq_len=64,
+            d=64,
+            seq_tile=32,
+            kv_seq_tile=64,
+            emb_tile=96,
+            ffn_tile=64,
+            parallel_seq=1,
+            parallel_heads=1,
+            proj_acc_depth=8,
+            o_proj_acc_group_size=1,
+            ffn_down_acc_group_size=1,
+            nB_tiles_distributed=1,
+            ffn_intermediate_size=3072,
+            use_fused_replayed_addnorm=True,
+            skip_add_to_list=True,
+        )
+
+
+def test_unsupported_data_movement_override_is_rejected():
+    with pytest.raises(
+        AIEOperatorConstraintError,
+        match="encoder_pipeline only supports use_unified_qr_split",
+    ):
+        AIEEncoderPipeline(
+            num_heads=12,
+            seq_len=64,
+            d=64,
+            seq_tile=32,
+            kv_seq_tile=64,
+            emb_tile=96,
+            ffn_tile=64,
+            parallel_seq=2,
+            parallel_heads=2,
+            proj_acc_depth=8,
+            o_proj_acc_group_size=1,
+            ffn_down_acc_group_size=1,
+            nB_tiles_distributed=2,
+            ffn_intermediate_size=3072,
+            use_unified_qr_split=False,
+            skip_add_to_list=True,
+        )
 
 
 def generate_test_params(base_topology: tuple[int, ...]):

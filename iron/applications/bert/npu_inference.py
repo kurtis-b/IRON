@@ -272,6 +272,9 @@ def current_topology_from_config(config, seq_len):
 
 
 def topology_id(topology):
+    topology_id_value = getattr(topology, "topology_id", None)
+    if topology_id_value is not None:
+        return str(topology_id_value)
     return load_encoder_pipeline_topology_module().topology_id(topology)
 
 

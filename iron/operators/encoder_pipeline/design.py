@@ -6,12 +6,15 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
 from ml_dtypes import bfloat16
 
+import aie.dialects.arith as arith
 import aie.dialects.index as index
+import aie.extras.types as T
 from aie.dialects.aiex import *
 from aie.helpers.dialects.scf import if_, else_
 from aie.helpers.taplib import TensorAccessPattern, TensorAccessSequence, TensorTiler2D
@@ -102,6 +105,18 @@ def assert_tap_iteration_count(
         raise ValueError(message)
 
 
+def repeat_outer_tap(
+    tap: TensorAccessPattern, tensor_shape: tuple[int, ...], repeat_count: int
+) -> TensorAccessPattern:
+    repeated_outer_size = int(tap.sizes[0]) * repeat_count
+    return TensorAccessPattern(
+        tensor_shape,
+        offset=int(tap.offset),
+        sizes=[repeated_outer_size, *[int(s) for s in tap.sizes[1:]]],
+        strides=[0, *[int(s) for s in tap.strides[1:]]],
+    )
+
+
 def _resolve_topology_placement(
     heads: int,
     seq_len: int,
@@ -115,6 +130,11 @@ def _resolve_topology_placement(
     proj_acc_depth: int,
     nB_tiles_distributed: int,
     ffn_intermediate_size: int,
+    use_transport_groups: bool | None = None,
+    use_unified_qr_split: bool | None = None,
+    use_explicit_o_proj_stage_mem_cols: bool | None = None,
+    use_explicit_ffn_down_acc_mem_cols: bool | None = None,
+    use_explicit_ffn_down_stage_mem_cols: bool | None = None,
 ) -> tuple[dict, dict | None]:
     topology = topology_from_fields(
         num_heads=heads,
@@ -137,7 +157,85 @@ def _resolve_topology_placement(
             "encoder_pipeline only supports hardcoded placement topologies "
             f"{sorted(topology_placements)} (got placement key {topology.key})"
         )
-    placement = topology_placements[topology.key]
+    placement = deepcopy(topology_placements[topology.key])
+    sequence_parallel = placement["sequence_parallel"]
+    if sequence_parallel is None:
+        if (
+            use_transport_groups is not None
+            or use_unified_qr_split is not None
+            or use_explicit_o_proj_stage_mem_cols is not None
+            or use_explicit_ffn_down_acc_mem_cols is not None
+            or use_explicit_ffn_down_stage_mem_cols is not None
+        ):
+            raise ValueError(
+                "encoder_pipeline data-movement overrides require a "
+                "sequence-parallel placement"
+            )
+        return placement, sequence_parallel
+
+    if use_transport_groups is not None:
+        transport_groups = sequence_parallel.get("transport_groups")
+        if transport_groups is None or len(transport_groups) <= 1:
+            raise ValueError(
+                "encoder_pipeline use_transport_groups override requires a "
+                "sequence-parallel placement with multiple transport groups"
+            )
+        if not use_transport_groups:
+            sequence_parallel = dict(sequence_parallel)
+            sequence_parallel.pop("transport_groups", None)
+            placement["sequence_parallel"] = sequence_parallel
+
+    if use_unified_qr_split is not None:
+        unified_qr_split = sequence_parallel.get("unified_qr_split")
+        if unified_qr_split is None:
+            raise ValueError(
+                "encoder_pipeline use_unified_qr_split override requires a "
+                "sequence-parallel placement that defines unified_qr_split"
+            )
+        if not use_unified_qr_split:
+            sequence_parallel = dict(sequence_parallel)
+            sequence_parallel.pop("unified_qr_split", None)
+            placement["sequence_parallel"] = sequence_parallel
+
+    if use_explicit_o_proj_stage_mem_cols is not None:
+        explicit_cols = sequence_parallel.get("lane_o_proj_stage_mem_cols")
+        if explicit_cols is None:
+            raise ValueError(
+                "encoder_pipeline use_explicit_o_proj_stage_mem_cols override "
+                "requires a sequence-parallel placement that defines "
+                "lane_o_proj_stage_mem_cols"
+            )
+        if not use_explicit_o_proj_stage_mem_cols:
+            sequence_parallel = dict(sequence_parallel)
+            sequence_parallel.pop("lane_o_proj_stage_mem_cols", None)
+            placement["sequence_parallel"] = sequence_parallel
+
+    if use_explicit_ffn_down_acc_mem_cols is not None:
+        explicit_cols = sequence_parallel.get("lane_ffn_down_acc_mem_cols")
+        if explicit_cols is None:
+            raise ValueError(
+                "encoder_pipeline use_explicit_ffn_down_acc_mem_cols override "
+                "requires a sequence-parallel placement that defines "
+                "lane_ffn_down_acc_mem_cols"
+            )
+        if not use_explicit_ffn_down_acc_mem_cols:
+            sequence_parallel = dict(sequence_parallel)
+            sequence_parallel.pop("lane_ffn_down_acc_mem_cols", None)
+            placement["sequence_parallel"] = sequence_parallel
+
+    if use_explicit_ffn_down_stage_mem_cols is not None:
+        explicit_cols = sequence_parallel.get("lane_ffn_down_stage_mem_cols")
+        if explicit_cols is None:
+            raise ValueError(
+                "encoder_pipeline use_explicit_ffn_down_stage_mem_cols override "
+                "requires a sequence-parallel placement that defines "
+                "lane_ffn_down_stage_mem_cols"
+            )
+        if not use_explicit_ffn_down_stage_mem_cols:
+            sequence_parallel = dict(sequence_parallel)
+            sequence_parallel.pop("lane_ffn_down_stage_mem_cols", None)
+            placement["sequence_parallel"] = sequence_parallel
+
     return placement, placement["sequence_parallel"]
 
 
@@ -223,6 +321,12 @@ def _derive_encoder_pipeline_layout(
     o_proj_acc_group_size: int,
     ffn_down_acc_group_size: int,
     emulate_bf16_mmul_with_bfp16: bool,
+    weight_forward_depth: int | None = None,
+    o_proj_fifo_depth: int | None = None,
+    ffn_replay_fifo_depth: int | None = None,
+    ffn_up_consumer_depth: int | None = None,
+    ffn_up_out_depth: int | None = None,
+    ffn_down_output_producer_depth: int | None = None,
 ) -> dict:
     if trace_size != 0:
         raise ValueError("encoder_pipeline does not support tracing")
@@ -272,13 +376,39 @@ def _derive_encoder_pipeline_layout(
     of_depth = 2
     o_tile_bytes = seq_tile * emb_tile * np.dtype(dtype).itemsize
     large_activation_tile = emb_tile >= 128 or o_tile_bytes > 8192
-    weight_forward_depth = 1 if large_activation_tile else (2 if ffn_tile <= 64 else 1)
-    o_proj_fifo_depth = 1 if large_activation_tile else of_depth
+    weight_forward_depth_default = (
+        1 if large_activation_tile else (2 if ffn_tile <= 64 else 1)
+    )
+    o_proj_fifo_depth_default = 1 if large_activation_tile else of_depth
+    ffn_replay_fifo_depth_default = 1 if large_activation_tile else 2
+    ffn_up_consumer_depth_default = 1 if large_activation_tile else 2
+    ffn_up_out_depth_default = 1 if large_activation_tile else 2
+    ffn_down_output_producer_depth_default = 1 if large_activation_tile else 2
+    weight_forward_depth = _resolve_positive_layout_override(
+        "weight_forward_depth", weight_forward_depth, weight_forward_depth_default
+    )
+    o_proj_fifo_depth = _resolve_positive_layout_override(
+        "o_proj_fifo_depth", o_proj_fifo_depth, o_proj_fifo_depth_default
+    )
     o_proj_weight_consumer_depth = o_proj_fifo_depth
-    ffn_replay_fifo_depth = 1 if large_activation_tile else 2
-    ffn_up_consumer_depth = 1 if large_activation_tile else 2
-    ffn_up_out_depth = 1 if large_activation_tile else 2
-    ffn_down_output_producer_depth = 1 if large_activation_tile else 2
+    ffn_replay_fifo_depth = _resolve_positive_layout_override(
+        "ffn_replay_fifo_depth",
+        ffn_replay_fifo_depth,
+        ffn_replay_fifo_depth_default,
+    )
+    ffn_up_consumer_depth = _resolve_positive_layout_override(
+        "ffn_up_consumer_depth",
+        ffn_up_consumer_depth,
+        ffn_up_consumer_depth_default,
+    )
+    ffn_up_out_depth = _resolve_positive_layout_override(
+        "ffn_up_out_depth", ffn_up_out_depth, ffn_up_out_depth_default
+    )
+    ffn_down_output_producer_depth = _resolve_positive_layout_override(
+        "ffn_down_output_producer_depth",
+        ffn_down_output_producer_depth,
+        ffn_down_output_producer_depth_default,
+    )
     ln1_broadcast_groups = compute_ln1_broadcast_groups(ffn_intermediate_size, ffn_tile)
     effective_ffn_branches = len(placement["tail_tiles"]["ffn_up_by_branch"])
     if effective_ffn_branches != nB_tiles_distributed:
@@ -385,6 +515,19 @@ def _normalize_slot_mem_cols(value, expected_count, name):
     return [int(col) for col in value]
 
 
+def _resolve_positive_layout_override(name, value, default):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError(
+            f"encoder_pipeline requires {name} to be an integer > 0 (got {value})"
+        )
+    normalized = int(value)
+    if normalized <= 0:
+        raise ValueError(f"encoder_pipeline requires {name} > 0 (got {normalized})")
+    return normalized
+
+
 def _normalize_base_placement(placement: dict) -> dict:
     return {
         "qk_tiles": [Tile(col=col, row=2) for col in placement["mha_cols"]],
@@ -438,14 +581,41 @@ def _load_ln_weights(
     return static_ln1_weights, static_ln2_weights
 
 
+def _load_staged_projection_biases(
+    *,
+    heads: int,
+    d: int,
+    q_proj_bias_file: str | None,
+    k_proj_bias_file: str | None,
+    v_proj_bias_file: str | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _load_bias_file(path: str | None, expected_shape: tuple[int]) -> np.ndarray:
+        if path is None:
+            return np.zeros(expected_shape, dtype=bfloat16)
+        raw = np.load(path)
+        if raw.dtype == np.dtype("V2"):
+            raw = raw.view(bfloat16)
+        return np.asarray(raw, dtype=bfloat16).reshape(expected_shape)
+
+    return (
+        _load_bias_file(q_proj_bias_file, (heads * d,)),
+        _load_bias_file(k_proj_bias_file, (heads * d,)),
+        _load_bias_file(v_proj_bias_file, (heads * d,)),
+    )
+
+
 def _pack_ln_weights_for_runtime(weights: np.ndarray) -> np.ndarray:
     return np.asarray(weights, dtype=np.float32).view(np.int32).copy()
 
 
 def _emit_runtime_buffer_values(buffer: Buffer, values: np.ndarray) -> None:
     flat_values = np.asarray(values).reshape(-1)
+    shape = tuple(int(dim) for dim in getattr(buffer, "shape", (len(flat_values),)))
     for idx, value in enumerate(flat_values):
-        buffer[idx] = int(value)
+        if len(shape) == 1:
+            buffer[idx] = int(value)
+        else:
+            buffer[np.unravel_index(idx, shape)] = int(value)
 
 
 def _emit_program(rt: Runtime):
@@ -480,6 +650,50 @@ def main():
     argparser.add_argument("--trace-size", type=int, default=0)
     argparser.add_argument("--ln1-weight-file", type=str, default=None)
     argparser.add_argument("--ln2-weight-file", type=str, default=None)
+    argparser.add_argument("--weight-forward-depth", type=int, default=None)
+    argparser.add_argument("--o-proj-fifo-depth", type=int, default=None)
+    argparser.add_argument("--ffn-replay-fifo-depth", type=int, default=None)
+    argparser.add_argument("--ffn-up-consumer-depth", type=int, default=None)
+    argparser.add_argument("--ffn-up-out-depth", type=int, default=None)
+    argparser.add_argument("--ffn-down-output-producer-depth", type=int, default=None)
+    argparser.add_argument(
+        "--use-fused-replayed-addnorm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    argparser.add_argument(
+        "--use-transport-groups",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    argparser.add_argument(
+        "--use-unified-qr-split",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    argparser.add_argument(
+        "--use-explicit-o-proj-stage-mem-cols",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    argparser.add_argument(
+        "--use-explicit-ffn-down-acc-mem-cols",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    argparser.add_argument(
+        "--use-explicit-ffn-down-stage-mem-cols",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    argparser.add_argument(
+        "--qkv-projection-mode",
+        type=str,
+        default="packed_input",
+    )
+    argparser.add_argument("--q-proj-bias-file", type=str, default=None)
+    argparser.add_argument("--k-proj-bias-file", type=str, default=None)
+    argparser.add_argument("--v-proj-bias-file", type=str, default=None)
     argparser.add_argument(
         "--output-file-path",
         "-o",
@@ -508,6 +722,22 @@ def main():
         ffn_intermediate_size=args.ffn_intermediate_size,
         o_proj_acc_group_size=args.o_proj_acc_group_size,
         ffn_down_acc_group_size=args.ffn_down_acc_group_size,
+        weight_forward_depth=args.weight_forward_depth,
+        o_proj_fifo_depth=args.o_proj_fifo_depth,
+        ffn_replay_fifo_depth=args.ffn_replay_fifo_depth,
+        ffn_up_consumer_depth=args.ffn_up_consumer_depth,
+        ffn_up_out_depth=args.ffn_up_out_depth,
+        ffn_down_output_producer_depth=args.ffn_down_output_producer_depth,
+        use_fused_replayed_addnorm=args.use_fused_replayed_addnorm,
+        use_transport_groups=args.use_transport_groups,
+        use_unified_qr_split=args.use_unified_qr_split,
+        use_explicit_o_proj_stage_mem_cols=args.use_explicit_o_proj_stage_mem_cols,
+        use_explicit_ffn_down_acc_mem_cols=args.use_explicit_ffn_down_acc_mem_cols,
+        use_explicit_ffn_down_stage_mem_cols=args.use_explicit_ffn_down_stage_mem_cols,
+        qkv_projection_mode=args.qkv_projection_mode,
+        q_proj_bias_file=args.q_proj_bias_file,
+        k_proj_bias_file=args.k_proj_bias_file,
+        v_proj_bias_file=args.v_proj_bias_file,
     )
 
     output_file_path = Path(args.output_file_path)
@@ -535,9 +765,30 @@ def encoder_pipeline(
     ffn_intermediate_size: int | None = None,
     o_proj_acc_group_size: int = 1,
     ffn_down_acc_group_size: int = 1,
+    weight_forward_depth: int | None = None,
+    o_proj_fifo_depth: int | None = None,
+    ffn_replay_fifo_depth: int | None = None,
+    ffn_up_consumer_depth: int | None = None,
+    ffn_up_out_depth: int | None = None,
+    ffn_down_output_producer_depth: int | None = None,
     use_fused_replayed_addnorm: bool = False,
+    use_transport_groups: bool | None = None,
+    use_unified_qr_split: bool | None = None,
+    use_explicit_o_proj_stage_mem_cols: bool | None = None,
+    use_explicit_ffn_down_acc_mem_cols: bool | None = None,
+    use_explicit_ffn_down_stage_mem_cols: bool | None = None,
+    qkv_projection_mode: str = "packed_input",
+    q_proj_bias_file: str | None = None,
+    k_proj_bias_file: str | None = None,
+    v_proj_bias_file: str | None = None,
     use_runtime_ln_weights: bool = False,
 ):
+    if qkv_projection_mode not in {"packed_input", "staged_hidden_states"}:
+        raise ValueError(
+            "encoder_pipeline qkv_projection_mode must be one of "
+            "{'packed_input', 'staged_hidden_states'} "
+            f"(got {qkv_projection_mode!r})"
+        )
     if ffn_intermediate_size is None:
         ffn_intermediate_size = 4 * heads * d
     if ffn_tile is None:
@@ -556,7 +807,30 @@ def encoder_pipeline(
         proj_acc_depth,
         nB_tiles_distributed,
         ffn_intermediate_size,
+        use_transport_groups,
+        use_unified_qr_split,
+        use_explicit_o_proj_stage_mem_cols,
+        use_explicit_ffn_down_acc_mem_cols,
+        use_explicit_ffn_down_stage_mem_cols,
     )
+    use_staged_hidden_state_projection = qkv_projection_mode == "staged_hidden_states"
+    if (
+        use_staged_hidden_state_projection
+        and sequence_parallel is not None
+        and (parallel_heads > 2 or nB_tiles_distributed != 1)
+    ):
+        raise ValueError(
+            "encoder_pipeline staged_hidden_states sequence-parallel projection "
+            "currently requires parallel_heads <= 2 and nB_tiles_distributed=1 "
+            f"(got parallel_heads={parallel_heads}, "
+            f"nB_tiles_distributed={nB_tiles_distributed})"
+        )
+    if use_staged_hidden_state_projection and parallel_heads > 2:
+        raise ValueError(
+            "encoder_pipeline staged_hidden_states QKV projection currently "
+            "supports parallel_heads <= 2 "
+            f"(got parallel_heads={parallel_heads})"
+        )
     layout = _derive_encoder_pipeline_layout(
         heads,
         seq_len,
@@ -576,6 +850,12 @@ def encoder_pipeline(
         o_proj_acc_group_size,
         ffn_down_acc_group_size,
         emulate_bf16_mmul_with_bfp16,
+        weight_forward_depth,
+        o_proj_fifo_depth,
+        ffn_replay_fifo_depth,
+        ffn_up_consumer_depth,
+        ffn_up_out_depth,
+        ffn_down_output_producer_depth,
     )
     embed_sz = layout["embed_sz"]
     num_q_seq_blocks = layout["num_q_seq_blocks"]
@@ -600,13 +880,41 @@ def encoder_pipeline(
     ffn_col_group_count = layout["ffn_col_group_count"]
     ln_tiles_per_q_block = layout["ln_tiles_per_q_block"]
     ln1_dram_stage_rows = layout["ln1_dram_stage_rows"]
-    or_tensor_shape = (2 * seq_len + ln1_dram_stage_rows, embed_sz)
+    use_staged_hidden_state_kv_cache = False
+    # The staged hidden-state path currently keeps direct K/V streaming for all
+    # supported topologies. The earlier OR-backed K/V cache path is pruned
+    # because it is not functionally stable at longer sequence lengths.
+    or_rows_before_ln1_stage = (
+        3 * seq_len
+        if use_staged_hidden_state_kv_cache
+        else (
+            4 * seq_len
+            if (use_staged_hidden_state_projection and sequence_parallel is not None)
+            else (seq_len if use_staged_hidden_state_projection else 2 * seq_len)
+        )
+    )
+    or_tensor_shape = (or_rows_before_ln1_stage + ln1_dram_stage_rows, embed_sz)
 
     static_ln1_weights_bf16, static_ln2_weights_bf16 = _load_ln_weights(
         embed_sz, ln1_weight_file, ln2_weight_file
     )
     static_ln1_weights = _pack_ln_weights_for_runtime(static_ln1_weights_bf16)
     static_ln2_weights = _pack_ln_weights_for_runtime(static_ln2_weights_bf16)
+    static_q_proj_biases = None
+    static_k_proj_biases = None
+    static_v_proj_biases = None
+    if use_staged_hidden_state_projection:
+        (
+            static_q_proj_biases,
+            static_k_proj_biases,
+            static_v_proj_biases,
+        ) = _load_staged_projection_biases(
+            heads=heads,
+            d=d,
+            q_proj_bias_file=q_proj_bias_file,
+            k_proj_bias_file=k_proj_bias_file,
+            v_proj_bias_file=v_proj_bias_file,
+        )
 
     normalized_placement = _normalize_base_placement(placement)
     qk_tiles = normalized_placement["qk_tiles"]
@@ -639,8 +947,13 @@ def encoder_pipeline(
     use_memtile_o_proj_replay = o_proj_fifo_depth == 1 and parallel_seq > 1
 
     W_O_ty = np.ndarray[(embed_sz, embed_sz), np.dtype[dtype]]
+    W_ATTN_ty = np.ndarray[(4 * embed_sz, embed_sz), np.dtype[dtype]]
+    X_ty = np.ndarray[(seq_len, embed_sz), np.dtype[dtype]]
+    W_Q_ty = np.ndarray[(embed_sz, embed_sz), np.dtype[dtype]]
+    W_K_ty = np.ndarray[(embed_sz, embed_sz), np.dtype[dtype]]
+    W_V_ty = np.ndarray[(embed_sz, embed_sz), np.dtype[dtype]]
     QKV_ty = np.ndarray[(3 * seq_len, embed_sz), np.dtype[dtype]]
-    OR_ty = np.ndarray[(2 * seq_len + ln1_dram_stage_rows, embed_sz), np.dtype[dtype]]
+    OR_ty = np.ndarray[or_tensor_shape, np.dtype[dtype]]
     B_Up_ty = np.ndarray[(embed_sz * ffn_intermediate_size,), np.dtype[dtype]]
     B_Down_ty = np.ndarray[(ffn_intermediate_size * embed_sz,), np.dtype[dtype]]
     q_stream_ty = np.ndarray[(seq_tile, d * parallel_heads), np.dtype[dtype]]
@@ -651,6 +964,15 @@ def encoder_pipeline(
     k_ty = np.ndarray[(d, kv_seq_tile), np.dtype[dtype]]
     qk_ty = np.ndarray[(seq_tile, kv_seq_tile), np.dtype[dtype]]
     v_ty = np.ndarray[(kv_seq_tile, d), np.dtype[dtype]]
+    bias_matrix_ty = np.ndarray[
+        (num_qkv_head_block_per_parallel_head, d), np.dtype[dtype]
+    ]
+    xq_ty = np.ndarray[(seq_tile, emb_tile), np.dtype[dtype]]
+    xkv_ty = np.ndarray[(kv_seq_tile, emb_tile), np.dtype[dtype]]
+    q_proj_w_ty = np.ndarray[(emb_tile, d), np.dtype[dtype]]
+    k_proj_w_ty = np.ndarray[(emb_tile, d), np.dtype[dtype]]
+    v_proj_w_ty = np.ndarray[(emb_tile, d), np.dtype[dtype]]
+    staged_proj_group_w_ty = np.ndarray[(emb_tile, d * parallel_heads), np.dtype[dtype]]
     s_ty = np.ndarray[(4 * seq_tile,), np.dtype[dtype]]
     wo_ty = np.ndarray[(d, emb_tile), np.dtype[dtype]]
     o_ty = np.ndarray[(seq_tile, emb_tile), np.dtype[dtype]]
@@ -691,6 +1013,48 @@ def encoder_pipeline(
         kernel_archive,
         [q_ty, k_ty, qk_ty, np.ndarray[(2,), np.dtype[np.int32]]],
     )
+    if use_staged_hidden_state_projection:
+        matmul_init_q_proj_kernel = Kernel(
+            "matmul_init_bf16_bf16_q_proj",
+            kernel_archive,
+            [xq_ty, q_proj_w_ty, q_ty],
+        )
+        matmul_q_proj_kernel = Kernel(
+            "matmul_with_acc_bf16_bf16_q_proj",
+            kernel_archive,
+            [xq_ty, q_proj_w_ty, q_ty, q_ty],
+        )
+        matmul_init_k_proj_kernel = Kernel(
+            "matmul_init_bf16_bf16_k_proj",
+            kernel_archive,
+            [xkv_ty, k_proj_w_ty, k_ty],
+        )
+        matmul_k_proj_kernel = Kernel(
+            "matmul_with_acc_bf16_bf16_k_proj",
+            kernel_archive,
+            [xkv_ty, k_proj_w_ty, k_ty, k_ty],
+        )
+        matmul_init_v_proj_kernel = Kernel(
+            "matmul_init_bf16_bf16_v_proj",
+            kernel_archive,
+            [xkv_ty, v_proj_w_ty, v_ty],
+        )
+        matmul_v_proj_kernel = Kernel(
+            "matmul_with_acc_bf16_bf16_v_proj",
+            kernel_archive,
+            [xkv_ty, v_proj_w_ty, v_ty, v_ty],
+        )
+        eltwise_add_q_kernel = Kernel(
+            "eltwise_add_bf16_tile_bias_matrix_q_proj",
+            kernel_archive,
+            [q_ty, bias_matrix_ty, q_ty, np.int32, np.int32, np.int32],
+        )
+        eltwise_add_k_kernel = Kernel(
+            "eltwise_add_bf16_tile_bias_matrix_kv_proj",
+            kernel_archive,
+            [k_ty, bias_matrix_ty, k_ty, np.int32, np.int32, np.int32],
+        )
+        eltwise_add_v_kernel = eltwise_add_k_kernel
     matmul_pv_kernel = Kernel(
         "matmul_PV",
         kernel_archive,
@@ -843,6 +1207,109 @@ def encoder_pipeline(
         depths=[of_depth] * parallel_heads,
         placement=Tile(col=v_mem_col, row=1),
     )
+    projQOut = None
+    projKOut = None
+    projVOut = None
+    inXQ = None
+    inXK = None
+    inXV = None
+    inWQ = None
+    inWK = None
+    inWV = None
+    inWKShared = None
+    inWVShared = None
+    if use_staged_hidden_state_projection:
+        inXQ = [
+            ObjectFifo(xq_ty, name=f"inXQ{i}", depth=1) for i in range(parallel_heads)
+        ]
+        inXK = [
+            ObjectFifo(xkv_ty, name=f"inXK{i}", depth=1) for i in range(parallel_heads)
+        ]
+        inXV = [
+            ObjectFifo(xkv_ty, name=f"inXV{i}", depth=1) for i in range(parallel_heads)
+        ]
+        inWQ = [
+            ObjectFifo(q_proj_w_ty, name=f"inWQ{i}", depth=1)
+            for i in range(parallel_heads)
+        ]
+        inWK = [
+            ObjectFifo(k_proj_w_ty, name=f"inWK{i}", depth=1)
+            for i in range(parallel_heads)
+        ]
+        inWV = [
+            ObjectFifo(k_proj_w_ty, name=f"inWV{i}", depth=1)
+            for i in range(parallel_heads)
+        ]
+        if parallel_heads > 1:
+            # Multi-head staged projection cannot afford one shim producer per
+            # head for every weight ingress stream. Group the staged K/V
+            # weights, then split them on-chip back to per-head worker inputs.
+            inWKShared = ObjectFifo(staged_proj_group_w_ty, name="inWKAll", depth=1)
+            inWK = list(
+                inWKShared.cons().split(
+                    offsets=[emb_tile * d * i for i in range(parallel_heads)],
+                    obj_types=[k_proj_w_ty] * parallel_heads,
+                    names=[f"inWK{i}" for i in range(parallel_heads)],
+                    depths=[1] * parallel_heads,
+                    placement=Tile(col=k_mem_col, row=1),
+                )
+            )
+            inWVShared = ObjectFifo(staged_proj_group_w_ty, name="inWVAll", depth=1)
+            inWV = list(
+                inWVShared.cons().split(
+                    offsets=[emb_tile * d * i for i in range(parallel_heads)],
+                    obj_types=[v_proj_w_ty] * parallel_heads,
+                    names=[f"inWV{i}" for i in range(parallel_heads)],
+                    depths=[1] * parallel_heads,
+                    placement=Tile(col=ow_mem_col, row=1),
+                )
+            )
+        projQOut = [
+            ObjectFifo(q_ty, name=f"projQOut{i}", depth=1)
+            for i in range(parallel_heads)
+        ]
+        projKOut = [
+            ObjectFifo(k_ty, name=f"projKOut{i}", depth=2)
+            for i in range(parallel_heads)
+        ]
+        projVOut = [
+            ObjectFifo(v_ty, name=f"projVOut{i}", depth=2)
+            for i in range(parallel_heads)
+        ]
+        memQ = [
+            projQOut[i]
+            .cons()
+            .forward(
+                obj_type=q_ty,
+                name=f"stagedMemQ{i}",
+                depth=of_depth,
+                placement=Tile(col=q_mem_col, row=1),
+            )
+            for i in range(parallel_heads)
+        ]
+        if not use_staged_hidden_state_kv_cache:
+            memK = [
+                projKOut[i]
+                .cons()
+                .forward(
+                    obj_type=k_ty,
+                    name=f"stagedMemK{i}",
+                    depth=max(of_depth, min(q_blocks_per_lane, 4)),
+                    placement=Tile(col=k_mem_col, row=1),
+                )
+                for i in range(parallel_heads)
+            ]
+            memV = [
+                projVOut[i]
+                .cons()
+                .forward(
+                    obj_type=v_ty,
+                    name=f"stagedMemV{i}",
+                    depth=max(of_depth, min(q_blocks_per_lane, 4)),
+                    placement=Tile(col=v_mem_col, row=1),
+                )
+                for i in range(parallel_heads)
+            ]
     inOW = ObjectFifo(wo_stream_ty, name="inOW", depth=of_depth)
     memOW = inOW.cons().split(
         offsets=[d * emb_tile * i for i in range(parallel_heads)],
@@ -1828,6 +2295,106 @@ def encoder_pipeline(
                 of_in2.release(1)
                 of_in1.release(1)
 
+    def project_q_from_hidden_states(
+        of_x_in,
+        of_w_in,
+        of_q_out,
+        matmul_init,
+        matmul_acc,
+        add_bias,
+        bias_buffer,
+    ):
+        for _ in range_(sys.maxsize):
+            for head_group_idx in range_(num_qkv_head_block_per_parallel_head):
+                head_group_i32 = arith.index_castui(T.i32(), head_group_idx)
+                elem_out_q = of_q_out.acquire(1)
+                elem_in_x = of_x_in.acquire(1)
+                elem_in_w = of_w_in.acquire(1)
+                matmul_init(elem_in_x, elem_in_w, elem_out_q)
+                of_w_in.release(1)
+                of_x_in.release(1)
+                for _ in range_(proj_acc_depth - 1):
+                    elem_in_x = of_x_in.acquire(1)
+                    elem_in_w = of_w_in.acquire(1)
+                    matmul_acc(elem_in_x, elem_in_w, elem_out_q, elem_out_q)
+                    of_w_in.release(1)
+                    of_x_in.release(1)
+                add_bias(
+                    elem_out_q,
+                    bias_buffer,
+                    elem_out_q,
+                    head_group_i32,
+                    seq_tile,
+                    d,
+                )
+                of_q_out.release(1)
+
+    def project_k_from_hidden_states(
+        of_x_in,
+        of_w_in,
+        of_k_out,
+        matmul_init_k,
+        matmul_acc_k,
+        add_k_bias,
+        k_bias_buffer,
+    ):
+        for _ in range_(sys.maxsize):
+            for head_group_idx in range_(num_qkv_head_block_per_parallel_head):
+                head_group_i32 = arith.index_castui(T.i32(), head_group_idx)
+                for _ in range_(num_kv_seq_blocks):
+                    elem_out_k = of_k_out.acquire(1)
+                    for acc_idx in range_(proj_acc_depth):
+                        elem_in_x = of_x_in.acquire(1)
+                        elem_in_wk = of_w_in.acquire(1)
+                        if acc_idx == 0:
+                            matmul_init_k(elem_in_x, elem_in_wk, elem_out_k)
+                        else:
+                            matmul_acc_k(elem_in_x, elem_in_wk, elem_out_k, elem_out_k)
+                        of_w_in.release(1)
+                        of_x_in.release(1)
+                    add_k_bias(
+                        elem_out_k,
+                        k_bias_buffer,
+                        elem_out_k,
+                        head_group_i32,
+                        kv_seq_tile,
+                        d,
+                    )
+                    of_k_out.release(1)
+
+    def project_v_from_hidden_states(
+        of_x_in,
+        of_w_in,
+        of_v_out,
+        matmul_init_v,
+        matmul_acc_v,
+        add_v_bias,
+        v_bias_buffer,
+    ):
+        for _ in range_(sys.maxsize):
+            for head_group_idx in range_(num_qkv_head_block_per_parallel_head):
+                head_group_i32 = arith.index_castui(T.i32(), head_group_idx)
+                for _ in range_(num_kv_seq_blocks):
+                    elem_out_v = of_v_out.acquire(1)
+                    for acc_idx in range_(proj_acc_depth):
+                        elem_in_x = of_x_in.acquire(1)
+                        elem_in_wv = of_w_in.acquire(1)
+                        if acc_idx == 0:
+                            matmul_init_v(elem_in_x, elem_in_wv, elem_out_v)
+                        else:
+                            matmul_acc_v(elem_in_x, elem_in_wv, elem_out_v, elem_out_v)
+                        of_w_in.release(1)
+                        of_x_in.release(1)
+                    add_v_bias(
+                        elem_out_v,
+                        v_bias_buffer,
+                        elem_out_v,
+                        head_group_i32,
+                        kv_seq_tile,
+                        d,
+                    )
+                    of_v_out.release(1)
+
     use_fused_replayed_addnorm_for_winners = use_fused_replayed_addnorm
 
     if sequence_parallel is not None:
@@ -1887,6 +2454,38 @@ def encoder_pipeline(
                 f"(got parallel_heads={parallel_heads}, "
                 f"nB_tiles_distributed={effective_ffn_branches})"
             )
+        if use_staged_hidden_state_projection:
+            if parallel_heads > 2 or effective_ffn_branches != 1:
+                raise ValueError(
+                    "encoder_pipeline staged_hidden_states sequence-parallel "
+                    "projection currently supports only parallel_heads <= 2 and "
+                    "nB_tiles_distributed=1 "
+                    f"(got parallel_heads={parallel_heads}, "
+                    f"nB_tiles_distributed={effective_ffn_branches})"
+                )
+            if unified_qr_split is not None:
+                raise ValueError(
+                    "encoder_pipeline staged_hidden_states sequence-parallel "
+                    "projection does not yet support unified_qr_split"
+                )
+            if group_count != 1:
+                raise ValueError(
+                    "encoder_pipeline staged_hidden_states sequence-parallel "
+                    "projection currently supports only the default single "
+                    f"transport group (got group_count={group_count})"
+                )
+            if tuple(transport_groups[0]["lanes"]) != tuple(range(parallel_seq)):
+                raise ValueError(
+                    "encoder_pipeline staged_hidden_states sequence-parallel "
+                    "projection currently requires the default contiguous lane "
+                    f"order (got lanes={transport_groups[0]['lanes']})"
+                )
+            if parallel_seq > 2:
+                raise ValueError(
+                    "encoder_pipeline staged_hidden_states sequence-parallel "
+                    "projection currently supports only parallel_seq <= 2 "
+                    f"(got parallel_seq={parallel_seq})"
+                )
 
         q_batch_ty = np.ndarray[
             (group_size * seq_tile, d * parallel_heads), np.dtype[dtype]
@@ -1902,6 +2501,7 @@ def encoder_pipeline(
             if unified_qr_split is not None
             else None
         )
+        ln_stage_base_offset = or_rows_before_ln1_stage * embed_sz
         joined_o_dims = [
             (group_size * seq_tile // 8, 8 * emb_tile),
             (8, 8),
@@ -2083,6 +2683,110 @@ def encoder_pipeline(
         lane_ln2_weight_buffers = [None] * parallel_seq
 
         lane_outLN2 = [None] * parallel_seq
+        staged_seq_inXQ = None
+        staged_seq_inXQAll = None
+        staged_seq_inWQAll = None
+        staged_seq_inWQ = None
+        staged_seq_projQOut = None
+        staged_seq_inXKAll = None
+        staged_seq_inXK = None
+        staged_seq_inWK = None
+        staged_seq_projKOut = None
+        staged_seq_inXVAll = None
+        staged_seq_inXV = None
+        staged_seq_inWV = None
+        staged_seq_projVOut = None
+        staged_seq_q_proj_workers = []
+        staged_seq_k_proj_workers = []
+        staged_seq_v_proj_workers = []
+        q_proj_bias_buffers = None
+        k_proj_bias_buffers = None
+        v_proj_bias_buffers = None
+        if use_staged_hidden_state_projection:
+            staged_q_bias_rows = static_q_proj_biases.reshape(
+                num_qkv_head_block_per_parallel_head, parallel_heads, d
+            )
+            staged_k_bias_rows = static_k_proj_biases.reshape(
+                num_qkv_head_block_per_parallel_head, parallel_heads, d
+            )
+            staged_v_bias_rows = static_v_proj_biases.reshape(
+                num_qkv_head_block_per_parallel_head, parallel_heads, d
+            )
+            q_proj_bias_buffers = [
+                [
+                    Buffer(
+                        type=bias_matrix_ty,
+                        initial_value=np.ascontiguousarray(
+                            staged_q_bias_rows[:, head_idx, :]
+                        ),
+                        name=f"static_q_proj_bias_seq_l{lane_idx}_h{head_idx}",
+                    )
+                    for head_idx in range(parallel_heads)
+                ]
+                for lane_idx in range(parallel_seq)
+            ]
+            k_proj_bias_buffers = [
+                Buffer(
+                    type=bias_matrix_ty,
+                    initial_value=np.ascontiguousarray(
+                        staged_k_bias_rows[:, head_idx, :]
+                    ),
+                    name=f"static_k_proj_bias_seq_h{head_idx}",
+                )
+                for head_idx in range(parallel_heads)
+            ]
+            v_proj_bias_buffers = [
+                Buffer(
+                    type=bias_matrix_ty,
+                    initial_value=np.ascontiguousarray(
+                        staged_v_bias_rows[:, head_idx, :]
+                    ),
+                    name=f"static_v_proj_bias_seq_h{head_idx}",
+                )
+                for head_idx in range(parallel_heads)
+            ]
+            if parallel_heads == 1:
+                staged_seq_inWQ = [
+                    [
+                        ObjectFifo(
+                            q_proj_w_ty,
+                            name=f"inWQSeqL{lane_idx}H0",
+                            depth=1,
+                        )
+                    ]
+                    for lane_idx in range(parallel_seq)
+                ]
+            else:
+                staged_seq_inWQAll = [None] * parallel_heads
+            staged_seq_projQOut = [
+                [
+                    ObjectFifo(
+                        q_ty,
+                        name=f"projQOutSeqL{lane_idx}H{head_idx}",
+                        depth=1,
+                    )
+                    for head_idx in range(parallel_heads)
+                ]
+                for lane_idx in range(parallel_seq)
+            ]
+            staged_seq_inXKAll = ObjectFifo(xkv_ty, name="inXKSeqAll", depth=1)
+            staged_seq_inWK = [
+                ObjectFifo(k_proj_w_ty, name=f"inWKSeqH{head_idx}", depth=1)
+                for head_idx in range(parallel_heads)
+            ]
+            staged_seq_projKOut = [
+                ObjectFifo(k_ty, name=f"projKOutSeqH{head_idx}", depth=2)
+                for head_idx in range(parallel_heads)
+            ]
+            staged_seq_inXVAll = ObjectFifo(xkv_ty, name="inXVSeqAll", depth=1)
+            staged_seq_inWV = [
+                ObjectFifo(v_proj_w_ty, name=f"inWVSeqH{head_idx}", depth=1)
+                for head_idx in range(parallel_heads)
+            ]
+            staged_seq_projVOut = [
+                ObjectFifo(v_ty, name=f"projVOutSeqH{head_idx}", depth=2)
+                for head_idx in range(parallel_heads)
+            ]
         grouped_o_proj_acc = (
             parallel_heads > 1 and o_proj_acc_group_size == parallel_heads
         )
@@ -2156,80 +2860,278 @@ def encoder_pipeline(
                 "joined_or_shim_cols", default_group_joined_or_shim_cols
             )
 
-            if unified_qr_split is None:
-                inQSeq = ObjectFifo(q_batch_ty, name=f"inQSeq{suffix}", depth=of_depth)
-                group_inQSeq.append(inQSeq)
-                memQ_group = inQSeq.cons().split(
-                    offsets=q_offsets,
-                    obj_types=[q_ty] * (group_size * parallel_heads),
-                    names=[
-                        f"memQSeqL{lane_idx}H{head_idx}"
-                        for head_idx in range(parallel_heads)
-                        for lane_idx in lanes
-                    ],
-                    dims_to_stream=[q_dims] * (group_size * parallel_heads),
-                    depths=[of_depth] * (group_size * parallel_heads),
-                    placement=Tile(col=transport_group["joined_q_mem_col"], row=1),
+            if use_staged_hidden_state_projection and staged_seq_inXQAll is None:
+                staged_seq_inXQAll = ObjectFifo(
+                    np.ndarray[(parallel_seq * seq_tile, emb_tile), np.dtype[dtype]],
+                    name="inXQSeqAll",
+                    depth=1,
                 )
-                for head_idx in range(parallel_heads):
-                    for local_idx, lane_idx in enumerate(lanes):
-                        memQ_by_lane[lane_idx][head_idx] = memQ_group[
-                            head_idx * group_size + local_idx
+                if parallel_heads == 1:
+                    staged_seq_inXQ = [
+                        [fifo]
+                        for fifo in staged_seq_inXQAll.cons().split(
+                            offsets=[
+                                lane_idx * seq_tile * emb_tile
+                                for lane_idx in range(parallel_seq)
+                            ],
+                            obj_types=[xq_ty] * parallel_seq,
+                            names=[
+                                f"inXQSeqL{lane_idx}"
+                                for lane_idx in range(parallel_seq)
+                            ],
+                            depths=[1] * parallel_seq,
+                            placement=Tile(
+                                col=transport_group["joined_q_mem_col"], row=1
+                            ),
+                        )
+                    ]
+                else:
+                    staged_seq_inXQ_split = list(
+                        staged_seq_inXQAll.cons().split(
+                            offsets=[
+                                lane_idx * seq_tile * emb_tile
+                                for lane_idx in range(parallel_seq)
+                                for _ in range(parallel_heads)
+                            ],
+                            obj_types=[xq_ty] * (parallel_seq * parallel_heads),
+                            names=[
+                                f"inXQSeqL{lane_idx}H{head_idx}"
+                                for lane_idx in range(parallel_seq)
+                                for head_idx in range(parallel_heads)
+                            ],
+                            depths=[1] * (parallel_seq * parallel_heads),
+                            placement=Tile(col=7, row=1),
+                        )
+                    )
+                    staged_seq_inXQ = [
+                        [
+                            staged_seq_inXQ_split[lane_idx * parallel_heads + head_idx]
+                            for head_idx in range(parallel_heads)
                         ]
+                        for lane_idx in range(parallel_seq)
+                    ]
+                    staged_seq_inWQ = [
+                        [None] * parallel_heads for _ in range(parallel_seq)
+                    ]
+                    for head_idx in range(parallel_heads):
+                        if head_idx == 0:
+                            for lane_idx in range(parallel_seq):
+                                staged_seq_inWQ[lane_idx][head_idx] = ObjectFifo(
+                                    q_proj_w_ty,
+                                    name=f"inWQSeqL{lane_idx}H{head_idx}",
+                                    depth=1,
+                                )
+                            continue
+                        staged_seq_inWQAll[head_idx] = ObjectFifo(
+                            q_proj_w_ty,
+                            name=f"inWQSeqAllH{head_idx}",
+                            depth=1,
+                        )
+                        staged_seq_inWQ_lane = list(
+                            staged_seq_inWQAll[head_idx]
+                            .cons()
+                            .split(
+                                offsets=[0] * parallel_seq,
+                                obj_types=[q_proj_w_ty] * parallel_seq,
+                                names=[
+                                    f"inWQSeqL{lane_idx}H{head_idx}"
+                                    for lane_idx in range(parallel_seq)
+                                ],
+                                depths=[1] * parallel_seq,
+                                placement=Tile(
+                                    col=6,
+                                    row=1,
+                                ),
+                            )
+                        )
+                        for lane_idx in range(parallel_seq):
+                            staged_seq_inWQ[lane_idx][head_idx] = staged_seq_inWQ_lane[
+                                lane_idx
+                            ]
+                if parallel_heads == 1:
+                    staged_seq_inXK = [staged_seq_inXKAll]
+                    staged_seq_inXV = [staged_seq_inXVAll]
+                else:
+                    staged_seq_inXK = list(
+                        staged_seq_inXKAll.cons().split(
+                            offsets=[0] * parallel_heads,
+                            obj_types=[xkv_ty] * parallel_heads,
+                            names=[
+                                f"inXKSeqH{head_idx}"
+                                for head_idx in range(parallel_heads)
+                            ],
+                            depths=[1] * parallel_heads,
+                            placement=Tile(
+                                col=transport_group["shared_ingress_cols"]["k"], row=1
+                            ),
+                        )
+                    )
+                    staged_seq_inXV = list(
+                        staged_seq_inXVAll.cons().split(
+                            offsets=[0] * parallel_heads,
+                            obj_types=[xkv_ty] * parallel_heads,
+                            names=[
+                                f"inXVSeqH{head_idx}"
+                                for head_idx in range(parallel_heads)
+                            ],
+                            depths=[1] * parallel_heads,
+                            placement=Tile(
+                                col=transport_group["shared_ingress_cols"]["v"], row=1
+                            ),
+                        )
+                    )
+
+            if unified_qr_split is None:
+                if use_staged_hidden_state_projection:
+                    group_inQSeq.append(None)
+                    for lane_idx in lanes:
+                        for head_idx in range(parallel_heads):
+                            if parallel_heads > 1:
+                                if parallel_seq > 1 and head_idx == 1:
+                                    # For the staged seq-par 2-head branch, feed the
+                                    # second projected-Q head directly into QK instead
+                                    # of relaying it through another memtile. This
+                                    # removes the last hot memtile on the staged Q path.
+                                    memQ_by_lane[lane_idx][head_idx] = (
+                                        staged_seq_projQOut[lane_idx][head_idx]
+                                    )
+                                else:
+                                    memQ_by_lane[lane_idx][head_idx] = (
+                                        staged_seq_projQOut[lane_idx][head_idx]
+                                        .cons()
+                                        .forward(
+                                            obj_type=q_ty,
+                                            name=f"stagedMemQSeqL{lane_idx}H{head_idx}",
+                                            depth=of_depth,
+                                            placement=Tile(col=6 + head_idx, row=1),
+                                        )
+                                    )
+                            else:
+                                memQ_by_lane[lane_idx][head_idx] = (
+                                    staged_seq_projQOut[lane_idx][head_idx]
+                                    .cons()
+                                    .forward(
+                                        obj_type=q_ty,
+                                        name=f"stagedMemQSeqL{lane_idx}H{head_idx}",
+                                        depth=of_depth,
+                                        placement=Tile(
+                                            col=transport_group["joined_q_mem_col"],
+                                            row=1,
+                                        ),
+                                    )
+                                )
+                else:
+                    inQSeq = ObjectFifo(
+                        q_batch_ty, name=f"inQSeq{suffix}", depth=of_depth
+                    )
+                    group_inQSeq.append(inQSeq)
+                    memQ_group = inQSeq.cons().split(
+                        offsets=q_offsets,
+                        obj_types=[q_ty] * (group_size * parallel_heads),
+                        names=[
+                            f"memQSeqL{lane_idx}H{head_idx}"
+                            for head_idx in range(parallel_heads)
+                            for lane_idx in lanes
+                        ],
+                        dims_to_stream=[q_dims] * (group_size * parallel_heads),
+                        depths=[of_depth] * (group_size * parallel_heads),
+                        placement=Tile(col=transport_group["joined_q_mem_col"], row=1),
+                    )
+                    for head_idx in range(parallel_heads):
+                        for local_idx, lane_idx in enumerate(lanes):
+                            memQ_by_lane[lane_idx][head_idx] = memQ_group[
+                                head_idx * group_size + local_idx
+                            ]
             else:
                 group_inQSeq.append(None)
 
-            inKSeq = ObjectFifo(kv_stream_ty, name=f"inK{suffix}", depth=of_depth)
-            group_inKSeq.append(inKSeq)
-            if parallel_heads == 1:
-                memKSeq = inKSeq.cons().forward(
-                    obj_type=k_ty,
-                    name=f"memKSeq{suffix}",
-                    dims_to_stream=k_dims,
-                    depth=shared_forward_depth,
-                    placement=Tile(
-                        col=transport_group["shared_ingress_cols"]["k"], row=1
-                    ),
+            if use_staged_hidden_state_projection and parallel_heads > 1:
+                group_inKSeq.append(None)
+                group_memKSeq.append(
+                    [
+                        staged_seq_projKOut[head_idx]
+                        .cons()
+                        .forward(
+                            obj_type=k_ty,
+                            name=f"stagedMemKSeq{suffix}H{head_idx}",
+                            depth=shared_forward_depth,
+                            placement=Tile(
+                                col=transport_group["shared_ingress_cols"]["k"], row=1
+                            ),
+                        )
+                        for head_idx in range(parallel_heads)
+                    ]
                 )
-                group_memKSeq.append([memKSeq])
             else:
-                memKSeq = inKSeq.cons().split(
-                    offsets=[kv_seq_tile * d * i for i in range(parallel_heads)],
-                    obj_types=[k_ty] * parallel_heads,
-                    names=[f"memKSeq{suffix}H{i}" for i in range(parallel_heads)],
-                    dims_to_stream=[k_dims] * parallel_heads,
-                    depths=[shared_forward_depth] * parallel_heads,
-                    placement=Tile(
-                        col=transport_group["shared_ingress_cols"]["k"], row=1
-                    ),
-                )
-                group_memKSeq.append(list(memKSeq))
+                inKSeq = ObjectFifo(kv_stream_ty, name=f"inK{suffix}", depth=of_depth)
+                group_inKSeq.append(inKSeq)
+                if parallel_heads == 1:
+                    memKSeq = inKSeq.cons().forward(
+                        obj_type=k_ty,
+                        name=f"memKSeq{suffix}",
+                        dims_to_stream=k_dims,
+                        depth=shared_forward_depth,
+                        placement=Tile(
+                            col=transport_group["shared_ingress_cols"]["k"], row=1
+                        ),
+                    )
+                    group_memKSeq.append([memKSeq])
+                else:
+                    memKSeq = inKSeq.cons().split(
+                        offsets=[kv_seq_tile * d * i for i in range(parallel_heads)],
+                        obj_types=[k_ty] * parallel_heads,
+                        names=[f"memKSeq{suffix}H{i}" for i in range(parallel_heads)],
+                        dims_to_stream=[k_dims] * parallel_heads,
+                        depths=[shared_forward_depth] * parallel_heads,
+                        placement=Tile(
+                            col=transport_group["shared_ingress_cols"]["k"], row=1
+                        ),
+                    )
+                    group_memKSeq.append(list(memKSeq))
 
-            inVSeq = ObjectFifo(kv_stream_ty, name=f"inV{suffix}", depth=of_depth)
-            group_inVSeq.append(inVSeq)
-            if parallel_heads == 1:
-                memVSeq = inVSeq.cons().forward(
-                    obj_type=v_ty,
-                    name=f"memVSeq{suffix}",
-                    dims_to_stream=v_dims,
-                    depth=shared_forward_depth,
-                    placement=Tile(
-                        col=transport_group["shared_ingress_cols"]["v"], row=1
-                    ),
+            if use_staged_hidden_state_projection and parallel_heads > 1:
+                group_inVSeq.append(None)
+                group_memVSeq.append(
+                    [
+                        staged_seq_projVOut[head_idx]
+                        .cons()
+                        .forward(
+                            obj_type=v_ty,
+                            name=f"stagedMemVSeq{suffix}H{head_idx}",
+                            depth=shared_forward_depth,
+                            placement=Tile(
+                                col=transport_group["shared_ingress_cols"]["v"], row=1
+                            ),
+                        )
+                        for head_idx in range(parallel_heads)
+                    ]
                 )
-                group_memVSeq.append([memVSeq])
             else:
-                memVSeq = inVSeq.cons().split(
-                    offsets=[kv_seq_tile * d * i for i in range(parallel_heads)],
-                    obj_types=[v_ty] * parallel_heads,
-                    names=[f"memVSeq{suffix}H{i}" for i in range(parallel_heads)],
-                    dims_to_stream=[v_dims] * parallel_heads,
-                    depths=[shared_forward_depth] * parallel_heads,
-                    placement=Tile(
-                        col=transport_group["shared_ingress_cols"]["v"], row=1
-                    ),
-                )
-                group_memVSeq.append(list(memVSeq))
+                inVSeq = ObjectFifo(kv_stream_ty, name=f"inV{suffix}", depth=of_depth)
+                group_inVSeq.append(inVSeq)
+                if parallel_heads == 1:
+                    memVSeq = inVSeq.cons().forward(
+                        obj_type=v_ty,
+                        name=f"memVSeq{suffix}",
+                        dims_to_stream=v_dims,
+                        depth=shared_forward_depth,
+                        placement=Tile(
+                            col=transport_group["shared_ingress_cols"]["v"], row=1
+                        ),
+                    )
+                    group_memVSeq.append([memVSeq])
+                else:
+                    memVSeq = inVSeq.cons().split(
+                        offsets=[kv_seq_tile * d * i for i in range(parallel_heads)],
+                        obj_types=[v_ty] * parallel_heads,
+                        names=[f"memVSeq{suffix}H{i}" for i in range(parallel_heads)],
+                        dims_to_stream=[v_dims] * parallel_heads,
+                        depths=[shared_forward_depth] * parallel_heads,
+                        placement=Tile(
+                            col=transport_group["shared_ingress_cols"]["v"], row=1
+                        ),
+                    )
+                    group_memVSeq.append(list(memVSeq))
 
             if unified_memOWSeq is None:
                 inOWSeq = ObjectFifo(wo_stream_ty, name=f"inOW{suffix}", depth=of_depth)
@@ -3063,7 +3965,101 @@ def encoder_pipeline(
                 )
             )
 
+        if use_staged_hidden_state_projection:
+            if parallel_heads == 1:
+                staged_seq_wq_shim_cols = [k_shim_col, ln1_stage_shim_col][
+                    :parallel_seq
+                ]
+                staged_seq_shared_wq_shim_cols = None
+            else:
+                staged_seq_wq_shim_cols = [k_shim_col, v_shim_col][:parallel_seq]
+                staged_seq_shared_wq_shim_cols = [None, ln1_stage_shim_col][
+                    :parallel_heads
+                ]
+            # In staged seq-par mode, route projected-X ingress away from the
+            # residual/output shim so the front-end does not exhaust shim DMA
+            # resources before the rest of the lane graph is even considered.
+            staged_seq_xq_shim_cols = [q_shim_col, ln1_stage_shim_col][:parallel_seq]
+            staged_seq_xk_shim_cols = [v_shim_col, residual_shim_col][:parallel_heads]
+            staged_seq_wk_shim_cols = [ow_shim_col, output_shim_col][:parallel_heads]
+            staged_seq_xv_shim_cols = [ln1_stage_shim_col, k_shim_col][:parallel_heads]
+            staged_seq_wv_shim_cols = [bdown_shim_col, bup_shim_col][:parallel_heads]
+
+            if parallel_heads == 1:
+                q_proj_tiles = [
+                    [Tile(col=2 + lane_idx, row=2)] for lane_idx in range(parallel_seq)
+                ]
+                k_proj_tiles = [Tile(col=6, row=2)]
+                v_proj_tiles = [Tile(col=7, row=2)]
+            else:
+                q_proj_tiles = [
+                    [Tile(col=3, row=2), Tile(col=3, row=3)],
+                    [Tile(col=7, row=2), Tile(col=7, row=3)],
+                ][:parallel_seq]
+                k_proj_tiles = [Tile(col=2, row=4), Tile(col=6, row=4)][:parallel_heads]
+                v_proj_tiles = [Tile(col=3, row=5), Tile(col=7, row=5)][:parallel_heads]
+
+            for lane_idx in range(parallel_seq):
+                for head_idx in range(parallel_heads):
+                    staged_seq_q_proj_workers.append(
+                        Worker(
+                            project_q_from_hidden_states,
+                            fn_args=[
+                                staged_seq_inXQ[lane_idx][head_idx].cons(),
+                                staged_seq_inWQ[lane_idx][head_idx].cons(),
+                                staged_seq_projQOut[lane_idx][head_idx].prod(),
+                                matmul_init_q_proj_kernel,
+                                matmul_q_proj_kernel,
+                                eltwise_add_q_kernel,
+                                q_proj_bias_buffers[lane_idx][head_idx],
+                            ],
+                            placement=q_proj_tiles[lane_idx][head_idx],
+                            stack_size=0xD00,
+                            while_true=False,
+                        )
+                    )
+            for head_idx in range(parallel_heads):
+                staged_seq_k_proj_workers.append(
+                    Worker(
+                        project_k_from_hidden_states,
+                        fn_args=[
+                            staged_seq_inXK[head_idx].cons(),
+                            staged_seq_inWK[head_idx].cons(),
+                            staged_seq_projKOut[head_idx].prod(),
+                            matmul_init_k_proj_kernel,
+                            matmul_k_proj_kernel,
+                            eltwise_add_k_kernel,
+                            k_proj_bias_buffers[head_idx],
+                        ],
+                        placement=k_proj_tiles[head_idx],
+                        stack_size=0xD00,
+                        while_true=False,
+                    )
+                )
+                staged_seq_v_proj_workers.append(
+                    Worker(
+                        project_v_from_hidden_states,
+                        fn_args=[
+                            staged_seq_inXV[head_idx].cons(),
+                            staged_seq_inWV[head_idx].cons(),
+                            staged_seq_projVOut[head_idx].prod(),
+                            matmul_init_v_proj_kernel,
+                            matmul_v_proj_kernel,
+                            eltwise_add_v_kernel,
+                            v_proj_bias_buffers[head_idx],
+                        ],
+                        placement=v_proj_tiles[head_idx],
+                        stack_size=0xD00,
+                        while_true=False,
+                    )
+                )
+
         qkv_tensor_shape = (3 * seq_len, embed_sz)
+        staged_seq_q_stage_base_offset = seq_len * embed_sz
+        staged_seq_k_stage_base_offset = 2 * seq_len * embed_sz
+        staged_seq_v_stage_base_offset = 3 * seq_len * embed_sz
+        staged_hidden_state_tensor_shape = (seq_len, embed_sz)
+        attn_weight_tensor_shape = (4 * embed_sz, embed_sz)
         q_batch_tiles_base = TensorTiler2D.group_tiler(
             (seq_len, embed_sz),
             (group_size * seq_tile, d),
@@ -3109,6 +4105,72 @@ def encoder_pipeline(
             )
         else:
             unified_q_batch_tiles = None
+        staged_hidden_state_q_tiles_base = None
+        staged_hidden_state_q_batch_tiles_base = None
+        staged_hidden_state_q_tiles = None
+        staged_hidden_state_q_batch_tiles = None
+        staged_seq_q_tiles = None
+        staged_seq_q_batch_tiles = None
+        if use_staged_hidden_state_projection:
+            staged_hidden_state_q_tiles_base = TensorTiler2D.group_tiler(
+                (seq_len, embed_sz),
+                (seq_tile, emb_tile),
+                (1, proj_acc_depth),
+            )
+            staged_hidden_state_q_batch_tiles_base = TensorTiler2D.group_tiler(
+                (seq_len, embed_sz),
+                (parallel_seq * seq_tile, emb_tile),
+                (1, proj_acc_depth),
+            )
+            staged_seq_q_tiles_base = TensorTiler2D.group_tiler(
+                (seq_len, embed_sz),
+                (seq_tile, d),
+                (1, parallel_heads),
+            )
+            staged_hidden_state_q_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        staged_hidden_state_tensor_shape,
+                        offset=tap.offset,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in staged_hidden_state_q_tiles_base
+                ]
+            )
+            staged_hidden_state_q_batch_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        staged_hidden_state_tensor_shape,
+                        offset=tap.offset,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in staged_hidden_state_q_batch_tiles_base
+                ]
+            )
+            staged_seq_q_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        or_tensor_shape,
+                        offset=tap.offset + staged_seq_q_stage_base_offset,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in staged_seq_q_tiles_base
+                ]
+            )
+            staged_seq_q_batch_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        or_tensor_shape,
+                        offset=tap.offset + staged_seq_q_stage_base_offset,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in q_batch_tiles_base
+                ]
+            )
         k_tiles = TensorAccessSequence.from_taps(
             [
                 TensorAccessPattern(
@@ -3120,6 +4182,17 @@ def encoder_pipeline(
                 for tap in k_tiles_base
             ]
         )
+        staged_hidden_state_kv_tiles = None
+        staged_seq_k_tiles = None
+        staged_seq_v_tiles = None
+        staged_seq_wq_tiles = None
+        staged_seq_wk_tiles = None
+        staged_seq_wv_tiles = None
+        staged_seq_repeated_wk_tiles = None
+        staged_seq_repeated_wv_tiles = None
+        staged_seq_hidden_state_kv_fill_taps = None
+        staged_seq_wk_fill_taps = None
+        staged_seq_wv_fill_taps = None
         v_tiles = TensorAccessSequence.from_taps(
             [
                 TensorAccessPattern(
@@ -3131,6 +4204,106 @@ def encoder_pipeline(
                 for tap in v_tiles_base
             ]
         )
+        if use_staged_hidden_state_projection:
+            staged_hidden_state_kv_tiles_base = TensorTiler2D.group_tiler(
+                (seq_len, embed_sz),
+                (kv_seq_tile, emb_tile),
+                (num_kv_seq_blocks, proj_acc_depth),
+            )
+            staged_hidden_state_kv_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        staged_hidden_state_tensor_shape,
+                        offset=tap.offset,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in staged_hidden_state_kv_tiles_base
+                ]
+            )
+            staged_seq_wq_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        attn_weight_tensor_shape,
+                        offset=tap.offset,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in TensorTiler2D.group_tiler(
+                        (embed_sz, embed_sz),
+                        (emb_tile, d),
+                        (proj_acc_depth, 1),
+                    )
+                ]
+            )
+            staged_seq_wk_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        attn_weight_tensor_shape,
+                        offset=tap.offset + embed_sz * embed_sz,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in TensorTiler2D.group_tiler(
+                        (embed_sz, embed_sz),
+                        (emb_tile, d),
+                        (proj_acc_depth, 1),
+                    )
+                ]
+            )
+            staged_seq_wv_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        attn_weight_tensor_shape,
+                        offset=tap.offset + 2 * embed_sz * embed_sz,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in TensorTiler2D.group_tiler(
+                        (embed_sz, embed_sz),
+                        (emb_tile, d),
+                        (proj_acc_depth, 1),
+                    )
+                ]
+            )
+            staged_seq_repeated_wk_tiles = [
+                repeat_outer_tap(
+                    staged_seq_wk_tiles[head_group_idx],
+                    attn_weight_tensor_shape,
+                    num_kv_seq_blocks,
+                )
+                for head_group_idx in range(len(staged_seq_wk_tiles))
+            ]
+            staged_seq_repeated_wv_tiles = [
+                repeat_outer_tap(
+                    staged_seq_wv_tiles[head_group_idx],
+                    attn_weight_tensor_shape,
+                    num_kv_seq_blocks,
+                )
+                for head_group_idx in range(len(staged_seq_wv_tiles))
+            ]
+            staged_seq_k_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        or_tensor_shape,
+                        offset=tap.offset + staged_seq_k_stage_base_offset,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in k_tiles_base
+                ]
+            )
+            staged_seq_v_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        or_tensor_shape,
+                        offset=tap.offset + staged_seq_v_stage_base_offset,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in v_tiles_base
+                ]
+            )
         wo_tiles = TensorTiler2D.group_tiler(
             (embed_sz, embed_sz),
             (d, emb_tile),
@@ -3174,31 +4347,31 @@ def encoder_pipeline(
             [
                 TensorAccessPattern(
                     or_tensor_shape,
-                    offset=tap.offset + 2 * seq_len * embed_sz,
+                    offset=(
+                        tap.offset + ln_stage_base_offset
+                        if use_staged_hidden_state_projection
+                        else tap.offset + 2 * seq_len * embed_sz
+                    ),
                     sizes=tap.sizes,
                     strides=tap.strides,
                 )
                 for tap in joined_o_tiles_base
             ]
         )
-        joined_r_tiles = TensorAccessSequence.from_taps(
-            [
-                TensorAccessPattern(
-                    or_tensor_shape,
-                    offset=tap.offset + seq_len * embed_sz,
-                    sizes=tap.sizes,
-                    strides=tap.strides,
-                )
-                for tap in joined_r_tiles_base
-            ]
-        )
-        if unified_qr_split is not None:
-            unified_joined_r_tiles_base = TensorTiler2D.group_tiler(
-                (seq_len, embed_sz),
-                (parallel_seq * seq_tile, emb_tile),
-                (1, embed_sz // emb_tile // num_o_col_groups),
+        if use_staged_hidden_state_projection:
+            joined_r_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        staged_hidden_state_tensor_shape,
+                        offset=tap.offset,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in joined_r_tiles_base
+                ]
             )
-            unified_joined_r_tiles = TensorAccessSequence.from_taps(
+        else:
+            joined_r_tiles = TensorAccessSequence.from_taps(
                 [
                     TensorAccessPattern(
                         or_tensor_shape,
@@ -3206,9 +4379,39 @@ def encoder_pipeline(
                         sizes=tap.sizes,
                         strides=tap.strides,
                     )
-                    for tap in unified_joined_r_tiles_base
+                    for tap in joined_r_tiles_base
                 ]
             )
+        if unified_qr_split is not None:
+            unified_joined_r_tiles_base = TensorTiler2D.group_tiler(
+                (seq_len, embed_sz),
+                (parallel_seq * seq_tile, emb_tile),
+                (1, embed_sz // emb_tile // num_o_col_groups),
+            )
+            if use_staged_hidden_state_projection:
+                unified_joined_r_tiles = TensorAccessSequence.from_taps(
+                    [
+                        TensorAccessPattern(
+                            staged_hidden_state_tensor_shape,
+                            offset=tap.offset,
+                            sizes=tap.sizes,
+                            strides=tap.strides,
+                        )
+                        for tap in unified_joined_r_tiles_base
+                    ]
+                )
+            else:
+                unified_joined_r_tiles = TensorAccessSequence.from_taps(
+                    [
+                        TensorAccessPattern(
+                            or_tensor_shape,
+                            offset=tap.offset + seq_len * embed_sz,
+                            sizes=tap.sizes,
+                            strides=tap.strides,
+                        )
+                        for tap in unified_joined_r_tiles_base
+                    ]
+                )
         else:
             unified_joined_r_tiles = None
 
@@ -3315,6 +4518,31 @@ def encoder_pipeline(
                 chunk_start += chunk_len
             return chunk_taps
 
+        def split_fill_tap_prefix_rest(
+            tap: TensorAccessPattern,
+            tensor_shape: tuple[int, ...],
+            prefix_outer_dim: int,
+        ) -> tuple[TensorAccessPattern | None, TensorAccessPattern | None]:
+            outer_size = int(tap.sizes[0])
+            if outer_size <= 0:
+                return None, None
+            prefix_len = min(prefix_outer_dim, outer_size)
+            prefix_tap = TensorAccessPattern(
+                tensor_shape,
+                offset=int(tap.offset),
+                sizes=[prefix_len, *[int(s) for s in tap.sizes[1:]]],
+                strides=[int(s) for s in tap.strides],
+            )
+            if prefix_len == outer_size:
+                return prefix_tap, None
+            rest_tap = TensorAccessPattern(
+                tensor_shape,
+                offset=int(tap.offset) + prefix_len * int(tap.strides[0]),
+                sizes=[outer_size - prefix_len, *[int(s) for s in tap.sizes[1:]]],
+                strides=[int(s) for s in tap.strides],
+            )
+            return prefix_tap, rest_tap
+
         for tas in (
             q_batch_tiles,
             k_tiles,
@@ -3331,6 +4559,22 @@ def encoder_pipeline(
             legalize_tas(unified_q_batch_tiles)
         if unified_joined_r_tiles is not None:
             legalize_tas(unified_joined_r_tiles)
+        if use_staged_hidden_state_projection:
+            for tas in (
+                staged_hidden_state_q_tiles,
+                staged_hidden_state_q_batch_tiles,
+                staged_hidden_state_kv_tiles,
+                staged_seq_q_tiles,
+                staged_seq_q_batch_tiles,
+                staged_seq_k_tiles,
+                staged_seq_v_tiles,
+                staged_seq_wq_tiles,
+                staged_seq_wk_tiles,
+                staged_seq_wv_tiles,
+                staged_seq_repeated_wk_tiles,
+                staged_seq_repeated_wv_tiles,
+            ):
+                legalize_tas(tas)
         for tas in (joined_refill_taps,):
             legalize_tas(tas)
 
@@ -3343,6 +4587,28 @@ def encoder_pipeline(
             split_fill_tap_on_outer_dim(tap, qkv_tensor_shape, max_host_fill_outer_dim)
             for tap in v_tiles
         ]
+        if use_staged_hidden_state_projection:
+            staged_seq_hidden_state_kv_fill_taps = split_fill_tap_on_outer_dim(
+                staged_hidden_state_kv_tiles[0],
+                staged_hidden_state_tensor_shape,
+                max_host_fill_outer_dim,
+            )
+            staged_seq_wk_fill_taps = [
+                split_fill_tap_on_outer_dim(
+                    tap,
+                    attn_weight_tensor_shape,
+                    max_host_fill_outer_dim,
+                )
+                for tap in staged_seq_repeated_wk_tiles
+            ]
+            staged_seq_wv_fill_taps = [
+                split_fill_tap_on_outer_dim(
+                    tap,
+                    attn_weight_tensor_shape,
+                    max_host_fill_outer_dim,
+                )
+                for tap in staged_seq_repeated_wv_tiles
+            ]
 
         assert_tap_iteration_count(
             q_batch_tiles[0],
@@ -3408,13 +4674,14 @@ def encoder_pipeline(
         )
 
         rt = Runtime()
-        with rt.sequence(W_O_ty, QKV_ty, OR_ty, B_Up_ty, B_Down_ty) as (
-            W_O,
-            QKV,
-            OR,
-            B_Up,
-            B_Down,
-        ):
+        sequence_types = (W_O_ty, QKV_ty, OR_ty, B_Up_ty, B_Down_ty)
+        if use_staged_hidden_state_projection:
+            sequence_types = (W_ATTN_ty, X_ty, OR_ty, B_Up_ty, B_Down_ty)
+        with rt.sequence(*sequence_types) as sequence_args:
+            if use_staged_hidden_state_projection:
+                W_ATTN, X, OR, B_Up, B_Down = sequence_args
+            else:
+                W_O, QKV, OR, B_Up, B_Down = sequence_args
             if use_runtime_ln_weights:
                 for lane_idx in range(parallel_seq):
                     rt.inline_ops(
@@ -3425,6 +4692,13 @@ def encoder_pipeline(
                         _emit_runtime_buffer_values,
                         [lane_ln2_weight_buffers[lane_idx], static_ln2_weights],
                     )
+            if use_staged_hidden_state_projection:
+                for worker in staged_seq_q_proj_workers:
+                    rt.start(worker)
+                for worker in staged_seq_k_proj_workers:
+                    rt.start(worker)
+                for worker in staged_seq_v_proj_workers:
+                    rt.start(worker)
             for worker in lane_qk_workers:
                 rt.start(worker)
             for worker in lane_softmax_workers:
@@ -3445,15 +4719,186 @@ def encoder_pipeline(
             pending_tail_tg = None
             for lane_batch_idx in range(q_blocks_per_lane):
                 for head_group_idx in range(num_qkv_head_block_per_parallel_head):
+                    if (
+                        use_staged_hidden_state_projection
+                        and parallel_heads == 1
+                        and lane_batch_idx == 0
+                    ):
+                        tg_kv_stage = rt.task_group()
+                        for hidden_state_kv_tap in staged_seq_hidden_state_kv_fill_taps:
+                            rt.fill(
+                                staged_seq_inXK[0].prod(),
+                                X,
+                                tap=hidden_state_kv_tap,
+                                placement=Tile(col=v_shim_col, row=0),
+                                task_group=tg_kv_stage,
+                                wait=True,
+                            )
+                        for wk_tap in staged_seq_wk_fill_taps[head_group_idx]:
+                            rt.fill(
+                                staged_seq_inWK[0].prod(),
+                                W_ATTN,
+                                tap=wk_tap,
+                                placement=Tile(col=ow_shim_col, row=0),
+                                task_group=tg_kv_stage,
+                                wait=True,
+                            )
+                        rt.drain(
+                            staged_seq_projKOut[0].cons(),
+                            OR,
+                            tap=staged_seq_k_tiles[head_group_idx],
+                            placement=Tile(col=v_shim_col, row=0),
+                            task_group=tg_kv_stage,
+                            wait=True,
+                        )
+                        for hidden_state_kv_tap in staged_seq_hidden_state_kv_fill_taps:
+                            rt.fill(
+                                staged_seq_inXV[0].prod(),
+                                X,
+                                tap=hidden_state_kv_tap,
+                                placement=Tile(col=ln1_stage_shim_col, row=0),
+                                task_group=tg_kv_stage,
+                                wait=True,
+                            )
+                        for wv_tap in staged_seq_wv_fill_taps[head_group_idx]:
+                            rt.fill(
+                                staged_seq_inWV[0].prod(),
+                                W_ATTN,
+                                tap=wv_tap,
+                                placement=Tile(col=ln1_stage_shim_col, row=0),
+                                task_group=tg_kv_stage,
+                                wait=True,
+                            )
+                        rt.drain(
+                            staged_seq_projVOut[0].cons(),
+                            OR,
+                            tap=staged_seq_v_tiles[head_group_idx],
+                            placement=Tile(col=v_shim_col, row=0),
+                            task_group=tg_kv_stage,
+                            wait=True,
+                        )
+                        rt.finish_task_group(tg_kv_stage)
+
+                    if use_staged_hidden_state_projection:
+                        tg_q_stage = rt.task_group()
+                        rt.fill(
+                            staged_seq_inXQAll.prod(),
+                            X,
+                            tap=staged_hidden_state_q_batch_tiles[lane_batch_idx],
+                            placement=Tile(col=q_shim_col, row=0),
+                            task_group=tg_q_stage,
+                            wait=True,
+                        )
+                        if parallel_heads == 1:
+                            for lane_idx in transport_groups[0]["lanes"]:
+                                rt.fill(
+                                    staged_seq_inWQ[lane_idx][0].prod(),
+                                    W_ATTN,
+                                    tap=staged_seq_wq_tiles[head_group_idx],
+                                    placement=Tile(
+                                        col=staged_seq_wq_shim_cols[lane_idx], row=0
+                                    ),
+                                    task_group=tg_q_stage,
+                                    wait=True,
+                                )
+                        else:
+                            for head_idx in range(parallel_heads):
+                                global_head_idx = (
+                                    head_group_idx * parallel_heads + head_idx
+                                )
+                                if staged_seq_inWQAll[head_idx] is None:
+                                    for lane_idx in transport_groups[0]["lanes"]:
+                                        rt.fill(
+                                            staged_seq_inWQ[lane_idx][head_idx].prod(),
+                                            W_ATTN,
+                                            tap=staged_seq_wq_tiles[global_head_idx],
+                                            placement=Tile(
+                                                col=staged_seq_wq_shim_cols[lane_idx],
+                                                row=0,
+                                            ),
+                                            task_group=tg_q_stage,
+                                            wait=True,
+                                        )
+                                else:
+                                    rt.fill(
+                                        staged_seq_inWQAll[head_idx].prod(),
+                                        W_ATTN,
+                                        tap=staged_seq_wq_tiles[global_head_idx],
+                                        placement=Tile(
+                                            col=staged_seq_shared_wq_shim_cols[
+                                                head_idx
+                                            ],
+                                            row=0,
+                                        ),
+                                        task_group=tg_q_stage,
+                                        wait=True,
+                                    )
+                        rt.finish_task_group(tg_q_stage)
+
+                    if use_staged_hidden_state_projection and parallel_heads > 1:
+                        tg_kv_direct = rt.task_group()
+                        for hidden_state_kv_tap in staged_seq_hidden_state_kv_fill_taps:
+                            rt.fill(
+                                staged_seq_inXKAll.prod(),
+                                X,
+                                tap=hidden_state_kv_tap,
+                                placement=Tile(col=staged_seq_xk_shim_cols[0], row=0),
+                                task_group=tg_kv_direct,
+                                wait=True,
+                            )
+                        for hidden_state_kv_tap in staged_seq_hidden_state_kv_fill_taps:
+                            rt.fill(
+                                staged_seq_inXVAll.prod(),
+                                X,
+                                tap=hidden_state_kv_tap,
+                                placement=Tile(col=staged_seq_xv_shim_cols[0], row=0),
+                                task_group=tg_kv_direct,
+                                wait=True,
+                            )
+                        for head_idx in range(parallel_heads):
+                            global_head_idx = head_group_idx * parallel_heads + head_idx
+                            for wk_tap in staged_seq_wk_fill_taps[global_head_idx]:
+                                rt.fill(
+                                    staged_seq_inWK[head_idx].prod(),
+                                    W_ATTN,
+                                    tap=wk_tap,
+                                    placement=Tile(
+                                        col=staged_seq_wk_shim_cols[head_idx], row=0
+                                    ),
+                                    task_group=tg_kv_direct,
+                                    wait=True,
+                                )
+                            for wv_tap in staged_seq_wv_fill_taps[global_head_idx]:
+                                rt.fill(
+                                    staged_seq_inWV[head_idx].prod(),
+                                    W_ATTN,
+                                    tap=wv_tap,
+                                    placement=Tile(
+                                        col=staged_seq_wv_shim_cols[head_idx], row=0
+                                    ),
+                                    task_group=tg_kv_direct,
+                                    wait=True,
+                                )
+                        rt.finish_task_group(tg_kv_direct)
+
                     tg_head = rt.task_group()
                     if unified_qr_split is not None:
                         rt.fill(
                             unified_inQSeq.prod(),
-                            QKV,
-                            tap=unified_q_batch_tiles[
-                                lane_batch_idx * num_qkv_head_block_per_parallel_head
-                                + head_group_idx
-                            ],
+                            OR if use_staged_hidden_state_projection else QKV,
+                            tap=(
+                                staged_seq_q_batch_tiles[
+                                    lane_batch_idx
+                                    * num_qkv_head_block_per_parallel_head
+                                    + head_group_idx
+                                ]
+                                if use_staged_hidden_state_projection
+                                else unified_q_batch_tiles[
+                                    lane_batch_idx
+                                    * num_qkv_head_block_per_parallel_head
+                                    + head_group_idx
+                                ]
+                            ),
                             placement=Tile(
                                 col=unified_qr_split["q_shim_col"],
                                 row=0,
@@ -3475,15 +4920,26 @@ def encoder_pipeline(
                         )
                     for group_idx in range(group_count):
                         group_batch_idx = lane_batch_idx * group_count + group_idx
-                        if unified_qr_split is None:
+                        if (
+                            unified_qr_split is None
+                            and not use_staged_hidden_state_projection
+                        ):
                             rt.fill(
                                 group_inQSeq[group_idx].prod(),
-                                QKV,
-                                tap=q_batch_tiles[
-                                    group_batch_idx
-                                    * num_qkv_head_block_per_parallel_head
-                                    + head_group_idx
-                                ],
+                                OR if use_staged_hidden_state_projection else QKV,
+                                tap=(
+                                    staged_seq_q_batch_tiles[
+                                        group_batch_idx
+                                        * num_qkv_head_block_per_parallel_head
+                                        + head_group_idx
+                                    ]
+                                    if use_staged_hidden_state_projection
+                                    else q_batch_tiles[
+                                        group_batch_idx
+                                        * num_qkv_head_block_per_parallel_head
+                                        + head_group_idx
+                                    ]
+                                ),
                                 placement=Tile(
                                     col=transport_groups[group_idx].get(
                                         "shim_cols", default_group_shim_cols
@@ -3493,38 +4949,49 @@ def encoder_pipeline(
                                 task_group=tg_head,
                                 wait=True,
                             )
-                        for k_tap in K_fill_taps[head_group_idx]:
-                            rt.fill(
-                                group_inKSeq[group_idx].prod(),
-                                QKV,
-                                tap=k_tap,
-                                placement=Tile(
-                                    col=transport_groups[group_idx].get(
-                                        "shim_cols", default_group_shim_cols
-                                    )["k"],
-                                    row=0,
-                                ),
-                                task_group=tg_head,
-                                wait=True,
-                            )
-                        for v_tap in V_fill_taps[head_group_idx]:
-                            rt.fill(
-                                group_inVSeq[group_idx].prod(),
-                                QKV,
-                                tap=v_tap,
-                                placement=Tile(
-                                    col=transport_groups[group_idx].get(
-                                        "shim_cols", default_group_shim_cols
-                                    )["v"],
-                                    row=0,
-                                ),
-                                task_group=tg_head,
-                                wait=True,
-                            )
+                        if not (
+                            use_staged_hidden_state_projection and parallel_heads > 1
+                        ):
+                            for k_tap in (
+                                [staged_seq_k_tiles[head_group_idx]]
+                                if use_staged_hidden_state_projection
+                                else K_fill_taps[head_group_idx]
+                            ):
+                                rt.fill(
+                                    group_inKSeq[group_idx].prod(),
+                                    OR if use_staged_hidden_state_projection else QKV,
+                                    tap=k_tap,
+                                    placement=Tile(
+                                        col=transport_groups[group_idx].get(
+                                            "shim_cols", default_group_shim_cols
+                                        )["k"],
+                                        row=0,
+                                    ),
+                                    task_group=tg_head,
+                                    wait=True,
+                                )
+                            for v_tap in (
+                                [staged_seq_v_tiles[head_group_idx]]
+                                if use_staged_hidden_state_projection
+                                else V_fill_taps[head_group_idx]
+                            ):
+                                rt.fill(
+                                    group_inVSeq[group_idx].prod(),
+                                    OR if use_staged_hidden_state_projection else QKV,
+                                    tap=v_tap,
+                                    placement=Tile(
+                                        col=transport_groups[group_idx].get(
+                                            "shim_cols", default_group_shim_cols
+                                        )["v"],
+                                        row=0,
+                                    ),
+                                    task_group=tg_head,
+                                    wait=True,
+                                )
                         if unified_inOWSeq is None:
                             rt.fill(
                                 group_inOWSeq[group_idx].prod(),
-                                W_O,
+                                W_ATTN if use_staged_hidden_state_projection else W_O,
                                 tap=wo_tiles[head_group_idx],
                                 placement=Tile(
                                     col=transport_groups[group_idx].get(
@@ -3541,7 +5008,7 @@ def encoder_pipeline(
                 if unified_qr_split is not None:
                     rt.fill(
                         unified_inRSeq.prod(),
-                        OR,
+                        X if use_staged_hidden_state_projection else OR,
                         tap=unified_joined_r_tiles[lane_batch_idx],
                         placement=Tile(
                             col=unified_qr_split["residual_shim_col"],
@@ -3552,7 +5019,7 @@ def encoder_pipeline(
                     )
                     rt.fill(
                         unified_inRSeq.prod(),
-                        OR,
+                        X if use_staged_hidden_state_projection else OR,
                         tap=unified_joined_r_tiles[lane_batch_idx],
                         placement=Tile(
                             col=unified_qr_split["residual_shim_col"],
@@ -3566,7 +5033,7 @@ def encoder_pipeline(
                         group_batch_idx = lane_batch_idx * group_count + group_idx
                         rt.fill(
                             group_inRSeq[group_idx].prod(),
-                            OR,
+                            X if use_staged_hidden_state_projection else OR,
                             tap=joined_r_tiles[group_batch_idx],
                             placement=Tile(
                                 col=transport_groups[group_idx].get(
@@ -3580,7 +5047,7 @@ def encoder_pipeline(
                         )
                         rt.fill(
                             group_inRSeq[group_idx].prod(),
-                            OR,
+                            X if use_staged_hidden_state_projection else OR,
                             tap=joined_r_tiles[group_batch_idx],
                             placement=Tile(
                                 col=transport_groups[group_idx].get(
@@ -3618,34 +5085,105 @@ def encoder_pipeline(
                     pending_tail_tg = None
 
                 tg_tail = rt.task_group()
+                use_seq_b_up_priming = (
+                    effective_ffn_branches == 1 and ffn_col_group_count > 1
+                )
+                seq_b_up_prime_groups = 1 if use_seq_b_up_priming else 0
                 if unified_inBUpSeq is not None:
-                    rt.fill(
-                        unified_inBUpSeq.prod(),
-                        B_Up,
-                        tap=b_up_tiles[0],
-                        placement=Tile(
-                            col=unified_shared_streams["b_up"]["shim_col"],
-                            row=0,
-                        ),
-                        task_group=tg_tail,
-                        wait=True,
-                    )
-                for group_idx in range(group_count):
-                    for branch_idx in range(effective_ffn_branches):
-                        if unified_inBUpSeq is None:
+                    if use_seq_b_up_priming:
+                        first_tap, rest_tap = split_fill_tap_prefix_rest(
+                            b_up_tiles[0],
+                            (embed_sz, ffn_intermediate_size),
+                            seq_b_up_prime_groups,
+                        )
+                        if first_tap is not None:
                             rt.fill(
-                                group_inBUpSeq[group_idx][branch_idx].prod(),
+                                unified_inBUpSeq.prod(),
                                 B_Up,
-                                tap=b_up_tiles[branch_idx],
+                                tap=first_tap,
                                 placement=Tile(
-                                    col=group_weight_b_up_shim_cols[group_idx][
-                                        branch_idx
-                                    ],
+                                    col=unified_shared_streams["b_up"]["shim_col"],
+                                    row=0,
+                                ),
+                                task_group=tg_tail,
+                                wait=False,
+                            )
+                        if rest_tap is not None:
+                            rt.fill(
+                                unified_inBUpSeq.prod(),
+                                B_Up,
+                                tap=rest_tap,
+                                placement=Tile(
+                                    col=unified_shared_streams["b_up"]["shim_col"],
                                     row=0,
                                 ),
                                 task_group=tg_tail,
                                 wait=True,
                             )
+                    else:
+                        rt.fill(
+                            unified_inBUpSeq.prod(),
+                            B_Up,
+                            tap=b_up_tiles[0],
+                            placement=Tile(
+                                col=unified_shared_streams["b_up"]["shim_col"],
+                                row=0,
+                            ),
+                            task_group=tg_tail,
+                            wait=True,
+                        )
+                for group_idx in range(group_count):
+                    for branch_idx in range(effective_ffn_branches):
+                        if unified_inBUpSeq is None:
+                            if use_seq_b_up_priming:
+                                first_tap, rest_tap = split_fill_tap_prefix_rest(
+                                    b_up_tiles[branch_idx],
+                                    (embed_sz, ffn_intermediate_size),
+                                    seq_b_up_prime_groups,
+                                )
+                                if first_tap is not None:
+                                    rt.fill(
+                                        group_inBUpSeq[group_idx][branch_idx].prod(),
+                                        B_Up,
+                                        tap=first_tap,
+                                        placement=Tile(
+                                            col=group_weight_b_up_shim_cols[group_idx][
+                                                branch_idx
+                                            ],
+                                            row=0,
+                                        ),
+                                        task_group=tg_tail,
+                                        wait=False,
+                                    )
+                                if rest_tap is not None:
+                                    rt.fill(
+                                        group_inBUpSeq[group_idx][branch_idx].prod(),
+                                        B_Up,
+                                        tap=rest_tap,
+                                        placement=Tile(
+                                            col=group_weight_b_up_shim_cols[group_idx][
+                                                branch_idx
+                                            ],
+                                            row=0,
+                                        ),
+                                        task_group=tg_tail,
+                                        wait=True,
+                                    )
+                            else:
+                                rt.fill(
+                                    group_inBUpSeq[group_idx][branch_idx].prod(),
+                                    B_Up,
+                                    tap=b_up_tiles[branch_idx],
+                                    placement=Tile(
+                                        col=group_weight_b_up_shim_cols[group_idx][
+                                            branch_idx
+                                        ],
+                                        row=0,
+                                    ),
+                                    task_group=tg_tail,
+                                    wait=True,
+                                )
+                    for branch_idx in range(effective_ffn_branches):
                         rt.fill(
                             group_inBDownSeq[group_idx][branch_idx].prod(),
                             B_Down,
@@ -3722,6 +5260,106 @@ def encoder_pipeline(
 
         return _emit_program(rt)
 
+    def project_q_from_hidden_states(
+        of_x_in,
+        of_w_in,
+        of_q_out,
+        matmul_init,
+        matmul_acc,
+        add_bias,
+        bias_buffer,
+    ):
+        for _ in range_(sys.maxsize):
+            for head_group_idx in range_(num_qkv_head_block_per_parallel_head):
+                head_group_i32 = arith.index_castui(T.i32(), head_group_idx)
+                elem_out_q = of_q_out.acquire(1)
+                elem_in_x = of_x_in.acquire(1)
+                elem_in_w = of_w_in.acquire(1)
+                matmul_init(elem_in_x, elem_in_w, elem_out_q)
+                of_w_in.release(1)
+                of_x_in.release(1)
+                for _ in range_(proj_acc_depth - 1):
+                    elem_in_x = of_x_in.acquire(1)
+                    elem_in_w = of_w_in.acquire(1)
+                    matmul_acc(elem_in_x, elem_in_w, elem_out_q, elem_out_q)
+                    of_w_in.release(1)
+                    of_x_in.release(1)
+                add_bias(
+                    elem_out_q,
+                    bias_buffer,
+                    elem_out_q,
+                    head_group_i32,
+                    seq_tile,
+                    d,
+                )
+                of_q_out.release(1)
+
+    def project_k_from_hidden_states(
+        of_x_in,
+        of_w_in,
+        of_k_out,
+        matmul_init_k,
+        matmul_acc_k,
+        add_k_bias,
+        k_bias_buffer,
+    ):
+        for _ in range_(sys.maxsize):
+            for head_group_idx in range_(num_qkv_head_block_per_parallel_head):
+                head_group_i32 = arith.index_castui(T.i32(), head_group_idx)
+                for _ in range_(num_kv_seq_blocks):
+                    elem_out_k = of_k_out.acquire(1)
+                    for acc_idx in range_(proj_acc_depth):
+                        elem_in_x = of_x_in.acquire(1)
+                        elem_in_wk = of_w_in.acquire(1)
+                        if acc_idx == 0:
+                            matmul_init_k(elem_in_x, elem_in_wk, elem_out_k)
+                        else:
+                            matmul_acc_k(elem_in_x, elem_in_wk, elem_out_k, elem_out_k)
+                        of_w_in.release(1)
+                        of_x_in.release(1)
+                    add_k_bias(
+                        elem_out_k,
+                        k_bias_buffer,
+                        elem_out_k,
+                        head_group_i32,
+                        kv_seq_tile,
+                        d,
+                    )
+                    of_k_out.release(1)
+
+    def project_v_from_hidden_states(
+        of_x_in,
+        of_w_in,
+        of_v_out,
+        matmul_init_v,
+        matmul_acc_v,
+        add_v_bias,
+        v_bias_buffer,
+    ):
+        for _ in range_(sys.maxsize):
+            for head_group_idx in range_(num_qkv_head_block_per_parallel_head):
+                head_group_i32 = arith.index_castui(T.i32(), head_group_idx)
+                for _ in range_(num_kv_seq_blocks):
+                    elem_out_v = of_v_out.acquire(1)
+                    for acc_idx in range_(proj_acc_depth):
+                        elem_in_x = of_x_in.acquire(1)
+                        elem_in_wv = of_w_in.acquire(1)
+                        if acc_idx == 0:
+                            matmul_init_v(elem_in_x, elem_in_wv, elem_out_v)
+                        else:
+                            matmul_acc_v(elem_in_x, elem_in_wv, elem_out_v, elem_out_v)
+                        of_w_in.release(1)
+                        of_x_in.release(1)
+                    add_v_bias(
+                        elem_out_v,
+                        v_bias_buffer,
+                        elem_out_v,
+                        head_group_i32,
+                        kv_seq_tile,
+                        d,
+                    )
+                    of_v_out.release(1)
+
     idx_buffer_qk = [
         Buffer(
             initial_value=np.zeros(shape=(2,), dtype=np.int32),
@@ -3768,6 +5406,118 @@ def encoder_pipeline(
     ffn_down_sumsq_buffer = Buffer(type=sum_l1_ty, name="ffn_down_sumsq_buffer")
     ln2_sum_buffer = Buffer(type=sum_l1_ty, name="ln2_sum_buffer")
     ln2_sumsq_buffer = Buffer(type=sum_l1_ty, name="ln2_sumsq_buffer")
+    q_proj_bias_buffer = None
+    k_proj_bias_buffer = None
+    v_proj_bias_buffer = None
+    if use_staged_hidden_state_projection:
+        staged_q_bias_rows = static_q_proj_biases.reshape(
+            num_qkv_head_block_per_parallel_head, parallel_heads, d
+        )
+        staged_k_bias_rows = static_k_proj_biases.reshape(
+            num_qkv_head_block_per_parallel_head, parallel_heads, d
+        )
+        staged_v_bias_rows = static_v_proj_biases.reshape(
+            num_qkv_head_block_per_parallel_head, parallel_heads, d
+        )
+        q_proj_bias_buffer = [
+            Buffer(
+                type=bias_matrix_ty,
+                initial_value=np.ascontiguousarray(staged_q_bias_rows[:, head_idx, :]),
+                name=f"static_q_proj_bias_{head_idx}",
+            )
+            for head_idx in range(parallel_heads)
+        ]
+        k_proj_bias_buffer = [
+            Buffer(
+                type=bias_matrix_ty,
+                initial_value=np.ascontiguousarray(staged_k_bias_rows[:, head_idx, :]),
+                name=f"static_k_proj_bias_{head_idx}",
+            )
+            for head_idx in range(parallel_heads)
+        ]
+        v_proj_bias_buffer = [
+            Buffer(
+                type=bias_matrix_ty,
+                initial_value=np.ascontiguousarray(staged_v_bias_rows[:, head_idx, :]),
+                name=f"static_v_proj_bias_{head_idx}",
+            )
+            for head_idx in range(parallel_heads)
+        ]
+
+    q_proj_workers = []
+    k_proj_workers = []
+    v_proj_workers = []
+    if use_staged_hidden_state_projection:
+        if parallel_heads == 1:
+            q_proj_tiles = [Tile(col=2, row=2)]
+            k_proj_tiles = [Tile(col=3, row=2)]
+            v_proj_tiles = [Tile(col=4, row=2)]
+        else:
+            proj_col_start = parallel_heads
+            q_proj_tiles = [
+                Tile(col=proj_col_start + head_idx, row=2)
+                for head_idx in range(parallel_heads)
+            ]
+            k_proj_tiles = [
+                Tile(col=proj_col_start + head_idx, row=3)
+                for head_idx in range(parallel_heads)
+            ]
+            v_proj_tiles = [
+                Tile(col=proj_col_start + parallel_heads + head_idx, row=3)
+                for head_idx in range(parallel_heads)
+            ]
+        for head_idx in range(parallel_heads):
+            q_proj_workers.append(
+                Worker(
+                    project_q_from_hidden_states,
+                    fn_args=[
+                        inXQ[head_idx].cons(),
+                        inWQ[head_idx].cons(),
+                        projQOut[head_idx].prod(),
+                        matmul_init_q_proj_kernel,
+                        matmul_q_proj_kernel,
+                        eltwise_add_q_kernel,
+                        q_proj_bias_buffer[head_idx],
+                    ],
+                    placement=q_proj_tiles[head_idx],
+                    stack_size=0xD00,
+                    while_true=False,
+                )
+            )
+            k_proj_workers.append(
+                Worker(
+                    project_k_from_hidden_states,
+                    fn_args=[
+                        inXK[head_idx].cons(),
+                        inWK[head_idx].cons(),
+                        projKOut[head_idx].prod(),
+                        matmul_init_k_proj_kernel,
+                        matmul_k_proj_kernel,
+                        eltwise_add_k_kernel,
+                        k_proj_bias_buffer[head_idx],
+                    ],
+                    placement=k_proj_tiles[head_idx],
+                    stack_size=0xD00,
+                    while_true=False,
+                )
+            )
+            v_proj_workers.append(
+                Worker(
+                    project_v_from_hidden_states,
+                    fn_args=[
+                        inXV[head_idx].cons(),
+                        inWV[head_idx].cons(),
+                        projVOut[head_idx].prod(),
+                        matmul_init_v_proj_kernel,
+                        matmul_v_proj_kernel,
+                        eltwise_add_v_kernel,
+                        v_proj_bias_buffer[head_idx],
+                    ],
+                    placement=v_proj_tiles[head_idx],
+                    stack_size=0xD00,
+                    while_true=False,
+                )
+            )
 
     qk_workers = []
     softmax_workers = []
@@ -3975,6 +5725,9 @@ def encoder_pipeline(
     )
 
     qkv_tensor_shape = (3 * seq_len, embed_sz)
+    attn_weight_tensor_shape = (4 * embed_sz, embed_sz)
+    ln_stage_base_offset = or_rows_before_ln1_stage * embed_sz
+    hidden_state_tensor_shape = (seq_len, embed_sz)
     q_tiles_base = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
         (seq_tile, d),
@@ -4023,10 +5776,145 @@ def encoder_pipeline(
             for tap in v_tiles_base
         ]
     )
-    WO_tiles = TensorTiler2D.group_tiler(
+    if use_staged_hidden_state_projection:
+        hidden_state_q_tiles_base = TensorTiler2D.group_tiler(
+            (seq_len, embed_sz),
+            (seq_tile, emb_tile),
+            (1, proj_acc_depth),
+        )
+        hidden_state_q_tiles = TensorAccessSequence.from_taps(
+            [
+                TensorAccessPattern(
+                    hidden_state_tensor_shape,
+                    offset=tap.offset,
+                    sizes=tap.sizes,
+                    strides=tap.strides,
+                )
+                for tap in hidden_state_q_tiles_base
+            ]
+        )
+        hidden_state_kv_tiles_base = TensorTiler2D.group_tiler(
+            (seq_len, embed_sz),
+            (kv_seq_tile, emb_tile),
+            (num_kv_seq_blocks, proj_acc_depth),
+        )
+        hidden_state_kv_tiles = TensorAccessSequence.from_taps(
+            [
+                TensorAccessPattern(
+                    hidden_state_tensor_shape,
+                    offset=tap.offset,
+                    sizes=tap.sizes,
+                    strides=tap.strides,
+                )
+                for tap in hidden_state_kv_tiles_base
+            ]
+        )
+        wq_tiles_base = TensorTiler2D.group_tiler(
+            (embed_sz, embed_sz),
+            (emb_tile, d),
+            (proj_acc_depth, 1),
+        )
+        WQ_tiles = TensorAccessSequence.from_taps(
+            [
+                TensorAccessPattern(
+                    attn_weight_tensor_shape,
+                    offset=tap.offset,
+                    sizes=tap.sizes,
+                    strides=tap.strides,
+                )
+                for tap in wq_tiles_base
+            ]
+        )
+        wk_tiles_base = TensorTiler2D.group_tiler(
+            (embed_sz, embed_sz),
+            (emb_tile, d),
+            (proj_acc_depth, 1),
+        )
+        WK_tiles = TensorAccessSequence.from_taps(
+            [
+                TensorAccessPattern(
+                    attn_weight_tensor_shape,
+                    offset=tap.offset + embed_sz * embed_sz,
+                    sizes=tap.sizes,
+                    strides=tap.strides,
+                )
+                for tap in wk_tiles_base
+            ]
+        )
+        wv_tiles_base = TensorTiler2D.group_tiler(
+            (embed_sz, embed_sz),
+            (emb_tile, d),
+            (proj_acc_depth, 1),
+        )
+        WV_tiles = TensorAccessSequence.from_taps(
+            [
+                TensorAccessPattern(
+                    attn_weight_tensor_shape,
+                    offset=tap.offset + 2 * embed_sz * embed_sz,
+                    sizes=tap.sizes,
+                    strides=tap.strides,
+                )
+                for tap in wv_tiles_base
+            ]
+        )
+        grouped_k_weight_tiles = None
+        grouped_v_weight_tiles = None
+        if parallel_heads > 1:
+            wk_group_tiles_base = TensorTiler2D.group_tiler(
+                (embed_sz, embed_sz),
+                (emb_tile, d * parallel_heads),
+                (proj_acc_depth, 1),
+            )
+            grouped_k_weight_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        attn_weight_tensor_shape,
+                        offset=tap.offset + embed_sz * embed_sz,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in wk_group_tiles_base
+                ]
+            )
+            wv_group_tiles_base = TensorTiler2D.group_tiler(
+                (embed_sz, embed_sz),
+                (emb_tile, d * parallel_heads),
+                (proj_acc_depth, 1),
+            )
+            grouped_v_weight_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        attn_weight_tensor_shape,
+                        offset=tap.offset + 2 * embed_sz * embed_sz,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in wv_group_tiles_base
+                ]
+            )
+    wo_tiles_base = TensorTiler2D.group_tiler(
         (embed_sz, embed_sz),
         (d, emb_tile),
         (parallel_heads, embed_sz // emb_tile),
+    )
+    WO_tiles = TensorAccessSequence.from_taps(
+        [
+            TensorAccessPattern(
+                (
+                    attn_weight_tensor_shape
+                    if use_staged_hidden_state_projection
+                    else (embed_sz, embed_sz)
+                ),
+                offset=(
+                    tap.offset + 3 * embed_sz * embed_sz
+                    if use_staged_hidden_state_projection
+                    else tap.offset
+                ),
+                sizes=tap.sizes,
+                strides=tap.strides,
+            )
+            for tap in wo_tiles_base
+        ]
     )
     for tile in WO_tiles:
         tile._sizes = [tile._sizes[1], tile._sizes[0], tile._sizes[2], tile._sizes[3]]
@@ -4057,17 +5945,54 @@ def encoder_pipeline(
             for tap in o_tiles_base
         ]
     )
-    R_tiles = TensorAccessSequence.from_taps(
-        [
-            TensorAccessPattern(
-                or_tensor_shape,
-                offset=tap.offset + seq_len * embed_sz,
-                sizes=tap.sizes,
-                strides=tap.strides,
+    R_tiles = None
+    if not use_staged_hidden_state_projection:
+        R_tiles = TensorAccessSequence.from_taps(
+            [
+                TensorAccessPattern(
+                    or_tensor_shape,
+                    offset=tap.offset + seq_len * embed_sz,
+                    sizes=tap.sizes,
+                    strides=tap.strides,
+                )
+                for tap in r_tiles_base
+            ]
+        )
+    if use_staged_hidden_state_projection:
+        hidden_state_residual_tiles = TensorAccessSequence.from_taps(
+            [
+                TensorAccessPattern(
+                    hidden_state_tensor_shape,
+                    offset=tap.offset,
+                    sizes=tap.sizes,
+                    strides=tap.strides,
+                )
+                for tap in r_tiles_base
+            ]
+        )
+        if use_staged_hidden_state_kv_cache:
+            cached_k_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        or_tensor_shape,
+                        offset=tap.offset + seq_len * embed_sz,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in k_tiles_base
+                ]
             )
-            for tap in r_tiles_base
-        ]
-    )
+            cached_v_tiles = TensorAccessSequence.from_taps(
+                [
+                    TensorAccessPattern(
+                        or_tensor_shape,
+                        offset=tap.offset + 2 * seq_len * embed_sz,
+                        sizes=tap.sizes,
+                        strides=tap.strides,
+                    )
+                    for tap in v_tiles_base
+                ]
+            )
     B_Up_tiles = TensorAccessSequence.from_taps(
         [
             TensorAccessPattern(
@@ -4149,16 +6074,31 @@ def encoder_pipeline(
             chunk_start += chunk_len
         return chunk_taps
 
-    for tas in (
+    legalized_tas = [
         Q_tiles,
         K_tiles,
         V_tiles,
         WO_tiles,
         O_tiles,
-        R_tiles,
         B_Up_tiles,
         B_Down_tiles,
-    ):
+    ]
+    if R_tiles is not None:
+        legalized_tas.append(R_tiles)
+    if use_staged_hidden_state_projection:
+        legalized_tas.extend(
+            [
+                hidden_state_q_tiles,
+                hidden_state_kv_tiles,
+                hidden_state_residual_tiles,
+                WQ_tiles,
+                WK_tiles,
+                WV_tiles,
+            ]
+        )
+        if use_staged_hidden_state_kv_cache:
+            legalized_tas.extend([cached_k_tiles, cached_v_tiles])
+    for tas in legalized_tas:
         legalize_tas(tas)
 
     max_host_fill_outer_dim = 64
@@ -4170,6 +6110,11 @@ def encoder_pipeline(
         split_fill_tap_on_outer_dim(tap, qkv_tensor_shape, max_host_fill_outer_dim)
         for tap in V_tiles
     ]
+    staged_hidden_state_kv_fill_taps = None
+    staged_k_weight_fill_taps = None
+    staged_v_weight_fill_taps = None
+    staged_grouped_k_weight_fill_taps = None
+    staged_grouped_v_weight_fill_taps = None
 
     for tap_seq, obj_shape, expected, message in (
         (
@@ -4197,12 +6142,6 @@ def encoder_pipeline(
             "W_O tap count does not match proj_acc_depth",
         ),
         (
-            R_tiles,
-            (seq_tile, emb_tile),
-            proj_acc_depth,
-            "Residual tap count does not match LN1 runtime contract",
-        ),
-        (
             O_tiles,
             (seq_tile, emb_tile),
             proj_acc_depth,
@@ -4222,15 +6161,184 @@ def encoder_pipeline(
         ),
     ):
         assert_tap_iteration_count(tap_seq[0], obj_shape, expected, message)
+    if R_tiles is not None:
+        assert_tap_iteration_count(
+            R_tiles[0],
+            (seq_tile, emb_tile),
+            proj_acc_depth,
+            "Residual tap count does not match LN1 runtime contract",
+        )
 
+    if use_staged_hidden_state_projection:
+        repeated_k_weight_tiles = [
+            repeat_outer_tap(
+                WK_tiles[head_group_idx], attn_weight_tensor_shape, num_kv_seq_blocks
+            )
+            for head_group_idx in range(len(WK_tiles))
+        ]
+        repeated_v_weight_tiles = [
+            repeat_outer_tap(
+                WV_tiles[head_group_idx], attn_weight_tensor_shape, num_kv_seq_blocks
+            )
+            for head_group_idx in range(len(WV_tiles))
+        ]
+        repeated_grouped_k_weight_tiles = None
+        repeated_grouped_v_weight_tiles = None
+        if parallel_heads > 1:
+            repeated_grouped_k_weight_tiles = [
+                repeat_outer_tap(
+                    grouped_k_weight_tiles[head_group_idx],
+                    attn_weight_tensor_shape,
+                    num_kv_seq_blocks,
+                )
+                for head_group_idx in range(len(grouped_k_weight_tiles))
+            ]
+            repeated_grouped_v_weight_tiles = [
+                repeat_outer_tap(
+                    grouped_v_weight_tiles[head_group_idx],
+                    attn_weight_tensor_shape,
+                    num_kv_seq_blocks,
+                )
+                for head_group_idx in range(len(grouped_v_weight_tiles))
+            ]
+        assert_tap_iteration_count(
+            hidden_state_q_tiles[0],
+            (seq_tile, emb_tile),
+            proj_acc_depth,
+            "XQ tap count does not match proj_acc_depth",
+        )
+        assert_tap_iteration_count(
+            hidden_state_kv_tiles[0],
+            (kv_seq_tile, emb_tile),
+            num_kv_seq_blocks * proj_acc_depth,
+            "XKV tap count does not match staged KV projection loop count",
+        )
+        assert_tap_iteration_count(
+            hidden_state_residual_tiles[0],
+            (seq_tile, emb_tile),
+            proj_acc_depth,
+            "staged residual tap count does not match LN1 runtime contract",
+        )
+        assert_tap_iteration_count(
+            WQ_tiles[0],
+            (emb_tile, d),
+            proj_acc_depth,
+            "W_Q tap count does not match proj_acc_depth",
+        )
+        assert_tap_iteration_count(
+            repeated_k_weight_tiles[0],
+            (emb_tile, d),
+            num_kv_seq_blocks * proj_acc_depth,
+            "W_K tap count does not match staged KV projection loop count",
+        )
+        assert_tap_iteration_count(
+            repeated_v_weight_tiles[0],
+            (emb_tile, d),
+            num_kv_seq_blocks * proj_acc_depth,
+            "W_V tap count does not match staged KV projection loop count",
+        )
+        if parallel_heads > 1:
+            assert_tap_iteration_count(
+                repeated_grouped_k_weight_tiles[0],
+                (emb_tile, d * parallel_heads),
+                num_kv_seq_blocks * proj_acc_depth,
+                "grouped W_K tap count does not match staged KV projection loop count",
+            )
+            assert_tap_iteration_count(
+                repeated_grouped_v_weight_tiles[0],
+                (emb_tile, d * parallel_heads),
+                num_kv_seq_blocks * proj_acc_depth,
+                "grouped W_V tap count does not match staged KV projection loop count",
+            )
+        if use_staged_hidden_state_kv_cache:
+            assert_tap_iteration_count(
+                cached_k_tiles[0],
+                (kv_seq_tile, d),
+                num_kv_seq_blocks,
+                "cached K tap count does not match KV block count",
+            )
+            assert_tap_iteration_count(
+                cached_v_tiles[0],
+                (kv_seq_tile, d),
+                num_kv_seq_blocks,
+                "cached V tap count does not match KV block count",
+            )
+        staged_hidden_state_kv_fill_taps = split_fill_tap_on_outer_dim(
+            hidden_state_kv_tiles[0],
+            hidden_state_tensor_shape,
+            max_host_fill_outer_dim,
+        )
+        staged_k_weight_fill_taps = [
+            split_fill_tap_on_outer_dim(
+                tap,
+                attn_weight_tensor_shape,
+                max_host_fill_outer_dim,
+            )
+            for tap in repeated_k_weight_tiles
+        ]
+        staged_v_weight_fill_taps = [
+            split_fill_tap_on_outer_dim(
+                tap,
+                attn_weight_tensor_shape,
+                max_host_fill_outer_dim,
+            )
+            for tap in repeated_v_weight_tiles
+        ]
+        if parallel_heads > 1:
+            staged_grouped_k_weight_fill_taps = [
+                split_fill_tap_on_outer_dim(
+                    tap,
+                    attn_weight_tensor_shape,
+                    max_host_fill_outer_dim,
+                )
+                for tap in repeated_grouped_k_weight_tiles
+            ]
+            staged_grouped_v_weight_fill_taps = [
+                split_fill_tap_on_outer_dim(
+                    tap,
+                    attn_weight_tensor_shape,
+                    max_host_fill_outer_dim,
+                )
+                for tap in repeated_grouped_v_weight_tiles
+            ]
     rt = Runtime()
-    with rt.sequence(W_O_ty, QKV_ty, OR_ty, B_Up_ty, B_Down_ty) as (
-        W_O,
-        QKV,
-        OR,
-        B_Up,
-        B_Down,
-    ):
+    staged_xq_shim_cols = None
+    staged_wq_shim_cols = None
+    staged_xk_shim_cols = None
+    staged_wk_shim_cols = None
+    staged_xv_shim_cols = None
+    staged_wv_shim_cols = None
+    if use_staged_hidden_state_projection:
+        staged_xq_shim_cols = [q_shim_col] * parallel_heads
+        staged_wq_shim_cols = [k_shim_col] * parallel_heads
+        staged_xk_shim_cols = [v_shim_col] * parallel_heads
+        staged_wk_shim_cols = [bdown_shim_col] * parallel_heads
+        staged_xv_shim_cols = [ow_shim_col] * parallel_heads
+        if parallel_heads == 2:
+            staged_xv_shim_cols = [ow_shim_col, residual_shim_col]
+        staged_wv_shim_cols = [bup_shim_col] * parallel_heads
+        if effective_ffn_branches > 1:
+            # Keep staged K/V weight ingress off the FFN-tail shims entirely.
+            # The multi-branch tail already saturates the branch-weight columns,
+            # and the LN/output shims are consumed by OR staging. For staged
+            # multi-branch bring-up, isolate the projection weights on the
+            # projection-side shim group instead.
+            staged_wk_shim_cols = [k_shim_col] * parallel_heads
+            staged_wv_shim_cols = [q_shim_col] * parallel_heads
+    sequence_types = (W_O_ty, QKV_ty, OR_ty, B_Up_ty, B_Down_ty)
+    if use_staged_hidden_state_projection:
+        sequence_types = (W_ATTN_ty, X_ty, OR_ty, B_Up_ty, B_Down_ty)
+    with rt.sequence(*sequence_types) as sequence_args:
+        if use_staged_hidden_state_projection:
+            (
+                W_ATTN,
+                X,
+                OR,
+                B_Up,
+                B_Down,
+            ) = sequence_args
+        else:
+            W_O, QKV, OR, B_Up, B_Down = sequence_args
         if use_runtime_ln_weights:
             rt.inline_ops(
                 _emit_runtime_buffer_values,
@@ -4240,6 +6348,13 @@ def encoder_pipeline(
                 _emit_runtime_buffer_values,
                 [ln2_weight_buffer, static_ln2_weights],
             )
+        if use_staged_hidden_state_projection:
+            for worker in q_proj_workers:
+                rt.start(worker)
+            for worker in k_proj_workers:
+                rt.start(worker)
+            for worker in v_proj_workers:
+                rt.start(worker)
         for i in range(parallel_heads):
             rt.start(qk_workers[i])
             rt.start(softmax_workers[i])
@@ -4250,7 +6365,79 @@ def encoder_pipeline(
             rt.start(ffn_up_workers[branch_idx])
             rt.start(ffn_down_workers[branch_idx])
         rt.start(ln2_worker)
-
+        if use_staged_hidden_state_kv_cache:
+            for head_group_idx in range(num_qkv_head_block_per_parallel_head):
+                tg_kv_cache = rt.task_group()
+                if parallel_heads > 1:
+                    rt.fill(
+                        inWKShared.prod(),
+                        W_ATTN,
+                        tap=repeated_grouped_k_weight_tiles[head_group_idx],
+                        placement=Tile(col=staged_wk_shim_cols[0], row=0),
+                        task_group=tg_kv_cache,
+                        wait=True,
+                    )
+                    rt.fill(
+                        inWVShared.prod(),
+                        W_ATTN,
+                        tap=repeated_grouped_v_weight_tiles[head_group_idx],
+                        placement=Tile(col=staged_wv_shim_cols[0], row=0),
+                        task_group=tg_kv_cache,
+                        wait=True,
+                    )
+                for head_idx in range(parallel_heads):
+                    global_head_idx = head_group_idx * parallel_heads + head_idx
+                    rt.fill(
+                        inXK[head_idx].prod(),
+                        X,
+                        tap=hidden_state_kv_tiles[0],
+                        placement=Tile(col=staged_xk_shim_cols[head_idx], row=0),
+                        task_group=tg_kv_cache,
+                        wait=True,
+                    )
+                    if parallel_heads == 1:
+                        rt.fill(
+                            inWK[head_idx].prod(),
+                            W_ATTN,
+                            tap=repeated_k_weight_tiles[global_head_idx],
+                            placement=Tile(col=staged_wk_shim_cols[head_idx], row=0),
+                            task_group=tg_kv_cache,
+                            wait=True,
+                        )
+                    rt.fill(
+                        inXV[head_idx].prod(),
+                        X,
+                        tap=hidden_state_kv_tiles[0],
+                        placement=Tile(col=staged_xv_shim_cols[head_idx], row=0),
+                        task_group=tg_kv_cache,
+                        wait=True,
+                    )
+                    if parallel_heads == 1:
+                        rt.fill(
+                            inWV[head_idx].prod(),
+                            W_ATTN,
+                            tap=repeated_v_weight_tiles[global_head_idx],
+                            placement=Tile(col=staged_wv_shim_cols[head_idx], row=0),
+                            task_group=tg_kv_cache,
+                            wait=True,
+                        )
+                    rt.drain(
+                        projKOut[head_idx].cons(),
+                        OR,
+                        tap=cached_k_tiles[global_head_idx],
+                        placement=Tile(col=k_shim_col, row=0),
+                        task_group=tg_kv_cache,
+                        wait=True,
+                    )
+                    rt.drain(
+                        projVOut[head_idx].cons(),
+                        OR,
+                        tap=cached_v_tiles[global_head_idx],
+                        placement=Tile(col=v_shim_col, row=0),
+                        task_group=tg_kv_cache,
+                        wait=True,
+                    )
+                rt.finish_task_group(tg_kv_cache)
         pending_ln1_refill_tg = None
         pending_output_tap_idx = None
         q_block_schedule = build_q_block_schedule(parallel_seq, q_blocks_per_lane)
@@ -4280,78 +6467,196 @@ def encoder_pipeline(
 
             for head_group_idx in range(num_qkv_head_block_per_parallel_head):
                 tg_head = rt.task_group()
-                rt.fill(
-                    inQ.prod(),
-                    QKV,
-                    tap=Q_tiles[
-                        tap_idx * num_qkv_head_block_per_parallel_head + head_group_idx
-                    ],
-                    placement=Tile(col=q_shim_col, row=0),
-                    task_group=tg_head,
-                    wait=True,
-                )
-                for k_tap in K_fill_taps[head_group_idx]:
+                if use_staged_hidden_state_projection and parallel_heads > 1:
+                    if not use_staged_hidden_state_kv_cache:
+                        for grouped_k_weight_tap in staged_grouped_k_weight_fill_taps[
+                            head_group_idx
+                        ]:
+                            rt.fill(
+                                inWKShared.prod(),
+                                W_ATTN,
+                                tap=grouped_k_weight_tap,
+                                placement=Tile(col=staged_wk_shim_cols[0], row=0),
+                                task_group=tg_head,
+                                wait=True,
+                            )
+                        for grouped_v_weight_tap in staged_grouped_v_weight_fill_taps[
+                            head_group_idx
+                        ]:
+                            rt.fill(
+                                inWVShared.prod(),
+                                W_ATTN,
+                                tap=grouped_v_weight_tap,
+                                placement=Tile(col=staged_wv_shim_cols[0], row=0),
+                                task_group=tg_head,
+                                wait=True,
+                            )
+                if use_staged_hidden_state_projection:
+                    for head_idx in range(parallel_heads):
+                        global_head_idx = head_group_idx * parallel_heads + head_idx
+                        if use_staged_hidden_state_kv_cache:
+                            rt.fill(
+                                inK.prod(),
+                                OR,
+                                tap=cached_k_tiles[global_head_idx],
+                                placement=Tile(col=k_shim_col, row=0),
+                                task_group=tg_head,
+                                wait=False,
+                            )
+                            rt.fill(
+                                inV.prod(),
+                                OR,
+                                tap=cached_v_tiles[global_head_idx],
+                                placement=Tile(col=v_shim_col, row=0),
+                                task_group=tg_head,
+                                wait=False,
+                            )
+                        else:
+                            for hidden_state_kv_tap in staged_hidden_state_kv_fill_taps:
+                                rt.fill(
+                                    inXK[head_idx].prod(),
+                                    X,
+                                    tap=hidden_state_kv_tap,
+                                    placement=Tile(
+                                        col=staged_xk_shim_cols[head_idx], row=0
+                                    ),
+                                    task_group=tg_head,
+                                    wait=True,
+                                )
+                            if parallel_heads == 1:
+                                for k_weight_tap in staged_k_weight_fill_taps[
+                                    global_head_idx
+                                ]:
+                                    rt.fill(
+                                        inWK[head_idx].prod(),
+                                        W_ATTN,
+                                        tap=k_weight_tap,
+                                        placement=Tile(
+                                            col=staged_wk_shim_cols[head_idx], row=0
+                                        ),
+                                        task_group=tg_head,
+                                        wait=True,
+                                    )
+                            for hidden_state_kv_tap in staged_hidden_state_kv_fill_taps:
+                                rt.fill(
+                                    inXV[head_idx].prod(),
+                                    X,
+                                    tap=hidden_state_kv_tap,
+                                    placement=Tile(
+                                        col=staged_xv_shim_cols[head_idx], row=0
+                                    ),
+                                    task_group=tg_head,
+                                    wait=True,
+                                )
+                            if parallel_heads == 1:
+                                for v_weight_tap in staged_v_weight_fill_taps[
+                                    global_head_idx
+                                ]:
+                                    rt.fill(
+                                        inWV[head_idx].prod(),
+                                        W_ATTN,
+                                        tap=v_weight_tap,
+                                        placement=Tile(
+                                            col=staged_wv_shim_cols[head_idx], row=0
+                                        ),
+                                        task_group=tg_head,
+                                        wait=True,
+                                    )
+                        rt.fill(
+                            inXQ[head_idx].prod(),
+                            X,
+                            tap=hidden_state_q_tiles[tap_idx],
+                            placement=Tile(col=staged_xq_shim_cols[head_idx], row=0),
+                            task_group=tg_head,
+                            wait=True,
+                        )
+                        rt.fill(
+                            inWQ[head_idx].prod(),
+                            W_ATTN,
+                            tap=WQ_tiles[global_head_idx],
+                            placement=Tile(col=staged_wq_shim_cols[head_idx], row=0),
+                            task_group=tg_head,
+                            wait=True,
+                        )
+                else:
                     rt.fill(
-                        inK.prod(),
+                        inQ.prod(),
                         QKV,
-                        tap=k_tap,
-                        placement=Tile(col=k_shim_col, row=0),
+                        tap=Q_tiles[
+                            tap_idx * num_qkv_head_block_per_parallel_head
+                            + head_group_idx
+                        ],
+                        placement=Tile(col=q_shim_col, row=0),
                         task_group=tg_head,
                         wait=True,
                     )
-                for v_tap in V_fill_taps[head_group_idx]:
-                    rt.fill(
-                        inV.prod(),
-                        QKV,
-                        tap=v_tap,
-                        placement=Tile(col=v_shim_col, row=0),
-                        task_group=tg_head,
-                        wait=True,
-                    )
+                    for k_tap in K_fill_taps[head_group_idx]:
+                        rt.fill(
+                            inK.prod(),
+                            QKV,
+                            tap=k_tap,
+                            placement=Tile(col=k_shim_col, row=0),
+                            task_group=tg_head,
+                            wait=True,
+                        )
+                    for v_tap in V_fill_taps[head_group_idx]:
+                        rt.fill(
+                            inV.prod(),
+                            QKV,
+                            tap=v_tap,
+                            placement=Tile(col=v_shim_col, row=0),
+                            task_group=tg_head,
+                            wait=True,
+                        )
                 rt.fill(
                     inOW.prod(),
-                    W_O,
+                    W_ATTN if use_staged_hidden_state_projection else W_O,
                     tap=WO_tiles[head_group_idx],
                     placement=Tile(col=ow_shim_col, row=0),
                     task_group=tg_head,
-                    wait=True,
+                    wait=not use_staged_hidden_state_kv_cache,
                 )
                 rt.finish_task_group(tg_head)
 
             tg_tail = rt.task_group()
+            initial_residual_source = X if use_staged_hidden_state_projection else OR
+            initial_residual_tap = (
+                hidden_state_residual_tiles[tap_idx]
+                if use_staged_hidden_state_projection
+                else R_tiles[tap_idx]
+            )
             rt.fill(
                 inR.prod(),
-                OR,
-                tap=R_tiles[tap_idx],
+                initial_residual_source,
+                tap=initial_residual_tap,
                 placement=Tile(col=residual_shim_col, row=0),
                 task_group=tg_tail,
                 wait=False,
             )
             rt.fill(
                 inR.prod(),
-                OR,
-                tap=R_tiles[tap_idx],
+                initial_residual_source,
+                tap=initial_residual_tap,
                 placement=Tile(col=residual_shim_col, row=0),
                 task_group=tg_tail,
                 wait=False,
             )
 
-            ln1_stage_base_offset = 2 * seq_len * embed_sz
             branch_stage_tap = TensorAccessPattern(
                 or_tensor_shape,
-                offset=ln1_stage_base_offset,
+                offset=ln_stage_base_offset,
                 sizes=[1, proj_acc_depth, seq_tile, emb_tile],
                 strides=[0, emb_tile, embed_sz, 1],
             )
             branch_refill_tap = TensorAccessPattern(
                 or_tensor_shape,
-                offset=ln1_stage_base_offset,
+                offset=ln_stage_base_offset,
                 sizes=[ffn_col_group_count, proj_acc_depth, seq_tile, emb_tile],
                 strides=[0, emb_tile, embed_sz, 1],
             )
             residual_stage_tap = TensorAccessPattern(
                 or_tensor_shape,
-                offset=ln1_stage_base_offset,
+                offset=ln_stage_base_offset,
                 sizes=[1, proj_acc_depth, seq_tile, emb_tile],
                 strides=[0, emb_tile, embed_sz, 1],
             )

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "../aie_kernel_utils.h"
+#define EXCLUDE_TILE_BIAS_ADD_KERNELS
 #include "../generic/add.cc"
 #include "gelu.cc"
 #include "zero.cc"

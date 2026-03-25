@@ -6,12 +6,23 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
+from itertools import product
 from pathlib import Path
 from typing import Any, Mapping
 
 _BASE_DIR = Path(__file__).resolve().parent
+_LAYOUT_VARIANT_INT_FIELDS = (
+    "weight_forward_depth",
+    "o_proj_fifo_depth",
+    "ffn_replay_fifo_depth",
+)
+_LAYOUT_VARIANT_BOOL_FIELDS = (
+    "use_fused_replayed_addnorm",
+    "use_transport_groups",
+    "use_unified_qr_split",
+)
 
 
 @lru_cache(maxsize=1)
@@ -54,6 +65,12 @@ class EncoderTopology:
     o_proj_acc_group_size: int
     parallel_ffn: int
     ffn_intermediate_size: int
+    weight_forward_depth: int | None = None
+    o_proj_fifo_depth: int | None = None
+    ffn_replay_fifo_depth: int | None = None
+    use_fused_replayed_addnorm: bool | None = None
+    use_transport_groups: bool | None = None
+    use_unified_qr_split: bool | None = None
     placement: Mapping[str, Any] | None = field(default=None, compare=False, repr=False)
 
     @property
@@ -89,14 +106,18 @@ class EncoderTopology:
 
     @property
     def topology_id(self) -> str:
-        return (
+        base_id = (
             f"{self.family_id}__ps{self.parallel_seq}"
             f"_ph{self.parallel_heads}_pffn{self.parallel_ffn}"
         )
+        variant_suffix = _layout_variant_suffix(self)
+        if not variant_suffix:
+            return base_id
+        return f"{base_id}__{variant_suffix}"
 
     @property
-    def cache_signature(self) -> tuple[int, ...]:
-        return (
+    def cache_signature(self) -> tuple[Any, ...]:
+        base_signature = (
             self.parallel_seq,
             self.parallel_heads,
             self.parallel_ffn,
@@ -108,6 +129,10 @@ class EncoderTopology:
             self.o_proj_acc_group_size,
             self.ffn_intermediate_size,
         )
+        variant_signature = _layout_variant_signature(self)
+        if not variant_signature:
+            return base_signature
+        return base_signature + variant_signature
 
     @property
     def compute_tile_count(self) -> int:
@@ -117,8 +142,8 @@ class EncoderTopology:
     def utilization_fraction(self) -> float:
         return compute_utilization(self.compute_tile_count)
 
-    def to_runtime_dict(self) -> dict[str, int]:
-        return {
+    def to_runtime_dict(self) -> dict[str, int | bool]:
+        runtime_dict = {
             "parallel_seq": self.parallel_seq,
             "parallel_heads": self.parallel_heads,
             "parallel_ffn": self.parallel_ffn,
@@ -130,6 +155,15 @@ class EncoderTopology:
             "o_proj_acc_group_size": self.o_proj_acc_group_size,
             "ffn_intermediate_size": self.ffn_intermediate_size,
         }
+        for field_name in _LAYOUT_VARIANT_INT_FIELDS:
+            value = getattr(self, field_name)
+            if value is not None:
+                runtime_dict[field_name] = value
+        for field_name in _LAYOUT_VARIANT_BOOL_FIELDS:
+            value = getattr(self, field_name)
+            if value is not None:
+                runtime_dict[field_name] = value
+        return runtime_dict
 
 
 def topology_key_from_fields(
@@ -166,7 +200,15 @@ def topology_key_from_fields(
 
 
 def topology_from_key(
-    key: tuple[int, ...], placement: Mapping[str, Any] | None = None
+    key: tuple[int, ...],
+    placement: Mapping[str, Any] | None = None,
+    *,
+    weight_forward_depth: int | None = None,
+    o_proj_fifo_depth: int | None = None,
+    ffn_replay_fifo_depth: int | None = None,
+    use_fused_replayed_addnorm: bool | None = None,
+    use_transport_groups: bool | None = None,
+    use_unified_qr_split: bool | None = None,
 ) -> EncoderTopology:
     return EncoderTopology(
         num_heads=int(key[0]),
@@ -182,6 +224,12 @@ def topology_from_key(
         o_proj_acc_group_size=int(key[10]),
         parallel_ffn=int(key[11]),
         ffn_intermediate_size=int(key[12]),
+        weight_forward_depth=weight_forward_depth,
+        o_proj_fifo_depth=o_proj_fifo_depth,
+        ffn_replay_fifo_depth=ffn_replay_fifo_depth,
+        use_fused_replayed_addnorm=use_fused_replayed_addnorm,
+        use_transport_groups=use_transport_groups,
+        use_unified_qr_split=use_unified_qr_split,
         placement=placement,
     )
 
@@ -201,6 +249,12 @@ def topology_from_fields(
     o_proj_acc_group_size: int,
     parallel_ffn: int,
     ffn_intermediate_size: int,
+    weight_forward_depth: int | None = None,
+    o_proj_fifo_depth: int | None = None,
+    ffn_replay_fifo_depth: int | None = None,
+    use_fused_replayed_addnorm: bool | None = None,
+    use_transport_groups: bool | None = None,
+    use_unified_qr_split: bool | None = None,
     placement: Mapping[str, Any] | None = None,
 ) -> EncoderTopology:
     return topology_from_key(
@@ -219,6 +273,12 @@ def topology_from_fields(
             parallel_ffn=parallel_ffn,
             ffn_intermediate_size=ffn_intermediate_size,
         ),
+        weight_forward_depth=weight_forward_depth,
+        o_proj_fifo_depth=o_proj_fifo_depth,
+        ffn_replay_fifo_depth=ffn_replay_fifo_depth,
+        use_fused_replayed_addnorm=use_fused_replayed_addnorm,
+        use_transport_groups=use_transport_groups,
+        use_unified_qr_split=use_unified_qr_split,
         placement=placement,
     )
 
@@ -264,6 +324,24 @@ def topology_from_config(config, seq_len: int) -> EncoderTopology:
                 config.model_config.intermediate_size,
             )
         ),
+        weight_forward_depth=_optional_config_int(
+            aie_cfg, "encoder_pipeline_weight_forward_depth"
+        ),
+        o_proj_fifo_depth=_optional_config_int(
+            aie_cfg, "encoder_pipeline_o_proj_fifo_depth"
+        ),
+        ffn_replay_fifo_depth=_optional_config_int(
+            aie_cfg, "encoder_pipeline_ffn_replay_fifo_depth"
+        ),
+        use_fused_replayed_addnorm=_optional_config_bool(
+            aie_cfg, "encoder_pipeline_use_fused_replayed_addnorm"
+        ),
+        use_transport_groups=_optional_config_bool(
+            aie_cfg, "encoder_pipeline_use_transport_groups"
+        ),
+        use_unified_qr_split=_optional_config_bool(
+            aie_cfg, "encoder_pipeline_use_unified_qr_split"
+        ),
     )
 
 
@@ -279,7 +357,10 @@ def supported_topologies_for_config_family(
     config, seq_len: int
 ) -> list[EncoderTopology]:
     current = topology_from_config(config, seq_len)
-    return _matching_topologies(current, include_all_families=False)
+    return _expand_topologies_if_requested(
+        _matching_topologies(current, include_all_families=False),
+        config,
+    )
 
 
 def parse_candidate_topology_filters(raw: str | None) -> set[str] | None:
@@ -311,7 +392,10 @@ def supported_topologies_for_seq_len(
 ) -> list[EncoderTopology]:
     current = topology_from_config(config, seq_len)
     matches = filter_topologies_by_alias_or_id(
-        _matching_topologies(current, include_all_families=True),
+        _expand_topologies_if_requested(
+            _matching_topologies(current, include_all_families=True),
+            config,
+        ),
         candidate_ids,
     )
     if not matches:
@@ -350,30 +434,52 @@ def apply_topology_to_config(config, topology: EncoderTopology | Mapping[str, An
     config.aie_config.encoder_pipeline_ffn_intermediate_size = _topology_int(
         topology, "ffn_intermediate_size"
     )
+    config.aie_config.encoder_pipeline_weight_forward_depth = _topology_optional_int(
+        topology, "weight_forward_depth"
+    )
+    config.aie_config.encoder_pipeline_o_proj_fifo_depth = _topology_optional_int(
+        topology, "o_proj_fifo_depth"
+    )
+    config.aie_config.encoder_pipeline_ffn_replay_fifo_depth = _topology_optional_int(
+        topology, "ffn_replay_fifo_depth"
+    )
+    config.aie_config.encoder_pipeline_use_fused_replayed_addnorm = (
+        _topology_optional_bool(topology, "use_fused_replayed_addnorm")
+    )
+    config.aie_config.encoder_pipeline_use_transport_groups = _topology_optional_bool(
+        topology, "use_transport_groups"
+    )
+    config.aie_config.encoder_pipeline_use_unified_qr_split = _topology_optional_bool(
+        topology, "use_unified_qr_split"
+    )
     return config
 
 
 def topology_id(topology: EncoderTopology | Mapping[str, Any]) -> str:
     if isinstance(topology, EncoderTopology):
         return topology.topology_id
-    return (
+    base_id = (
         f"seq{_topology_int(topology, 'seq_tile')}"
         f"_kv{_topology_int(topology, 'kv_seq_tile')}__"
         f"ps{_topology_int(topology, 'parallel_seq')}"
         f"_ph{_topology_int(topology, 'parallel_heads')}"
         f"_pffn{_topology_int(topology, 'parallel_ffn')}"
     )
+    variant_suffix = _layout_variant_suffix(topology)
+    if not variant_suffix:
+        return base_id
+    return f"{base_id}__{variant_suffix}"
 
 
 def topology_signature(
     topology: EncoderTopology | Mapping[str, Any] | None,
-) -> tuple[int, ...] | None:
+) -> tuple[Any, ...] | None:
     if topology is None:
         return None
     if isinstance(topology, EncoderTopology):
         return topology.cache_signature
     try:
-        return (
+        base_signature = (
             _topology_int(topology, "parallel_seq"),
             _topology_int(topology, "parallel_heads"),
             _topology_int(topology, "parallel_ffn"),
@@ -385,6 +491,10 @@ def topology_signature(
             _topology_int(topology, "o_proj_acc_group_size"),
             _topology_int(topology, "ffn_intermediate_size"),
         )
+        variant_signature = _layout_variant_signature(topology)
+        if not variant_signature:
+            return base_signature
+        return base_signature + variant_signature
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -475,6 +585,211 @@ def _topology_int(
     if isinstance(topology, EncoderTopology):
         return int(getattr(topology, field_name))
     return int(topology[field_name])
+
+
+def _topology_optional_int(
+    topology: EncoderTopology | Mapping[str, Any], field_name: str
+) -> int | None:
+    if isinstance(topology, EncoderTopology):
+        value = getattr(topology, field_name)
+    elif hasattr(topology, "get"):
+        value = topology.get(field_name)
+    else:
+        value = getattr(topology, field_name, None)
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _topology_optional_bool(
+    topology: EncoderTopology | Mapping[str, Any], field_name: str
+) -> bool | None:
+    if isinstance(topology, EncoderTopology):
+        value = getattr(topology, field_name)
+    elif hasattr(topology, "get"):
+        value = topology.get(field_name)
+    else:
+        value = getattr(topology, field_name, None)
+    if value is None or value == "":
+        return None
+    return bool(value)
+
+
+def _optional_config_int(config_obj, field_name: str) -> int | None:
+    value = getattr(config_obj, field_name, None)
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _optional_config_bool(config_obj, field_name: str) -> bool | None:
+    value = getattr(config_obj, field_name, None)
+    if value is None or value == "":
+        return None
+    return bool(value)
+
+
+def _layout_variant_suffix(topology: EncoderTopology | Mapping[str, Any]) -> str:
+    parts = []
+    weight_forward_depth = _topology_optional_int(topology, "weight_forward_depth")
+    if weight_forward_depth is not None:
+        parts.append(f"wf{weight_forward_depth}")
+    o_proj_fifo_depth = _topology_optional_int(topology, "o_proj_fifo_depth")
+    if o_proj_fifo_depth is not None:
+        parts.append(f"of{o_proj_fifo_depth}")
+    ffn_replay_fifo_depth = _topology_optional_int(topology, "ffn_replay_fifo_depth")
+    if ffn_replay_fifo_depth is not None:
+        parts.append(f"fr{ffn_replay_fifo_depth}")
+    use_fused_replayed_addnorm = _topology_optional_bool(
+        topology, "use_fused_replayed_addnorm"
+    )
+    if use_fused_replayed_addnorm is not None:
+        parts.append(f"fa{int(use_fused_replayed_addnorm)}")
+    use_transport_groups = _topology_optional_bool(topology, "use_transport_groups")
+    if use_transport_groups is not None:
+        parts.append(f"tg{int(use_transport_groups)}")
+    use_unified_qr_split = _topology_optional_bool(topology, "use_unified_qr_split")
+    if use_unified_qr_split is not None:
+        parts.append(f"uq{int(use_unified_qr_split)}")
+    return "_".join(parts)
+
+
+def _layout_variant_signature(
+    topology: EncoderTopology | Mapping[str, Any],
+) -> tuple[Any, ...]:
+    suffix = _layout_variant_suffix(topology)
+    if not suffix:
+        return ()
+    return ("layout", suffix)
+
+
+def _layout_variant_expansion_enabled(config) -> bool:
+    return bool(
+        getattr(config.aie_config, "encoder_pipeline_expand_layout_variants", False)
+    )
+
+
+def _large_activation_tile(topology: EncoderTopology) -> bool:
+    return topology.emb_tile >= 128 or topology.seq_tile * topology.emb_tile * 2 > 8192
+
+
+def _default_layout_overrides(topology: EncoderTopology) -> dict[str, int | bool]:
+    large_activation_tile = _large_activation_tile(topology)
+    return {
+        "weight_forward_depth": (
+            1 if large_activation_tile else (2 if topology.ffn_tile <= 64 else 1)
+        ),
+        "o_proj_fifo_depth": 1 if large_activation_tile else 2,
+        "ffn_replay_fifo_depth": 1 if large_activation_tile else 2,
+        "use_fused_replayed_addnorm": _supports_addnorm_replay_fastpath(topology),
+    }
+
+
+def _supports_addnorm_replay_fastpath(topology: EncoderTopology) -> bool:
+    return (
+        topology.seq_tile == 32
+        and topology.kv_seq_tile == 64
+        and topology.emb_tile == 96
+        and topology.proj_acc_depth == 8
+        and (
+            (
+                topology.parallel_seq == 4
+                and topology.parallel_heads == 1
+                and topology.parallel_ffn == 1
+            )
+            or (
+                topology.parallel_seq == 2
+                and topology.parallel_heads == 2
+                and topology.parallel_ffn == 2
+            )
+        )
+    )
+
+
+def _sequence_parallel_transport_group_fallback_supported(
+    topology: EncoderTopology,
+) -> bool:
+    sequence_parallel = (
+        None
+        if topology.placement is None
+        else topology.placement.get("sequence_parallel")
+    )
+    if sequence_parallel is None:
+        return False
+    transport_groups = sequence_parallel.get("transport_groups")
+    return transport_groups is not None and len(transport_groups) > 1
+
+
+def _unified_qr_split_fallback_supported(topology: EncoderTopology) -> bool:
+    sequence_parallel = (
+        None
+        if topology.placement is None
+        else topology.placement.get("sequence_parallel")
+    )
+    if sequence_parallel is None:
+        return False
+    return sequence_parallel.get("unified_qr_split") is not None
+
+
+def pruned_layout_variant_domains(
+    topology: EncoderTopology,
+) -> dict[str, tuple[Any, ...]]:
+    defaults = _default_layout_overrides(topology)
+    domains: dict[str, tuple[Any, ...]] = {}
+    if defaults["weight_forward_depth"] > 1:
+        domains["weight_forward_depth"] = (1,)
+    if topology.parallel_seq > 1 and defaults["o_proj_fifo_depth"] > 1:
+        domains["o_proj_fifo_depth"] = (1,)
+    if topology.parallel_seq > 1 and defaults["ffn_replay_fifo_depth"] > 1:
+        domains["ffn_replay_fifo_depth"] = (1,)
+    if defaults["use_fused_replayed_addnorm"]:
+        domains["use_fused_replayed_addnorm"] = (False,)
+    if _sequence_parallel_transport_group_fallback_supported(topology):
+        domains["use_transport_groups"] = (False,)
+    if _unified_qr_split_fallback_supported(topology):
+        domains["use_unified_qr_split"] = (False,)
+    return domains
+
+
+def expand_pruned_layout_variants(topology: EncoderTopology) -> list[EncoderTopology]:
+    domains = pruned_layout_variant_domains(topology)
+    if not domains:
+        return [topology]
+    field_names = tuple(domains)
+    variants = [topology]
+    for values in product(
+        *([(None,) + domains[field_name] for field_name in field_names])
+    ):
+        overrides = {
+            field_name: value
+            for field_name, value in zip(field_names, values)
+            if value is not None
+        }
+        if not overrides:
+            continue
+        variants.append(replace(topology, **overrides))
+    variants.sort(
+        key=lambda candidate: (
+            candidate.family_id,
+            candidate.parallel_seq,
+            candidate.parallel_heads,
+            candidate.parallel_ffn,
+            candidate.topology_id,
+        )
+    )
+    return variants
+
+
+def _expand_topologies_if_requested(
+    topologies: list[EncoderTopology],
+    config,
+) -> list[EncoderTopology]:
+    if not _layout_variant_expansion_enabled(config):
+        return list(topologies)
+    expanded = []
+    for topology in topologies:
+        expanded.extend(expand_pruned_layout_variants(topology))
+    return expanded
 
 
 def _matching_topologies(

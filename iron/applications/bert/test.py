@@ -57,6 +57,7 @@ from model_support import (
     zero_all_model_biases,
 )
 from npu_inference import (
+    apply_topology_to_config,
     current_topology_from_config,
     find_cached_topology,
     load_encoder_pipeline_topology_placements,
@@ -1148,6 +1149,43 @@ def test_supported_topologies_for_seq_len_discovers_both_families_when_legal():
     assert families == {"seq32_kv64", "seq64_kv32"}
 
 
+def test_supported_topologies_for_seq_len_can_expand_pruned_layout_variants():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    config.aie_config.encoder_pipeline_expand_layout_variants = True
+
+    expanded = supported_topologies_for_seq_len(
+        config,
+        128,
+        candidate_ids=parse_candidate_topology_ids("4ps"),
+    )
+
+    topology_ids = {topology_id(topology) for topology in expanded}
+
+    assert "seq32_kv64__ps4_ph1_pffn1" in topology_ids
+    assert {topology.family_id for topology in expanded} == {"seq32_kv64"}
+    assert any(
+        topology_id_value.endswith("__wf1") for topology_id_value in topology_ids
+    )
+    assert any("__of1" in topology_id_value for topology_id_value in topology_ids)
+    assert any("__fr1" in topology_id_value for topology_id_value in topology_ids)
+
+
+def test_supported_topologies_for_seq_len_can_expand_pruned_data_movement_variants():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    config.aie_config.encoder_pipeline_expand_layout_variants = True
+
+    expanded = supported_topologies_for_seq_len(
+        config,
+        128,
+        candidate_ids=parse_candidate_topology_ids("4ps"),
+    )
+
+    topology_ids = {topology_id(topology) for topology in expanded}
+
+    assert any("__tg0" in topology_id_value for topology_id_value in topology_ids)
+    assert any("__uq0" in topology_id_value for topology_id_value in topology_ids)
+
+
 @pytest.mark.parametrize(
     "config_path,seq_len",
     [
@@ -1239,6 +1277,92 @@ def test_supported_topologies_expose_compute_tile_utilization_counts():
     assert four_ps.compute_tile_count == 32
     assert one_ps.utilization_fraction == pytest.approx(0.25)
     assert four_ps.utilization_fraction == pytest.approx(1.0)
+
+
+def test_apply_topology_to_config_round_trips_layout_variant_fields():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    config.aie_config.encoder_pipeline_expand_layout_variants = True
+    variant = next(
+        topology
+        for topology in supported_topologies_for_seq_len(
+            config,
+            128,
+            candidate_ids=parse_candidate_topology_ids("4ps"),
+        )
+        if topology.weight_forward_depth == 1
+        and topology.o_proj_fifo_depth == 1
+        and topology.ffn_replay_fifo_depth == 1
+    )
+
+    applied = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    apply_topology_to_config(applied, variant)
+    round_tripped = current_topology_from_config(applied, 128)
+
+    assert topology_id(round_tripped) == topology_id(variant)
+    assert round_tripped.to_runtime_dict()["weight_forward_depth"] == 1
+    assert round_tripped.to_runtime_dict()["o_proj_fifo_depth"] == 1
+    assert round_tripped.to_runtime_dict()["ffn_replay_fifo_depth"] == 1
+
+
+def test_apply_topology_to_config_round_trips_data_movement_variant_fields():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    config.aie_config.encoder_pipeline_expand_layout_variants = True
+    variant = next(
+        topology
+        for topology in supported_topologies_for_seq_len(
+            config,
+            128,
+            candidate_ids=parse_candidate_topology_ids("4ps"),
+        )
+        if topology.use_transport_groups is False
+        and topology.use_unified_qr_split is False
+    )
+
+    applied = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    apply_topology_to_config(applied, variant)
+    round_tripped = current_topology_from_config(applied, 128)
+
+    assert topology_id(round_tripped) == topology_id(variant)
+    assert round_tripped.to_runtime_dict()["use_transport_groups"] is False
+    assert round_tripped.to_runtime_dict()["use_unified_qr_split"] is False
+
+
+def test_npu_inference_topology_id_accepts_encoder_topology_instance():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    config.aie_config.encoder_pipeline_expand_layout_variants = True
+    topology = next(
+        topology
+        for topology in supported_topologies_for_seq_len(
+            config,
+            128,
+            candidate_ids=parse_candidate_topology_ids("4ps"),
+        )
+        if topology.family_id == "seq32_kv64"
+    )
+
+    assert npu_inference.topology_id(topology) == topology.topology_id
+
+
+def test_find_cached_topology_matches_layout_variant_signature_when_expansion_enabled():
+    config = load_encoder_pipeline_config(str(CONFIG_FILE), 128)
+    config.aie_config.encoder_pipeline_expand_layout_variants = True
+    variant = next(
+        topology
+        for topology in supported_topologies_for_seq_len(
+            config,
+            128,
+            candidate_ids=parse_candidate_topology_ids("4ps"),
+        )
+        if topology.weight_forward_depth == 1
+        and topology.o_proj_fifo_depth == 1
+        and topology.ffn_replay_fifo_depth == 1
+    )
+
+    cache_data = {topology_cache_key(config, 128): variant.to_runtime_dict()}
+    cached = find_cached_topology(cache_data, config, 128)
+
+    assert cached is not None
+    assert topology_id(cached) == topology_id(variant)
 
 
 def test_supported_topologies_for_seq_len_omits_illegal_mirrored_shapes():
@@ -2172,6 +2296,377 @@ def test_gemm_only_layer_uses_one_runtime_xclbin():
     assert len(declared_xclbins) == 1
     assert len(insts_xclbin_inputs) == 1
     assert len(runtime_paths) == 1
+
+
+def test_encoder_pipeline_layer_supports_packed_host_qkv_projection(monkeypatch):
+    import importlib
+
+    module = importlib.import_module("src.block.transformer")
+    real_pipeline_cls = module.AIEEncoderPipeline
+
+    class FakePipeline:
+        def __init__(self, *, num_heads, seq_len, d, **kwargs):
+            self.num_heads = num_heads
+            self.seq_len = seq_len
+            self.d = d
+            self.embed_sz = num_heads * d
+            self.qkv_proj_weight = None
+            self.qkv_proj_bias = None
+            self.w_o_proj = None
+            self.weight_up_proj = None
+            self.weight_down_proj = None
+            self.ln1_weight = None
+            self.ln2_weight = None
+            self.seen_packed_qkv = None
+            self.seen_residual = None
+
+        def project_hidden_states_to_packed_qkv(self, hidden_states):
+            projected = torch.matmul(hidden_states, self.qkv_proj_weight)
+            if self.qkv_proj_bias is not None:
+                projected = projected + self.qkv_proj_bias
+            return real_pipeline_cls.pack_projected_qkv_rows(
+                projected,
+                seq_len=self.seq_len,
+                embed_sz=self.embed_sz,
+            )
+
+        def forward_packed_qkv(self, packed_qkv, r=None):
+            self.seen_packed_qkv = packed_qkv.clone()
+            self.seen_residual = None if r is None else r.clone()
+            return torch.zeros(
+                (self.seq_len, self.embed_sz),
+                dtype=packed_qkv.dtype,
+            )
+
+    monkeypatch.setattr(module, "AIEEncoderPipeline", FakePipeline)
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hidden_size=4,
+            intermediate_size=8,
+            num_attention_heads=2,
+        ),
+        aie_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            encoder_pipeline_qkv_projection_mode="packed_host",
+        ),
+    )
+    layer = module.BertEncoderPipelineLayer(config, seq_len=2)
+
+    combined_weights = {
+        "encoder.layer.0.attention.self.query.weight": torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]] * 4,
+            dtype=torch.bfloat16,
+        ),
+        "encoder.layer.0.attention.self.key.weight": torch.tensor(
+            [[0.0, 1.0, 0.0, 0.0]] * 4,
+            dtype=torch.bfloat16,
+        ),
+        "encoder.layer.0.attention.self.value.weight": torch.tensor(
+            [[0.0, 0.0, 1.0, 0.0]] * 4,
+            dtype=torch.bfloat16,
+        ),
+        "encoder.layer.0.attention.self.query.bias": torch.tensor(
+            [0.0, 1.0, 2.0, 3.0], dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.self.key.bias": torch.tensor(
+            [4.0, 5.0, 6.0, 7.0], dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.self.value.bias": torch.tensor(
+            [8.0, 9.0, 10.0, 11.0], dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.output.dense.weight": torch.zeros(
+            (4, 4), dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.intermediate.dense.weight": torch.zeros(
+            (8, 4), dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.output.dense.weight": torch.zeros(
+            (4, 8), dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.output.LayerNorm.weight": torch.ones(
+            4, dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.output.LayerNorm.weight": torch.ones(4, dtype=torch.bfloat16),
+    }
+    layer.assign_weights(0, combined_weights, torch.bfloat16)
+
+    hidden_states = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]],
+        dtype=torch.bfloat16,
+    )
+    output, timings = layer.forward_with_stage_timings(hidden_states)
+
+    combined_qkv_weight, combined_qkv_bias = (
+        real_pipeline_cls.combine_qkv_projection_parameters(
+            combined_weights["encoder.layer.0.attention.self.query.weight"],
+            combined_weights["encoder.layer.0.attention.self.key.weight"],
+            combined_weights["encoder.layer.0.attention.self.value.weight"],
+            combined_weights["encoder.layer.0.attention.self.query.bias"],
+            combined_weights["encoder.layer.0.attention.self.key.bias"],
+            combined_weights["encoder.layer.0.attention.self.value.bias"],
+        )
+    )
+    expected_projected = torch.matmul(hidden_states.squeeze(0), combined_qkv_weight)
+    expected_projected = expected_projected + combined_qkv_bias
+    expected_packed = real_pipeline_cls.pack_projected_qkv_rows(
+        expected_projected,
+        seq_len=2,
+        embed_sz=4,
+    )
+
+    assert layer.qkv_projection is None
+    assert torch.equal(layer.encoder_pipeline.seen_packed_qkv, expected_packed)
+    assert layer.encoder_pipeline.seen_residual is None
+    assert tuple(output.shape) == (1, 2, 4)
+    assert timings["qkv_projection_sec"] >= 0.0
+    assert timings["encoder_pipeline_sec"] >= 0.0
+
+
+def test_encoder_pipeline_layer_supports_staged_npu_qkv_projection(monkeypatch):
+    import importlib
+
+    module = importlib.import_module("src.block.transformer")
+
+    class FakePipeline:
+        def __init__(
+            self, *, num_heads, seq_len, d, qkv_projection_mode="packed_input", **kwargs
+        ):
+            self.num_heads = num_heads
+            self.seq_len = seq_len
+            self.d = d
+            self.embed_sz = num_heads * d
+            self.qkv_projection_mode = qkv_projection_mode
+            self.q_proj_weight = None
+            self.k_proj_weight = None
+            self.v_proj_weight = None
+            self.q_proj_bias = None
+            self.k_proj_bias = None
+            self.v_proj_bias = None
+            self.w_o_proj = None
+            self.weight_up_proj = None
+            self.weight_down_proj = None
+            self.ln1_weight = None
+            self.ln2_weight = None
+            self.seen_hidden_states = None
+            self.seen_residual = None
+
+        def forward_hidden_states(self, hidden_states, r=None, **kwargs):
+            self.seen_hidden_states = hidden_states.clone()
+            self.seen_residual = None if r is None else r.clone()
+            return torch.zeros(
+                (self.seq_len, self.embed_sz),
+                dtype=hidden_states.dtype,
+            )
+
+    monkeypatch.setattr(module, "AIEEncoderPipeline", FakePipeline)
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hidden_size=4,
+            intermediate_size=8,
+            num_attention_heads=2,
+        ),
+        aie_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            encoder_pipeline_qkv_projection_mode="staged_npu",
+        ),
+    )
+    layer = module.BertEncoderPipelineLayer(config, seq_len=2)
+
+    combined_weights = {
+        "encoder.layer.0.attention.self.query.weight": torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]] * 4,
+            dtype=torch.bfloat16,
+        ),
+        "encoder.layer.0.attention.self.key.weight": torch.tensor(
+            [[0.0, 1.0, 0.0, 0.0]] * 4,
+            dtype=torch.bfloat16,
+        ),
+        "encoder.layer.0.attention.self.value.weight": torch.tensor(
+            [[0.0, 0.0, 1.0, 0.0]] * 4,
+            dtype=torch.bfloat16,
+        ),
+        "encoder.layer.0.attention.self.query.bias": torch.tensor(
+            [0.0, 1.0, 2.0, 3.0], dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.self.key.bias": torch.tensor(
+            [4.0, 5.0, 6.0, 7.0], dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.self.value.bias": torch.tensor(
+            [8.0, 9.0, 10.0, 11.0], dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.output.dense.weight": torch.zeros(
+            (4, 4), dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.intermediate.dense.weight": torch.zeros(
+            (8, 4), dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.output.dense.weight": torch.zeros(
+            (4, 8), dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.output.LayerNorm.weight": torch.ones(
+            4, dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.output.LayerNorm.weight": torch.ones(4, dtype=torch.bfloat16),
+    }
+    layer.assign_weights(0, combined_weights, torch.bfloat16)
+
+    hidden_states = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]],
+        dtype=torch.bfloat16,
+    )
+    output, timings = layer.forward_with_stage_timings(hidden_states)
+
+    assert layer.qkv_projection is None
+    assert layer.encoder_pipeline.qkv_projection_mode == "staged_hidden_states"
+    assert torch.equal(
+        layer.encoder_pipeline.q_proj_weight,
+        combined_weights["encoder.layer.0.attention.self.query.weight"].T.contiguous(),
+    )
+    assert torch.equal(
+        layer.encoder_pipeline.k_proj_weight,
+        combined_weights["encoder.layer.0.attention.self.key.weight"].T.contiguous(),
+    )
+    assert torch.equal(
+        layer.encoder_pipeline.v_proj_weight,
+        combined_weights["encoder.layer.0.attention.self.value.weight"].T.contiguous(),
+    )
+    assert torch.equal(
+        layer.encoder_pipeline.seen_hidden_states, hidden_states.squeeze(0)
+    )
+    assert layer.encoder_pipeline.seen_residual is None
+    assert tuple(output.shape) == (1, 2, 4)
+    assert timings["qkv_projection_sec"] >= 0.0
+    assert timings["encoder_pipeline_sec"] >= 0.0
+
+
+@pytest.mark.parametrize(
+    ("projection_mode", "expected_operator_mode"),
+    (
+        ("packed_host", "packed_input"),
+        ("staged_npu", "staged_hidden_states"),
+    ),
+)
+def test_encoder_pipeline_layer_forward_uses_hidden_state_interface(
+    monkeypatch,
+    projection_mode,
+    expected_operator_mode,
+):
+    import importlib
+
+    module = importlib.import_module("src.block.transformer")
+
+    class FakePipeline:
+        def __init__(
+            self, *, num_heads, seq_len, d, qkv_projection_mode="packed_input", **kwargs
+        ):
+            self.num_heads = num_heads
+            self.seq_len = seq_len
+            self.d = d
+            self.embed_sz = num_heads * d
+            self.qkv_projection_mode = qkv_projection_mode
+            self.qkv_proj_weight = None
+            self.qkv_proj_bias = None
+            self.q_proj_weight = None
+            self.k_proj_weight = None
+            self.v_proj_weight = None
+            self.q_proj_bias = None
+            self.k_proj_bias = None
+            self.v_proj_bias = None
+            self.w_o_proj = None
+            self.weight_up_proj = None
+            self.weight_down_proj = None
+            self.ln1_weight = None
+            self.ln2_weight = None
+            self.seen_hidden_states = None
+            self.seen_residual = None
+
+        def forward_hidden_states(self, hidden_states, r=None, **kwargs):
+            self.seen_hidden_states = hidden_states.clone()
+            self.seen_residual = None if r is None else r.clone()
+            return torch.zeros(
+                (self.seq_len, self.embed_sz),
+                dtype=hidden_states.dtype,
+            )
+
+        def forward_packed_qkv(self, packed_qkv, r=None):
+            raise AssertionError(
+                "forward() should use hidden-state interface, not packed QKV"
+            )
+
+    monkeypatch.setattr(module, "AIEEncoderPipeline", FakePipeline)
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hidden_size=4,
+            intermediate_size=8,
+            num_attention_heads=2,
+        ),
+        aie_config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            encoder_pipeline_qkv_projection_mode=projection_mode,
+        ),
+    )
+    layer = module.BertEncoderPipelineLayer(config, seq_len=2)
+
+    combined_weights = {
+        "encoder.layer.0.attention.self.query.weight": torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]] * 4,
+            dtype=torch.bfloat16,
+        ),
+        "encoder.layer.0.attention.self.key.weight": torch.tensor(
+            [[0.0, 1.0, 0.0, 0.0]] * 4,
+            dtype=torch.bfloat16,
+        ),
+        "encoder.layer.0.attention.self.value.weight": torch.tensor(
+            [[0.0, 0.0, 1.0, 0.0]] * 4,
+            dtype=torch.bfloat16,
+        ),
+        "encoder.layer.0.attention.self.query.bias": torch.tensor(
+            [0.0, 1.0, 2.0, 3.0], dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.self.key.bias": torch.tensor(
+            [4.0, 5.0, 6.0, 7.0], dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.self.value.bias": torch.tensor(
+            [8.0, 9.0, 10.0, 11.0], dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.output.dense.weight": torch.zeros(
+            (4, 4), dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.intermediate.dense.weight": torch.zeros(
+            (8, 4), dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.output.dense.weight": torch.zeros(
+            (4, 8), dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.attention.output.LayerNorm.weight": torch.ones(
+            4, dtype=torch.bfloat16
+        ),
+        "encoder.layer.0.output.LayerNorm.weight": torch.ones(4, dtype=torch.bfloat16),
+    }
+    layer.assign_weights(0, combined_weights, torch.bfloat16)
+
+    hidden_states = torch.tensor(
+        [[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]],
+        dtype=torch.bfloat16,
+    )
+    output = layer.forward(hidden_states)
+
+    assert layer.encoder_pipeline.qkv_projection_mode == expected_operator_mode
+    assert torch.equal(
+        layer.encoder_pipeline.seen_hidden_states,
+        hidden_states.squeeze(0),
+    )
+    if projection_mode == "staged_npu":
+        assert layer.encoder_pipeline.seen_residual is None
+    else:
+        assert torch.equal(
+            layer.encoder_pipeline.seen_residual,
+            hidden_states.squeeze(0),
+        )
+    assert tuple(output.shape) == (1, 2, 4)
 
 
 def test_npu_benchmark_with_config_reports_operator_runlist_breakdown(monkeypatch):
