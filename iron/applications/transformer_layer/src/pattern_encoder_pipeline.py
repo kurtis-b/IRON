@@ -15,6 +15,7 @@ from iron.operators.encoder_pipeline.topology import (
     topology_from_fields,
 )
 
+from .input_bundle import TransformerLayerInputs
 from .layer_spec import TransformerLayerSpec
 from .utils import require_keys
 
@@ -37,9 +38,6 @@ class EncoderPipelinePattern(nn.Module):
         self._runtime_ready = False
         self._weights_assigned = False
         self.compile_setup_time_sec: float | None = None
-        self.q_proj = nn.Linear(hidden, hidden, bias=False, dtype=dtype)
-        self.k_proj = nn.Linear(hidden, hidden, bias=False, dtype=dtype)
-        self.v_proj = nn.Linear(hidden, hidden, bias=False, dtype=dtype)
         self.encoder_pipeline = AIEEncoderPipeline(
             num_heads=spec.num_attention_heads,
             seq_len=spec.seq_len,
@@ -79,9 +77,6 @@ class EncoderPipelinePattern(nn.Module):
         require_keys(
             weights,
             [
-                "q_proj_weight",
-                "k_proj_weight",
-                "v_proj_weight",
                 "out_proj_weight",
                 "ffn_up_weight",
                 "ffn_down_weight",
@@ -89,10 +84,6 @@ class EncoderPipelinePattern(nn.Module):
                 "ln2_weight",
             ],
         )
-        with torch.no_grad():
-            self.q_proj.weight.copy_(weights["q_proj_weight"])
-            self.k_proj.weight.copy_(weights["k_proj_weight"])
-            self.v_proj.weight.copy_(weights["v_proj_weight"])
         self.encoder_pipeline.w_o_proj = weights["out_proj_weight"].contiguous()
         self.encoder_pipeline.weight_up_proj = weights["ffn_up_weight"].contiguous()
         self.encoder_pipeline.weight_down_proj = weights["ffn_down_weight"].contiguous()
@@ -102,50 +93,29 @@ class EncoderPipelinePattern(nn.Module):
 
     def forward_with_stage_timings(
         self,
-        hidden_states: torch.Tensor,
+        layer_inputs: TransformerLayerInputs,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if attention_mask is not None:
             raise RuntimeError(
                 "encoder_pipeline thesis pattern currently requires attention_mask=None"
             )
-        if hidden_states.shape[0] != 1:
+        layer_inputs.validate(self.spec)
+        if layer_inputs.q.shape[0] != 1:
             raise RuntimeError(
                 "encoder_pipeline thesis pattern currently supports batch_size=1"
             )
         self._prepare_runtime()
 
-        qkv_start = time.perf_counter()
-        batch, seq_len, _ = hidden_states.shape
-        heads = self.spec.num_attention_heads
-        head_dim = self.spec.attention_head_size
-        query = (
-            self.q_proj(hidden_states)
-            .view(batch, seq_len, heads, head_dim)
-            .transpose(1, 2)
-        )
-        key = (
-            self.k_proj(hidden_states)
-            .view(batch, seq_len, heads, head_dim)
-            .transpose(1, 2)
-        )
-        value = (
-            self.v_proj(hidden_states)
-            .view(batch, seq_len, heads, head_dim)
-            .transpose(1, 2)
-        )
-        qkv_end = time.perf_counter()
-
         start = time.perf_counter()
         output = self.encoder_pipeline(
-            query.squeeze(0),
-            key.squeeze(0),
-            value.squeeze(0),
-            r=hidden_states.squeeze(0),
+            layer_inputs.q.squeeze(0),
+            layer_inputs.k.squeeze(0),
+            layer_inputs.v.squeeze(0),
+            r=layer_inputs.r.squeeze(0),
         ).unsqueeze(0)
         end = time.perf_counter()
         return output, {
-            "qkv_projection_sec": qkv_end - qkv_start,
             "encoder_pipeline_sec": end - start,
         }
 
@@ -198,13 +168,14 @@ class EncoderPipelinePattern(nn.Module):
             "compute_tile_count": topology.compute_tile_count,
             "compute_tile_utilization_fraction": topology.utilization_fraction,
             "process_model": "in_process",
-            "stability_retry_count": 0,
         }
 
     def forward(
-        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None
+        self,
+        layer_inputs: TransformerLayerInputs,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         output, _ = self.forward_with_stage_timings(
-            hidden_states, attention_mask=attention_mask
+            layer_inputs, attention_mask=attention_mask
         )
         return output

@@ -87,7 +87,6 @@ def _fixture_suite_rows(study_id: str) -> list[dict[str, object]]:
                 estimated_bytes=estimated_bytes,
                 avg_power_w=14.0,
                 compile_setup_time_ms=35.0,
-                avg_qkv_projection_latency_ms=0.3 * scale,
                 avg_encoder_pipeline_latency_ms=3.7 * scale,
                 npu_dispatch_count=1,
                 npu_unique_instruction_binary_count=1,
@@ -99,7 +98,6 @@ def _fixture_suite_rows(study_id: str) -> list[dict[str, object]]:
                 compute_tile_count=16,
                 compute_tile_utilization_fraction=0.5,
                 process_model="in_process",
-                stability_retry_count=0,
             )
         )
         rows.append(
@@ -113,15 +111,13 @@ def _fixture_suite_rows(study_id: str) -> list[dict[str, object]]:
                 estimated_bytes=estimated_bytes,
                 avg_power_w=13.0,
                 compile_setup_time_ms=55.0,
-                avg_qkv_projection_latency_ms=0.5 * scale,
                 avg_npu_gemm_latency_ms=10.0 * scale,
                 avg_host_preprocess_latency_ms=1.1 * scale,
                 avg_host_postprocess_latency_ms=6.1 * scale,
                 avg_device_sync_latency_ms=0.3 * scale,
-                npu_dispatch_count=28,
+                npu_dispatch_count=27,
                 npu_unique_instruction_binary_count=4,
                 process_model="in_process",
-                stability_retry_count=0,
             )
         )
         rows.append(
@@ -135,15 +131,13 @@ def _fixture_suite_rows(study_id: str) -> list[dict[str, object]]:
                 estimated_bytes=estimated_bytes,
                 avg_power_w=14.5,
                 compile_setup_time_ms=40.0,
-                avg_qkv_projection_latency_ms=0.4 * scale,
                 avg_operator_runlist_latency_ms=17.8 * scale,
                 avg_host_preprocess_latency_ms=0.8 * scale,
-                avg_host_postprocess_latency_ms=0.8 * scale,
+                avg_host_postprocess_latency_ms=0.0,
                 avg_device_sync_latency_ms=0.2 * scale,
                 npu_dispatch_count=12,
                 npu_unique_instruction_binary_count=1,
                 process_model="child_process",
-                stability_retry_count=0,
             )
         )
     return rows
@@ -259,7 +253,6 @@ def run_paper_smoke_validation(output_dir: str | Path) -> dict[str, object]:
             "compute_tile_count",
             "compute_tile_utilization_fraction",
             "process_model",
-            "stability_retry_count",
             "bottleneck_summary",
         ],
     )

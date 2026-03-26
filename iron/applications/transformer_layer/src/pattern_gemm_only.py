@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from iron.common import AIEContext
 from iron.operators.gemm.op import AIEGEMM
 
+from .input_bundle import TransformerLayerInputs
 from .layer_spec import TransformerLayerSpec
 from .utils import require_keys
 
@@ -59,14 +60,6 @@ class GemmOnlyPattern(nn.Module):
         self._runtime_ready = False
         self._weights_assigned = False
         self.compile_setup_time_sec: float | None = None
-        self.qkv_proj = AIEGEMM(
-            M=spec.seq_len,
-            K=hidden,
-            N=hidden * 3,
-            use_static_weight=True,
-            context=self.context,
-            **gemm_common,
-        )
         self.attn_scores = AIEGEMM(
             M=spec.seq_len,
             K=head_dim,
@@ -105,7 +98,6 @@ class GemmOnlyPattern(nn.Module):
             context=self.context,
             **gemm_common,
         )
-        self.qkv_proj_weight = None
         self.scale = head_dim**-0.5
         self.ln1_weight = nn.Parameter(
             torch.ones(hidden, dtype=spec.torch_dtype), requires_grad=False
@@ -133,9 +125,6 @@ class GemmOnlyPattern(nn.Module):
         require_keys(
             weights,
             [
-                "q_proj_weight",
-                "k_proj_weight",
-                "v_proj_weight",
                 "out_proj_weight",
                 "ffn_up_weight",
                 "ffn_down_weight",
@@ -143,14 +132,6 @@ class GemmOnlyPattern(nn.Module):
                 "ln2_weight",
             ],
         )
-        self.qkv_proj.weight = torch.cat(
-            [
-                weights["q_proj_weight"],
-                weights["k_proj_weight"],
-                weights["v_proj_weight"],
-            ],
-            dim=0,
-        ).contiguous()
         self.out_proj.weight = weights["out_proj_weight"].contiguous()
         self.ffn_up.weight = weights["ffn_up_weight"].contiguous()
         self.ffn_down.weight = weights["ffn_down_weight"].contiguous()
@@ -158,38 +139,32 @@ class GemmOnlyPattern(nn.Module):
         self.ln2_weight.data.copy_(weights["ln2_weight"])
         self._weights_assigned = True
 
-    def _split_heads(self, projected: torch.Tensor) -> torch.Tensor:
-        return projected.view(
-            self.spec.seq_len,
-            self.spec.num_attention_heads,
-            self.spec.attention_head_size,
-        )
-
     def forward_with_stage_timings(
         self,
-        hidden_states: torch.Tensor,
+        layer_inputs: TransformerLayerInputs,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if attention_mask is not None:
             raise RuntimeError(
                 "gemm_only thesis pattern currently requires attention_mask=None"
             )
-        if hidden_states.shape[0] != 1:
+        layer_inputs.validate(self.spec)
+        if layer_inputs.q.shape[0] != 1:
             raise RuntimeError(
                 "gemm_only thesis pattern currently supports batch_size=1"
             )
         self._prepare_runtime()
 
-        hidden_states = hidden_states.squeeze(0).to(self.spec.torch_dtype)
-        qkv_start = time.perf_counter()
-        qkv = self.qkv_proj(hidden_states)
-        query, key, value = qkv.split(self.spec.hidden_size, dim=-1)
-        qkv_end = time.perf_counter()
-
         host_preprocess_start = time.perf_counter()
-        query_heads = self._split_heads(query).permute(1, 0, 2).contiguous()
-        key_heads = self._split_heads(key).permute(1, 2, 0).contiguous()
-        value_heads = self._split_heads(value).permute(1, 0, 2).contiguous()
+        query_heads = layer_inputs.q.squeeze(0).to(self.spec.torch_dtype).contiguous()
+        key_heads = (
+            layer_inputs.k.squeeze(0)
+            .to(self.spec.torch_dtype)
+            .transpose(-1, -2)
+            .contiguous()
+        )
+        value_heads = layer_inputs.v.squeeze(0).to(self.spec.torch_dtype).contiguous()
+        residual = layer_inputs.r.squeeze(0).to(self.spec.torch_dtype)
         host_preprocess_end = time.perf_counter()
 
         npu_gemm_start = time.perf_counter()
@@ -222,7 +197,7 @@ class GemmOnlyPattern(nn.Module):
         npu_gemm_after_attention = time.perf_counter()
         host_postprocess_start = npu_gemm_after_attention
         attention_output = _layer_norm_no_bias(
-            attention_output + hidden_states,
+            attention_output + residual,
             self.ln1_weight,
             self.spec.layer_norm_eps,
         )
@@ -239,7 +214,6 @@ class GemmOnlyPattern(nn.Module):
         ).unsqueeze(0)
         host_postprocess_end = time.perf_counter()
         return output, {
-            "qkv_projection_sec": qkv_end - qkv_start,
             "host_preprocess_sec": host_preprocess_end - host_preprocess_start,
             "npu_gemm_sec": (
                 (npu_gemm_after_scores - npu_gemm_start)
@@ -256,7 +230,6 @@ class GemmOnlyPattern(nn.Module):
 
     def get_benchmark_metadata(self) -> dict[str, object]:
         gemm_ops = [
-            self.qkv_proj,
             self.attn_scores,
             self.attn_output,
             self.out_proj,
@@ -274,16 +247,17 @@ class GemmOnlyPattern(nn.Module):
                 if self.compile_setup_time_sec is None
                 else self.compile_setup_time_sec * 1000.0
             ),
-            "npu_dispatch_count": (2 * self.spec.num_attention_heads) + 4,
+            "npu_dispatch_count": (2 * self.spec.num_attention_heads) + 3,
             "npu_unique_instruction_binary_count": len(unique_insts),
             "process_model": "in_process",
-            "stability_retry_count": 0,
         }
 
     def forward(
-        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None
+        self,
+        layer_inputs: TransformerLayerInputs,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         output, _ = self.forward_with_stage_timings(
-            hidden_states, attention_mask=attention_mask
+            layer_inputs, attention_mask=attention_mask
         )
         return output

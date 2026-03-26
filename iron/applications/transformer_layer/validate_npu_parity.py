@@ -16,7 +16,7 @@ from iron.applications.transformer_layer.src.reference_layer import (
     ReferenceTransformerLayer,
 )
 from iron.applications.transformer_layer.src.utils import (
-    make_synthetic_hidden_states,
+    make_synthetic_layer_inputs,
     make_synthetic_layer_weights,
 )
 
@@ -37,15 +37,15 @@ def validate_pattern_parity(
     study_id: str = "synthetic_transformer_layer",
 ) -> dict[str, object]:
     weights = make_synthetic_layer_weights(spec, seed=seed)
-    hidden_states = make_synthetic_hidden_states(spec, seed=seed + 1)
+    layer_inputs = make_synthetic_layer_inputs(spec, seed=seed + 1)
 
     reference = ReferenceTransformerLayer(spec)
     reference.assign_weights(weights)
-    reference_output = reference(hidden_states)
+    reference_output = reference(layer_inputs)
 
     pattern = build_pattern(execution_mode, spec)
     pattern.assign_weights(weights)
-    candidate_output = pattern(hidden_states)
+    candidate_output = pattern(layer_inputs)
     stats = error_stats(reference_output, candidate_output)
     return {
         "study_id": study_id,

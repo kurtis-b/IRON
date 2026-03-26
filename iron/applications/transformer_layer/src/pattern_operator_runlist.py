@@ -3,41 +3,17 @@
 
 from __future__ import annotations
 
-import math
 import time
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from iron.common import AIEContext
-from iron.operators.elementwise_add.op import AIEElementwiseAdd
-from iron.operators.elementwise_mul.op import AIEElementwiseMul
-from iron.operators.gelu.op import AIEGELU
-from iron.operators.gemm.op import AIEGEMM
-from iron.operators.softmax.op import AIESoftmax
+from iron.operators.encoder_runlist.op import AIEEncoderRunlist
 
+from .input_bundle import TransformerLayerInputs
 from .layer_spec import TransformerLayerSpec
 from .utils import require_keys
-
-
-def _balanced_tile_size(
-    total_size: int, num_aie_columns: int, num_channels: int
-) -> int:
-    per_channel_tile = max(16, total_size // (num_aie_columns * num_channels))
-    return min(math.gcd(4096, per_channel_tile), per_channel_tile)
-
-
-def _layer_norm_no_bias(
-    hidden_states: torch.Tensor, weight: torch.Tensor, eps: float
-) -> torch.Tensor:
-    return F.layer_norm(
-        hidden_states,
-        (hidden_states.shape[-1],),
-        weight=weight,
-        bias=None,
-        eps=eps,
-    )
 
 
 class OperatorRunlistPattern(nn.Module):
@@ -54,163 +30,19 @@ class OperatorRunlistPattern(nn.Module):
                 "operator_runlist thesis pattern currently requires dtype=bfloat16"
             )
 
-        hidden = spec.hidden_size
-        heads = spec.num_attention_heads
-        head_dim = spec.attention_head_size
-        gemm_common = {
-            "prio_accuracy": False,
-            "emulate_bf16_mmul_with_bfp16": True,
-        }
-        eltwise_tile = _balanced_tile_size(spec.seq_len * hidden, 8, 2)
-        gelu_tile = _balanced_tile_size(spec.seq_len * spec.intermediate_size, 8, 2)
-        attn_tile = _balanced_tile_size(spec.seq_len * spec.seq_len * heads, 8, 2)
-
         self.spec = spec
         self.context = AIEContext(use_runlist=True)
         self._runtime_ready = False
         self._weights_assigned = False
         self.compile_setup_time_sec: float | None = None
-        self.query_proj = AIEGEMM(
-            M=spec.seq_len,
-            K=hidden,
-            N=hidden,
-            use_static_weight=True,
-            tile_m=64,
-            tile_k=96,
-            tile_n=48,
-            num_aie_columns=8,
+        self.encoder_runlist = AIEEncoderRunlist(
+            seq_len=spec.seq_len,
+            hidden_size=spec.hidden_size,
+            intermediate_size=spec.intermediate_size,
+            num_heads=spec.num_attention_heads,
+            ln1_weight=torch.ones(spec.hidden_size, dtype=spec.torch_dtype),
+            ln2_weight=torch.ones(spec.hidden_size, dtype=spec.torch_dtype),
             context=self.context,
-            **gemm_common,
-        )
-        self.key_proj = AIEGEMM(
-            M=spec.seq_len,
-            K=hidden,
-            N=hidden,
-            use_static_weight=True,
-            tile_m=64,
-            tile_k=96,
-            tile_n=48,
-            num_aie_columns=8,
-            context=self.context,
-            **gemm_common,
-        )
-        self.value_proj = AIEGEMM(
-            M=spec.seq_len,
-            K=hidden,
-            N=hidden,
-            use_static_weight=True,
-            tile_m=64,
-            tile_k=96,
-            tile_n=48,
-            num_aie_columns=8,
-            context=self.context,
-            **gemm_common,
-        )
-        self.attn_scores = AIEGEMM(
-            M=spec.seq_len,
-            K=head_dim,
-            N=spec.seq_len,
-            tile_m=64,
-            tile_k=64,
-            tile_n=64,
-            num_aie_columns=8,
-            batch_A=(heads, 1),
-            batch_B=(heads, 1),
-            batch_C=(heads, 0),
-            context=self.context,
-            **gemm_common,
-        )
-        self.attn_scale = AIEElementwiseMul(
-            size=spec.seq_len * spec.seq_len * heads,
-            num_aie_columns=8,
-            num_channels=2,
-            tile_size=attn_tile,
-            scalar_broadcast=head_dim**-0.5,
-            context=self.context,
-        )
-        self.attn_softmax = AIESoftmax(
-            rows=spec.seq_len * heads,
-            cols=spec.seq_len,
-            num_aie_columns=8,
-            num_channels=2,
-            context=self.context,
-        )
-        self.attn_output = AIEGEMM(
-            M=spec.seq_len,
-            K=spec.seq_len,
-            N=head_dim,
-            tile_m=64,
-            tile_k=64,
-            tile_n=16,
-            num_aie_columns=4,
-            batch_A=(heads, 0),
-            batch_B=(heads, 1),
-            batch_C=(heads, 1),
-            context=self.context,
-            **gemm_common,
-        )
-        self.out_proj = AIEGEMM(
-            M=spec.seq_len,
-            K=hidden,
-            N=hidden,
-            use_static_weight=True,
-            tile_m=64,
-            tile_k=96,
-            tile_n=48,
-            num_aie_columns=8,
-            context=self.context,
-            **gemm_common,
-        )
-        self.add1 = AIEElementwiseAdd(
-            size=spec.seq_len * hidden,
-            num_aie_columns=8,
-            num_channels=2,
-            tile_size=eltwise_tile,
-            context=self.context,
-        )
-        self.ffn_up = AIEGEMM(
-            M=spec.seq_len,
-            K=hidden,
-            N=spec.intermediate_size,
-            use_static_weight=True,
-            tile_m=64,
-            tile_k=48,
-            tile_n=96,
-            num_aie_columns=8,
-            context=self.context,
-            **gemm_common,
-        )
-        self.gelu = AIEGELU(
-            size=spec.seq_len * spec.intermediate_size,
-            num_aie_columns=8,
-            num_channels=2,
-            tile_size=gelu_tile,
-            context=self.context,
-        )
-        self.ffn_down = AIEGEMM(
-            M=spec.seq_len,
-            K=spec.intermediate_size,
-            N=hidden,
-            use_static_weight=True,
-            tile_m=64,
-            tile_k=96,
-            tile_n=48,
-            num_aie_columns=8,
-            context=self.context,
-            **gemm_common,
-        )
-        self.add2 = AIEElementwiseAdd(
-            size=spec.seq_len * hidden,
-            num_aie_columns=8,
-            num_channels=2,
-            tile_size=eltwise_tile,
-            context=self.context,
-        )
-        self.ln1_weight = nn.Parameter(
-            torch.ones(hidden, dtype=spec.torch_dtype), requires_grad=False
-        )
-        self.ln2_weight = nn.Parameter(
-            torch.ones(hidden, dtype=spec.torch_dtype), requires_grad=False
         )
 
     def _prepare_runtime(self) -> None:
@@ -232,9 +64,6 @@ class OperatorRunlistPattern(nn.Module):
         require_keys(
             weights,
             [
-                "q_proj_weight",
-                "k_proj_weight",
-                "v_proj_weight",
                 "out_proj_weight",
                 "ffn_up_weight",
                 "ffn_down_weight",
@@ -242,132 +71,48 @@ class OperatorRunlistPattern(nn.Module):
                 "ln2_weight",
             ],
         )
-        self.query_proj.weight = weights["q_proj_weight"].contiguous()
-        self.key_proj.weight = weights["k_proj_weight"].contiguous()
-        self.value_proj.weight = weights["v_proj_weight"].contiguous()
-        self.out_proj.weight = weights["out_proj_weight"].contiguous()
-        self.ffn_up.weight = weights["ffn_up_weight"].contiguous()
-        self.ffn_down.weight = weights["ffn_down_weight"].contiguous()
-        self.ln1_weight.data.copy_(weights["ln1_weight"])
-        self.ln2_weight.data.copy_(weights["ln2_weight"])
-        self._weights_assigned = True
-
-    def _split_heads(self, projected: torch.Tensor) -> torch.Tensor:
-        return projected.view(
-            self.spec.seq_len,
-            self.spec.num_attention_heads,
-            self.spec.attention_head_size,
+        self.encoder_runlist.assign_weights(
+            w_o=weights["out_proj_weight"],
+            b_up=weights["ffn_up_weight"],
+            b_down=weights["ffn_down_weight"],
+            ln1_weight=weights["ln1_weight"],
+            ln2_weight=weights["ln2_weight"],
         )
+        self._weights_assigned = True
 
     def forward_with_stage_timings(
         self,
-        hidden_states: torch.Tensor,
+        layer_inputs: TransformerLayerInputs,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         if attention_mask is not None:
             raise RuntimeError(
                 "operator_runlist thesis pattern currently requires attention_mask=None"
             )
-        if hidden_states.shape[0] != 1:
+        layer_inputs.validate(self.spec)
+        if layer_inputs.q.shape[0] != 1:
             raise RuntimeError(
                 "operator_runlist thesis pattern currently supports batch_size=1"
             )
         self._prepare_runtime()
 
-        hidden_states = hidden_states.squeeze(0).to(self.spec.torch_dtype)
-        qkv_start = time.perf_counter()
-        query = self.query_proj(hidden_states)
-        key = self.key_proj(hidden_states)
-        value = self.value_proj(hidden_states)
-        qkv_end = time.perf_counter()
-
-        host_preprocess_start = time.perf_counter()
-        query_heads = self._split_heads(query).contiguous()
-        key_heads = self._split_heads(key).permute(2, 1, 0).contiguous()
-        value_heads = self._split_heads(value).contiguous()
-        host_preprocess_end = time.perf_counter()
         operator_runlist_start = time.perf_counter()
-        attn_scores = self.attn_scores(query_heads, key_heads)
-        attn_scores = self.attn_scale(attn_scores.unsqueeze(0)).squeeze(0)
-        attn_probs = self.attn_softmax(
-            attn_scores.reshape(
-                self.spec.num_attention_heads * self.spec.seq_len,
-                self.spec.seq_len,
-            )
-        ).view(
-            self.spec.num_attention_heads,
-            self.spec.seq_len,
-            self.spec.seq_len,
-        )
-        attn_context = (
-            self.attn_output(attn_probs, value_heads)
-            .contiguous()
-            .view(
-                self.spec.seq_len,
-                self.spec.hidden_size,
-            )
-        )
-        attention_output = self.out_proj(attn_context)
-        operator_runlist_after_attention = time.perf_counter()
-        host_postprocess_start = operator_runlist_after_attention
-        attention_output = _layer_norm_no_bias(
-            self.add1(
-                attention_output.view(1, -1),
-                hidden_states.view(1, -1),
-            ).view(self.spec.seq_len, self.spec.hidden_size),
-            self.ln1_weight,
-            self.spec.layer_norm_eps,
-        )
-        host_after_ln1 = time.perf_counter()
-        operator_runlist_resume_start = host_after_ln1
-        ffn_hidden = self.ffn_up(attention_output)
-        ffn_hidden = self.gelu(ffn_hidden)
-        ffn_output = self.ffn_down(ffn_hidden)
-        operator_runlist_end = time.perf_counter()
-        host_postprocess_resume_start = operator_runlist_end
-        output = _layer_norm_no_bias(
-            self.add2(
-                ffn_output.view(1, -1),
-                attention_output.view(1, -1),
-            ).view(self.spec.seq_len, self.spec.hidden_size),
-            self.ln2_weight,
-            self.spec.layer_norm_eps,
+        output = self.encoder_runlist(
+            layer_inputs.q.squeeze(0),
+            layer_inputs.k.squeeze(0),
+            layer_inputs.v.squeeze(0),
+            layer_inputs.r.squeeze(0),
         ).unsqueeze(0)
-        host_postprocess_end = time.perf_counter()
+        operator_runlist_end = time.perf_counter()
+
         return output, {
-            "qkv_projection_sec": qkv_end - qkv_start,
-            "host_preprocess_sec": host_preprocess_end - host_preprocess_start,
-            "operator_runlist_sec": (
-                (operator_runlist_after_attention - operator_runlist_start)
-                + (operator_runlist_end - operator_runlist_resume_start)
-            ),
-            "host_postprocess_sec": (
-                (host_after_ln1 - host_postprocess_start)
-                + (host_postprocess_end - host_postprocess_resume_start)
-            ),
-            "device_sync_sec": 0.0,
+            "operator_runlist_sec": operator_runlist_end - operator_runlist_start,
         }
 
     def get_benchmark_metadata(self) -> dict[str, object]:
-        ops = [
-            self.query_proj,
-            self.key_proj,
-            self.value_proj,
-            self.attn_scores,
-            self.attn_scale,
-            self.attn_softmax,
-            self.attn_output,
-            self.out_proj,
-            self.add1,
-            self.ffn_up,
-            self.gelu,
-            self.ffn_down,
-            self.add2,
-        ]
         unique_insts = {
-            str(op.insts_artifact.path)
-            for op in ops
-            if getattr(op, "insts_artifact", None) is not None
+            str(insts_artifact.path)
+            for _, insts_artifact in self.encoder_runlist.component_artifacts.values()
         }
         return {
             "compile_setup_time_ms": (
@@ -375,16 +120,17 @@ class OperatorRunlistPattern(nn.Module):
                 if self.compile_setup_time_sec is None
                 else self.compile_setup_time_sec * 1000.0
             ),
-            "npu_dispatch_count": sum(len(op.runlist) for op in ops),
+            "npu_dispatch_count": len(self.encoder_runlist.runlist),
             "npu_unique_instruction_binary_count": len(unique_insts),
             "process_model": "in_process",
-            "stability_retry_count": 0,
         }
 
     def forward(
-        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None
+        self,
+        layer_inputs: TransformerLayerInputs,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         output, _ = self.forward_with_stage_timings(
-            hidden_states, attention_mask=attention_mask
+            layer_inputs, attention_mask=attention_mask
         )
         return output

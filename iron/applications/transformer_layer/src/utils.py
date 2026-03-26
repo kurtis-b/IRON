@@ -7,6 +7,7 @@ from collections.abc import Mapping
 
 import torch
 
+from .input_bundle import TransformerLayerInputs
 from .layer_spec import TransformerLayerSpec
 
 
@@ -14,18 +15,33 @@ def dtype_from_name(dtype_name: str) -> torch.dtype:
     return TransformerLayerSpec(dtype=dtype_name).torch_dtype
 
 
-def make_synthetic_hidden_states(
+def make_synthetic_layer_inputs(
     spec: TransformerLayerSpec,
     *,
     seed: int = 0,
-) -> torch.Tensor:
+) -> TransformerLayerInputs:
     generator = torch.Generator().manual_seed(seed)
-    hidden_states = torch.randn(
-        (spec.batch_size, spec.seq_len, spec.hidden_size),
-        generator=generator,
-        dtype=torch.float32,
+    qkv_shape = (
+        spec.batch_size,
+        spec.num_attention_heads,
+        spec.seq_len,
+        spec.attention_head_size,
     )
-    return hidden_states.to(spec.torch_dtype)
+    residual_shape = (spec.batch_size, spec.seq_len, spec.hidden_size)
+
+    def randn(*shape: int) -> torch.Tensor:
+        return torch.randn(
+            shape,
+            generator=generator,
+            dtype=torch.float32,
+        ).to(spec.torch_dtype)
+
+    return TransformerLayerInputs(
+        q=randn(*qkv_shape),
+        k=randn(*qkv_shape),
+        v=randn(*qkv_shape),
+        r=randn(*residual_shape),
+    )
 
 
 def make_synthetic_layer_weights(
@@ -44,9 +60,6 @@ def make_synthetic_layer_weights(
         )
 
     weights = {
-        "q_proj_weight": randn(hidden, hidden),
-        "k_proj_weight": randn(hidden, hidden),
-        "v_proj_weight": randn(hidden, hidden),
         "out_proj_weight": randn(hidden, hidden),
         "ffn_up_weight": randn(intermediate, hidden),
         "ffn_down_weight": randn(hidden, intermediate),
@@ -56,9 +69,6 @@ def make_synthetic_layer_weights(
     if spec.use_bias:
         weights.update(
             {
-                "q_proj_bias": randn(hidden),
-                "k_proj_bias": randn(hidden),
-                "v_proj_bias": randn(hidden),
                 "out_proj_bias": randn(hidden),
                 "ffn_up_bias": randn(intermediate),
                 "ffn_down_bias": randn(hidden),

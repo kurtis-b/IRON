@@ -19,8 +19,7 @@ def estimate_layer_flops(spec: TransformerLayerSpec) -> float:
     n_heads = spec.num_attention_heads
     d = spec.attention_head_size
     return float(
-        3 * 2 * b * s * h * h
-        + 2 * b * n_heads * s * s * d
+        2 * b * n_heads * s * s * d
         + 2 * b * n_heads * s * s * d
         + 2 * b * s * h * h
         + 2 * b * s * h * i
@@ -36,8 +35,9 @@ def estimate_layer_bytes(spec: TransformerLayerSpec) -> float:
     }[spec.dtype]
     activation_bytes = spec.batch_size * spec.seq_len * spec.hidden_size * dtype_bytes
     weight_bytes = (
-        4 * spec.hidden_size * spec.hidden_size
+        spec.hidden_size * spec.hidden_size
         + 2 * spec.hidden_size * spec.intermediate_size
+        + 2 * spec.hidden_size
     ) * dtype_bytes
     return float((4 * activation_bytes) + weight_bytes)
 

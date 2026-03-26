@@ -25,7 +25,7 @@ from iron.applications.transformer_layer.src.reference_layer import (
     ReferenceTransformerLayer,
 )
 from iron.applications.transformer_layer.src.utils import (
-    make_synthetic_hidden_states,
+    make_synthetic_layer_inputs,
     make_synthetic_layer_weights,
 )
 
@@ -75,11 +75,11 @@ def benchmark_gpu_layer(
     model.assign_weights(weights)
     model.eval()
 
-    hidden_states = make_synthetic_hidden_states(spec, seed=seed + 1).to(runtime_device)
+    layer_inputs = make_synthetic_layer_inputs(spec, seed=seed + 1).to(runtime_device)
 
     for _ in range(warmup_runs):
         with torch.no_grad():
-            model(hidden_states)
+            model(layer_inputs)
         if runtime_device.type == "cuda":
             torch.cuda.synchronize(runtime_device)
 
@@ -94,7 +94,7 @@ def benchmark_gpu_layer(
         for _ in range(runs_per_sample):
             start = time.perf_counter()
             with torch.no_grad():
-                model(hidden_states)
+                model(layer_inputs)
             if runtime_device.type == "cuda":
                 torch.cuda.synchronize(runtime_device)
             latencies.append(time.perf_counter() - start)

@@ -13,7 +13,6 @@ from pathlib import Path
 from iron.applications.transformer_layer.benchmark_common import write_dict_rows_csv
 
 COMPONENT_FIELDS = {
-    "qkv_projection": "avg_qkv_projection_latency_ms",
     "encoder_pipeline": "avg_encoder_pipeline_latency_ms",
     "npu_gemm": "avg_npu_gemm_latency_ms",
     "operator_runlist": "avg_operator_runlist_latency_ms",
@@ -42,7 +41,6 @@ SUMMARY_FIELD_ORDER = [
     "compute_tile_count",
     "compute_tile_utilization_fraction",
     "process_model",
-    "stability_retry_count",
     "bottleneck_summary",
 ]
 
@@ -157,7 +155,6 @@ def build_row_summary(row: dict[str, object]) -> dict[str, object]:
             row.get("compute_tile_utilization_fraction")
         ),
         "process_model": row.get("process_model"),
-        "stability_retry_count": _optional_int(row.get("stability_retry_count")),
         "bottleneck_summary": summary,
     }
 
@@ -210,10 +207,6 @@ def build_execution_mode_summary(
             "average_dominant_component_fraction": average_dominant_fraction,
             "max_dispatch_count": max(
                 (_optional_int(row.get("npu_dispatch_count")) or 0 for row in rows),
-                default=0,
-            ),
-            "max_retry_count": max(
-                (_optional_int(row.get("stability_retry_count")) or 0 for row in rows),
                 default=0,
             ),
             "process_models": sorted(
