@@ -62,6 +62,13 @@ def test_artifact_names_track_softmax_vector_width():
     assert object_32.path.name != object_512.path.name
 
 
+def test_row_chunk_size_tracks_long_softmax_rows():
+    assert AIESoftmax._resolve_row_chunk_size(8192) == 8192
+    assert AIESoftmax._resolve_row_chunk_size(16384) == 8192
+    with pytest.raises(ValueError):
+        AIESoftmax._resolve_row_chunk_size(12288)
+
+
 def get_optimal_columns_channels(input_length, tile_size):
     """Helper function to determine optimal columns and channels for a given input length and tile size"""
     total_cores = input_length // tile_size
@@ -151,6 +158,37 @@ def test_softmax_32wide_path(aie_context):
 def test_softmax_8192wide_path(aie_context):
     rows = 16
     cols = 8192
+    golden_ref = generate_golden_reference(rows=rows, cols=cols)
+    operator = AIESoftmax(
+        rows=rows,
+        cols=cols,
+        num_aie_columns=8,
+        num_channels=2,
+        context=aie_context,
+    )
+
+    errors, latency_us, bandwidth_gbps = run_test(
+        operator,
+        {"in": golden_ref["input"]},
+        {"output": golden_ref["output"]},
+        rel_tol=0.04,
+        abs_tol=1e-6,
+    )
+
+    print(f"\nLatency (us): {latency_us:.1f}")
+    print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
+
+    assert not errors, f"Test failed with errors: {errors}"
+
+
+@pytest.mark.extensive
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
+)
+def test_softmax_16384wide_path(aie_context):
+    rows = 16
+    cols = 16384
     golden_ref = generate_golden_reference(rows=rows, cols=cols)
     operator = AIESoftmax(
         rows=rows,

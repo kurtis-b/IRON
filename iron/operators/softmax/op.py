@@ -19,6 +19,8 @@ from iron.common import (
 
 
 class AIESoftmax(AIEOperatorBase):
+    LONG_ROW_CHUNK_SIZE = 8192
+
     @staticmethod
     def _resolve_kernel_vector_width(cols: int) -> int:
         for width in (128, 64, 32, 16):
@@ -42,6 +44,7 @@ class AIESoftmax(AIEOperatorBase):
         self.rows = rows
         self.cols = cols
         self.kernel_vec_len = self._resolve_kernel_vector_width(cols)
+        self.row_chunk_size = self._resolve_row_chunk_size(cols)
 
         self.num_channels = num_channels
         self.num_columns = num_aie_columns
@@ -54,12 +57,23 @@ class AIESoftmax(AIEOperatorBase):
             self, context=context, skip_add_to_list=skip_add_to_list
         )
 
+    @classmethod
+    def _resolve_row_chunk_size(cls, cols: int) -> int:
+        if cols <= cls.LONG_ROW_CHUNK_SIZE:
+            return cols
+        if cols % cls.LONG_ROW_CHUNK_SIZE != 0:
+            raise ValueError(
+                "AIESoftmax long-row path requires cols divisible by "
+                f"{cls.LONG_ROW_CHUNK_SIZE}; got cols={cols}"
+            )
+        return cls.LONG_ROW_CHUNK_SIZE
+
     def get_artifacts(self, prefix="softmax_"):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
         file_name_base = (
             f"{prefix}{self.num_columns}c_{self.num_channels}ch_"
-            f"{self.size}_{self.cols}t_sm{self.kernel_vec_len}"
+            f"{self.size}_{self.cols}t_rs{self.row_chunk_size}_sm{self.kernel_vec_len}"
         )
         kernel_object_name = f"softmax_sm{self.kernel_vec_len}.o"
 
@@ -74,6 +88,7 @@ class AIESoftmax(AIEOperatorBase):
                 self.num_channels,
                 0,
                 self.cols,
+                self.row_chunk_size,
                 kernel_object_name,
             ],
         )
