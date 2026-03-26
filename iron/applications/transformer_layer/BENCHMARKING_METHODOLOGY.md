@@ -28,3 +28,10 @@ Phase 5 bottleneck workflow:
 1. Run a normal suite so each row includes stage-level timing and pattern metadata.
 2. Post-process the suite with [analyze_design_pattern_bottlenecks.py](/home/cj/iron/iron/applications/transformer_layer/analyze_design_pattern_bottlenecks.py).
 3. Use the emitted CSV/JSON/text outputs as the basis for thesis bottleneck discussion.
+
+Phase 6 programmability/debugging workflow:
+
+1. Pass `debug_log_csv` in the study manifest or on the CLI when running [automated_benchmark.py](/home/cj/iron/iron/applications/transformer_layer/automated_benchmark.py).
+2. Let the harness append structured study, benchmark-case, roofline, and parity events to the debug CSV.
+3. Curate stable challenge/mitigation rows into [study/programmability_debug_log.csv](/home/cj/iron/iron/applications/transformer_layer/study/programmability_debug_log.csv).
+4. Use [docs/programmability_debugging.md](/home/cj/iron/iron/applications/transformer_layer/docs/programmability_debugging.md) as the thesis-section skeleton.

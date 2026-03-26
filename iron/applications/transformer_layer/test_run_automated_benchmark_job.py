@@ -14,6 +14,7 @@ def test_build_command_resolves_manifest_and_optional_flags(tmp_path):
             {
                 "study_manifest": "study.json",
                 "output_csv": "suite.csv",
+                "debug_log_csv": "debug.csv",
                 "run_parity_check": True,
                 "parity_output_csv": "parity.csv",
             }
@@ -27,5 +28,7 @@ def test_build_command_resolves_manifest_and_optional_flags(tmp_path):
     assert str(manifest.resolve()) in command
     assert "--output-csv" in command
     assert str((tmp_path / "suite.csv").resolve()) in command
+    assert "--debug-log-csv" in command
+    assert str((tmp_path / "debug.csv").resolve()) in command
     assert "--run-parity-check" in command
     assert str((tmp_path / "parity.csv").resolve()) in command

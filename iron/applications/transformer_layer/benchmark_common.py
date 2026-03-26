@@ -102,6 +102,10 @@ def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
         manifest["output_csv"] = resolve_study_path(
             manifest_file, manifest["output_csv"]
         )
+    if "debug_log_csv" in manifest:
+        manifest["debug_log_csv"] = resolve_study_path(
+            manifest_file, manifest["debug_log_csv"]
+        )
     if "peak_reference" in manifest:
         manifest["peak_reference"] = resolve_study_path(
             manifest_file, manifest["peak_reference"]

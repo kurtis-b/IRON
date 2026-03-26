@@ -18,6 +18,10 @@ from iron.applications.transformer_layer.benchmark_common import (
     resolve_study_path,
     write_results_csv,
 )
+from iron.applications.transformer_layer.debug_log import (
+    append_debug_event,
+    classify_debug_exception,
+)
 from iron.applications.transformer_layer.npu_inference import benchmark_pattern
 from iron.applications.transformer_layer.roofline import annotate_results_csv
 from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
@@ -33,6 +37,11 @@ def parse_args():
     )
     parser.add_argument("--seq-lens", default="64,128,256,512")
     parser.add_argument("--output-csv", default="transformer_layer_npu_suite.csv")
+    parser.add_argument(
+        "--debug-log-csv",
+        default=None,
+        help="Optional structured programmability/debug event log path.",
+    )
     parser.add_argument("--warmup-runs", type=int, default=5)
     parser.add_argument("--runs-per-sample", type=int, default=20)
     parser.add_argument("--hidden-size", type=int, default=768)
@@ -98,6 +107,12 @@ def _resolve_annotated_output_csv(args, manifest: dict[str, object]) -> str | No
     if args.annotated_output_csv is not None:
         return args.annotated_output_csv
     return manifest.get("annotated_output_csv")
+
+
+def _resolve_debug_log_csv(args, manifest: dict[str, object]) -> str | None:
+    if args.debug_log_csv is not None:
+        return args.debug_log_csv
+    return manifest.get("debug_log_csv")
 
 
 def _resolve_parity_config(
@@ -168,6 +183,7 @@ def _run_parity_checks(
 def main():
     args = parse_args()
     manifest = load_study_manifest(args.study_manifest)
+    study_id = str(manifest["study_id"])
     execution_modes = (
         parse_execution_modes(args.execution_modes)
         if args.execution_modes != "encoder_pipeline,gemm_only,operator_runlist"
@@ -179,49 +195,171 @@ def main():
         else list(manifest["seq_lens"])
     )
     output_csv = _resolve_output_csv(args, manifest)
+    debug_log_csv = _resolve_debug_log_csv(args, manifest)
     peak_reference = _resolve_peak_reference(args, manifest)
     annotated_output_csv = _resolve_annotated_output_csv(args, manifest)
+    append_debug_event(
+        debug_log_csv,
+        study_id=study_id,
+        event_kind="study_started",
+        component="automation",
+        challenge="study_execution",
+        symptom=f"Starting manifest-driven run for {study_id}",
+        impact_on_experiment="The requested design-pattern study is beginning.",
+        mitigation="None required.",
+        status="started",
+        supporting_log_path=output_csv,
+    )
     all_rows = []
-    for seq_len in seq_lens:
-        spec = _resolve_spec(args, manifest, seq_len)
-        for execution_mode in execution_modes:
-            all_rows.extend(
-                benchmark_pattern(
-                    execution_mode=execution_mode,
-                    spec=spec,
-                    warmup_runs=args.warmup_runs,
-                    runs_per_sample=args.runs_per_sample,
-                    output_csv=output_csv,
-                    seed=args.seed,
-                    write_immediately=False,
+    try:
+        for seq_len in seq_lens:
+            spec = _resolve_spec(args, manifest, seq_len)
+            for execution_mode in execution_modes:
+                try:
+                    rows = benchmark_pattern(
+                        execution_mode=execution_mode,
+                        spec=spec,
+                        warmup_runs=args.warmup_runs,
+                        runs_per_sample=args.runs_per_sample,
+                        output_csv=output_csv,
+                        seed=args.seed,
+                        write_immediately=False,
+                    )
+                except Exception as exc:
+                    event = classify_debug_exception(exc)
+                    append_debug_event(
+                        debug_log_csv,
+                        study_id=study_id,
+                        event_kind="benchmark_case_failed",
+                        pattern=execution_mode,
+                        seq_len=seq_len,
+                        supporting_log_path=output_csv,
+                        **event,
+                    )
+                    raise
+                all_rows.extend(rows)
+                if rows:
+                    row = rows[-1]
+                    append_debug_event(
+                        debug_log_csv,
+                        study_id=study_id,
+                        event_kind="benchmark_case_completed",
+                        component="benchmark_runner",
+                        pattern=execution_mode,
+                        seq_len=seq_len,
+                        challenge="binary_generation_or_reuse",
+                        symptom=(
+                            f"Completed with {row.get('npu_dispatch_count')} dispatches, "
+                            f"{row.get('npu_unique_instruction_binary_count')} instruction binaries, "
+                            f"avg_latency_ms={row.get('avg_latency_ms')}"
+                        ),
+                        impact_on_experiment="The requested case completed and produced a benchmark row.",
+                        mitigation="Use the recorded dispatch, topology, and instruction-binary counts when interpreting programmability overhead.",
+                        status="completed",
+                        supporting_log_path=output_csv,
+                    )
+        if all_rows:
+            write_results_csv(output_csv, all_rows)
+            if peak_reference and annotated_output_csv:
+                try:
+                    annotate_results_csv(
+                        input_csv=output_csv,
+                        peak_reference_path=peak_reference,
+                        output_csv=annotated_output_csv,
+                    )
+                except Exception as exc:
+                    event = classify_debug_exception(exc)
+                    append_debug_event(
+                        debug_log_csv,
+                        study_id=study_id,
+                        event_kind="roofline_annotation_failed",
+                        pattern=None,
+                        seq_len=None,
+                        supporting_log_path=annotated_output_csv,
+                        **event,
+                    )
+                    raise
+                append_debug_event(
+                    debug_log_csv,
+                    study_id=study_id,
+                    event_kind="roofline_annotation_completed",
+                    component="roofline",
+                    challenge="roofline_annotation",
+                    symptom="Annotated suite CSV was written successfully.",
+                    impact_on_experiment="Percent-of-peak and roofline metrics are available for analysis.",
+                    mitigation="None required.",
+                    status="completed",
+                    supporting_log_path=annotated_output_csv,
                 )
-            )
-    if all_rows:
-        write_results_csv(output_csv, all_rows)
-        if peak_reference and annotated_output_csv:
-            annotate_results_csv(
-                input_csv=output_csv,
-                peak_reference_path=peak_reference,
-                output_csv=annotated_output_csv,
-            )
 
-    parity = _resolve_parity_config(args, manifest)
-    if parity is not None:
-        parity_rows = _run_parity_checks(
-            parity=parity,
-            execution_modes=execution_modes,
-            seq_lens=seq_lens,
-            base_spec=_resolve_spec(args, manifest, seq_lens[0]),
-            seed=args.seed,
-            study_id=str(manifest["study_id"]),
+        parity = _resolve_parity_config(args, manifest)
+        if parity is not None:
+            try:
+                parity_rows = _run_parity_checks(
+                    parity=parity,
+                    execution_modes=execution_modes,
+                    seq_lens=seq_lens,
+                    base_spec=_resolve_spec(args, manifest, seq_lens[0]),
+                    seed=args.seed,
+                    study_id=study_id,
+                )
+            except Exception as exc:
+                event = classify_debug_exception(exc)
+                append_debug_event(
+                    debug_log_csv,
+                    study_id=study_id,
+                    event_kind="parity_failed",
+                    pattern=None,
+                    seq_len=None,
+                    supporting_log_path=parity.get("output_csv"),
+                    **event,
+                )
+                raise
+            parity_output = parity.get("output_csv")
+            if parity_output:
+                from iron.applications.transformer_layer.benchmark_common import (
+                    write_dict_rows_csv,
+                )
+
+                write_dict_rows_csv(parity_output, parity_rows)
+            append_debug_event(
+                debug_log_csv,
+                study_id=study_id,
+                event_kind="parity_completed",
+                component="parity",
+                challenge="parity_validation",
+                symptom="Layer-level parity completed successfully.",
+                impact_on_experiment="Correctness-check outputs are available for the selected execution modes.",
+                mitigation="None required.",
+                status="completed",
+                supporting_log_path=parity_output,
+            )
+    except Exception:
+        append_debug_event(
+            debug_log_csv,
+            study_id=study_id,
+            event_kind="study_failed",
+            component="automation",
+            challenge="study_execution",
+            symptom=f"Study {study_id} failed before all requested outputs were produced.",
+            impact_on_experiment="The requested manifest run did not complete.",
+            mitigation="Inspect earlier failure rows in the same debug log and rerun the failing stage in isolation.",
+            status="failed",
+            supporting_log_path=output_csv,
         )
-        parity_output = parity.get("output_csv")
-        if parity_output:
-            from iron.applications.transformer_layer.benchmark_common import (
-                write_dict_rows_csv,
-            )
-
-            write_dict_rows_csv(parity_output, parity_rows)
+        raise
+    append_debug_event(
+        debug_log_csv,
+        study_id=study_id,
+        event_kind="study_completed",
+        component="automation",
+        challenge="study_execution",
+        symptom=f"Study {study_id} completed successfully.",
+        impact_on_experiment="The requested suite outputs are available for thesis analysis.",
+        mitigation="None required.",
+        status="completed",
+        supporting_log_path=output_csv,
+    )
 
 
 if __name__ == "__main__":

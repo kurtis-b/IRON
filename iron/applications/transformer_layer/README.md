@@ -55,3 +55,16 @@ python -m iron.applications.transformer_layer.analyze_design_pattern_bottlenecks
   --summary-json iron/applications/transformer_layer/results/design_patterns_main_bottlenecks.json \
   --summary-text iron/applications/transformer_layer/results/design_patterns_main_bottlenecks.txt
 ```
+
+To capture structured programmability/debug events during a manifest run:
+
+```bash
+python iron/applications/transformer_layer/automated_benchmark.py \
+  --study-manifest iron/applications/transformer_layer/study/design_patterns_main.json \
+  --debug-log-csv iron/applications/transformer_layer/results/design_patterns_main_debug_log.csv
+```
+
+The checked-in thesis-facing skeletons live at:
+
+- [study/programmability_debug_log.csv](/home/cj/iron/iron/applications/transformer_layer/study/programmability_debug_log.csv)
+- [docs/programmability_debugging.md](/home/cj/iron/iron/applications/transformer_layer/docs/programmability_debugging.md)

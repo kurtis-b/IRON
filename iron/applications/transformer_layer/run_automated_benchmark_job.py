@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from iron.applications.transformer_layer.debug_log import append_debug_event
+
 SCRIPT_DIR = Path(__file__).parent.resolve()
 AUTOMATED_BENCHMARK = SCRIPT_DIR / "automated_benchmark.py"
 
@@ -18,6 +20,7 @@ OPTION_MAP = {
     "execution_modes": "--execution-modes",
     "seq_lens": "--seq-lens",
     "output_csv": "--output-csv",
+    "debug_log_csv": "--debug-log-csv",
     "peak_reference": "--peak-reference",
     "annotated_output_csv": "--annotated-output-csv",
     "warmup_runs": "--warmup-runs",
@@ -31,6 +34,7 @@ OPTION_MAP = {
 PATH_KEYS = {
     "study_manifest",
     "output_csv",
+    "debug_log_csv",
     "peak_reference",
     "annotated_output_csv",
     "parity_output_csv",
@@ -85,11 +89,47 @@ def main():
     args = parse_args()
     job = load_job_config(args.job_config)
     command = build_command(args.job_config, job)
+    debug_log_csv = (
+        resolve_path(Path(args.job_config).resolve().parent, str(job["debug_log_csv"]))
+        if job.get("debug_log_csv") is not None
+        else None
+    )
     if args.print_command:
         print(" ".join(command))
         return
-
+    append_debug_event(
+        debug_log_csv,
+        study_id=None,
+        event_kind="job_started",
+        component="unattended_job",
+        challenge="job_execution",
+        symptom=f"Launching automated_benchmark.py from {args.job_config}",
+        impact_on_experiment="The unattended wrapper is starting the requested manifest run.",
+        mitigation="None required.",
+        status="started",
+        supporting_log_path=job.get("study_manifest"),
+    )
     result = subprocess.run(command, cwd=SCRIPT_DIR, check=False)
+    append_debug_event(
+        debug_log_csv,
+        study_id=None,
+        event_kind="job_completed" if result.returncode == 0 else "job_failed",
+        component="unattended_job",
+        challenge="job_execution",
+        symptom=f"automated_benchmark.py exited with return code {result.returncode}",
+        impact_on_experiment=(
+            "The unattended wrapper finished successfully."
+            if result.returncode == 0
+            else "The unattended wrapper ended with a non-zero exit code."
+        ),
+        mitigation=(
+            "None required."
+            if result.returncode == 0
+            else "Inspect the earlier benchmark or parity events in the same debug log."
+        ),
+        status="completed" if result.returncode == 0 else "failed",
+        supporting_log_path=job.get("output_csv"),
+    )
     raise SystemExit(result.returncode)
 
 

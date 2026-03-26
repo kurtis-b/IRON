@@ -1,6 +1,7 @@
 {
   "study_manifest": "../study/design_patterns_main.json",
   "output_csv": "../results/design_patterns_main.csv",
+  "debug_log_csv": "../results/design_patterns_main_debug_log.csv",
   "peak_reference": "../config/peak_references.json",
   "annotated_output_csv": "../results/design_patterns_main_annotated.csv",
   "run_parity_check": true,
