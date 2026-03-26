@@ -22,14 +22,3 @@ from .swiglu_decode.op import AIESwiGLUDecode
 from .swiglu_prefill.op import AIESwiGLUPrefill
 from .tanh.op import AIETanh
 from .transpose.op import AIETranspose
-
-from .addnorm.op import AIEAddAndNorm
-from .encoder.op import AIEBERTEncoder
-from .encoder_pipeline.op import AIEEncoderPipeline
-from .encoder_pipeline_memtile.op import AIEEncoderPipeline as AIEEncoderPipelineMemtile
-from .ffn.op import AIEFFN
-from .ffn_addnorm.op import AIEFFNAN
-from .mha_to_an.op import AIEMHAOutProj
-
-# Backward-compatible alias used in some application code.
-AIEANFFN = AIEFFNAN

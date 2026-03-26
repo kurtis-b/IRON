@@ -5,6 +5,21 @@ import torch
 from iron.common.utils import torch_dtype_map
 
 
+def _layer_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.layer_norm(
+        x,
+        normalized_shape=(x.shape[-1],),
+        weight=weight,
+        bias=None,
+    )
+
+
+def _add_then_norm(
+    residual: torch.Tensor, update: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return _layer_norm(update + residual, weight)
+
+
 def generate_golden_reference(
     seq_len: int,
     hidden_size: int,
@@ -14,13 +29,14 @@ def generate_golden_reference(
     seed=42,
 ):
     """
-    Generate golden reference for BERT Encoder Layer.
+    Generate golden reference for the post-projection encoder layer.
 
-    A BERT Encoder Layer consists of:
-    1. Multi-Head Self-Attention (MHA)
-    2. Add & Norm (residual connection + layer normalization)
-    3. Feed-Forward Network (FFN): up-projection -> GeLU -> down-projection
-    4. Add & Norm (residual connection + layer normalization)
+    The encoder runlist workload consists of:
+    1. Multi-Head Self-Attention (MHA) from supplied Q/K/V
+    2. Output projection
+    3. Add & Norm (residual connection followed by layer normalization)
+    4. Feed-Forward Network (FFN): up-projection -> GeLU -> down-projection
+    5. Add & Norm (residual connection followed by layer normalization)
 
     Args:
         seq_len: Sequence length (M)
@@ -32,34 +48,31 @@ def generate_golden_reference(
 
     Returns:
         Dictionary containing:
-            - input: Input tensor (seq_len, hidden_size)
-            - attention_mask: Attention mask (seq_len, seq_len)
+            - Q: Query tensor (seq_len, hidden_size)
+            - K: Key tensor (seq_len, hidden_size)
+            - V: Value tensor (seq_len, hidden_size)
+            - R: Residual input tensor (seq_len, hidden_size)
             - output: Final output after encoder layer (seq_len, hidden_size)
-            - weights: Dictionary of all weight matrices
+            - weights: Dictionary of downstream weight matrices
     """
     torch.manual_seed(seed)
     val_range = 0.05
     dtype_torch = torch_dtype_map[dtype]
 
-    # Generate input tensor (seq_len, hidden_size)
-    input_tensor = torch.randn(seq_len, hidden_size, dtype=dtype_torch) * val_range
-
-    # Generate attention mask (seq_len, seq_len)
-    attention_mask = torch.ones(seq_len, seq_len, dtype=dtype_torch)
-
-    # MHA weights (separate Q/K/V weights)
+    # Generate post-projection inputs (seq_len, hidden_size)
     head_dim = hidden_size // num_heads
-    q_weight = torch.randn(hidden_size, hidden_size, dtype=dtype_torch) * val_range
-    k_weight = torch.randn(hidden_size, hidden_size, dtype=dtype_torch) * val_range
-    v_weight = torch.randn(hidden_size, hidden_size, dtype=dtype_torch) * val_range
+    q_input = torch.randn(seq_len, hidden_size, dtype=dtype_torch) * val_range
+    k_input = torch.randn(seq_len, hidden_size, dtype=dtype_torch) * val_range
+    v_input = torch.randn(seq_len, hidden_size, dtype=dtype_torch) * val_range
+    residual_input = torch.randn(seq_len, hidden_size, dtype=dtype_torch) * val_range
+
+    # Downstream encoder weights
     attn_output_weight = (
         torch.randn(hidden_size, hidden_size, dtype=dtype_torch) * val_range
     )
 
     # Layer norm 1 weights
     ln1_weight = torch.rand(hidden_size, dtype=dtype_torch)
-    ln1_bias = torch.zeros(hidden_size, dtype=dtype_torch)
-
     # FFN weights
     ffn_up_weight = (
         torch.randn(hidden_size, intermediate_size, dtype=dtype_torch) * val_range
@@ -70,18 +83,11 @@ def generate_golden_reference(
 
     # Layer norm 2 weights
     ln2_weight = torch.rand(hidden_size, dtype=dtype_torch)
-    ln2_bias = torch.zeros(hidden_size, dtype=dtype_torch)
 
-    # Forward pass simulation
-    # 1. Multi-Head Attention (separate Q/K/V projections)
-    q = torch.matmul(input_tensor, q_weight)
-    k = torch.matmul(input_tensor, k_weight)
-    v = torch.matmul(input_tensor, v_weight)
-
-    # Reshape for multi-head attention
-    q = q.view(seq_len, num_heads, head_dim).transpose(0, 1)
-    k = k.view(seq_len, num_heads, head_dim).transpose(0, 1)
-    v = v.view(seq_len, num_heads, head_dim).transpose(0, 1)
+    # Forward pass simulation from supplied Q/K/V/R
+    q = q_input.view(seq_len, num_heads, head_dim).transpose(0, 1)
+    k = k_input.view(seq_len, num_heads, head_dim).transpose(0, 1)
+    v = v_input.view(seq_len, num_heads, head_dim).transpose(0, 1)
 
     # Attention scores
     attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim**0.5)
@@ -92,11 +98,8 @@ def generate_golden_reference(
     attn_output = attn_output.transpose(0, 1).contiguous().view(seq_len, hidden_size)
     attn_output = torch.matmul(attn_output, attn_output_weight)
 
-    # 2. Add & Norm 1
-    hidden_states = torch.nn.functional.layer_norm(
-        attn_output, (hidden_size,), ln1_weight, ln1_bias
-    )
-    hidden_states = input_tensor + hidden_states
+    # 2. Norm & Add 1
+    hidden_states = _add_then_norm(residual_input, attn_output, ln1_weight)
 
     # 3. Feed-Forward Network
     # Up-projection
@@ -106,16 +109,10 @@ def generate_golden_reference(
     # Down-projection
     ffn_output = torch.matmul(intermediate, ffn_down_weight)
 
-    # 4. Add & Norm 2
-    output = torch.nn.functional.layer_norm(
-        ffn_output, (hidden_size,), ln2_weight, ln2_bias
-    )
-    output = hidden_states + output
+    # 4. Norm & Add 2
+    output = _add_then_norm(hidden_states, ffn_output, ln2_weight)
 
     weights = {
-        "q_weight": q_weight,
-        "k_weight": k_weight,
-        "v_weight": v_weight,
         "attn_output_weight": attn_output_weight,
         "ln1_weight": ln1_weight,
         "ffn_up_weight": ffn_up_weight,
@@ -124,8 +121,10 @@ def generate_golden_reference(
     }
 
     return {
-        "input": input_tensor,
-        "attention_mask": attention_mask,
+        "Q": q_input,
+        "K": k_input,
+        "V": v_input,
+        "R": residual_input,
         "output": output,
         "weights": weights,
     }
