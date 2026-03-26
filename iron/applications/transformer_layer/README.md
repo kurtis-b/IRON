@@ -129,9 +129,11 @@ python iron/applications/transformer_layer/calibrate_backend_peaks.py \
 ```
 
 The checked-in [peak_references.json](/home/cj/iron/iron/applications/transformer_layer/config/peak_references.json)
-unblocks the manifest workflow, but its `source_note` fields currently mark it
-as provisional local evidence rather than thesis-final calibrated hardware
-peaks.
+now records study-local calibrated backend references derived from the current
+checked-in benchmark artifacts. Those values are suitable for branch-local
+roofline analysis; if a separate thesis-final hardware calibration pass is
+performed later, preserve the updated `source_note` provenance when replacing
+them.
 
 Roofline annotation:
 

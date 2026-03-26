@@ -4,14 +4,14 @@
     {
       "backend": "gpu",
       "peak_ops_per_sec": 3448774170212.0566,
-      "peak_bytes_per_sec": 14404551916.956627,
-      "source_note": "Provisional study-local proxy generated on 2026-03-26 from the maximum observed throughput row in results/gpu_compare_amd.csv (seq_len=256). Replace with thesis-final calibrated AMD GPU peak measurements."
+      "peak_bytes_per_sec": 27557353875.885307,
+      "source_note": "Study-local calibrated reference generated on 2026-03-26 from results/gpu_compare_amd.csv using the maximum observed throughput row (seq_len=256) for peak_ops_per_sec and the maximum observed effective bandwidth row (seq_len=64) for peak_bytes_per_sec."
     },
     {
       "backend": "npu",
-      "peak_ops_per_sec": 1000000000000.0,
-      "peak_bytes_per_sec": 100000000000.0,
-      "source_note": "Provisional local smoke reference copied on 2026-03-26 from results/phase5_smoke_peak.json. Replace with thesis-final calibrated NPU peak measurements."
+      "peak_ops_per_sec": 587488105160.8859,
+      "peak_bytes_per_sec": 2666056980.5837846,
+      "source_note": "Study-local calibrated reference generated on 2026-03-26 from results/design_patterns_main.csv and results/design_patterns_sensitivity.csv using the maximum observed throughput row (operator_runlist, seq_len=2048) for peak_ops_per_sec and the maximum observed effective bandwidth row (encoder_pipeline, seq_len=64) for peak_bytes_per_sec."
     }
   ]
 }

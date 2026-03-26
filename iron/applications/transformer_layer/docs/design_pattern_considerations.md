@@ -185,9 +185,8 @@ limitations of the current branch.
 
 The next engineering steps implied by these considerations are:
 
-1. extend the component-boundary `operator_runlist` validation path to the
-   longer sequence-length surfaces that matter most for the study, especially
-   `8192` and `16384`
+1. decide whether the current full-layer `operator_runlist` parity gap is an
+   acceptable documented limitation or worth another debugging pass
 2. measure whether more BO reuse / aliasing is needed beyond the current
    query-blocked score/scale/softmax reuse
 3. if desired, add the second comparison axis where all three patterns include
@@ -196,7 +195,9 @@ The next engineering steps implied by these considerations are:
 4. if desired, add a larger-embedding comparison axis that highlights the
    relative scaling difficulty of `encoder_pipeline` versus `gemm_only` and
    `operator_runlist`
-5. reassess long-sequence `operator_runlist` execution after those steps
+5. if desired, extend the sensitivity or final thesis sweeps beyond the
+   currently retained `64..2048` study surface now that all three patterns run
+   through `16384`
 
 Those steps belong to implementation work, not to the benchmark methodology
 itself.
