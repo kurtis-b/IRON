@@ -114,7 +114,10 @@ Important current considerations:
 
 At the moment, full end-to-end `8192` parity is not practical for
 `operator_runlist`, because both the runtime path and the host reference
-materialize large `seq_len^2 * num_heads` attention tensors.
+materialize large `seq_len^2 * num_heads` attention tensors. The currently
+verified `operator_runlist` surface extends through `seq_len=4096` on the
+retained `768/3072/12` and `1024/4096/16` families, while `8192` is still
+blocked by compile-time memory limits in the stitched `attn_softmax` stage.
 
 In a projection-inclusive comparison, `operator_runlist` is also a natural
 place to absorb Q/K/V projection because it can represent those projections as
