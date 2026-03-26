@@ -128,6 +128,11 @@ python iron/applications/transformer_layer/calibrate_backend_peaks.py \
   --append
 ```
 
+The checked-in [peak_references.json](/home/cj/iron/iron/applications/transformer_layer/config/peak_references.json)
+unblocks the manifest workflow, but its `source_note` fields currently mark it
+as provisional local evidence rather than thesis-final calibrated hardware
+peaks.
+
 Roofline annotation:
 
 ```bash

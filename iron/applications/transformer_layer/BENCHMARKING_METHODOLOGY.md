@@ -133,6 +133,9 @@ The annotation writes:
 - `roofline_pct`
 
 Peak artifacts live in the multi-backend format defined by [peak_reference.py](/home/cj/iron/iron/applications/transformer_layer/peak_reference.py).
+The checked-in config artifact currently serves as a provisional local
+reference; thesis-final roofline claims should replace it with calibrated
+backend peaks and preserve the updated `source_note` provenance.
 
 ## Bottleneck Logging Method
 
