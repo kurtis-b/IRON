@@ -18,6 +18,8 @@ OPTION_MAP = {
     "execution_modes": "--execution-modes",
     "seq_lens": "--seq-lens",
     "output_csv": "--output-csv",
+    "peak_reference": "--peak-reference",
+    "annotated_output_csv": "--annotated-output-csv",
     "warmup_runs": "--warmup-runs",
     "runs_per_sample": "--runs-per-sample",
     "hidden_size": "--hidden-size",
@@ -26,7 +28,13 @@ OPTION_MAP = {
     "seed": "--seed",
     "parity_output_csv": "--parity-output-csv",
 }
-PATH_KEYS = {"study_manifest", "output_csv", "parity_output_csv"}
+PATH_KEYS = {
+    "study_manifest",
+    "output_csv",
+    "peak_reference",
+    "annotated_output_csv",
+    "parity_output_csv",
+}
 BOOLEAN_FLAGS = {"run_parity_check": "--run-parity-check"}
 
 

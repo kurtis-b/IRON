@@ -36,3 +36,12 @@ source ./ironenv/bin/activate
 python iron/applications/transformer_layer/automated_benchmark.py \
   --study-manifest iron/applications/transformer_layer/study/design_patterns_main.json
 ```
+
+To annotate an existing suite with backend peak and roofline percentages:
+
+```bash
+python -m iron.applications.transformer_layer.annotate_roofline \
+  --input-csv iron/applications/transformer_layer/results/design_patterns_main.csv \
+  --peak-reference iron/applications/transformer_layer/config/peak_references.json \
+  --output-csv iron/applications/transformer_layer/results/design_patterns_main_annotated.csv
+```

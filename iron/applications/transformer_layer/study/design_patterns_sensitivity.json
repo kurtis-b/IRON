@@ -25,6 +25,8 @@
   "warmup_runs": 3,
   "runs_per_sample": 10,
   "output_csv": "../results/design_patterns_sensitivity.csv",
+  "peak_reference": "../config/peak_references.json",
+  "annotated_output_csv": "../results/design_patterns_sensitivity_annotated.csv",
   "parity": {
     "enabled": false
   }

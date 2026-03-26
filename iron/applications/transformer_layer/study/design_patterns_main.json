@@ -25,6 +25,8 @@
   "warmup_runs": 5,
   "runs_per_sample": 20,
   "output_csv": "../results/design_patterns_main.csv",
+  "peak_reference": "../config/peak_references.json",
+  "annotated_output_csv": "../results/design_patterns_main_annotated.csv",
   "parity": {
     "enabled": true,
     "execution_modes": [

@@ -19,6 +19,7 @@ from iron.applications.transformer_layer.benchmark_common import (
     write_results_csv,
 )
 from iron.applications.transformer_layer.npu_inference import benchmark_pattern
+from iron.applications.transformer_layer.roofline import annotate_results_csv
 from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
 
 
@@ -38,6 +39,16 @@ def parse_args():
     parser.add_argument("--intermediate-size", type=int, default=3072)
     parser.add_argument("--num-attention-heads", type=int, default=12)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--peak-reference",
+        default=None,
+        help="Optional backend peak-reference artifact used to write an annotated suite CSV.",
+    )
+    parser.add_argument(
+        "--annotated-output-csv",
+        default=None,
+        help="Optional annotated suite CSV output path.",
+    )
     parser.add_argument(
         "--run-parity-check",
         action="store_true",
@@ -75,6 +86,18 @@ def _resolve_output_csv(args, manifest: dict[str, object]) -> str:
     if args.output_csv != "transformer_layer_npu_suite.csv":
         return args.output_csv
     return manifest.get("output_csv", args.output_csv)
+
+
+def _resolve_peak_reference(args, manifest: dict[str, object]) -> str | None:
+    if args.peak_reference is not None:
+        return args.peak_reference
+    return manifest.get("peak_reference")
+
+
+def _resolve_annotated_output_csv(args, manifest: dict[str, object]) -> str | None:
+    if args.annotated_output_csv is not None:
+        return args.annotated_output_csv
+    return manifest.get("annotated_output_csv")
 
 
 def _resolve_parity_config(
@@ -156,6 +179,8 @@ def main():
         else list(manifest["seq_lens"])
     )
     output_csv = _resolve_output_csv(args, manifest)
+    peak_reference = _resolve_peak_reference(args, manifest)
+    annotated_output_csv = _resolve_annotated_output_csv(args, manifest)
     all_rows = []
     for seq_len in seq_lens:
         spec = _resolve_spec(args, manifest, seq_len)
@@ -173,6 +198,12 @@ def main():
             )
     if all_rows:
         write_results_csv(output_csv, all_rows)
+        if peak_reference and annotated_output_csv:
+            annotate_results_csv(
+                input_csv=output_csv,
+                peak_reference_path=peak_reference,
+                output_csv=annotated_output_csv,
+            )
 
     parity = _resolve_parity_config(args, manifest)
     if parity is not None:

@@ -13,5 +13,8 @@ echo
 echo "4. Run the manifest-driven main study."
 echo "   python iron/applications/transformer_layer/automated_benchmark.py --study-manifest iron/applications/transformer_layer/study/design_patterns_main.json"
 echo
-echo "5. For unattended execution, resolve the systemd job command first."
+echo "5. Generate or update the peak-reference artifact before roofline annotation."
+echo "   python iron/applications/transformer_layer/calibrate_backend_peaks.py --backend npu --peak-ops-per-sec 1.0 --peak-bytes-per-sec 1.0 --output iron/applications/transformer_layer/config/peak_references.json --append"
+echo
+echo "6. For unattended execution, resolve the systemd job command first."
 echo "   python iron/applications/transformer_layer/run_automated_benchmark_job.py iron/applications/transformer_layer/systemd/benchmark_job.example.json --print-command"
