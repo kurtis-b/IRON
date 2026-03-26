@@ -503,10 +503,11 @@ class AIEEncoderRunlist(AIEOperatorBase):
             )
 
         prepared = self.prepare_component_inputs(q, k, v, r)
-        q_heads = prepared["query_heads"]
+        runtime_rows = self._runtime_rows()
+        q_heads = prepared["query_heads"][:runtime_rows]
         k_heads = prepared["key_heads"]
         v_heads = prepared["value_heads"]
-        residual = prepared["residual"]
+        residual = prepared["residual"][:runtime_rows]
 
         if component_name == "k_transpose":
             return {
@@ -525,7 +526,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             }
 
         attn_scale = attn_scores * (self.head_dim**-0.5)
-        attn_scale_matrix = attn_scale.view(self.num_heads * self.seq_len, self.seq_len)
+        attn_scale_matrix = attn_scale.view(self.num_heads * runtime_rows, self.seq_len)
         if component_name == "attn_scale":
             return {
                 "args": (attn_scores.unsqueeze(0),),
@@ -537,8 +538,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             dim=-1,
         ).to(torch.bfloat16)
         attn_softmax_matrix = attn_softmax.view(
-            self.num_heads * self.seq_len,
-            self.seq_len,
+            self.num_heads * runtime_rows, self.seq_len
         )
         if component_name == "attn_softmax":
             return {
@@ -556,7 +556,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 "expected": attn_output,
             }
 
-        attn_output_matrix = attn_output.view(self.seq_len, self.hidden_size)
+        attn_output_matrix = attn_output.view(runtime_rows, self.hidden_size)
         out_proj = F.linear(attn_output_matrix, self.attn_output_weight)
         if component_name == "out_proj":
             return {
@@ -625,20 +625,18 @@ class AIEEncoderRunlist(AIEOperatorBase):
         names: tuple[str, ...] | list[str] | None = None,
     ) -> dict[str, object]:
         requested_names = self._normalize_component_names(names)
+        runtime_rows = self._runtime_rows()
+        runtime_act_size = self._runtime_act_size()
+        runtime_ffn_size = self._runtime_ffn_size()
+        runtime_attn_size = self._runtime_attn_size()
         seq_gemm_tile_m = self._resolve_seq_gemm_tile_m(self.seq_len)
         attn_scores_tile_n = self._resolve_attn_scores_tile_n(
             self.seq_len, self.num_aie_columns
         )
         projection_tiling = self._resolve_projection_tiling()
-        eltwise_mul_tile_size = (self.seq_len * self.seq_len * self.num_heads) // (
-            self.num_aie_columns * 2
-        )
-        eltwise_add_tile_size = (self.seq_len * self.hidden_size) // (
-            self.num_aie_columns * 2
-        )
-        gelu_tile_size = (self.seq_len * self.intermediate_size) // (
-            self.num_aie_columns * 2
-        )
+        eltwise_mul_tile_size = runtime_attn_size // (self.num_aie_columns * 2)
+        eltwise_add_tile_size = runtime_act_size // (self.num_aie_columns * 2)
+        gelu_tile_size = runtime_ffn_size // (self.num_aie_columns * 2)
 
         operators: dict[str, object] = {}
         for name in requested_names:
@@ -655,7 +653,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 )
             elif name == "attn_scores":
                 operators[name] = AIEGEMM(
-                    M=self.seq_len,
+                    M=runtime_rows,
                     K=self.head_dim,
                     N=self.seq_len,
                     tile_m=seq_gemm_tile_m,
@@ -671,7 +669,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 )
             elif name == "attn_scale":
                 operators[name] = AIEElementwiseMul(
-                    size=self.seq_len * self.seq_len * self.num_heads,
+                    size=runtime_attn_size,
                     num_aie_columns=self.num_aie_columns,
                     num_channels=2,
                     tile_size=min(
@@ -683,7 +681,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 )
             elif name == "attn_softmax":
                 operators[name] = AIESoftmax(
-                    rows=self.seq_len * self.num_heads,
+                    rows=runtime_rows * self.num_heads,
                     cols=self.seq_len,
                     num_aie_columns=self.num_aie_columns,
                     num_channels=2,
@@ -691,7 +689,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 )
             elif name == "attn_output":
                 operators[name] = AIEGEMM(
-                    M=self.seq_len,
+                    M=runtime_rows,
                     K=self.seq_len,
                     N=self.head_dim,
                     tile_m=seq_gemm_tile_m,
@@ -707,7 +705,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 )
             elif name == "out_proj":
                 operators[name] = AIEGEMM(
-                    M=self.seq_len,
+                    M=runtime_rows,
                     K=self.hidden_size,
                     N=self.hidden_size,
                     use_static_weight=True,
@@ -722,7 +720,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 operators[name].weight = self.attn_output_weight.contiguous()
             elif name in {"add1", "add2"}:
                 operators[name] = AIEElementwiseAdd(
-                    size=self.seq_len * self.hidden_size,
+                    size=runtime_act_size,
                     num_aie_columns=self.num_aie_columns,
                     num_channels=2,
                     tile_size=min(
@@ -733,7 +731,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 )
             elif name == "ln1":
                 operators[name] = AIELayerNorm(
-                    size=self.seq_len * self.hidden_size,
+                    size=runtime_act_size,
                     tile_size=self.hidden_size,
                     num_aie_columns=self.num_aie_columns,
                     num_channels=2,
@@ -742,7 +740,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 )
             elif name == "ffn_up":
                 operators[name] = AIEGEMM(
-                    M=self.seq_len,
+                    M=runtime_rows,
                     K=self.hidden_size,
                     N=self.intermediate_size,
                     use_static_weight=True,
@@ -757,7 +755,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 operators[name].weight = self.ffn_up_weight.contiguous()
             elif name == "gelu":
                 operators[name] = AIEGELU(
-                    size=self.seq_len * self.intermediate_size,
+                    size=runtime_ffn_size,
                     num_aie_columns=self.num_aie_columns,
                     num_channels=2,
                     tile_size=min(math.gcd(4096, gelu_tile_size), gelu_tile_size),
@@ -765,7 +763,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 )
             elif name == "ffn_down":
                 operators[name] = AIEGEMM(
-                    M=self.seq_len,
+                    M=runtime_rows,
                     K=self.intermediate_size,
                     N=self.hidden_size,
                     use_static_weight=True,
@@ -780,7 +778,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 operators[name].weight = self.ffn_down_weight.contiguous()
             elif name == "ln2":
                 operators[name] = AIELayerNorm(
-                    size=self.seq_len * self.hidden_size,
+                    size=runtime_act_size,
                     tile_size=self.hidden_size,
                     num_aie_columns=self.num_aie_columns,
                     num_channels=2,

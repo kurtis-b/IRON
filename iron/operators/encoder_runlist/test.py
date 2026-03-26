@@ -397,6 +397,93 @@ def test_encoder_runlist_defaults_to_eager_kernel_loading():
     assert operator.lazy_kernel_loading is False
 
 
+def test_validation_component_case_uses_runtime_rows_when_query_blocked():
+    operator = object.__new__(AIEEncoderRunlist)
+    operator.seq_len = 8
+    operator.hidden_size = 6
+    operator.intermediate_size = 12
+    operator.num_heads = 2
+    operator.head_dim = 3
+    operator.num_aie_columns = 8
+    operator.query_block_size = 4
+    operator.uses_query_blocking = True
+    operator.attn_output_weight = torch.eye(6, dtype=torch.bfloat16)
+    operator.ffn_up_weight = (
+        torch.arange(72, dtype=torch.float32).reshape(12, 6).to(torch.bfloat16)
+    )
+    operator.ffn_down_weight = (
+        torch.arange(72, dtype=torch.float32).reshape(6, 12).to(torch.bfloat16)
+    )
+    operator.ln1_weight = torch.ones(6, dtype=torch.bfloat16)
+    operator.ln2_weight = torch.ones(6, dtype=torch.bfloat16)
+
+    q = torch.arange(48, dtype=torch.float32).reshape(8, 6).to(torch.bfloat16)
+    k = torch.arange(48, 96, dtype=torch.float32).reshape(8, 6).to(torch.bfloat16)
+    v = torch.arange(96, 144, dtype=torch.float32).reshape(8, 6).to(torch.bfloat16)
+    r = torch.arange(144, 192, dtype=torch.float32).reshape(8, 6).to(torch.bfloat16)
+
+    attn_scores_case = operator.validation_component_case(
+        "attn_scores", q, k, v, r, eps=1e-5
+    )
+    assert attn_scores_case["args"][0].shape == (4, 2, 3)
+    assert attn_scores_case["args"][1].shape == (3, 2, 8)
+    assert attn_scores_case["expected"].shape == (2, 4, 8)
+
+    attn_softmax_case = operator.validation_component_case(
+        "attn_softmax", q, k, v, r, eps=1e-5
+    )
+    assert attn_softmax_case["args"][0].shape == (8, 8)
+    assert attn_softmax_case["expected"].shape == (8, 8)
+
+    ln2_case = operator.validation_component_case("ln2", q, k, v, r, eps=1e-5)
+    assert ln2_case["args"][0].shape == (4, 6)
+    assert ln2_case["expected"].shape == (4, 6)
+
+
+def test_make_validation_component_operators_uses_runtime_sizes_when_query_blocked():
+    class DummyContext:
+        def __init__(self):
+            self.operators = []
+            self.static_data_pool = {}
+            self.base_dir = Path(__file__).resolve().parents[3]
+            self.device_manager = SimpleNamespace(
+                device_str=lambda: "npu1_4col",
+                device_type="npu1_4col",
+            )
+
+        def register_operator(self, operator, skip_add_to_list=False):
+            operator.context = self
+            if not skip_add_to_list:
+                self.operators.append(operator)
+
+    operator = AIEEncoderRunlist(
+        seq_len=16384,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_heads=12,
+        ln1_weight=torch.ones(768, dtype=torch.bfloat16),
+        ln2_weight=torch.ones(768, dtype=torch.bfloat16),
+        context=DummyContext(),
+    )
+    operator.attn_output_weight = torch.zeros((768, 768), dtype=torch.bfloat16)
+    operator.ffn_up_weight = torch.zeros((3072, 768), dtype=torch.bfloat16)
+    operator.ffn_down_weight = torch.zeros((768, 3072), dtype=torch.bfloat16)
+
+    operators = operator.make_validation_component_operators(
+        context=operator.context,
+        names=("attn_scores", "attn_scale", "attn_softmax", "ln2"),
+    )
+
+    assert operator.uses_query_blocking is True
+    assert operator.query_block_size == 1024
+    assert operators["attn_scores"].M == 1024
+    assert operators["attn_scores"].N == 16384
+    assert operators["attn_scale"].size == 1024 * 16384 * 12
+    assert operators["attn_softmax"].rows == 1024 * 12
+    assert operators["attn_softmax"].cols == 16384
+    assert operators["ln2"].size == 1024 * 768
+
+
 @pytest.mark.parametrize(
     "seq_len,embedding_dim,ffn_dim,num_heads",
     smoke_params,
