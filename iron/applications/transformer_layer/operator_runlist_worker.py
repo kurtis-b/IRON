@@ -27,6 +27,9 @@ from iron.applications.transformer_layer.roofline import (
     operational_intensity,
 )
 from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
+from iron.applications.transformer_layer.src.reference_layer import (
+    ReferenceTransformerLayer,
+)
 from iron.applications.transformer_layer.src.pattern_operator_runlist import (
     OperatorRunlistPattern,
 )
@@ -112,6 +115,36 @@ def benchmark_operator_runlist_request(request: dict[str, object]) -> dict[str, 
     return row
 
 
+def parity_operator_runlist_request(request: dict[str, object]) -> dict[str, object]:
+    spec = TransformerLayerSpec.from_dict(request["spec"])
+    seed = int(request["seed"])
+    study_id = str(request.get("study_id", "synthetic_transformer_layer"))
+
+    weights = make_synthetic_layer_weights(spec, seed=seed)
+    layer_inputs = make_synthetic_layer_inputs(spec, seed=seed + 1)
+
+    reference = ReferenceTransformerLayer(spec)
+    reference.assign_weights(weights)
+    reference_output = reference(layer_inputs)
+
+    pattern = OperatorRunlistPattern(spec)
+    pattern.assign_weights(weights)
+    candidate_output = pattern(layer_inputs)
+    diff = (reference_output - candidate_output).abs().to(candidate_output.dtype)
+
+    return {
+        "study_id": study_id,
+        "execution_mode": "operator_runlist",
+        "seq_len": spec.seq_len,
+        "batch_size": spec.batch_size,
+        "dtype": spec.dtype,
+        "weights_source": spec.weights_source,
+        "seed": seed,
+        "max_abs_diff": float(diff.max().item()),
+        "mean_abs_diff": float(diff.float().mean().item()),
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Run operator_runlist benchmark in an isolated child process."
@@ -126,7 +159,13 @@ def main():
     request_path = Path(args.request_json)
     response_path = Path(args.response_json)
     request = json.loads(request_path.read_text())
-    row = benchmark_operator_runlist_request(request)
+    mode = str(request.get("mode", "benchmark"))
+    if mode == "benchmark":
+        row = benchmark_operator_runlist_request(request)
+    elif mode == "parity":
+        row = parity_operator_runlist_request(request)
+    else:
+        raise ValueError(f"Unsupported operator_runlist worker mode: {mode}")
     response_path.write_text(json.dumps(row))
     os._exit(0)
 

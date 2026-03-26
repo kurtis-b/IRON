@@ -5,6 +5,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 
 import torch
 
@@ -29,6 +34,51 @@ def error_stats(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, f
     }
 
 
+def _validate_operator_runlist_parity_isolated(
+    *,
+    spec: TransformerLayerSpec,
+    seed: int,
+    study_id: str,
+) -> dict[str, object]:
+    repo_root = Path(__file__).resolve().parents[3]
+    with tempfile.TemporaryDirectory(
+        prefix="transformer_layer_operator_runlist_parity_"
+    ) as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        request_path = temp_dir_path / "request.json"
+        response_path = temp_dir_path / "response.json"
+        request_path.write_text(
+            json.dumps(
+                {
+                    "mode": "parity",
+                    "spec": spec.to_dict(),
+                    "seed": seed,
+                    "study_id": study_id,
+                }
+            )
+        )
+        command = [
+            sys.executable,
+            "-m",
+            "iron.applications.transformer_layer.operator_runlist_worker",
+            "--request-json",
+            str(request_path),
+            "--response-json",
+            str(response_path),
+        ]
+        result = subprocess.run(command, cwd=repo_root, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "operator_runlist parity child process failed with exit code "
+                f"{result.returncode}"
+            )
+        if not response_path.exists():
+            raise RuntimeError(
+                "operator_runlist parity child process did not produce a response payload"
+            )
+        return json.loads(response_path.read_text())
+
+
 def validate_pattern_parity(
     *,
     execution_mode: str,
@@ -36,6 +86,13 @@ def validate_pattern_parity(
     seed: int,
     study_id: str = "synthetic_transformer_layer",
 ) -> dict[str, object]:
+    if execution_mode == "operator_runlist":
+        return _validate_operator_runlist_parity_isolated(
+            spec=spec,
+            seed=seed,
+            study_id=study_id,
+        )
+
     weights = make_synthetic_layer_weights(spec, seed=seed)
     layer_inputs = make_synthetic_layer_inputs(spec, seed=seed + 1)
 
