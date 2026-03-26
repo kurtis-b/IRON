@@ -2,6 +2,11 @@
 
 This document is the paper-section skeleton for the thesis discussion of engineering difficulty across the three transformer-layer NPU design patterns.
 
+For the living engineering notes about pattern-specific constraints and
+follow-on implementation considerations, see
+[design_pattern_considerations.md](/home/cj/iron/iron/applications/transformer_layer/docs/design_pattern_considerations.md).
+This file should stay thesis-facing.
+
 ## Sources
 
 Use these checked-in artifacts as the primary evidence sources:

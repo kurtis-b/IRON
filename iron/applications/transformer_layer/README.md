@@ -17,11 +17,20 @@ The default study uses one synthetic transformer layer with:
 - batch size `1`
 - no attention mask
 - `bfloat16`
-- synthetic hidden states
+- synthetic post-projection `Q/K/V/R` inputs
 - synthetic weights
 - one layer-local CPU reference path for parity checks
 
 The canonical layer spec lives in [layer_spec.py](/home/cj/iron/iron/applications/transformer_layer/src/layer_spec.py). Imported weights are represented in the schema, but this branch currently runs synthetic weights only. There is no `import_layer_weights.py` command in the app yet.
+
+All four compared executions start from the same boundary as the
+[encoder_pipeline](/home/cj/iron/iron/operators/encoder_pipeline/op.py) operator:
+supplied `Q`, `K`, `V`, and residual `R`. Q/K/V projection is intentionally
+out of scope for this thesis app.
+
+For the engineering tradeoffs that differ across `encoder_pipeline`,
+`gemm_only`, and `operator_runlist`, see
+[design_pattern_considerations.md](/home/cj/iron/iron/applications/transformer_layer/docs/design_pattern_considerations.md).
 
 ## Environment
 
@@ -74,6 +83,25 @@ python iron/applications/transformer_layer/validate_npu_parity.py \
   --execution-mode encoder_pipeline \
   --seq-lens 64,128 \
   --output-csv iron/applications/transformer_layer/results/parity_encoder_pipeline.csv
+```
+
+Operator-runlist stability validation:
+
+```bash
+python iron/applications/transformer_layer/validate_operator_runlist_stability.py \
+  --seq-len 64 \
+  --repeats 3 \
+  --output-csv iron/applications/transformer_layer/results/operator_runlist_stability_seq64.csv
+```
+
+Component-boundary operator-runlist validation:
+
+```bash
+python iron/applications/transformer_layer/validate_operator_runlist_stability.py \
+  --seq-len 64 \
+  --targets attn_scores,attn_softmax,ln2 \
+  --components-only \
+  --output-csv iron/applications/transformer_layer/results/operator_runlist_components_seq64.csv
 ```
 
 Peak-reference artifact generation:
@@ -162,6 +190,7 @@ Checked-in manifests and scaffolds:
 - [design_patterns_sensitivity.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_sensitivity.json)
 - [gpu_compare.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare.json)
 - [programmability_debug_log.csv](/home/cj/iron/iron/applications/transformer_layer/study/programmability_debug_log.csv)
+- [design_pattern_considerations.md](/home/cj/iron/iron/applications/transformer_layer/docs/design_pattern_considerations.md)
 - [programmability_debugging.md](/home/cj/iron/iron/applications/transformer_layer/docs/programmability_debugging.md)
 
 Generated benchmark outputs belong under `iron/applications/transformer_layer/results/` and are intentionally ignored by git.

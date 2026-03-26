@@ -35,8 +35,13 @@ Current branch assumptions:
 - batch size is `1`
 - `attention_mask_mode` is `none`
 - `activation` is `gelu`
-- the active study uses synthetic weights and synthetic hidden states
+- the active study uses synthetic weights and synthetic post-projection `Q/K/V/R` inputs
 - imported weights are represented in the schema but no import CLI is wired yet
+
+Pattern-specific engineering tradeoffs are documented separately in
+[design_pattern_considerations.md](/home/cj/iron/iron/applications/transformer_layer/docs/design_pattern_considerations.md).
+This methodology document is only about workload definition, measurement, and
+analysis flow.
 
 The default synthetic layer is BERT-shaped:
 
@@ -60,7 +65,7 @@ The normal sweep varies `seq_len` while keeping the rest of the layer spec fixed
 For each case:
 
 1. Build the layer spec for the requested `seq_len`.
-2. Materialize deterministic synthetic weights and hidden states from the configured seed.
+2. Materialize deterministic synthetic weights and post-projection `Q/K/V/R` inputs from the configured seed.
 3. Run warmup iterations.
 4. Run timed iterations.
 5. Write one schema-normalized suite row.
@@ -71,6 +76,7 @@ Important measurement rules:
 - `avg_latency_ms` is computed from only the timed runs
 - the row also stores per-pattern staged timings when available
 - compile/setup time is tracked separately from steady-state timed latency
+- execution is single-attempt; this app does not implement retry or recovery logic
 
 The main CLI for one pattern is [npu_inference.py](/home/cj/iron/iron/applications/transformer_layer/npu_inference.py). The main study harness is [automated_benchmark.py](/home/cj/iron/iron/applications/transformer_layer/automated_benchmark.py).
 
@@ -132,7 +138,6 @@ Peak artifacts live in the multi-backend format defined by [peak_reference.py](/
 
 Each NPU row may include pattern-specific stage timings such as:
 
-- `avg_qkv_projection_latency_ms`
 - `avg_encoder_pipeline_latency_ms`
 - `avg_npu_gemm_latency_ms`
 - `avg_operator_runlist_latency_ms`
@@ -147,6 +152,13 @@ Post-process the annotated suite with [analyze_design_pattern_bottlenecks.py](/h
 - human-readable text summary
 
 These outputs support the thesis discussion of where each design pattern spends time and why.
+
+`operator_runlist` also has a dedicated repeated-run stability check via
+[validate_operator_runlist_stability.py](/home/cj/iron/iron/applications/transformer_layer/validate_operator_runlist_stability.py).
+That validation is separate from the benchmark harness and is used to confirm
+that the individual NPU operators used by the runlist complete repeatedly
+without relying on retries. It also supports component-boundary checks, where
+only the inputs and output of the selected operator are materialized for parity.
 
 ## Programmability and Debugging Log
 
@@ -168,7 +180,7 @@ Parity is layer-local.
 Steps:
 
 1. Build a synthetic reference layer with [reference_layer.py](/home/cj/iron/iron/applications/transformer_layer/src/reference_layer.py).
-2. Run the requested NPU pattern on the same synthetic weights and hidden states.
+2. Run the requested NPU pattern on the same synthetic weights and synthetic `Q/K/V/R` inputs.
 3. Record `max_abs_diff` and `mean_abs_diff`.
 
 Use [validate_npu_parity.py](/home/cj/iron/iron/applications/transformer_layer/validate_npu_parity.py) for this workflow.
@@ -178,6 +190,11 @@ Parity should be interpreted as:
 - a correctness guard for pattern bringup
 - not a benchmark result
 - separate from the roofline and bottleneck analysis
+
+Long-sequence validation constraints and follow-on engineering work, including
+stage-level parity for `operator_runlist`, are tracked in
+[design_pattern_considerations.md](/home/cj/iron/iron/applications/transformer_layer/docs/design_pattern_considerations.md)
+rather than in this methodology document.
 
 ## AMD GPU Comparison Methodology
 
