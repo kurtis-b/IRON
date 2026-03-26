@@ -194,7 +194,11 @@ Parity should be interpreted as:
 Long-sequence validation constraints and follow-on engineering work, including
 stage-level parity for `operator_runlist`, are tracked in
 [design_pattern_considerations.md](/home/cj/iron/iron/applications/transformer_layer/docs/design_pattern_considerations.md)
-rather than in this methodology document.
+rather than in this methodology document. The retained `operator_runlist`
+runtime surface now executes through `seq_len=16384` on the supported
+`768/3072/12` and `1024/4096/16` families, but long-sequence correctness
+should still lean on component-boundary validation rather than full
+host-materialized parity.
 
 ## AMD GPU Comparison Methodology
 

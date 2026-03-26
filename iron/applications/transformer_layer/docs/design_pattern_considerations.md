@@ -101,8 +101,12 @@ Important current considerations:
 - long-sequence behavior is currently limited by large attention intermediates
   such as `attn_scores_output`, `attn_scaled_output`, and
   `attn_weights_output`
-- the current runtime already reuses one of those large buffers by aliasing
-  `attn_weights_output` onto `attn_scores_output`
+- the current runtime now query-blocks the long-sequence path so those
+  intermediates are sized to one query block at a time instead of the full
+  sequence
+- the current runtime already reuses those large buffers within the query
+  block by aliasing `attn_scaled_output` and `attn_weights_output` onto
+  `attn_scores_output`
 - the current runtime already has exact-size BO pooling and explicit aliasing,
   so any further BO work should keep using lifetime-based reuse of the large
   attention buffers rather than general suballocation from one large slab
@@ -112,13 +116,14 @@ Important current considerations:
 - the dedicated `operator_runlist` validator should remain the place where
   component-boundary parity and repeated completion checks are combined
 
-At the moment, full end-to-end `8192` parity is still not practical for
+At the moment, full end-to-end `8192` and `16384` parity are still not
+practical for
 `operator_runlist`, because both the runtime path and the host reference
 materialize large `seq_len^2 * num_heads` attention tensors. The currently
-verified `operator_runlist` runtime surface extends through `seq_len=8192` on
-the retained `768/3072/12` and `1024/4096/16` families, but long-sequence
-correctness should still prefer component-boundary validation over full host
-materialization.
+verified `operator_runlist` runtime surface extends through `seq_len=16384` on
+the retained `768/3072/12` and `1024/4096/16` families via query-blocked
+execution, but long-sequence correctness should still prefer
+component-boundary validation over full host materialization.
 
 In a projection-inclusive comparison, `operator_runlist` is also a natural
 place to absorb Q/K/V projection because it can represent those projections as
@@ -161,9 +166,10 @@ limitations of the current branch.
 The next engineering steps implied by these considerations are:
 
 1. extend the component-boundary `operator_runlist` validation path to the
-   longer sequence-length surfaces that matter most for the study
-2. measure whether more BO reuse / aliasing is needed beyond the first reused
-   large attention buffer
+   longer sequence-length surfaces that matter most for the study, especially
+   `8192` and `16384`
+2. measure whether more BO reuse / aliasing is needed beyond the current
+   query-blocked score/scale/softmax reuse
 3. if desired, add the second comparison axis where all three patterns include
    Q/K/V projection, with `encoder_pipeline` using host-side projection and the
    other two patterns carrying it in their own execution structures

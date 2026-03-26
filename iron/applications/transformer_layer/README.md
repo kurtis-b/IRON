@@ -104,6 +104,11 @@ python iron/applications/transformer_layer/validate_operator_runlist_stability.p
   --output-csv iron/applications/transformer_layer/results/operator_runlist_components_seq64.csv
 ```
 
+The retained `operator_runlist` runtime surface now executes through
+`seq_len=16384` on the supported `768/3072/12` and `1024/4096/16` families.
+For those long-sequence cases, prefer component-boundary validation over full
+host-materialized parity.
+
 Peak-reference artifact generation:
 
 ```bash
