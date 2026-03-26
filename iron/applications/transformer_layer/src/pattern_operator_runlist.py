@@ -69,6 +69,7 @@ class OperatorRunlistPattern(nn.Module):
         self.context = AIEContext(use_runlist=True)
         self._runtime_ready = False
         self._weights_assigned = False
+        self.compile_setup_time_sec: float | None = None
         self.query_proj = AIEGEMM(
             M=spec.seq_len,
             K=hidden,
@@ -217,8 +218,10 @@ class OperatorRunlistPattern(nn.Module):
             return
         if not self._weights_assigned:
             raise RuntimeError("assign_weights() must be called before execution")
+        start = time.perf_counter()
         self.context.compile_all()
         self.context.prepare_runtime()
+        self.compile_setup_time_sec = time.perf_counter() - start
         self._runtime_ready = True
 
     def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
@@ -272,15 +275,18 @@ class OperatorRunlistPattern(nn.Module):
         self._prepare_runtime()
 
         hidden_states = hidden_states.squeeze(0).to(self.spec.torch_dtype)
-        start = time.perf_counter()
+        qkv_start = time.perf_counter()
         query = self.query_proj(hidden_states)
         key = self.key_proj(hidden_states)
         value = self.value_proj(hidden_states)
         qkv_end = time.perf_counter()
 
+        host_preprocess_start = time.perf_counter()
         query_heads = self._split_heads(query).contiguous()
         key_heads = self._split_heads(key).permute(2, 1, 0).contiguous()
         value_heads = self._split_heads(value).contiguous()
+        host_preprocess_end = time.perf_counter()
+        operator_runlist_start = time.perf_counter()
         attn_scores = self.attn_scores(query_heads, key_heads)
         attn_scores = self.attn_scale(attn_scores.unsqueeze(0)).squeeze(0)
         attn_probs = self.attn_softmax(
@@ -302,6 +308,8 @@ class OperatorRunlistPattern(nn.Module):
             )
         )
         attention_output = self.out_proj(attn_context)
+        operator_runlist_after_attention = time.perf_counter()
+        host_postprocess_start = operator_runlist_after_attention
         attention_output = _layer_norm_no_bias(
             self.add1(
                 attention_output.view(1, -1),
@@ -310,9 +318,13 @@ class OperatorRunlistPattern(nn.Module):
             self.ln1_weight,
             self.spec.layer_norm_eps,
         )
+        host_after_ln1 = time.perf_counter()
+        operator_runlist_resume_start = host_after_ln1
         ffn_hidden = self.ffn_up(attention_output)
         ffn_hidden = self.gelu(ffn_hidden)
         ffn_output = self.ffn_down(ffn_hidden)
+        operator_runlist_end = time.perf_counter()
+        host_postprocess_resume_start = operator_runlist_end
         output = _layer_norm_no_bias(
             self.add2(
                 ffn_output.view(1, -1),
@@ -321,10 +333,52 @@ class OperatorRunlistPattern(nn.Module):
             self.ln2_weight,
             self.spec.layer_norm_eps,
         ).unsqueeze(0)
-        end = time.perf_counter()
+        host_postprocess_end = time.perf_counter()
         return output, {
-            "qkv_projection_sec": qkv_end - start,
-            "pattern_sec": end - start,
+            "qkv_projection_sec": qkv_end - qkv_start,
+            "host_preprocess_sec": host_preprocess_end - host_preprocess_start,
+            "operator_runlist_sec": (
+                (operator_runlist_after_attention - operator_runlist_start)
+                + (operator_runlist_end - operator_runlist_resume_start)
+            ),
+            "host_postprocess_sec": (
+                (host_after_ln1 - host_postprocess_start)
+                + (host_postprocess_end - host_postprocess_resume_start)
+            ),
+            "device_sync_sec": 0.0,
+        }
+
+    def get_benchmark_metadata(self) -> dict[str, object]:
+        ops = [
+            self.query_proj,
+            self.key_proj,
+            self.value_proj,
+            self.attn_scores,
+            self.attn_scale,
+            self.attn_softmax,
+            self.attn_output,
+            self.out_proj,
+            self.add1,
+            self.ffn_up,
+            self.gelu,
+            self.ffn_down,
+            self.add2,
+        ]
+        unique_insts = {
+            str(op.insts_artifact.path)
+            for op in ops
+            if getattr(op, "insts_artifact", None) is not None
+        }
+        return {
+            "compile_setup_time_ms": (
+                None
+                if self.compile_setup_time_sec is None
+                else self.compile_setup_time_sec * 1000.0
+            ),
+            "npu_dispatch_count": sum(len(op.runlist) for op in ops),
+            "npu_unique_instruction_binary_count": len(unique_insts),
+            "process_model": "in_process",
+            "stability_retry_count": 0,
         }
 
     def forward(

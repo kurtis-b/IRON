@@ -42,6 +42,35 @@ SUPPORTED_EXECUTION_MODES = (
 )
 
 
+def _run_pattern_with_stage_timings(pattern, hidden_states):
+    if hasattr(pattern, "forward_with_stage_timings"):
+        return pattern.forward_with_stage_timings(hidden_states)
+    start = time.perf_counter()
+    output = pattern(hidden_states)
+    end = time.perf_counter()
+    return output, {"pattern_sec": end - start}
+
+
+def _average_stage_timings_ms(
+    stage_sums_sec: dict[str, float], measured_inference_count: int
+) -> dict[str, float]:
+    if measured_inference_count <= 0:
+        return {}
+    row = {}
+    for stage_name, total_sec in stage_sums_sec.items():
+        if not stage_name.endswith("_sec"):
+            continue
+        metric_name = f"avg_{stage_name.removesuffix('_sec')}_latency_ms"
+        row[metric_name] = (total_sec / measured_inference_count) * 1000.0
+    return row
+
+
+def _pattern_metadata(pattern) -> dict[str, object]:
+    if hasattr(pattern, "get_benchmark_metadata"):
+        return pattern.get_benchmark_metadata()
+    return {}
+
+
 def build_pattern(execution_mode: str, spec: TransformerLayerSpec):
     if execution_mode == "encoder_pipeline":
         return EncoderPipelinePattern(spec)
@@ -71,11 +100,16 @@ def benchmark_pattern(
         pattern(hidden_states)
 
     latencies = []
+    stage_sums_sec: dict[str, float] = {}
     with create_power_monitor() as power_stats:
         for _ in range(runs_per_sample):
             start = time.perf_counter()
-            pattern(hidden_states)
+            _, stage_timings = _run_pattern_with_stage_timings(pattern, hidden_states)
             latencies.append(time.perf_counter() - start)
+            for stage_name, stage_sec in stage_timings.items():
+                stage_sums_sec[stage_name] = stage_sums_sec.get(
+                    stage_name, 0.0
+                ) + float(stage_sec)
 
     summary = summarize_latency_measurements(latencies)
     estimated_flops = estimate_layer_flops(spec)
@@ -99,6 +133,10 @@ def benchmark_pattern(
         "source_layer_index": spec.source_layer_index,
         "warmup_runs": warmup_runs,
         "runs_per_sample": runs_per_sample,
+        **_average_stage_timings_ms(
+            stage_sums_sec,
+            summary["measured_inference_count"],
+        ),
         "throughput_flops_per_sec": throughput_flops_per_sec,
         "estimated_flops_per_inference": estimated_flops,
         "estimated_bytes_per_inference": estimated_bytes,
@@ -111,6 +149,7 @@ def benchmark_pattern(
         "backend_pct_of_peak": None,
         "roofline_pct": None,
         **summary,
+        **_pattern_metadata(pattern),
         **(power_stats if power_stats is not None else empty_power_stats()),
     }
     if write_immediately:

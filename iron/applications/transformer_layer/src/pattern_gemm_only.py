@@ -58,6 +58,7 @@ class GemmOnlyPattern(nn.Module):
         self.context = AIEContext(use_runlist=False)
         self._runtime_ready = False
         self._weights_assigned = False
+        self.compile_setup_time_sec: float | None = None
         self.qkv_proj = AIEGEMM(
             M=spec.seq_len,
             K=hidden,
@@ -118,8 +119,10 @@ class GemmOnlyPattern(nn.Module):
             return
         if not self._weights_assigned:
             raise RuntimeError("assign_weights() must be called before execution")
+        start = time.perf_counter()
         self.context.compile_all()
         self.context.prepare_runtime()
+        self.compile_setup_time_sec = time.perf_counter() - start
         self._runtime_ready = True
 
     def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
@@ -178,15 +181,18 @@ class GemmOnlyPattern(nn.Module):
         self._prepare_runtime()
 
         hidden_states = hidden_states.squeeze(0).to(self.spec.torch_dtype)
-        start = time.perf_counter()
+        qkv_start = time.perf_counter()
         qkv = self.qkv_proj(hidden_states)
         query, key, value = qkv.split(self.spec.hidden_size, dim=-1)
         qkv_end = time.perf_counter()
 
+        host_preprocess_start = time.perf_counter()
         query_heads = self._split_heads(query).permute(1, 0, 2).contiguous()
         key_heads = self._split_heads(key).permute(1, 2, 0).contiguous()
         value_heads = self._split_heads(value).permute(1, 0, 2).contiguous()
+        host_preprocess_end = time.perf_counter()
 
+        npu_gemm_start = time.perf_counter()
         attn_scores = torch.stack(
             [
                 self.attn_scores(query_heads[h], key_heads[h])
@@ -194,9 +200,13 @@ class GemmOnlyPattern(nn.Module):
             ],
             dim=0,
         )
+        npu_gemm_after_scores = time.perf_counter()
+        host_softmax_start = npu_gemm_after_scores
         attn_probs = torch.softmax(
             attn_scores.to(torch.float32) * self.scale, dim=-1
         ).to(self.spec.torch_dtype)
+        host_softmax_end = time.perf_counter()
+        npu_gemm_resume_start = host_softmax_end
         attn_context = (
             torch.stack(
                 [
@@ -209,22 +219,65 @@ class GemmOnlyPattern(nn.Module):
             .view(self.spec.seq_len, self.spec.hidden_size)
         )
         attention_output = self.out_proj(attn_context)
+        npu_gemm_after_attention = time.perf_counter()
+        host_postprocess_start = npu_gemm_after_attention
         attention_output = _layer_norm_no_bias(
             attention_output + hidden_states,
             self.ln1_weight,
             self.spec.layer_norm_eps,
         )
+        host_after_ln1 = time.perf_counter()
+        npu_gemm_ffn_start = host_after_ln1
         ffn_up = self.ffn_up(attention_output)
         ffn_down = self.ffn_down(F.gelu(ffn_up))
+        npu_gemm_end = time.perf_counter()
+        host_postprocess_resume_start = npu_gemm_end
         output = _layer_norm_no_bias(
             ffn_down + attention_output,
             self.ln2_weight,
             self.spec.layer_norm_eps,
         ).unsqueeze(0)
-        end = time.perf_counter()
+        host_postprocess_end = time.perf_counter()
         return output, {
-            "qkv_projection_sec": qkv_end - start,
-            "pattern_sec": end - start,
+            "qkv_projection_sec": qkv_end - qkv_start,
+            "host_preprocess_sec": host_preprocess_end - host_preprocess_start,
+            "npu_gemm_sec": (
+                (npu_gemm_after_scores - npu_gemm_start)
+                + (npu_gemm_after_attention - npu_gemm_resume_start)
+                + (npu_gemm_end - npu_gemm_ffn_start)
+            ),
+            "host_postprocess_sec": (
+                (host_softmax_end - host_softmax_start)
+                + (host_after_ln1 - host_postprocess_start)
+                + (host_postprocess_end - host_postprocess_resume_start)
+            ),
+            "device_sync_sec": 0.0,
+        }
+
+    def get_benchmark_metadata(self) -> dict[str, object]:
+        gemm_ops = [
+            self.qkv_proj,
+            self.attn_scores,
+            self.attn_output,
+            self.out_proj,
+            self.ffn_up,
+            self.ffn_down,
+        ]
+        unique_insts = {
+            str(op.insts_artifact.path)
+            for op in gemm_ops
+            if getattr(op, "insts_artifact", None) is not None
+        }
+        return {
+            "compile_setup_time_ms": (
+                None
+                if self.compile_setup_time_sec is None
+                else self.compile_setup_time_sec * 1000.0
+            ),
+            "npu_dispatch_count": (2 * self.spec.num_attention_heads) + 4,
+            "npu_unique_instruction_binary_count": len(unique_insts),
+            "process_model": "in_process",
+            "stability_retry_count": 0,
         }
 
     def forward(

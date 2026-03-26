@@ -22,3 +22,9 @@ Phase 4 roofline workflow:
 1. Create or update [peak_reference.py](/home/cj/iron/iron/applications/transformer_layer/peak_reference.py) artifacts with [calibrate_backend_peaks.py](/home/cj/iron/iron/applications/transformer_layer/calibrate_backend_peaks.py).
 2. Run a manifest-driven suite with [automated_benchmark.py](/home/cj/iron/iron/applications/transformer_layer/automated_benchmark.py).
 3. Either let the manifest write an annotated CSV automatically, or post-process the suite with [annotate_roofline.py](/home/cj/iron/iron/applications/transformer_layer/annotate_roofline.py).
+
+Phase 5 bottleneck workflow:
+
+1. Run a normal suite so each row includes stage-level timing and pattern metadata.
+2. Post-process the suite with [analyze_design_pattern_bottlenecks.py](/home/cj/iron/iron/applications/transformer_layer/analyze_design_pattern_bottlenecks.py).
+3. Use the emitted CSV/JSON/text outputs as the basis for thesis bottleneck discussion.

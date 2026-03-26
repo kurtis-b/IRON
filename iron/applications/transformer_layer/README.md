@@ -45,3 +45,13 @@ python -m iron.applications.transformer_layer.annotate_roofline \
   --peak-reference iron/applications/transformer_layer/config/peak_references.json \
   --output-csv iron/applications/transformer_layer/results/design_patterns_main_annotated.csv
 ```
+
+To generate pattern-specific bottleneck summaries from a suite CSV:
+
+```bash
+python -m iron.applications.transformer_layer.analyze_design_pattern_bottlenecks \
+  --input-csv iron/applications/transformer_layer/results/design_patterns_main_annotated.csv \
+  --summary-csv iron/applications/transformer_layer/results/design_patterns_main_bottlenecks.csv \
+  --summary-json iron/applications/transformer_layer/results/design_patterns_main_bottlenecks.json \
+  --summary-text iron/applications/transformer_layer/results/design_patterns_main_bottlenecks.txt
+```

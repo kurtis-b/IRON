@@ -19,6 +19,21 @@ class _FakePattern:
     def assign_weights(self, weights):
         self.weights = weights
 
+    def forward_with_stage_timings(self, hidden_states):
+        return hidden_states, {
+            "qkv_projection_sec": 0.001,
+            "encoder_pipeline_sec": 0.002,
+        }
+
+    def get_benchmark_metadata(self):
+        return {
+            "compile_setup_time_ms": 12.5,
+            "npu_dispatch_count": 1,
+            "npu_unique_instruction_binary_count": 1,
+            "process_model": "in_process",
+            "stability_retry_count": 0,
+        }
+
     def __call__(self, hidden_states):
         return hidden_states
 
@@ -78,4 +93,8 @@ def test_benchmark_pattern_emits_expected_schema(monkeypatch, tmp_path):
     assert row["backend"] == "npu"
     assert row["throughput_flops_per_sec"] is not None
     assert row["measured_inference_count"] == 2
+    assert row["avg_qkv_projection_latency_ms"] == pytest.approx(1.0)
+    assert row["avg_encoder_pipeline_latency_ms"] == pytest.approx(2.0)
+    assert row["compile_setup_time_ms"] == 12.5
+    assert row["npu_dispatch_count"] == 1
     assert output_csv.exists()
