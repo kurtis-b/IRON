@@ -370,6 +370,31 @@ def test_runtime_reuses_attention_score_buffer_for_softmax_output():
     )
 
 
+def test_runtime_keeps_live_source_buffers_distinct(aie_context):
+    golden_ref = generate_golden_reference(64, 768, 3072, 12)
+
+    operator = AIEEncoderRunlist(
+        seq_len=64,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_heads=12,
+        ln1_weight=golden_ref["weights"]["ln1_weight"],
+        ln2_weight=golden_ref["weights"]["ln2_weight"],
+        context=aie_context,
+    )
+    operator.attn_output_weight = golden_ref["weights"]["attn_output_weight"]
+    operator.ffn_up_weight = golden_ref["weights"]["ffn_up_weight"]
+    operator.ffn_down_weight = golden_ref["weights"]["ffn_down_weight"]
+
+    aie_context.compile_all()
+    aie_context.prepare_runtime()
+
+    assert len({id(operator.buffer_bos[name]) for name in ("Q", "K", "V", "R")}) == 4
+    assert operator.buffer_bos["Q"] is not operator.buffer_bos["attn_scores_output"]
+    assert operator.buffer_bos["V"] is not operator.buffer_bos["attn_scores_output"]
+    assert operator.buffer_bos["R"] is not operator.buffer_bos["output_proj_output"]
+
+
 def test_encoder_runlist_defaults_to_eager_kernel_loading():
     class DummyContext:
         def __init__(self):

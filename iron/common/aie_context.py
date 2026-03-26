@@ -116,41 +116,41 @@ class AIEContext:
                 for arg in args:
                     buffer_to_runlist_entries.setdefault(arg, set()).add(idx)
 
-            # Second pass: determine conflicts
-            for idx, (kernel, *args) in enumerate(op.runlist):
-                for arg in args:
-                    if arg in op.buffer_static_data:
-                        # Static buffers never conflict
+            producer_entry = {}
+            for idx, (_, *args) in enumerate(op.runlist):
+                if not args:
+                    continue
+                output_buffer = args[-1]
+                if (
+                    output_buffer in op.buffers
+                    and output_buffer not in op.buffer_static_data
+                ):
+                    producer_entry.setdefault(output_buffer, idx)
+
+            live_ranges = {}
+            for buffer_name in buffer_to_runlist_entries:
+                if buffer_name in op.buffer_static_data:
+                    continue
+                if buffer_name not in op.buffers:
+                    continue
+                start_idx = producer_entry.get(buffer_name, -1)
+                end_idx = max(buffer_to_runlist_entries[buffer_name])
+                live_ranges[buffer_name] = (start_idx, end_idx)
+
+            # Buffers with overlapping lifetimes cannot share the same BO.
+            # Host-written source buffers use start_idx=-1 so they remain live
+            # from the beginning of the run until their last consuming kernel.
+            live_range_items = list(live_ranges.items())
+            for i, (buffer_name, (start_idx, end_idx)) in enumerate(live_range_items):
+                pool_sz = get_pool_sz(op.buffers[buffer_name])
+                conflicts = conflicting_buffers.setdefault(buffer_name, set())
+                for other_name, (other_start, other_end) in live_range_items[i + 1 :]:
+                    if get_pool_sz(op.buffers[other_name]) != pool_sz:
                         continue
-                    pool_sz = get_pool_sz(op.buffers[arg])
-
-                    # Buffers conflict if they're in the same runlist entry
-                    conflicting_args = {
-                        a for a in args if get_pool_sz(op.buffers[a]) == pool_sz
-                    } - {arg}
-
-                    # Also conflict with buffers in other runlist entries that share
-                    # a buffer with this entry
-                    for other_arg in args:
-                        if other_arg == arg:
-                            continue
-                        for other_idx in buffer_to_runlist_entries.get(
-                            other_arg, set()
-                        ):
-                            if other_idx != idx:
-                                _, *other_args = op.runlist[other_idx]
-                                conflicting_args.update(
-                                    {
-                                        a
-                                        for a in other_args
-                                        if get_pool_sz(op.buffers[a]) == pool_sz
-                                        and a != arg
-                                    }
-                                )
-
-                    conflicting_buffers[arg] = conflicting_buffers.get(
-                        arg, set()
-                    ).union(conflicting_args)
+                    if end_idx < other_start or other_end < start_idx:
+                        continue
+                    conflicts.add(other_name)
+                    conflicting_buffers.setdefault(other_name, set()).add(buffer_name)
 
             # Allocate buffers
             buffer_allocations = {}
