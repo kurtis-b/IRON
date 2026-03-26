@@ -98,6 +98,30 @@ class AIEEncoderRunlist(AIEOperatorBase):
         return cls._resolve_short_seq_tile(seq_len, scale_factor=8)
 
     @classmethod
+    def _resolve_seq_gemm_tile_m(cls, seq_len):
+        if seq_len >= 16384:
+            return 16
+        return cls._resolve_short_seq_gemm_tile_m(seq_len)
+
+    @staticmethod
+    def _resolve_query_block_size(seq_len):
+        if seq_len >= 16384:
+            return 1024
+        return seq_len
+
+    def _runtime_rows(self):
+        return self.query_block_size if self.uses_query_blocking else self.seq_len
+
+    def _runtime_act_size(self):
+        return self._runtime_rows() * self.hidden_size
+
+    def _runtime_ffn_size(self):
+        return self._runtime_rows() * self.intermediate_size
+
+    def _runtime_attn_size(self):
+        return self._runtime_rows() * self.seq_len * self.num_heads
+
+    @classmethod
     def _resolve_attn_scores_tile_n(cls, seq_len, num_aie_columns):
         return cls._resolve_short_seq_tile(seq_len, scale_factor=num_aie_columns)
 
@@ -160,6 +184,31 @@ class AIEEncoderRunlist(AIEOperatorBase):
             f"hidden_size={self.hidden_size}, intermediate_size={self.intermediate_size}"
         )
 
+    def _resolve_k_transpose_layout(self):
+        projection_tiling = self._resolve_projection_tiling()
+        tile_rows = 64
+        tile_cols = projection_tiling["transpose_n"]
+        num_aie_columns = self.num_aie_columns
+
+        if self.seq_len >= 16384:
+            tile_rows = 128
+            tile_cols = 64
+            num_aie_columns = max(
+                candidate
+                for candidate in range(self.num_aie_columns, 0, -1)
+                if self.hidden_size % (candidate * tile_cols) == 0
+            )
+
+        num_channels = self._resolve_k_transpose_num_channels(self.seq_len, tile_rows)
+
+        return {
+            "tile_rows": tile_rows,
+            "tile_cols": tile_cols,
+            "tile_shuffle": 8,
+            "num_aie_columns": num_aie_columns,
+            "num_channels": num_channels,
+        }
+
     @staticmethod
     def _normalize_qkv_tensor(
         tensor: torch.Tensor,
@@ -216,6 +265,8 @@ class AIEEncoderRunlist(AIEOperatorBase):
 
         # Derived dimensions
         self.head_dim = hidden_size // num_heads
+        self.query_block_size = self._resolve_query_block_size(self.seq_len)
+        self.uses_query_blocking = self.query_block_size < self.seq_len
 
         # Weights to be set by user
         self.attn_output_weight = None
@@ -245,9 +296,8 @@ class AIEEncoderRunlist(AIEOperatorBase):
             self.mha_xclbin = None
             self.mha_insts = None
         else:
-            self.k_transpose_num_channels = self._resolve_k_transpose_num_channels(
-                self.seq_len, 64
-            )
+            self.k_transpose_layout = self._resolve_k_transpose_layout()
+            self.k_transpose_num_channels = self.k_transpose_layout["num_channels"]
             self.k_transpose_xclbin = None
             self.k_transpose_insts = None
             self.attn_scores_xclbin = None
@@ -575,7 +625,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
         names: tuple[str, ...] | list[str] | None = None,
     ) -> dict[str, object]:
         requested_names = self._normalize_component_names(names)
-        short_seq_tile_m = self._resolve_short_seq_gemm_tile_m(self.seq_len)
+        seq_gemm_tile_m = self._resolve_seq_gemm_tile_m(self.seq_len)
         attn_scores_tile_n = self._resolve_attn_scores_tile_n(
             self.seq_len, self.num_aie_columns
         )
@@ -596,11 +646,11 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 operators[name] = AIETranspose(
                     M=self.seq_len,
                     N=self.hidden_size,
-                    num_aie_columns=self.num_aie_columns,
-                    num_channels=self.k_transpose_num_channels,
-                    m=64,
-                    n=projection_tiling["transpose_n"],
-                    s=8,
+                    num_aie_columns=self.k_transpose_layout["num_aie_columns"],
+                    num_channels=self.k_transpose_layout["num_channels"],
+                    m=self.k_transpose_layout["tile_rows"],
+                    n=self.k_transpose_layout["tile_cols"],
+                    s=self.k_transpose_layout["tile_shuffle"],
                     context=context,
                 )
             elif name == "attn_scores":
@@ -608,7 +658,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                     M=self.seq_len,
                     K=self.head_dim,
                     N=self.seq_len,
-                    tile_m=short_seq_tile_m,
+                    tile_m=seq_gemm_tile_m,
                     tile_k=64,
                     tile_n=attn_scores_tile_n,
                     num_aie_columns=self.num_aie_columns,
@@ -644,7 +694,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                     M=self.seq_len,
                     K=self.seq_len,
                     N=self.head_dim,
-                    tile_m=short_seq_tile_m,
+                    tile_m=seq_gemm_tile_m,
                     tile_k=64,
                     tile_n=8,
                     num_aie_columns=8,
@@ -661,7 +711,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                     K=self.hidden_size,
                     N=self.hidden_size,
                     use_static_weight=True,
-                    tile_m=short_seq_tile_m,
+                    tile_m=seq_gemm_tile_m,
                     tile_k=projection_tiling["out_proj_tile_k"],
                     tile_n=projection_tiling["out_proj_tile_n"],
                     num_aie_columns=self.num_aie_columns,
@@ -696,7 +746,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                     K=self.hidden_size,
                     N=self.intermediate_size,
                     use_static_weight=True,
-                    tile_m=short_seq_tile_m,
+                    tile_m=seq_gemm_tile_m,
                     tile_k=projection_tiling["up_proj_tile_k"],
                     tile_n=projection_tiling["up_proj_tile_n"],
                     num_aie_columns=self.num_aie_columns,
@@ -719,7 +769,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                     K=self.intermediate_size,
                     N=self.hidden_size,
                     use_static_weight=True,
-                    tile_m=short_seq_tile_m,
+                    tile_m=seq_gemm_tile_m,
                     tile_k=projection_tiling["down_proj_tile_k"],
                     tile_n=projection_tiling["down_proj_tile_n"],
                     num_aie_columns=self.num_aie_columns,
@@ -743,7 +793,6 @@ class AIEEncoderRunlist(AIEOperatorBase):
         """Set up artifacts for the encoder runlist using 13 individual stages."""
         self.component_artifacts = {}
         artifacts = []
-        device_str = self.context.device_manager.device_str()
 
         kernel_id = 0x801
 
@@ -760,17 +809,20 @@ class AIEEncoderRunlist(AIEOperatorBase):
             )
 
         prefix_base = "encoder_runlist_qkvr_"
-        short_seq_tile_m = self._resolve_short_seq_gemm_tile_m(self.seq_len)
+        seq_gemm_tile_m = self._resolve_seq_gemm_tile_m(self.seq_len)
         attn_scores_tile_n = self._resolve_attn_scores_tile_n(
             self.seq_len, self.num_aie_columns
         )
         projection_tiling = self._resolve_projection_tiling()
+        runtime_rows = self._runtime_rows()
+        runtime_act_size = self._runtime_act_size()
+        runtime_ffn_size = self._runtime_ffn_size()
         # Output projection kernel
         out_proj = AIEGEMM(  # L1 utilization = 54 KB with double buffering
-            M=self.seq_len,
+            M=runtime_rows,
             K=self.hidden_size,
             N=self.hidden_size,
-            tile_m=short_seq_tile_m,
+            tile_m=seq_gemm_tile_m,
             tile_k=projection_tiling["out_proj_tile_k"],
             tile_n=projection_tiling["out_proj_tile_n"],
             num_aie_columns=self.num_aie_columns,
@@ -812,11 +864,11 @@ class AIEEncoderRunlist(AIEOperatorBase):
             k_transpose = AIETranspose(
                 M=self.seq_len,
                 N=self.hidden_size,
-                num_aie_columns=self.num_aie_columns,
-                num_channels=self.k_transpose_num_channels,
-                m=64,
-                n=projection_tiling["transpose_n"],
-                s=8,
+                num_aie_columns=self.k_transpose_layout["num_aie_columns"],
+                num_channels=self.k_transpose_layout["num_channels"],
+                m=self.k_transpose_layout["tile_rows"],
+                n=self.k_transpose_layout["tile_cols"],
+                s=self.k_transpose_layout["tile_shuffle"],
                 skip_add_to_list=True,
             )
             self.k_transpose_xclbin, self.k_transpose_insts = k_transpose.get_artifacts(
@@ -833,10 +885,10 @@ class AIEEncoderRunlist(AIEOperatorBase):
 
             # Attention score calculations (GEMM for Q*K^T, batched across heads)
             self.attn_scores_xclbin, self.attn_scores_insts = AIEGEMM(
-                M=self.seq_len,
+                M=runtime_rows,
                 K=self.head_dim,
                 N=self.seq_len,
-                tile_m=short_seq_tile_m,
+                tile_m=seq_gemm_tile_m,
                 tile_k=64,
                 tile_n=attn_scores_tile_n,
                 num_aie_columns=self.num_aie_columns,
@@ -861,7 +913,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
 
             # Attention score scaling (Multiplication per attention score)
             self.attn_scale_xclbin, self.attn_scale_insts = AIEElementwiseMul(
-                size=self.seq_len * self.seq_len * self.num_heads,
+                size=runtime_rows * self.seq_len * self.num_heads,
                 num_aie_columns=self.num_aie_columns,
                 num_channels=2,
                 tile_size=min(
@@ -882,7 +934,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
 
             # Attention weight calculations (Softmax per attention score)
             self.attn_softmax_xclbin, self.attn_softmax_insts = AIESoftmax(
-                rows=self.seq_len * self.num_heads,
+                rows=runtime_rows * self.num_heads,
                 cols=self.seq_len,
                 num_aie_columns=self.num_aie_columns,
                 num_channels=2,
@@ -900,10 +952,10 @@ class AIEEncoderRunlist(AIEOperatorBase):
 
             # Output head calculations (GEMM per attention weights/V heads, batched across heads)
             self.attn_output_xclbin, self.attn_output_insts = AIEGEMM(
-                M=self.seq_len,
+                M=runtime_rows,
                 K=self.seq_len,
                 N=self.head_dim,
-                tile_m=short_seq_tile_m,
+                tile_m=seq_gemm_tile_m,
                 tile_k=64,
                 tile_n=8,
                 num_aie_columns=8,
@@ -941,7 +993,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             }
             # Second Layer normalization kernel
             self.anffn_xclbin, self.anffn_insts = AIEFFNAN(
-                M=self.seq_len,
+                M=runtime_rows,
                 K=self.hidden_size,
                 N=self.intermediate_size,
                 tile_m=16,
@@ -969,7 +1021,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             if self.use_pip_addnorm:
                 # Pipelined add & norm kernel
                 self.add_norm1_xclbin, self.add_norm1_insts = AIEAddAndNorm(
-                    size=self.seq_len * self.hidden_size,
+                    size=runtime_act_size,
                     num_aie_columns=self.num_aie_columns,
                     tile_size=self.hidden_size,
                     weights=self.ln1_weight,
@@ -988,7 +1040,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             else:
                 # Residual connection kernel (Eltwise add)
                 self.add_xclbin, self.add_insts = AIEElementwiseAdd(
-                    size=self.seq_len * self.hidden_size,
+                    size=runtime_act_size,
                     num_aie_columns=self.num_aie_columns,
                     num_channels=2,
                     tile_size=min(
@@ -1009,7 +1061,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
 
                 # Layer normalization kernel
                 self.ln1_xclbin, self.ln1_insts = AIELayerNorm(
-                    size=self.seq_len * self.hidden_size,
+                    size=runtime_act_size,
                     tile_size=self.hidden_size,
                     num_aie_columns=self.num_aie_columns,
                     num_channels=2,
@@ -1037,7 +1089,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
                     "gelu_stage": 1,
                 }
                 self.ffn_xclbin, self.ffn_insts = AIEFFN(
-                    M=self.seq_len,
+                    M=runtime_rows,
                     K=self.hidden_size,
                     N=self.intermediate_size,
                     tile_m=64,
@@ -1062,10 +1114,10 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 # Up projection (GEMM with Up projection weight)
                 self.up_proj_xclbin, self.up_proj_insts = (
                     AIEGEMM(  # L1 utilization = 54 KB with double buffering
-                        M=self.seq_len,
+                        M=runtime_rows,
                         K=self.hidden_size,
                         N=self.intermediate_size,
-                        tile_m=short_seq_tile_m,
+                        tile_m=seq_gemm_tile_m,
                         tile_k=projection_tiling["up_proj_tile_k"],
                         tile_n=projection_tiling["up_proj_tile_n"],
                         num_aie_columns=self.num_aie_columns,
@@ -1086,7 +1138,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
 
                 # Activation function (GeLU)
                 self.gelu_xclbin, self.gelu_insts = AIEGELU(
-                    size=self.seq_len * self.intermediate_size,
+                    size=runtime_ffn_size,
                     num_aie_columns=self.num_aie_columns,
                     num_channels=2,
                     tile_size=min(math.gcd(4096, gelu_tile_size), gelu_tile_size),
@@ -1105,10 +1157,10 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 # Down projection (GEMM with Down projection weight)
                 self.down_proj_xclbin, self.down_proj_insts = (
                     AIEGEMM(  # L1 utilization = 54 KB with double buffering
-                        M=self.seq_len,
+                        M=runtime_rows,
                         K=self.intermediate_size,
                         N=self.hidden_size,
-                        tile_m=short_seq_tile_m,
+                        tile_m=seq_gemm_tile_m,
                         tile_k=projection_tiling["down_proj_tile_k"],
                         tile_n=projection_tiling["down_proj_tile_n"],
                         num_aie_columns=self.num_aie_columns,
@@ -1130,7 +1182,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             if self.use_pip_addnorm:
                 # Second Pipelined add & norm kernel
                 self.add_norm2_xclbin, self.add_norm2_insts = AIEAddAndNorm(
-                    size=self.seq_len * self.hidden_size,
+                    size=runtime_act_size,
                     num_aie_columns=self.num_aie_columns,
                     tile_size=self.hidden_size,
                     weights=self.ln2_weight,
@@ -1152,7 +1204,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             else:
                 # Second Layer normalization kernel
                 self.ln2_xclbin, self.ln2_insts = AIELayerNorm(
-                    size=self.seq_len * self.hidden_size,
+                    size=runtime_act_size,
                     tile_size=self.hidden_size,
                     num_aie_columns=self.num_aie_columns,
                     num_channels=2,
@@ -1313,12 +1365,16 @@ class AIEEncoderRunlist(AIEOperatorBase):
     def set_up_runtime(self):
         """Set up runtime buffers and kernels for all 13 layers."""
         act_size = self.seq_len * self.hidden_size
+        runtime_rows = self._runtime_rows()
+        runtime_act_size = self._runtime_act_size()
+        runtime_ffn_size = self._runtime_ffn_size()
+        runtime_attn_size = self._runtime_attn_size()
 
         # Post-projection activations and residual input
-        self.add_buffer("Q", act_size)
+        self.add_buffer("Q", runtime_act_size)
         self.add_buffer("K", act_size)
         self.add_buffer("V", act_size)
-        self.add_buffer("R", act_size)
+        self.add_buffer("R", runtime_act_size)
 
         # Weight buffers
         self.add_buffer(
@@ -1357,48 +1413,46 @@ class AIEEncoderRunlist(AIEOperatorBase):
 
         # Intermediate buffers for all layers
         if self.use_pip_mha:
-            self.add_buffer("mha_output", act_size)  # After layer 5
+            self.add_buffer("mha_output", runtime_act_size)  # After layer 5
         else:
             # Keep K^T on a distinct BO. It stays live across the score/softmax
             # path while V must remain intact until the later attention-output
             # GEMM, so these same-sized buffers cannot share an allocation.
             self.add_buffer("k_transposed", act_size + 1)  # After K transpose
-            self.add_buffer(
-                "attn_scores_output", self.seq_len * self.seq_len * self.num_heads
-            )  # After layer 2
-            self.add_buffer(
-                "attn_scaled_output", self.seq_len * self.seq_len * self.num_heads
-            )  # After layer 3
-            self.add_buffer(
-                "attn_weights_output", self.seq_len * self.seq_len * self.num_heads
-            )  # After layer 4
-            # Reuse the attention-score BO once the scaling stage has completed.
-            # This trims one of the three large seq_len^2 attention buffers
-            # without changing the operator boundary or full-pattern output.
-            self.buffer_aliases["attn_weights_output"] = "attn_scores_output"
-            self.add_buffer("attn_heads_output", act_size)  # After layer 5
-        self.add_buffer("output_proj_output", act_size)  # After layer 6
+            self.add_buffer("attn_scores_output", runtime_attn_size)  # After layer 2
+            self.add_buffer("attn_scaled_output", runtime_attn_size)  # After layer 3
+            self.add_buffer("attn_weights_output", runtime_attn_size)  # After layer 4
+            # Query-blocked long-sequence execution keeps one query block live at
+            # a time. Within that block, reuse the attention-score BO across the
+            # score/scale/softmax path to further reduce host BO pressure.
+            if self.seq_len >= 16384:
+                self.buffer_aliases["attn_scaled_output"] = "attn_scores_output"
+                self.buffer_aliases["attn_weights_output"] = "attn_scores_output"
+            else:
+                self.buffer_aliases["attn_weights_output"] = "attn_scores_output"
+            self.add_buffer("attn_heads_output", runtime_act_size)  # After layer 5
+        self.add_buffer("output_proj_output", runtime_act_size)  # After layer 6
         if not self.use_pip_an_ffn:
             if self.use_pip_addnorm:
-                self.add_buffer("add_norm1_output", act_size)  # After layer 7
+                self.add_buffer("add_norm1_output", runtime_act_size)  # After layer 7
             else:
-                self.add_buffer("ln1_norm_output", act_size)  # After residual add 1
-                self.add_buffer("ln1_output", act_size)  # After layer norm 1
+                self.add_buffer(
+                    "ln1_norm_output", runtime_act_size
+                )  # After residual add 1
+                self.add_buffer("ln1_output", runtime_act_size)  # After layer norm 1
             if self.use_pip_ffn:
-                self.add_buffer("ffn_output", act_size)  # After layer 9-12
+                self.add_buffer("ffn_output", runtime_act_size)  # After layer 9-12
             else:
-                self.add_buffer(
-                    "up_proj_output", self.seq_len * self.intermediate_size
-                )  # After layer 9
-                self.add_buffer(
-                    "gelu_output", self.seq_len * self.intermediate_size
-                )  # After layer 10
-                self.add_buffer("down_proj_output", act_size)  # After layer 11
+                self.add_buffer("up_proj_output", runtime_ffn_size)  # After layer 9
+                self.add_buffer("gelu_output", runtime_ffn_size)  # After layer 10
+                self.add_buffer("down_proj_output", runtime_act_size)  # After layer 11
             if not self.use_pip_addnorm:
-                self.add_buffer("ln2_norm_output", act_size)  # After residual add 2
+                self.add_buffer(
+                    "ln2_norm_output", runtime_act_size
+                )  # After residual add 2
 
         # Output buffer
-        self.add_buffer("output", act_size)
+        self.add_buffer("output", runtime_act_size)
         logging.info(
             f"Finished setting up {len(self.buffers)} encoder runlist runtime buffers."
         )
@@ -1674,30 +1728,63 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 f"{expected_shape}; got shape={tuple(residual.shape)}"
             )
 
+        uses_query_blocking = getattr(self, "uses_query_blocking", False)
+        query_block_size = getattr(self, "query_block_size", self.seq_len)
+        expected_size = self.seq_len * self.hidden_size
+
         # Flatten inputs for AIE processing
-        q_flat = q_matrix.view(-1)
         k_flat = k_matrix.view(-1)
         v_flat = v_matrix.view(-1)
-        residual_flat = residual.view(-1)
-
-        # Verify input size matches expected dimensions
-        expected_size = self.seq_len * self.hidden_size
-        assert q_flat.shape[0] == expected_size
         assert k_flat.shape[0] == expected_size
         assert v_flat.shape[0] == expected_size
-        assert residual_flat.shape[0] == expected_size
 
         if not self.use_static_runtime_weights:
             self.write_runtime_weights()
-        self.write_buffer("Q", q_flat)
         self.write_buffer("K", k_flat)
         self.write_buffer("V", v_flat)
-        self.write_buffer("R", residual_flat)
-        self.run_runlist()
-        result = self.read_buffer_as_torch(
-            "output",
-            (self.seq_len, self.hidden_size),
-            dtype=bfloat16,
-        ).view(expected_shape)
 
-        return result
+        if not uses_query_blocking:
+            q_flat = q_matrix.view(-1)
+            residual_flat = residual.view(-1)
+            # Verify input size matches expected dimensions
+            assert q_flat.shape[0] == expected_size
+            assert residual_flat.shape[0] == expected_size
+            self.write_buffer("Q", q_flat)
+            self.write_buffer("R", residual_flat)
+            self.run_runlist()
+            return self.read_buffer_as_torch(
+                "output",
+                (self.seq_len, self.hidden_size),
+                dtype=bfloat16,
+            ).view(expected_shape)
+
+        block_outputs = []
+        for block_start in range(0, self.seq_len, query_block_size):
+            block_end = min(block_start + query_block_size, self.seq_len)
+            current_rows = block_end - block_start
+            q_block = q_matrix[block_start:block_end]
+            residual_block = residual[block_start:block_end]
+            # Runtime buffers are sized for the fixed query-block shape used to
+            # compile the long-sequence path, so pad only the final short block.
+            if current_rows != query_block_size:
+                q_storage = q_matrix.new_zeros((query_block_size, self.hidden_size))
+                residual_storage = residual.new_zeros(
+                    (query_block_size, self.hidden_size)
+                )
+                q_storage[:current_rows] = q_block
+                residual_storage[:current_rows] = residual_block
+            else:
+                q_storage = q_block.contiguous()
+                residual_storage = residual_block.contiguous()
+
+            self.write_buffer("Q", q_storage.view(-1))
+            self.write_buffer("R", residual_storage.view(-1))
+            self.run_runlist()
+            block_output = self.read_buffer_as_torch(
+                "output",
+                (query_block_size, self.hidden_size),
+                dtype=bfloat16,
+            )
+            block_outputs.append(block_output[:current_rows].contiguous())
+
+        return torch.cat(block_outputs, dim=0).view(expected_shape)

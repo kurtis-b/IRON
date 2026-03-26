@@ -47,25 +47,10 @@ def benchmark_operator_runlist_request(request: dict[str, object]) -> dict[str, 
     layer_inputs = make_synthetic_layer_inputs(spec, seed=seed + 1)
     pattern.assign_weights(weights)
     pattern._prepare_runtime()
-    prepared = pattern.encoder_runlist.prepare_component_inputs(
-        layer_inputs.q.squeeze(0),
-        layer_inputs.k.squeeze(0),
-        layer_inputs.v.squeeze(0),
-        layer_inputs.r.squeeze(0),
-    )
 
     def _run_once() -> dict[str, float]:
-        for name, value in (
-            ("Q", prepared["q_matrix"]),
-            ("K", prepared["k_matrix"]),
-            ("V", prepared["v_matrix"]),
-            ("R", prepared["residual"]),
-        ):
-            pattern.encoder_runlist.write_buffer(name, value)
-        start = time.perf_counter()
-        pattern.encoder_runlist.run_runlist()
-        end = time.perf_counter()
-        return {"operator_runlist_sec": end - start}
+        _, stage_timings = pattern.forward_with_stage_timings(layer_inputs)
+        return stage_timings
 
     for _ in range(warmup_runs):
         _run_once()
