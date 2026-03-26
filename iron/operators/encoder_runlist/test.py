@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import csv
+import subprocess
 import sys
 import pytest
 import logging
@@ -31,12 +33,34 @@ SMOKE_PARAMS = [
     (128, 1024, 4096, 16),
     (512, 1024, 4096, 16),
 ]
+LONG_SEQ_EXEC_PARAMS = [
+    (1024, 768, 3072, 12),
+    (2048, 768, 3072, 12),
+    (4096, 768, 3072, 12),
+    (1024, 1024, 4096, 16),
+    (2048, 1024, 4096, 16),
+    (4096, 1024, 4096, 16),
+]
 BENCHMARK_PARAMS = [
     (512, 768, 3072, 12),
     (512, 1024, 4096, 16),
 ]
 
 smoke_params = _named_params(SMOKE_PARAMS, prefix="encoder_runlist_smoke")
+long_seq_exec_params = [
+    pytest.param(
+        *param_set,
+        marks=pytest.mark.extensive,
+        id=name,
+    )
+    for param_set, name in zip(
+        LONG_SEQ_EXEC_PARAMS,
+        [
+            f"encoder_runlist_long_seq_{seq_len}x{embedding_dim}x{ffn_dim}x{num_heads}"
+            for seq_len, embedding_dim, ffn_dim, num_heads in LONG_SEQ_EXEC_PARAMS
+        ],
+    )
+]
 benchmark_params = _named_params(
     BENCHMARK_PARAMS, prefix="encoder_runlist_non_pipelined"
 )
@@ -428,6 +452,54 @@ def test_encoder_runlist_smoke(
         f"Test failed with {len(output_errors)} errors "
         f"(max allowable: {max_acceptable_errors})"
     )
+
+
+@pytest.mark.parametrize(
+    "seq_len,embedding_dim,ffn_dim,num_heads",
+    long_seq_exec_params,
+)
+def test_encoder_runlist_long_seq_executes_via_npu_inference(
+    seq_len,
+    embedding_dim,
+    ffn_dim,
+    num_heads,
+    tmp_path,
+):
+    output_csv = tmp_path / f"encoder_runlist_{seq_len}_{embedding_dim}.csv"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "iron.applications.transformer_layer.npu_inference",
+            "--execution-mode",
+            "operator_runlist",
+            "--seq-len",
+            str(seq_len),
+            "--hidden-size",
+            str(embedding_dim),
+            "--intermediate-size",
+            str(ffn_dim),
+            "--num-attention-heads",
+            str(num_heads),
+            "--warmup-runs",
+            "0",
+            "--runs-per-sample",
+            "1",
+            "--output-csv",
+            str(output_csv),
+        ],
+        check=True,
+    )
+
+    with output_csv.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["execution_mode"] == "operator_runlist"
+    assert row["process_model"] == "child_process"
+    assert int(row["seq_len"]) == seq_len
+    assert float(row["avg_latency_ms"]) > 0.0
 
 
 @pytest.mark.metrics(
