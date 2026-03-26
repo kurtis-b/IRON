@@ -27,3 +27,12 @@ python iron/applications/transformer_layer/npu_inference.py \
   --warmup-runs 1 \
   --runs-per-sample 5
 ```
+
+For study-driven sweeps, use the checked-in manifests under [study](/home/cj/iron/iron/applications/transformer_layer/study):
+
+```bash
+source /opt/xilinx/xrt/setup.sh
+source ./ironenv/bin/activate
+python iron/applications/transformer_layer/automated_benchmark.py \
+  --study-manifest iron/applications/transformer_layer/study/design_patterns_main.json
+```

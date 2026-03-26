@@ -1,0 +1,38 @@
+{
+  "study_id": "design_patterns_main",
+  "description": "Primary NPU-only thesis sweep across the three single-layer design patterns.",
+  "layer_spec": {
+    "hidden_size": 768,
+    "intermediate_size": 3072,
+    "num_attention_heads": 12,
+    "batch_size": 1,
+    "seq_len": 128,
+    "dtype": "bfloat16",
+    "activation": "gelu",
+    "use_bias": false,
+    "layer_norm_eps": 1e-12,
+    "attention_mask_mode": "none",
+    "weights_source": "synthetic",
+    "source_model_name": null,
+    "source_layer_index": null
+  },
+  "execution_modes": [
+    "encoder_pipeline",
+    "gemm_only",
+    "operator_runlist"
+  ],
+  "seq_lens": [64, 128, 256, 512],
+  "warmup_runs": 5,
+  "runs_per_sample": 20,
+  "output_csv": "../results/design_patterns_main.csv",
+  "parity": {
+    "enabled": true,
+    "execution_modes": [
+      "encoder_pipeline",
+      "gemm_only",
+      "operator_runlist"
+    ],
+    "seq_lens": [64, 128],
+    "output_csv": "../results/design_patterns_main_parity.csv"
+  }
+}

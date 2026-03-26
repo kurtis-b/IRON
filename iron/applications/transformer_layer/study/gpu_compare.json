@@ -1,0 +1,6 @@
+{
+  "study_id": "gpu_compare",
+  "description": "Reserved manifest for the later NPU-versus-NVIDIA comparison phase.",
+  "deferred_until_phase": 7,
+  "reference_npu_study_manifest": "design_patterns_main.json"
+}

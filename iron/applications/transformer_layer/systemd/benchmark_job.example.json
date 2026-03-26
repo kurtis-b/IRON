@@ -1,0 +1,9 @@
+{
+  "study_manifest": "../study/design_patterns_main.json",
+  "output_csv": "../results/design_patterns_main.csv",
+  "run_parity_check": true,
+  "parity_output_csv": "../results/design_patterns_main_parity.csv",
+  "warmup_runs": 5,
+  "runs_per_sample": 20,
+  "seed": 0
+}
