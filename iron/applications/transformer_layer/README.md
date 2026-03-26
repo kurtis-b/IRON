@@ -15,3 +15,15 @@ The initial milestone in this branch is intentionally synthetic-first:
 - `iron/applications/bert/` remains donor code temporarily and will be removed later
 
 Use [npu_inference.py](/home/cj/iron/iron/applications/transformer_layer/npu_inference.py) to run the first synthetic layer benchmark path.
+
+Typical local workflow:
+
+```bash
+source /opt/xilinx/xrt/setup.sh
+source ./ironenv/bin/activate
+python iron/applications/transformer_layer/npu_inference.py \
+  --execution-mode encoder_pipeline \
+  --seq-len 64 \
+  --warmup-runs 1 \
+  --runs-per-sample 5
+```

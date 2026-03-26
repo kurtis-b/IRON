@@ -8,6 +8,7 @@ import time
 import torch
 import torch.nn as nn
 
+from iron.common import AIEContext
 from iron.operators.encoder_pipeline.op import AIEEncoderPipeline
 
 from .layer_spec import TransformerLayerSpec
@@ -28,6 +29,9 @@ class EncoderPipelinePattern(nn.Module):
         hidden = spec.hidden_size
         dtype = spec.torch_dtype
         self.spec = spec
+        self.context = AIEContext(use_runlist=True)
+        self._runtime_ready = False
+        self._weights_assigned = False
         self.q_proj = nn.Linear(hidden, hidden, bias=False, dtype=dtype)
         self.k_proj = nn.Linear(hidden, hidden, bias=False, dtype=dtype)
         self.v_proj = nn.Linear(hidden, hidden, bias=False, dtype=dtype)
@@ -48,9 +52,23 @@ class EncoderPipelinePattern(nn.Module):
             static_weights=True,
             ln1_weight=torch.ones(hidden, dtype=dtype),
             ln2_weight=torch.ones(hidden, dtype=dtype),
+            context=self.context,
         )
 
+    def _prepare_runtime(self) -> None:
+        if self._runtime_ready:
+            return
+        if not self._weights_assigned:
+            raise RuntimeError("assign_weights() must be called before execution")
+        self.context.compile_all()
+        self.context.prepare_runtime()
+        self._runtime_ready = True
+
     def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        if self._runtime_ready:
+            raise RuntimeError(
+                "assign_weights() after runtime preparation is not supported"
+            )
         require_keys(
             weights,
             [
@@ -73,6 +91,7 @@ class EncoderPipelinePattern(nn.Module):
         self.encoder_pipeline.weight_down_proj = weights["ffn_down_weight"].contiguous()
         self.encoder_pipeline.ln1_weight = weights["ln1_weight"].contiguous()
         self.encoder_pipeline.ln2_weight = weights["ln2_weight"].contiguous()
+        self._weights_assigned = True
 
     def forward_with_stage_timings(
         self,
@@ -87,6 +106,7 @@ class EncoderPipelinePattern(nn.Module):
             raise RuntimeError(
                 "encoder_pipeline thesis pattern currently supports batch_size=1"
             )
+        self._prepare_runtime()
 
         qkv_start = time.perf_counter()
         batch, seq_len, _ = hidden_states.shape

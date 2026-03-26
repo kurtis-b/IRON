@@ -67,6 +67,8 @@ class OperatorRunlistPattern(nn.Module):
 
         self.spec = spec
         self.context = AIEContext(use_runlist=True)
+        self._runtime_ready = False
+        self._weights_assigned = False
         self.query_proj = AIEGEMM(
             M=spec.seq_len,
             K=hidden,
@@ -210,7 +212,20 @@ class OperatorRunlistPattern(nn.Module):
             torch.ones(hidden, dtype=spec.torch_dtype), requires_grad=False
         )
 
+    def _prepare_runtime(self) -> None:
+        if self._runtime_ready:
+            return
+        if not self._weights_assigned:
+            raise RuntimeError("assign_weights() must be called before execution")
+        self.context.compile_all()
+        self.context.prepare_runtime()
+        self._runtime_ready = True
+
     def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        if self._runtime_ready:
+            raise RuntimeError(
+                "assign_weights() after runtime preparation is not supported"
+            )
         require_keys(
             weights,
             [
@@ -232,6 +247,7 @@ class OperatorRunlistPattern(nn.Module):
         self.ffn_down.weight = weights["ffn_down_weight"].contiguous()
         self.ln1_weight.data.copy_(weights["ln1_weight"])
         self.ln2_weight.data.copy_(weights["ln2_weight"])
+        self._weights_assigned = True
 
     def _split_heads(self, projected: torch.Tensor) -> torch.Tensor:
         return projected.view(
@@ -253,6 +269,7 @@ class OperatorRunlistPattern(nn.Module):
             raise RuntimeError(
                 "operator_runlist thesis pattern currently supports batch_size=1"
             )
+        self._prepare_runtime()
 
         hidden_states = hidden_states.squeeze(0).to(self.spec.torch_dtype)
         start = time.perf_counter()
@@ -261,12 +278,21 @@ class OperatorRunlistPattern(nn.Module):
         value = self.value_proj(hidden_states)
         qkv_end = time.perf_counter()
 
-        query_heads = self._split_heads(query).permute(1, 0, 2).contiguous()
-        key_heads = self._split_heads(key).permute(1, 2, 0).contiguous()
-        value_heads = self._split_heads(value).permute(1, 0, 2).contiguous()
+        query_heads = self._split_heads(query).contiguous()
+        key_heads = self._split_heads(key).permute(2, 1, 0).contiguous()
+        value_heads = self._split_heads(value).contiguous()
         attn_scores = self.attn_scores(query_heads, key_heads)
-        attn_scores = self.attn_scale(attn_scores)
-        attn_probs = self.attn_softmax(attn_scores)
+        attn_scores = self.attn_scale(attn_scores.unsqueeze(0)).squeeze(0)
+        attn_probs = self.attn_softmax(
+            attn_scores.reshape(
+                self.spec.num_attention_heads * self.spec.seq_len,
+                self.spec.seq_len,
+            )
+        ).view(
+            self.spec.num_attention_heads,
+            self.spec.seq_len,
+            self.spec.seq_len,
+        )
         attn_context = (
             self.attn_output(attn_probs, value_heads)
             .contiguous()
@@ -277,7 +303,10 @@ class OperatorRunlistPattern(nn.Module):
         )
         attention_output = self.out_proj(attn_context)
         attention_output = _layer_norm_no_bias(
-            self.add1(attention_output, hidden_states),
+            self.add1(
+                attention_output.view(1, -1),
+                hidden_states.view(1, -1),
+            ).view(self.spec.seq_len, self.spec.hidden_size),
             self.ln1_weight,
             self.spec.layer_norm_eps,
         )
@@ -285,7 +314,10 @@ class OperatorRunlistPattern(nn.Module):
         ffn_hidden = self.gelu(ffn_hidden)
         ffn_output = self.ffn_down(ffn_hidden)
         output = _layer_norm_no_bias(
-            self.add2(ffn_output, attention_output),
+            self.add2(
+                ffn_output.view(1, -1),
+                attention_output.view(1, -1),
+            ).view(self.spec.seq_len, self.spec.hidden_size),
             self.ln2_weight,
             self.spec.layer_norm_eps,
         ).unsqueeze(0)

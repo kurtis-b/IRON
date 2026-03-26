@@ -20,6 +20,7 @@ RESULT_FIELD_ORDER = [
     "measured_inference_count",
     "timed_total_sec",
     "avg_latency_ms",
+    "throughput_flops_per_sec",
     "estimated_flops_per_inference",
     "estimated_bytes_per_inference",
     "operational_intensity_flops_per_byte",
@@ -27,6 +28,10 @@ RESULT_FIELD_ORDER = [
     "roofline_bound_ops_per_sec",
     "backend_pct_of_peak",
     "roofline_pct",
+    "avg_power_w",
+    "max_power_w",
+    "energy_j",
+    "power_sample_count",
 ]
 
 REQUIRED_RESULT_FIELDS = {

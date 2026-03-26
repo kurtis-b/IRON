@@ -56,6 +56,8 @@ class GemmOnlyPattern(nn.Module):
 
         self.spec = spec
         self.context = AIEContext(use_runlist=False)
+        self._runtime_ready = False
+        self._weights_assigned = False
         self.qkv_proj = AIEGEMM(
             M=spec.seq_len,
             K=hidden,
@@ -111,7 +113,20 @@ class GemmOnlyPattern(nn.Module):
             torch.ones(hidden, dtype=spec.torch_dtype), requires_grad=False
         )
 
+    def _prepare_runtime(self) -> None:
+        if self._runtime_ready:
+            return
+        if not self._weights_assigned:
+            raise RuntimeError("assign_weights() must be called before execution")
+        self.context.compile_all()
+        self.context.prepare_runtime()
+        self._runtime_ready = True
+
     def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        if self._runtime_ready:
+            raise RuntimeError(
+                "assign_weights() after runtime preparation is not supported"
+            )
         require_keys(
             weights,
             [
@@ -138,6 +153,7 @@ class GemmOnlyPattern(nn.Module):
         self.ffn_down.weight = weights["ffn_down_weight"].contiguous()
         self.ln1_weight.data.copy_(weights["ln1_weight"])
         self.ln2_weight.data.copy_(weights["ln2_weight"])
+        self._weights_assigned = True
 
     def _split_heads(self, projected: torch.Tensor) -> torch.Tensor:
         return projected.view(
@@ -159,6 +175,7 @@ class GemmOnlyPattern(nn.Module):
             raise RuntimeError(
                 "gemm_only thesis pattern currently supports batch_size=1"
             )
+        self._prepare_runtime()
 
         hidden_states = hidden_states.squeeze(0).to(self.spec.torch_dtype)
         start = time.perf_counter()

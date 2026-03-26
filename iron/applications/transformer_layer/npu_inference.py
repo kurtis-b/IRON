@@ -80,6 +80,11 @@ def benchmark_pattern(
     summary = summarize_latency_measurements(latencies)
     estimated_flops = estimate_layer_flops(spec)
     estimated_bytes = estimate_layer_bytes(spec)
+    throughput_flops_per_sec = (
+        estimated_flops
+        * summary["measured_inference_count"]
+        / summary["timed_total_sec"]
+    )
     row = {
         "study_id": "synthetic_transformer_layer",
         "backend": "npu",
@@ -94,6 +99,7 @@ def benchmark_pattern(
         "source_layer_index": spec.source_layer_index,
         "warmup_runs": warmup_runs,
         "runs_per_sample": runs_per_sample,
+        "throughput_flops_per_sec": throughput_flops_per_sec,
         "estimated_flops_per_inference": estimated_flops,
         "estimated_bytes_per_inference": estimated_bytes,
         "operational_intensity_flops_per_byte": operational_intensity(
