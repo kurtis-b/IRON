@@ -123,9 +123,22 @@ class AIEGEMM(AIEOperatorBase):
         return min_M, min_K, min_N
 
     def _get_artifact_name_base(self, prefix, M, K, N):
+        dtype_in = self.gemm_args.get("dtype_in", "bf16")
+        dtype_out = self.gemm_args.get("dtype_out", "bf16")
+        emulate_bf16_mmul_with_bfp16 = self.gemm_args.get(
+            "emulate_bf16_mmul_with_bfp16", True
+        )
+        prio_accuracy = self.gemm_args.get("prio_accuracy", False)
+        use_scalar = self.gemm_args.get("use_scalar", False)
+        round_conv_even = self.gemm_args.get("round_conv_even", True)
         file_name_total_base = (
             f"{prefix}{M}x{K}x{N}_{self.num_aie_columns}_{self.tile_m}x{self.tile_k}x{self.tile_n}"
             f"_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
+            f"_{dtype_in}_{dtype_out}"
+            f"_sc{int(use_scalar)}"
+            f"_acc{int(prio_accuracy)}"
+            f"_embf16{int(emulate_bf16_mmul_with_bfp16)}"
+            f"_round{int(round_conv_even)}"
         )
         if self._uses_batched_layout():
             file_name_total_base += (
@@ -166,7 +179,14 @@ class AIEGEMM(AIEOperatorBase):
 
         file_name_total_base = self._get_artifact_name_base(prefix, M, K, N)
 
-        kernel_archive = f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}.a"
+        kernel_archive = (
+            f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
+            f"_{dtype_in}_{dtype_out}"
+            f"_sc{int(use_scalar)}"
+            f"_acc{int(prio_accuracy)}"
+            f"_embf16{int(emulate_bf16_mmul_with_bfp16)}"
+            f"_round{int(round_conv_even)}.a"
+        )
         kernel_flags = [
             f"-DDIM_M={tile_m}",
             f"-DDIM_K={tile_k}",

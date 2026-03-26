@@ -15,7 +15,15 @@ from aie.helpers.dialects.scf import _for as range_
 from ml_dtypes import bfloat16
 
 
-def softmax(dev, num_elements, num_columns, num_channels, trace_size, tile_size):
+def softmax(
+    dev,
+    num_elements,
+    num_columns,
+    num_channels,
+    trace_size,
+    tile_size,
+    kernel_object_name="softmax.o",
+):
     per_tile_elements = tile_size
     n = per_tile_elements * num_columns
     if num_elements % n != 0:
@@ -43,7 +51,11 @@ def softmax(dev, num_elements, num_columns, num_channels, trace_size, tile_size)
     ]
 
     # AIE Core Function declaration
-    softmax_kernel = Kernel("softmax_bf16", "softmax.o", [tile_ty, tile_ty, np.int32])
+    softmax_kernel = Kernel(
+        "softmax_bf16",
+        kernel_object_name,
+        [tile_ty, tile_ty, np.int32],
+    )
 
     # Define a task that will run on a compute tile
     def core_body(of_in1, of_out, softmax_kernel):

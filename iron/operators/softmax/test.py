@@ -12,6 +12,56 @@ from iron.operators.softmax.reference import generate_golden_reference
 from iron.common.test_utils import run_test
 
 
+class _DummyContext:
+    def __init__(self):
+        self.operators = []
+        self.static_data_pool = {}
+        self.base_dir = Path(__file__).resolve().parents[3]
+        self.device_manager = type(
+            "_DummyDeviceManager",
+            (),
+            {
+                "device_str": staticmethod(lambda: "npu1_4col"),
+                "device_type": "npu1_4col",
+            },
+        )()
+
+    def register_operator(self, operator, skip_add_to_list=False):
+        operator.context = self
+        if not skip_add_to_list:
+            self.operators.append(operator)
+
+
+def test_artifact_names_track_softmax_vector_width():
+    context = _DummyContext()
+
+    softmax_32 = AIESoftmax(
+        rows=64,
+        cols=32,
+        num_aie_columns=2,
+        num_channels=2,
+        context=context,
+    )
+    softmax_512 = AIESoftmax(
+        rows=6144,
+        cols=512,
+        num_aie_columns=8,
+        num_channels=2,
+        context=context,
+    )
+
+    softmax_32_xclbin, _ = softmax_32.get_artifacts()
+    softmax_512_xclbin, _ = softmax_512.get_artifacts()
+
+    object_32 = softmax_32_xclbin.depends[1]
+    object_512 = softmax_512_xclbin.depends[1]
+
+    assert softmax_32.kernel_vec_len == 32
+    assert softmax_512.kernel_vec_len == 128
+    assert softmax_32_xclbin.path.name != softmax_512_xclbin.path.name
+    assert object_32.path.name != object_512.path.name
+
+
 def get_optimal_columns_channels(input_length, tile_size):
     """Helper function to determine optimal columns and channels for a given input length and tile size"""
     total_cores = input_length // tile_size

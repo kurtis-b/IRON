@@ -29,6 +29,44 @@ class _DummyContext:
             self.operators.append(operator)
 
 
+def test_artifact_names_track_accuracy_flags():
+    context = _DummyContext()
+    common = dict(
+        M=512,
+        K=768,
+        N=768,
+        num_aie_columns=8,
+        tile_m=64,
+        tile_k=96,
+        tile_n=48,
+        context=context,
+    )
+    acc0 = AIEGEMM(
+        prio_accuracy=False,
+        emulate_bf16_mmul_with_bfp16=True,
+        **common,
+    )
+    acc1 = AIEGEMM(
+        prio_accuracy=True,
+        emulate_bf16_mmul_with_bfp16=True,
+        **common,
+    )
+    emb0 = AIEGEMM(
+        prio_accuracy=False,
+        emulate_bf16_mmul_with_bfp16=False,
+        **common,
+    )
+
+    acc0_xclbin, acc0_insts = acc0.get_artifacts()
+    acc1_xclbin, acc1_insts = acc1.get_artifacts()
+    emb0_xclbin, emb0_insts = emb0.get_artifacts()
+
+    assert acc0_xclbin.path.name != acc1_xclbin.path.name
+    assert acc0_insts.path.name != acc1_insts.path.name
+    assert acc0_xclbin.path.name != emb0_xclbin.path.name
+    assert acc0_insts.path.name != emb0_insts.path.name
+
+
 def generate_test_params(extensive=False):
     params = [
         # M, K, N, cols, b_col_maj, c_col_maj, m, k, n, prio_accuracy, emulate_bf16, trace_size, partition_N, batch_A, batch_B, batch_C

@@ -3,6 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+import torch
+from pathlib import Path
+from types import SimpleNamespace
 
 from iron.common.test_utils import run_test
 from iron.operators.layer_norm.op import AIELayerNorm
@@ -65,6 +68,89 @@ all_params = [
     pytest.param(*params, marks=pytest.mark.extensive, id=name)
     for params, name in zip(extensive_params, extensive_names)
 ]
+
+
+def test_weighted_artifact_names_track_weight_values():
+    class DummyContext:
+        def __init__(self):
+            self.operators = []
+            self.static_data_pool = {}
+            self.base_dir = Path(__file__).resolve().parents[3]
+            self.build_dir = self.base_dir / "build"
+            self.device_manager = SimpleNamespace(device_type="npu2")
+
+        def register_operator(self, operator, skip_add_to_list=False):
+            operator.context = self
+            if not skip_add_to_list:
+                self.operators.append(operator)
+
+    context = DummyContext()
+    weight_a = torch.ones(768, dtype=torch.bfloat16)
+    weight_b = torch.linspace(1, 2, 768, dtype=torch.float32).to(torch.bfloat16)
+
+    op_a = AIELayerNorm(
+        size=64 * 768,
+        num_aie_columns=8,
+        num_channels=2,
+        tile_size=768,
+        weights=weight_a,
+        context=context,
+    )
+    op_b = AIELayerNorm(
+        size=64 * 768,
+        num_aie_columns=8,
+        num_channels=2,
+        tile_size=768,
+        weights=weight_b,
+        context=context,
+    )
+    op_a_same = AIELayerNorm(
+        size=64 * 768,
+        num_aie_columns=8,
+        num_channels=2,
+        tile_size=768,
+        weights=weight_a.clone(),
+        context=context,
+    )
+
+    xclbin_a, _ = op_a.get_artifacts()
+    xclbin_b, _ = op_b.get_artifacts()
+    xclbin_a_same, _ = op_a_same.get_artifacts()
+
+    assert xclbin_a.path.name != xclbin_b.path.name
+    assert xclbin_a.path.name == xclbin_a_same.path.name
+
+
+def test_weighted_layer_norm_short_surface(aie_context):
+    rows, cols = 64, 768
+    weight = torch.linspace(1, 2, cols, dtype=torch.float32).to(torch.bfloat16)
+    x = torch.randn(rows, cols, dtype=torch.bfloat16)
+    mean = x.to(torch.float32).mean(dim=-1, keepdim=True)
+    var = x.to(torch.float32).var(dim=-1, unbiased=False, keepdim=True)
+    y = (
+        (x.to(torch.float32) - mean) / torch.sqrt(var + 1e-5) * weight.to(torch.float32)
+    ).to(torch.bfloat16)
+
+    operator = AIELayerNorm(
+        size=rows * cols,
+        num_aie_columns=8,
+        num_channels=2,
+        tile_size=cols,
+        weights=weight,
+        context=aie_context,
+    )
+
+    errors, _, _ = run_test(
+        operator,
+        {"input": x},
+        {"output": y},
+        rel_tol=0.1,
+        abs_tol=0.1,
+        warmup_iters=1,
+        timed_iters=1,
+    )
+
+    assert not errors, f"Short weighted surface failed with errors: {errors}"
 
 
 @pytest.mark.metrics(

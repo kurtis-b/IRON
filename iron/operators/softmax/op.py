@@ -19,6 +19,15 @@ from iron.common import (
 
 
 class AIESoftmax(AIEOperatorBase):
+    @staticmethod
+    def _resolve_kernel_vector_width(cols: int) -> int:
+        for width in (128, 64, 32, 16):
+            if cols >= width and cols % width == 0:
+                return width
+        raise ValueError(
+            f"AIESoftmax requires cols to be divisible by one of "
+            f"(16, 32, 64, 128); got cols={cols}"
+        )
 
     def __init__(
         self,
@@ -32,6 +41,7 @@ class AIESoftmax(AIEOperatorBase):
         self.size = rows * cols
         self.rows = rows
         self.cols = cols
+        self.kernel_vec_len = self._resolve_kernel_vector_width(cols)
 
         self.num_channels = num_channels
         self.num_columns = num_aie_columns
@@ -47,7 +57,11 @@ class AIESoftmax(AIEOperatorBase):
     def get_artifacts(self, prefix="softmax_"):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
-        file_name_base = f"{prefix}{self.num_columns}c_{self.num_channels}ch_{self.size}_{self.cols}t"
+        file_name_base = (
+            f"{prefix}{self.num_columns}c_{self.num_channels}ch_"
+            f"{self.size}_{self.cols}t_sm{self.kernel_vec_len}"
+        )
+        kernel_object_name = f"softmax_sm{self.kernel_vec_len}.o"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -60,6 +74,7 @@ class AIESoftmax(AIEOperatorBase):
                 self.num_channels,
                 0,
                 self.cols,
+                kernel_object_name,
             ],
         )
 
@@ -68,8 +83,8 @@ class AIESoftmax(AIEOperatorBase):
             depends=[
                 mlir_artifact,
                 KernelObjectArtifact.new(
-                    f"softmax.o",
-                    extra_flags=[f"-DSM_VEC_LEN={self.cols}"],
+                    kernel_object_name,
+                    extra_flags=[f"-DSM_VEC_LEN={self.kernel_vec_len}"],
                     depends=[
                         SourceArtifact.new(
                             self.context.base_dir

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,14 @@ from iron.common.utils import torch_to_numpy
 
 class AIELayerNorm(AIEOperatorBase):
     """AIE-accelerated LAYER NORM operator."""
+
+    @staticmethod
+    def _weight_signature(weights):
+        if isinstance(weights, np.ndarray):
+            weight_np = np.ascontiguousarray(weights)
+        else:
+            weight_np = np.ascontiguousarray(torch_to_numpy(weights))
+        return hashlib.sha1(weight_np.view(np.uint8)).hexdigest()[:12]
 
     def __init__(
         self,
@@ -59,9 +68,9 @@ class AIELayerNorm(AIEOperatorBase):
         file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
 
         if self.weight is not None:
-            weight_file_name = (
-                self.context.build_dir / f"{file_name_base}_weights_{self.size}.npy"
-            )
+            weight_signature = self._weight_signature(self.weight)
+            file_name_base = f"{file_name_base}_{weight_signature}"
+            weight_file_name = self.context.build_dir / f"{file_name_base}_weights.npy"
             np.save(weight_file_name, torch_to_numpy(self.weight))
             mlir_artifact = PythonGeneratedMLIRArtifact.new(
                 f"{file_name_base}.mlir",
