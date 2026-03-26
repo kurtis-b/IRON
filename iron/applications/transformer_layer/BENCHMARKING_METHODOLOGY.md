@@ -35,3 +35,10 @@ Phase 6 programmability/debugging workflow:
 2. Let the harness append structured study, benchmark-case, roofline, and parity events to the debug CSV.
 3. Curate stable challenge/mitigation rows into [study/programmability_debug_log.csv](/home/cj/iron/iron/applications/transformer_layer/study/programmability_debug_log.csv).
 4. Use [docs/programmability_debugging.md](/home/cj/iron/iron/applications/transformer_layer/docs/programmability_debugging.md) as the thesis-section skeleton.
+
+Phase 7 isolated AMD GPU workflow:
+
+1. Use [gpu_inference.py](/home/cj/iron/iron/applications/transformer_layer/gpu_inference.py) for the separate ROCm-based comparison path.
+2. Keep the GPU rows separate from the main NPU suite; compare them only against the best NPU pattern.
+3. Use `power_backend=rocm-smi` when AMD GPU power and energy collection is needed.
+4. Use [gpu_compare.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare.json) as the dedicated comparison manifest.

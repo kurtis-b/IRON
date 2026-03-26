@@ -68,3 +68,17 @@ The checked-in thesis-facing skeletons live at:
 
 - [study/programmability_debug_log.csv](/home/cj/iron/iron/applications/transformer_layer/study/programmability_debug_log.csv)
 - [docs/programmability_debugging.md](/home/cj/iron/iron/applications/transformer_layer/docs/programmability_debugging.md)
+
+The isolated AMD GPU comparison path is separate from the main NPU study:
+
+```bash
+source /opt/xilinx/xrt/setup.sh
+source ./ironenv/bin/activate
+python iron/applications/transformer_layer/gpu_inference.py \
+  --seq-len 64 \
+  --device cuda:0 \
+  --power-backend rocm-smi \
+  --output-csv iron/applications/transformer_layer/results/gpu_compare_amd.csv
+```
+
+The comparison manifest lives at [gpu_compare.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare.json).

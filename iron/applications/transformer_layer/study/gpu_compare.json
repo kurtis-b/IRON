@@ -1,6 +1,29 @@
 {
   "study_id": "gpu_compare",
-  "description": "Reserved manifest for the later NPU-versus-NVIDIA comparison phase.",
-  "deferred_until_phase": 7,
-  "reference_npu_study_manifest": "design_patterns_main.json"
+  "description": "Isolated AMD GPU comparison against the best NPU pattern from the main study.",
+  "reference_npu_study_manifest": "design_patterns_main.json",
+  "reference_npu_execution_mode": "encoder_pipeline",
+  "backend": "amd_gpu",
+  "device": "cuda:0",
+  "power_backend": "rocm-smi",
+  "layer_spec": {
+    "hidden_size": 768,
+    "intermediate_size": 3072,
+    "num_attention_heads": 12,
+    "batch_size": 1,
+    "seq_len": 128,
+    "dtype": "bfloat16",
+    "activation": "gelu",
+    "use_bias": false,
+    "layer_norm_eps": 1e-12,
+    "attention_mask_mode": "none",
+    "weights_source": "synthetic",
+    "source_model_name": null,
+    "source_layer_index": null
+  },
+  "seq_lens": [64, 128, 256, 512],
+  "warmup_runs": 5,
+  "runs_per_sample": 20,
+  "output_csv": "../results/gpu_compare_amd.csv",
+  "peak_reference": "../config/peak_references.json"
 }
