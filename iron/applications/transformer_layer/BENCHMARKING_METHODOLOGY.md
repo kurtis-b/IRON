@@ -42,3 +42,11 @@ Phase 7 isolated AMD GPU workflow:
 2. Keep the GPU rows separate from the main NPU suite; compare them only against the best NPU pattern.
 3. Use `power_backend=rocm-smi` when AMD GPU power and energy collection is needed.
 4. Use [gpu_compare.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare.json) as the dedicated comparison manifest.
+
+Phase 8 thesis plotting workflow:
+
+1. Produce or update the annotated NPU suite CSV with [annotate_roofline.py](/home/cj/iron/iron/applications/transformer_layer/annotate_roofline.py).
+2. Produce the bottleneck summary CSV with [analyze_design_pattern_bottlenecks.py](/home/cj/iron/iron/applications/transformer_layer/analyze_design_pattern_bottlenecks.py).
+3. Run the isolated AMD GPU suite separately with [gpu_inference.py](/home/cj/iron/iron/applications/transformer_layer/gpu_inference.py) or [gpu_compare.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare.json).
+4. Generate SVG and HTML figures with [plot_design_pattern_results.py](/home/cj/iron/iron/applications/transformer_layer/plot_design_pattern_results.py).
+5. Treat the main NPU pattern plots and the best-NPU-vs-AMD-GPU plots as distinct figure groups in the thesis writeup.

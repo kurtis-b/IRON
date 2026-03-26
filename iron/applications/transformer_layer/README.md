@@ -56,6 +56,16 @@ python -m iron.applications.transformer_layer.analyze_design_pattern_bottlenecks
   --summary-text iron/applications/transformer_layer/results/design_patterns_main_bottlenecks.txt
 ```
 
+To generate thesis-specific SVG and HTML figures from the annotated suite, bottleneck summary, and isolated AMD GPU comparison:
+
+```bash
+python -m iron.applications.transformer_layer.plot_design_pattern_results \
+  --input-csv iron/applications/transformer_layer/results/design_patterns_main_annotated.csv \
+  --bottleneck-csv iron/applications/transformer_layer/results/design_patterns_main_bottlenecks.csv \
+  --gpu-compare-csv iron/applications/transformer_layer/results/gpu_compare_amd.csv \
+  --output-dir iron/applications/transformer_layer/results/plots/design_patterns_main
+```
+
 To capture structured programmability/debug events during a manifest run:
 
 ```bash
