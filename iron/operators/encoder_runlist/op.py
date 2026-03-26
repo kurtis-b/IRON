@@ -240,6 +240,22 @@ class AIEEncoderRunlist(AIEOperatorBase):
             f"got shape={tuple(tensor.shape)}"
         )
 
+    @staticmethod
+    def _pack_k_for_transpose(
+        k_matrix: torch.Tensor,
+        *,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+        hidden_size: int,
+    ) -> torch.Tensor:
+        return (
+            k_matrix.view(seq_len, num_heads, head_dim)
+            .permute(0, 2, 1)
+            .reshape(seq_len, hidden_size)
+            .contiguous()
+        )
+
     def __init__(
         self,
         seq_len,
@@ -307,6 +323,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             self.attn_softmax_xclbin = None
             self.attn_softmax_insts = None
             self.attn_output_xclbin = None
+            self.attn_output_runtime_xclbin = None
             self.attn_output_insts = None
         if self.use_pip_an_ffn:
             self.anffn_xclbin = None
@@ -357,14 +374,17 @@ class AIEEncoderRunlist(AIEOperatorBase):
     def write_runtime_weights(self):
         self.write_buffer(
             "out_proj_weight",
-            torch_to_numpy(self.attn_output_weight),
+            torch_to_numpy(self.attn_output_weight.T.contiguous()),
         )
         if self.use_pip_addnorm or self.use_pip_an_ffn:
             self.write_buffer("ln1_weight", torch_to_numpy(self.ln1_weight))
-        self.write_buffer("ffn_up_weight", torch_to_numpy(self.ffn_up_weight))
+        self.write_buffer(
+            "ffn_up_weight",
+            torch_to_numpy(self.ffn_up_weight.T.contiguous()),
+        )
         self.write_buffer(
             "ffn_down_weight",
-            torch_to_numpy(self.ffn_down_weight),
+            torch_to_numpy(self.ffn_down_weight.T.contiguous()),
         )
         if self.use_pip_addnorm or self.use_pip_an_ffn:
             self.write_buffer("ln2_weight", torch_to_numpy(self.ln2_weight))
@@ -445,12 +465,23 @@ class AIEEncoderRunlist(AIEOperatorBase):
         q_heads = q_matrix.view(self.seq_len, self.num_heads, self.head_dim)
         k_heads = k_matrix.view(self.seq_len, self.num_heads, self.head_dim)
         v_heads = v_matrix.view(self.seq_len, self.num_heads, self.head_dim)
+        k_input_matrix = self._pack_k_for_transpose(
+            k_matrix,
+            seq_len=self.seq_len,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            hidden_size=self.hidden_size,
+        )
         k_transposed = (
-            k_heads.permute(1, 2, 0).contiguous().view(self.hidden_size, self.seq_len)
+            k_input_matrix.view(self.seq_len, self.head_dim, self.num_heads)
+            .permute(1, 2, 0)
+            .contiguous()
+            .view(self.hidden_size, self.seq_len)
         )
         return {
             "q_matrix": q_matrix,
             "k_matrix": k_matrix,
+            "k_input_matrix": k_input_matrix,
             "v_matrix": v_matrix,
             "k_transposed": k_transposed,
             "query_heads": q_heads,
@@ -511,7 +542,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
 
         if component_name == "k_transpose":
             return {
-                "args": (prepared["k_matrix"],),
+                "args": (prepared["k_input_matrix"],),
                 "expected": prepared["k_transposed"],
             }
 
@@ -949,7 +980,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             kernel_id += 1
 
             # Output head calculations (GEMM per attention weights/V heads, batched across heads)
-            self.attn_output_xclbin, self.attn_output_insts = AIEGEMM(
+            attn_output_gemm = AIEGEMM(
                 M=runtime_rows,
                 K=self.seq_len,
                 N=self.head_dim,
@@ -963,7 +994,15 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 prio_accuracy=False,
                 emulate_bf16_mmul_with_bfp16=True,
                 skip_add_to_list=True,
-            ).get_artifacts(prefix=f"{prefix_base}attn_output_")
+            )
+            self.attn_output_xclbin, self.attn_output_insts = (
+                attn_output_gemm.get_artifacts(prefix=f"{prefix_base}attn_output_")
+            )
+            self.attn_output_runtime_xclbin = (
+                attn_output_gemm.get_runtime_xclbin_artifact(
+                    prefix=f"{prefix_base}attn_output_runtime_"
+                )
+            )
             self.attn_output_xclbin.xclbin_input = self.attn_softmax_xclbin
             self.attn_output_xclbin.extra_flags += [
                 "--xclbin-instance-name=encoder_attn_output",
@@ -973,6 +1012,11 @@ class AIEEncoderRunlist(AIEOperatorBase):
             self.attn_output_xclbin.depends += [
                 self.attn_softmax_xclbin,
             ]
+            self.attn_output_runtime_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_attn_output",
+            ]
+            self.attn_output_runtime_xclbin.kernel_name = "encoder_attn_output"
+            artifacts.append(self.attn_output_runtime_xclbin)
             artifacts.append(self.attn_output_insts)
             kernel_id += 1
             next_dep = self.attn_output_xclbin
@@ -1380,6 +1424,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             self.hidden_size * self.hidden_size,
             static_data=self._runtime_weight_static_data(
                 self.attn_output_weight,
+                transpose=True,
             ),
         )
         if self.use_pip_addnorm or self.use_pip_an_ffn:
@@ -1393,6 +1438,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             self.hidden_size * self.intermediate_size,
             static_data=self._runtime_weight_static_data(
                 self.ffn_up_weight,
+                transpose=True,
             ),
         )
         self.add_buffer(
@@ -1400,6 +1446,7 @@ class AIEEncoderRunlist(AIEOperatorBase):
             self.intermediate_size * self.hidden_size,
             static_data=self._runtime_weight_static_data(
                 self.ffn_down_weight,
+                transpose=True,
             ),
         )
         if self.use_pip_addnorm or self.use_pip_an_ffn:
@@ -1428,7 +1475,10 @@ class AIEEncoderRunlist(AIEOperatorBase):
                 self.buffer_aliases["attn_weights_output"] = "attn_scores_output"
             else:
                 self.buffer_aliases["attn_weights_output"] = "attn_scores_output"
-            self.add_buffer("attn_heads_output", runtime_act_size)  # After layer 5
+            # Keep attention output on its own BO. On the 64x768x3072x12 surface,
+            # it is the same size as the attention score/weight buffers, and
+            # reusing that BO makes attn_output effectively in-place.
+            self.add_buffer("attn_heads_output", runtime_act_size + 1)  # After layer 5
         self.add_buffer("output_proj_output", runtime_act_size)  # After layer 6
         if not self.use_pip_an_ffn:
             if self.use_pip_addnorm:
@@ -1496,8 +1546,12 @@ class AIEEncoderRunlist(AIEOperatorBase):
             )
             self.add_kernel(
                 "encoder_attn_output",
-                self.attn_output_xclbin,
-                self.attn_output_xclbin.kernel_name,
+                self.attn_output_runtime_xclbin or self.attn_output_xclbin,
+                (
+                    self.attn_output_runtime_xclbin.kernel_name
+                    if self.attn_output_runtime_xclbin is not None
+                    else self.attn_output_xclbin.kernel_name
+                ),
                 self.attn_output_insts,
             )
         if self.use_pip_an_ffn:
@@ -1731,7 +1785,13 @@ class AIEEncoderRunlist(AIEOperatorBase):
         expected_size = self.seq_len * self.hidden_size
 
         # Flatten inputs for AIE processing
-        k_flat = k_matrix.view(-1)
+        k_flat = self._pack_k_for_transpose(
+            k_matrix,
+            seq_len=self.seq_len,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            hidden_size=self.hidden_size,
+        ).view(-1)
         v_flat = v_matrix.view(-1)
         assert k_flat.shape[0] == expected_size
         assert v_flat.shape[0] == expected_size

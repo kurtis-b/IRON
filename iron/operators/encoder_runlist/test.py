@@ -137,7 +137,7 @@ def test_forward_rejects_non_2d_input():
         AIEEncoderRunlist.forward(operator, q, k, v, r)
 
 
-def test_write_runtime_weights_preserves_downstream_weight_layout(monkeypatch):
+def test_write_runtime_weights_transposes_downstream_gemm_weights(monkeypatch):
     operator = object.__new__(AIEEncoderRunlist)
     operator.use_pip_addnorm = False
     operator.use_pip_an_ffn = False
@@ -159,15 +159,15 @@ def test_write_runtime_weights_preserves_downstream_weight_layout(monkeypatch):
 
     np.testing.assert_array_equal(
         captured["out_proj_weight"].astype(np.float32),
-        operator.attn_output_weight.float().numpy(),
+        operator.attn_output_weight.T.float().numpy(),
     )
     np.testing.assert_array_equal(
         captured["ffn_up_weight"].astype(np.float32),
-        operator.ffn_up_weight.float().numpy(),
+        operator.ffn_up_weight.T.float().numpy(),
     )
     np.testing.assert_array_equal(
         captured["ffn_down_weight"].astype(np.float32),
-        operator.ffn_down_weight.float().numpy(),
+        operator.ffn_down_weight.T.float().numpy(),
     )
 
 
@@ -326,7 +326,9 @@ def test_runtime_kernels_bind_stage_specific_xclbins():
     assert operator.kernels["encoder_attn_scores"][0] is operator.attn_scores_xclbin
     assert operator.kernels["encoder_attn_scale"][0] is operator.attn_scale_xclbin
     assert operator.kernels["encoder_attn_softmax"][0] is operator.attn_softmax_xclbin
-    assert operator.kernels["encoder_attn_output"][0] is operator.attn_output_xclbin
+    assert operator.kernels["encoder_attn_output"][0] is (
+        operator.attn_output_runtime_xclbin or operator.attn_output_xclbin
+    )
     assert operator.kernels["encoder_ln1"][0] is operator.ln1_xclbin
     assert operator.kernels["encoder_add"][0] is operator.add_xclbin
     assert operator.kernels["encoder_up_proj"][0] is operator.up_proj_xclbin
@@ -392,6 +394,14 @@ def test_runtime_keeps_live_source_buffers_distinct(aie_context):
     assert len({id(operator.buffer_bos[name]) for name in ("Q", "K", "V", "R")}) == 4
     assert operator.buffer_bos["Q"] is not operator.buffer_bos["attn_scores_output"]
     assert operator.buffer_bos["V"] is not operator.buffer_bos["attn_scores_output"]
+    assert (
+        operator.buffer_bos["attn_heads_output"]
+        is not operator.buffer_bos["attn_weights_output"]
+    )
+    assert (
+        operator.buffer_bos["attn_heads_output"]
+        is not operator.buffer_bos["attn_scores_output"]
+    )
     assert operator.buffer_bos["R"] is not operator.buffer_bos["output_proj_output"]
 
 
