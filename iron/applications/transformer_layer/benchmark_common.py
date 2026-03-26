@@ -102,6 +102,14 @@ def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
         manifest["output_csv"] = resolve_study_path(
             manifest_file, manifest["output_csv"]
         )
+    if "peak_reference" in manifest:
+        manifest["peak_reference"] = resolve_study_path(
+            manifest_file, manifest["peak_reference"]
+        )
+    if "annotated_output_csv" in manifest:
+        manifest["annotated_output_csv"] = resolve_study_path(
+            manifest_file, manifest["annotated_output_csv"]
+        )
 
     parity = manifest.get("parity")
     if isinstance(parity, dict):

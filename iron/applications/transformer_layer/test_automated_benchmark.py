@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from iron.applications.transformer_layer.automated_benchmark import main
+from iron.applications.transformer_layer.benchmark_common import load_study_manifest
 
 
 def test_manifest_driven_automation_writes_suite_and_parity(monkeypatch, tmp_path):
@@ -221,3 +222,30 @@ def test_manifest_can_request_annotated_output(monkeypatch, tmp_path):
 
     assert suite_csv.exists()
     assert annotated_csv.exists()
+
+
+def test_load_study_manifest_resolves_roofline_paths(tmp_path):
+    manifest_dir = tmp_path / "study"
+    manifest_dir.mkdir()
+    manifest = manifest_dir / "study.json"
+    manifest.write_text(
+        (
+            "{"
+            '"study_id":"design_patterns_main",'
+            '"layer_spec":{"hidden_size":768,"intermediate_size":3072,"num_attention_heads":12,"batch_size":1,"seq_len":64,"dtype":"bfloat16","activation":"gelu","use_bias":false,"layer_norm_eps":1e-12,"attention_mask_mode":"none","weights_source":"synthetic","source_model_name":null,"source_layer_index":null},'
+            '"execution_modes":["encoder_pipeline"],'
+            '"seq_lens":[64],'
+            '"warmup_runs":1,'
+            '"runs_per_sample":1,'
+            '"output_csv":"../results/suite.csv",'
+            '"peak_reference":"../config/peak.json",'
+            '"annotated_output_csv":"../results/suite_annotated.csv"'
+            "}"
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_study_manifest(manifest)
+
+    assert loaded["peak_reference"].endswith("/config/peak.json")
+    assert loaded["annotated_output_csv"].endswith("/results/suite_annotated.csv")
