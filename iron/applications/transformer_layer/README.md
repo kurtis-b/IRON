@@ -104,10 +104,18 @@ python iron/applications/transformer_layer/validate_operator_runlist_stability.p
   --output-csv iron/applications/transformer_layer/results/operator_runlist_components_seq64.csv
 ```
 
-The retained `operator_runlist` runtime surface now executes through
-`seq_len=16384` on the supported `768/3072/12` and `1024/4096/16` families.
+The retained runtime surface now executes through `seq_len=16384` on the
+supported `768/3072/12` and `1024/4096/16` families for all three NPU
+patterns. The implementation route is different in each case:
+
+- `encoder_pipeline` uses family-specific topology defaults
+- `gemm_only` uses long attention-score partitioning and query-blocked
+  execution
+- `operator_runlist` uses query-blocked execution with component-boundary
+  validation as the preferred long-sequence correctness check
+
 For those long-sequence cases, prefer component-boundary validation over full
-host-materialized parity.
+host-materialized parity when checking `operator_runlist`.
 
 Peak-reference artifact generation:
 

@@ -43,6 +43,9 @@ Important considerations:
   runtime correctness
 - long-sequence capability is part of the value proposition of this pattern,
   not just an implementation detail
+- the retained runtime surface now reaches `seq_len=16384` on both supported
+  families, but the larger `1024/4096/16` family needed different topology
+  defaults than the `768/3072/12` family, especially `emb_tile=128`
 
 In the study, `encoder_pipeline` is the reference point for what a more
 integrated NPU-native mapping can achieve when the topology is valid.
@@ -74,6 +77,15 @@ integrated pattern, but it also means:
 
 Its comparison value comes from holding the `Q/K/V/R` starting boundary fixed
 while showing what happens when the offload policy is narrowed to GEMMs only.
+
+The retained runtime surface now also reaches `seq_len=16384` on both
+supported families. It gets there differently from the other two patterns:
+
+- the long attention-score GEMM is partitioned in `N`
+- the sequence is query-blocked so the host only materializes one query block
+  of scores / probabilities / PV context at a time
+- that keeps the design simple enough to extend, but it also makes the
+  host-device orchestration cost more visible at long sequence lengths
 
 In a projection-inclusive comparison, `gemm_only` is a natural place to absorb
 Q/K/V projection because that work is itself GEMM-heavy.
@@ -145,6 +157,14 @@ These considerations matter in different ways:
   story
 - interpretation: results should distinguish between algorithmic capability and
   engineering cost
+
+At the current retained support boundary, all three NPU patterns execute
+through `seq_len=16384` on the `768/3072/12` and `1024/4096/16` families, but
+they do so by very different mechanisms:
+
+- `encoder_pipeline` depends on family-specific topology choices
+- `gemm_only` depends on partitioned attention-score GEMMs and query blocking
+- `operator_runlist` depends on query-blocked execution and staged validation
 
 A projection-inclusive comparison would intentionally relax the current shared
 `Q/K/V/R` boundary and answer a different question: how much harder is it to

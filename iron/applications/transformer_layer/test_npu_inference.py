@@ -1,5 +1,8 @@
+import csv
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -36,6 +39,46 @@ class _FakePattern:
 
     def __call__(self, layer_inputs):
         return layer_inputs.r
+
+
+LONG_SEQ_EXEC_PARAMS = [
+    pytest.param(
+        "encoder_pipeline",
+        16384,
+        768,
+        3072,
+        12,
+        marks=pytest.mark.extensive,
+        id="encoder_pipeline_16384x768x3072x12",
+    ),
+    pytest.param(
+        "encoder_pipeline",
+        16384,
+        1024,
+        4096,
+        16,
+        marks=pytest.mark.extensive,
+        id="encoder_pipeline_16384x1024x4096x16",
+    ),
+    pytest.param(
+        "gemm_only",
+        16384,
+        768,
+        3072,
+        12,
+        marks=pytest.mark.extensive,
+        id="gemm_only_16384x768x3072x12",
+    ),
+    pytest.param(
+        "gemm_only",
+        16384,
+        1024,
+        4096,
+        16,
+        marks=pytest.mark.extensive,
+        id="gemm_only_16384x1024x4096x16",
+    ),
+]
 
 
 @pytest.mark.parametrize("execution_mode", SUPPORTED_EXECUTION_MODES)
@@ -201,3 +244,51 @@ def test_benchmark_pattern_runs_operator_runlist_in_child_process(
     assert row["process_model"] == "child_process"
     assert row["npu_dispatch_count"] == 12
     assert output_csv.exists()
+
+
+@pytest.mark.parametrize(
+    "execution_mode,seq_len,hidden_size,intermediate_size,num_attention_heads",
+    LONG_SEQ_EXEC_PARAMS,
+)
+def test_npu_inference_long_seq_executes(
+    execution_mode,
+    seq_len,
+    hidden_size,
+    intermediate_size,
+    num_attention_heads,
+    tmp_path,
+):
+    output_csv = tmp_path / f"{execution_mode}_{seq_len}_{hidden_size}.csv"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "iron.applications.transformer_layer.npu_inference",
+            "--execution-mode",
+            execution_mode,
+            "--seq-len",
+            str(seq_len),
+            "--hidden-size",
+            str(hidden_size),
+            "--intermediate-size",
+            str(intermediate_size),
+            "--num-attention-heads",
+            str(num_attention_heads),
+            "--warmup-runs",
+            "0",
+            "--runs-per-sample",
+            "1",
+            "--output-csv",
+            str(output_csv),
+        ],
+        check=True,
+    )
+
+    with output_csv.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["execution_mode"] == execution_mode
+    assert int(row["seq_len"]) == seq_len
+    assert float(row["avg_latency_ms"]) > 0.0
