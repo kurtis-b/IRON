@@ -32,6 +32,26 @@ def _layer_norm_no_bias(
 class GemmOnlyPattern(nn.Module):
     pattern_label = "gemm_only"
 
+    @staticmethod
+    def _resolve_attn_scores_partition_n(seq_len: int) -> int:
+        # The long attention-score GEMM's C-drain exceeds DMA BD stride limits
+        # once seq_len grows beyond 8192. Split only that output dimension across
+        # repeated GEMM invocations instead of changing the smaller-sequence path.
+        if seq_len <= 8192:
+            return 1
+        if seq_len % 4096 != 0:
+            raise ValueError(
+                "gemm_only long attention-score partitioning requires seq_len "
+                f"divisible by 4096; got seq_len={seq_len}"
+            )
+        return seq_len // 4096
+
+    @staticmethod
+    def _resolve_query_block_size(seq_len: int) -> int:
+        if seq_len >= 16384:
+            return 256
+        return seq_len
+
     def __init__(self, spec: TransformerLayerSpec):
         super().__init__()
         if spec.use_bias:
@@ -46,6 +66,10 @@ class GemmOnlyPattern(nn.Module):
         hidden = spec.hidden_size
         heads = spec.num_attention_heads
         head_dim = spec.attention_head_size
+        runtime_seq_len = self._resolve_query_block_size(spec.seq_len)
+        self.query_block_size = runtime_seq_len
+        self.uses_query_blocking = runtime_seq_len < spec.seq_len
+        attn_scores_partition_n = self._resolve_attn_scores_partition_n(spec.seq_len)
         gemm_common = {
             "tile_m": 64,
             "tile_k": 64,
@@ -61,21 +85,22 @@ class GemmOnlyPattern(nn.Module):
         self._weights_assigned = False
         self.compile_setup_time_sec: float | None = None
         self.attn_scores = AIEGEMM(
-            M=spec.seq_len,
+            M=runtime_seq_len,
             K=head_dim,
             N=spec.seq_len,
+            partition_N=attn_scores_partition_n,
             context=self.context,
             **gemm_common,
         )
         self.attn_output = AIEGEMM(
-            M=spec.seq_len,
+            M=runtime_seq_len,
             K=spec.seq_len,
             N=head_dim,
             context=self.context,
             **gemm_common,
         )
         self.out_proj = AIEGEMM(
-            M=spec.seq_len,
+            M=runtime_seq_len,
             K=hidden,
             N=hidden,
             use_static_weight=True,
@@ -83,7 +108,7 @@ class GemmOnlyPattern(nn.Module):
             **gemm_common,
         )
         self.ffn_up = AIEGEMM(
-            M=spec.seq_len,
+            M=runtime_seq_len,
             K=hidden,
             N=spec.intermediate_size,
             use_static_weight=True,
@@ -91,7 +116,7 @@ class GemmOnlyPattern(nn.Module):
             **gemm_common,
         )
         self.ffn_down = AIEGEMM(
-            M=spec.seq_len,
+            M=runtime_seq_len,
             K=spec.intermediate_size,
             N=hidden,
             use_static_weight=True,
@@ -168,34 +193,47 @@ class GemmOnlyPattern(nn.Module):
         host_preprocess_end = time.perf_counter()
 
         npu_gemm_start = time.perf_counter()
-        attn_scores = torch.stack(
-            [
-                self.attn_scores(query_heads[h], key_heads[h])
-                for h in range(self.spec.num_attention_heads)
-            ],
-            dim=0,
-        )
-        npu_gemm_after_scores = time.perf_counter()
-        host_softmax_start = npu_gemm_after_scores
-        attn_probs = torch.softmax(
-            attn_scores.to(torch.float32) * self.scale, dim=-1
-        ).to(self.spec.torch_dtype)
-        host_softmax_end = time.perf_counter()
-        npu_gemm_resume_start = host_softmax_end
-        attn_context = (
-            torch.stack(
+        query_block_size = self.query_block_size
+        attention_blocks = []
+        host_softmax_total = 0.0
+        npu_attention_total = 0.0
+        for block_start in range(0, self.spec.seq_len, query_block_size):
+            block_end = min(block_start + query_block_size, self.spec.seq_len)
+            block_query = query_heads[:, block_start:block_end, :].contiguous()
+            block_npu_start = time.perf_counter()
+            attn_scores = torch.stack(
                 [
-                    self.attn_output(attn_probs[h], value_heads[h])
+                    self.attn_scores(block_query[h], key_heads[h])
                     for h in range(self.spec.num_attention_heads)
                 ],
-                dim=1,
+                dim=0,
             )
-            .contiguous()
-            .view(self.spec.seq_len, self.spec.hidden_size)
-        )
-        attention_output = self.out_proj(attn_context)
+            host_softmax_start = time.perf_counter()
+            attn_probs = torch.softmax(
+                attn_scores.to(torch.float32) * self.scale, dim=-1
+            ).to(self.spec.torch_dtype)
+            host_softmax_end = time.perf_counter()
+            host_softmax_total += host_softmax_end - host_softmax_start
+            npu_resume_start = time.perf_counter()
+            attn_context = (
+                torch.stack(
+                    [
+                        self.attn_output(attn_probs[h], value_heads[h])
+                        for h in range(self.spec.num_attention_heads)
+                    ],
+                    dim=1,
+                )
+                .contiguous()
+                .view(block_end - block_start, self.spec.hidden_size)
+            )
+            attention_block = self.out_proj(attn_context)
+            attention_blocks.append(attention_block)
+            npu_attention_total += (host_softmax_start - block_npu_start) + (
+                time.perf_counter() - npu_resume_start
+            )
         npu_gemm_after_attention = time.perf_counter()
         host_postprocess_start = npu_gemm_after_attention
+        attention_output = torch.cat(attention_blocks, dim=0)
         attention_output = _layer_norm_no_bias(
             attention_output + residual,
             self.ln1_weight,
@@ -203,10 +241,16 @@ class GemmOnlyPattern(nn.Module):
         )
         host_after_ln1 = time.perf_counter()
         npu_gemm_ffn_start = host_after_ln1
-        ffn_up = self.ffn_up(attention_output)
-        ffn_down = self.ffn_down(F.gelu(ffn_up))
+        output_blocks = []
+        for block_start in range(0, self.spec.seq_len, query_block_size):
+            block_end = min(block_start + query_block_size, self.spec.seq_len)
+            attention_block = attention_output[block_start:block_end]
+            ffn_up = self.ffn_up(attention_block)
+            ffn_down = self.ffn_down(F.gelu(ffn_up))
+            output_blocks.append(ffn_down)
         npu_gemm_end = time.perf_counter()
         host_postprocess_resume_start = npu_gemm_end
+        ffn_down = torch.cat(output_blocks, dim=0)
         output = _layer_norm_no_bias(
             ffn_down + attention_output,
             self.ln2_weight,
@@ -215,13 +259,9 @@ class GemmOnlyPattern(nn.Module):
         host_postprocess_end = time.perf_counter()
         return output, {
             "host_preprocess_sec": host_preprocess_end - host_preprocess_start,
-            "npu_gemm_sec": (
-                (npu_gemm_after_scores - npu_gemm_start)
-                + (npu_gemm_after_attention - npu_gemm_resume_start)
-                + (npu_gemm_end - npu_gemm_ffn_start)
-            ),
+            "npu_gemm_sec": npu_attention_total + (npu_gemm_end - npu_gemm_ffn_start),
             "host_postprocess_sec": (
-                (host_softmax_end - host_softmax_start)
+                host_softmax_total
                 + (host_after_ln1 - host_postprocess_start)
                 + (host_postprocess_end - host_postprocess_resume_start)
             ),
@@ -241,13 +281,17 @@ class GemmOnlyPattern(nn.Module):
             for op in gemm_ops
             if getattr(op, "insts_artifact", None) is not None
         }
+        block_count = (
+            self.spec.seq_len + self.query_block_size - 1
+        ) // self.query_block_size
         return {
             "compile_setup_time_ms": (
                 None
                 if self.compile_setup_time_sec is None
                 else self.compile_setup_time_sec * 1000.0
             ),
-            "npu_dispatch_count": (2 * self.spec.num_attention_heads) + 3,
+            "npu_dispatch_count": ((2 * self.spec.num_attention_heads) + 3)
+            * block_count,
             "npu_unique_instruction_binary_count": len(unique_insts),
             "process_model": "in_process",
         }

@@ -25,6 +25,47 @@ class EncoderPipelinePattern(nn.Module):
 
     pattern_label = "encoder_pipeline"
 
+    @staticmethod
+    def _family_topology_defaults(spec: TransformerLayerSpec) -> dict[str, int]:
+        if (
+            spec.hidden_size == 768
+            and spec.intermediate_size == 3072
+            and spec.num_attention_heads == 12
+        ):
+            return {
+                "seq_tile": 32,
+                "kv_seq_tile": 64,
+                "emb_tile": 96,
+                "ffn_tile": 64,
+                "parallel_seq": 1,
+                "parallel_heads": 1,
+                "proj_acc_depth": 8,
+                "o_proj_acc_group_size": 1,
+                "nB_tiles_distributed": 1,
+            }
+        if (
+            spec.hidden_size == 1024
+            and spec.intermediate_size == 4096
+            and spec.num_attention_heads == 16
+        ):
+            return {
+                "seq_tile": 32,
+                "kv_seq_tile": 64,
+                "emb_tile": 128,
+                "ffn_tile": 64,
+                "parallel_seq": 1,
+                "parallel_heads": 1,
+                "proj_acc_depth": 8,
+                "o_proj_acc_group_size": 1,
+                "nB_tiles_distributed": 1,
+            }
+        raise ValueError(
+            "encoder_pipeline thesis pattern currently supports only the "
+            "768/3072/12 and 1024/4096/16 families; got "
+            f"hidden_size={spec.hidden_size}, intermediate_size={spec.intermediate_size}, "
+            f"num_attention_heads={spec.num_attention_heads}"
+        )
+
     def __init__(self, spec: TransformerLayerSpec):
         super().__init__()
         if spec.use_bias:
@@ -33,6 +74,7 @@ class EncoderPipelinePattern(nn.Module):
             )
         hidden = spec.hidden_size
         dtype = spec.torch_dtype
+        topology = self._family_topology_defaults(spec)
         self.spec = spec
         self.context = AIEContext(use_runlist=True)
         self._runtime_ready = False
@@ -42,15 +84,15 @@ class EncoderPipelinePattern(nn.Module):
             num_heads=spec.num_attention_heads,
             seq_len=spec.seq_len,
             d=spec.attention_head_size,
-            seq_tile=32,
-            kv_seq_tile=64,
-            emb_tile=96,
-            ffn_tile=64,
-            parallel_seq=1,
-            parallel_heads=1,
-            proj_acc_depth=max(1, hidden // 96),
-            o_proj_acc_group_size=1,
-            nB_tiles_distributed=1,
+            seq_tile=topology["seq_tile"],
+            kv_seq_tile=topology["kv_seq_tile"],
+            emb_tile=topology["emb_tile"],
+            ffn_tile=topology["ffn_tile"],
+            parallel_seq=topology["parallel_seq"],
+            parallel_heads=topology["parallel_heads"],
+            proj_acc_depth=topology["proj_acc_depth"],
+            o_proj_acc_group_size=topology["o_proj_acc_group_size"],
+            nB_tiles_distributed=topology["nB_tiles_distributed"],
             ffn_intermediate_size=spec.intermediate_size,
             static_weights=True,
             ln1_weight=torch.ones(hidden, dtype=dtype),
