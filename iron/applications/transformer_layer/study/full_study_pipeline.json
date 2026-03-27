@@ -1,0 +1,180 @@
+{
+  "pipeline_id": "transformer_layer_full_study",
+  "debug_log_csv": "../results/full_study_pipeline_debug_log.csv",
+  "fail_fast": true,
+  "npu_power": {
+    "power_backend": "turbostat_pkgwatt",
+    "power_sample_interval_sec": 0.05,
+    "quiescent_baseline_duration_sec": 0.5
+  },
+  "power_cycle": {
+    "enabled": false,
+    "command": ["sudo", "-n", "systemctl", "start", "transformer-layer-power-cycle.service"],
+    "off_command": null,
+    "on_command": null,
+    "off_wait_sec": 2.0,
+    "on_wait_sec": 5.0,
+    "skip_in_smoke": true,
+    "temperature_sensor_name": "k10temp",
+    "temperature_sensor_input": "temp1_input",
+    "recovery_tolerance_fraction": 0.05,
+    "recovery_timeout_sec": 150.0,
+    "recovery_poll_interval_sec": 1.0
+  },
+  "steps": [
+    {
+      "step_id": "design_patterns_main",
+      "kind": "npu_study",
+      "manifest": "design_patterns_main.json"
+    },
+    {
+      "step_id": "design_patterns_main_bottlenecks",
+      "kind": "bottleneck",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_main_annotated.csv",
+      "summary_csv": "../results/design_patterns_main_bottlenecks.csv",
+      "summary_json": "../results/design_patterns_main_bottlenecks.json",
+      "summary_text": "../results/design_patterns_main_bottlenecks.txt"
+    },
+    {
+      "step_id": "design_patterns_main_plots",
+      "kind": "plot",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_main_annotated.csv",
+      "bottleneck_csv": "../results/design_patterns_main_bottlenecks.csv",
+      "output_dir": "../results/plots/design_patterns_main",
+      "x_axis": "seq_len"
+    },
+    {
+      "step_id": "design_patterns_sensitivity",
+      "kind": "npu_study",
+      "manifest": "design_patterns_sensitivity.json"
+    },
+    {
+      "step_id": "design_patterns_sensitivity_bottlenecks",
+      "kind": "bottleneck",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_sensitivity_annotated.csv",
+      "summary_csv": "../results/design_patterns_sensitivity_bottlenecks.csv",
+      "summary_json": "../results/design_patterns_sensitivity_bottlenecks.json",
+      "summary_text": "../results/design_patterns_sensitivity_bottlenecks.txt"
+    },
+    {
+      "step_id": "design_patterns_sensitivity_plots",
+      "kind": "plot",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_sensitivity_annotated.csv",
+      "bottleneck_csv": "../results/design_patterns_sensitivity_bottlenecks.csv",
+      "output_dir": "../results/plots/design_patterns_sensitivity",
+      "x_axis": "seq_len"
+    },
+    {
+      "step_id": "design_patterns_long_seq",
+      "kind": "npu_study",
+      "manifest": "design_patterns_long_seq.json"
+    },
+    {
+      "step_id": "design_patterns_long_seq_bottlenecks",
+      "kind": "bottleneck",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_long_seq_annotated.csv",
+      "summary_csv": "../results/design_patterns_long_seq_bottlenecks.csv",
+      "summary_json": "../results/design_patterns_long_seq_bottlenecks.json",
+      "summary_text": "../results/design_patterns_long_seq_bottlenecks.txt"
+    },
+    {
+      "step_id": "design_patterns_long_seq_plots",
+      "kind": "plot",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_long_seq_annotated.csv",
+      "bottleneck_csv": "../results/design_patterns_long_seq_bottlenecks.csv",
+      "output_dir": "../results/plots/design_patterns_long_seq",
+      "x_axis": "seq_len"
+    },
+    {
+      "step_id": "operator_runlist_component_long_seq",
+      "kind": "component_study",
+      "config": "operator_runlist_component_long_seq.json"
+    },
+    {
+      "step_id": "design_patterns_embedding_scale",
+      "kind": "npu_study",
+      "manifest": "design_patterns_embedding_scale.json"
+    },
+    {
+      "step_id": "gpu_compare_embedding_igpu",
+      "kind": "gpu_compare",
+      "config": "gpu_compare_embedding_igpu.json"
+    },
+    {
+      "step_id": "design_patterns_embedding_scale_bottlenecks",
+      "kind": "bottleneck",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_embedding_scale_annotated.csv",
+      "summary_csv": "../results/design_patterns_embedding_scale_bottlenecks.csv",
+      "summary_json": "../results/design_patterns_embedding_scale_bottlenecks.json",
+      "summary_text": "../results/design_patterns_embedding_scale_bottlenecks.txt"
+    },
+    {
+      "step_id": "design_patterns_embedding_scale_plots",
+      "kind": "plot",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_embedding_scale_annotated.csv",
+      "bottleneck_csv": "../results/design_patterns_embedding_scale_bottlenecks.csv",
+      "gpu_compare_csv": "../results/gpu_compare_embedding_igpu.csv",
+      "output_dir": "../results/plots/design_patterns_embedding_scale",
+      "x_axis": "hidden_size"
+    },
+    {
+      "step_id": "design_patterns_long_seq_with_projection",
+      "kind": "npu_study",
+      "manifest": "design_patterns_long_seq_with_projection.json"
+    },
+    {
+      "step_id": "design_patterns_long_seq_with_projection_bottlenecks",
+      "kind": "bottleneck",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_long_seq_with_projection_annotated.csv",
+      "summary_csv": "../results/design_patterns_long_seq_with_projection_bottlenecks.csv",
+      "summary_json": "../results/design_patterns_long_seq_with_projection_bottlenecks.json",
+      "summary_text": "../results/design_patterns_long_seq_with_projection_bottlenecks.txt"
+    },
+    {
+      "step_id": "design_patterns_long_seq_with_projection_plots",
+      "kind": "plot",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_long_seq_with_projection_annotated.csv",
+      "bottleneck_csv": "../results/design_patterns_long_seq_with_projection_bottlenecks.csv",
+      "output_dir": "../results/plots/design_patterns_long_seq_with_projection",
+      "x_axis": "seq_len"
+    },
+    {
+      "step_id": "operator_runlist_component_long_seq_with_projection",
+      "kind": "component_study",
+      "config": "operator_runlist_component_long_seq_with_projection.json"
+    },
+    {
+      "step_id": "design_patterns_embedding_scale_with_projection",
+      "kind": "npu_study",
+      "manifest": "design_patterns_embedding_scale_with_projection.json"
+    },
+    {
+      "step_id": "design_patterns_embedding_scale_with_projection_bottlenecks",
+      "kind": "bottleneck",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_embedding_scale_with_projection_annotated.csv",
+      "summary_csv": "../results/design_patterns_embedding_scale_with_projection_bottlenecks.csv",
+      "summary_json": "../results/design_patterns_embedding_scale_with_projection_bottlenecks.json",
+      "summary_text": "../results/design_patterns_embedding_scale_with_projection_bottlenecks.txt"
+    },
+    {
+      "step_id": "design_patterns_embedding_scale_with_projection_plots",
+      "kind": "plot",
+      "benchmarking_step": false,
+      "input_csv": "../results/design_patterns_embedding_scale_with_projection_annotated.csv",
+      "bottleneck_csv": "../results/design_patterns_embedding_scale_with_projection_bottlenecks.csv",
+      "output_dir": "../results/plots/design_patterns_embedding_scale_with_projection",
+      "x_axis": "hidden_size"
+    }
+  ]
+}
