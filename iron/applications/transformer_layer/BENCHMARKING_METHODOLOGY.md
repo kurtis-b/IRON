@@ -10,7 +10,9 @@ The mainline study compares three NPU design patterns:
 - `gemm_only`
 - `operator_runlist`
 
-The AMD GPU path is a separate end-of-study comparison against the best NPU result. It is not mixed into the primary NPU pattern sweep.
+The follow-on iGPU path is a separate end-of-study comparison against the best
+completed NPU result per case. It is not mixed into the primary NPU pattern
+sweep.
 
 ## Exact Workload Definition
 
@@ -51,14 +53,47 @@ The default synthetic layer is BERT-shaped:
 - `dtype=bfloat16`
 - `use_bias=false`
 
-## Sequence-Length Sweep
+## Study Manifest Structure
 
-The checked-in manifests define the intended sweep:
+The benchmark harness accepts either:
+
+- a single `layer_spec`, for the existing one-family studies
+- `study_cases`, for mixed-shape studies such as long-sequence or
+  embedding-scale follow-ons
+
+Each `study_case` carries:
+
+- `case_id`
+- `case_label`
+- `layer_spec`
+- optional local `seq_lens`
+- optional local `execution_modes`
+
+The checked-in manifests now include:
 
 - [design_patterns_main.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_main.json)
 - [design_patterns_sensitivity.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_sensitivity.json)
+- [design_patterns_long_seq.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_long_seq.json)
+- [design_patterns_embedding_scale.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_embedding_scale.json)
 
-The normal sweep varies `seq_len` while keeping the rest of the layer spec fixed. That isolates sequence scaling from model-family differences.
+## Sweep Structure
+
+The checked-in study set now has three sweep styles:
+
+- the retained main sweep over `seq_len=64,128,256,512`
+- the retained sensitivity sweep over `seq_len=64,128,256,512,1024,2048`
+- the follow-on long-sequence sweep over `seq_len=64..16384` on the retained
+  `768/3072/12` and `1024/4096/16` families
+- the follow-on embedding-scale sweep over:
+  - `baseline_768`
+  - `baseline_1024`
+  - `dense_4b_class`
+  - `dense_8b_class`
+
+The long-sequence study isolates sequence scaling while holding model-family
+choice to the retained baseline families. The embedding-scale study changes the
+layer family explicitly and records unsupported points instead of silently
+dropping them.
 
 ## Measurement Protocol
 
@@ -73,10 +108,15 @@ For each case:
 Important measurement rules:
 
 - `warmup_runs` and `runs_per_sample` are recorded per row
+- multi-case studies may override those with a per-`seq_len`
+  `sampling_schedule`
 - `avg_latency_ms` is computed from only the timed runs
 - the row also stores per-pattern staged timings when available
 - compile/setup time is tracked separately from steady-state timed latency
 - execution is single-attempt; this app does not implement retry or recovery logic
+- mixed-support studies may continue after a row-level failure and write an
+  explicit `failed` or `unsupported` result row instead of aborting the whole
+  study
 
 The main CLI for one pattern is [npu_inference.py](/home/cj/iron/iron/applications/transformer_layer/npu_inference.py). The main study harness is [automated_benchmark.py](/home/cj/iron/iron/applications/transformer_layer/automated_benchmark.py).
 
@@ -89,19 +129,22 @@ All pattern runners write the shared schema in [result_schema.py](/home/cj/iron/
 The schema includes:
 
 - workload metadata
+- case metadata for mixed-shape studies
 - latency summary
 - stage-level latency fields
 - dispatch / topology metadata
 - FLOP and byte estimates
 - roofline annotation fields
 - power and energy fields
+- run-status and failure metadata for explicit unsupported points
 
 That shared schema is the basis for:
 
 - roofline annotation
 - bottleneck analysis
 - plotting
-- NPU-vs-AMD-GPU comparison
+- support-matrix summaries
+- best-NPU-vs-iGPU comparison
 
 ## Power Collection
 
@@ -113,7 +156,8 @@ Power methodology rules:
 - derive `energy_j` from average power and timed duration
 - leave power fields empty when no backend-specific monitor is active
 
-The AMD GPU comparison should use `power_backend=rocm-smi` when energy or efficiency is part of the figure set.
+The GPU/iGPU comparison should use `power_backend=rocm-smi` when energy or
+efficiency is part of the figure set.
 
 ## Roofline Method
 
@@ -164,6 +208,24 @@ that the individual NPU operators used by the runlist complete repeatedly
 without relying on retries. It also supports component-boundary checks, where
 only the inputs and output of the selected operator are materialized for parity.
 
+Long-sequence `operator_runlist` component studies can also be driven
+manifest-first with
+[operator_runlist_component_study.py](/home/cj/iron/iron/applications/transformer_layer/operator_runlist_component_study.py),
+using
+[operator_runlist_component_long_seq.json](/home/cj/iron/iron/applications/transformer_layer/study/operator_runlist_component_long_seq.json).
+
+## Support-Matrix Reporting
+
+Mixed-support studies write explicit support summaries when configured:
+
+- `*_support_matrix.csv`
+- `*_support_matrix.txt`
+
+These artifacts are derived from the same benchmark rows as the latency suite,
+but they preserve `completed`, `unsupported`, and `failed` outcomes instead of
+filtering to performance-ready rows only. This is the mechanism that keeps
+`encoder_pipeline` limitations visible in the embedding-scale study.
+
 ## Programmability and Debugging Log
 
 Study automation can append structured events to a debug CSV via [debug_log.py](/home/cj/iron/iron/applications/transformer_layer/debug_log.py).
@@ -195,24 +257,30 @@ Parity should be interpreted as:
 - not a benchmark result
 - separate from the roofline and bottleneck analysis
 
-Long-sequence validation constraints and follow-on engineering work, including
-stage-level parity for `operator_runlist`, are tracked in
+Long-sequence validation constraints and follow-on engineering work are tracked in
 [design_pattern_considerations.md](/home/cj/iron/iron/applications/transformer_layer/docs/design_pattern_considerations.md)
 rather than in this methodology document. The retained runtime surfaces for
 `encoder_pipeline`, `gemm_only`, and `operator_runlist` all now execute
 through `seq_len=16384` on the supported `768/3072/12` and `1024/4096/16`
-families. Long-sequence correctness for `operator_runlist` should still lean
-on component-boundary validation rather than full host-materialized parity.
+families. On the retained short surfaces, `operator_runlist` full-layer parity
+is again in-family with the other patterns. Long-sequence correctness for
+`operator_runlist` should still lean on component-boundary validation rather
+than full host-materialized parity.
 
-## AMD GPU Comparison Methodology
+## iGPU Comparison Methodology
 
-The AMD GPU path is intentionally isolated:
+The iGPU path is intentionally isolated:
 
-- run [gpu_inference.py](/home/cj/iron/iron/applications/transformer_layer/gpu_inference.py) separately
-- keep GPU rows separate from the main NPU suite
-- compare the GPU only against the best NPU row per sequence length
+- keep iGPU rows separate from the main NPU suite
+- compare the iGPU only against the best completed NPU row per
+  `(study_case_id, seq_len)`
+- use the embedding-scale NPU suite as the selection source
 
-This avoids turning the thesis app into a generic multi-backend benchmark surface. The dedicated manifest is [gpu_compare.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare.json).
+This avoids turning the thesis app into a generic multi-backend benchmark
+surface. The retained follow-on compare driver is
+[gpu_compare_best_npu.py](/home/cj/iron/iron/applications/transformer_layer/gpu_compare_best_npu.py),
+configured by
+[gpu_compare_embedding_igpu.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare_embedding_igpu.json).
 
 ## Plotting Method
 
@@ -222,13 +290,18 @@ Inputs:
 
 - annotated NPU suite CSV
 - bottleneck summary CSV
-- isolated AMD GPU comparison CSV
+- optional iGPU comparison CSV
 
 Outputs:
 
 - latency, throughput, power, energy-efficiency, and roofline SVGs for the three NPU patterns
 - bottleneck SVG for the NPU study
-- best-NPU-vs-AMD-GPU SVGs
+- best-NPU-vs-iGPU SVGs
 - an `index.html` bundle for quick browsing
+
+The plotter now supports both:
+
+- `x_axis=seq_len` for the retained main and long-sequence studies
+- `x_axis=hidden_size` for the embedding-scale study
 
 The pure-Python validation target [paper_smoke_validation.py](/home/cj/iron/iron/applications/transformer_layer/paper_smoke_validation.py) exercises config parsing, schema writing, roofline annotation, bottleneck analysis, and plotting without hardware.

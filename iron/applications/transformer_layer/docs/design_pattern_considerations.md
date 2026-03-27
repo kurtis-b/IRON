@@ -20,14 +20,21 @@ The fairness rule for this branch is: compare the same downstream transformer
 layer work, even when the mapping of that work across host and NPU is very
 different.
 
-The current checked-in study intentionally excludes Q/K/V projection. Useful
-future extensions are:
+The current checked-in study intentionally excludes Q/K/V projection. The
+follow-on study surface now also includes:
+
+- a long-sequence sweep through `seq_len=16384` on the retained
+  `768/3072/12` and `1024/4096/16` families
+- an embedding-scale sweep through `dense_8b_class`, with explicit
+  unsupported rows instead of silent pruning
+
+Useful future extensions beyond that are:
 
 - add a second comparison axis where all three patterns also include projection
   work, while keeping the current post-projection study as the cleaner
   downstream-only baseline
-- add a comparison axis that pushes to larger embedding sizes, while keeping
-  the current retained families as the baseline study surface
+- extend the embedding-scale sweep beyond `dense_8b_class` if the study needs
+  a stronger scaling break point
 
 ## `encoder_pipeline` Considerations
 
@@ -60,6 +67,10 @@ should also be treated as the hardest pattern to scale cleanly. That kind of
 comparison is interesting precisely because it would show how quickly topology
 and resource pressure become first-order constraints for a tightly integrated
 pipeline design.
+
+That is now reflected directly in the follow-on embedding-scale study design:
+the study should record unsupported `encoder_pipeline` points as first-class
+results rather than broadening the topology surface just to avoid empty cells.
 
 ## `gemm_only` Considerations
 
@@ -95,6 +106,10 @@ because increasing hidden size mostly expands GEMM surfaces that are already
 the core of the design. That does not make scaling free, but it is a more
 direct fit than asking `encoder_pipeline` to grow the same way.
 
+That is why the follow-on embedding-scale study extends `gemm_only` through
+`dense_8b_class` and treats it as one of the likely best-NPU candidates for
+the final iGPU comparison.
+
 ## `operator_runlist` Considerations
 
 `operator_runlist` uses a different tradeoff surface:
@@ -127,15 +142,18 @@ Important current considerations:
   full downstream layer
 - the dedicated `operator_runlist` validator should remain the place where
   component-boundary parity and repeated completion checks are combined
+- the retained short-surface full-layer parity issue has been fixed; the
+  remaining long-sequence preference for component-boundary validation is now a
+  deliberate methodology choice rather than a short-surface correctness bug
 
-At the moment, full end-to-end `8192` and `16384` parity are still not
-practical for
-`operator_runlist`, because both the runtime path and the host reference
-materialize large `seq_len^2 * num_heads` attention tensors. The currently
-verified `operator_runlist` runtime surface extends through `seq_len=16384` on
-the retained `768/3072/12` and `1024/4096/16` families via query-blocked
-execution, but long-sequence correctness should still prefer
-component-boundary validation over full host materialization.
+At the moment, full end-to-end `8192` and `16384` parity are still not the
+preferred validation path for `operator_runlist`, because both the runtime path
+and the host reference still become expensive if the entire layer is
+materialized at once. The currently verified `operator_runlist` runtime surface
+extends through `seq_len=16384` on the retained `768/3072/12` and
+`1024/4096/16` families via query-blocked execution, and the long-sequence
+correctness method is the dedicated component-boundary study rather than full
+host materialization.
 
 In a projection-inclusive comparison, `operator_runlist` is also a natural
 place to absorb Q/K/V projection because it can represent those projections as
@@ -166,6 +184,11 @@ they do so by very different mechanisms:
 - `gemm_only` depends on partitioned attention-score GEMMs and query blocking
 - `operator_runlist` depends on query-blocked execution and staged validation
 
+The follow-on embedding-scale study answers a different question: how far each
+design can scale hidden size before the practical best pattern changes. That is
+why the study needs explicit unsupported rows and a best-NPU-vs-iGPU compare
+rather than assuming all three NPU patterns remain feasible at every point.
+
 A projection-inclusive comparison would intentionally relax the current shared
 `Q/K/V/R` boundary and answer a different question: how much harder is it to
 carry projection work inside each design pattern, especially for
@@ -181,23 +204,22 @@ same internal execution structure. Instead, the study should make clear which
 constraints are part of the pattern itself and which are temporary engineering
 limitations of the current branch.
 
-## Immediate Follow-On Work
+## Optional Next Extensions
 
 The next engineering steps implied by these considerations are:
 
-1. decide whether the current full-layer `operator_runlist` parity gap is an
-   acceptable documented limitation or worth another debugging pass
-2. measure whether more BO reuse / aliasing is needed beyond the current
+1. measure whether more BO reuse / aliasing is needed beyond the current
    query-blocked score/scale/softmax reuse
-3. if desired, add the second comparison axis where all three patterns include
+2. if desired, add the second comparison axis where all three patterns include
    Q/K/V projection, with `encoder_pipeline` using host-side projection and the
    other two patterns carrying it in their own execution structures
-4. if desired, add a larger-embedding comparison axis that highlights the
-   relative scaling difficulty of `encoder_pipeline` versus `gemm_only` and
-   `operator_runlist`
+3. if desired, extend the embedding-scale study beyond `dense_8b_class`
+4. if desired, add a thesis-facing support-matrix figure that makes the
+   `encoder_pipeline` feasibility boundary explicit next to the performance
+   plots
 5. if desired, extend the sensitivity or final thesis sweeps beyond the
-   currently retained `64..2048` study surface now that all three patterns run
-   through `16384`
+   currently retained `64..2048` single-family surface now that the follow-on
+   long-sequence study runs through `16384`
 
 Those steps belong to implementation work, not to the benchmark methodology
 itself.

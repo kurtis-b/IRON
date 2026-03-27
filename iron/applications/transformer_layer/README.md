@@ -8,7 +8,9 @@
 
 The app is intentionally layer-centric rather than model-centric. It does not benchmark embeddings, tokenization, or full-sequence application behavior. The point is to isolate how workload mapping changes latency, efficiency, bottlenecks, and programmability on a resource-constrained NPU.
 
-The AMD GPU comparison is separate from the main NPU study. It is only used to compare the best NPU result against a laptop-class AMD GPU baseline after the NPU workflow is already stable.
+GPU comparisons are separate from the main NPU study. The retained follow-on
+comparison is a best-NPU-vs-AMD-iGPU workflow for the embedding-scale study,
+after the NPU study surface is already stable.
 
 ## Workload Contract
 
@@ -74,6 +76,20 @@ python iron/applications/transformer_layer/automated_benchmark.py \
   --study-manifest iron/applications/transformer_layer/study/design_patterns_main.json
 ```
 
+Long-sequence NPU sweep through `seq_len=16384`:
+
+```bash
+python iron/applications/transformer_layer/automated_benchmark.py \
+  --study-manifest iron/applications/transformer_layer/study/design_patterns_long_seq.json
+```
+
+Embedding-scale NPU sweep through `dense_8b_class`:
+
+```bash
+python iron/applications/transformer_layer/automated_benchmark.py \
+  --study-manifest iron/applications/transformer_layer/study/design_patterns_embedding_scale.json
+```
+
 There is no separate topology-cache warmup step in this app. Each pattern owns its own compilation/runtime setup inside the study harness.
 
 Parity validation:
@@ -102,6 +118,13 @@ python iron/applications/transformer_layer/validate_operator_runlist_stability.p
   --targets attn_scores,attn_softmax,ln2 \
   --components-only \
   --output-csv iron/applications/transformer_layer/results/operator_runlist_components_seq64.csv
+```
+
+Manifest-driven long-sequence component-boundary validation:
+
+```bash
+python iron/applications/transformer_layer/operator_runlist_component_study.py \
+  --config iron/applications/transformer_layer/study/operator_runlist_component_long_seq.json
 ```
 
 The retained runtime surface now executes through `seq_len=16384` on the
@@ -162,7 +185,7 @@ python iron/applications/transformer_layer/automated_benchmark.py \
   --debug-log-csv iron/applications/transformer_layer/results/design_patterns_main_debug_log.csv
 ```
 
-Isolated AMD GPU comparison:
+Isolated ROCm GPU comparison:
 
 ```bash
 python iron/applications/transformer_layer/gpu_inference.py \
@@ -172,7 +195,7 @@ python iron/applications/transformer_layer/gpu_inference.py \
   --output-csv iron/applications/transformer_layer/results/gpu_compare_amd.csv
 ```
 
-Manifest-driven AMD GPU comparison:
+Legacy single-case AMD GPU comparison:
 
 ```bash
 python iron/applications/transformer_layer/gpu_inference.py \
@@ -182,7 +205,17 @@ python iron/applications/transformer_layer/gpu_inference.py \
   --output-csv iron/applications/transformer_layer/results/gpu_compare_amd_seq128.csv
 ```
 
-The dedicated AMD GPU comparison manifest lives at [gpu_compare.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare.json).
+The older single-case AMD GPU comparison manifest lives at
+[gpu_compare.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare.json).
+The retained follow-on study compare is the best-NPU-vs-iGPU workflow shown
+below.
+
+Best-NPU-vs-iGPU comparison for the embedding-scale study:
+
+```bash
+python iron/applications/transformer_layer/gpu_compare_best_npu.py \
+  --config iron/applications/transformer_layer/study/gpu_compare_embedding_igpu.json
+```
 
 Thesis plotting:
 
@@ -192,6 +225,17 @@ python -m iron.applications.transformer_layer.plot_design_pattern_results \
   --bottleneck-csv iron/applications/transformer_layer/results/design_patterns_main_bottlenecks.csv \
   --gpu-compare-csv iron/applications/transformer_layer/results/gpu_compare_amd.csv \
   --output-dir iron/applications/transformer_layer/results/plots/design_patterns_main
+```
+
+Embedding-scale plotting with `hidden_size` on the x-axis:
+
+```bash
+python -m iron.applications.transformer_layer.plot_design_pattern_results \
+  --input-csv iron/applications/transformer_layer/results/design_patterns_embedding_scale_annotated.csv \
+  --bottleneck-csv iron/applications/transformer_layer/results/design_patterns_embedding_scale_bottlenecks.csv \
+  --gpu-compare-csv iron/applications/transformer_layer/results/gpu_compare_embedding_igpu.csv \
+  --x-axis hidden_size \
+  --output-dir iron/applications/transformer_layer/results/plots/design_patterns_embedding_scale
 ```
 
 Unattended job command preview:
@@ -208,9 +252,17 @@ Checked-in manifests and scaffolds:
 
 - [design_patterns_main.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_main.json)
 - [design_patterns_sensitivity.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_sensitivity.json)
+- [design_patterns_long_seq.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_long_seq.json)
+- [design_patterns_embedding_scale.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_embedding_scale.json)
+- [operator_runlist_component_long_seq.json](/home/cj/iron/iron/applications/transformer_layer/study/operator_runlist_component_long_seq.json)
 - [gpu_compare.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare.json)
+- [gpu_compare_embedding_igpu.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare_embedding_igpu.json)
 - [programmability_debug_log.csv](/home/cj/iron/iron/applications/transformer_layer/study/programmability_debug_log.csv)
 - [design_pattern_considerations.md](/home/cj/iron/iron/applications/transformer_layer/docs/design_pattern_considerations.md)
 - [programmability_debugging.md](/home/cj/iron/iron/applications/transformer_layer/docs/programmability_debugging.md)
+
+Mixed-status study manifests may also emit support summaries under
+`results/*_support_matrix.{csv,txt}` so unsupported pattern/case points remain
+explicit in the study outputs instead of disappearing from the matrix.
 
 Generated benchmark outputs belong under `iron/applications/transformer_layer/results/` and are intentionally ignored by git.
