@@ -476,7 +476,7 @@ def generate_plots(
             file_name = _chart_output_name(chart_title)
             _write_text(
                 output_path / file_name,
-                _line_chart_svg(
+                _grouped_bar_svg(
                     title=chart_title,
                     x_label=x_label,
                     y_label=y_label,
@@ -495,7 +495,7 @@ def generate_plots(
         file_name = _chart_output_name(title)
         _write_text(
             output_path / file_name,
-            _line_chart_svg(
+            _grouped_bar_svg(
                 title=title,
                 x_label=x_label,
                 y_label="Efficiency (FLOP/J)",
@@ -516,7 +516,7 @@ def generate_plots(
             file_name = _chart_output_name(chart_title)
             _write_text(
                 output_path / file_name,
-                _line_chart_svg(
+                _grouped_bar_svg(
                     title=chart_title,
                     x_label=x_label,
                     y_label="Efficiency (FLOP/J)",
@@ -616,7 +616,7 @@ def generate_plots(
                 file_name = _chart_output_name(chart_title)
                 _write_text(
                     output_path / file_name,
-                    _line_chart_svg(
+                    _grouped_bar_svg(
                         title=chart_title,
                         x_label=x_label,
                         y_label=y_label,

@@ -347,6 +347,24 @@ def test_generate_plots_writes_expected_svg_set(tmp_path):
     assert (output_dir / "index.html").exists()
     assert (output_dir / "latency_by_sequence_length.svg").exists()
     assert (output_dir / "best_npu_vs_amd_gpu_latency.svg").exists()
+    assert (output_dir / "percent_of_roofline_by_sequence_length.svg").exists()
+    latency_svg = (output_dir / "latency_by_sequence_length.svg").read_text(
+        encoding="utf-8"
+    )
+    compare_svg = (output_dir / "best_npu_vs_amd_gpu_latency.svg").read_text(
+        encoding="utf-8"
+    )
+    roofline_svg = (
+        output_dir / "percent_of_roofline_by_sequence_length.svg"
+    ).read_text(encoding="utf-8")
+    assert "<rect" in latency_svg
+    assert "<polyline" not in latency_svg
+    assert 'opacity="0.9"' in latency_svg
+    assert "<rect" in compare_svg
+    assert "<polyline" not in compare_svg
+    assert 'opacity="0.9"' in compare_svg
+    assert "<circle" in roofline_svg
+    assert 'opacity="0.9"' not in roofline_svg
     assert "Transformer Layer Thesis Plots" in (output_dir / "index.html").read_text(
         encoding="utf-8"
     )

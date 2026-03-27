@@ -126,7 +126,18 @@ Important measurement rules:
 
 The main CLI for one pattern is [npu_inference.py](/home/cj/iron/iron/applications/transformer_layer/npu_inference.py). The main study harness is [automated_benchmark.py](/home/cj/iron/iron/applications/transformer_layer/automated_benchmark.py).
 
-There is no separate topology-cache warmup command in this app. Pattern compilation and runtime setup happen inside the pattern wrappers and harness.
+There is no separate topology-cache warmup command in this app. Pattern
+compilation and runtime setup happen inside the pattern wrappers and harness.
+
+`encoder_pipeline` now includes an exhaustive topology autotune on the first cache
+miss for each `(device, hidden_size, intermediate_size, num_attention_heads,
+seq_len, dtype)` surface. The wrapper benchmarks every supported topology that
+is valid for that exact case, then caches the winning topology in:
+
+- `build/encoder_pipeline_autotune_cache.json`
+
+That autotune cost is folded into `compile_setup_time_ms`; the steady-state
+timed latency fields still measure only the final selected topology.
 
 ## Measurement Audit Log
 
@@ -216,19 +227,12 @@ Power methodology rules:
 - derive `energy_j` from average power and timed duration
 - leave power fields empty only when no backend-specific monitor is active
 
-The retained unattended full-study flow is [run_study_pipeline.py](/home/cj/iron/iron/applications/transformer_layer/run_study_pipeline.py), driven by [full_study_pipeline.json](/home/cj/iron/iron/applications/transformer_layer/study/full_study_pipeline.json). That runner also supports a smoke mode that skips power cycling but still measures NPU pseudo-power and iGPU power.
-
-For unattended thermal reset, the pipeline power-cycles between benchmark-producing
-steps only. It supports either one `power_cycle.command` or a structured
-`power_cycle.off_command` / `power_cycle.on_command` sequence, then waits for
-`k10temp` `Tctl` to recover to within `5%` of the initial captured package
-temperature or until the configured timeout expires. The checked-in pipeline
-config now points at a systemd service entrypoint:
-
-- `sudo -n systemctl start transformer-layer-power-cycle.service`
-
-The service template and env-file example live under
-[systemd/](/home/cj/iron/iron/applications/transformer_layer/systemd).
+The retained unattended full-study flow is [run_study_pipeline.py](/home/cj/iron/iron/applications/transformer_layer/run_study_pipeline.py), driven by [full_study_pipeline.json](/home/cj/iron/iron/applications/transformer_layer/study/full_study_pipeline.json). That runner also supports a smoke mode that skips thermal recovery waits but still measures NPU pseudo-power and iGPU power.
+For unattended thermal control, the pipeline now uses thermal recovery only
+between benchmark-producing steps. It captures an initial `k10temp` `Tctl`
+baseline, then waits for later benchmark steps to return to within `5%` of that
+starting temperature or until the configured timeout expires. No host power
+controller or reboot orchestration is required for the checked-in workflow.
 
 ## Roofline Method
 
@@ -373,6 +377,13 @@ Outputs:
 - bottleneck SVG for the NPU study
 - best-NPU-vs-iGPU SVGs
 - an `index.html` bundle for quick browsing
+
+Plot-style policy:
+
+- grouped bar charts for latency, throughput, power, energy-efficiency, bottleneck, and best-NPU-vs-GPU views
+- line plots for the roofline trend views:
+  - `Percent Of Peak`
+  - `Percent Of Roofline`
 
 The plotter now supports both:
 

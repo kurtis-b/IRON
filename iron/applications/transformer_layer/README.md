@@ -126,7 +126,18 @@ python iron/applications/transformer_layer/automated_benchmark.py \
   --study-manifest iron/applications/transformer_layer/study/design_patterns_embedding_scale_with_projection.json
 ```
 
-There is no separate topology-cache warmup step in this app. Each pattern owns its own compilation/runtime setup inside the study harness.
+There is no separate topology-cache warmup step in this app. Each pattern owns
+its own compilation/runtime setup inside the study harness.
+
+`encoder_pipeline` now does an exhaustive per-shape autotune on the first cache
+miss for a `(device, hidden_size, intermediate_size, num_attention_heads,
+seq_len, dtype)` surface. It benchmarks every supported topology that is valid
+for that exact case, then caches the fastest winner at:
+
+- `build/encoder_pipeline_autotune_cache.json`
+
+Later runs on the same surface reuse that cached topology instead of repeating
+the search.
 
 Parity validation:
 
@@ -174,7 +185,8 @@ The retained runtime surface now executes through `seq_len=16384` on the
 supported `768/3072/12` and `1024/4096/16` families for all three NPU
 patterns. The implementation route is different in each case:
 
-- `encoder_pipeline` uses family-specific topology defaults
+- `encoder_pipeline` uses an exhaustive per-shape topology autotune with a
+  cached winner
 - `gemm_only` uses long attention-score partitioning and query-blocked
   execution
 - `operator_runlist` uses query-blocked execution with component-boundary
@@ -271,26 +283,19 @@ python iron/applications/transformer_layer/run_study_pipeline.py \
   --config iron/applications/transformer_layer/study/full_study_pipeline.json
 ```
 
-The pipeline runner power-cycles only between benchmark-producing steps, not
-between individual rows. The checked-in config supports either:
+The pipeline runner now uses thermal recovery only between benchmark-producing
+steps, not between individual rows. It captures an initial `k10temp` `Tctl`
+baseline, then waits for later benchmark steps to start near that same thermal
+state. The checked-in config enables this behavior by default and does not
+require any host power-control service.
 
-- one `power_cycle.command`
-- or a structured `power_cycle.off_command` / `power_cycle.on_command` pair
-
-The checked-in pipeline config is now wired for a systemd-backed helper:
-
-- `power_cycle.command = ["sudo", "-n", "systemctl", "start", "transformer-layer-power-cycle.service"]`
-
-It still leaves `power_cycle.enabled=false` until the service is installed and
-the real environment-specific off/on commands are configured.
-
-Quick end-to-end smoke run without power cycling:
+Quick end-to-end smoke run:
 
 ```bash
 python iron/applications/transformer_layer/run_study_pipeline.py \
   --config iron/applications/transformer_layer/study/full_study_pipeline.json \
   --smoke \
-  --skip-power-cycle \
+  --skip-thermal-recovery \
   --warmup-runs 0 \
   --runs-per-sample 1 \
   --output-root /tmp/transformer_layer_pipeline_smoke
@@ -305,19 +310,6 @@ same-workload probe window so the latency loop stays minimally invasive. The
 minimum power-probe duration is no longer pinned to `0.5s`; the current floor
 is `0.25s`. The iGPU compare continues to use `rocm-smi`.
 
-Install the power-cycle helper service:
-
-```bash
-sudo cp iron/applications/transformer_layer/systemd/transformer-layer-power-cycle.service /etc/systemd/system/
-sudo cp iron/applications/transformer_layer/systemd/transformer-layer-power-cycle.env.example /etc/transformer-layer-power-cycle.env
-sudoedit /etc/transformer-layer-power-cycle.env
-sudo systemctl daemon-reload
-sudo systemctl start transformer-layer-power-cycle.service
-```
-
-After the service works on the host, set `"power_cycle.enabled": true` in
-[full_study_pipeline.json](/home/cj/iron/iron/applications/transformer_layer/study/full_study_pipeline.json).
-
 Thesis plotting:
 
 ```bash
@@ -327,6 +319,10 @@ python -m iron.applications.transformer_layer.plot_design_pattern_results \
   --gpu-compare-csv iron/applications/transformer_layer/results/gpu_compare_amd.csv \
   --output-dir iron/applications/transformer_layer/results/plots/design_patterns_main
 ```
+
+The plotter now uses grouped bar charts for latency, throughput, power,
+energy-efficiency, bottleneck, and compare views, while the roofline trend
+views (`Percent Of Peak` and `Percent Of Roofline`) stay as line plots.
 
 Embedding-scale plotting with `hidden_size` on the x-axis:
 
