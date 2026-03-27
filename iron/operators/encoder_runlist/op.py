@@ -169,7 +169,21 @@ class AIEEncoderRunlist(AIEOperatorBase):
 
         if self.hidden_size == 1024 and self.intermediate_size == 4096:
             return {
-                "transpose_n": embedding_tile,
+                "transpose_n": 64,
+                "out_proj_tile_k": 64,
+                "out_proj_tile_n": 64,
+                "up_proj_tile_k": 64,
+                "up_proj_tile_n": 64,
+                "down_proj_tile_k": 64,
+                "down_proj_tile_n": 64,
+            }
+
+        if (
+            self.hidden_size % (self.num_aie_columns * 64) == 0
+            and self.intermediate_size % (self.num_aie_columns * 64) == 0
+        ):
+            return {
+                "transpose_n": 64,
                 "out_proj_tile_k": 64,
                 "out_proj_tile_n": 64,
                 "up_proj_tile_k": 64,
@@ -179,8 +193,9 @@ class AIEEncoderRunlist(AIEOperatorBase):
             }
 
         raise ValueError(
-            "AIEEncoderRunlist currently supports only the 768/3072 and "
-            "1024/4096 encoder families; got "
+            "AIEEncoderRunlist currently supports the tuned 768/3072 family and "
+            "families whose hidden/intermediate sizes are divisible by "
+            f"{self.num_aie_columns * 64}; got "
             f"hidden_size={self.hidden_size}, intermediate_size={self.intermediate_size}"
         )
 

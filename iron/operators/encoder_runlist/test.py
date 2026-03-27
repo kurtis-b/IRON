@@ -88,6 +88,35 @@ def test_resolve_short_seq_tiles_track_seq_len():
     assert AIEEncoderRunlist._resolve_attn_scores_tile_n(512, 8) == 64
 
 
+def test_resolve_projection_tiling_supports_dense_4b_and_dense_8b_classes():
+    operator = object.__new__(AIEEncoderRunlist)
+    operator.num_aie_columns = 8
+
+    operator.hidden_size = 2560
+    operator.intermediate_size = 10240
+    assert operator._resolve_projection_tiling() == {
+        "transpose_n": 64,
+        "out_proj_tile_k": 64,
+        "out_proj_tile_n": 64,
+        "up_proj_tile_k": 64,
+        "up_proj_tile_n": 64,
+        "down_proj_tile_k": 64,
+        "down_proj_tile_n": 64,
+    }
+
+    operator.hidden_size = 4096
+    operator.intermediate_size = 14336
+    assert operator._resolve_projection_tiling() == {
+        "transpose_n": 64,
+        "out_proj_tile_k": 64,
+        "out_proj_tile_n": 64,
+        "up_proj_tile_k": 64,
+        "up_proj_tile_n": 64,
+        "down_proj_tile_k": 64,
+        "down_proj_tile_n": 64,
+    }
+
+
 def test_forward_accepts_2d_qkvr_inputs(monkeypatch):
     operator = object.__new__(AIEEncoderRunlist)
     operator.seq_len = 64
