@@ -66,13 +66,13 @@
     "operator_runlist"
   ],
   "seq_lens": [64, 128, 256, 512],
-  "warmup_runs": 5,
-  "runs_per_sample": 20,
+  "warmup_runs": 6,
+  "runs_per_sample": 24,
   "sampling_schedule": {
-    "64": { "warmup_runs": 8, "runs_per_sample": 40 },
-    "128": { "warmup_runs": 8, "runs_per_sample": 40 },
-    "256": { "warmup_runs": 6, "runs_per_sample": 30 },
-    "512": { "warmup_runs": 5, "runs_per_sample": 20 }
+    "64": { "warmup_runs": 10, "runs_per_sample": 48 },
+    "128": { "warmup_runs": 10, "runs_per_sample": 48 },
+    "256": { "warmup_runs": 8, "runs_per_sample": 36 },
+    "512": { "warmup_runs": 6, "runs_per_sample": 24 }
   },
   "continue_on_error": true,
   "output_csv": "../results/design_patterns_embedding_scale.csv",

@@ -22,8 +22,8 @@
     "operator_runlist"
   ],
   "seq_lens": [64, 128, 256, 512, 1024, 2048],
-  "warmup_runs": 3,
-  "runs_per_sample": 10,
+  "warmup_runs": 4,
+  "runs_per_sample": 12,
   "output_csv": "../results/design_patterns_sensitivity.csv",
   "debug_log_csv": "../results/design_patterns_sensitivity_debug_log.csv",
   "peak_reference": "../config/peak_references.json",

@@ -7,13 +7,13 @@
   "device": "cuda:0",
   "power_backend": "rocm-smi",
   "power_sample_interval_sec": 0.2,
-  "warmup_runs": 6,
-  "runs_per_sample": 20,
+  "warmup_runs": 7,
+  "runs_per_sample": 24,
   "sampling_schedule": {
-    "64": { "warmup_runs": 10, "runs_per_sample": 50 },
-    "128": { "warmup_runs": 10, "runs_per_sample": 50 },
-    "256": { "warmup_runs": 8, "runs_per_sample": 30 },
-    "512": { "warmup_runs": 6, "runs_per_sample": 20 }
+    "64": { "warmup_runs": 12, "runs_per_sample": 60 },
+    "128": { "warmup_runs": 12, "runs_per_sample": 60 },
+    "256": { "warmup_runs": 10, "runs_per_sample": 36 },
+    "512": { "warmup_runs": 8, "runs_per_sample": 24 }
   },
   "output_csv": "../results/gpu_compare_embedding_igpu.csv"
 }
