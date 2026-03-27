@@ -195,28 +195,44 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def split_fill_tap_on_outer_dim(
+def split_tap_on_dim(
     tap: TensorAccessPattern,
     tensor_shape: tuple[int, ...],
-    max_outer_dim: int,
+    split_dim: int,
+    max_dim: int,
 ) -> list[TensorAccessPattern]:
-    outer_size = int(tap.sizes[0])
-    if outer_size <= max_outer_dim:
+    dim_size = int(tap.sizes[split_dim])
+    if dim_size <= max_dim:
         return [tap]
     chunk_taps = []
     chunk_start = 0
-    while chunk_start < outer_size:
-        chunk_len = min(max_outer_dim, outer_size - chunk_start)
+    while chunk_start < dim_size:
+        chunk_len = min(max_dim, dim_size - chunk_start)
+        sizes = [int(s) for s in tap.sizes]
+        sizes[split_dim] = chunk_len
         chunk_taps.append(
             TensorAccessPattern(
                 tensor_shape,
-                offset=int(tap.offset) + chunk_start * int(tap.strides[0]),
-                sizes=[chunk_len, *[int(s) for s in tap.sizes[1:]]],
+                offset=int(tap.offset) + chunk_start * int(tap.strides[split_dim]),
+                sizes=sizes,
                 strides=[int(s) for s in tap.strides],
             )
         )
         chunk_start += chunk_len
     return chunk_taps
+
+
+def split_fill_tap_on_outer_dim(
+    tap: TensorAccessPattern,
+    tensor_shape: tuple[int, ...],
+    max_outer_dim: int,
+) -> list[TensorAccessPattern]:
+    return split_tap_on_dim(
+        tap,
+        tensor_shape,
+        split_dim=0,
+        max_dim=max_outer_dim,
+    )
 
 
 def my_matmul(
@@ -659,74 +675,64 @@ def my_matmul(
                         # For small input sizes, we may not even need a "pong" iteration
                         break
                     for col in range(n_aie_cols):
-                        # C Output Transfer:
-                        # The smallest transfer unit is a (m*n_aie_rows)-x-(n)-sized sub-tile of the matrix.
-                        # Transfer one such tile for every (n_aie_cols)-th column, evenly spaced,
-                        # then repeat that (current_tb_n_rows) times for the next contiguous blocks of rows.
-                        # Each shim will start at a different column offset, transferring interleaved
-                        # columns. For example, shim 0 may transfer the blocks marked 0 below, and shim 1
-                        # may transfer the blocks marked 1.
-                        #
-                        #             N
-                        #      ----------------
-                        #     |0011    0011    |
-                        #     |0011    0011    |
-                        #     |0011    0011    |
-                        # M   |0011    0011    |
-                        #     |                |
-                        #     |                |
-                        #     |                |
-                        #     |                |
-                        #      ----------------
                         C_batch_offset = get_batch_offset(
                             N, M, batch_idx, batch_C_stride_dim, col_maj=c_col_maj
                         )
-                        if not c_col_maj:
-                            C_row_offset = row_base * mem_tile_m_C * batched_C_shape[-1]
-                            C_col_offset = col * n
-                            C_offset = C_col_offset + C_row_offset
-                            C_sizes = [
-                                current_tb_n_rows,
-                                N // mem_tile_n,
-                                mem_tile_m_C,
-                                n,
-                            ]
-                            C_strides = [
-                                mem_tile_m_C * batched_C_shape[-1],
-                                mem_tile_n,
-                                batched_C_shape[-1],
-                                1,
-                            ]
-                        else:
-                            C_row_offset = row_base * mem_tile_m_C
-                            C_col_offset = col * n * batched_C_shape[-1]
-                            C_offset = C_col_offset + C_row_offset
-                            C_sizes = [N // mem_tile_n, n_aie_rows, n, m]
-                            C_strides = [
-                                batched_C_shape[-1] * mem_tile_n,
-                                m,
-                                batched_C_shape[-1],
-                                1,
-                            ]
-                        C_tile = TensorAccessPattern(
-                            batched_C_shape,
-                            offset=C_offset + C_batch_offset,
-                            sizes=C_sizes,
-                            strides=C_strides,
-                        )
-
-                        # This line does not change MLIR output at all - it's just for recording data movement
-                        C_taps.append(C_tile)
-
-                        rt.drain(
-                            C_l2l3_fifos[col].cons(),
-                            C,
-                            tap=C_tile,
-                            wait=True,
-                            task_group=tg,
-                            placement=Tile(col, 0),
-                        )
                         for tile_row in range(current_tb_n_rows):
+                            # C Output Transfer:
+                            # Drain one tile-row block at a time so the runtime sequence
+                            # stays within DMA descriptor size/stride limits on large N.
+                            if not c_col_maj:
+                                C_col_offset = col * n
+                                C_block_offset = (
+                                    (row_base + tile_row)
+                                    * n_aie_rows
+                                    * m
+                                    * batched_C_shape[-1]
+                                )
+                                C_offset = C_col_offset + C_block_offset
+                                C_sizes = [1, N // mem_tile_n, mem_tile_m_C, n]
+                                C_strides = [
+                                    0,
+                                    mem_tile_n,
+                                    batched_C_shape[-1],
+                                    1,
+                                ]
+                            else:
+                                C_col_offset = col * n * batched_C_shape[-1]
+                                C_block_offset = (row_base + tile_row) * n_aie_rows * m
+                                C_offset = C_col_offset + C_block_offset
+                                C_sizes = [N // mem_tile_n, 1, n, m]
+                                C_strides = [
+                                    batched_C_shape[-1] * mem_tile_n,
+                                    0,
+                                    batched_C_shape[-1],
+                                    1,
+                                ]
+                            C_tile = TensorAccessPattern(
+                                batched_C_shape,
+                                offset=C_offset + C_batch_offset,
+                                sizes=C_sizes,
+                                strides=C_strides,
+                            )
+
+                            C_drain_taps = split_tap_on_dim(
+                                C_tile,
+                                batched_C_shape,
+                                split_dim=0 if c_col_maj else 1,
+                                max_dim=max_host_fill_outer_dim,
+                            )
+                            for C_drain_tap in C_drain_taps:
+                                rt.drain(
+                                    C_l2l3_fifos[col].cons(),
+                                    C,
+                                    tap=C_drain_tap,
+                                    wait=True,
+                                    task_group=tg,
+                                    placement=Tile(col, 0),
+                                )
+                                # This line does not change MLIR output at all - it's just for recording data movement
+                                C_taps.append(C_drain_tap)
                             # A input transfer:
                             #
                             # The smallest transfer unit is a (m*n_A_tiles_per_shim)-sized sub-tile of the input matrix.

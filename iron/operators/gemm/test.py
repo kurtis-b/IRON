@@ -838,6 +838,27 @@ def test_batched_attn_scores_16384_compiles():
     context.compile_all()
 
 
+@pytest.mark.extensive
+def test_singleton_batched_ffn_up_dense_8b_512_compiles():
+    context = AIEContext(use_runlist=False)
+    AIEGEMM(
+        M=512,
+        K=4096,
+        N=14336,
+        tile_m=64,
+        tile_k=64,
+        tile_n=16,
+        num_aie_columns=8,
+        prio_accuracy=False,
+        emulate_bf16_mmul_with_bfp16=True,
+        use_static_weight=True,
+        force_batched_design=True,
+        context=context,
+    )
+
+    context.compile_all()
+
+
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
