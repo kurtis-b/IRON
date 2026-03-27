@@ -30,7 +30,7 @@ def test_select_best_npu_rows_picks_lowest_latency_per_case_and_seq():
         {
             "backend": "npu",
             "run_status": "completed",
-            "study_case_id": "dense_4b_class",
+            "study_case_id": "dense_8b_class",
             "seq_len": "64",
             "execution_mode": "operator_runlist",
             "avg_latency_ms": "8.0",
@@ -96,13 +96,13 @@ def test_benchmark_best_npu_vs_gpu_carries_case_and_reference_fields(
             {
                 "backend": "npu",
                 "run_status": "completed",
-                "study_case_id": "dense_4b_class",
-                "study_case_label": "dense_4b_class",
+                "study_case_id": "dense_8b_class",
+                "study_case_label": "dense_8b_class",
                 "seq_len": 64,
-                "hidden_size": 2560,
-                "intermediate_size": 10240,
+                "hidden_size": 4096,
+                "intermediate_size": 14336,
                 "num_attention_heads": 32,
-                "attention_head_size": 80,
+                "attention_head_size": 128,
                 "batch_size": 1,
                 "dtype": "bfloat16",
                 "use_bias": False,
@@ -181,8 +181,8 @@ def test_benchmark_best_npu_vs_gpu_carries_case_and_reference_fields(
     )
 
     assert len(benchmark_calls) == 1
-    assert benchmark_calls[0]["spec"].hidden_size == 2560
+    assert benchmark_calls[0]["spec"].hidden_size == 4096
     assert benchmark_calls[0]["warmup_runs"] == 10
-    assert rows[0]["study_case_id"] == "dense_4b_class"
+    assert rows[0]["study_case_id"] == "dense_8b_class"
     assert rows[0]["reference_npu_execution_mode"] == "operator_runlist"
     assert rows[0]["execution_mode"] == "amd_igpu_reference"

@@ -21,12 +21,6 @@ def make_synthetic_layer_inputs(
     seed: int = 0,
 ) -> TransformerLayerInputs:
     generator = torch.Generator().manual_seed(seed)
-    qkv_shape = (
-        spec.batch_size,
-        spec.num_attention_heads,
-        spec.seq_len,
-        spec.attention_head_size,
-    )
     residual_shape = (spec.batch_size, spec.seq_len, spec.hidden_size)
 
     def randn(*shape: int) -> torch.Tensor:
@@ -36,6 +30,19 @@ def make_synthetic_layer_inputs(
             dtype=torch.float32,
         ).to(spec.torch_dtype)
 
+    if spec.input_boundary == "hidden_states":
+        hidden_states = randn(*residual_shape)
+        return TransformerLayerInputs(
+            hidden_states=hidden_states,
+            r=hidden_states.clone(),
+        )
+
+    qkv_shape = (
+        spec.batch_size,
+        spec.num_attention_heads,
+        spec.seq_len,
+        spec.attention_head_size,
+    )
     return TransformerLayerInputs(
         q=randn(*qkv_shape),
         k=randn(*qkv_shape),
@@ -66,6 +73,14 @@ def make_synthetic_layer_weights(
         "ln1_weight": torch.ones(hidden, dtype=dtype),
         "ln2_weight": torch.ones(hidden, dtype=dtype),
     }
+    if spec.input_boundary == "hidden_states":
+        weights.update(
+            {
+                "q_proj_weight": randn(hidden, hidden),
+                "k_proj_weight": randn(hidden, hidden),
+                "v_proj_weight": randn(hidden, hidden),
+            }
+        )
     if spec.use_bias:
         weights.update(
             {

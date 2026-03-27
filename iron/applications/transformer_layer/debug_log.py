@@ -83,6 +83,15 @@ def classify_debug_exception(exc: Exception) -> dict[str, str]:
             "mitigation": "Record the point as unsupported or reduce the study to the retained supported families.",
             "status": "open",
         }
+    if "non-finite output" in lowered or "nonfinite output" in lowered:
+        return {
+            "component": "runtime_numeric",
+            "challenge": "unsupported_pattern_surface",
+            "symptom": symptom,
+            "impact_on_experiment": "The requested benchmark case executed but did not produce a valid finite output tensor.",
+            "mitigation": "Record the point as unsupported for the current retained pattern surface or retile/rework the failing data path.",
+            "status": "open",
+        }
     if "aie.dma_bd" in lowered and "exceeds the" in lowered:
         return {
             "component": "npu_compile",

@@ -65,10 +65,42 @@ class GemmOnlyPattern(nn.Module):
         }
 
         self.spec = spec
+        self._uses_projection = spec.input_boundary == "hidden_states"
         self.context = AIEContext(use_runlist=False)
         self._runtime_ready = False
         self._weights_assigned = False
         self.compile_setup_time_sec: float | None = None
+        self.q_proj = None
+        self.k_proj = None
+        self.v_proj = None
+        if self._uses_projection:
+            self.q_proj = AIEGEMM(
+                M=spec.seq_len,
+                K=hidden,
+                N=hidden,
+                use_static_weight=True,
+                force_batched_design=True,
+                context=self.context,
+                **gemm_common,
+            )
+            self.k_proj = AIEGEMM(
+                M=spec.seq_len,
+                K=hidden,
+                N=hidden,
+                use_static_weight=True,
+                force_batched_design=True,
+                context=self.context,
+                **gemm_common,
+            )
+            self.v_proj = AIEGEMM(
+                M=spec.seq_len,
+                K=hidden,
+                N=hidden,
+                use_static_weight=True,
+                force_batched_design=True,
+                context=self.context,
+                **gemm_common,
+            )
         self.attn_scores = AIEGEMM(
             M=runtime_seq_len,
             K=head_dim,
@@ -128,13 +160,25 @@ class GemmOnlyPattern(nn.Module):
         )
 
     def _gemm_ops(self) -> list[tuple[str, AIEGEMM]]:
-        return [
-            ("attn_scores", self.attn_scores),
-            ("attn_output", self.attn_output),
-            ("out_proj", self.out_proj),
-            ("ffn_up", self.ffn_up),
-            ("ffn_down", self.ffn_down),
-        ]
+        ops = []
+        if self._uses_projection:
+            ops.extend(
+                [
+                    ("q_proj", self.q_proj),
+                    ("k_proj", self.k_proj),
+                    ("v_proj", self.v_proj),
+                ]
+            )
+        ops.extend(
+            [
+                ("attn_scores", self.attn_scores),
+                ("attn_output", self.attn_output),
+                ("out_proj", self.out_proj),
+                ("ffn_up", self.ffn_up),
+                ("ffn_down", self.ffn_down),
+            ]
+        )
+        return ops
 
     def _artifact_case_prefix(self) -> str:
         return (
@@ -186,8 +230,17 @@ class GemmOnlyPattern(nn.Module):
                 "ffn_down_weight",
                 "ln1_weight",
                 "ln2_weight",
-            ],
+            ]
+            + (
+                ["q_proj_weight", "k_proj_weight", "v_proj_weight"]
+                if self._uses_projection
+                else []
+            ),
         )
+        if self._uses_projection:
+            self.q_proj.weight = weights["q_proj_weight"].contiguous()
+            self.k_proj.weight = weights["k_proj_weight"].contiguous()
+            self.v_proj.weight = weights["v_proj_weight"].contiguous()
         self.out_proj.weight = weights["out_proj_weight"].contiguous()
         self.ffn_up.weight = weights["ffn_up_weight"].contiguous()
         self.ffn_down.weight = weights["ffn_down_weight"].contiguous()
@@ -205,33 +258,68 @@ class GemmOnlyPattern(nn.Module):
                 "gemm_only thesis pattern currently requires attention_mask=None"
             )
         layer_inputs.validate(self.spec)
-        if layer_inputs.q.shape[0] != 1:
+        batch_size = (
+            layer_inputs.hidden_states.shape[0]
+            if self._uses_projection
+            else layer_inputs.q.shape[0]
+        )
+        if batch_size != 1:
             raise RuntimeError(
                 "gemm_only thesis pattern currently supports batch_size=1"
             )
         self._prepare_runtime()
 
         host_preprocess_start = time.perf_counter()
-        query_heads = (
-            layer_inputs.q.squeeze(0)
-            .to(self.spec.torch_dtype)
-            .permute(1, 0, 2)
-            .contiguous()
-        )
-        key_heads = (
-            layer_inputs.k.squeeze(0)
-            .to(self.spec.torch_dtype)
-            .permute(2, 0, 1)
-            .contiguous()
-        )
-        value_heads = (
-            layer_inputs.v.squeeze(0)
-            .to(self.spec.torch_dtype)
-            .permute(1, 0, 2)
-            .contiguous()
-        )
         residual = layer_inputs.r.squeeze(0).to(self.spec.torch_dtype)
         host_preprocess_end = time.perf_counter()
+        npu_projection_total = 0.0
+        if self._uses_projection:
+            hidden_states = layer_inputs.hidden_states.squeeze(0).to(
+                self.spec.torch_dtype
+            )
+            projection_start = time.perf_counter()
+            q_matrix = self.q_proj(hidden_states).contiguous()
+            k_matrix = self.k_proj(hidden_states).contiguous()
+            v_matrix = self.v_proj(hidden_states).contiguous()
+            npu_projection_total = time.perf_counter() - projection_start
+            query_heads = q_matrix.view(
+                self.spec.seq_len,
+                self.spec.num_attention_heads,
+                self.spec.attention_head_size,
+            ).contiguous()
+            key_heads = (
+                k_matrix.view(
+                    self.spec.seq_len,
+                    self.spec.num_attention_heads,
+                    self.spec.attention_head_size,
+                )
+                .permute(2, 1, 0)
+                .contiguous()
+            )
+            value_heads = v_matrix.view(
+                self.spec.seq_len,
+                self.spec.num_attention_heads,
+                self.spec.attention_head_size,
+            ).contiguous()
+        else:
+            query_heads = (
+                layer_inputs.q.squeeze(0)
+                .to(self.spec.torch_dtype)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            key_heads = (
+                layer_inputs.k.squeeze(0)
+                .to(self.spec.torch_dtype)
+                .permute(2, 0, 1)
+                .contiguous()
+            )
+            value_heads = (
+                layer_inputs.v.squeeze(0)
+                .to(self.spec.torch_dtype)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
 
         npu_gemm_start = time.perf_counter()
         query_block_size = self.query_block_size
@@ -288,6 +376,7 @@ class GemmOnlyPattern(nn.Module):
         host_postprocess_end = time.perf_counter()
         return output, {
             "host_preprocess_sec": host_preprocess_end - host_preprocess_start,
+            "npu_projection_sec": npu_projection_total,
             "npu_gemm_sec": npu_attention_total + (npu_gemm_end - npu_gemm_ffn_start),
             "host_postprocess_sec": (
                 host_softmax_total
@@ -315,13 +404,14 @@ class GemmOnlyPattern(nn.Module):
         block_count = (
             self.spec.seq_len + self.query_block_size - 1
         ) // self.query_block_size
+        projection_dispatches = 3 if self._uses_projection else 0
         return {
             "compile_setup_time_ms": (
                 None
                 if self.compile_setup_time_sec is None
                 else self.compile_setup_time_sec * 1000.0
             ),
-            "npu_dispatch_count": 5 * block_count,
+            "npu_dispatch_count": projection_dispatches + (5 * block_count),
             "npu_unique_instruction_binary_count": len(unique_insts),
             "npu_unique_xclbin_count": len(unique_xclbins),
             "process_model": "in_process",

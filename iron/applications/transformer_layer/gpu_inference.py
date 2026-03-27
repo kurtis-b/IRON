@@ -117,6 +117,7 @@ def benchmark_gpu_layer(
         "backend": "gpu",
         "execution_mode": "amd_gpu_reference",
         "pattern_label": "amd_gpu_reference",
+        "input_boundary": spec.input_boundary,
         "seq_len": spec.seq_len,
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
@@ -163,6 +164,11 @@ def parse_args():
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--intermediate-size", type=int, default=3072)
     parser.add_argument("--num-attention-heads", type=int, default=12)
+    parser.add_argument(
+        "--input-boundary",
+        choices=("post_projection", "hidden_states"),
+        default="post_projection",
+    )
     parser.add_argument("--warmup-runs", type=int, default=5)
     parser.add_argument("--runs-per-sample", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
@@ -188,6 +194,7 @@ def main():
         intermediate_size=args.intermediate_size,
         num_attention_heads=args.num_attention_heads,
         seq_len=args.seq_len,
+        input_boundary=args.input_boundary,
         use_bias=False,
         weights_source="synthetic",
     )

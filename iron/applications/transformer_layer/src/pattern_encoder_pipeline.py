@@ -7,6 +7,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from iron.common import AIEContext
 from iron.operators.encoder_pipeline.op import AIEEncoderPipeline
@@ -76,10 +77,14 @@ class EncoderPipelinePattern(nn.Module):
         dtype = spec.torch_dtype
         topology = self._family_topology_defaults(spec)
         self.spec = spec
+        self._uses_projection = spec.input_boundary == "hidden_states"
         self.context = AIEContext(use_runlist=True)
         self._runtime_ready = False
         self._weights_assigned = False
         self.compile_setup_time_sec: float | None = None
+        self.q_proj_weight: torch.Tensor | None = None
+        self.k_proj_weight: torch.Tensor | None = None
+        self.v_proj_weight: torch.Tensor | None = None
         self.encoder_pipeline = AIEEncoderPipeline(
             num_heads=spec.num_attention_heads,
             seq_len=spec.seq_len,
@@ -124,8 +129,17 @@ class EncoderPipelinePattern(nn.Module):
                 "ffn_down_weight",
                 "ln1_weight",
                 "ln2_weight",
-            ],
+            ]
+            + (
+                ["q_proj_weight", "k_proj_weight", "v_proj_weight"]
+                if self._uses_projection
+                else []
+            ),
         )
+        if self._uses_projection:
+            self.q_proj_weight = weights["q_proj_weight"].contiguous()
+            self.k_proj_weight = weights["k_proj_weight"].contiguous()
+            self.v_proj_weight = weights["v_proj_weight"].contiguous()
         self.encoder_pipeline.w_o_proj = weights["out_proj_weight"].contiguous()
         self.encoder_pipeline.weight_up_proj = weights["ffn_up_weight"].contiguous()
         self.encoder_pipeline.weight_down_proj = weights["ffn_down_weight"].contiguous()
@@ -143,21 +157,70 @@ class EncoderPipelinePattern(nn.Module):
                 "encoder_pipeline thesis pattern currently requires attention_mask=None"
             )
         layer_inputs.validate(self.spec)
-        if layer_inputs.q.shape[0] != 1:
+        batch_size = (
+            layer_inputs.hidden_states.shape[0]
+            if self._uses_projection
+            else layer_inputs.q.shape[0]
+        )
+        if batch_size != 1:
             raise RuntimeError(
                 "encoder_pipeline thesis pattern currently supports batch_size=1"
             )
         self._prepare_runtime()
 
+        host_projection_start = time.perf_counter()
+        if self._uses_projection:
+            hidden_states = layer_inputs.hidden_states.squeeze(0).to(
+                self.spec.torch_dtype
+            )
+            residual = layer_inputs.r.squeeze(0).to(self.spec.torch_dtype)
+            q = F.linear(hidden_states, self.q_proj_weight)
+            k = F.linear(hidden_states, self.k_proj_weight)
+            v = F.linear(hidden_states, self.v_proj_weight)
+            q = (
+                q.view(
+                    self.spec.seq_len,
+                    self.spec.num_attention_heads,
+                    self.spec.attention_head_size,
+                )
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            k = (
+                k.view(
+                    self.spec.seq_len,
+                    self.spec.num_attention_heads,
+                    self.spec.attention_head_size,
+                )
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            v = (
+                v.view(
+                    self.spec.seq_len,
+                    self.spec.num_attention_heads,
+                    self.spec.attention_head_size,
+                )
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+        else:
+            q = layer_inputs.q.squeeze(0)
+            k = layer_inputs.k.squeeze(0)
+            v = layer_inputs.v.squeeze(0)
+            residual = layer_inputs.r.squeeze(0)
+        host_projection_end = time.perf_counter()
+
         start = time.perf_counter()
         output = self.encoder_pipeline(
-            layer_inputs.q.squeeze(0),
-            layer_inputs.k.squeeze(0),
-            layer_inputs.v.squeeze(0),
-            r=layer_inputs.r.squeeze(0),
+            q,
+            k,
+            v,
+            r=residual,
         ).unsqueeze(0)
         end = time.perf_counter()
         return output, {
+            "host_projection_sec": host_projection_end - host_projection_start,
             "encoder_pipeline_sec": end - start,
         }
 

@@ -3,6 +3,7 @@ from pathlib import Path
 
 from iron.applications.transformer_layer.automated_benchmark import (
     _failure_result_row,
+    _run_parity_checks,
     main,
 )
 from iron.applications.transformer_layer.benchmark_common import load_study_manifest
@@ -227,6 +228,77 @@ def test_manifest_can_request_annotated_output(monkeypatch, tmp_path):
 
     assert suite_csv.exists()
     assert annotated_csv.exists()
+
+
+def test_run_parity_checks_skips_non_completed_rows(monkeypatch, tmp_path):
+    commands = []
+
+    def fake_subprocess_run(command, check):
+        commands.append(command)
+        output_csv = Path(command[command.index("--output-csv") + 1])
+        output_csv.write_text(
+            "study_id,execution_mode,seq_len,max_abs_diff,mean_abs_diff\n",
+            encoding="utf-8",
+        )
+        return None
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.automated_benchmark.subprocess.run",
+        fake_subprocess_run,
+    )
+
+    rows = _run_parity_checks(
+        parity={
+            "enabled": True,
+            "execution_modes": ["encoder_pipeline"],
+            "seq_lens": [64],
+        },
+        cases=[
+            {
+                "case_id": "dense_8b_class",
+                "case_label": "dense_8b_class",
+                "layer_spec": {
+                    "hidden_size": 4096,
+                    "intermediate_size": 14336,
+                    "num_attention_heads": 32,
+                    "batch_size": 1,
+                    "seq_len": 64,
+                    "dtype": "bfloat16",
+                    "activation": "gelu",
+                    "use_bias": False,
+                    "layer_norm_eps": 1e-12,
+                    "attention_mask_mode": "none",
+                    "weights_source": "synthetic",
+                    "source_model_name": None,
+                    "source_layer_index": None,
+                },
+            }
+        ],
+        execution_modes=["encoder_pipeline"],
+        seq_lens=[64],
+        benchmark_rows=[
+            {
+                "study_case_id": "dense_8b_class",
+                "execution_mode": "encoder_pipeline",
+                "seq_len": 64,
+                "run_status": "unsupported",
+            }
+        ],
+        seed=0,
+        study_id="design_patterns_embedding_scale",
+        args=type(
+            "Args",
+            (),
+            {
+                "hidden_size": None,
+                "intermediate_size": None,
+                "num_attention_heads": None,
+            },
+        )(),
+    )
+
+    assert rows == []
+    assert commands == []
 
 
 def test_load_study_manifest_resolves_roofline_paths(tmp_path):
@@ -497,7 +569,7 @@ def test_automation_multi_case_continue_on_error_writes_failure_rows(
             '"study_id":"embedding_scale",'
             '"study_cases":['
             '{"case_id":"baseline_768","case_label":"baseline_768","layer_spec":{"hidden_size":768,"intermediate_size":3072,"num_attention_heads":12,"batch_size":1,"seq_len":64,"dtype":"bfloat16","activation":"gelu","use_bias":false,"layer_norm_eps":1e-12,"attention_mask_mode":"none","weights_source":"synthetic","source_model_name":null,"source_layer_index":null}},'
-            '{"case_id":"dense_4b_class","case_label":"dense_4b_class","layer_spec":{"hidden_size":2560,"intermediate_size":10240,"num_attention_heads":32,"batch_size":1,"seq_len":64,"dtype":"bfloat16","activation":"gelu","use_bias":false,"layer_norm_eps":1e-12,"attention_mask_mode":"none","weights_source":"synthetic","source_model_name":null,"source_layer_index":null}}'
+            '{"case_id":"dense_8b_class","case_label":"dense_8b_class","layer_spec":{"hidden_size":4096,"intermediate_size":14336,"num_attention_heads":32,"batch_size":1,"seq_len":64,"dtype":"bfloat16","activation":"gelu","use_bias":false,"layer_norm_eps":1e-12,"attention_mask_mode":"none","weights_source":"synthetic","source_model_name":null,"source_layer_index":null}}'
             "],"
             '"execution_modes":["encoder_pipeline"],'
             '"seq_lens":[64],'
@@ -513,7 +585,7 @@ def test_automation_multi_case_continue_on_error_writes_failure_rows(
 
     def fake_benchmark_pattern(**kwargs):
         spec = kwargs["spec"]
-        if spec.hidden_size == 2560:
+        if spec.hidden_size == 4096:
             raise RuntimeError("unsupported topology for requested placement")
         return [
             {
@@ -569,7 +641,7 @@ def test_automation_multi_case_continue_on_error_writes_failure_rows(
     assert len(rows) == 2
     statuses = {(row["study_case_id"], row["run_status"]) for row in rows}
     assert ("baseline_768", "completed") in statuses
-    assert ("dense_4b_class", "unsupported") in statuses
+    assert ("dense_8b_class", "unsupported") in statuses
 
     with support_csv.open(newline="", encoding="utf-8") as handle:
         support_rows = list(csv.DictReader(handle))
@@ -580,12 +652,12 @@ def test_failure_result_row_marks_unsupported_pattern_surface():
     row = _failure_result_row(
         study_id="embedding_scale",
         case={
-            "case_id": "dense_4b_class",
-            "case_label": "dense_4b_class",
+            "case_id": "dense_8b_class",
+            "case_label": "dense_8b_class",
         },
         spec=TransformerLayerSpec(
-            hidden_size=2560,
-            intermediate_size=10240,
+            hidden_size=4096,
+            intermediate_size=14336,
             num_attention_heads=32,
             seq_len=64,
         ),

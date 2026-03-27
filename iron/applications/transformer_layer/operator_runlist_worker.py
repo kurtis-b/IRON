@@ -7,8 +7,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
+import traceback
 from pathlib import Path
+
+import torch
 
 from iron.applications.transformer_layer.benchmark_common import (
     summarize_latency_measurements,
@@ -39,6 +43,18 @@ from iron.applications.transformer_layer.src.utils import (
 )
 
 
+def _ensure_finite_output(
+    output: torch.Tensor, *, mode: str, spec: TransformerLayerSpec
+):
+    if torch.isfinite(output).all():
+        return
+    raise RuntimeError(
+        "operator_runlist produced non-finite output on the current pattern surface "
+        f"(mode={mode}, input_boundary={spec.input_boundary}, seq_len={spec.seq_len}, "
+        f"hidden_size={spec.hidden_size}, num_attention_heads={spec.num_attention_heads})"
+    )
+
+
 def benchmark_operator_runlist_request(request: dict[str, object]) -> dict[str, object]:
     spec = TransformerLayerSpec.from_dict(request["spec"])
     warmup_runs = int(request["warmup_runs"])
@@ -52,7 +68,8 @@ def benchmark_operator_runlist_request(request: dict[str, object]) -> dict[str, 
     pattern._prepare_runtime()
 
     def _run_once() -> dict[str, float]:
-        _, stage_timings = pattern.forward_with_stage_timings(layer_inputs)
+        output, stage_timings = pattern.forward_with_stage_timings(layer_inputs)
+        _ensure_finite_output(output, mode="benchmark", spec=spec)
         return stage_timings
 
     for _ in range(warmup_runs):
@@ -83,6 +100,7 @@ def benchmark_operator_runlist_request(request: dict[str, object]) -> dict[str, 
         "backend": "npu",
         "execution_mode": "operator_runlist",
         "pattern_label": "operator_runlist",
+        "input_boundary": spec.input_boundary,
         "seq_len": spec.seq_len,
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
@@ -138,11 +156,13 @@ def parity_operator_runlist_request(request: dict[str, object]) -> dict[str, obj
     pattern = OperatorRunlistPattern(spec)
     pattern.assign_weights(weights)
     candidate_output = pattern(layer_inputs)
+    _ensure_finite_output(candidate_output, mode="parity", spec=spec)
     diff = (reference_output - candidate_output).abs().to(candidate_output.dtype)
 
     return {
         "study_id": study_id,
         "execution_mode": "operator_runlist",
+        "input_boundary": spec.input_boundary,
         "seq_len": spec.seq_len,
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
@@ -168,18 +188,23 @@ def parse_args():
 
 def main():
     args = parse_args()
-    request_path = Path(args.request_json)
-    response_path = Path(args.response_json)
-    request = json.loads(request_path.read_text())
-    mode = str(request.get("mode", "benchmark"))
-    if mode == "benchmark":
-        row = benchmark_operator_runlist_request(request)
-    elif mode == "parity":
-        row = parity_operator_runlist_request(request)
-    else:
-        raise ValueError(f"Unsupported operator_runlist worker mode: {mode}")
-    response_path.write_text(json.dumps(row))
-    os._exit(0)
+    try:
+        request_path = Path(args.request_json)
+        response_path = Path(args.response_json)
+        request = json.loads(request_path.read_text())
+        mode = str(request.get("mode", "benchmark"))
+        if mode == "benchmark":
+            row = benchmark_operator_runlist_request(request)
+        elif mode == "parity":
+            row = parity_operator_runlist_request(request)
+        else:
+            raise ValueError(f"Unsupported operator_runlist worker mode: {mode}")
+        response_path.write_text(json.dumps(row))
+        os._exit(0)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        os._exit(1)
 
 
 if __name__ == "__main__":

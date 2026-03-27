@@ -197,6 +197,7 @@ def _decorate_row_for_case(
     normalized["study_id"] = study_id
     normalized["study_case_id"] = case["case_id"]
     normalized["study_case_label"] = case["case_label"]
+    normalized["input_boundary"] = spec.input_boundary
     normalized["hidden_size"] = spec.hidden_size
     normalized["intermediate_size"] = spec.intermediate_size
     normalized["num_attention_heads"] = spec.num_attention_heads
@@ -236,6 +237,7 @@ def _failure_result_row(
         "backend": "npu",
         "execution_mode": execution_mode,
         "pattern_label": execution_mode,
+        "input_boundary": spec.input_boundary,
         "seq_len": spec.seq_len,
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
@@ -283,12 +285,22 @@ def _run_parity_checks(
     cases: list[dict[str, object]],
     execution_modes: list[str],
     seq_lens: list[int],
+    benchmark_rows: list[dict[str, object]],
     seed: int,
     study_id: str,
     args,
 ) -> list[dict[str, object]]:
     validate_script = Path(__file__).with_name("validate_npu_parity.py")
     rows: list[dict[str, object]] = []
+    completed_points = {
+        (
+            str(row.get("study_case_id")),
+            str(row.get("execution_mode")),
+            int(row.get("seq_len")),
+        )
+        for row in benchmark_rows
+        if row.get("run_status") == "completed"
+    }
     with tempfile.TemporaryDirectory(prefix="transformer_layer_parity_") as temp_dir:
         temp_root = Path(temp_dir)
         for case in cases:
@@ -302,6 +314,13 @@ def _run_parity_checks(
                 continue
             base_spec = _resolve_spec(args, case["layer_spec"], parity_seq_lens[0])
             for execution_mode in parity_execution_modes:
+                eligible_seq_lens = [
+                    seq_len
+                    for seq_len in parity_seq_lens
+                    if (case["case_id"], execution_mode, seq_len) in completed_points
+                ]
+                if not eligible_seq_lens:
+                    continue
                 output_csv = (
                     temp_root / f"{case['case_id']}_{execution_mode}_parity.csv"
                 )
@@ -311,13 +330,15 @@ def _run_parity_checks(
                     "--execution-mode",
                     execution_mode,
                     "--seq-lens",
-                    ",".join(str(seq_len) for seq_len in parity_seq_lens),
+                    ",".join(str(seq_len) for seq_len in eligible_seq_lens),
                     "--hidden-size",
                     str(base_spec.hidden_size),
                     "--intermediate-size",
                     str(base_spec.intermediate_size),
                     "--num-attention-heads",
                     str(base_spec.num_attention_heads),
+                    "--input-boundary",
+                    base_spec.input_boundary,
                     "--seed",
                     str(seed),
                     "--output-csv",
@@ -498,6 +519,7 @@ def main():
                     cases=study_cases,
                     execution_modes=execution_modes,
                     seq_lens=seq_lens,
+                    benchmark_rows=all_rows,
                     seed=args.seed,
                     study_id=study_id,
                     args=args,

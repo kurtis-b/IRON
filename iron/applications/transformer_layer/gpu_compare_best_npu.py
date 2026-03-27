@@ -97,6 +97,7 @@ def _spec_from_row(row: dict[str, str]) -> TransformerLayerSpec:
         seq_len=int(row["seq_len"]),
         batch_size=int(row.get("batch_size", 1)),
         dtype=str(row.get("dtype", "bfloat16")),
+        input_boundary=str(row.get("input_boundary", "post_projection")),
         use_bias=str(row.get("use_bias", "False")).lower() == "true",
         weights_source=str(row.get("weights_source", "synthetic")),
         source_model_name=(

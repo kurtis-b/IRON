@@ -22,6 +22,7 @@ def test_validate_pattern_parity_routes_operator_runlist_to_child(monkeypatch):
     expected = {
         "study_id": "synthetic_transformer_layer",
         "execution_mode": "operator_runlist",
+        "input_boundary": "post_projection",
         "seq_len": 64,
         "hidden_size": 768,
         "intermediate_size": 3072,
@@ -62,6 +63,7 @@ def test_operator_runlist_parity_child_request(monkeypatch, tmp_path):
                 {
                     "study_id": "synthetic_transformer_layer",
                     "execution_mode": "operator_runlist",
+                    "input_boundary": "post_projection",
                     "seq_len": 64,
                     "hidden_size": 768,
                     "intermediate_size": 3072,

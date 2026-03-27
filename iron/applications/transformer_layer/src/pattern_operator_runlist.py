@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from iron.common import AIEContext
 from iron.operators.encoder_runlist.op import AIEEncoderRunlist
+from iron.operators.gemm.op import AIEGEMM
 
 from .input_bundle import TransformerLayerInputs
 from .layer_spec import TransformerLayerSpec
@@ -31,10 +32,48 @@ class OperatorRunlistPattern(nn.Module):
             )
 
         self.spec = spec
+        self._uses_projection = spec.input_boundary == "hidden_states"
         self.context = AIEContext(use_runlist=True)
         self._runtime_ready = False
         self._weights_assigned = False
         self.compile_setup_time_sec: float | None = None
+        self.q_proj = None
+        self.k_proj = None
+        self.v_proj = None
+        if self._uses_projection:
+            projection_common = {
+                "tile_m": 64,
+                "tile_k": 64,
+                "tile_n": 64,
+                "num_aie_columns": 8,
+                "prio_accuracy": False,
+                "emulate_bf16_mmul_with_bfp16": True,
+            }
+            self.q_proj = AIEGEMM(
+                M=spec.seq_len,
+                K=spec.hidden_size,
+                N=spec.hidden_size,
+                use_static_weight=True,
+                context=self.context,
+                **projection_common,
+            )
+            self.k_proj = AIEGEMM(
+                M=spec.seq_len,
+                K=spec.hidden_size,
+                N=spec.hidden_size,
+                use_static_weight=True,
+                context=self.context,
+                **projection_common,
+            )
+            self.v_proj = AIEGEMM(
+                M=spec.seq_len,
+                K=spec.hidden_size,
+                N=spec.hidden_size,
+                use_static_weight=True,
+                context=self.context,
+                **projection_common,
+            )
+            self._bind_projection_artifacts()
         self.encoder_runlist = AIEEncoderRunlist(
             seq_len=spec.seq_len,
             hidden_size=spec.hidden_size,
@@ -44,6 +83,39 @@ class OperatorRunlistPattern(nn.Module):
             ln2_weight=torch.ones(spec.hidden_size, dtype=spec.torch_dtype),
             context=self.context,
         )
+
+    def _projection_ops(self) -> list[tuple[str, AIEGEMM]]:
+        if not self._uses_projection:
+            return []
+        return [
+            ("q_proj", self.q_proj),
+            ("k_proj", self.k_proj),
+            ("v_proj", self.v_proj),
+        ]
+
+    def _bind_projection_artifacts(self) -> None:
+        shared_xclbin = self.q_proj.get_runtime_xclbin_artifact(
+            prefix=(
+                "operator_runlist_projection_"
+                f"{self.spec.seq_len}x{self.spec.hidden_size}_runtime_"
+            )
+        )
+        shared_xclbin.kernel_name = "operator_runlist_projection"
+        for workload_name, gemm_op in self._projection_ops():
+            insts_artifact = gemm_op.get_insts_artifact(
+                prefix=(
+                    "operator_runlist_projection_"
+                    f"{self.spec.seq_len}x{self.spec.hidden_size}_{workload_name}_"
+                ),
+                xclbin_input=shared_xclbin,
+                kernel_name=shared_xclbin.kernel_name,
+            )
+            gemm_op.bind_artifacts(
+                shared_xclbin,
+                insts_artifact,
+                runtime_xclbin_artifact=shared_xclbin,
+                runtime_kernel_name=shared_xclbin.kernel_name,
+            )
 
     def _prepare_runtime(self) -> None:
         if self._runtime_ready:
@@ -69,8 +141,17 @@ class OperatorRunlistPattern(nn.Module):
                 "ffn_down_weight",
                 "ln1_weight",
                 "ln2_weight",
-            ],
+            ]
+            + (
+                ["q_proj_weight", "k_proj_weight", "v_proj_weight"]
+                if self._uses_projection
+                else []
+            ),
         )
+        if self._uses_projection:
+            self.q_proj.weight = weights["q_proj_weight"].contiguous()
+            self.k_proj.weight = weights["k_proj_weight"].contiguous()
+            self.v_proj.weight = weights["v_proj_weight"].contiguous()
         self.encoder_runlist.assign_weights(
             w_o=weights["out_proj_weight"],
             b_up=weights["ffn_up_weight"],
@@ -90,22 +171,43 @@ class OperatorRunlistPattern(nn.Module):
                 "operator_runlist thesis pattern currently requires attention_mask=None"
             )
         layer_inputs.validate(self.spec)
-        if layer_inputs.q.shape[0] != 1:
+        batch_size = (
+            layer_inputs.hidden_states.shape[0]
+            if self._uses_projection
+            else layer_inputs.q.shape[0]
+        )
+        if batch_size != 1:
             raise RuntimeError(
                 "operator_runlist thesis pattern currently supports batch_size=1"
             )
         self._prepare_runtime()
 
+        npu_projection_start = time.perf_counter()
+        if self._uses_projection:
+            hidden_states = layer_inputs.hidden_states.squeeze(0).to(
+                self.spec.torch_dtype
+            )
+            residual = layer_inputs.r.squeeze(0).to(self.spec.torch_dtype)
+            q = self.q_proj(hidden_states)[:, : self.spec.hidden_size].contiguous()
+            k = self.k_proj(hidden_states)[:, : self.spec.hidden_size].contiguous()
+            v = self.v_proj(hidden_states)[:, : self.spec.hidden_size].contiguous()
+        else:
+            q = layer_inputs.q.squeeze(0)
+            k = layer_inputs.k.squeeze(0)
+            v = layer_inputs.v.squeeze(0)
+            residual = layer_inputs.r.squeeze(0)
+        npu_projection_end = time.perf_counter()
         operator_runlist_start = time.perf_counter()
         output = self.encoder_runlist(
-            layer_inputs.q.squeeze(0),
-            layer_inputs.k.squeeze(0),
-            layer_inputs.v.squeeze(0),
-            layer_inputs.r.squeeze(0),
+            q,
+            k,
+            v,
+            residual,
         ).unsqueeze(0)
         operator_runlist_end = time.perf_counter()
 
         return output, {
+            "npu_projection_sec": npu_projection_end - npu_projection_start,
             "operator_runlist_sec": operator_runlist_end - operator_runlist_start,
         }
 
@@ -114,14 +216,25 @@ class OperatorRunlistPattern(nn.Module):
             str(insts_artifact.path)
             for _, insts_artifact in self.encoder_runlist.component_artifacts.values()
         }
+        unique_xclbins = {
+            str(xclbin_artifact.path)
+            for xclbin_artifact, _ in self.encoder_runlist.component_artifacts.values()
+        }
+        for _, gemm_op in self._projection_ops():
+            unique_insts.add(str(gemm_op.insts_artifact.path))
+            unique_xclbins.add(
+                str((gemm_op.runtime_xclbin_artifact or gemm_op.xclbin_artifact).path)
+            )
         return {
             "compile_setup_time_ms": (
                 None
                 if self.compile_setup_time_sec is None
                 else self.compile_setup_time_sec * 1000.0
             ),
-            "npu_dispatch_count": len(self.encoder_runlist.runlist),
+            "npu_dispatch_count": len(self.encoder_runlist.runlist)
+            + (3 if self._uses_projection else 0),
             "npu_unique_instruction_binary_count": len(unique_insts),
+            "npu_unique_xclbin_count": len(unique_xclbins),
             "process_model": "in_process",
         }
 

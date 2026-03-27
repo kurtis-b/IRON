@@ -52,6 +52,8 @@ def _run_component_check_isolated(
             str(spec.intermediate_size),
             "--num-attention-heads",
             str(spec.num_attention_heads),
+            "--input-boundary",
+            spec.input_boundary,
             "--seed",
             str(seed),
             "--repeats",

@@ -98,3 +98,21 @@ def test_gemm_only_dispatch_count_uses_batched_attention():
 
     block_count = spec.seq_len // pattern.query_block_size
     assert pattern.get_benchmark_metadata()["npu_dispatch_count"] == 5 * block_count
+
+
+def test_gemm_only_hidden_state_boundary_adds_projection_gemms():
+    spec = TransformerLayerSpec(
+        seq_len=256,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_attention_heads=12,
+        input_boundary="hidden_states",
+    )
+
+    pattern = GemmOnlyPattern(spec)
+
+    assert pattern.q_proj is not None
+    assert pattern.k_proj is not None
+    assert pattern.v_proj is not None
+    assert pattern.get_benchmark_metadata()["npu_unique_xclbin_count"] == 1
+    assert pattern.get_benchmark_metadata()["npu_dispatch_count"] == 8

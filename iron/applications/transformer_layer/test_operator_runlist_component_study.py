@@ -69,11 +69,11 @@ def test_run_component_study_tags_case_metadata_and_writes_csv(monkeypatch, tmp_
         {
             "study_cases": [
                 {
-                    "case_id": "dense_4b_class",
-                    "case_label": "dense_4b_class",
+                    "case_id": "dense_8b_class",
+                    "case_label": "dense_8b_class",
                     "layer_spec": {
-                        "hidden_size": 2560,
-                        "intermediate_size": 10240,
+                        "hidden_size": 4096,
+                        "intermediate_size": 14336,
                         "num_attention_heads": 32,
                         "batch_size": 1,
                         "seq_len": 128,
@@ -97,7 +97,7 @@ def test_run_component_study_tags_case_metadata_and_writes_csv(monkeypatch, tmp_
     )
 
     assert len(rows) == 1
-    assert rows[0]["study_case_id"] == "dense_4b_class"
-    assert rows[0]["hidden_size"] == 2560
-    assert rows[0]["attention_head_size"] == 80
+    assert rows[0]["study_case_id"] == "dense_8b_class"
+    assert rows[0]["hidden_size"] == 4096
+    assert rows[0]["attention_head_size"] == 128
     assert output_csv.exists()

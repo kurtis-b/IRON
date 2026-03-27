@@ -24,6 +24,7 @@ class TransformerLayerSpec:
     use_bias: bool = False
     layer_norm_eps: float = 1.0e-12
     attention_mask_mode: str = "none"
+    input_boundary: str = "post_projection"
     weights_source: str = "synthetic"
     source_model_name: str | None = None
     source_layer_index: int | None = None
@@ -47,6 +48,8 @@ class TransformerLayerSpec:
             raise ValueError("Only gelu is currently supported")
         if self.attention_mask_mode not in {"none"}:
             raise ValueError("Only attention_mask_mode='none' is currently supported")
+        if self.input_boundary not in {"post_projection", "hidden_states"}:
+            raise ValueError("input_boundary must be post_projection or hidden_states")
         if self.weights_source not in {"synthetic", "imported"}:
             raise ValueError("weights_source must be synthetic or imported")
         if self.weights_source == "synthetic":

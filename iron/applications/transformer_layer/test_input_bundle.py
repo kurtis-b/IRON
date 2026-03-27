@@ -18,6 +18,23 @@ def test_make_synthetic_layer_inputs_matches_spec_shapes():
     inputs.validate(spec)
 
 
+def test_make_synthetic_layer_inputs_matches_hidden_state_boundary_shapes():
+    spec = TransformerLayerSpec(
+        seq_len=64,
+        hidden_size=768,
+        num_attention_heads=12,
+        input_boundary="hidden_states",
+    )
+    inputs = make_synthetic_layer_inputs(spec, seed=0)
+
+    assert inputs.hidden_states.shape == (1, 64, 768)
+    assert inputs.r.shape == (1, 64, 768)
+    assert inputs.q is None
+    assert inputs.k is None
+    assert inputs.v is None
+    inputs.validate(spec)
+
+
 def test_make_synthetic_layer_inputs_is_deterministic():
     spec = TransformerLayerSpec(seq_len=64)
     first = make_synthetic_layer_inputs(spec, seed=7)
@@ -41,3 +58,12 @@ def test_make_synthetic_layer_weights_are_post_projection_only():
     assert "ffn_down_weight" in weights
     assert "ln1_weight" in weights
     assert "ln2_weight" in weights
+
+
+def test_make_synthetic_layer_weights_include_projection_weights_for_hidden_states():
+    spec = TransformerLayerSpec(seq_len=64, input_boundary="hidden_states")
+    weights = make_synthetic_layer_weights(spec, seed=0)
+
+    assert "q_proj_weight" in weights
+    assert "k_proj_weight" in weights
+    assert "v_proj_weight" in weights

@@ -107,6 +107,7 @@ def validate_pattern_parity(
     return {
         "study_id": study_id,
         "execution_mode": execution_mode,
+        "input_boundary": spec.input_boundary,
         "seq_len": spec.seq_len,
         "hidden_size": spec.hidden_size,
         "intermediate_size": spec.intermediate_size,
@@ -161,6 +162,11 @@ def parse_args():
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--intermediate-size", type=int, default=3072)
     parser.add_argument("--num-attention-heads", type=int, default=12)
+    parser.add_argument(
+        "--input-boundary",
+        choices=("post_projection", "hidden_states"),
+        default="post_projection",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-csv", default=None)
     return parser.parse_args()
@@ -175,6 +181,7 @@ def main():
             hidden_size=args.hidden_size,
             intermediate_size=args.intermediate_size,
             num_attention_heads=args.num_attention_heads,
+            input_boundary=args.input_boundary,
             use_bias=False,
             weights_source="synthetic",
         ),

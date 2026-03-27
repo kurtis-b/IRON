@@ -81,3 +81,16 @@ def test_operator_runlist_validation_component_case_uses_component_boundary_shap
         spec.num_attention_heads * spec.seq_len,
         spec.seq_len,
     )
+
+
+def test_operator_runlist_hidden_state_boundary_adds_projection_gemms():
+    spec = TransformerLayerSpec(seq_len=64, input_boundary="hidden_states")
+    pattern = OperatorRunlistPattern(spec)
+    pattern.assign_weights(make_synthetic_layer_weights(spec, seed=0))
+
+    assert pattern.q_proj is not None
+    assert pattern.k_proj is not None
+    assert pattern.v_proj is not None
+    metadata = pattern.get_benchmark_metadata()
+    assert metadata["npu_dispatch_count"] == len(pattern.encoder_runlist.runlist) + 3
+    assert metadata["npu_unique_xclbin_count"] >= 1

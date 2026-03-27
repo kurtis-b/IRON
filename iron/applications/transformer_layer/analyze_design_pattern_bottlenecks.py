@@ -14,6 +14,8 @@ from iron.applications.transformer_layer.benchmark_common import write_dict_rows
 
 COMPONENT_FIELDS = {
     "encoder_pipeline": "avg_encoder_pipeline_latency_ms",
+    "host_projection": "avg_host_projection_latency_ms",
+    "npu_projection": "avg_npu_projection_latency_ms",
     "npu_gemm": "avg_npu_gemm_latency_ms",
     "operator_runlist": "avg_operator_runlist_latency_ms",
     "host_preprocess": "avg_host_preprocess_latency_ms",

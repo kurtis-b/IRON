@@ -1,0 +1,48 @@
+{
+  "study_cases": [
+    {
+      "case_id": "baseline_768",
+      "case_label": "baseline_768",
+      "layer_spec": {
+        "hidden_size": 768,
+        "intermediate_size": 3072,
+        "num_attention_heads": 12,
+        "batch_size": 1,
+        "seq_len": 128,
+        "dtype": "bfloat16",
+        "activation": "gelu",
+        "use_bias": false,
+        "layer_norm_eps": 1e-12,
+        "attention_mask_mode": "none",
+        "input_boundary": "hidden_states",
+        "weights_source": "synthetic",
+        "source_model_name": null,
+        "source_layer_index": null
+      }
+    },
+    {
+      "case_id": "baseline_1024",
+      "case_label": "baseline_1024",
+      "layer_spec": {
+        "hidden_size": 1024,
+        "intermediate_size": 4096,
+        "num_attention_heads": 16,
+        "batch_size": 1,
+        "seq_len": 128,
+        "dtype": "bfloat16",
+        "activation": "gelu",
+        "use_bias": false,
+        "layer_norm_eps": 1e-12,
+        "attention_mask_mode": "none",
+        "input_boundary": "hidden_states",
+        "weights_source": "synthetic",
+        "source_model_name": null,
+        "source_layer_index": null
+      }
+    }
+  ],
+  "seq_lens": [4096, 8192, 16384],
+  "targets": "q_proj,k_proj,v_proj,attn_scores,attn_softmax,ln2",
+  "repeats": 3,
+  "output_csv": "../results/operator_runlist_component_long_seq_with_projection.csv"
+}
