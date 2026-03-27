@@ -155,16 +155,33 @@ That shared schema is the basis for:
 
 ## Power Collection
 
-NPU pattern runs use the generic power monitor abstraction in [benchmark_power.py](/home/cj/iron/iron/applications/transformer_layer/benchmark_power.py). The AMD GPU path uses [gpu_power.py](/home/cj/iron/iron/applications/transformer_layer/gpu_power.py) and `rocm-smi`.
+NPU pattern runs use the generic power monitor abstraction in [benchmark_power.py](/home/cj/iron/iron/applications/transformer_layer/benchmark_power.py). The AMD GPU/iGPU path uses [gpu_power.py](/home/cj/iron/iron/applications/transformer_layer/gpu_power.py) and `rocm-smi`.
 
 Power methodology rules:
 
-- collect average and max power over the timed region
+- for NPU rows, sample package power with `sudo -n turbostat --quiet --Summary --show PkgWatt`
+- measure a quiescent package-power baseline immediately before each timed benchmark row
+- report pseudo-NPU power as `max(package_power - quiescent_baseline, 0)`
+- keep the configured sample interval as a ceiling, then adapt downward for short timed windows so the monitor still collects multiple samples without oversampling long runs
+- perform NPU and iGPU power collection on a separate same-workload probe window so the latency loop remains minimally invasive
+- allow the minimum probe window to drop below `0.5s`; the current retained floor is `0.25s`
+- for iGPU rows, collect average and max power over the timed region with `rocm-smi`
 - derive `energy_j` from average power and timed duration
-- leave power fields empty when no backend-specific monitor is active
+- leave power fields empty only when no backend-specific monitor is active
 
-The GPU/iGPU comparison should use `power_backend=rocm-smi` when energy or
-efficiency is part of the figure set.
+The retained unattended full-study flow is [run_study_pipeline.py](/home/cj/iron/iron/applications/transformer_layer/run_study_pipeline.py), driven by [full_study_pipeline.json](/home/cj/iron/iron/applications/transformer_layer/study/full_study_pipeline.json). That runner also supports a smoke mode that skips power cycling but still measures NPU pseudo-power and iGPU power.
+
+For unattended thermal reset, the pipeline power-cycles between benchmark-producing
+steps only. It supports either one `power_cycle.command` or a structured
+`power_cycle.off_command` / `power_cycle.on_command` sequence, then waits for
+`k10temp` `Tctl` to recover to within `5%` of the initial captured package
+temperature or until the configured timeout expires. The checked-in pipeline
+config now points at a systemd service entrypoint:
+
+- `sudo -n systemctl start transformer-layer-power-cycle.service`
+
+The service template and env-file example live under
+[systemd/](/home/cj/iron/iron/applications/transformer_layer/systemd).
 
 ## Roofline Method
 
@@ -415,16 +432,20 @@ These are averages over timed runs only. They are emitted when a pattern exposes
 
 | Column | Meaning / Computation |
 | --- | --- |
+| `power_backend` | Backend used to collect power, e.g. `turbostat_pkgwatt` or `rocm-smi`. |
+| `raw_package_avg_power_w` | Raw average package power for NPU rows before subtracting the quiescent baseline. |
+| `raw_package_max_power_w` | Raw max package power for NPU rows before subtracting the quiescent baseline. |
+| `quiescent_package_power_w` | Per-row idle package-power baseline used for pseudo-NPU power. |
 | `avg_power_w` | Average sampled power over the timed region. |
 | `max_power_w` | Maximum sampled power over the timed region. |
 | `energy_j` | `avg_power_w * timed_total_sec`. |
+| `flops_per_joule` | `throughput_flops_per_sec / avg_power_w`. Equivalent to FLOPs per joule. |
+| `gflops_per_joule` | `flops_per_joule / 1e9`. |
 | `power_sample_count` | Number of power samples collected during the timed region. |
 
 For the current app:
 
-- NPU rows typically leave these fields empty because
-  [benchmark_power.py](/home/cj/iron/iron/applications/transformer_layer/benchmark_power.py)
-  is a null monitor on the retained NPU path.
+- NPU rows can populate them through the `turbostat_pkgwatt` pseudo-NPU path.
 - GPU/iGPU rows populate them when the compare run uses `power_backend=rocm-smi`.
 
 ### Parity Output Columns

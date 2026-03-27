@@ -243,6 +243,60 @@ python iron/applications/transformer_layer/gpu_compare_best_npu.py \
   --config iron/applications/transformer_layer/study/gpu_compare_embedding_igpu.json
 ```
 
+Full unattended study pipeline:
+
+```bash
+python iron/applications/transformer_layer/run_study_pipeline.py \
+  --config iron/applications/transformer_layer/study/full_study_pipeline.json
+```
+
+The pipeline runner power-cycles only between benchmark-producing steps, not
+between individual rows. The checked-in config supports either:
+
+- one `power_cycle.command`
+- or a structured `power_cycle.off_command` / `power_cycle.on_command` pair
+
+The checked-in pipeline config is now wired for a systemd-backed helper:
+
+- `power_cycle.command = ["sudo", "-n", "systemctl", "start", "transformer-layer-power-cycle.service"]`
+
+It still leaves `power_cycle.enabled=false` until the service is installed and
+the real environment-specific off/on commands are configured.
+
+Quick end-to-end smoke run without power cycling:
+
+```bash
+python iron/applications/transformer_layer/run_study_pipeline.py \
+  --config iron/applications/transformer_layer/study/full_study_pipeline.json \
+  --smoke \
+  --skip-power-cycle \
+  --warmup-runs 0 \
+  --runs-per-sample 1 \
+  --output-root /tmp/transformer_layer_pipeline_smoke
+```
+
+NPU power sampling uses `turbostat` package power with per-row quiescent
+baseline subtraction. The runtime chooses an adaptive sample interval: the
+configured interval is treated as a ceiling, and short timed windows sample
+faster down to a low floor so the run still produces multiple samples without
+sampling aggressively during long runs. Power is measured on a separate
+same-workload probe window so the latency loop stays minimally invasive. The
+minimum power-probe duration is no longer pinned to `0.5s`; the current floor
+is `0.25s`. The iGPU compare continues to use `rocm-smi`.
+
+Install the power-cycle helper service:
+
+```bash
+sudo cp iron/applications/transformer_layer/systemd/transformer-layer-power-cycle.service /etc/systemd/system/
+sudo cp iron/applications/transformer_layer/systemd/transformer-layer-power-cycle.env.example /etc/transformer-layer-power-cycle.env
+sudoedit /etc/transformer-layer-power-cycle.env
+sudo systemctl daemon-reload
+sudo systemctl start transformer-layer-power-cycle.service
+```
+
+After the service works on the host, set `"power_cycle.enabled": true` in
+[full_study_pipeline.json](/home/cj/iron/iron/applications/transformer_layer/study/full_study_pipeline.json).
+
 Thesis plotting:
 
 ```bash
@@ -286,6 +340,7 @@ Checked-in manifests and scaffolds:
 - [operator_runlist_component_long_seq_with_projection.json](/home/cj/iron/iron/applications/transformer_layer/study/operator_runlist_component_long_seq_with_projection.json)
 - [gpu_compare.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare.json)
 - [gpu_compare_embedding_igpu.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare_embedding_igpu.json)
+- [full_study_pipeline.json](/home/cj/iron/iron/applications/transformer_layer/study/full_study_pipeline.json)
 - [programmability_debug_log.csv](/home/cj/iron/iron/applications/transformer_layer/study/programmability_debug_log.csv)
 - [design_pattern_considerations.md](/home/cj/iron/iron/applications/transformer_layer/docs/design_pattern_considerations.md)
 - [programmability_debugging.md](/home/cj/iron/iron/applications/transformer_layer/docs/programmability_debugging.md)
