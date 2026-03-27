@@ -15,6 +15,7 @@ SERIES_COLORS = {
     "gemm_only": "#c84c09",
     "operator_runlist": "#1d4ed8",
     "amd_gpu_reference": "#7c3aed",
+    "amd_igpu_reference": "#7c3aed",
     "best_npu": "#111827",
 }
 
@@ -54,18 +55,26 @@ def _gpu_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     return [row for row in rows if row.get("backend") == "gpu"]
 
 
+def _completed_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [
+        row for row in rows if row.get("run_status") in (None, "", "None", "completed")
+    ]
+
+
 def _series_by_execution_mode(
     rows: list[dict[str, str]],
     value_key: str,
+    *,
+    x_key: str = "seq_len",
 ) -> dict[str, list[tuple[int, float]]]:
     series: dict[str, list[tuple[int, float]]] = {}
     for row in rows:
         execution_mode = str(row.get("execution_mode"))
-        seq_len = _optional_int(row.get("seq_len"))
+        x_value = _optional_int(row.get(x_key))
         value = _optional_float(row.get(value_key))
-        if execution_mode in ("", "None") or seq_len is None or value is None:
+        if execution_mode in ("", "None") or x_value is None or value is None:
             continue
-        series.setdefault(execution_mode, []).append((seq_len, value))
+        series.setdefault(execution_mode, []).append((x_value, value))
     for execution_mode in series:
         series[execution_mode].sort(key=lambda item: item[0])
     return series
@@ -84,39 +93,67 @@ def _efficiency_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     return derived
 
 
-def _best_npu_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
-    best_by_seq: dict[int, dict[str, str]] = {}
-    for row in _npu_rows(rows):
-        seq_len = _optional_int(row.get("seq_len"))
+def _best_npu_rows(
+    rows: list[dict[str, str]],
+    *,
+    group_keys: tuple[str, ...] = ("seq_len",),
+) -> list[dict[str, str]]:
+    best_by_group: dict[tuple[object, ...], dict[str, str]] = {}
+    for row in _npu_rows(_completed_rows(rows)):
+        group = []
+        for key in group_keys:
+            value = row.get(key)
+            if key == "study_case_id" and value in (None, "", "None"):
+                value = "default"
+            group.append(value)
+        group = tuple(group)
         latency = _optional_float(row.get("avg_latency_ms"))
-        if seq_len is None or latency is None:
+        if any(value in (None, "", "None") for value in group) or latency is None:
             continue
-        current = best_by_seq.get(seq_len)
+        current = best_by_group.get(group)
         if current is None or latency < _optional_float(current.get("avg_latency_ms")):
-            best_by_seq[seq_len] = dict(row)
+            best_by_group[group] = dict(row)
     output = []
-    for seq_len in sorted(best_by_seq):
-        row = dict(best_by_seq[seq_len])
+    for group in sorted(best_by_group):
+        row = dict(best_by_group[group])
         row["execution_mode"] = "best_npu"
         row["pattern_label"] = f"best_npu({row.get('pattern_label')})"
         output.append(row)
     return output
 
 
+def _facet_groups(
+    rows: list[dict[str, str]],
+    facet_key: str | None,
+) -> list[tuple[str, list[dict[str, str]]]]:
+    if facet_key is None:
+        return [("all", rows)]
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        raw_value = row.get(facet_key)
+        label = "unknown" if raw_value in (None, "", "None") else str(raw_value)
+        grouped.setdefault(label, []).append(row)
+    if len(grouped) <= 1:
+        return [("all", rows)]
+    return sorted(grouped.items())
+
+
 def _bottleneck_series(
     rows: list[dict[str, str]],
+    *,
+    x_key: str = "seq_len",
 ) -> tuple[dict[str, list[tuple[int, float]]], dict[tuple[str, int], str]]:
     series: dict[str, list[tuple[int, float]]] = {}
     labels: dict[tuple[str, int], str] = {}
     for row in rows:
         execution_mode = str(row.get("execution_mode"))
-        seq_len = _optional_int(row.get("seq_len"))
+        x_value = _optional_int(row.get(x_key))
         fraction = _optional_float(row.get("dominant_component_fraction"))
         component = row.get("dominant_component")
-        if execution_mode in ("", "None") or seq_len is None or fraction is None:
+        if execution_mode in ("", "None") or x_value is None or fraction is None:
             continue
-        series.setdefault(execution_mode, []).append((seq_len, fraction))
-        labels[(execution_mode, seq_len)] = str(component)
+        series.setdefault(execution_mode, []).append((x_value, fraction))
+        labels[(execution_mode, x_value)] = str(component)
     for execution_mode in series:
         series[execution_mode].sort(key=lambda item: item[0])
     return series, labels
@@ -358,6 +395,16 @@ def _chart_output_name(title: str) -> str:
     return title.lower().replace(" ", "_").replace("/", "_") + ".svg"
 
 
+def _sanitize_suffix(value: str) -> str:
+    return (
+        value.lower()
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+
 def _render_index_html(study_title: str, sections: list[tuple[str, list[str]]]) -> str:
     lines = [
         "<!DOCTYPE html>",
@@ -393,86 +440,127 @@ def generate_plots(
     output_dir: str | Path,
     bottleneck_csv: str | Path | None = None,
     gpu_compare_csv: str | Path | None = None,
+    x_axis: str = "seq_len",
 ) -> dict[str, list[str]]:
     suite_rows = _load_csv_rows(input_csv)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    npu_rows = _npu_rows(suite_rows)
+    completed_suite_rows = _completed_rows(suite_rows)
+    npu_rows = _npu_rows(completed_suite_rows)
     sections: dict[str, list[str]] = {"main": [], "gpu_compare": []}
+    if x_axis not in {"seq_len", "hidden_size"}:
+        raise ValueError(f"Unsupported x_axis: {x_axis}")
+    x_label = "Sequence Length" if x_axis == "seq_len" else "Hidden Size"
+    facet_key = "study_case_label" if x_axis == "seq_len" else "seq_len"
 
+    axis_suffix = "Sequence Length" if x_axis == "seq_len" else "Hidden Size"
     main_specs = [
-        ("Latency By Sequence Length", "avg_latency_ms", "Latency (ms)"),
+        (f"Latency By {axis_suffix}", "avg_latency_ms", "Latency (ms)"),
         (
-            "Throughput By Sequence Length",
+            f"Throughput By {axis_suffix}",
             "throughput_flops_per_sec",
             "Throughput (FLOP/s)",
         ),
-        ("Power By Sequence Length", "avg_power_w", "Power (W)"),
+        (f"Power By {axis_suffix}", "avg_power_w", "Power (W)"),
     ]
     for title, field_name, y_label in main_specs:
-        series = _series_by_execution_mode(npu_rows, field_name)
-        if not series:
-            continue
+        for facet_value, facet_rows in _facet_groups(npu_rows, facet_key):
+            series = _series_by_execution_mode(facet_rows, field_name, x_key=x_axis)
+            if not series:
+                continue
+            chart_title = title if facet_value == "all" else f"{title}: {facet_value}"
+            file_name = _chart_output_name(chart_title)
+            _write_text(
+                output_path / file_name,
+                _line_chart_svg(
+                    title=chart_title,
+                    x_label=x_label,
+                    y_label=y_label,
+                    series=series,
+                ),
+            )
+            sections["main"].append(file_name)
+
+    efficiency_series = _series_by_execution_mode(
+        _efficiency_rows(npu_rows),
+        "flops_per_joule",
+        x_key=x_axis,
+    )
+    if efficiency_series and facet_key is None:
+        title = f"Energy Efficiency By {axis_suffix}"
         file_name = _chart_output_name(title)
         _write_text(
             output_path / file_name,
             _line_chart_svg(
                 title=title,
-                x_label="Sequence Length",
-                y_label=y_label,
-                series=series,
-            ),
-        )
-        sections["main"].append(file_name)
-
-    efficiency_series = _series_by_execution_mode(
-        _efficiency_rows(npu_rows),
-        "flops_per_joule",
-    )
-    if efficiency_series:
-        file_name = _chart_output_name("Energy Efficiency By Sequence Length")
-        _write_text(
-            output_path / file_name,
-            _line_chart_svg(
-                title="Energy Efficiency By Sequence Length",
-                x_label="Sequence Length",
+                x_label=x_label,
                 y_label="Efficiency (FLOP/J)",
                 series=efficiency_series,
             ),
         )
         sections["main"].append(file_name)
+    elif facet_key is not None:
+        for facet_value, facet_rows in _facet_groups(npu_rows, facet_key):
+            efficiency_series = _series_by_execution_mode(
+                _efficiency_rows(facet_rows),
+                "flops_per_joule",
+                x_key=x_axis,
+            )
+            if not efficiency_series:
+                continue
+            chart_title = f"Energy Efficiency By {axis_suffix}: {facet_value}"
+            file_name = _chart_output_name(chart_title)
+            _write_text(
+                output_path / file_name,
+                _line_chart_svg(
+                    title=chart_title,
+                    x_label=x_label,
+                    y_label="Efficiency (FLOP/J)",
+                    series=efficiency_series,
+                ),
+            )
+            sections["main"].append(file_name)
 
     for title, field_name in [
-        ("Percent Of Peak By Sequence Length", "backend_pct_of_peak"),
-        ("Percent Of Roofline By Sequence Length", "roofline_pct"),
+        (f"Percent Of Peak By {axis_suffix}", "backend_pct_of_peak"),
+        (f"Percent Of Roofline By {axis_suffix}", "roofline_pct"),
     ]:
-        series = _series_by_execution_mode(npu_rows, field_name)
-        if not series:
-            continue
-        file_name = _chart_output_name(title)
-        _write_text(
-            output_path / file_name,
-            _line_chart_svg(
-                title=title,
-                x_label="Sequence Length",
-                y_label="Fraction",
-                series=series,
-                percent_axis=True,
-            ),
-        )
-        sections["main"].append(file_name)
+        for facet_value, facet_rows in _facet_groups(npu_rows, facet_key):
+            series = _series_by_execution_mode(facet_rows, field_name, x_key=x_axis)
+            if not series:
+                continue
+            chart_title = title if facet_value == "all" else f"{title}: {facet_value}"
+            file_name = _chart_output_name(chart_title)
+            _write_text(
+                output_path / file_name,
+                _line_chart_svg(
+                    title=chart_title,
+                    x_label=x_label,
+                    y_label="Fraction",
+                    series=series,
+                    percent_axis=True,
+                ),
+            )
+            sections["main"].append(file_name)
 
     if bottleneck_csv is not None and Path(bottleneck_csv).exists():
-        bottleneck_rows = _load_csv_rows(bottleneck_csv)
-        series, labels = _bottleneck_series(bottleneck_rows)
-        if series:
-            file_name = _chart_output_name("Bottleneck Breakdown")
+        bottleneck_rows = _completed_rows(_load_csv_rows(bottleneck_csv))
+        for facet_value, facet_rows in _facet_groups(bottleneck_rows, facet_key):
+            series, labels = _bottleneck_series(facet_rows, x_key=x_axis)
+            if not series:
+                continue
+            chart_title = (
+                "Bottleneck Breakdown"
+                if facet_value == "all"
+                else f"Bottleneck Breakdown: {facet_value}"
+            )
+            file_name = _chart_output_name(chart_title)
             _write_text(
                 output_path / file_name,
                 _grouped_bar_svg(
-                    title="Bottleneck Breakdown",
-                    x_label="Sequence Length",
+                    title=chart_title,
+                    x_label=x_label,
                     y_label="Dominant Component Fraction",
                     series=series,
                     label_lookup=labels,
@@ -481,40 +569,64 @@ def generate_plots(
             )
             sections["main"].append(file_name)
 
-    compare_rows = _best_npu_rows(suite_rows)
+    compare_rows = _best_npu_rows(
+        suite_rows,
+        group_keys=("study_case_id", x_axis),
+    )
     if gpu_compare_csv is not None and Path(gpu_compare_csv).exists():
-        compare_rows.extend(_gpu_rows(_load_csv_rows(gpu_compare_csv)))
+        compare_rows.extend(_gpu_rows(_completed_rows(_load_csv_rows(gpu_compare_csv))))
     else:
-        compare_rows.extend(_gpu_rows(suite_rows))
+        compare_rows.extend(_gpu_rows(_completed_rows(suite_rows)))
 
-    for title, field_name, y_label in [
-        ("Best NPU Vs AMD GPU Latency", "avg_latency_ms", "Latency (ms)"),
-        (
-            "Best NPU Vs AMD GPU Throughput",
-            "throughput_flops_per_sec",
-            "Throughput (FLOP/s)",
-        ),
-    ]:
-        series = _series_by_execution_mode(compare_rows, field_name)
-        if not series or "amd_gpu_reference" not in series or "best_npu" not in series:
-            continue
-        file_name = _chart_output_name(title)
-        _write_text(
-            output_path / file_name,
-            _line_chart_svg(
-                title=title,
-                x_label="Sequence Length",
-                y_label=y_label,
-                series={key: series[key] for key in ("best_npu", "amd_gpu_reference")},
+    compare_gpu_modes = sorted(
+        {
+            row["execution_mode"]
+            for row in compare_rows
+            if row.get("backend") == "gpu"
+            and row.get("execution_mode") not in (None, "", "None")
+        }
+    )
+    compare_title_map = {
+        "amd_gpu_reference": "AMD GPU",
+        "amd_igpu_reference": "AMD iGPU",
+    }
+    for gpu_mode in compare_gpu_modes:
+        for title, field_name, y_label in [
+            (
+                f"Best NPU Vs {compare_title_map.get(gpu_mode, gpu_mode)} Latency",
+                "avg_latency_ms",
+                "Latency (ms)",
             ),
-        )
-        sections["gpu_compare"].append(file_name)
+            (
+                f"Best NPU Vs {compare_title_map.get(gpu_mode, gpu_mode)} Throughput",
+                "throughput_flops_per_sec",
+                "Throughput (FLOP/s)",
+            ),
+        ]:
+            for facet_value, facet_rows in _facet_groups(compare_rows, facet_key):
+                series = _series_by_execution_mode(facet_rows, field_name, x_key=x_axis)
+                if not series or gpu_mode not in series or "best_npu" not in series:
+                    continue
+                chart_title = (
+                    title if facet_value == "all" else f"{title}: {facet_value}"
+                )
+                file_name = _chart_output_name(chart_title)
+                _write_text(
+                    output_path / file_name,
+                    _line_chart_svg(
+                        title=chart_title,
+                        x_label=x_label,
+                        y_label=y_label,
+                        series={key: series[key] for key in ("best_npu", gpu_mode)},
+                    ),
+                )
+                sections["gpu_compare"].append(file_name)
 
     index_html = _render_index_html(
         study_title=f"Transformer Layer Thesis Plots: {Path(input_csv).stem}",
         sections=[
             ("Main NPU Study", sections["main"]),
-            ("Best NPU vs AMD GPU", sections["gpu_compare"]),
+            ("Best NPU vs GPU", sections["gpu_compare"]),
         ],
     )
     _write_text(output_path / "index.html", index_html)
@@ -529,6 +641,9 @@ def parse_args():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--bottleneck-csv", default=None)
     parser.add_argument("--gpu-compare-csv", default=None)
+    parser.add_argument(
+        "--x-axis", choices=("seq_len", "hidden_size"), default="seq_len"
+    )
     return parser.parse_args()
 
 
@@ -539,6 +654,7 @@ def main():
         output_dir=args.output_dir,
         bottleneck_csv=args.bottleneck_csv,
         gpu_compare_csv=args.gpu_compare_csv,
+        x_axis=args.x_axis,
     )
 
 

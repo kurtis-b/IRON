@@ -178,6 +178,129 @@ def _write_fixture_gpu(path: Path):
     )
 
 
+def _write_fixture_embedding_suite(path: Path):
+    write_results_csv(
+        path,
+        [
+            {
+                "study_id": "embedding_scale",
+                "study_case_id": "baseline_768",
+                "study_case_label": "baseline_768",
+                "backend": "npu",
+                "execution_mode": "encoder_pipeline",
+                "pattern_label": "encoder_pipeline",
+                "seq_len": 64,
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_attention_heads": 12,
+                "attention_head_size": 64,
+                "batch_size": 1,
+                "dtype": "bfloat16",
+                "use_bias": False,
+                "weights_source": "synthetic",
+                "source_model_name": None,
+                "source_layer_index": None,
+                "warmup_runs": 1,
+                "runs_per_sample": 1,
+                "measured_inference_count": 1,
+                "timed_total_sec": 1.0,
+                "avg_latency_ms": 10.0,
+                "throughput_flops_per_sec": 100.0,
+                "estimated_flops_per_inference": 10.0,
+                "estimated_bytes_per_inference": 5.0,
+                "operational_intensity_flops_per_byte": 2.0,
+                "backend_peak_ops_per_sec": 200.0,
+                "roofline_bound_ops_per_sec": 150.0,
+                "backend_pct_of_peak": 0.5,
+                "roofline_pct": 0.66,
+                "avg_power_w": 20.0,
+                "max_power_w": 22.0,
+                "energy_j": 2.0,
+                "power_sample_count": 3,
+                "run_status": "completed",
+            },
+            {
+                "study_id": "embedding_scale",
+                "study_case_id": "dense_4b_class",
+                "study_case_label": "dense_4b_class",
+                "backend": "npu",
+                "execution_mode": "gemm_only",
+                "pattern_label": "gemm_only",
+                "seq_len": 64,
+                "hidden_size": 2560,
+                "intermediate_size": 10240,
+                "num_attention_heads": 32,
+                "attention_head_size": 80,
+                "batch_size": 1,
+                "dtype": "bfloat16",
+                "use_bias": False,
+                "weights_source": "synthetic",
+                "source_model_name": None,
+                "source_layer_index": None,
+                "warmup_runs": 1,
+                "runs_per_sample": 1,
+                "measured_inference_count": 1,
+                "timed_total_sec": 1.0,
+                "avg_latency_ms": 12.0,
+                "throughput_flops_per_sec": 120.0,
+                "estimated_flops_per_inference": 10.0,
+                "estimated_bytes_per_inference": 5.0,
+                "operational_intensity_flops_per_byte": 2.0,
+                "backend_peak_ops_per_sec": 200.0,
+                "roofline_bound_ops_per_sec": 150.0,
+                "backend_pct_of_peak": 0.6,
+                "roofline_pct": 0.8,
+                "avg_power_w": 22.0,
+                "max_power_w": 24.0,
+                "energy_j": 2.2,
+                "power_sample_count": 3,
+                "run_status": "completed",
+            },
+        ],
+    )
+
+
+def _write_fixture_igpu(path: Path):
+    write_results_csv(
+        path,
+        [
+            {
+                "study_id": "gpu_compare_embedding_igpu",
+                "study_case_id": "baseline_768",
+                "study_case_label": "baseline_768",
+                "backend": "gpu",
+                "execution_mode": "amd_igpu_reference",
+                "pattern_label": "amd_igpu_reference",
+                "seq_len": 64,
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_attention_heads": 12,
+                "attention_head_size": 64,
+                "batch_size": 1,
+                "dtype": "bfloat16",
+                "use_bias": False,
+                "weights_source": "synthetic",
+                "source_model_name": None,
+                "source_layer_index": None,
+                "warmup_runs": 1,
+                "runs_per_sample": 1,
+                "measured_inference_count": 1,
+                "timed_total_sec": 1.0,
+                "avg_latency_ms": 5.0,
+                "throughput_flops_per_sec": 150.0,
+                "estimated_flops_per_inference": 10.0,
+                "estimated_bytes_per_inference": 5.0,
+                "operational_intensity_flops_per_byte": 2.0,
+                "avg_power_w": 17.0,
+                "max_power_w": 18.0,
+                "energy_j": 1.0,
+                "power_sample_count": 2,
+                "run_status": "completed",
+            }
+        ],
+    )
+
+
 def test_best_npu_rows_selects_lowest_latency_per_sequence_length():
     rows = [
         {
@@ -227,3 +350,24 @@ def test_generate_plots_writes_expected_svg_set(tmp_path):
     assert "Transformer Layer Thesis Plots" in (output_dir / "index.html").read_text(
         encoding="utf-8"
     )
+
+
+def test_generate_plots_supports_hidden_size_axis_and_igpu_compare(tmp_path):
+    suite_csv = tmp_path / "embedding_suite.csv"
+    gpu_csv = tmp_path / "igpu.csv"
+    output_dir = tmp_path / "embedding_plots"
+    _write_fixture_embedding_suite(suite_csv)
+    _write_fixture_igpu(gpu_csv)
+
+    sections = generate_plots(
+        input_csv=suite_csv,
+        output_dir=output_dir,
+        gpu_compare_csv=gpu_csv,
+        x_axis="hidden_size",
+    )
+
+    assert any("latency_by_hidden_size" in name for name in sections["main"])
+    assert any(
+        "best_npu_vs_amd_igpu_latency" in name for name in sections["gpu_compare"]
+    )
+    assert (output_dir / "index.html").exists()

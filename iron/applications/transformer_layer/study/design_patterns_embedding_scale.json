@@ -1,0 +1,106 @@
+{
+  "study_id": "design_patterns_embedding_scale",
+  "description": "Embedding-scale thesis sweep through dense_8b_class with explicit unsupported rows.",
+  "study_cases": [
+    {
+      "case_id": "baseline_768",
+      "case_label": "baseline_768",
+      "layer_spec": {
+        "hidden_size": 768,
+        "intermediate_size": 3072,
+        "num_attention_heads": 12,
+        "batch_size": 1,
+        "seq_len": 128,
+        "dtype": "bfloat16",
+        "activation": "gelu",
+        "use_bias": false,
+        "layer_norm_eps": 1e-12,
+        "attention_mask_mode": "none",
+        "weights_source": "synthetic",
+        "source_model_name": null,
+        "source_layer_index": null
+      }
+    },
+    {
+      "case_id": "baseline_1024",
+      "case_label": "baseline_1024",
+      "layer_spec": {
+        "hidden_size": 1024,
+        "intermediate_size": 4096,
+        "num_attention_heads": 16,
+        "batch_size": 1,
+        "seq_len": 128,
+        "dtype": "bfloat16",
+        "activation": "gelu",
+        "use_bias": false,
+        "layer_norm_eps": 1e-12,
+        "attention_mask_mode": "none",
+        "weights_source": "synthetic",
+        "source_model_name": null,
+        "source_layer_index": null
+      }
+    },
+    {
+      "case_id": "dense_4b_class",
+      "case_label": "dense_4b_class",
+      "layer_spec": {
+        "hidden_size": 2560,
+        "intermediate_size": 10240,
+        "num_attention_heads": 32,
+        "batch_size": 1,
+        "seq_len": 128,
+        "dtype": "bfloat16",
+        "activation": "gelu",
+        "use_bias": false,
+        "layer_norm_eps": 1e-12,
+        "attention_mask_mode": "none",
+        "weights_source": "synthetic",
+        "source_model_name": null,
+        "source_layer_index": null
+      }
+    },
+    {
+      "case_id": "dense_8b_class",
+      "case_label": "dense_8b_class",
+      "layer_spec": {
+        "hidden_size": 4096,
+        "intermediate_size": 14336,
+        "num_attention_heads": 32,
+        "batch_size": 1,
+        "seq_len": 128,
+        "dtype": "bfloat16",
+        "activation": "gelu",
+        "use_bias": false,
+        "layer_norm_eps": 1e-12,
+        "attention_mask_mode": "none",
+        "weights_source": "synthetic",
+        "source_model_name": null,
+        "source_layer_index": null
+      }
+    }
+  ],
+  "execution_modes": [
+    "encoder_pipeline",
+    "gemm_only",
+    "operator_runlist"
+  ],
+  "seq_lens": [64, 128, 256, 512],
+  "warmup_runs": 5,
+  "runs_per_sample": 20,
+  "sampling_schedule": {
+    "64": { "warmup_runs": 8, "runs_per_sample": 40 },
+    "128": { "warmup_runs": 8, "runs_per_sample": 40 },
+    "256": { "warmup_runs": 6, "runs_per_sample": 30 },
+    "512": { "warmup_runs": 5, "runs_per_sample": 20 }
+  },
+  "continue_on_error": true,
+  "output_csv": "../results/design_patterns_embedding_scale.csv",
+  "debug_log_csv": "../results/design_patterns_embedding_scale_debug_log.csv",
+  "peak_reference": "../config/peak_references.json",
+  "annotated_output_csv": "../results/design_patterns_embedding_scale_annotated.csv",
+  "support_matrix_csv": "../results/design_patterns_embedding_scale_support_matrix.csv",
+  "support_matrix_text": "../results/design_patterns_embedding_scale_support_matrix.txt",
+  "parity": {
+    "enabled": false
+  }
+}
