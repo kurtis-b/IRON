@@ -3,6 +3,8 @@ from iron.applications.transformer_layer.roofline import (
     annotate_result_row_with_peak,
     estimate_layer_bytes,
     estimate_layer_flops,
+    flops_per_joule,
+    gflops_per_joule,
     roofline_bound_ops_per_sec,
 )
 from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
@@ -31,6 +33,7 @@ def test_annotate_result_row_with_peak_fills_percent_fields():
         "estimated_flops_per_inference": 10.0,
         "estimated_bytes_per_inference": 5.0,
         "operational_intensity_flops_per_byte": 2.0,
+        "avg_power_w": 4.0,
     }
     peak = BackendPeakReference(
         backend="npu",
@@ -44,3 +47,10 @@ def test_annotate_result_row_with_peak_fills_percent_fields():
     assert annotated["roofline_bound_ops_per_sec"] == 16.0
     assert annotated["backend_pct_of_peak"] == 0.5
     assert annotated["roofline_pct"] == 1.25
+    assert annotated["flops_per_joule"] == 5.0
+    assert annotated["gflops_per_joule"] == 5.0e-09
+
+
+def test_energy_efficiency_helpers():
+    assert flops_per_joule(throughput_flops_per_sec=20.0, avg_power_w=4.0) == 5.0
+    assert gflops_per_joule(throughput_flops_per_sec=20.0, avg_power_w=4.0) == 5.0e-09

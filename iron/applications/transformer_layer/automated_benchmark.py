@@ -48,6 +48,21 @@ def parse_args():
     )
     parser.add_argument("--warmup-runs", type=int, default=None)
     parser.add_argument("--runs-per-sample", type=int, default=None)
+    parser.add_argument(
+        "--power-backend",
+        choices=("none", "turbostat_pkgwatt"),
+        default="none",
+    )
+    parser.add_argument(
+        "--power-sample-interval-sec",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--quiescent-baseline-duration-sec",
+        type=float,
+        default=0.5,
+    )
     parser.add_argument("--hidden-size", type=int, default=None)
     parser.add_argument("--intermediate-size", type=int, default=None)
     parser.add_argument("--num-attention-heads", type=int, default=None)
@@ -263,9 +278,15 @@ def _failure_result_row(
         "roofline_bound_ops_per_sec": None,
         "backend_pct_of_peak": None,
         "roofline_pct": None,
+        "power_backend": None,
+        "raw_package_avg_power_w": None,
+        "raw_package_max_power_w": None,
+        "quiescent_package_power_w": None,
         "avg_power_w": None,
         "max_power_w": None,
         "energy_j": None,
+        "flops_per_joule": None,
+        "gflops_per_joule": None,
         "power_sample_count": None,
         "run_status": run_status,
         "failure_component": event["component"],
@@ -408,6 +429,9 @@ def main():
                             runs_per_sample=runs_per_sample,
                             output_csv=output_csv,
                             seed=args.seed,
+                            power_backend=args.power_backend,
+                            power_sample_interval_sec=args.power_sample_interval_sec,
+                            quiescent_baseline_duration_sec=args.quiescent_baseline_duration_sec,
                             write_immediately=False,
                         )
                     except Exception as exc:

@@ -151,6 +151,52 @@ def test_manifest_override_flags_take_precedence(monkeypatch, tmp_path):
     assert calls[0]["runs_per_sample"] == 4
 
 
+def test_manifest_forwards_power_options(monkeypatch, tmp_path):
+    suite_csv = tmp_path / "suite.csv"
+    manifest = tmp_path / "study.json"
+    manifest.write_text(
+        (
+            "{"
+            '"study_id":"design_patterns_main",'
+            '"layer_spec":{"hidden_size":768,"intermediate_size":3072,"num_attention_heads":12,"batch_size":1,"seq_len":64,"dtype":"bfloat16","activation":"gelu","use_bias":false,"layer_norm_eps":1e-12,"attention_mask_mode":"none","weights_source":"synthetic","source_model_name":null,"source_layer_index":null},'
+            '"execution_modes":["encoder_pipeline"],'
+            '"seq_lens":[64],'
+            '"warmup_runs":1,'
+            '"runs_per_sample":1,'
+            f'"output_csv":"{suite_csv}"'
+            "}"
+        ),
+        encoding="utf-8",
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.automated_benchmark.benchmark_pattern",
+        lambda **kwargs: calls.append(kwargs) or [],
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "automated_benchmark.py",
+            "--study-manifest",
+            str(manifest),
+            "--power-backend",
+            "turbostat_pkgwatt",
+            "--power-sample-interval-sec",
+            "0.05",
+            "--quiescent-baseline-duration-sec",
+            "0.5",
+        ],
+    )
+
+    main()
+
+    assert len(calls) == 1
+    assert calls[0]["power_backend"] == "turbostat_pkgwatt"
+    assert calls[0]["power_sample_interval_sec"] == 0.05
+    assert calls[0]["quiescent_baseline_duration_sec"] == 0.5
+
+
 def test_manifest_can_request_annotated_output(monkeypatch, tmp_path):
     suite_csv = tmp_path / "suite.csv"
     annotated_csv = tmp_path / "suite_annotated.csv"

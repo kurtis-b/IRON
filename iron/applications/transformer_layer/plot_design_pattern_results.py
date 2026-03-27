@@ -83,12 +83,15 @@ def _series_by_execution_mode(
 def _efficiency_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     derived = []
     for row in rows:
-        energy_j = _optional_float(row.get("energy_j"))
-        flops = _optional_float(row.get("estimated_flops_per_inference"))
-        if energy_j in (None, 0.0) or flops is None:
-            continue
         derived_row = dict(row)
-        derived_row["flops_per_joule"] = str(flops / energy_j)
+        flops_per_joule = _optional_float(row.get("flops_per_joule"))
+        if flops_per_joule is None:
+            energy_j = _optional_float(row.get("energy_j"))
+            flops = _optional_float(row.get("estimated_flops_per_inference"))
+            if energy_j in (None, 0.0) or flops is None:
+                continue
+            flops_per_joule = flops / energy_j
+        derived_row["flops_per_joule"] = str(flops_per_joule)
         derived.append(derived_row)
     return derived
 

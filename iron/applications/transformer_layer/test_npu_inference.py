@@ -1,5 +1,6 @@
 import csv
 import json
+from contextlib import nullcontext
 from pathlib import Path
 import subprocess
 import sys
@@ -149,6 +150,24 @@ def test_benchmark_pattern_emits_expected_schema(monkeypatch, tmp_path):
             ),
         ),
     )
+
+    class _FakePowerMonitor:
+        def stats(self, elapsed_sec):
+            return {
+                "power_backend": "turbostat_pkgwatt",
+                "raw_package_avg_power_w": 24.0,
+                "raw_package_max_power_w": 27.0,
+                "quiescent_package_power_w": 10.0,
+                "avg_power_w": 14.0,
+                "max_power_w": 17.0,
+                "energy_j": 28.0,
+                "power_sample_count": 2,
+            }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.npu_inference.create_power_monitor",
+        lambda **kwargs: nullcontext(_FakePowerMonitor()),
+    )
     output_csv = tmp_path / "results.csv"
 
     rows = benchmark_pattern(
@@ -158,6 +177,7 @@ def test_benchmark_pattern_emits_expected_schema(monkeypatch, tmp_path):
         runs_per_sample=2,
         output_csv=str(output_csv),
         seed=0,
+        power_backend="turbostat_pkgwatt",
     )
 
     assert len(rows) == 1
@@ -169,6 +189,10 @@ def test_benchmark_pattern_emits_expected_schema(monkeypatch, tmp_path):
     assert row["avg_encoder_pipeline_latency_ms"] == pytest.approx(2.0)
     assert row["compile_setup_time_ms"] == 12.5
     assert row["npu_dispatch_count"] == 1
+    assert row["power_backend"] == "turbostat_pkgwatt"
+    assert row["avg_power_w"] == pytest.approx(14.0)
+    assert row["flops_per_joule"] is not None
+    assert row["gflops_per_joule"] is not None
     assert output_csv.exists()
 
 
@@ -177,11 +201,14 @@ def test_benchmark_pattern_runs_operator_runlist_in_child_process(
 ):
     spec = TransformerLayerSpec(seq_len=64)
 
-    def _fake_subprocess_run(command, cwd, check):
+    def _fake_subprocess_run(command, cwd, check, capture_output=None, text=None):
         request_path = Path(command[command.index("--request-json") + 1])
         response_path = Path(command[command.index("--response-json") + 1])
         request = json.loads(request_path.read_text())
         assert request["spec"]["seq_len"] == 64
+        assert request["power_backend"] == "turbostat_pkgwatt"
+        assert request["power_sample_interval_sec"] == 0.05
+        assert request["quiescent_baseline_duration_sec"] == 0.5
         response_path.write_text(
             json.dumps(
                 {
@@ -214,10 +241,16 @@ def test_benchmark_pattern_runs_operator_runlist_in_child_process(
                     "roofline_bound_ops_per_sec": None,
                     "backend_pct_of_peak": None,
                     "roofline_pct": None,
-                    "avg_power_w": None,
-                    "max_power_w": None,
-                    "energy_j": None,
-                    "power_sample_count": 0,
+                    "power_backend": "turbostat_pkgwatt",
+                    "raw_package_avg_power_w": 30.0,
+                    "raw_package_max_power_w": 35.0,
+                    "quiescent_package_power_w": 10.0,
+                    "avg_power_w": 20.0,
+                    "max_power_w": 25.0,
+                    "energy_j": 0.4,
+                    "flops_per_joule": 0.05,
+                    "gflops_per_joule": 5.0e-11,
+                    "power_sample_count": 2,
                 }
             )
         )
@@ -236,6 +269,7 @@ def test_benchmark_pattern_runs_operator_runlist_in_child_process(
         runs_per_sample=2,
         output_csv=str(output_csv),
         seed=0,
+        power_backend="turbostat_pkgwatt",
     )
 
     assert len(rows) == 1
@@ -243,6 +277,9 @@ def test_benchmark_pattern_runs_operator_runlist_in_child_process(
     assert row["execution_mode"] == "operator_runlist"
     assert row["process_model"] == "child_process"
     assert row["npu_dispatch_count"] == 12
+    assert row["power_backend"] == "turbostat_pkgwatt"
+    assert row["flops_per_joule"] is not None
+    assert row["gflops_per_joule"] is not None
     assert output_csv.exists()
 
 

@@ -80,11 +80,51 @@ def roofline_bound_from_metrics(
     )
 
 
+def flops_per_joule(
+    *,
+    throughput_flops_per_sec: float | None,
+    avg_power_w: float | None,
+) -> float | None:
+    if throughput_flops_per_sec is None or avg_power_w is None or avg_power_w <= 0:
+        return None
+    return throughput_flops_per_sec / avg_power_w
+
+
+def gflops_per_joule(
+    *,
+    throughput_flops_per_sec: float | None,
+    avg_power_w: float | None,
+) -> float | None:
+    value = flops_per_joule(
+        throughput_flops_per_sec=throughput_flops_per_sec,
+        avg_power_w=avg_power_w,
+    )
+    if value is None:
+        return None
+    return value / 1.0e9
+
+
 def annotate_result_row_with_peak(
     row: dict[str, object],
     peak: BackendPeakReference | None,
 ) -> dict[str, object]:
     annotated = dict(row)
+    throughput = None
+    if row.get("throughput_flops_per_sec") not in ("", None, "None"):
+        throughput = float(row["throughput_flops_per_sec"])
+    avg_power_w = None
+    if row.get("avg_power_w") not in ("", None, "None"):
+        avg_power_w = float(row["avg_power_w"])
+    if row.get("flops_per_joule") in ("", None, "None"):
+        annotated["flops_per_joule"] = flops_per_joule(
+            throughput_flops_per_sec=throughput,
+            avg_power_w=avg_power_w,
+        )
+    if row.get("gflops_per_joule") in ("", None, "None"):
+        annotated["gflops_per_joule"] = gflops_per_joule(
+            throughput_flops_per_sec=throughput,
+            avg_power_w=avg_power_w,
+        )
     if peak is None:
         return annotated
     if str(row.get("run_status", "completed")) != "completed":

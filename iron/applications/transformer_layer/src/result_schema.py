@@ -59,9 +59,15 @@ RESULT_FIELD_ORDER = [
     "roofline_bound_ops_per_sec",
     "backend_pct_of_peak",
     "roofline_pct",
+    "power_backend",
+    "raw_package_avg_power_w",
+    "raw_package_max_power_w",
+    "quiescent_package_power_w",
     "avg_power_w",
     "max_power_w",
     "energy_j",
+    "flops_per_joule",
+    "gflops_per_joule",
     "power_sample_count",
 ]
 

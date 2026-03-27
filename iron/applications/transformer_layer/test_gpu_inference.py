@@ -28,6 +28,9 @@ def test_benchmark_gpu_layer_emits_shared_schema_on_cpu_for_unit_test(tmp_path):
     assert row["execution_mode"] == "amd_gpu_reference"
     assert row["pattern_label"] == "amd_gpu_reference"
     assert row["gpu_device"] == "cpu"
+    assert row["power_backend"] == "none"
+    assert row["flops_per_joule"] is None
+    assert row["gflops_per_joule"] is None
     assert row["power_sample_count"] is None
     assert output_csv.exists()
 

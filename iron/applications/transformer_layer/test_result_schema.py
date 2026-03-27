@@ -23,6 +23,9 @@ def test_normalize_result_row_accepts_minimum_required_fields():
     assert row["execution_mode"] == "encoder_pipeline"
     assert row["avg_latency_ms"] == 50.0
     assert "topology_id" in row
+    assert "power_backend" in row
+    assert "flops_per_joule" in row
+    assert "gflops_per_joule" in row
 
 
 def test_normalize_result_row_rejects_missing_required_fields():

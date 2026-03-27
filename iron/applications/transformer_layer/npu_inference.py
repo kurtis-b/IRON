@@ -20,10 +20,14 @@ from iron.applications.transformer_layer.benchmark_common import (
 from iron.applications.transformer_layer.benchmark_power import (
     create_power_monitor,
     empty_power_stats,
+    resolve_power_probe_runs,
+    resolve_power_sample_interval_sec,
 )
 from iron.applications.transformer_layer.roofline import (
     estimate_layer_bytes,
     estimate_layer_flops,
+    flops_per_joule,
+    gflops_per_joule,
     operational_intensity,
 )
 from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
@@ -104,6 +108,9 @@ def _benchmark_operator_runlist_isolated(
     runs_per_sample: int,
     output_csv: str,
     seed: int,
+    power_backend: str,
+    power_sample_interval_sec: float,
+    quiescent_baseline_duration_sec: float,
     write_immediately: bool = True,
 ) -> list[dict[str, object]]:
     repo_root = Path(__file__).resolve().parents[3]
@@ -112,6 +119,9 @@ def _benchmark_operator_runlist_isolated(
         "warmup_runs": warmup_runs,
         "runs_per_sample": runs_per_sample,
         "seed": seed,
+        "power_backend": power_backend,
+        "power_sample_interval_sec": power_sample_interval_sec,
+        "quiescent_baseline_duration_sec": quiescent_baseline_duration_sec,
     }
     with tempfile.TemporaryDirectory(
         prefix="transformer_layer_operator_runlist_"
@@ -162,6 +172,9 @@ def benchmark_pattern(
     runs_per_sample: int,
     output_csv: str,
     seed: int,
+    power_backend: str = "none",
+    power_sample_interval_sec: float = 0.05,
+    quiescent_baseline_duration_sec: float = 0.5,
     write_immediately: bool = True,
 ) -> list[dict[str, object]]:
     if execution_mode == "operator_runlist":
@@ -171,6 +184,9 @@ def benchmark_pattern(
             runs_per_sample=runs_per_sample,
             output_csv=output_csv,
             seed=seed,
+            power_backend=power_backend,
+            power_sample_interval_sec=power_sample_interval_sec,
+            quiescent_baseline_duration_sec=quiescent_baseline_duration_sec,
             write_immediately=write_immediately,
         )
 
@@ -184,15 +200,14 @@ def benchmark_pattern(
 
     latencies = []
     stage_sums_sec: dict[str, float] = {}
-    with create_power_monitor() as power_stats:
-        for _ in range(runs_per_sample):
-            start = time.perf_counter()
-            _, stage_timings = _run_pattern_with_stage_timings(pattern, layer_inputs)
-            latencies.append(time.perf_counter() - start)
-            for stage_name, stage_sec in stage_timings.items():
-                stage_sums_sec[stage_name] = stage_sums_sec.get(
-                    stage_name, 0.0
-                ) + float(stage_sec)
+    for _ in range(runs_per_sample):
+        start = time.perf_counter()
+        _, stage_timings = _run_pattern_with_stage_timings(pattern, layer_inputs)
+        latencies.append(time.perf_counter() - start)
+        for stage_name, stage_sec in stage_timings.items():
+            stage_sums_sec[stage_name] = stage_sums_sec.get(stage_name, 0.0) + float(
+                stage_sec
+            )
 
     summary = summarize_latency_measurements(latencies)
     estimated_flops = estimate_layer_flops(spec)
@@ -202,6 +217,43 @@ def benchmark_pattern(
         * summary["measured_inference_count"]
         / summary["timed_total_sec"]
     )
+    avg_iteration_sec = summary["timed_total_sec"] / summary["measured_inference_count"]
+    power_probe_runs = resolve_power_probe_runs(
+        avg_iteration_sec=avg_iteration_sec,
+        baseline_runs=runs_per_sample,
+        min_measurement_duration_sec=0.25,
+    )
+    power_probe_window_sec = avg_iteration_sec * power_probe_runs
+    effective_power_sample_interval_sec = resolve_power_sample_interval_sec(
+        requested_interval_sec=power_sample_interval_sec,
+        estimated_timed_window_sec=power_probe_window_sec,
+    )
+    if power_backend == "none":
+        power_stats = empty_power_stats()
+    else:
+        with create_power_monitor(
+            power_backend=power_backend,
+            sample_interval_sec=effective_power_sample_interval_sec,
+            quiescent_baseline_duration_sec=quiescent_baseline_duration_sec,
+            estimated_timed_window_sec=power_probe_window_sec,
+        ) as power_monitor:
+            power_phase_start = time.perf_counter()
+            for _ in range(power_probe_runs):
+                pattern(layer_inputs)
+                time.sleep(0)
+            power_phase_elapsed_sec = time.perf_counter() - power_phase_start
+        power_stats = power_monitor.stats(power_phase_elapsed_sec)
+        if power_stats.get("avg_power_w") is not None:
+            power_stats["energy_j"] = (
+                float(power_stats["avg_power_w"]) * summary["timed_total_sec"]
+            )
+    if power_stats.get("power_backend") is None:
+        power_stats["power_backend"] = power_backend
+    energy_efficiency_flops_per_joule = flops_per_joule(
+        throughput_flops_per_sec=throughput_flops_per_sec,
+        avg_power_w=power_stats.get("avg_power_w"),
+    )
+
     row = {
         "study_id": "synthetic_transformer_layer",
         "backend": "npu",
@@ -236,13 +288,18 @@ def benchmark_pattern(
         "roofline_bound_ops_per_sec": None,
         "backend_pct_of_peak": None,
         "roofline_pct": None,
+        "flops_per_joule": energy_efficiency_flops_per_joule,
+        "gflops_per_joule": gflops_per_joule(
+            throughput_flops_per_sec=throughput_flops_per_sec,
+            avg_power_w=power_stats.get("avg_power_w"),
+        ),
         "run_status": "completed",
         "failure_component": None,
         "failure_category": None,
         "failure_message": None,
         **summary,
         **_pattern_metadata(pattern),
-        **(power_stats if power_stats is not None else empty_power_stats()),
+        **power_stats,
     }
     if write_immediately:
         write_results_csv(output_csv, [row])
@@ -270,6 +327,21 @@ def parse_args():
     )
     parser.add_argument("--warmup-runs", type=int, default=5)
     parser.add_argument("--runs-per-sample", type=int, default=20)
+    parser.add_argument(
+        "--power-backend",
+        choices=("none", "turbostat_pkgwatt"),
+        default="none",
+    )
+    parser.add_argument(
+        "--power-sample-interval-sec",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--quiescent-baseline-duration-sec",
+        type=float,
+        default=0.5,
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-csv", default="transformer_layer_npu_latest.csv")
     return parser.parse_args()
@@ -293,6 +365,9 @@ def main():
         runs_per_sample=args.runs_per_sample,
         output_csv=args.output_csv,
         seed=args.seed,
+        power_backend=args.power_backend,
+        power_sample_interval_sec=args.power_sample_interval_sec,
+        quiescent_baseline_duration_sec=args.quiescent_baseline_duration_sec,
     )
 
 

@@ -23,7 +23,11 @@ from iron.applications.transformer_layer.peak_reference import (
 from iron.applications.transformer_layer.plot_design_pattern_results import (
     generate_plots,
 )
-from iron.applications.transformer_layer.roofline import annotate_results_csv
+from iron.applications.transformer_layer.roofline import (
+    annotate_results_csv,
+    flops_per_joule,
+    gflops_per_joule,
+)
 from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
 
 
@@ -65,6 +69,14 @@ def _latency_row(
         "avg_power_w": avg_power_w,
         "max_power_w": avg_power_w,
         "energy_j": None if avg_power_w is None else avg_power_w * timed_total_sec,
+        "flops_per_joule": flops_per_joule(
+            throughput_flops_per_sec=estimated_flops / (avg_latency_ms / 1000.0),
+            avg_power_w=avg_power_w,
+        ),
+        "gflops_per_joule": gflops_per_joule(
+            throughput_flops_per_sec=estimated_flops / (avg_latency_ms / 1000.0),
+            avg_power_w=avg_power_w,
+        ),
         "power_sample_count": 4 if avg_power_w is not None else None,
     }
     row.update(extra)
