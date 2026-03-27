@@ -30,6 +30,7 @@ class AIEGEMM(AIEOperatorBase):
         K,
         N,
         use_static_weight=False,
+        force_batched_design=False,
         tile_m=64,
         tile_k=64,
         tile_n=64,
@@ -47,6 +48,7 @@ class AIEGEMM(AIEOperatorBase):
         self.tile_n = tile_n
         self.num_aie_columns = num_aie_columns
         self.partition_N = partition_N
+        self.force_batched_design = force_batched_design
         self.batch_A = batch_A
         self.batch_B = batch_B
         self.batch_C = batch_C
@@ -65,7 +67,7 @@ class AIEGEMM(AIEOperatorBase):
             raise AIEOperatorConstraintError(
                 "batch_A, batch_B, and batch_C must be 2-tuples of (batch_size, batch_stride_dim)"
             )
-        if self._uses_batched_layout() and partition_N != 1:
+        if self._uses_batched_design() and partition_N != 1:
             raise AIEOperatorConstraintError(
                 "partition_N > 1 is not supported together with batched GEMM"
             )
@@ -73,12 +75,12 @@ class AIEGEMM(AIEOperatorBase):
             raise AIEOperatorConstraintError(
                 "batch_A/batch_B > 1 requires batch_C > 1 in AIEGEMM"
             )
-        if self._uses_batched_layout() and use_static_weight and batch_B[0] > 1:
+        if self._uses_batched_design() and use_static_weight and batch_B[0] > 1:
             raise AIEOperatorConstraintError(
                 "Static weights are only supported for batch_B=(1, 0) in batched GEMM"
             )
 
-        if self._uses_batched_layout():
+        if self._uses_batched_design():
             M_padded, K_padded, N_padded = self._get_padded_dims(M, K, N)
         else:
             if N % partition_N != 0:
@@ -115,6 +117,9 @@ class AIEGEMM(AIEOperatorBase):
     def _uses_batched_layout(self):
         return self.batch_C[0] > 1
 
+    def _uses_batched_design(self):
+        return self.force_batched_design or self._uses_batched_layout()
+
     def _get_runtime_dims(self):
         num_aie_rows = 4
         min_M = self.tile_m * num_aie_rows
@@ -140,7 +145,7 @@ class AIEGEMM(AIEOperatorBase):
             f"_embf16{int(emulate_bf16_mmul_with_bfp16)}"
             f"_round{int(round_conv_even)}"
         )
-        if self._uses_batched_layout():
+        if self._uses_batched_design():
             file_name_total_base += (
                 f"_batchA{self.batch_A[0]}d{self.batch_A[1]}"
                 f"_batchB{self.batch_B[0]}d{self.batch_B[1]}"
@@ -149,7 +154,7 @@ class AIEGEMM(AIEOperatorBase):
         else:
             file_name_total_base += "_ctiles1"
         if (
-            not self._uses_batched_layout()
+            not self._uses_batched_design()
             and include_partition_suffix
             and self.partition_N > 1
         ):
@@ -217,7 +222,7 @@ class AIEGEMM(AIEOperatorBase):
         if self.c_col_maj:
             kernel_flags.append("-DC_COL_MAJ")
 
-        if self._uses_batched_layout():
+        if self._uses_batched_design():
             mlir_artifact = PythonGeneratedMLIRArtifact.new(
                 f"{file_name_total_base}.mlir",
                 import_path=operator_dir / "design_batched.py",
@@ -388,7 +393,7 @@ class AIEGEMM(AIEOperatorBase):
             self.insts_artifact,
         )
 
-        if self._uses_batched_layout():
+        if self._uses_batched_design():
             self.add_buffer("A", self.M * self.K * self.batch_A[0])
             if static_weights is None:
                 self.add_buffer("B", self.K * self.N * self.batch_B[0])
@@ -415,7 +420,7 @@ class AIEGEMM(AIEOperatorBase):
 
     def forward(self, A, B=None):
         """Forward pass through GEMM operation: C = A @ B."""
-        if self._uses_batched_layout():
+        if self._uses_batched_design():
             return self._do_batched_gemm(A, B)
 
         B_shape = B.shape if B is not None else self.static_weight_shape
@@ -480,7 +485,23 @@ class AIEGEMM(AIEOperatorBase):
     def _get_gemm_shapes(self, mtx_shape, batch_params):
         batch_size, batch_stride_dim = batch_params
         if batch_size == 1:
-            return mtx_shape
+            if len(mtx_shape) == 2:
+                return mtx_shape
+            if len(mtx_shape) == 3:
+                if batch_stride_dim == 0:
+                    if mtx_shape[0] == 1:
+                        return mtx_shape[1:]
+                    raise AIEOperatorConstraintError(
+                        "AIEGEMM: unexpected singleton-batched tensor shape"
+                    )
+                if mtx_shape[1] == 1:
+                    return mtx_shape[0], mtx_shape[2]
+                raise AIEOperatorConstraintError(
+                    "AIEGEMM: unexpected singleton-batched tensor shape"
+                )
+            raise AIEOperatorConstraintError(
+                "AIEGEMM: unexpected singleton-batched tensor rank"
+            )
         if batch_stride_dim == 0:
             if batch_size == mtx_shape[0]:
                 return mtx_shape[1:]
@@ -494,9 +515,19 @@ class AIEGEMM(AIEOperatorBase):
         K2, N = self._get_gemm_shapes(B_shape, self.batch_B)
         M, K = self._get_gemm_shapes(A.shape, self.batch_A)
         batch_size_C, batch_stride_dim_C = self.batch_C
-        expected_output_shape = (
-            (batch_size_C, M, N) if batch_stride_dim_C == 0 else (M, batch_size_C, N)
-        )
+        degenerate_batch = batch_size_C == 1
+        if degenerate_batch:
+            expected_output_shape = (
+                A.shape[:-2] + (N, A.shape[-1])
+                if self.c_col_maj
+                else A.shape[:-1] + (N,)
+            )
+        else:
+            expected_output_shape = (
+                (batch_size_C, M, N)
+                if batch_stride_dim_C == 0
+                else (M, batch_size_C, N)
+            )
         applicable = K == K2 and M <= self.M and K <= self.K and N <= self.N
         if not applicable:
             raise AIEOperatorConstraintError("AIEGEMM: incompatible tensor shape(s)")
@@ -524,7 +555,10 @@ class AIEGEMM(AIEOperatorBase):
                 result_part = self._execute_batched_aie_operation(A_part, B_padded)
                 max_M = min(M_lo + self.M, M)
                 result_padded[:, M_lo:max_M, :N] = result_part[:, :max_M, :N]
-            result = numpy_to_torch(result_padded[:, :M, :N])
+            if degenerate_batch:
+                result = numpy_to_torch(result_padded[0, :M, :N])
+            else:
+                result = numpy_to_torch(result_padded[:, :M, :N])
         else:
             result_padded = np.zeros((M, batch_size_C, self.N), dtype=A_padded.dtype)
             for M_lo in range(0, M, self.M):
@@ -535,7 +569,10 @@ class AIEGEMM(AIEOperatorBase):
                 result_part = self._execute_batched_aie_operation(A_part, B_padded)
                 max_M = min(M_lo + self.M, M)
                 result_padded[M_lo:max_M, :, :N] = result_part[:max_M, :, :N]
-            result = numpy_to_torch(result_padded[:M, :, :N])
+            if degenerate_batch:
+                result = numpy_to_torch(result_padded[:M, 0, :N])
+            else:
+                result = numpy_to_torch(result_padded[:M, :, :N])
 
         return result.view(expected_output_shape)
 
@@ -560,6 +597,38 @@ class AIEGEMM(AIEOperatorBase):
 
     def _pad_A_batched(self, A_np):
         batch_size, batch_stride_dim = self.batch_A
+        if batch_size == 1:
+            M, K = self._get_gemm_shapes(A_np.shape, self.batch_A)
+            if batch_stride_dim == 0:
+                if (
+                    A_np.ndim == 3
+                    and A_np.shape[0] == 1
+                    and M % self.M == 0
+                    and K == self.K
+                ):
+                    return A_np
+                M_multiple = ((M + self.M - 1) // self.M) * self.M
+                A_padded = np.zeros((1, M_multiple, self.K), dtype=A_np.dtype)
+                if A_np.ndim == 3:
+                    A_padded[:, :M, :K] = A_np
+                else:
+                    A_padded[0, :M, :K] = A_np
+                return A_padded
+
+            if (
+                A_np.ndim == 3
+                and A_np.shape[1] == 1
+                and M % self.M == 0
+                and K == self.K
+            ):
+                return A_np
+            M_multiple = ((M + self.M - 1) // self.M) * self.M
+            A_padded = np.zeros((M_multiple, 1, self.K), dtype=A_np.dtype)
+            if A_np.ndim == 3:
+                A_padded[:M, :, :K] = A_np
+            else:
+                A_padded[:M, 0, :K] = A_np
+            return A_padded
         if batch_stride_dim == 0:
             M, K = A_np.shape[1:]
             if M % self.M == 0 and K == self.K:
@@ -595,6 +664,31 @@ class AIEGEMM(AIEOperatorBase):
 
     def _pad_B_batched(self, B_np):
         batch_size, batch_stride_dim = self.batch_B
+        if batch_size == 1:
+            K, N = self._get_gemm_shapes(B_np.shape, self.batch_B)
+            if batch_stride_dim == 0:
+                if (
+                    B_np.ndim == 3
+                    and B_np.shape[0] == 1
+                    and K == self.K
+                    and N == self.N
+                ):
+                    return B_np
+                B_padded = np.zeros((1, self.K, self.N), dtype=B_np.dtype)
+                if B_np.ndim == 3:
+                    B_padded[:, :K, :N] = B_np
+                else:
+                    B_padded[0, :K, :N] = B_np
+                return B_padded
+
+            if B_np.ndim == 3 and B_np.shape[1] == 1 and K == self.K and N == self.N:
+                return B_np
+            B_padded = np.zeros((self.K, 1, self.N), dtype=B_np.dtype)
+            if B_np.ndim == 3:
+                B_padded[:K, :, :N] = B_np
+            else:
+                B_padded[:K, 0, :N] = B_np
+            return B_padded
         if batch_stride_dim == 0:
             K, N = B_np.shape[1:]
             if K == self.K and N == self.N:

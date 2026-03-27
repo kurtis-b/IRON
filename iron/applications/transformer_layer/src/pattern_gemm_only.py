@@ -33,20 +33,6 @@ class GemmOnlyPattern(nn.Module):
     pattern_label = "gemm_only"
 
     @staticmethod
-    def _resolve_attn_scores_partition_n(seq_len: int) -> int:
-        # The long attention-score GEMM's C-drain exceeds DMA BD stride limits
-        # once seq_len grows beyond 8192. Split only that output dimension across
-        # repeated GEMM invocations instead of changing the smaller-sequence path.
-        if seq_len <= 8192:
-            return 1
-        if seq_len % 4096 != 0:
-            raise ValueError(
-                "gemm_only long attention-score partitioning requires seq_len "
-                f"divisible by 4096; got seq_len={seq_len}"
-            )
-        return seq_len // 4096
-
-    @staticmethod
     def _resolve_query_block_size(seq_len: int) -> int:
         if seq_len >= 16384:
             return 256
@@ -69,7 +55,6 @@ class GemmOnlyPattern(nn.Module):
         runtime_seq_len = self._resolve_query_block_size(spec.seq_len)
         self.query_block_size = runtime_seq_len
         self.uses_query_blocking = runtime_seq_len < spec.seq_len
-        attn_scores_partition_n = self._resolve_attn_scores_partition_n(spec.seq_len)
         gemm_common = {
             "tile_m": 64,
             "tile_k": 64,
@@ -88,7 +73,10 @@ class GemmOnlyPattern(nn.Module):
             M=runtime_seq_len,
             K=head_dim,
             N=spec.seq_len,
-            partition_N=attn_scores_partition_n,
+            force_batched_design=True,
+            batch_A=(heads, 1),
+            batch_B=(heads, 1),
+            batch_C=(heads, 0),
             context=self.context,
             **gemm_common,
         )
@@ -96,6 +84,10 @@ class GemmOnlyPattern(nn.Module):
             M=runtime_seq_len,
             K=spec.seq_len,
             N=head_dim,
+            force_batched_design=True,
+            batch_A=(heads, 0),
+            batch_B=(heads, 1),
+            batch_C=(heads, 1),
             context=self.context,
             **gemm_common,
         )
@@ -104,6 +96,7 @@ class GemmOnlyPattern(nn.Module):
             K=hidden,
             N=hidden,
             use_static_weight=True,
+            force_batched_design=True,
             context=self.context,
             **gemm_common,
         )
@@ -112,6 +105,7 @@ class GemmOnlyPattern(nn.Module):
             K=hidden,
             N=spec.intermediate_size,
             use_static_weight=True,
+            force_batched_design=True,
             context=self.context,
             **gemm_common,
         )
@@ -120,6 +114,7 @@ class GemmOnlyPattern(nn.Module):
             K=spec.intermediate_size,
             N=hidden,
             use_static_weight=True,
+            force_batched_design=True,
             context=self.context,
             **gemm_common,
         )
@@ -150,7 +145,7 @@ class GemmOnlyPattern(nn.Module):
 
     def _bind_shared_gemm_artifacts(self) -> None:
         case_prefix = self._artifact_case_prefix()
-        shared_xclbin = self.out_proj.get_runtime_xclbin_artifact(
+        shared_xclbin = self.attn_scores.get_runtime_xclbin_artifact(
             prefix=f"{case_prefix}runtime_"
         )
         shared_xclbin.kernel_name = "gemm_only_runtime"
@@ -158,6 +153,7 @@ class GemmOnlyPattern(nn.Module):
             insts_artifact = gemm_op.get_insts_artifact(
                 prefix=f"{case_prefix}{workload_name}_",
                 xclbin_input=shared_xclbin,
+                kernel_name=shared_xclbin.kernel_name,
             )
             gemm_op.bind_artifacts(
                 shared_xclbin,
@@ -216,14 +212,24 @@ class GemmOnlyPattern(nn.Module):
         self._prepare_runtime()
 
         host_preprocess_start = time.perf_counter()
-        query_heads = layer_inputs.q.squeeze(0).to(self.spec.torch_dtype).contiguous()
+        query_heads = (
+            layer_inputs.q.squeeze(0)
+            .to(self.spec.torch_dtype)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
         key_heads = (
             layer_inputs.k.squeeze(0)
             .to(self.spec.torch_dtype)
-            .transpose(-1, -2)
+            .permute(2, 0, 1)
             .contiguous()
         )
-        value_heads = layer_inputs.v.squeeze(0).to(self.spec.torch_dtype).contiguous()
+        value_heads = (
+            layer_inputs.v.squeeze(0)
+            .to(self.spec.torch_dtype)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
         residual = layer_inputs.r.squeeze(0).to(self.spec.torch_dtype)
         host_preprocess_end = time.perf_counter()
 
@@ -234,15 +240,9 @@ class GemmOnlyPattern(nn.Module):
         npu_attention_total = 0.0
         for block_start in range(0, self.spec.seq_len, query_block_size):
             block_end = min(block_start + query_block_size, self.spec.seq_len)
-            block_query = query_heads[:, block_start:block_end, :].contiguous()
+            block_query = query_heads[block_start:block_end].contiguous()
             block_npu_start = time.perf_counter()
-            attn_scores = torch.stack(
-                [
-                    self.attn_scores(block_query[h], key_heads[h])
-                    for h in range(self.spec.num_attention_heads)
-                ],
-                dim=0,
-            )
+            attn_scores = self.attn_scores(block_query, key_heads)
             host_softmax_start = time.perf_counter()
             attn_probs = torch.softmax(
                 attn_scores.to(torch.float32) * self.scale, dim=-1
@@ -251,13 +251,7 @@ class GemmOnlyPattern(nn.Module):
             host_softmax_total += host_softmax_end - host_softmax_start
             npu_resume_start = time.perf_counter()
             attn_context = (
-                torch.stack(
-                    [
-                        self.attn_output(attn_probs[h], value_heads[h])
-                        for h in range(self.spec.num_attention_heads)
-                    ],
-                    dim=1,
-                )
+                self.attn_output(attn_probs, value_heads)
                 .contiguous()
                 .view(block_end - block_start, self.spec.hidden_size)
             )
@@ -327,8 +321,7 @@ class GemmOnlyPattern(nn.Module):
                 if self.compile_setup_time_sec is None
                 else self.compile_setup_time_sec * 1000.0
             ),
-            "npu_dispatch_count": ((2 * self.spec.num_attention_heads) + 3)
-            * block_count,
+            "npu_dispatch_count": 5 * block_count,
             "npu_unique_instruction_binary_count": len(unique_insts),
             "npu_unique_xclbin_count": len(unique_xclbins),
             "process_model": "in_process",

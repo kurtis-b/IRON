@@ -701,6 +701,34 @@ def test_batched_gemm_trims_padded_n_for_batch_stride_dim_1():
     assert tuple(output.shape) == (64, 12, 64)
 
 
+def test_force_batched_design_supports_singleton_batch_runtime():
+    operator = AIEGEMM(
+        M=64,
+        K=64,
+        N=64,
+        force_batched_design=True,
+        tile_m=64,
+        tile_k=64,
+        tile_n=16,
+        num_aie_columns=8,
+        prio_accuracy=False,
+        emulate_bf16_mmul_with_bfp16=True,
+        context=_DummyContext(),
+    )
+
+    operator._execute_batched_aie_operation = lambda _A_np, _B_np=None: np.ones(
+        (1, 64, 64),
+        dtype=np.dtype("bfloat16"),
+    )
+
+    output = operator(
+        torch.zeros((64, 64), dtype=torch.bfloat16),
+        torch.zeros((64, 64), dtype=torch.bfloat16),
+    )
+
+    assert tuple(output.shape) == (64, 64)
+
+
 def test_runtime_xclbin_and_instruction_artifacts_can_be_bound_independently():
     common_kwargs = dict(
         tile_m=64,
