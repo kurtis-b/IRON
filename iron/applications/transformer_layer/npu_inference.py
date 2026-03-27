@@ -133,10 +133,16 @@ def _benchmark_operator_runlist_isolated(
             command,
             cwd=repo_root,
             check=False,
+            capture_output=True,
+            text=True,
         )
         if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            detail = stderr or stdout
             raise RuntimeError(
-                f"operator_runlist child process failed with exit code {result.returncode}"
+                "operator_runlist child process failed with exit code "
+                f"{result.returncode}" + (f": {detail}" if detail else "")
             )
         if not response_path.exists():
             raise RuntimeError(
@@ -202,6 +208,10 @@ def benchmark_pattern(
         "execution_mode": execution_mode,
         "pattern_label": execution_mode,
         "seq_len": spec.seq_len,
+        "hidden_size": spec.hidden_size,
+        "intermediate_size": spec.intermediate_size,
+        "num_attention_heads": spec.num_attention_heads,
+        "attention_head_size": spec.attention_head_size,
         "batch_size": spec.batch_size,
         "dtype": spec.dtype,
         "use_bias": spec.use_bias,
@@ -225,6 +235,10 @@ def benchmark_pattern(
         "roofline_bound_ops_per_sec": None,
         "backend_pct_of_peak": None,
         "roofline_pct": None,
+        "run_status": "completed",
+        "failure_component": None,
+        "failure_category": None,
+        "failure_message": None,
         **summary,
         **_pattern_metadata(pattern),
         **(power_stats if power_stats is not None else empty_power_stats()),

@@ -36,3 +36,23 @@ def test_classify_debug_exception_detects_topology_issue():
 
     assert event["component"] == "npu_compile"
     assert event["challenge"] == "unsupported_topology_or_placement"
+
+
+def test_classify_debug_exception_detects_unsupported_pattern_surface():
+    event = classify_debug_exception(
+        ValueError(
+            "encoder_pipeline thesis pattern currently supports only the 768/3072/12 and 1024/4096/16 families"
+        )
+    )
+
+    assert event["component"] == "pattern_surface"
+    assert event["challenge"] == "unsupported_pattern_surface"
+
+
+def test_classify_debug_exception_detects_dma_descriptor_limit():
+    event = classify_debug_exception(
+        RuntimeError("'aie.dma_bd' op Stride 3 exceeds the [1:1048576] range.")
+    )
+
+    assert event["component"] == "npu_compile"
+    assert event["challenge"] == "unsupported_dma_descriptor_limits"

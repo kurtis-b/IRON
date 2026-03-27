@@ -15,7 +15,7 @@ from iron.applications.transformer_layer.benchmark_common import (
     load_study_manifest,
     parse_execution_modes,
     parse_seq_lens,
-    resolve_study_path,
+    write_dict_rows_csv,
     write_results_csv,
 )
 from iron.applications.transformer_layer.debug_log import (
@@ -25,6 +25,10 @@ from iron.applications.transformer_layer.debug_log import (
 from iron.applications.transformer_layer.npu_inference import benchmark_pattern
 from iron.applications.transformer_layer.roofline import annotate_results_csv
 from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
+from iron.applications.transformer_layer.support_matrix import (
+    render_support_summary_text,
+    summarize_support_rows,
+)
 
 
 def parse_args():
@@ -42,11 +46,11 @@ def parse_args():
         default=None,
         help="Optional structured programmability/debug event log path.",
     )
-    parser.add_argument("--warmup-runs", type=int, default=5)
-    parser.add_argument("--runs-per-sample", type=int, default=20)
-    parser.add_argument("--hidden-size", type=int, default=768)
-    parser.add_argument("--intermediate-size", type=int, default=3072)
-    parser.add_argument("--num-attention-heads", type=int, default=12)
+    parser.add_argument("--warmup-runs", type=int, default=None)
+    parser.add_argument("--runs-per-sample", type=int, default=None)
+    parser.add_argument("--hidden-size", type=int, default=None)
+    parser.add_argument("--intermediate-size", type=int, default=None)
+    parser.add_argument("--num-attention-heads", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--peak-reference",
@@ -77,18 +81,17 @@ def parse_args():
 
 
 def _resolve_spec(
-    args, manifest: dict[str, object], seq_len: int
+    args, layer_spec: dict[str, object], seq_len: int
 ) -> TransformerLayerSpec:
-    layer_spec = dict(manifest["layer_spec"])
-    layer_spec.update(
-        {
-            "hidden_size": args.hidden_size,
-            "intermediate_size": args.intermediate_size,
-            "num_attention_heads": args.num_attention_heads,
-            "seq_len": seq_len,
-        }
-    )
-    return TransformerLayerSpec.from_dict(layer_spec)
+    resolved_spec = dict(layer_spec)
+    resolved_spec["seq_len"] = seq_len
+    if args.hidden_size is not None:
+        resolved_spec["hidden_size"] = args.hidden_size
+    if args.intermediate_size is not None:
+        resolved_spec["intermediate_size"] = args.intermediate_size
+    if args.num_attention_heads is not None:
+        resolved_spec["num_attention_heads"] = args.num_attention_heads
+    return TransformerLayerSpec.from_dict(resolved_spec)
 
 
 def _resolve_output_csv(args, manifest: dict[str, object]) -> str:
@@ -132,6 +135,143 @@ def _resolve_parity_config(
     return parity
 
 
+def _iter_study_cases(manifest: dict[str, object]) -> list[dict[str, object]]:
+    if "study_cases" in manifest:
+        return list(manifest["study_cases"])
+    return [
+        {
+            "case_id": "default",
+            "case_label": "default",
+            "layer_spec": dict(manifest["layer_spec"]),
+        }
+    ]
+
+
+def _case_execution_modes(
+    case: dict[str, object], fallback_execution_modes: list[str]
+) -> list[str]:
+    raw = case.get("execution_modes")
+    if raw is None:
+        return list(fallback_execution_modes)
+    return list(raw)
+
+
+def _case_seq_lens(case: dict[str, object], fallback_seq_lens: list[int]) -> list[int]:
+    raw = case.get("seq_lens")
+    if raw is None:
+        return list(fallback_seq_lens)
+    return list(raw)
+
+
+def _resolve_sampling(
+    manifest: dict[str, object], seq_len: int, args
+) -> tuple[int, int]:
+    if args.warmup_runs is not None or args.runs_per_sample is not None:
+        return (
+            int(
+                manifest["warmup_runs"]
+                if args.warmup_runs is None
+                else args.warmup_runs
+            ),
+            int(
+                manifest["runs_per_sample"]
+                if args.runs_per_sample is None
+                else args.runs_per_sample
+            ),
+        )
+    sampling_schedule = manifest.get("sampling_schedule")
+    if isinstance(sampling_schedule, dict) and seq_len in sampling_schedule:
+        payload = sampling_schedule[seq_len]
+        return int(payload["warmup_runs"]), int(payload["runs_per_sample"])
+    return int(manifest["warmup_runs"]), int(manifest["runs_per_sample"])
+
+
+def _decorate_row_for_case(
+    row: dict[str, object],
+    *,
+    study_id: str,
+    case: dict[str, object],
+    spec: TransformerLayerSpec,
+) -> dict[str, object]:
+    normalized = dict(row)
+    normalized["study_id"] = study_id
+    normalized["study_case_id"] = case["case_id"]
+    normalized["study_case_label"] = case["case_label"]
+    normalized["hidden_size"] = spec.hidden_size
+    normalized["intermediate_size"] = spec.intermediate_size
+    normalized["num_attention_heads"] = spec.num_attention_heads
+    normalized["attention_head_size"] = spec.attention_head_size
+    normalized.setdefault("run_status", "completed")
+    normalized.setdefault("failure_component", None)
+    normalized.setdefault("failure_category", None)
+    normalized.setdefault("failure_message", None)
+    return normalized
+
+
+def _failure_result_row(
+    *,
+    study_id: str,
+    case: dict[str, object],
+    spec: TransformerLayerSpec,
+    execution_mode: str,
+    warmup_runs: int,
+    runs_per_sample: int,
+    exc: Exception,
+) -> dict[str, object]:
+    event = classify_debug_exception(exc)
+    run_status = (
+        "unsupported"
+        if event["challenge"]
+        in {
+            "unsupported_topology_or_placement",
+            "unsupported_pattern_surface",
+            "unsupported_dma_descriptor_limits",
+        }
+        else "failed"
+    )
+    return {
+        "study_id": study_id,
+        "study_case_id": case["case_id"],
+        "study_case_label": case["case_label"],
+        "backend": "npu",
+        "execution_mode": execution_mode,
+        "pattern_label": execution_mode,
+        "seq_len": spec.seq_len,
+        "hidden_size": spec.hidden_size,
+        "intermediate_size": spec.intermediate_size,
+        "num_attention_heads": spec.num_attention_heads,
+        "attention_head_size": spec.attention_head_size,
+        "batch_size": spec.batch_size,
+        "dtype": spec.dtype,
+        "use_bias": spec.use_bias,
+        "weights_source": spec.weights_source,
+        "source_model_name": spec.source_model_name,
+        "source_layer_index": spec.source_layer_index,
+        "warmup_runs": warmup_runs,
+        "runs_per_sample": runs_per_sample,
+        "measured_inference_count": 0,
+        "timed_total_sec": None,
+        "avg_latency_ms": None,
+        "compile_setup_time_ms": None,
+        "throughput_flops_per_sec": None,
+        "estimated_flops_per_inference": None,
+        "estimated_bytes_per_inference": None,
+        "operational_intensity_flops_per_byte": None,
+        "backend_peak_ops_per_sec": None,
+        "roofline_bound_ops_per_sec": None,
+        "backend_pct_of_peak": None,
+        "roofline_pct": None,
+        "avg_power_w": None,
+        "max_power_w": None,
+        "energy_j": None,
+        "power_sample_count": None,
+        "run_status": run_status,
+        "failure_component": event["component"],
+        "failure_category": event["challenge"],
+        "failure_message": event["symptom"],
+    }
+
+
 def _load_csv_rows(path: str | Path) -> list[dict[str, object]]:
     with Path(path).open("r", newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
@@ -140,43 +280,60 @@ def _load_csv_rows(path: str | Path) -> list[dict[str, object]]:
 def _run_parity_checks(
     *,
     parity: dict[str, object],
+    cases: list[dict[str, object]],
     execution_modes: list[str],
     seq_lens: list[int],
-    base_spec: TransformerLayerSpec,
     seed: int,
     study_id: str,
+    args,
 ) -> list[dict[str, object]]:
-    parity_seq_lens = list(parity.get("seq_lens", seq_lens))
-    parity_execution_modes = list(parity.get("execution_modes", execution_modes))
     validate_script = Path(__file__).with_name("validate_npu_parity.py")
     rows: list[dict[str, object]] = []
     with tempfile.TemporaryDirectory(prefix="transformer_layer_parity_") as temp_dir:
         temp_root = Path(temp_dir)
-        for execution_mode in parity_execution_modes:
-            output_csv = temp_root / f"{execution_mode}_parity.csv"
-            command = [
-                sys.executable,
-                str(validate_script),
-                "--execution-mode",
-                execution_mode,
-                "--seq-lens",
-                ",".join(str(seq_len) for seq_len in parity_seq_lens),
-                "--hidden-size",
-                str(base_spec.hidden_size),
-                "--intermediate-size",
-                str(base_spec.intermediate_size),
-                "--num-attention-heads",
-                str(base_spec.num_attention_heads),
-                "--seed",
-                str(seed),
-                "--output-csv",
-                str(output_csv),
-            ]
-            subprocess.run(command, check=True)
-            mode_rows = _load_csv_rows(output_csv)
-            for row in mode_rows:
-                row["study_id"] = study_id
-            rows.extend(mode_rows)
+        for case in cases:
+            case_seq_lens = _case_seq_lens(case, seq_lens)
+            case_execution_modes = _case_execution_modes(case, execution_modes)
+            parity_seq_lens = list(parity.get("seq_lens", case_seq_lens))
+            parity_execution_modes = list(
+                parity.get("execution_modes", case_execution_modes)
+            )
+            if not parity_seq_lens or not parity_execution_modes:
+                continue
+            base_spec = _resolve_spec(args, case["layer_spec"], parity_seq_lens[0])
+            for execution_mode in parity_execution_modes:
+                output_csv = (
+                    temp_root / f"{case['case_id']}_{execution_mode}_parity.csv"
+                )
+                command = [
+                    sys.executable,
+                    str(validate_script),
+                    "--execution-mode",
+                    execution_mode,
+                    "--seq-lens",
+                    ",".join(str(seq_len) for seq_len in parity_seq_lens),
+                    "--hidden-size",
+                    str(base_spec.hidden_size),
+                    "--intermediate-size",
+                    str(base_spec.intermediate_size),
+                    "--num-attention-heads",
+                    str(base_spec.num_attention_heads),
+                    "--seed",
+                    str(seed),
+                    "--output-csv",
+                    str(output_csv),
+                ]
+                subprocess.run(command, check=True)
+                mode_rows = _load_csv_rows(output_csv)
+                for row in mode_rows:
+                    row["study_id"] = study_id
+                    row["study_case_id"] = case["case_id"]
+                    row["study_case_label"] = case["case_label"]
+                    row["hidden_size"] = base_spec.hidden_size
+                    row["intermediate_size"] = base_spec.intermediate_size
+                    row["num_attention_heads"] = base_spec.num_attention_heads
+                    row["attention_head_size"] = base_spec.attention_head_size
+                rows.extend(mode_rows)
     return rows
 
 
@@ -198,6 +355,7 @@ def main():
     debug_log_csv = _resolve_debug_log_csv(args, manifest)
     peak_reference = _resolve_peak_reference(args, manifest)
     annotated_output_csv = _resolve_annotated_output_csv(args, manifest)
+    study_cases = _iter_study_cases(manifest)
     append_debug_event(
         debug_log_csv,
         study_id=study_id,
@@ -212,52 +370,80 @@ def main():
     )
     all_rows = []
     try:
-        for seq_len in seq_lens:
-            spec = _resolve_spec(args, manifest, seq_len)
-            for execution_mode in execution_modes:
-                try:
-                    rows = benchmark_pattern(
-                        execution_mode=execution_mode,
-                        spec=spec,
-                        warmup_runs=args.warmup_runs,
-                        runs_per_sample=args.runs_per_sample,
-                        output_csv=output_csv,
-                        seed=args.seed,
-                        write_immediately=False,
-                    )
-                except Exception as exc:
-                    event = classify_debug_exception(exc)
-                    append_debug_event(
-                        debug_log_csv,
-                        study_id=study_id,
-                        event_kind="benchmark_case_failed",
-                        pattern=execution_mode,
-                        seq_len=seq_len,
-                        supporting_log_path=output_csv,
-                        **event,
-                    )
-                    raise
-                all_rows.extend(rows)
-                if rows:
-                    row = rows[-1]
-                    append_debug_event(
-                        debug_log_csv,
-                        study_id=study_id,
-                        event_kind="benchmark_case_completed",
-                        component="benchmark_runner",
-                        pattern=execution_mode,
-                        seq_len=seq_len,
-                        challenge="binary_generation_or_reuse",
-                        symptom=(
-                            f"Completed with {row.get('npu_dispatch_count')} dispatches, "
-                            f"{row.get('npu_unique_instruction_binary_count')} instruction binaries, "
-                            f"avg_latency_ms={row.get('avg_latency_ms')}"
-                        ),
-                        impact_on_experiment="The requested case completed and produced a benchmark row.",
-                        mitigation="Use the recorded dispatch, topology, and instruction-binary counts when interpreting programmability overhead.",
-                        status="completed",
-                        supporting_log_path=output_csv,
-                    )
+        for case in study_cases:
+            case_seq_lens = _case_seq_lens(case, seq_lens)
+            case_execution_modes = _case_execution_modes(case, execution_modes)
+            for seq_len in case_seq_lens:
+                warmup_runs, runs_per_sample = _resolve_sampling(
+                    manifest, seq_len, args
+                )
+                spec = _resolve_spec(args, case["layer_spec"], seq_len)
+                for execution_mode in case_execution_modes:
+                    try:
+                        rows = benchmark_pattern(
+                            execution_mode=execution_mode,
+                            spec=spec,
+                            warmup_runs=warmup_runs,
+                            runs_per_sample=runs_per_sample,
+                            output_csv=output_csv,
+                            seed=args.seed,
+                            write_immediately=False,
+                        )
+                    except Exception as exc:
+                        event = classify_debug_exception(exc)
+                        append_debug_event(
+                            debug_log_csv,
+                            study_id=study_id,
+                            event_kind="benchmark_case_failed",
+                            pattern=execution_mode,
+                            seq_len=seq_len,
+                            supporting_log_path=output_csv,
+                            **event,
+                        )
+                        if not manifest.get("continue_on_error", False):
+                            raise
+                        all_rows.append(
+                            _failure_result_row(
+                                study_id=study_id,
+                                case=case,
+                                spec=spec,
+                                execution_mode=execution_mode,
+                                warmup_runs=warmup_runs,
+                                runs_per_sample=runs_per_sample,
+                                exc=exc,
+                            )
+                        )
+                        continue
+                    decorated_rows = [
+                        _decorate_row_for_case(
+                            row,
+                            study_id=study_id,
+                            case=case,
+                            spec=spec,
+                        )
+                        for row in rows
+                    ]
+                    all_rows.extend(decorated_rows)
+                    if decorated_rows:
+                        row = decorated_rows[-1]
+                        append_debug_event(
+                            debug_log_csv,
+                            study_id=study_id,
+                            event_kind="benchmark_case_completed",
+                            component="benchmark_runner",
+                            pattern=execution_mode,
+                            seq_len=seq_len,
+                            challenge="binary_generation_or_reuse",
+                            symptom=(
+                                f"Completed with {row.get('npu_dispatch_count')} dispatches, "
+                                f"{row.get('npu_unique_instruction_binary_count')} instruction binaries, "
+                                f"avg_latency_ms={row.get('avg_latency_ms')}"
+                            ),
+                            impact_on_experiment="The requested case completed and produced a benchmark row.",
+                            mitigation="Use the recorded dispatch, topology, and instruction-binary counts when interpreting programmability overhead.",
+                            status="completed",
+                            supporting_log_path=output_csv,
+                        )
         if all_rows:
             write_results_csv(output_csv, all_rows)
             if peak_reference and annotated_output_csv:
@@ -291,17 +477,30 @@ def main():
                     status="completed",
                     supporting_log_path=annotated_output_csv,
                 )
+            support_matrix_csv = manifest.get("support_matrix_csv")
+            support_matrix_text = manifest.get("support_matrix_text")
+            if support_matrix_csv or support_matrix_text:
+                support_rows = summarize_support_rows(all_rows)
+                if support_matrix_csv:
+                    write_dict_rows_csv(support_matrix_csv, support_rows)
+                if support_matrix_text:
+                    output_path = Path(support_matrix_text)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_text(
+                        render_support_summary_text(support_rows), encoding="utf-8"
+                    )
 
         parity = _resolve_parity_config(args, manifest)
         if parity is not None:
             try:
                 parity_rows = _run_parity_checks(
                     parity=parity,
+                    cases=study_cases,
                     execution_modes=execution_modes,
                     seq_lens=seq_lens,
-                    base_spec=_resolve_spec(args, manifest, seq_lens[0]),
                     seed=args.seed,
                     study_id=study_id,
+                    args=args,
                 )
             except Exception as exc:
                 event = classify_debug_exception(exc)
@@ -317,10 +516,6 @@ def main():
                 raise
             parity_output = parity.get("output_csv")
             if parity_output:
-                from iron.applications.transformer_layer.benchmark_common import (
-                    write_dict_rows_csv,
-                )
-
                 write_dict_rows_csv(parity_output, parity_rows)
             append_debug_event(
                 debug_log_csv,

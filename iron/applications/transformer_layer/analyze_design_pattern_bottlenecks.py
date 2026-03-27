@@ -23,8 +23,13 @@ COMPONENT_FIELDS = {
 
 SUMMARY_FIELD_ORDER = [
     "study_id",
+    "study_case_id",
+    "study_case_label",
     "execution_mode",
     "seq_len",
+    "hidden_size",
+    "intermediate_size",
+    "num_attention_heads",
     "avg_latency_ms",
     "dominant_component",
     "dominant_component_latency_ms",
@@ -133,8 +138,13 @@ def build_row_summary(row: dict[str, object]) -> dict[str, object]:
         summary = f"{summary}; {context}"
     return {
         "study_id": row.get("study_id"),
+        "study_case_id": row.get("study_case_id"),
+        "study_case_label": row.get("study_case_label"),
         "execution_mode": row.get("execution_mode"),
         "seq_len": _optional_int(row.get("seq_len")),
+        "hidden_size": _optional_int(row.get("hidden_size")),
+        "intermediate_size": _optional_int(row.get("intermediate_size")),
+        "num_attention_heads": _optional_int(row.get("num_attention_heads")),
         "avg_latency_ms": total_latency_ms,
         "dominant_component": dominant_component,
         "dominant_component_latency_ms": dominant_latency_ms,
@@ -164,10 +174,17 @@ def build_execution_mode_summary(
 ) -> dict[str, dict[str, object]]:
     by_mode: dict[str, list[dict[str, object]]] = defaultdict(list)
     for row in summary_rows:
-        by_mode[str(row["execution_mode"])].append(row)
+        case_id = row.get("study_case_id")
+        execution_mode = row.get("execution_mode")
+        key = (
+            f"{case_id}:{execution_mode}"
+            if case_id not in (None, "", "None")
+            else str(execution_mode)
+        )
+        by_mode[key].append(row)
 
     output: dict[str, dict[str, object]] = {}
-    for execution_mode, rows in sorted(by_mode.items()):
+    for mode_key, rows in sorted(by_mode.items()):
         component_counts = Counter(
             row["dominant_component"]
             for row in rows
@@ -193,7 +210,10 @@ def build_execution_mode_summary(
             if dominant_fraction_values
             else None
         )
-        output[execution_mode] = {
+        output[mode_key] = {
+            "study_case_id": rows[0].get("study_case_id"),
+            "study_case_label": rows[0].get("study_case_label"),
+            "execution_mode": rows[0].get("execution_mode"),
             "row_count": len(rows),
             "seq_lens": sorted(
                 {
@@ -226,11 +246,18 @@ def render_execution_mode_summaries(
 ) -> str:
     rows_by_mode: dict[str, list[dict[str, object]]] = defaultdict(list)
     for row in summary_rows:
-        rows_by_mode[str(row["execution_mode"])].append(row)
+        case_id = row.get("study_case_id")
+        execution_mode = row.get("execution_mode")
+        key = (
+            f"{case_id}:{execution_mode}"
+            if case_id not in (None, "", "None")
+            else str(execution_mode)
+        )
+        rows_by_mode[key].append(row)
 
     lines = []
-    for execution_mode in sorted(rows_by_mode):
-        aggregate = aggregates[execution_mode]
+    for mode_key in sorted(rows_by_mode):
+        aggregate = aggregates[mode_key]
         counts = aggregate["dominant_component_counts"]
         if counts:
             dominant_component, dominant_count = max(
@@ -246,9 +273,13 @@ def render_execution_mode_summaries(
             else ""
         )
         seq_lens = ",".join(str(seq_len) for seq_len in aggregate["seq_lens"])
-        example_row = rows_by_mode[execution_mode][0]
+        example_row = rows_by_mode[mode_key][0]
+        prefix = str(aggregate.get("execution_mode"))
+        case_label = aggregate.get("study_case_label")
+        if case_label not in (None, "", "None"):
+            prefix = f"{case_label}:{prefix}"
         lines.append(
-            f"{execution_mode}: {dominant_text}{fraction_text}; seq_lens={seq_lens}; "
+            f"{prefix}: {dominant_text}{fraction_text}; seq_lens={seq_lens}; "
             f"example={example_row['bottleneck_summary']}"
         )
     return "\n".join(lines) + ("\n" if lines else "")
@@ -257,7 +288,11 @@ def render_execution_mode_summaries(
 def analyze_results(
     input_csv: str | Path,
 ) -> tuple[list[dict[str, object]], dict[str, dict[str, object]], str]:
-    input_rows = _load_result_rows(input_csv)
+    input_rows = [
+        row
+        for row in _load_result_rows(input_csv)
+        if row.get("run_status") in (None, "", "None", "completed")
+    ]
     if not input_rows:
         raise ValueError(f"No suite rows found in {input_csv}")
     summary_rows = [build_row_summary(row) for row in input_rows]

@@ -82,10 +82,16 @@ def resolve_study_path(manifest_path: str | Path, value: str | None) -> str | No
 def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
     manifest_file = Path(manifest_path).resolve()
     manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-    required = {"study_id", "layer_spec", "execution_modes", "seq_lens"}
+    required = {"study_id", "execution_modes", "seq_lens"}
     missing = sorted(required.difference(manifest))
     if missing:
         raise KeyError(f"Missing required study-manifest fields: {', '.join(missing)}")
+    has_layer_spec = "layer_spec" in manifest
+    has_study_cases = "study_cases" in manifest
+    if has_layer_spec == has_study_cases:
+        raise KeyError(
+            "Study manifest must include exactly one of layer_spec or study_cases"
+        )
 
     manifest["manifest_path"] = str(manifest_file)
     execution_modes = manifest["execution_modes"]
@@ -97,6 +103,7 @@ def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
     manifest.setdefault("warmup_runs", 5)
     manifest.setdefault("runs_per_sample", 20)
     manifest.setdefault("seed", 0)
+    manifest.setdefault("continue_on_error", False)
 
     if "output_csv" in manifest:
         manifest["output_csv"] = resolve_study_path(
@@ -114,6 +121,14 @@ def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
         manifest["annotated_output_csv"] = resolve_study_path(
             manifest_file, manifest["annotated_output_csv"]
         )
+    if "support_matrix_csv" in manifest:
+        manifest["support_matrix_csv"] = resolve_study_path(
+            manifest_file, manifest["support_matrix_csv"]
+        )
+    if "support_matrix_text" in manifest:
+        manifest["support_matrix_text"] = resolve_study_path(
+            manifest_file, manifest["support_matrix_text"]
+        )
 
     parity = manifest.get("parity")
     if isinstance(parity, dict):
@@ -128,5 +143,37 @@ def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
                 manifest_file, parity["output_csv"]
             )
         manifest["parity"] = parity
+
+    sampling_schedule = manifest.get("sampling_schedule")
+    if isinstance(sampling_schedule, dict):
+        normalized_schedule = {}
+        for raw_seq_len, payload in sampling_schedule.items():
+            seq_len = int(raw_seq_len)
+            if not isinstance(payload, dict):
+                raise TypeError(f"sampling_schedule[{raw_seq_len!r}] must be an object")
+            normalized_schedule[seq_len] = {
+                "warmup_runs": int(payload.get("warmup_runs", manifest["warmup_runs"])),
+                "runs_per_sample": int(
+                    payload.get("runs_per_sample", manifest["runs_per_sample"])
+                ),
+            }
+        manifest["sampling_schedule"] = normalized_schedule
+
+    if has_study_cases:
+        normalized_cases = []
+        for index, raw_case in enumerate(manifest["study_cases"]):
+            if not isinstance(raw_case, dict):
+                raise TypeError("Each study_cases entry must be an object")
+            if "layer_spec" not in raw_case:
+                raise KeyError("Each study_cases entry must include layer_spec")
+            case = dict(raw_case)
+            case.setdefault("case_id", f"case_{index}")
+            case.setdefault("case_label", case["case_id"])
+            if "execution_modes" in case and isinstance(case["execution_modes"], str):
+                case["execution_modes"] = parse_execution_modes(case["execution_modes"])
+            if "seq_lens" in case and isinstance(case["seq_lens"], str):
+                case["seq_lens"] = parse_seq_lens(case["seq_lens"])
+            normalized_cases.append(case)
+        manifest["study_cases"] = normalized_cases
 
     return manifest

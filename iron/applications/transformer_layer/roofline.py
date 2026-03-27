@@ -80,6 +80,10 @@ def annotate_result_row_with_peak(
     annotated = dict(row)
     if peak is None:
         return annotated
+    if str(row.get("run_status", "completed")) != "completed":
+        return annotated
+    if row.get("throughput_flops_per_sec") in ("", None, "None"):
+        return annotated
 
     throughput = float(row["throughput_flops_per_sec"])
     estimated_flops = float(row["estimated_flops_per_inference"])

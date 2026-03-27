@@ -74,6 +74,24 @@ def classify_debug_exception(exc: Exception) -> dict[str, str]:
     symptom = f"{type(exc).__name__}: {exc}"
     lowered = symptom.lower()
 
+    if "currently supports only" in lowered or "currently requires" in lowered:
+        return {
+            "component": "pattern_surface",
+            "challenge": "unsupported_pattern_surface",
+            "symptom": symptom,
+            "impact_on_experiment": "The requested benchmark case is outside the retained supported surface for that pattern.",
+            "mitigation": "Record the point as unsupported or reduce the study to the retained supported families.",
+            "status": "open",
+        }
+    if "aie.dma_bd" in lowered and "exceeds the" in lowered:
+        return {
+            "component": "npu_compile",
+            "challenge": "unsupported_dma_descriptor_limits",
+            "symptom": symptom,
+            "impact_on_experiment": "The requested benchmark case exceeds current DMA descriptor limits for the compiled pattern.",
+            "mitigation": "Retile, partition the transfer, or record the point as unsupported for the current pattern surface.",
+            "status": "open",
+        }
     if "unsupported" in lowered and ("topology" in lowered or "placement" in lowered):
         return {
             "component": "npu_compile",
