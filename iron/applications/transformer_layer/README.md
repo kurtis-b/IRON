@@ -19,16 +19,20 @@ The default study uses one synthetic transformer layer with:
 - batch size `1`
 - no attention mask
 - `bfloat16`
-- synthetic post-projection `Q/K/V/R` inputs
+- synthetic inputs at either:
+  - post-projection `Q/K/V/R`
+  - `hidden_states` with derived residual `R`
 - synthetic weights
 - one layer-local CPU reference path for parity checks
 
 The canonical layer spec lives in [layer_spec.py](/home/cj/iron/iron/applications/transformer_layer/src/layer_spec.py). Imported weights are represented in the schema, but this branch currently runs synthetic weights only. There is no `import_layer_weights.py` command in the app yet.
 
-All four compared executions start from the same boundary as the
-[encoder_pipeline](/home/cj/iron/iron/operators/encoder_pipeline/op.py) operator:
-supplied `Q`, `K`, `V`, and residual `R`. Q/K/V projection is intentionally
-out of scope for this thesis app.
+The retained baseline studies start from supplied `Q`, `K`, `V`, and residual
+`R`. The projection-inclusive follow-on studies start from `hidden_states`:
+
+- `encoder_pipeline` performs `Q/K/V` projection on the host
+- `gemm_only` offloads `Q/K/V` projection GEMMs to the NPU
+- `operator_runlist` offloads `Q/K/V` projection GEMM stages to the NPU
 
 For the engineering tradeoffs that differ across `encoder_pipeline`,
 `gemm_only`, and `operator_runlist`, see
@@ -64,6 +68,7 @@ One-shot NPU smoke:
 python iron/applications/transformer_layer/npu_inference.py \
   --execution-mode encoder_pipeline \
   --seq-len 64 \
+  --input-boundary hidden_states \
   --warmup-runs 1 \
   --runs-per-sample 5 \
   --output-csv iron/applications/transformer_layer/results/npu_smoke_seq64.csv
@@ -83,11 +88,25 @@ python iron/applications/transformer_layer/automated_benchmark.py \
   --study-manifest iron/applications/transformer_layer/study/design_patterns_long_seq.json
 ```
 
+Projection-inclusive long-sequence NPU sweep:
+
+```bash
+python iron/applications/transformer_layer/automated_benchmark.py \
+  --study-manifest iron/applications/transformer_layer/study/design_patterns_long_seq_with_projection.json
+```
+
 Embedding-scale NPU sweep through `dense_8b_class`:
 
 ```bash
 python iron/applications/transformer_layer/automated_benchmark.py \
   --study-manifest iron/applications/transformer_layer/study/design_patterns_embedding_scale.json
+```
+
+Projection-inclusive embedding-scale NPU sweep:
+
+```bash
+python iron/applications/transformer_layer/automated_benchmark.py \
+  --study-manifest iron/applications/transformer_layer/study/design_patterns_embedding_scale_with_projection.json
 ```
 
 There is no separate topology-cache warmup step in this app. Each pattern owns its own compilation/runtime setup inside the study harness.
@@ -125,6 +144,13 @@ Manifest-driven long-sequence component-boundary validation:
 ```bash
 python iron/applications/transformer_layer/operator_runlist_component_study.py \
   --config iron/applications/transformer_layer/study/operator_runlist_component_long_seq.json
+```
+
+Projection-inclusive long-sequence component-boundary validation:
+
+```bash
+python iron/applications/transformer_layer/operator_runlist_component_study.py \
+  --config iron/applications/transformer_layer/study/operator_runlist_component_long_seq_with_projection.json
 ```
 
 The retained runtime surface now executes through `seq_len=16384` on the
@@ -254,7 +280,10 @@ Checked-in manifests and scaffolds:
 - [design_patterns_sensitivity.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_sensitivity.json)
 - [design_patterns_long_seq.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_long_seq.json)
 - [design_patterns_embedding_scale.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_embedding_scale.json)
+- [design_patterns_long_seq_with_projection.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_long_seq_with_projection.json)
+- [design_patterns_embedding_scale_with_projection.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_embedding_scale_with_projection.json)
 - [operator_runlist_component_long_seq.json](/home/cj/iron/iron/applications/transformer_layer/study/operator_runlist_component_long_seq.json)
+- [operator_runlist_component_long_seq_with_projection.json](/home/cj/iron/iron/applications/transformer_layer/study/operator_runlist_component_long_seq_with_projection.json)
 - [gpu_compare.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare.json)
 - [gpu_compare_embedding_igpu.json](/home/cj/iron/iron/applications/transformer_layer/study/gpu_compare_embedding_igpu.json)
 - [programmability_debug_log.csv](/home/cj/iron/iron/applications/transformer_layer/study/programmability_debug_log.csv)

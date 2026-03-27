@@ -9,30 +9,33 @@ to the workflow and methodology docs, not replace them.
 All compared executions are intentionally aligned on the same workload
 boundary:
 
-- supplied post-projection `Q`, `K`, `V`, and residual `R`
+- one of two explicit input boundaries:
+  - supplied post-projection `Q`, `K`, `V`, and residual `R`
+  - `hidden_states` with derived residual `R`
 - one encoder-style downstream workload
 - batch size `1`
 - `bfloat16`
 - no attention mask
 - synthetic-first inputs and weights
 
-The fairness rule for this branch is: compare the same downstream transformer
-layer work, even when the mapping of that work across host and NPU is very
-different.
+The fairness rule for this branch is:
 
-The current checked-in study intentionally excludes Q/K/V projection. The
-follow-on study surface now also includes:
+- within one study axis, compare the same effective layer work even when the
+  mapping across host and NPU is very different
+- across study axes, record the input boundary explicitly rather than implying
+  that post-projection and hidden-state runs are interchangeable
+
+The checked-in study surface now includes:
 
 - a long-sequence sweep through `seq_len=16384` on the retained
   `768/3072/12` and `1024/4096/16` families
 - an embedding-scale sweep through `dense_8b_class`, with explicit
   unsupported rows instead of silent pruning
+- a projection-inclusive follow-on axis where the same studies start from
+  `hidden_states` instead of post-projection `Q/K/V/R`
 
 Useful future extensions beyond that are:
 
-- add a second comparison axis where all three patterns also include projection
-  work, while keeping the current post-projection study as the cleaner
-  downstream-only baseline
 - extend the embedding-scale sweep beyond `dense_8b_class` if the study needs
   a stronger scaling break point
 
@@ -57,10 +60,10 @@ Important considerations:
 In the study, `encoder_pipeline` is the reference point for what a more
 integrated NPU-native mapping can achieve when the topology is valid.
 
-If the study adds a projection-inclusive comparison later, `encoder_pipeline`
-should be expected to use host-side Q/K/V projection. That is not a flaw in
-the experiment; it is part of what the comparison would be intended to show
-about pipeline difficulty on a resource-constrained device.
+In the checked-in projection-inclusive follow-on axis, `encoder_pipeline` uses
+host-side Q/K/V projection. That is not a flaw in the experiment; it is part
+of what the comparison is intended to show about pipeline difficulty on a
+resource-constrained device.
 
 If the study adds a larger-embedding comparison later, `encoder_pipeline`
 should also be treated as the hardest pattern to scale cleanly. That kind of
@@ -86,8 +89,9 @@ integrated pattern, but it also means:
 - stage boundaries are more explicit
 - it is not expected to look like a fully NPU-native execution path
 
-Its comparison value comes from holding the `Q/K/V/R` starting boundary fixed
-while showing what happens when the offload policy is narrowed to GEMMs only.
+Its comparison value comes from keeping the operator set intentionally narrow
+while showing what happens when the offload policy is GEMM-centric rather than
+fully graph-centric.
 
 The retained runtime surface now also reaches `seq_len=16384` on both
 supported families. It gets there differently from the other two patterns:
@@ -98,8 +102,8 @@ supported families. It gets there differently from the other two patterns:
 - that keeps the design simple enough to extend, but it also makes the
   host-device orchestration cost more visible at long sequence lengths
 
-In a projection-inclusive comparison, `gemm_only` is a natural place to absorb
-Q/K/V projection because that work is itself GEMM-heavy.
+In the checked-in projection-inclusive follow-on axis, `gemm_only` absorbs
+Q/K/V projection directly on the NPU because that work is itself GEMM-heavy.
 
 `gemm_only` is also a natural candidate for a larger-embedding comparison,
 because increasing hidden size mostly expands GEMM surfaces that are already
@@ -155,10 +159,9 @@ extends through `seq_len=16384` on the retained `768/3072/12` and
 correctness method is the dedicated component-boundary study rather than full
 host materialization.
 
-In a projection-inclusive comparison, `operator_runlist` is also a natural
-place to absorb Q/K/V projection because it can represent those projections as
-additional staged operators rather than as a separate host-side preprocessing
-step.
+In the checked-in projection-inclusive follow-on axis, `operator_runlist`
+absorbs Q/K/V projection as additional staged GEMM operators rather than as a
+host-side preprocessing step.
 
 `operator_runlist` is also a reasonable candidate for a larger-embedding
 comparison. It still has real memory and runtime-pressure issues, but those are
@@ -189,8 +192,8 @@ design can scale hidden size before the practical best pattern changes. That is
 why the study needs explicit unsupported rows and a best-NPU-vs-iGPU compare
 rather than assuming all three NPU patterns remain feasible at every point.
 
-A projection-inclusive comparison would intentionally relax the current shared
-`Q/K/V/R` boundary and answer a different question: how much harder is it to
+The projection-inclusive axis intentionally relaxes the post-projection
+`Q/K/V/R` boundary and answers a different question: how much harder is it to
 carry projection work inside each design pattern, especially for
 `encoder_pipeline` on a resource-constrained NPU?
 
@@ -210,14 +213,11 @@ The next engineering steps implied by these considerations are:
 
 1. measure whether more BO reuse / aliasing is needed beyond the current
    query-blocked score/scale/softmax reuse
-2. if desired, add the second comparison axis where all three patterns include
-   Q/K/V projection, with `encoder_pipeline` using host-side projection and the
-   other two patterns carrying it in their own execution structures
-3. if desired, extend the embedding-scale study beyond `dense_8b_class`
-4. if desired, add a thesis-facing support-matrix figure that makes the
+2. if desired, extend the embedding-scale study beyond `dense_8b_class`
+3. if desired, add a thesis-facing support-matrix figure that makes the
    `encoder_pipeline` feasibility boundary explicit next to the performance
    plots
-5. if desired, extend the sensitivity or final thesis sweeps beyond the
+4. if desired, extend the sensitivity or final thesis sweeps beyond the
    currently retained `64..2048` single-family surface now that the follow-on
    long-sequence study runs through `16384`
 

@@ -37,7 +37,9 @@ Current branch assumptions:
 - batch size is `1`
 - `attention_mask_mode` is `none`
 - `activation` is `gelu`
-- the active study uses synthetic weights and synthetic post-projection `Q/K/V/R` inputs
+- the active studies use synthetic weights and one of two synthetic input boundaries:
+  - post-projection `Q/K/V/R`
+  - `hidden_states` plus derived residual `R`
 - imported weights are represented in the schema but no import CLI is wired yet
 
 Pattern-specific engineering tradeoffs are documented separately in
@@ -75,6 +77,8 @@ The checked-in manifests now include:
 - [design_patterns_sensitivity.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_sensitivity.json)
 - [design_patterns_long_seq.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_long_seq.json)
 - [design_patterns_embedding_scale.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_embedding_scale.json)
+- [design_patterns_long_seq_with_projection.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_long_seq_with_projection.json)
+- [design_patterns_embedding_scale_with_projection.json](/home/cj/iron/iron/applications/transformer_layer/study/design_patterns_embedding_scale_with_projection.json)
 
 ## Sweep Structure
 
@@ -87,7 +91,6 @@ The checked-in study set now has three sweep styles:
 - the follow-on embedding-scale sweep over:
   - `baseline_768`
   - `baseline_1024`
-  - `dense_4b_class`
   - `dense_8b_class`
 
 The long-sequence study isolates sequence scaling while holding model-family
@@ -100,7 +103,10 @@ dropping them.
 For each case:
 
 1. Build the layer spec for the requested `seq_len`.
-2. Materialize deterministic synthetic weights and post-projection `Q/K/V/R` inputs from the configured seed.
+2. Materialize deterministic synthetic weights and either:
+   - post-projection `Q/K/V/R` inputs, or
+   - `hidden_states` inputs plus derived residual `R`,
+   from the configured seed.
 3. Run warmup iterations.
 4. Run timed iterations.
 5. Write one schema-normalized suite row.
@@ -130,6 +136,7 @@ The schema includes:
 
 - workload metadata
 - case metadata for mixed-shape studies
+- input-boundary metadata
 - latency summary
 - stage-level latency fields
 - dispatch / topology metadata
@@ -189,6 +196,8 @@ Each NPU row may include pattern-specific stage timings such as:
 - `avg_encoder_pipeline_latency_ms`
 - `avg_npu_gemm_latency_ms`
 - `avg_operator_runlist_latency_ms`
+- `avg_host_projection_latency_ms`
+- `avg_npu_projection_latency_ms`
 - `avg_host_preprocess_latency_ms`
 - `avg_host_postprocess_latency_ms`
 - `avg_device_sync_latency_ms`
@@ -213,6 +222,8 @@ manifest-first with
 [operator_runlist_component_study.py](/home/cj/iron/iron/applications/transformer_layer/operator_runlist_component_study.py),
 using
 [operator_runlist_component_long_seq.json](/home/cj/iron/iron/applications/transformer_layer/study/operator_runlist_component_long_seq.json).
+The same driver also supports the projection-inclusive long-sequence manifest at
+[operator_runlist_component_long_seq_with_projection.json](/home/cj/iron/iron/applications/transformer_layer/study/operator_runlist_component_long_seq_with_projection.json).
 
 ## Support-Matrix Reporting
 
@@ -305,3 +316,128 @@ The plotter now supports both:
 - `x_axis=hidden_size` for the embedding-scale study
 
 The pure-Python validation target [paper_smoke_validation.py](/home/cj/iron/iron/applications/transformer_layer/paper_smoke_validation.py) exercises config parsing, schema writing, roofline annotation, bottleneck analysis, and plotting without hardware.
+
+## Appendix: Result Columns
+
+This appendix maps the shared result schema in
+[result_schema.py](/home/cj/iron/iron/applications/transformer_layer/src/result_schema.py)
+to the current benchmark implementation.
+
+### Identity And Workload Columns
+
+| Column | Meaning / Source |
+| --- | --- |
+| `study_id` | Study identifier from the manifest, for example `design_patterns_main` or `design_patterns_embedding_scale`. |
+| `study_case_id` | Case identifier from `study_cases` in mixed-shape manifests. |
+| `study_case_label` | Human-readable label from `study_cases`. |
+| `backend` | `npu` for Ryzen AI pattern rows, `gpu` for the AMD iGPU comparison. |
+| `execution_mode` | Pattern or backend mode, for example `encoder_pipeline`, `gemm_only`, `operator_runlist`, or `amd_igpu_reference`. |
+| `pattern_label` | Plot-facing label; in the current app this usually matches `execution_mode`. |
+| `input_boundary` | `post_projection` or `hidden_states`, from [TransformerLayerSpec](/home/cj/iron/iron/applications/transformer_layer/src/layer_spec.py). |
+| `seq_len` | Sequence length from the layer spec. |
+| `hidden_size` | Embedding width from the layer spec. |
+| `intermediate_size` | FFN hidden width from the layer spec. |
+| `num_attention_heads` | Attention head count from the layer spec. |
+| `attention_head_size` | Derived from `hidden_size / num_attention_heads`. |
+| `batch_size` | Batch size from the layer spec; retained studies use `1`. |
+| `dtype` | Tensor dtype from the layer spec; retained studies use `bfloat16`. |
+| `use_bias` | Bias toggle from the layer spec; retained studies use `false`. |
+| `weights_source` | Weight provenance, currently `synthetic`. |
+| `source_model_name` | Imported-model provenance when applicable; empty on the current synthetic studies. |
+| `source_layer_index` | Imported-layer provenance when applicable; empty on the current synthetic studies. |
+
+### Sampling And Latency Columns
+
+| Column | Meaning / Computation |
+| --- | --- |
+| `warmup_runs` | Untimed warmup iterations from the manifest or `sampling_schedule`. |
+| `runs_per_sample` | Timed iterations from the manifest or `sampling_schedule`. |
+| `measured_inference_count` | Number of timed runs actually recorded for the row. |
+| `timed_total_sec` | Sum of timed-run latencies only. Warmups are excluded. |
+| `avg_latency_ms` | `(timed_total_sec / measured_inference_count) * 1000`. |
+| `compile_setup_time_ms` | Pattern-reported setup / compile / runtime-preparation time. This is tracked separately from steady-state timed latency. |
+
+### Stage-Timing Columns
+
+These are averages over timed runs only. They are emitted when a pattern exposes
+`forward_with_stage_timings()`.
+
+| Column | Meaning / Source |
+| --- | --- |
+| `avg_encoder_pipeline_latency_ms` | Average of `encoder_pipeline_sec` from [pattern_encoder_pipeline.py](/home/cj/iron/iron/applications/transformer_layer/src/pattern_encoder_pipeline.py). |
+| `avg_host_projection_latency_ms` | Average of `host_projection_sec`, used by projection-inclusive `encoder_pipeline`. |
+| `avg_npu_projection_latency_ms` | Average of `npu_projection_sec`, used by projection-inclusive `gemm_only` and `operator_runlist`. |
+| `avg_npu_gemm_latency_ms` | Average of `npu_gemm_sec`, used by `gemm_only`. |
+| `avg_operator_runlist_latency_ms` | Average of `operator_runlist_sec`, used by `operator_runlist`. |
+| `avg_host_preprocess_latency_ms` | Average of `host_preprocess_sec`, used by `gemm_only`. |
+| `avg_host_postprocess_latency_ms` | Average of `host_postprocess_sec`, used by `gemm_only`. |
+| `avg_device_sync_latency_ms` | Average of `device_sync_sec`, currently `0.0` for `gemm_only`. |
+
+### NPU Dispatch And Topology Columns
+
+| Column | Meaning / Source |
+| --- | --- |
+| `npu_dispatch_count` | Pattern-reported dispatch count. `encoder_pipeline` uses `len(runlist)`. `gemm_only` uses projection dispatches plus `5 * query_block_count`. `operator_runlist` uses `len(runlist)` plus projection GEMMs when present. |
+| `npu_unique_instruction_binary_count` | Count of distinct `insts.bin` artifacts used by the row. |
+| `npu_unique_xclbin_count` | Count of distinct runtime xclbins used by the row. |
+| `topology_id` | Encoder-pipeline topology identifier from its topology registry. |
+| `topology_family` | Encoder-pipeline family identifier from its topology registry. |
+| `parallel_seq` | Encoder-pipeline sequence parallelism. |
+| `parallel_heads` | Encoder-pipeline head parallelism. |
+| `parallel_ffn` | Encoder-pipeline FFN parallelism. |
+| `compute_tile_count` | Encoder-pipeline compute tile count. |
+| `compute_tile_utilization_fraction` | Encoder-pipeline topology utilization fraction. |
+| `process_model` | `in_process` for normal runs, `child_process` for isolated worker paths such as `operator_runlist`. |
+
+### Status And Failure Columns
+
+| Column | Meaning / Source |
+| --- | --- |
+| `run_status` | `completed`, `unsupported`, or `failed`. |
+| `failure_component` | Normalized subsystem label from exception classification, for example `pattern_surface`, `npu_compile`, or `runtime_numeric`. |
+| `failure_category` | Normalized failure bucket, for example `unsupported_pattern_surface` or `unsupported_dma_descriptor_limits`. |
+| `failure_message` | Original failure symptom preserved in the result row. |
+
+### Throughput And Roofline Columns
+
+| Column | Meaning / Computation |
+| --- | --- |
+| `throughput_flops_per_sec` | `estimated_flops_per_inference * measured_inference_count / timed_total_sec`. |
+| `estimated_flops_per_inference` | Layer-centric FLOP estimate from [roofline.py](/home/cj/iron/iron/applications/transformer_layer/roofline.py): attention scores GEMM + attention output GEMM + output projection + FFN up + FFN down, plus `3 * Q/K/V projection GEMMs` when `input_boundary=hidden_states`. |
+| `estimated_bytes_per_inference` | Layer-centric byte estimate from [roofline.py](/home/cj/iron/iron/applications/transformer_layer/roofline.py). |
+| `operational_intensity_flops_per_byte` | `estimated_flops_per_inference / estimated_bytes_per_inference`. |
+| `backend_peak_ops_per_sec` | Peak backend throughput loaded from [peak_references.json](/home/cj/iron/iron/applications/transformer_layer/config/peak_references.json) during roofline annotation. |
+| `roofline_bound_ops_per_sec` | `min(backend_peak_ops_per_sec, operational_intensity * peak_bytes_per_sec)`. |
+| `backend_pct_of_peak` | `throughput_flops_per_sec / backend_peak_ops_per_sec`. |
+| `roofline_pct` | `throughput_flops_per_sec / roofline_bound_ops_per_sec`. |
+
+### Power And Energy Columns
+
+| Column | Meaning / Computation |
+| --- | --- |
+| `avg_power_w` | Average sampled power over the timed region. |
+| `max_power_w` | Maximum sampled power over the timed region. |
+| `energy_j` | `avg_power_w * timed_total_sec`. |
+| `power_sample_count` | Number of power samples collected during the timed region. |
+
+For the current app:
+
+- NPU rows typically leave these fields empty because
+  [benchmark_power.py](/home/cj/iron/iron/applications/transformer_layer/benchmark_power.py)
+  is a null monitor on the retained NPU path.
+- GPU/iGPU rows populate them when the compare run uses `power_backend=rocm-smi`.
+
+### Parity Output Columns
+
+Parity runs write a separate CSV, not the main benchmark suite. The key metric
+columns are:
+
+| Column | Meaning / Computation |
+| --- | --- |
+| `max_abs_diff` | `max(abs(reference - candidate))` against [ReferenceTransformerLayer](/home/cj/iron/iron/applications/transformer_layer/src/reference_layer.py). |
+| `mean_abs_diff` | `mean(abs(reference - candidate))` against the same reference. |
+
+`operator_runlist` parity is measured through the isolated worker path in
+[validate_npu_parity.py](/home/cj/iron/iron/applications/transformer_layer/validate_npu_parity.py)
+and
+[operator_runlist_worker.py](/home/cj/iron/iron/applications/transformer_layer/operator_runlist_worker.py).
