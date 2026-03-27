@@ -35,6 +35,7 @@ RESULT_FIELD_ORDER = [
     "avg_device_sync_latency_ms",
     "npu_dispatch_count",
     "npu_unique_instruction_binary_count",
+    "npu_unique_xclbin_count",
     "topology_id",
     "topology_family",
     "parallel_seq",

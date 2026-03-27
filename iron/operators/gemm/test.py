@@ -757,6 +757,36 @@ def test_runtime_xclbin_and_instruction_artifacts_can_be_bound_independently():
     assert qkv_op.insts_artifact.path != scores_op.insts_artifact.path
 
 
+def test_partition_n_changes_insts_but_not_runtime_xclbin():
+    common_kwargs = dict(
+        M=16384,
+        K=64,
+        N=16384,
+        tile_m=64,
+        tile_k=64,
+        tile_n=16,
+        num_aie_columns=8,
+        emulate_bf16_mmul_with_bfp16=True,
+        context=_DummyContext(),
+        skip_add_to_list=True,
+    )
+
+    unpartitioned = AIEGEMM(partition_N=1, **common_kwargs)
+    partitioned = AIEGEMM(partition_N=4, **common_kwargs)
+
+    unpartitioned_runtime = unpartitioned.get_runtime_xclbin_artifact(
+        prefix="gemm_partition_runtime_"
+    )
+    partitioned_runtime = partitioned.get_runtime_xclbin_artifact(
+        prefix="gemm_partition_runtime_"
+    )
+    unpartitioned_insts = unpartitioned.get_insts_artifact(prefix="gemm_partition_1_")
+    partitioned_insts = partitioned.get_insts_artifact(prefix="gemm_partition_4_")
+
+    assert unpartitioned_runtime.path == partitioned_runtime.path
+    assert unpartitioned_insts.path != partitioned_insts.path
+
+
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",

@@ -122,7 +122,7 @@ class AIEGEMM(AIEOperatorBase):
         min_N = self.tile_n * self.num_aie_columns
         return min_M, min_K, min_N
 
-    def _get_artifact_name_base(self, prefix, M, K, N):
+    def _get_artifact_name_base(self, prefix, M, K, N, include_partition_suffix=True):
         dtype_in = self.gemm_args.get("dtype_in", "bf16")
         dtype_out = self.gemm_args.get("dtype_out", "bf16")
         emulate_bf16_mmul_with_bfp16 = self.gemm_args.get(
@@ -146,11 +146,17 @@ class AIEGEMM(AIEOperatorBase):
                 f"_batchB{self.batch_B[0]}d{self.batch_B[1]}"
                 f"_batchC{self.batch_C[0]}d{self.batch_C[1]}"
             )
-        elif self.partition_N > 1:
+        else:
+            file_name_total_base += "_ctiles1"
+        if (
+            not self._uses_batched_layout()
+            and include_partition_suffix
+            and self.partition_N > 1
+        ):
             file_name_total_base += f"_partN{self.partition_N}"
         return file_name_total_base
 
-    def _build_mlir_artifact(self, prefix, M, K, N):
+    def _build_mlir_artifact(self, prefix, M, K, N, include_partition_suffix=True):
         operator_dir = Path(__file__).parent
         base_dir = self.context.base_dir
         device_str = self.context.device_manager.device_str()
@@ -177,7 +183,13 @@ class AIEGEMM(AIEOperatorBase):
         assert tile_k >= min_tile_k, f"tile_k ({tile_k}) must be >= {min_tile_k}"
         assert tile_n >= min_tile_n, f"tile_n ({tile_n}) must be >= {min_tile_n}"
 
-        file_name_total_base = self._get_artifact_name_base(prefix, M, K, N)
+        file_name_total_base = self._get_artifact_name_base(
+            prefix,
+            M,
+            K,
+            N,
+            include_partition_suffix=include_partition_suffix,
+        )
 
         kernel_archive = (
             f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
@@ -256,7 +268,9 @@ class AIEGEMM(AIEOperatorBase):
                     "use_scalar": use_scalar,
                     "emulate_bf16_mmul_with_bfp16": emulate_bf16_mmul_with_bfp16,
                     "prio_accuracy": prio_accuracy,
-                    "separate_c_tiles": int(self.partition_N > 1),
+                    # Keep one general non-batched topology so partition_N only
+                    # affects workload insts/runtime sequencing, not xclbin identity.
+                    "separate_c_tiles": 1,
                     "trace_size": 0,
                     "archive": kernel_archive,
                     "generate_taps": False,
@@ -318,9 +332,18 @@ class AIEGEMM(AIEOperatorBase):
     def get_artifacts(self, prefix="gemm_"):
         return self._build_mlir_artifact(prefix, self.M, self.K, self.N)
 
-    def get_insts_artifact(self, prefix="gemm_", xclbin_input=None):
+    def get_insts_artifact(self, prefix="gemm_", xclbin_input=None, kernel_name=None):
         _, insts_artifact = self._build_mlir_artifact(prefix, self.M, self.K, self.N)
         insts_artifact.xclbin_input = xclbin_input
+        insts_artifact.kernel_name = (
+            kernel_name
+            if kernel_name is not None
+            else (
+                xclbin_input.kernel_name
+                if xclbin_input is not None and hasattr(xclbin_input, "kernel_name")
+                else None
+            )
+        )
         return insts_artifact
 
     def get_runtime_xclbin_artifact(self, prefix="gemm_runtime_"):
@@ -330,6 +353,7 @@ class AIEGEMM(AIEOperatorBase):
             runtime_M,
             runtime_K,
             runtime_N,
+            include_partition_suffix=False,
         )
         return xclbin_artifact
 

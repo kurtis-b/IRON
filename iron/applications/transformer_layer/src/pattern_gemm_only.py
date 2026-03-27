@@ -123,6 +123,7 @@ class GemmOnlyPattern(nn.Module):
             context=self.context,
             **gemm_common,
         )
+        self._bind_shared_gemm_artifacts()
         self.scale = head_dim**-0.5
         self.ln1_weight = nn.Parameter(
             torch.ones(hidden, dtype=spec.torch_dtype), requires_grad=False
@@ -130,6 +131,40 @@ class GemmOnlyPattern(nn.Module):
         self.ln2_weight = nn.Parameter(
             torch.ones(hidden, dtype=spec.torch_dtype), requires_grad=False
         )
+
+    def _gemm_ops(self) -> list[tuple[str, AIEGEMM]]:
+        return [
+            ("attn_scores", self.attn_scores),
+            ("attn_output", self.attn_output),
+            ("out_proj", self.out_proj),
+            ("ffn_up", self.ffn_up),
+            ("ffn_down", self.ffn_down),
+        ]
+
+    def _artifact_case_prefix(self) -> str:
+        return (
+            "gemm_only_case_"
+            f"{self.spec.seq_len}x{self.spec.hidden_size}x"
+            f"{self.spec.intermediate_size}x{self.spec.num_attention_heads}_"
+        )
+
+    def _bind_shared_gemm_artifacts(self) -> None:
+        case_prefix = self._artifact_case_prefix()
+        shared_xclbin = self.out_proj.get_runtime_xclbin_artifact(
+            prefix=f"{case_prefix}runtime_"
+        )
+        shared_xclbin.kernel_name = "gemm_only_runtime"
+        for workload_name, gemm_op in self._gemm_ops():
+            insts_artifact = gemm_op.get_insts_artifact(
+                prefix=f"{case_prefix}{workload_name}_",
+                xclbin_input=shared_xclbin,
+            )
+            gemm_op.bind_artifacts(
+                shared_xclbin,
+                insts_artifact,
+                runtime_xclbin_artifact=shared_xclbin,
+                runtime_kernel_name=shared_xclbin.kernel_name,
+            )
 
     def _prepare_runtime(self) -> None:
         if self._runtime_ready:
@@ -269,17 +304,19 @@ class GemmOnlyPattern(nn.Module):
         }
 
     def get_benchmark_metadata(self) -> dict[str, object]:
-        gemm_ops = [
-            self.attn_scores,
-            self.attn_output,
-            self.out_proj,
-            self.ffn_up,
-            self.ffn_down,
-        ]
+        gemm_ops = [gemm_op for _, gemm_op in self._gemm_ops()]
         unique_insts = {
             str(op.insts_artifact.path)
             for op in gemm_ops
             if getattr(op, "insts_artifact", None) is not None
+        }
+        unique_xclbins = {
+            str((op.runtime_xclbin_artifact or op.xclbin_artifact).path)
+            for op in gemm_ops
+            if (
+                getattr(op, "runtime_xclbin_artifact", None) is not None
+                or getattr(op, "xclbin_artifact", None) is not None
+            )
         }
         block_count = (
             self.spec.seq_len + self.query_block_size - 1
@@ -293,6 +330,7 @@ class GemmOnlyPattern(nn.Module):
             "npu_dispatch_count": ((2 * self.spec.num_attention_heads) + 3)
             * block_count,
             "npu_unique_instruction_binary_count": len(unique_insts),
+            "npu_unique_xclbin_count": len(unique_xclbins),
             "process_model": "in_process",
         }
 
