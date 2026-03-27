@@ -195,6 +195,30 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
+def split_fill_tap_on_outer_dim(
+    tap: TensorAccessPattern,
+    tensor_shape: tuple[int, ...],
+    max_outer_dim: int,
+) -> list[TensorAccessPattern]:
+    outer_size = int(tap.sizes[0])
+    if outer_size <= max_outer_dim:
+        return [tap]
+    chunk_taps = []
+    chunk_start = 0
+    while chunk_start < outer_size:
+        chunk_len = min(max_outer_dim, outer_size - chunk_start)
+        chunk_taps.append(
+            TensorAccessPattern(
+                tensor_shape,
+                offset=int(tap.offset) + chunk_start * int(tap.strides[0]),
+                sizes=[chunk_len, *[int(s) for s in tap.sizes[1:]]],
+                strides=[int(s) for s in tap.strides],
+            )
+        )
+        chunk_start += chunk_len
+    return chunk_taps
+
+
 def my_matmul(
     dev,
     M,
@@ -346,6 +370,7 @@ def my_matmul(
     A_taps = []
     B_taps = []
     C_taps = []
+    max_host_fill_outer_dim = 64
 
     # Define tensor types
     A_ty = np.ndarray[batched_A_shape, np.dtype[dtype_in]]
@@ -753,17 +778,25 @@ def my_matmul(
                                     sizes=A_sizes,
                                     strides=A_strides,
                                 )
-                                rt.fill(
-                                    A_l3l2_fifos[col].prod(),
-                                    A,
-                                    tap=A_tile,
-                                    task_group=tg,
-                                    placement=Tile(
-                                        2 * col if n_aie_cols == 8 else col, 0
-                                    ),  # alternate columns in full 4x8 NPU2 case
+                                A_fill_taps = split_fill_tap_on_outer_dim(
+                                    A_tile,
+                                    batched_A_shape,
+                                    max_host_fill_outer_dim,
                                 )
-                                # This line does not change MLIR output at all - it's just for recording data movement
-                                A_taps.append(A_tile)
+                                A_fill_wait = len(A_fill_taps) > 1
+                                for A_fill_tap in A_fill_taps:
+                                    rt.fill(
+                                        A_l3l2_fifos[col].prod(),
+                                        A,
+                                        tap=A_fill_tap,
+                                        wait=A_fill_wait,
+                                        task_group=tg,
+                                        placement=Tile(
+                                            2 * col if n_aie_cols == 8 else col, 0
+                                        ),  # alternate columns in full 4x8 NPU2 case
+                                    )
+                                    # This line does not change MLIR output at all - it's just for recording data movement
+                                    A_taps.append(A_fill_tap)
                             # Use the calculated sizes/strides/offsets to record the data movement
                             # caused by the above call to npu_dma_memcpy_nd.
                             # This line does not change MLIR output at all.
@@ -820,16 +853,24 @@ def my_matmul(
                                 sizes=B_sizes,
                                 strides=B_strides,
                             )
-                            rt.fill(
-                                B_l3l2_fifos[col].prod(),
-                                B,
-                                tap=B_tile,
-                                task_group=tg,
-                                placement=Tile(col, 0),
+                            B_fill_taps = split_fill_tap_on_outer_dim(
+                                B_tile,
+                                batched_B_shape,
+                                max_host_fill_outer_dim,
                             )
+                            B_fill_wait = len(B_fill_taps) > 1
+                            for B_fill_tap in B_fill_taps:
+                                rt.fill(
+                                    B_l3l2_fifos[col].prod(),
+                                    B,
+                                    tap=B_fill_tap,
+                                    wait=B_fill_wait,
+                                    task_group=tg,
+                                    placement=Tile(col, 0),
+                                )
 
-                            # This line does not change MLIR output at all - it's just for recording data movement
-                            B_taps.append(B_tile)
+                                # This line does not change MLIR output at all - it's just for recording data movement
+                                B_taps.append(B_fill_tap)
                     if tb > 0 or (tb == 0 and pingpong > 0):
                         rt.finish_task_group(tg)
                         tg = rt.task_group()

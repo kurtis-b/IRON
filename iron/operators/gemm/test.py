@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+from iron.common import AIEContext
 from iron.common.test_utils import run_test
 from iron.operators.gemm.op import AIEGEMM
 from iron.operators.gemm.reference import generate_golden_reference
@@ -785,6 +786,28 @@ def test_partition_n_changes_insts_but_not_runtime_xclbin():
 
     assert unpartitioned_runtime.path == partitioned_runtime.path
     assert unpartitioned_insts.path != partitioned_insts.path
+
+
+@pytest.mark.extensive
+def test_batched_attn_scores_16384_compiles():
+    context = AIEContext(use_runlist=False)
+    AIEGEMM(
+        M=256,
+        K=64,
+        N=16384,
+        tile_m=64,
+        tile_k=64,
+        tile_n=16,
+        num_aie_columns=8,
+        prio_accuracy=False,
+        emulate_bf16_mmul_with_bfp16=True,
+        batch_A=(12, 1),
+        batch_B=(12, 1),
+        batch_C=(12, 0),
+        context=context,
+    )
+
+    context.compile_all()
 
 
 @pytest.mark.metrics(
