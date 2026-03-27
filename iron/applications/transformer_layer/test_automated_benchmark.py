@@ -98,6 +98,8 @@ def test_manifest_driven_automation_writes_suite_and_parity(monkeypatch, tmp_pat
     main()
 
     assert len(benchmark_calls) == 4
+    assert benchmark_calls[0]["study_id"] == "design_patterns_main"
+    assert benchmark_calls[0]["study_case_id"] == "default"
     assert suite_csv.exists()
     assert parity_csv.exists()
 

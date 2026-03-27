@@ -183,6 +183,8 @@ def test_benchmark_best_npu_vs_gpu_carries_case_and_reference_fields(
     assert len(benchmark_calls) == 1
     assert benchmark_calls[0]["spec"].hidden_size == 4096
     assert benchmark_calls[0]["warmup_runs"] == 10
+    assert benchmark_calls[0]["study_id"] == "gpu_compare_embedding_igpu"
+    assert benchmark_calls[0]["study_case_id"] == "dense_8b_class"
     assert rows[0]["study_case_id"] == "dense_8b_class"
     assert rows[0]["reference_npu_execution_mode"] == "operator_runlist"
     assert rows[0]["execution_mode"] == "amd_igpu_reference"

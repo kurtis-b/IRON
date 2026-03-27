@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from datetime import datetime, timezone
 import math
 import shutil
 import subprocess
 import threading
+import time
+
+from iron.applications.transformer_layer.measurement_log import utc_now_iso_precise
 
 
 def empty_power_stats() -> dict[str, float | None]:
@@ -34,6 +38,12 @@ def parse_turbostat_pkgwatt_samples(stdout: str) -> list[float]:
         except ValueError:
             continue
     return samples
+
+
+def _utc_iso_from_epoch(epoch_sec: float) -> str:
+    return datetime.fromtimestamp(epoch_sec, timezone.utc).isoformat(
+        timespec="microseconds"
+    )
 
 
 def resolve_power_sample_interval_sec(
@@ -89,6 +99,49 @@ def _run_turbostat_pkgwatt_samples(
     return samples
 
 
+def _run_turbostat_pkgwatt_capture(
+    *, sample_interval_sec: float, num_iterations: int
+) -> dict[str, object]:
+    started_epoch_sec = time.time()
+    started_perf_counter_sec = time.perf_counter()
+    started_at_utc = utc_now_iso_precise()
+    samples = _run_turbostat_pkgwatt_samples(
+        sample_interval_sec=sample_interval_sec,
+        num_iterations=num_iterations,
+    )
+    ended_perf_counter_sec = time.perf_counter()
+    ended_epoch_sec = time.time()
+    ended_at_utc = utc_now_iso_precise()
+    elapsed_sec = ended_perf_counter_sec - started_perf_counter_sec
+    sample_events = []
+    sample_window_sec = max(elapsed_sec, sample_interval_sec * len(samples))
+    sample_window_start_epoch_sec = ended_epoch_sec - sample_window_sec
+    sample_window_start_perf_counter_sec = ended_perf_counter_sec - sample_window_sec
+    for sample_index, sample in enumerate(samples, start=1):
+        sample_offset_sec = min(sample_window_sec, sample_index * sample_interval_sec)
+        sample_events.append(
+            {
+                "sample_index": sample_index,
+                "captured_at_utc": _utc_iso_from_epoch(
+                    sample_window_start_epoch_sec + sample_offset_sec
+                ),
+                "captured_perf_counter_sec": (
+                    sample_window_start_perf_counter_sec + sample_offset_sec
+                ),
+                "raw_package_power_w": sample,
+            }
+        )
+    return {
+        "started_at_utc": started_at_utc,
+        "ended_at_utc": ended_at_utc,
+        "started_perf_counter_sec": started_perf_counter_sec,
+        "ended_perf_counter_sec": ended_perf_counter_sec,
+        "elapsed_sec": elapsed_sec,
+        "samples": samples,
+        "sample_events": sample_events,
+    }
+
+
 class TurbostatPackagePowerMonitor:
     def __init__(
         self,
@@ -107,6 +160,13 @@ class TurbostatPackagePowerMonitor:
         self._process: subprocess.Popen[str] | None = None
         self._first_sample_event = threading.Event()
         self.quiescent_package_power_w: float | None = None
+        self.baseline_started_at_utc: str | None = None
+        self.baseline_ended_at_utc: str | None = None
+        self.baseline_started_perf_counter_sec: float | None = None
+        self.baseline_ended_perf_counter_sec: float | None = None
+        self.baseline_elapsed_sec: float | None = None
+        self.baseline_sample_events: list[dict[str, object]] = []
+        self.probe_sample_events: list[dict[str, object]] = []
         self._use_streaming_process = estimated_timed_window_sec is None or (
             estimated_timed_window_sec >= max(0.08, self.sample_interval_sec * 3.0)
         )
@@ -166,10 +226,19 @@ class TurbostatPackagePowerMonitor:
                 )
             ),
         )
-        samples = _run_turbostat_pkgwatt_samples(
+        capture = _run_turbostat_pkgwatt_capture(
             sample_interval_sec=self.sample_interval_sec,
             num_iterations=iterations,
         )
+        self.baseline_started_at_utc = str(capture["started_at_utc"])
+        self.baseline_ended_at_utc = str(capture["ended_at_utc"])
+        self.baseline_started_perf_counter_sec = float(
+            capture["started_perf_counter_sec"]
+        )
+        self.baseline_ended_perf_counter_sec = float(capture["ended_perf_counter_sec"])
+        self.baseline_elapsed_sec = float(capture["elapsed_sec"])
+        self.baseline_sample_events = list(capture["sample_events"])
+        samples = list(capture["samples"])
         return sum(samples) / len(samples)
 
     def _sample_loop_streaming(self):
@@ -182,8 +251,20 @@ class TurbostatPackagePowerMonitor:
                     break
                 samples = parse_turbostat_pkgwatt_samples(raw_line)
                 for sample in samples:
+                    captured_perf_counter_sec = time.perf_counter()
+                    captured_at_utc = utc_now_iso_precise()
                     self.raw_package_samples_w.append(sample)
-                    self._pseudo_samples_w.append(max(sample - baseline, 0.0))
+                    pseudo_sample_w = max(sample - baseline, 0.0)
+                    self._pseudo_samples_w.append(pseudo_sample_w)
+                    self.probe_sample_events.append(
+                        {
+                            "sample_index": len(self.probe_sample_events) + 1,
+                            "captured_at_utc": captured_at_utc,
+                            "captured_perf_counter_sec": captured_perf_counter_sec,
+                            "raw_package_power_w": sample,
+                            "pseudo_power_w": pseudo_sample_w,
+                        }
+                    )
                     self._first_sample_event.set()
         except Exception:
             return
@@ -192,13 +273,21 @@ class TurbostatPackagePowerMonitor:
         baseline = self.quiescent_package_power_w or 0.0
         while not self._stop_event.is_set():
             try:
-                samples = _run_turbostat_pkgwatt_samples(
+                capture = _run_turbostat_pkgwatt_capture(
                     sample_interval_sec=self.sample_interval_sec,
                     num_iterations=1,
                 )
-                for sample in samples:
+                for sample_event in capture["sample_events"]:
+                    sample = float(sample_event["raw_package_power_w"])
+                    pseudo_sample_w = max(sample - baseline, 0.0)
                     self.raw_package_samples_w.append(sample)
-                    self._pseudo_samples_w.append(max(sample - baseline, 0.0))
+                    self._pseudo_samples_w.append(pseudo_sample_w)
+                    self.probe_sample_events.append(
+                        {
+                            **sample_event,
+                            "pseudo_power_w": pseudo_sample_w,
+                        }
+                    )
             except Exception:
                 pass
 
@@ -220,6 +309,26 @@ class TurbostatPackagePowerMonitor:
             "max_power_w": max(self._pseudo_samples_w),
             "energy_j": avg_pseudo_w * elapsed_sec,
             "power_sample_count": len(self._pseudo_samples_w),
+        }
+
+    def measurement_details(self) -> dict[str, object]:
+        return {
+            "baseline": {
+                "start_time_utc": self.baseline_started_at_utc,
+                "end_time_utc": self.baseline_ended_at_utc,
+                "elapsed_sec": self.baseline_elapsed_sec,
+                "start_perf_counter_sec": self.baseline_started_perf_counter_sec,
+                "end_perf_counter_sec": self.baseline_ended_perf_counter_sec,
+                "sample_interval_sec": self.sample_interval_sec,
+                "average_power_w": self.quiescent_package_power_w,
+                "sample_count": len(self.baseline_sample_events),
+                "samples": list(self.baseline_sample_events),
+            },
+            "probe": {
+                "sample_interval_sec": self.sample_interval_sec,
+                "sample_count": len(self.probe_sample_events),
+                "samples": list(self.probe_sample_events),
+            },
         }
 
 

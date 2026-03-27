@@ -193,7 +193,91 @@ def test_benchmark_pattern_emits_expected_schema(monkeypatch, tmp_path):
     assert row["avg_power_w"] == pytest.approx(14.0)
     assert row["flops_per_joule"] is not None
     assert row["gflops_per_joule"] is not None
+    assert row["measurement_log_path"] is None
+    assert row["measurement_session_id"] is None
     assert output_csv.exists()
+
+
+def test_benchmark_pattern_can_emit_measurement_log_when_enabled(
+    monkeypatch, tmp_path
+):
+    spec = TransformerLayerSpec(seq_len=64)
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.npu_inference.build_pattern",
+        lambda execution_mode, spec: _FakePattern(spec),
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.npu_inference.make_synthetic_layer_weights",
+        lambda spec, seed: {"dummy": torch.ones(1)},
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.npu_inference.make_synthetic_layer_inputs",
+        lambda spec, seed: TransformerLayerInputs(
+            q=torch.ones(
+                (
+                    spec.batch_size,
+                    spec.num_attention_heads,
+                    spec.seq_len,
+                    spec.attention_head_size,
+                ),
+                dtype=spec.torch_dtype,
+            ),
+            k=torch.ones(
+                (
+                    spec.batch_size,
+                    spec.num_attention_heads,
+                    spec.seq_len,
+                    spec.attention_head_size,
+                ),
+                dtype=spec.torch_dtype,
+            ),
+            v=torch.ones(
+                (
+                    spec.batch_size,
+                    spec.num_attention_heads,
+                    spec.seq_len,
+                    spec.attention_head_size,
+                ),
+                dtype=spec.torch_dtype,
+            ),
+            r=torch.ones(
+                (spec.batch_size, spec.seq_len, spec.hidden_size),
+                dtype=spec.torch_dtype,
+            ),
+        ),
+    )
+    output_csv = tmp_path / "results.csv"
+
+    rows = benchmark_pattern(
+        execution_mode="encoder_pipeline",
+        spec=spec,
+        warmup_runs=1,
+        runs_per_sample=2,
+        output_csv=str(output_csv),
+        seed=0,
+        power_backend="none",
+        enable_measurement_log=True,
+    )
+
+    row = rows[0]
+    assert row["measurement_log_path"].endswith("results_measurements.jsonl")
+    assert row["measurement_session_id"]
+    measurement_events = [
+        json.loads(line)
+        for line in Path(row["measurement_log_path"])
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    timed_events = [
+        event
+        for event in measurement_events
+        if event["event_kind"] == "timing_measurement" and event["phase"] == "timed"
+    ]
+    assert timed_events
+    assert timed_events[0]["start_time_utc"] is not None
+    assert timed_events[0]["end_time_utc"] is not None
+    assert "Immediately before invoking" in timed_events[0]["start_point"]
+    assert "Immediately after" in timed_events[0]["end_point"]
 
 
 def test_benchmark_pattern_runs_operator_runlist_in_child_process(
@@ -209,6 +293,9 @@ def test_benchmark_pattern_runs_operator_runlist_in_child_process(
         assert request["power_backend"] == "turbostat_pkgwatt"
         assert request["power_sample_interval_sec"] == 0.05
         assert request["quiescent_baseline_duration_sec"] == 0.5
+        assert request["study_id"] == "synthetic_transformer_layer"
+        assert "measurement_log_path" not in request
+        assert "measurement_session_id" not in request
         response_path.write_text(
             json.dumps(
                 {
@@ -251,6 +338,8 @@ def test_benchmark_pattern_runs_operator_runlist_in_child_process(
                     "flops_per_joule": 0.05,
                     "gflops_per_joule": 5.0e-11,
                     "power_sample_count": 2,
+                    "measurement_log_path": None,
+                    "measurement_session_id": None,
                 }
             )
         )

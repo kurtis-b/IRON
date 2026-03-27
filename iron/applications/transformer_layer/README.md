@@ -71,8 +71,25 @@ python iron/applications/transformer_layer/npu_inference.py \
   --input-boundary hidden_states \
   --warmup-runs 1 \
   --runs-per-sample 5 \
+  --enable-measurement-log \
   --output-csv iron/applications/transformer_layer/results/npu_smoke_seq64.csv
 ```
+
+Measurement-audit sidecar logging is available, but it is now opt-in.
+If you pass `--enable-measurement-log`, the command above also writes:
+
+- `iron/applications/transformer_layer/results/npu_smoke_seq64_measurements.jsonl`
+
+When enabled, each result row carries:
+
+- `measurement_log_path`
+- `measurement_session_id`
+
+That sidecar log records every warmup run, every timed run, every separate
+power-probe run, the NPU quiescent-baseline measurement when active, and the
+final summary row payload. Timing entries include explicit `start_time_utc`,
+`end_time_utc`, and text describing the timer start and end points so the
+placement can be checked by hand.
 
 Main NPU sweep:
 
@@ -210,6 +227,10 @@ python iron/applications/transformer_layer/automated_benchmark.py \
   --study-manifest iron/applications/transformer_layer/study/design_patterns_main.json \
   --debug-log-csv iron/applications/transformer_layer/results/design_patterns_main_debug_log.csv
 ```
+
+Measurement-audit logging is separate from `debug_log_csv`. The debug log tracks
+study orchestration and failures. The measurement-audit sidecar tracks raw
+per-run timing and power measurements.
 
 Isolated ROCm GPU comparison:
 

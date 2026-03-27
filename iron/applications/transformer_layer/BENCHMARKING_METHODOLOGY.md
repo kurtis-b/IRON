@@ -128,6 +128,53 @@ The main CLI for one pattern is [npu_inference.py](/home/cj/iron/iron/applicatio
 
 There is no separate topology-cache warmup command in this app. Pattern compilation and runtime setup happen inside the pattern wrappers and harness.
 
+## Measurement Audit Log
+
+Benchmark runs can emit a sidecar measurement audit log when explicitly
+enabled. For a suite CSV such as `design_patterns_main.csv`, the default
+sidecar path is:
+
+- `design_patterns_main_measurements.jsonl`
+
+For a one-off run such as `npu_smoke_seq64.csv`, the default sidecar path is:
+
+- `npu_smoke_seq64_measurements.jsonl`
+
+When measurement logging is enabled with `--enable-measurement-log`, the result
+row records:
+
+- `measurement_log_path`
+- `measurement_session_id`
+
+Those two fields let a single benchmark row be matched back to the exact audit
+events that produced it.
+
+When measurement logging is not enabled, both fields remain empty and no sidecar
+JSONL file is written.
+
+The JSONL audit stream records:
+
+- benchmark-session start and completion
+- every warmup run
+- every timed run
+- every separate power-probe run
+- the quiescent NPU package-power baseline measurement when active
+- the benchmark summary payload written back into the result row
+
+For timing measurements, each event records:
+
+- `start_time_utc`
+- `end_time_utc`
+- `elapsed_sec`
+- `start_perf_counter_sec`
+- `end_perf_counter_sec`
+- `start_point`
+- `end_point`
+
+The `start_point` and `end_point` text is deliberate. It makes the timing
+boundary auditable by hand instead of forcing the reader to infer where the
+timer was placed from the code.
+
 ## Result Schema
 
 All pattern runners write the shared schema in [result_schema.py](/home/cj/iron/iron/applications/transformer_layer/src/result_schema.py).
@@ -442,6 +489,8 @@ These are averages over timed runs only. They are emitted when a pattern exposes
 | `flops_per_joule` | `throughput_flops_per_sec / avg_power_w`. Equivalent to FLOPs per joule. |
 | `gflops_per_joule` | `flops_per_joule / 1e9`. |
 | `power_sample_count` | Number of power samples collected during the timed region. |
+| `measurement_log_path` | Default sidecar JSONL measurement audit log written beside the benchmark CSV. |
+| `measurement_session_id` | Per-row session identifier used to match a result row back to its JSONL audit events. |
 
 For the current app:
 

@@ -63,6 +63,16 @@ def parse_args():
         type=float,
         default=0.5,
     )
+    parser.add_argument(
+        "--enable-measurement-log",
+        action="store_true",
+        help="Write a JSONL sidecar log with per-run timing and power audit events.",
+    )
+    parser.add_argument(
+        "--measurement-log-path",
+        default=None,
+        help="Optional JSONL sidecar path for detailed timing and power audit events.",
+    )
     parser.add_argument("--hidden-size", type=int, default=None)
     parser.add_argument("--intermediate-size", type=int, default=None)
     parser.add_argument("--num-attention-heads", type=int, default=None)
@@ -432,6 +442,11 @@ def main():
                             power_backend=args.power_backend,
                             power_sample_interval_sec=args.power_sample_interval_sec,
                             quiescent_baseline_duration_sec=args.quiescent_baseline_duration_sec,
+                            study_id=study_id,
+                            study_case_id=case["case_id"],
+                            study_case_label=case["case_label"],
+                            enable_measurement_log=args.enable_measurement_log,
+                            measurement_log_path=args.measurement_log_path,
                             write_immediately=False,
                         )
                     except Exception as exc:

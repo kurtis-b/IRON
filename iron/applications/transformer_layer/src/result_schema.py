@@ -69,6 +69,8 @@ RESULT_FIELD_ORDER = [
     "flops_per_joule",
     "gflops_per_joule",
     "power_sample_count",
+    "measurement_log_path",
+    "measurement_session_id",
 ]
 
 REQUIRED_RESULT_FIELDS = {

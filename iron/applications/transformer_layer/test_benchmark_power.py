@@ -29,6 +29,8 @@ def test_turbostat_monitor_stats_subtracts_quiescent_baseline():
     monitor.quiescent_package_power_w = 10.0
     monitor.raw_package_samples_w = [12.0, 18.0]
     monitor._pseudo_samples_w = [2.0, 8.0]
+    monitor.baseline_sample_events = [{"sample_index": 1, "raw_package_power_w": 10.0}]
+    monitor.probe_sample_events = [{"sample_index": 1, "raw_package_power_w": 12.0}]
 
     stats = monitor.stats(elapsed_sec=2.0)
 
@@ -38,6 +40,9 @@ def test_turbostat_monitor_stats_subtracts_quiescent_baseline():
     assert stats["max_power_w"] == pytest.approx(8.0)
     assert stats["energy_j"] == pytest.approx(10.0)
     assert stats["quiescent_package_power_w"] == pytest.approx(10.0)
+    details = monitor.measurement_details()
+    assert details["baseline"]["sample_count"] == 1
+    assert details["probe"]["sample_count"] == 1
 
 
 def test_create_power_monitor_rejects_unknown_backend():

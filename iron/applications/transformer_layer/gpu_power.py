@@ -12,6 +12,7 @@ import threading
 import time
 
 from iron.applications.transformer_layer.benchmark_power import empty_power_stats
+from iron.applications.transformer_layer.measurement_log import utc_now_iso_precise
 
 
 def _parse_power_value(value: object) -> float | None:
@@ -55,6 +56,7 @@ class RocmSMIPowerMonitor:
         self.device_index = int(device_index)
         self.sample_interval_sec = float(sample_interval_sec)
         self.samples_w: list[float] = []
+        self.sample_events: list[dict[str, object]] = []
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._card_label = f"card{self.device_index}"
@@ -85,6 +87,14 @@ class RocmSMIPowerMonitor:
                 )
                 if sample is not None:
                     self.samples_w.append(sample)
+                    self.sample_events.append(
+                        {
+                            "sample_index": len(self.sample_events) + 1,
+                            "captured_at_utc": utc_now_iso_precise(),
+                            "captured_perf_counter_sec": time.perf_counter(),
+                            "power_w": sample,
+                        }
+                    )
             except Exception:
                 pass
             self._stop_event.wait(self.sample_interval_sec)
@@ -98,6 +108,15 @@ class RocmSMIPowerMonitor:
             "max_power_w": max(self.samples_w),
             "energy_j": avg_power_w * elapsed_sec,
             "power_sample_count": len(self.samples_w),
+        }
+
+    def measurement_details(self) -> dict[str, object]:
+        return {
+            "probe": {
+                "sample_interval_sec": self.sample_interval_sec,
+                "sample_count": len(self.sample_events),
+                "samples": list(self.sample_events),
+            }
         }
 
 

@@ -28,6 +28,7 @@ OPTION_MAP = {
     "power_backend": "--power-backend",
     "power_sample_interval_sec": "--power-sample-interval-sec",
     "quiescent_baseline_duration_sec": "--quiescent-baseline-duration-sec",
+    "measurement_log_path": "--measurement-log-path",
     "hidden_size": "--hidden-size",
     "intermediate_size": "--intermediate-size",
     "num_attention_heads": "--num-attention-heads",
@@ -41,8 +42,12 @@ PATH_KEYS = {
     "peak_reference",
     "annotated_output_csv",
     "parity_output_csv",
+    "measurement_log_path",
 }
-BOOLEAN_FLAGS = {"run_parity_check": "--run-parity-check"}
+BOOLEAN_FLAGS = {
+    "run_parity_check": "--run-parity-check",
+    "enable_measurement_log": "--enable-measurement-log",
+}
 
 
 def parse_args():

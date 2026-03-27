@@ -26,6 +26,8 @@ def test_normalize_result_row_accepts_minimum_required_fields():
     assert "power_backend" in row
     assert "flops_per_joule" in row
     assert "gflops_per_joule" in row
+    assert "measurement_log_path" in row
+    assert "measurement_session_id" in row
 
 
 def test_normalize_result_row_rejects_missing_required_fields():
