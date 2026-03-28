@@ -158,6 +158,45 @@ def _resolve_parity_config(
     return parity
 
 
+def _record_parity_results(
+    *,
+    debug_log_csv: str | None,
+    study_id: str,
+    parity: dict[str, object],
+    parity_rows: list[dict[str, object]],
+) -> None:
+    parity_output = parity.get("output_csv")
+    if parity_rows:
+        if parity_output:
+            write_dict_rows_csv(parity_output, parity_rows)
+        append_debug_event(
+            debug_log_csv,
+            study_id=study_id,
+            event_kind="parity_completed",
+            component="parity",
+            challenge="parity_validation",
+            symptom="Layer-level parity completed successfully.",
+            impact_on_experiment="Correctness-check outputs are available for the selected execution modes.",
+            mitigation="None required.",
+            status="completed",
+            supporting_log_path=parity_output,
+        )
+        return
+
+    append_debug_event(
+        debug_log_csv,
+        study_id=study_id,
+        event_kind="parity_skipped",
+        component="parity",
+        challenge="parity_validation",
+        symptom="No parity rows matched the selected execution modes and sequence lengths.",
+        impact_on_experiment="No parity CSV was written for this filtered run.",
+        mitigation="Run a study configuration that overlaps the manifest parity surface if parity output is required.",
+        status="completed",
+        supporting_log_path=parity_output,
+    )
+
+
 def _iter_study_cases(manifest: dict[str, object]) -> list[dict[str, object]]:
     if "study_cases" in manifest:
         return list(manifest["study_cases"])
@@ -569,20 +608,11 @@ def main():
                     **event,
                 )
                 raise
-            parity_output = parity.get("output_csv")
-            if parity_output:
-                write_dict_rows_csv(parity_output, parity_rows)
-            append_debug_event(
-                debug_log_csv,
+            _record_parity_results(
+                debug_log_csv=debug_log_csv,
                 study_id=study_id,
-                event_kind="parity_completed",
-                component="parity",
-                challenge="parity_validation",
-                symptom="Layer-level parity completed successfully.",
-                impact_on_experiment="Correctness-check outputs are available for the selected execution modes.",
-                mitigation="None required.",
-                status="completed",
-                supporting_log_path=parity_output,
+                parity=parity,
+                parity_rows=parity_rows,
             )
     except Exception:
         append_debug_event(
