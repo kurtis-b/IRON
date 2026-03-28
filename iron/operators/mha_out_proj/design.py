@@ -131,6 +131,10 @@ def fused_mha(
     num_q_seq_blocks = seq_len // q_seq_tile
     num_kv_seq_blocks = seq_len // kv_seq_tile
     num_qkv_head_block_per_parallel_head = heads // parallel_heads
+    assert embed_sz % (emb_tile * o_proj_acc_depth) == 0, (
+        "embed_sz must be divisible by emb_tile * o_proj_acc_depth "
+        f"({embed_sz} % ({emb_tile} * {o_proj_acc_depth}) != 0)"
+    )
     num_o_col_groups = embed_sz // (emb_tile * o_proj_acc_depth)
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
