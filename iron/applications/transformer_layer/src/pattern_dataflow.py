@@ -19,6 +19,7 @@ from .utils import (
     bind_addnorm_ffn_addnorm_weights,
     bind_mha_out_proj_weights,
     bind_qkv_proj_weights,
+    make_in_process_npu_metadata,
     require_keys,
     select_mha_out_proj_emb_tile,
 )
@@ -145,19 +146,14 @@ class DataflowPattern(nn.Module):
         unique_xclbins.add(str(self.block2.xclbin_artifact.path))
         unique_insts.add(str(self.block3.block.insts_artifact.path))
         unique_xclbins.add(str(self.block3.block.xclbin_artifact.path))
-        return {
-            "compile_setup_time_ms": (
-                None
-                if self.compile_setup_time_sec is None
-                else self.compile_setup_time_sec * 1000.0
-            ),
-            "npu_dispatch_count": 3
+        return make_in_process_npu_metadata(
+            compile_setup_time_sec=self.compile_setup_time_sec,
+            dispatch_count=3
             + len(self.block2.runlist)
             + len(self.block3.block.runlist),
-            "npu_unique_instruction_binary_count": len(unique_insts),
-            "npu_unique_xclbin_count": len(unique_xclbins),
-            "process_model": "in_process",
-        }
+            unique_instruction_binary_count=len(unique_insts),
+            unique_xclbin_count=len(unique_xclbins),
+        )
 
     def forward(
         self,

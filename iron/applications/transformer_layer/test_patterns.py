@@ -7,6 +7,7 @@ import torch
 from iron.applications.transformer_layer.npu_inference import build_pattern
 from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
 from iron.applications.transformer_layer.src.utils import (
+    make_in_process_npu_metadata,
     make_synthetic_layer_inputs,
     make_synthetic_layer_weights,
 )
@@ -42,6 +43,22 @@ def test_block_patterns_prepare_hidden_state_inputs():
         pattern = build_pattern(execution_mode, spec)
         pattern.assign_weights(weights)
         pattern.prepare_benchmark_inputs(inputs)
+
+
+def test_make_in_process_npu_metadata_formats_common_fields():
+    metadata = make_in_process_npu_metadata(
+        compile_setup_time_sec=0.25,
+        dispatch_count=7,
+        unique_instruction_binary_count=3,
+        unique_xclbin_count=2,
+    )
+    assert metadata == {
+        "compile_setup_time_ms": 250.0,
+        "npu_dispatch_count": 7,
+        "npu_unique_instruction_binary_count": 3,
+        "npu_unique_xclbin_count": 2,
+        "process_model": "in_process",
+    }
 
 
 def test_block1_contract_reshapes_projection_outputs_to_head_major():

@@ -144,3 +144,25 @@ def bind_addnorm_ffn_addnorm_weights(
     block.block.weight_up_proj = weights["ffn_up_weight"].contiguous()
     block.block.weight_down_proj = weights["ffn_down_weight"].contiguous()
     block.block.ln2_weight = weights["ln2_weight"].contiguous()
+
+
+def compile_setup_time_ms(compile_setup_time_sec: float | None) -> float | None:
+    if compile_setup_time_sec is None:
+        return None
+    return compile_setup_time_sec * 1000.0
+
+
+def make_in_process_npu_metadata(
+    *,
+    compile_setup_time_sec: float | None,
+    dispatch_count: int,
+    unique_instruction_binary_count: int,
+    unique_xclbin_count: int,
+) -> dict[str, object]:
+    return {
+        "compile_setup_time_ms": compile_setup_time_ms(compile_setup_time_sec),
+        "npu_dispatch_count": dispatch_count,
+        "npu_unique_instruction_binary_count": unique_instruction_binary_count,
+        "npu_unique_xclbin_count": unique_xclbin_count,
+        "process_model": "in_process",
+    }

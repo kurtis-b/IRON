@@ -39,6 +39,8 @@ implementations.
 - shared thesis-app weight-binding helpers for Dataflow blocks may also live in
   `src/utils.py`, while the actual operator mutation still happens only from
   the pattern layer
+- repeated in-process benchmark-metadata formatting for Dataflow thesis patterns
+  may also be centralized in `src/utils.py`
 
 ## Block 1
 

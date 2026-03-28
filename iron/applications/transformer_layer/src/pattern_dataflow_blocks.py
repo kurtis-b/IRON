@@ -19,6 +19,7 @@ from .utils import (
     bind_addnorm_ffn_addnorm_weights,
     bind_mha_out_proj_weights,
     bind_qkv_proj_weights,
+    make_in_process_npu_metadata,
     host_attention_output,
     host_project_qkv_head_major,
     require_keys,
@@ -91,17 +92,12 @@ class Block1QKVProjPattern(_BaseBlockPattern):
             str((op.runtime_xclbin_artifact or op.xclbin_artifact).path)
             for op in gemm_ops
         }
-        return {
-            "compile_setup_time_ms": (
-                None
-                if self.compile_setup_time_sec is None
-                else self.compile_setup_time_sec * 1000.0
-            ),
-            "process_model": "in_process",
-            "npu_dispatch_count": 3,
-            "npu_unique_instruction_binary_count": len(unique_insts),
-            "npu_unique_xclbin_count": len(unique_xclbins),
-        }
+        return make_in_process_npu_metadata(
+            compile_setup_time_sec=self.compile_setup_time_sec,
+            dispatch_count=3,
+            unique_instruction_binary_count=len(unique_insts),
+            unique_xclbin_count=len(unique_xclbins),
+        )
 
     def forward(
         self,
@@ -171,17 +167,12 @@ class Block2MHAOutProjPattern(_BaseBlockPattern):
         return output.unsqueeze(0), {"block2_mha_out_proj_sec": end - start}
 
     def get_benchmark_metadata(self) -> dict[str, object]:
-        return {
-            "compile_setup_time_ms": (
-                None
-                if self.compile_setup_time_sec is None
-                else self.compile_setup_time_sec * 1000.0
-            ),
-            "npu_dispatch_count": len(self.block.runlist),
-            "npu_unique_instruction_binary_count": 1,
-            "npu_unique_xclbin_count": 1,
-            "process_model": "in_process",
-        }
+        return make_in_process_npu_metadata(
+            compile_setup_time_sec=self.compile_setup_time_sec,
+            dispatch_count=len(self.block.runlist),
+            unique_instruction_binary_count=1,
+            unique_xclbin_count=1,
+        )
 
     def forward(
         self,
@@ -257,17 +248,12 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
         return output.unsqueeze(0), {"block3_addnorm_ffn_addnorm_sec": end - start}
 
     def get_benchmark_metadata(self) -> dict[str, object]:
-        return {
-            "compile_setup_time_ms": (
-                None
-                if self.compile_setup_time_sec is None
-                else self.compile_setup_time_sec * 1000.0
-            ),
-            "process_model": "in_process",
-            "npu_dispatch_count": len(self.block.block.runlist),
-            "npu_unique_instruction_binary_count": 1,
-            "npu_unique_xclbin_count": 1,
-        }
+        return make_in_process_npu_metadata(
+            compile_setup_time_sec=self.compile_setup_time_sec,
+            dispatch_count=len(self.block.block.runlist),
+            unique_instruction_binary_count=1,
+            unique_xclbin_count=1,
+        )
 
     def forward(
         self,
