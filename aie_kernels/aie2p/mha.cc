@@ -125,8 +125,7 @@ void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_bu
 
     for (int32_t i = 0; i < B_q; i += SCALE_VECTOR_LENGTH) {
         using ScaleVecbf16 = aie::vector<bfloat16, SCALE_VECTOR_LENGTH>;
-        ScaleVecbf16 l_vec =
-            aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + 2 * B_q + i);
+        ScaleVecbf16 l_vec = aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + 2 * B_q + i);
         l_vec = aie::inv(l_vec);
         aie::store_v(scale_buffer + 2 * B_q + i, l_vec);
     }
@@ -181,9 +180,7 @@ void partial_softmax(bfloat16 *A,
     // Tail mask: invalidate padded Q rows
     if (valid_q_rows < B_q) {
         for (int32_t i = valid_q_rows; i < B_q; i++) {
-            store_row_value(
-                A + i * B_kv, B_kv, std::numeric_limits<bfloat16>::lowest()
-            );
+            store_row_value(A + i * B_kv, B_kv, std::numeric_limits<bfloat16>::lowest());
         }
     }
     // Tail mask: invalidate padded KV cols for valid rows
@@ -246,15 +243,11 @@ void partial_softmax(bfloat16 *A,
 
         using ScaleVecbf16 = aie::vector<bfloat16, SCALE_VECTOR_LENGTH>;
         ScaleVecbf16 m_i_minus_1 = aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + i);
-        ScaleVecbf16 m_i =
-            aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + B_q + i);
-        ScaleVecbf16 l_i_minus_1 =
-            aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + 2 * B_q + i);
-        ScaleVecbf16 accum_exp_val =
-            aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + 3 * B_q + i);
+        ScaleVecbf16 m_i = aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + B_q + i);
+        ScaleVecbf16 l_i_minus_1 = aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + 2 * B_q + i);
+        ScaleVecbf16 accum_exp_val = aie::load_v<SCALE_VECTOR_LENGTH>(scale_buffer + 3 * B_q + i);
 
-        aie::accum<accfloat, SCALE_VECTOR_LENGTH> l_i_accum =
-            aie::zeros<accfloat, SCALE_VECTOR_LENGTH>();
+        aie::accum<accfloat, SCALE_VECTOR_LENGTH> l_i_accum = aie::zeros<accfloat, SCALE_VECTOR_LENGTH>();
 
         aie::accum<accfloat, SCALE_VECTOR_LENGTH> diff =
             aie::accum<accfloat, SCALE_VECTOR_LENGTH>(aie::sub(m_i_minus_1, m_i));
@@ -262,8 +255,7 @@ void partial_softmax(bfloat16 *A,
         ScaleVecbf16 max_diff_exp = l_i_accum.to_vector<bfloat16>();
 
         aie::store_v(scale_buffer + 3 * B_q + i, max_diff_exp);
-        aie::accum<accfloat, SCALE_VECTOR_LENGTH> l_i =
-            aie::add(aie::mul(max_diff_exp, l_i_minus_1), accum_exp_val);
+        aie::accum<accfloat, SCALE_VECTOR_LENGTH> l_i = aie::add(aie::mul(max_diff_exp, l_i_minus_1), accum_exp_val);
         aie::store_v(scale_buffer + 2 * B_q + i, l_i.to_vector<bfloat16>());
         aie::store_v(scale_buffer + i, m_i);
     }
@@ -274,10 +266,8 @@ void init_scale_buffer(bfloat16 *scale_buffer, int32_t size)
     ::aie::set_rounding(ROUNDING_MODE);
 
     using ScaleVecbf16 = aie::vector<bfloat16, SCALE_VECTOR_LENGTH>;
-    ScaleVecbf16 lowest_vec =
-        aie::broadcast<bfloat16, SCALE_VECTOR_LENGTH>(std::numeric_limits<bfloat16>::lowest());
-    ScaleVecbf16 zeros_vec =
-        aie::broadcast<bfloat16, SCALE_VECTOR_LENGTH>(0.0f);
+    ScaleVecbf16 lowest_vec = aie::broadcast<bfloat16, SCALE_VECTOR_LENGTH>(std::numeric_limits<bfloat16>::lowest());
+    ScaleVecbf16 zeros_vec = aie::broadcast<bfloat16, SCALE_VECTOR_LENGTH>(0.0f);
 
     for (int32_t i = 0; i < size; i += SCALE_VECTOR_LENGTH) {
         // VJUNG: m_{i-1} vector
