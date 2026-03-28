@@ -22,6 +22,11 @@ from .gpu_power import (
     create_rocm_power_monitor,
     parse_rocm_smi_average_power_w,
 )
+from .gpu_inference import (
+    SUPPORTED_POWER_BACKENDS,
+    benchmark_gpu_layer,
+    resolve_amd_gpu_device,
+)
 from .measurement_log import (
     MeasurementAuditLogger,
     capture_timed_call,
@@ -51,6 +56,9 @@ __all__ = [
     "parse_rocm_smi_average_power_w",
     "RocmSMIPowerMonitor",
     "create_rocm_power_monitor",
+    "SUPPORTED_POWER_BACKENDS",
+    "resolve_amd_gpu_device",
+    "benchmark_gpu_layer",
     "utc_now_iso_precise",
     "default_measurement_log_path",
     "capture_timed_call",

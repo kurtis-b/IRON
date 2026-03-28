@@ -8,8 +8,10 @@ import csv
 import json
 from pathlib import Path
 
-from iron.applications.transformer_layer.gpu_inference import benchmark_gpu_layer
-from iron.applications.transformer_layer.src.bench import write_results_csv
+from iron.applications.transformer_layer.src.bench import (
+    benchmark_gpu_layer,
+    write_results_csv,
+)
 from iron.applications.transformer_layer.src.core.layer_spec import TransformerLayerSpec
 
 
