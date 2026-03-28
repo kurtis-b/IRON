@@ -5,7 +5,21 @@ import numpy as np
 import torch
 
 from iron.applications.transformer_layer.npu_inference import build_pattern
+from iron.applications.transformer_layer.src.core import (
+    TransformerLayerSpec as CoreSpec,
+)
+from iron.applications.transformer_layer.src.pattern_dataflow import (
+    DataflowPattern as LegacyDataflowPattern,
+)
+from iron.applications.transformer_layer.src.pattern_gemm_only import (
+    GemmOffloadPattern as LegacyGemmOffloadPattern,
+    GemmOnlyPattern as LegacyGemmOnlyPattern,
+)
 from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
+from iron.applications.transformer_layer.src.patterns import (
+    DataflowPattern as StructuredDataflowPattern,
+)
+from iron.applications.transformer_layer.src.patterns import GemmOnlyPattern
 from iron.applications.transformer_layer.src.utils import (
     make_in_process_npu_metadata,
     make_synthetic_layer_inputs,
@@ -13,6 +27,13 @@ from iron.applications.transformer_layer.src.utils import (
 )
 from iron.operators.mha_out_proj.op import _pack_qkv_head_major
 from iron.operators.qkv_proj.op import AIEQKVProj
+
+
+def test_restructured_src_packages_preserve_legacy_imports():
+    assert TransformerLayerSpec is CoreSpec
+    assert LegacyDataflowPattern is StructuredDataflowPattern
+    assert LegacyGemmOnlyPattern is GemmOnlyPattern
+    assert LegacyGemmOffloadPattern is GemmOnlyPattern
 
 
 def test_build_pattern_supports_thesis_modes():

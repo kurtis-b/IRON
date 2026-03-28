@@ -3,9 +3,11 @@
 
 """Single-layer transformer thesis app."""
 
-from .input_bundle import TransformerLayerInputs
-from .layer_spec import TransformerLayerSpec
-from .reference_layer import ReferenceTransformerLayer
+from .core import (
+    ReferenceTransformerLayer,
+    TransformerLayerInputs,
+    TransformerLayerSpec,
+)
 
 __all__ = [
     "TransformerLayerInputs",
