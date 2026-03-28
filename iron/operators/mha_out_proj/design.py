@@ -117,8 +117,8 @@ def fused_mha(
     embed_sz = heads * d
 
     of_depth = 2
-    o_proj_weight_consumer_depth = 1 if emb_tile >= 128 else of_depth
-    o_proj_partial_depth = 1 if emb_tile >= 128 else of_depth
+    o_proj_weight_consumer_depth = 1
+    o_proj_partial_depth = 1
     enable_tracing = True if trace_size > 0 else False
     dtype_str = "bf16"
     dev = "npu2"
