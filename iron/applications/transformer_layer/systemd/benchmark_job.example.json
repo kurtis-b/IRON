@@ -1,0 +1,16 @@
+{
+  "_header": [
+    "SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.",
+    "SPDX-License-Identifier: Apache-2.0"
+  ],
+  "study_manifest": "../study/design_patterns_main.json",
+  "output_csv": "../results/design_patterns_main.csv",
+  "debug_log_csv": "../results/design_patterns_main_debug_log.csv",
+  "peak_reference": "../config/peak_references.json",
+  "annotated_output_csv": "../results/design_patterns_main_annotated.csv",
+  "run_parity_check": true,
+  "parity_output_csv": "../results/design_patterns_main_parity.csv",
+  "warmup_runs": 5,
+  "runs_per_sample": 20,
+  "seed": 0
+}

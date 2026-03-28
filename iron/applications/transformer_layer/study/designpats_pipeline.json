@@ -1,0 +1,97 @@
+{
+  "_header": [
+    "SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.",
+    "SPDX-License-Identifier: Apache-2.0"
+  ],
+  "pipeline_id": "designpats_pipeline",
+  "fail_fast": true,
+  "debug_log_csv": "../results/designpats_pipeline_debug_log.csv",
+  "thermal_recovery": {
+    "enabled": true,
+    "skip_in_smoke": true,
+    "temperature_sensor_name": "k10temp",
+    "temperature_sensor_input": "temp1_input",
+    "recovery_tolerance_fraction": 0.05,
+    "recovery_timeout_sec": 15.0,
+    "recovery_poll_interval_sec": 1.0
+  },
+  "npu_power": {
+    "power_backend": "turbostat_pkgwatt",
+    "power_sample_interval_sec": 0.05,
+    "quiescent_baseline_duration_sec": 0.5
+  },
+  "steps": [
+    {
+      "step_id": "dataflow_blocks",
+      "kind": "npu_study",
+      "manifest": "dataflow_blocks.json"
+    },
+    {
+      "step_id": "dataflow_blocks_bottlenecks",
+      "kind": "bottleneck",
+      "input_csv": "../results/dataflow_blocks_annotated.csv",
+      "summary_csv": "../results/dataflow_blocks_bottlenecks.csv",
+      "summary_json": "../results/dataflow_blocks_bottlenecks.json",
+      "summary_text": "../results/dataflow_blocks_bottlenecks.txt",
+      "benchmarking_step": false
+    },
+    {
+      "step_id": "dataflow_blocks_plots",
+      "kind": "plot",
+      "input_csv": "../results/dataflow_blocks_annotated.csv",
+      "bottleneck_csv": "../results/dataflow_blocks_bottlenecks.csv",
+      "output_dir": "../results/plots/dataflow_blocks",
+      "benchmarking_step": false
+    },
+    {
+      "step_id": "design_patterns_end_to_end",
+      "kind": "npu_study",
+      "manifest": "design_patterns_end_to_end.json"
+    },
+    {
+      "step_id": "gpu_compare_end_to_end_igpu",
+      "kind": "gpu_compare",
+      "config": "gpu_compare_end_to_end_igpu.json"
+    },
+    {
+      "step_id": "design_patterns_end_to_end_bottlenecks",
+      "kind": "bottleneck",
+      "input_csv": "../results/design_patterns_end_to_end_annotated.csv",
+      "summary_csv": "../results/design_patterns_end_to_end_bottlenecks.csv",
+      "summary_json": "../results/design_patterns_end_to_end_bottlenecks.json",
+      "summary_text": "../results/design_patterns_end_to_end_bottlenecks.txt",
+      "benchmarking_step": false
+    },
+    {
+      "step_id": "design_patterns_end_to_end_plots",
+      "kind": "plot",
+      "input_csv": "../results/design_patterns_end_to_end_annotated.csv",
+      "bottleneck_csv": "../results/design_patterns_end_to_end_bottlenecks.csv",
+      "gpu_compare_csv": "../results/gpu_compare_end_to_end_igpu.csv",
+      "output_dir": "../results/plots/design_patterns_end_to_end",
+      "benchmarking_step": false
+    },
+    {
+      "step_id": "reconfiguration_overhead",
+      "kind": "npu_study",
+      "manifest": "reconfiguration_overhead.json"
+    },
+    {
+      "step_id": "reconfiguration_overhead_bottlenecks",
+      "kind": "bottleneck",
+      "input_csv": "../results/reconfiguration_overhead_annotated.csv",
+      "summary_csv": "../results/reconfiguration_overhead_bottlenecks.csv",
+      "summary_json": "../results/reconfiguration_overhead_bottlenecks.json",
+      "summary_text": "../results/reconfiguration_overhead_bottlenecks.txt",
+      "benchmarking_step": false
+    },
+    {
+      "step_id": "reconfiguration_overhead_plots",
+      "kind": "plot",
+      "input_csv": "../results/reconfiguration_overhead_annotated.csv",
+      "bottleneck_csv": "../results/reconfiguration_overhead_bottlenecks.csv",
+      "output_dir": "../results/plots/reconfiguration_overhead",
+      "benchmarking_step": false
+    }
+  ]
+}
