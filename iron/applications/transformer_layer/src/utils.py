@@ -141,9 +141,9 @@ def bind_mha_out_proj_weights(block, weights: Mapping[str, torch.Tensor]) -> Non
 def bind_addnorm_ffn_addnorm_weights(
     block, weights: Mapping[str, torch.Tensor]
 ) -> None:
-    block.block.weight_up_proj = weights["ffn_up_weight"].contiguous()
-    block.block.weight_down_proj = weights["ffn_down_weight"].contiguous()
-    block.block.ln2_weight = weights["ln2_weight"].contiguous()
+    block.weight_up_proj = weights["ffn_up_weight"].contiguous()
+    block.weight_down_proj = weights["ffn_down_weight"].contiguous()
+    block.ln2_weight = weights["ln2_weight"].contiguous()
 
 
 def compile_setup_time_ms(compile_setup_time_sec: float | None) -> float | None:

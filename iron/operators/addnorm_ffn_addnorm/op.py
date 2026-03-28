@@ -63,6 +63,30 @@ class AIEAddNormFFNAddNorm:
             context=context,
         )
 
+    @property
+    def weight_up_proj(self):
+        return self.block.weight_up_proj
+
+    @weight_up_proj.setter
+    def weight_up_proj(self, value):
+        self.block.weight_up_proj = value
+
+    @property
+    def weight_down_proj(self):
+        return self.block.weight_down_proj
+
+    @weight_down_proj.setter
+    def weight_down_proj(self, value):
+        self.block.weight_down_proj = value
+
+    @property
+    def ln2_weight(self):
+        return self.block.ln2_weight
+
+    @ln2_weight.setter
+    def ln2_weight(self, value):
+        self.block.ln2_weight = value
+
     def forward(
         self, attention_output: torch.Tensor, residual: torch.Tensor
     ) -> torch.Tensor:
