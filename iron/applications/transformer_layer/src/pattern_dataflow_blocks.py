@@ -16,6 +16,9 @@ from iron.operators.qkv_proj.op import AIEQKVProj
 from .input_bundle import TransformerLayerInputs
 from .layer_spec import TransformerLayerSpec
 from .utils import (
+    bind_addnorm_ffn_addnorm_weights,
+    bind_mha_out_proj_weights,
+    bind_qkv_proj_weights,
     host_attention_output,
     host_project_qkv_head_major,
     require_keys,
@@ -59,9 +62,7 @@ class Block1QKVProjPattern(_BaseBlockPattern):
 
     def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
         require_keys(weights, ["q_proj_weight", "k_proj_weight", "v_proj_weight"])
-        self.block.q_proj.weight = weights["q_proj_weight"].contiguous()
-        self.block.k_proj.weight = weights["k_proj_weight"].contiguous()
-        self.block.v_proj.weight = weights["v_proj_weight"].contiguous()
+        bind_qkv_proj_weights(self.block, weights)
 
     def prepare_benchmark_inputs(self, layer_inputs: TransformerLayerInputs) -> None:
         layer_inputs.validate(self.spec)
@@ -141,7 +142,7 @@ class Block2MHAOutProjPattern(_BaseBlockPattern):
             ["q_proj_weight", "k_proj_weight", "v_proj_weight", "out_proj_weight"],
         )
         self._weights = weights
-        self.block.w_o_proj = weights["out_proj_weight"].contiguous()
+        bind_mha_out_proj_weights(self.block, weights)
 
     def prepare_benchmark_inputs(self, layer_inputs: TransformerLayerInputs) -> None:
         layer_inputs.validate(self.spec)
@@ -223,9 +224,7 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
             ],
         )
         self._weights = weights
-        self.block.block.weight_up_proj = weights["ffn_up_weight"].contiguous()
-        self.block.block.weight_down_proj = weights["ffn_down_weight"].contiguous()
-        self.block.block.ln2_weight = weights["ln2_weight"].contiguous()
+        bind_addnorm_ffn_addnorm_weights(self.block, weights)
 
     def prepare_benchmark_inputs(self, layer_inputs: TransformerLayerInputs) -> None:
         layer_inputs.validate(self.spec)

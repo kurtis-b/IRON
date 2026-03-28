@@ -126,3 +126,21 @@ def host_attention_output(
         attn_context.transpose(0, 1).contiguous().view(spec.seq_len, spec.hidden_size)
     )
     return torch.matmul(attn_context, weights["out_proj_weight"].T.contiguous())
+
+
+def bind_qkv_proj_weights(block, weights: Mapping[str, torch.Tensor]) -> None:
+    block.q_proj.weight = weights["q_proj_weight"].contiguous()
+    block.k_proj.weight = weights["k_proj_weight"].contiguous()
+    block.v_proj.weight = weights["v_proj_weight"].contiguous()
+
+
+def bind_mha_out_proj_weights(block, weights: Mapping[str, torch.Tensor]) -> None:
+    block.w_o_proj = weights["out_proj_weight"].contiguous()
+
+
+def bind_addnorm_ffn_addnorm_weights(
+    block, weights: Mapping[str, torch.Tensor]
+) -> None:
+    block.block.weight_up_proj = weights["ffn_up_weight"].contiguous()
+    block.block.weight_down_proj = weights["ffn_down_weight"].contiguous()
+    block.block.ln2_weight = weights["ln2_weight"].contiguous()

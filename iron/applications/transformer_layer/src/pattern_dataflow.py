@@ -15,7 +15,13 @@ from iron.operators.qkv_proj.op import AIEQKVProj
 
 from .input_bundle import TransformerLayerInputs
 from .layer_spec import TransformerLayerSpec
-from .utils import require_keys, select_mha_out_proj_emb_tile
+from .utils import (
+    bind_addnorm_ffn_addnorm_weights,
+    bind_mha_out_proj_weights,
+    bind_qkv_proj_weights,
+    require_keys,
+    select_mha_out_proj_emb_tile,
+)
 
 
 class DataflowPattern(nn.Module):
@@ -84,13 +90,9 @@ class DataflowPattern(nn.Module):
                 "ln2_weight",
             ],
         )
-        self.block1.q_proj.weight = weights["q_proj_weight"].contiguous()
-        self.block1.k_proj.weight = weights["k_proj_weight"].contiguous()
-        self.block1.v_proj.weight = weights["v_proj_weight"].contiguous()
-        self.block2.w_o_proj = weights["out_proj_weight"].contiguous()
-        self.block3.block.weight_up_proj = weights["ffn_up_weight"].contiguous()
-        self.block3.block.weight_down_proj = weights["ffn_down_weight"].contiguous()
-        self.block3.block.ln2_weight = weights["ln2_weight"].contiguous()
+        bind_qkv_proj_weights(self.block1, weights)
+        bind_mha_out_proj_weights(self.block2, weights)
+        bind_addnorm_ffn_addnorm_weights(self.block3, weights)
         self._weights_assigned = True
 
     def prepare_benchmark_inputs(self, layer_inputs: TransformerLayerInputs) -> None:

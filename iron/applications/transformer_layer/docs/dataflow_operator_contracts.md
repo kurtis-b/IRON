@@ -36,6 +36,9 @@ implementations.
   pattern layer, not as extra helper methods on the operator class
 - shared host-side benchmark-preparation helpers for the Dataflow thesis app
   should live in `src/utils.py`, not duplicated across pattern modules
+- shared thesis-app weight-binding helpers for Dataflow blocks may also live in
+  `src/utils.py`, while the actual operator mutation still happens only from
+  the pattern layer
 
 ## Block 1
 
