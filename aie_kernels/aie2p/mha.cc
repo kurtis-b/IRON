@@ -19,6 +19,10 @@
 
 extern "C" {
 
+#ifndef DEBUG
+#define DEBUG 0
+#endif
+
 #ifndef IS_CAUSAL
 #define IS_CAUSAL 1
 #endif
@@ -47,6 +51,26 @@ scale_O_tile_rows(bfloat16 *out, const bfloat16 *scale_buffer, const int32_t sca
     }
 }
 
+static inline void copy_O_tile_rows(bfloat16 *out, const int32_t B_q)
+{
+    constexpr int32_t rows_per_group = 8;
+    constexpr int32_t cols = 64;
+    constexpr int32_t tile_elems = rows_per_group * rows_per_group;
+    constexpr int32_t col_groups = cols / rows_per_group;
+    using Vec8bf16 = aie::vector<bfloat16, rows_per_group>;
+
+    for (int32_t l = 0; l < B_q / rows_per_group; l++) {
+        const int32_t row_group_base = l * rows_per_group * cols;
+        for (int32_t k = 0; k < rows_per_group; k++) {
+            for (int32_t j = 0; j < col_groups; j++) {
+                const int32_t offset = row_group_base + j * tile_elems + k * rows_per_group;
+                Vec8bf16 o_vec = aie::load_v<rows_per_group>(out + offset);
+                aie::store_v(out + offset, o_vec);
+            }
+        }
+    }
+}
+
 static inline void store_row_value(bfloat16 *row, const int32_t cols, const bfloat16 value)
 {
     using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
@@ -57,6 +81,18 @@ static inline void store_row_value(bfloat16 *row, const int32_t cols, const bflo
     }
     for (; j < cols; ++j) {
         row[j] = value;
+    }
+}
+
+static inline void copy_row_values(const bfloat16 *src, bfloat16 *dst, const int32_t cols)
+{
+    int32_t j = 0;
+    for (; j + VECTOR_LENGTH <= cols; j += VECTOR_LENGTH) {
+        auto vec = aie::load_v<VECTOR_LENGTH>(src + j);
+        aie::store_v(dst + j, vec);
+    }
+    for (; j < cols; ++j) {
+        dst[j] = src[j];
     }
 }
 
@@ -111,9 +147,11 @@ void matmul_PV(bfloat16 *Q,
     }
 #endif
 
+#if DEBUG == 0 || DEBUG == 1
     if (first_iter != 0) {
         scale_O_tile_rows(out, scale_buffer, 3 * B_q, B_q);
     }
+#endif
 
     matmul_bf16_bf16_rowmaj(Q, K, out);
 }
@@ -130,7 +168,11 @@ void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_bu
         aie::store_v(scale_buffer + 2 * B_q + i, l_vec);
     }
 
+#if DEBUG == 0 || DEBUG == 1
     scale_O_tile_rows(O, scale_buffer, 2 * B_q, B_q);
+#else
+    copy_O_tile_rows(O, B_q);
+#endif
 }
 
 void partial_softmax(bfloat16 *A,
@@ -177,6 +219,7 @@ void partial_softmax(bfloat16 *A,
         return;
     }
 
+#if DEBUG == 0 || DEBUG == 1
     // Tail mask: invalidate padded Q rows
     if (valid_q_rows < B_q) {
         for (int32_t i = valid_q_rows; i < B_q; i++) {
@@ -259,6 +302,18 @@ void partial_softmax(bfloat16 *A,
         aie::store_v(scale_buffer + 2 * B_q + i, l_i.to_vector<bfloat16>());
         aie::store_v(scale_buffer + i, m_i);
     }
+#else
+    int32_t i = 0;
+    for (; i + 4 <= valid_q_rows; i += 4) {
+        copy_row_values(A + (i + 0) * B_kv, P + (i + 0) * B_kv, B_kv);
+        copy_row_values(A + (i + 1) * B_kv, P + (i + 1) * B_kv, B_kv);
+        copy_row_values(A + (i + 2) * B_kv, P + (i + 2) * B_kv, B_kv);
+        copy_row_values(A + (i + 3) * B_kv, P + (i + 3) * B_kv, B_kv);
+    }
+    for (; i < valid_q_rows; i++) {
+        copy_row_values(A + i * B_kv, P + i * B_kv, B_kv);
+    }
+#endif
 }
 
 void init_scale_buffer(bfloat16 *scale_buffer, int32_t size)
