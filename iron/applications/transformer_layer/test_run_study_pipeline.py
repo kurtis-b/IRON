@@ -10,7 +10,7 @@ from iron.applications.transformer_layer.run_study_pipeline import (
 
 class _Args:
     smoke = True
-    skip_power_cycle = False
+    skip_thermal_recovery = False
     warmup_runs = 0
     runs_per_sample = 1
     output_root = None
@@ -103,7 +103,7 @@ def test_build_step_command_rewrites_manifest_outputs_for_smoke(tmp_path):
     assert "--power-backend" in command
 
 
-def test_run_study_pipeline_skips_power_cycle_in_smoke(monkeypatch, tmp_path):
+def test_run_study_pipeline_skips_thermal_recovery_in_smoke(monkeypatch, tmp_path):
     config = {
         "pipeline_id": "full",
         "debug_log_csv": None,
@@ -113,16 +113,13 @@ def test_run_study_pipeline_skips_power_cycle_in_smoke(monkeypatch, tmp_path):
             "power_sample_interval_sec": 0.05,
             "quiescent_baseline_duration_sec": 0.5,
         },
-        "power_cycle": {
+        "thermal_recovery": {
             "enabled": True,
-            "command": "false",
-            "off_command": None,
-            "on_command": None,
             "skip_in_smoke": True,
             "temperature_sensor_name": "k10temp",
             "temperature_sensor_input": "temp1_input",
             "recovery_tolerance_fraction": 0.05,
-            "recovery_timeout_sec": 150.0,
+            "recovery_timeout_sec": 15.0,
             "recovery_poll_interval_sec": 1.0,
         },
         "steps": [
@@ -163,7 +160,9 @@ def test_run_study_pipeline_skips_power_cycle_in_smoke(monkeypatch, tmp_path):
     assert all(not shell for _, shell in commands)
 
 
-def test_run_study_pipeline_power_cycles_between_benchmark_steps(monkeypatch):
+def test_run_study_pipeline_waits_for_thermal_recovery_between_benchmark_steps(
+    monkeypatch,
+):
     config = {
         "pipeline_id": "full",
         "debug_log_csv": None,
@@ -173,16 +172,13 @@ def test_run_study_pipeline_power_cycles_between_benchmark_steps(monkeypatch):
             "power_sample_interval_sec": 0.05,
             "quiescent_baseline_duration_sec": 0.5,
         },
-        "power_cycle": {
+        "thermal_recovery": {
             "enabled": True,
-            "command": "power-cycle-now",
-            "off_command": None,
-            "on_command": None,
             "skip_in_smoke": False,
             "temperature_sensor_name": "k10temp",
             "temperature_sensor_input": "temp1_input",
             "recovery_tolerance_fraction": 0.05,
-            "recovery_timeout_sec": 150.0,
+            "recovery_timeout_sec": 15.0,
             "recovery_poll_interval_sec": 0.0,
         },
         "steps": [
@@ -214,29 +210,27 @@ def test_run_study_pipeline_power_cycles_between_benchmark_steps(monkeypatch):
         lambda sensor_name, sensor_input: Path("/tmp/fake_temp"),
     )
     temperatures = iter([40.0, 41.0])
+    observed_temps = []
     monkeypatch.setattr(
         "iron.applications.transformer_layer.run_study_pipeline._read_temperature_c",
-        lambda sensor_path: next(temperatures),
+        lambda sensor_path: observed_temps.append(next(temperatures))
+        or observed_temps[-1],
     )
 
-    power_cycles = []
-    monkeypatch.setattr(
-        "iron.applications.transformer_layer.run_study_pipeline._run_power_cycle_command",
-        lambda command: power_cycles.append(command),
-    )
+    commands = []
     monkeypatch.setattr(
         "iron.applications.transformer_layer.run_study_pipeline.subprocess.run",
-        lambda command, cwd=None, check=False, shell=False: type(
-            "Completed", (), {"returncode": 0}
-        )(),
+        lambda command, cwd=None, check=False, shell=False: commands.append(command)
+        or type("Completed", (), {"returncode": 0})(),
     )
 
     run_study_pipeline(config, args)
 
-    assert power_cycles == ["power-cycle-now"]
+    assert len(commands) == 2
+    assert observed_temps == [40.0, 41.0]
 
 
-def test_run_study_pipeline_power_cycles_with_off_and_on_commands(monkeypatch):
+def test_run_study_pipeline_thermal_recovery_timeout_is_tolerated(monkeypatch):
     config = {
         "pipeline_id": "full",
         "debug_log_csv": None,
@@ -246,18 +240,13 @@ def test_run_study_pipeline_power_cycles_with_off_and_on_commands(monkeypatch):
             "power_sample_interval_sec": 0.05,
             "quiescent_baseline_duration_sec": 0.5,
         },
-        "power_cycle": {
+        "thermal_recovery": {
             "enabled": True,
-            "command": None,
-            "off_command": ["relayctl", "off"],
-            "on_command": ["relayctl", "on"],
-            "off_wait_sec": 0.0,
-            "on_wait_sec": 0.0,
             "skip_in_smoke": False,
             "temperature_sensor_name": "k10temp",
             "temperature_sensor_input": "temp1_input",
             "recovery_tolerance_fraction": 0.05,
-            "recovery_timeout_sec": 150.0,
+            "recovery_timeout_sec": 0.0,
             "recovery_poll_interval_sec": 0.0,
         },
         "steps": [
@@ -288,24 +277,22 @@ def test_run_study_pipeline_power_cycles_with_off_and_on_commands(monkeypatch):
         "iron.applications.transformer_layer.run_study_pipeline._resolve_hwmon_temperature_path",
         lambda sensor_name, sensor_input: Path("/tmp/fake_temp"),
     )
-    temperatures = iter([40.0, 40.0])
+    temperatures = iter([40.0, 60.0])
+    observed_temps = []
     monkeypatch.setattr(
         "iron.applications.transformer_layer.run_study_pipeline._read_temperature_c",
-        lambda sensor_path: next(temperatures),
+        lambda sensor_path: observed_temps.append(next(temperatures))
+        or observed_temps[-1],
     )
 
-    power_cycle_commands = []
-    monkeypatch.setattr(
-        "iron.applications.transformer_layer.run_study_pipeline._run_power_cycle_command",
-        lambda command: power_cycle_commands.append(command),
-    )
+    commands = []
     monkeypatch.setattr(
         "iron.applications.transformer_layer.run_study_pipeline.subprocess.run",
-        lambda command, cwd=None, check=False, shell=False: type(
-            "Completed", (), {"returncode": 0}
-        )(),
+        lambda command, cwd=None, check=False, shell=False: commands.append(command)
+        or type("Completed", (), {"returncode": 0})(),
     )
 
     run_study_pipeline(config, args)
 
-    assert power_cycle_commands == [["relayctl", "off"], ["relayctl", "on"]]
+    assert len(commands) == 2
+    assert observed_temps == [40.0, 60.0]

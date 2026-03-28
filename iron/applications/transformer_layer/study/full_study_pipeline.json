@@ -7,18 +7,13 @@
     "power_sample_interval_sec": 0.05,
     "quiescent_baseline_duration_sec": 0.5
   },
-  "power_cycle": {
-    "enabled": false,
-    "command": ["sudo", "-n", "systemctl", "start", "transformer-layer-power-cycle.service"],
-    "off_command": null,
-    "on_command": null,
-    "off_wait_sec": 2.0,
-    "on_wait_sec": 5.0,
+  "thermal_recovery": {
+    "enabled": true,
     "skip_in_smoke": true,
     "temperature_sensor_name": "k10temp",
     "temperature_sensor_input": "temp1_input",
     "recovery_tolerance_fraction": 0.05,
-    "recovery_timeout_sec": 150.0,
+    "recovery_timeout_sec": 15.0,
     "recovery_poll_interval_sec": 1.0
   },
   "steps": [

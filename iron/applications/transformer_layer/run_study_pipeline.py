@@ -32,7 +32,13 @@ def parse_args():
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--skip-power-cycle", action="store_true")
+    parser.add_argument("--skip-thermal-recovery", action="store_true")
+    parser.add_argument(
+        "--skip-power-cycle",
+        dest="skip_thermal_recovery",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--warmup-runs", type=int, default=None)
     parser.add_argument("--runs-per-sample", type=int, default=None)
     parser.add_argument("--output-root", default=None)
@@ -64,20 +70,17 @@ def load_pipeline_config(path: str | Path) -> dict[str, object]:
     config["fail_fast"] = bool(config.get("fail_fast", True))
     config["debug_log_csv"] = resolve_path(config_path, config.get("debug_log_csv"))
 
-    power_cycle = dict(config.get("power_cycle", {}))
-    power_cycle.setdefault("enabled", False)
-    power_cycle.setdefault("skip_in_smoke", True)
-    power_cycle.setdefault("command", None)
-    power_cycle.setdefault("off_command", None)
-    power_cycle.setdefault("on_command", None)
-    power_cycle.setdefault("off_wait_sec", 2.0)
-    power_cycle.setdefault("on_wait_sec", 5.0)
-    power_cycle.setdefault("temperature_sensor_name", "k10temp")
-    power_cycle.setdefault("temperature_sensor_input", "temp1_input")
-    power_cycle.setdefault("recovery_tolerance_fraction", 0.05)
-    power_cycle.setdefault("recovery_timeout_sec", 150.0)
-    power_cycle.setdefault("recovery_poll_interval_sec", 1.0)
-    config["power_cycle"] = power_cycle
+    thermal_recovery = dict(
+        config.get("thermal_recovery", config.get("power_cycle", {}))
+    )
+    thermal_recovery.setdefault("enabled", True)
+    thermal_recovery.setdefault("skip_in_smoke", True)
+    thermal_recovery.setdefault("temperature_sensor_name", "k10temp")
+    thermal_recovery.setdefault("temperature_sensor_input", "temp1_input")
+    thermal_recovery.setdefault("recovery_tolerance_fraction", 0.05)
+    thermal_recovery.setdefault("recovery_timeout_sec", 15.0)
+    thermal_recovery.setdefault("recovery_poll_interval_sec", 1.0)
+    config["thermal_recovery"] = thermal_recovery
 
     npu_power = dict(config.get("npu_power", {}))
     npu_power.setdefault("power_backend", "turbostat_pkgwatt")
@@ -303,38 +306,6 @@ def _read_temperature_c(sensor_path: Path) -> float:
     return float(raw_value) / 1000.0
 
 
-def _run_power_cycle_command(command: object) -> None:
-    if isinstance(command, str):
-        result = subprocess.run(command, cwd=REPO_ROOT, shell=True, check=False)
-    elif isinstance(command, list):
-        result = subprocess.run(command, cwd=REPO_ROOT, check=False)
-    else:
-        raise TypeError("power_cycle.command must be a string or a list")
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"power-cycle command failed with return code {result.returncode}"
-        )
-
-
-def _run_power_cycle(power_cycle_cfg: dict[str, object]) -> None:
-    command = power_cycle_cfg.get("command")
-    if command not in (None, "", []):
-        _run_power_cycle_command(command)
-        return
-
-    off_command = power_cycle_cfg.get("off_command")
-    on_command = power_cycle_cfg.get("on_command")
-    if off_command in (None, "", []) or on_command in (None, "", []):
-        raise RuntimeError(
-            "power_cycle requires either command or both off_command and on_command"
-        )
-
-    _run_power_cycle_command(off_command)
-    time.sleep(float(power_cycle_cfg.get("off_wait_sec", 2.0)))
-    _run_power_cycle_command(on_command)
-    time.sleep(float(power_cycle_cfg.get("on_wait_sec", 5.0)))
-
-
 def _wait_for_temperature_recovery(
     *,
     sensor_path: Path,
@@ -353,11 +324,11 @@ def _wait_for_temperature_recovery(
         time.sleep(poll_interval_sec)
 
 
-def _should_skip_power_cycle(args, pipeline_config: dict[str, object]) -> bool:
-    if args.skip_power_cycle:
+def _should_skip_thermal_recovery(args, pipeline_config: dict[str, object]) -> bool:
+    if args.skip_thermal_recovery:
         return True
-    power_cycle = dict(pipeline_config["power_cycle"])
-    return bool(args.smoke and power_cycle.get("skip_in_smoke", False))
+    thermal_recovery = dict(pipeline_config["thermal_recovery"])
+    return bool(args.smoke and thermal_recovery.get("skip_in_smoke", False))
 
 
 def _step_supports_npu_power(step: dict[str, object]) -> bool:
@@ -485,8 +456,8 @@ def run_study_pipeline(config: dict[str, object], args) -> None:
     initial_temp_c: float | None = None
     sensor_path: Path | None = None
     benchmarking_steps_seen = 0
-    power_cycle_cfg = dict(config["power_cycle"])
-    skip_power_cycle = _should_skip_power_cycle(args, config)
+    thermal_recovery_cfg = dict(config["thermal_recovery"])
+    skip_thermal_recovery = _should_skip_thermal_recovery(args, config)
 
     append_debug_event(
         debug_log_csv,
@@ -500,17 +471,17 @@ def run_study_pipeline(config: dict[str, object], args) -> None:
         status="started",
     )
 
-    if power_cycle_cfg.get("enabled") and not skip_power_cycle:
+    if thermal_recovery_cfg.get("enabled") and not skip_thermal_recovery:
         sensor_path = _resolve_hwmon_temperature_path(
-            str(power_cycle_cfg["temperature_sensor_name"]),
-            str(power_cycle_cfg["temperature_sensor_input"]),
+            str(thermal_recovery_cfg["temperature_sensor_name"]),
+            str(thermal_recovery_cfg["temperature_sensor_input"]),
         )
         initial_temp_c = _read_temperature_c(sensor_path)
         append_debug_event(
             debug_log_csv,
             study_id=str(config["pipeline_id"]),
             event_kind="temperature_baseline_captured",
-            component="power_cycle",
+            component="thermal_recovery",
             challenge="temperature_recovery",
             symptom=f"Captured initial package temperature baseline: {initial_temp_c:.2f}C",
             impact_on_experiment="Subsequent benchmark steps can be gated on returning near the initial thermal state.",
@@ -527,21 +498,20 @@ def run_study_pipeline(config: dict[str, object], args) -> None:
             if (
                 bool(step.get("benchmarking_step"))
                 and benchmarking_steps_seen > 0
-                and power_cycle_cfg.get("enabled")
-                and not skip_power_cycle
+                and thermal_recovery_cfg.get("enabled")
+                and not skip_thermal_recovery
             ):
-                _run_power_cycle(power_cycle_cfg)
                 assert sensor_path is not None
                 assert initial_temp_c is not None
                 recovered, current_temp_c = _wait_for_temperature_recovery(
                     sensor_path=sensor_path,
                     initial_temp_c=initial_temp_c,
                     tolerance_fraction=float(
-                        power_cycle_cfg["recovery_tolerance_fraction"]
+                        thermal_recovery_cfg["recovery_tolerance_fraction"]
                     ),
-                    timeout_sec=float(power_cycle_cfg["recovery_timeout_sec"]),
+                    timeout_sec=float(thermal_recovery_cfg["recovery_timeout_sec"]),
                     poll_interval_sec=float(
-                        power_cycle_cfg["recovery_poll_interval_sec"]
+                        thermal_recovery_cfg["recovery_poll_interval_sec"]
                     ),
                 )
                 append_debug_event(
@@ -552,11 +522,11 @@ def run_study_pipeline(config: dict[str, object], args) -> None:
                         if recovered
                         else "temperature_recovery_timeout"
                     ),
-                    component="power_cycle",
+                    component="thermal_recovery",
                     challenge="temperature_recovery",
                     symptom=(
                         f"Current package temperature is {current_temp_c:.2f}C "
-                        f"after power cycle for step {step['step_id']}"
+                        f"before step {step['step_id']}"
                     ),
                     impact_on_experiment=(
                         "The next benchmark step is starting near the initial thermal state."
