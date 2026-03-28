@@ -1,0 +1,309 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import time
+
+import torch
+import torch.nn as nn
+
+from iron.common import AIEContext
+from iron.operators.addnorm_ffn_addnorm.op import AIEAddNormFFNAddNorm
+from iron.operators.mha_out_proj.op import AIEMHAOutProj
+from iron.operators.qkv_proj.op import AIEQKVProj
+
+from .input_bundle import TransformerLayerInputs
+from .layer_spec import TransformerLayerSpec
+from .utils import require_keys
+
+
+def _select_mha_out_proj_emb_tile(hidden_size: int) -> int:
+    if hidden_size % 128 == 0:
+        return 128
+    if hidden_size % 96 == 0:
+        return 96
+    raise ValueError(
+        "Block 2 currently requires hidden_size divisible by 128 or 96 for output-projection tiling"
+    )
+
+
+def _host_project_qkv(
+    hidden_states: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+    spec: TransformerLayerSpec,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q = torch.matmul(hidden_states, weights["q_proj_weight"].T.contiguous())
+    k = torch.matmul(hidden_states, weights["k_proj_weight"].T.contiguous())
+    v = torch.matmul(hidden_states, weights["v_proj_weight"].T.contiguous())
+    return (
+        q[:, : spec.hidden_size].contiguous(),
+        k[:, : spec.hidden_size].contiguous(),
+        v[:, : spec.hidden_size].contiguous(),
+    )
+
+
+def _host_attention_output(
+    hidden_states: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+    spec: TransformerLayerSpec,
+) -> torch.Tensor:
+    q_matrix, k_matrix, v_matrix = _host_project_qkv(hidden_states, weights, spec)
+    q = q_matrix.view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
+    k = k_matrix.view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
+    v = v_matrix.view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
+    q = q.permute(1, 0, 2).contiguous()
+    k = k.permute(1, 0, 2).contiguous()
+    v = v.permute(1, 0, 2).contiguous()
+    attn_scores = torch.matmul(q, k.transpose(-1, -2))
+    attn_scores = attn_scores * (spec.attention_head_size**-0.5)
+    attn_probs = torch.softmax(attn_scores.to(torch.float32), dim=-1).to(q.dtype)
+    attn_context = torch.matmul(attn_probs, v)
+    attn_context = (
+        attn_context.transpose(0, 1).contiguous().view(spec.seq_len, spec.hidden_size)
+    )
+    return torch.matmul(attn_context, weights["out_proj_weight"].T.contiguous())
+
+
+class _BaseBlockPattern(nn.Module):
+    def __init__(self, spec: TransformerLayerSpec) -> None:
+        super().__init__()
+        if spec.use_bias:
+            raise ValueError("Dataflow block patterns currently require use_bias=False")
+        if spec.torch_dtype != torch.bfloat16:
+            raise ValueError("Dataflow block patterns currently require dtype=bfloat16")
+        self.spec = spec
+        self.context = AIEContext(use_runlist=True)
+        self._runtime_ready = False
+        self.compile_setup_time_sec: float | None = None
+
+    def _prepare_runtime(self) -> None:
+        if self._runtime_ready:
+            return
+        start = time.perf_counter()
+        self.context.compile_all()
+        self.context.prepare_runtime()
+        self.compile_setup_time_sec = time.perf_counter() - start
+        self._runtime_ready = True
+
+
+class Block1QKVProjPattern(_BaseBlockPattern):
+    pattern_label = "block1_qkv_proj"
+
+    def __init__(self, spec: TransformerLayerSpec) -> None:
+        super().__init__(spec)
+        self.block = AIEQKVProj(
+            seq_len=spec.seq_len,
+            hidden_size=spec.hidden_size,
+            context=self.context,
+        )
+
+    def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        require_keys(weights, ["q_proj_weight", "k_proj_weight", "v_proj_weight"])
+        self.block.assign_weights(weights)
+
+    def prepare_benchmark_inputs(self, layer_inputs: TransformerLayerInputs) -> None:
+        layer_inputs.validate(self.spec)
+
+    def forward_with_stage_timings(
+        self,
+        layer_inputs: TransformerLayerInputs,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        if attention_mask is not None:
+            raise RuntimeError(
+                "Dataflow block studies currently require attention_mask=None"
+            )
+        layer_inputs.validate(self.spec)
+        self._prepare_runtime()
+        hidden_states = layer_inputs.hidden_states.squeeze(0).to(self.spec.torch_dtype)
+        start = time.perf_counter()
+        q, k, v = self.block.forward(hidden_states)
+        end = time.perf_counter()
+        return torch.stack((q, k, v), dim=0), {"block1_qkv_proj_sec": end - start}
+
+    def get_benchmark_metadata(self) -> dict[str, object]:
+        return {
+            "compile_setup_time_ms": (
+                None
+                if self.compile_setup_time_sec is None
+                else self.compile_setup_time_sec * 1000.0
+            ),
+            "process_model": "in_process",
+            **self.block.benchmark_metadata(),
+        }
+
+    def forward(
+        self,
+        layer_inputs: TransformerLayerInputs,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output, _ = self.forward_with_stage_timings(
+            layer_inputs,
+            attention_mask=attention_mask,
+        )
+        return output
+
+
+class Block2MHAOutProjPattern(_BaseBlockPattern):
+    pattern_label = "block2_mha_out_proj"
+
+    def __init__(self, spec: TransformerLayerSpec) -> None:
+        super().__init__(spec)
+        if spec.attention_head_size != 64:
+            raise ValueError("Block 2 currently supports attention_head_size=64 only")
+        mha_emb_tile = _select_mha_out_proj_emb_tile(spec.hidden_size)
+        self.block = AIEMHAOutProj(
+            num_heads=spec.num_attention_heads,
+            seq_len=spec.seq_len,
+            d=spec.attention_head_size,
+            emb_tile=mha_emb_tile,
+            static_weights=True,
+            context=self.context,
+        )
+        self._weights: dict[str, torch.Tensor] | None = None
+        self._cached_q: torch.Tensor | None = None
+        self._cached_k: torch.Tensor | None = None
+        self._cached_v: torch.Tensor | None = None
+
+    def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        require_keys(
+            weights,
+            ["q_proj_weight", "k_proj_weight", "v_proj_weight", "out_proj_weight"],
+        )
+        self._weights = weights
+        self.block.w_o_proj = weights["out_proj_weight"].contiguous()
+
+    def prepare_benchmark_inputs(self, layer_inputs: TransformerLayerInputs) -> None:
+        layer_inputs.validate(self.spec)
+        if self._weights is None:
+            raise RuntimeError("assign_weights() must be called before execution")
+        hidden_states = layer_inputs.hidden_states.squeeze(0).to(self.spec.torch_dtype)
+        self._cached_q, self._cached_k, self._cached_v = _host_project_qkv(
+            hidden_states, self._weights, self.spec
+        )
+
+    def forward_with_stage_timings(
+        self,
+        layer_inputs: TransformerLayerInputs,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        if attention_mask is not None:
+            raise RuntimeError(
+                "Dataflow block studies currently require attention_mask=None"
+            )
+        if self._cached_q is None or self._cached_k is None or self._cached_v is None:
+            self.prepare_benchmark_inputs(layer_inputs)
+        self._prepare_runtime()
+        start = time.perf_counter()
+        output = self.block(self._cached_q, self._cached_k, self._cached_v)
+        end = time.perf_counter()
+        return output.unsqueeze(0), {"block2_mha_out_proj_sec": end - start}
+
+    def get_benchmark_metadata(self) -> dict[str, object]:
+        return {
+            "compile_setup_time_ms": (
+                None
+                if self.compile_setup_time_sec is None
+                else self.compile_setup_time_sec * 1000.0
+            ),
+            "npu_dispatch_count": len(self.block.runlist),
+            "npu_unique_instruction_binary_count": 1,
+            "npu_unique_xclbin_count": 1,
+            "process_model": "in_process",
+        }
+
+    def forward(
+        self,
+        layer_inputs: TransformerLayerInputs,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output, _ = self.forward_with_stage_timings(
+            layer_inputs,
+            attention_mask=attention_mask,
+        )
+        return output
+
+
+class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
+    pattern_label = "block3_addnorm_ffn_addnorm"
+
+    def __init__(self, spec: TransformerLayerSpec) -> None:
+        super().__init__(spec)
+        self.block = AIEAddNormFFNAddNorm(
+            seq_len=spec.seq_len,
+            hidden_size=spec.hidden_size,
+            intermediate_size=spec.intermediate_size,
+            context=self.context,
+        )
+        self._weights: dict[str, torch.Tensor] | None = None
+        self._cached_attention_output: torch.Tensor | None = None
+        self._cached_residual: torch.Tensor | None = None
+
+    def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
+        require_keys(
+            weights,
+            [
+                "q_proj_weight",
+                "k_proj_weight",
+                "v_proj_weight",
+                "out_proj_weight",
+                "ffn_up_weight",
+                "ffn_down_weight",
+                "ln2_weight",
+            ],
+        )
+        self._weights = weights
+        self.block.assign_weights(weights)
+
+    def prepare_benchmark_inputs(self, layer_inputs: TransformerLayerInputs) -> None:
+        layer_inputs.validate(self.spec)
+        if self._weights is None:
+            raise RuntimeError("assign_weights() must be called before execution")
+        hidden_states = layer_inputs.hidden_states.squeeze(0).to(self.spec.torch_dtype)
+        self._cached_attention_output = _host_attention_output(
+            hidden_states, self._weights, self.spec
+        )
+        self._cached_residual = hidden_states
+
+    def forward_with_stage_timings(
+        self,
+        layer_inputs: TransformerLayerInputs,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        if attention_mask is not None:
+            raise RuntimeError(
+                "Dataflow block studies currently require attention_mask=None"
+            )
+        if self._cached_attention_output is None or self._cached_residual is None:
+            self.prepare_benchmark_inputs(layer_inputs)
+        self._prepare_runtime()
+        start = time.perf_counter()
+        output = self.block(
+            self._cached_attention_output,
+            self._cached_residual,
+        )
+        end = time.perf_counter()
+        return output.unsqueeze(0), {"block3_addnorm_ffn_addnorm_sec": end - start}
+
+    def get_benchmark_metadata(self) -> dict[str, object]:
+        return {
+            "compile_setup_time_ms": (
+                None
+                if self.compile_setup_time_sec is None
+                else self.compile_setup_time_sec * 1000.0
+            ),
+            "process_model": "in_process",
+            **self.block.benchmark_metadata(),
+        }
+
+    def forward(
+        self,
+        layer_inputs: TransformerLayerInputs,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output, _ = self.forward_with_stage_timings(
+            layer_inputs,
+            attention_mask=attention_mask,
+        )
+        return output
