@@ -29,6 +29,9 @@ implementations.
 - `design.py` should expose one retained design entrypoint plus optional `main()`
 - `reference.py` should expose only `generate_golden_reference()`
 - `test.py` should expose `generate_test_params()` and one test method
+- `op.py` should keep the same operator-method surface as `mha`; any small
+  layout-adaptation helpers should live at module scope rather than as extra
+  operator methods
 - thesis-specific weight binding and benchmark metadata should stay in the
   pattern layer, not as extra helper methods on the operator class
 

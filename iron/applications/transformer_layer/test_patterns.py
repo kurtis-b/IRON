@@ -10,7 +10,7 @@ from iron.applications.transformer_layer.src.utils import (
     make_synthetic_layer_inputs,
     make_synthetic_layer_weights,
 )
-from iron.operators.mha_out_proj.op import AIEMHAOutProj
+from iron.operators.mha_out_proj.op import _pack_qkv_head_major
 from iron.operators.qkv_proj.op import AIEQKVProj
 
 
@@ -59,17 +59,11 @@ def test_block1_contract_reshapes_projection_outputs_to_head_major():
 
 
 def test_block2_contract_packs_head_major_qkv_into_runtime_qkv_layout():
-    operator = object.__new__(AIEMHAOutProj)
-    operator.seq_len = 3
-    operator.num_heads = 2
-    operator.d = 4
-    operator.embed_sz = 8
-
     q = torch.arange(24, dtype=torch.bfloat16).reshape(2, 3, 4)
     k = torch.arange(24, 48, dtype=torch.bfloat16).reshape(2, 3, 4)
     v = torch.arange(48, 72, dtype=torch.bfloat16).reshape(2, 3, 4)
 
-    packed = AIEMHAOutProj._pack_qkv_head_major(operator, q, k, v)
+    packed = _pack_qkv_head_major(q, k, v, seq_len=3, embed_sz=8)
 
     expected = torch.cat(
         (

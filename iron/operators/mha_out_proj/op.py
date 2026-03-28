@@ -6,7 +6,6 @@ import torch
 import numpy as np
 from ml_dtypes import bfloat16
 from pathlib import Path
-from typing import Dict, List
 
 from iron.common import (
     AIEOperatorBase,
@@ -21,44 +20,41 @@ from iron.common import (
 from iron.common.utils import torch_to_numpy, numpy_to_torch
 
 
-class AIEMHAOutProj(AIEOperatorBase):
-    def _canonicalize_head_major_qkv(
-        self,
-        tensor: torch.Tensor,
-        *,
-        name: str,
-    ) -> torch.Tensor:
-        if tensor.ndim == 2:
-            if tensor.shape != (self.seq_len, self.embed_sz):
-                raise AIEOperatorConstraintError(
-                    f"AIEMHAOutProj: expected {name} shape {(self.seq_len, self.embed_sz)}"
-                )
-            return (
-                tensor.view(self.seq_len, self.num_heads, self.d)
-                .permute(1, 0, 2)
-                .contiguous()
+def _canonicalize_head_major_qkv(
+    tensor: torch.Tensor,
+    *,
+    seq_len: int,
+    num_heads: int,
+    d: int,
+    embed_sz: int,
+    name: str,
+) -> torch.Tensor:
+    if tensor.ndim == 2:
+        if tensor.shape != (seq_len, embed_sz):
+            raise AIEOperatorConstraintError(
+                f"AIEMHAOutProj: expected {name} shape {(seq_len, embed_sz)}"
             )
-        if tensor.ndim == 3 and tensor.shape == (self.num_heads, self.seq_len, self.d):
-            return tensor.contiguous()
-        raise AIEOperatorConstraintError("AIEMHAOutProj: incompatible tensor shape(s)")
+        return tensor.view(seq_len, num_heads, d).permute(1, 0, 2).contiguous()
+    if tensor.ndim == 3 and tensor.shape == (num_heads, seq_len, d):
+        return tensor.contiguous()
+    raise AIEOperatorConstraintError("AIEMHAOutProj: incompatible tensor shape(s)")
 
-    def _pack_qkv_head_major(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> np.ndarray:
-        q_np = torch_to_numpy(
-            q.permute(1, 0, 2).contiguous().view(self.seq_len, self.embed_sz)
-        )
-        k_np = torch_to_numpy(
-            k.permute(1, 0, 2).contiguous().view(self.seq_len, self.embed_sz)
-        )
-        v_np = torch_to_numpy(
-            v.permute(1, 0, 2).contiguous().view(self.seq_len, self.embed_sz)
-        )
-        return np.concatenate((q_np, k_np, v_np), axis=0)
 
+def _pack_qkv_head_major(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    seq_len: int,
+    embed_sz: int,
+) -> np.ndarray:
+    q_np = torch_to_numpy(q.permute(1, 0, 2).contiguous().view(seq_len, embed_sz))
+    k_np = torch_to_numpy(k.permute(1, 0, 2).contiguous().view(seq_len, embed_sz))
+    v_np = torch_to_numpy(v.permute(1, 0, 2).contiguous().view(seq_len, embed_sz))
+    return np.concatenate((q_np, k_np, v_np), axis=0)
+
+
+class AIEMHAOutProj(AIEOperatorBase):
     def __init__(
         self,
         num_heads: int,
@@ -101,14 +97,13 @@ class AIEMHAOutProj(AIEOperatorBase):
             self, context=context, skip_add_to_list=skip_add_to_list
         )
 
-    def get_artifacts(self, prefix="mha_o_proj"):
+    def set_up_artifacts(self):
         # Set up compilation artifacts
         # ---
         operator_dir = Path(__file__).parent
 
         file_name_base = f"mha_o_proj_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.q_seq_tile}qseqtile_{self.kv_seq_tile}kvseqtile_{self.emb_tile}e_{self.parallel_heads}ph_{self.o_proj_acc_depth}acc"
 
-        # Define source files
         mm_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mm.cc")
         softmax_source = str(
             self.context.base_dir / "aie_kernels" / "aie2p" / "softmax.cc"
@@ -119,7 +114,6 @@ class AIEMHAOutProj(AIEOperatorBase):
         )
         add_source = str(self.context.base_dir / "aie_kernels" / "generic" / "add.cc")
 
-        # Compile mm.cc (col-major)
         mm_defines_rowmaj = [
             "-Dbf16_bf16_ONLY",
             f"-DDIM_M={self.q_seq_tile}",
@@ -151,7 +145,7 @@ class AIEMHAOutProj(AIEOperatorBase):
             f"-DDIM_N={self.emb_tile}",
             "-DROUND_CONV_EVEN",
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
-            "-DGENERATE_MATMUL_WITH_ACC_KERNELS",  # NOTE: Matmul with accumulation won't be included in compilation unless this is passed in
+            "-DGENERATE_MATMUL_WITH_ACC_KERNELS",
         ]
         mm_o_proj_rename_symbols = {
             "matmul_bf16_bf16": "matmul_bf16_bf16_o_proj",
@@ -256,13 +250,6 @@ class AIEMHAOutProj(AIEOperatorBase):
             extra_flags=["--dynamic-objFifos"],
         )
 
-        return (xclbin_artifact, insts_artifact)
-
-    def set_up_artifacts(self):
-        # Describe required artifacts (xclbin, insts.bin)
-        device_str = self.context.device_manager.device_str()
-        xclbin_artifact, insts_artifact = self.get_artifacts()
-
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
 
@@ -305,9 +292,30 @@ class AIEMHAOutProj(AIEOperatorBase):
         v: torch.Tensor,
         w_o: torch.Tensor = None,
     ):
-        q = self._canonicalize_head_major_qkv(q, name="q")
-        k = self._canonicalize_head_major_qkv(k, name="k")
-        v = self._canonicalize_head_major_qkv(v, name="v")
+        q = _canonicalize_head_major_qkv(
+            q,
+            seq_len=self.seq_len,
+            num_heads=self.num_heads,
+            d=self.d,
+            embed_sz=self.embed_sz,
+            name="q",
+        )
+        k = _canonicalize_head_major_qkv(
+            k,
+            seq_len=self.seq_len,
+            num_heads=self.num_heads,
+            d=self.d,
+            embed_sz=self.embed_sz,
+            name="k",
+        )
+        v = _canonicalize_head_major_qkv(
+            v,
+            seq_len=self.seq_len,
+            num_heads=self.num_heads,
+            d=self.d,
+            embed_sz=self.embed_sz,
+            name="v",
+        )
         applicable = (
             q.shape[-1] == self.d
             and k.shape[-1] == self.d
@@ -332,7 +340,13 @@ class AIEMHAOutProj(AIEOperatorBase):
         v: torch.Tensor,
         w_o: torch.Tensor = None,
     ):
-        qkv_np = self._pack_qkv_head_major(q, k, v)
+        qkv_np = _pack_qkv_head_major(
+            q,
+            k,
+            v,
+            seq_len=self.seq_len,
+            embed_sz=self.embed_sz,
+        )
 
         # Write padded buffers
         self.write_buffer("QKV", qkv_np)
