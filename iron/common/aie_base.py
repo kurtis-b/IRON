@@ -28,12 +28,16 @@ class AIEOperatorBase(ABC):
         return AIEOperatorBase._default_context
 
     def __init__(self, context=None, skip_add_to_list=False):
+        # skip_add_to_list is for cases where the operator is a runlist implementation, which puts
+        # togegther a sequence of operators, which also execute this constructor. Those operators should not register
+        # themselves in the context's runlist again, otherwise the runtime setup will create kernels for them again.
         self.artifacts = (
             []
         )  # CompilationArtifact objects are uniqued within the context
         self.kernels = {}  # Name -> (xclbin_path, xclbin_kernel_name, insts_path)
         self.buffers = {}  # Name -> required buffer size in bytes
         self.buffer_static_data = {}
+        self.buffer_aliases = {}  # Alias name -> target buffer name
         self.runlist = (
             []
         )  # List of (kernel_name, buffers_name, buffer_name...), will be executed in sequence
@@ -47,9 +51,7 @@ class AIEOperatorBase(ABC):
 
         if context is None:
             context = self.get_default_context()
-        self.context = context
-        if not skip_add_to_list:
-            context.register_operator(self)
+        context.register_operator(self, skip_add_to_list=skip_add_to_list)
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
@@ -91,19 +93,28 @@ class AIEOperatorBase(ABC):
     def get_bo(self, buffer_name):
         return self.buffer_bos[buffer_name]
 
+    def buffer_view(self, buffer_name, shape, dtype=bfloat16):
+        """Return a mapped numpy view into an existing BO without copying."""
+        mv = self.get_bo(buffer_name).map()
+        return np.frombuffer(mv, dtype=dtype, count=np.prod(shape)).reshape(shape)
+
     def read_buffer(self, buffer_name, shape, copy=False, dtype=bfloat16):
         """Read buffer and return values as a numpy array"""
-        # Create a byte accessible memory view of the buffer object
-        mv = self.get_bo(buffer_name).map()
+        if copy:
+            return np.array(
+                self.buffer_view(buffer_name, shape, dtype=dtype),
+                copy=True,
+            )
 
-        # Interpret the buffer as a 1-dimensional array then change its view to the expected shape
-        arr = np.frombuffer(mv, dtype=dtype, count=np.prod(shape)).reshape(shape)
-
-        # Return an independent copy of the array if needed
-        return arr.copy() if copy else arr
+        return self.buffer_view(buffer_name, shape, dtype=dtype)
 
     def read_buffer_as_torch(self, buffer_name, shape, dtype=bfloat16):
-        return numpy_to_torch(self.read_buffer(buffer_name, shape, dtype))
+        # Detach the returned tensor from the live BO mapping. Several staged
+        # encoder paths segfault when Torch keeps viewing XRT-backed memory
+        # after the kernel returns.
+        return numpy_to_torch(
+            self.read_buffer(buffer_name, shape, copy=True, dtype=dtype)
+        )
 
     def write_buffer(self, buffer_name, array):
         """Write buffer from a numpy array into a XRT buffer object"""
@@ -183,29 +194,20 @@ class AIEOperatorBase(ABC):
             else:
                 artifact.set_path(context.build_dir / artifact.path)
             todo.extend(artifact.depends)
+            logging.debug(
+                f"Moved artifact: {artifact.path}, depends on {len(artifact.depends)}, left {len(todo)}."
+            )
+            if len(artifact.depends) > 1:
+                logging.debug(
+                    f"    Depends on more than 1: {', '.join(str(d.path) for d in artifact.depends)}"
+                )
 
     def run_runlist(self):
         elapsed = 0.0
         if self.xrt_runlist is None:
             # Execute as separate xclbin kernel invocations
             for i, (kernel_name, *buffer_args) in enumerate(self.runlist):
-                context, xrt_kernel, insts_bo, insts_len = self.xrt_kernels[kernel_name]
-                insts_bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-                bos = [self.buffer_bos[buffer_arg] for buffer_arg in buffer_args]
-                for bo in bos:
-                    bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
-                opcode = 3
-                start = time.perf_counter()
-                run = xrt_kernel(opcode, insts_bo, insts_len, *bos)
-                result = run.wait()
-                stop = time.perf_counter()
-                elapsed += stop - start
-                if result != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
-                    raise RuntimeError(
-                        f"Kernel {kernel_name} did not complete correctly: {result}"
-                    )
-                for bo in bos:
-                    bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+                elapsed += self.run_kernel_once(kernel_name, *buffer_args)
         else:
             bos = set(
                 self.buffer_bos[buffer_arg]
@@ -225,6 +227,49 @@ class AIEOperatorBase(ABC):
                 bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
             elapsed = stop - start
         return elapsed
+
+    def run_kernel_once(self, kernel_name, *buffer_args):
+        lazy_kernel_loading = getattr(self, "lazy_kernel_loading", False)
+        if lazy_kernel_loading:
+            if kernel_name in self.xrt_kernels:
+                context, xrt_kernel, insts_bo, insts_len = self.xrt_kernels[kernel_name]
+            else:
+                xclbin_artifact, xclbin_kernel_name, insts_artifact = self.kernels[
+                    kernel_name
+                ]
+                handle = self.context.device_manager.get_kernel_handle(
+                    str(xclbin_artifact.path),
+                    xclbin_kernel_name,
+                    str(insts_artifact.path),
+                )
+                context, xrt_kernel, insts_bo, insts_len = (
+                    handle.context,
+                    handle.kernel,
+                    handle.insts_bo,
+                    len(handle.insts),
+                )
+                self.xrt_kernels[kernel_name] = (
+                    context,
+                    xrt_kernel,
+                    insts_bo,
+                    insts_len,
+                )
+        else:
+            context, xrt_kernel, insts_bo, insts_len = self.xrt_kernels[kernel_name]
+        bos = [self.buffer_bos[buffer_arg] for buffer_arg in buffer_args]
+        insts_bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+        for bo in bos:
+            bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+        start = time.perf_counter()
+        result = xrt_kernel(3, insts_bo, insts_len, *bos).wait()
+        stop = time.perf_counter()
+        if result != pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED:
+            raise RuntimeError(
+                f"Kernel {kernel_name} did not complete correctly: {result}"
+            )
+        for bo in bos:
+            bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        return stop - start
 
 
 class AIEOperatorConstraintError(RuntimeError):
