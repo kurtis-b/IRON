@@ -9,34 +9,38 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from iron.operators.addnorm_ffn_addnorm.design import addnorm_ffn_addnorm_design
 from iron.operators.addnorm_ffn_addnorm.op import AIEAddNormFFNAddNorm
 from iron.operators.addnorm_ffn_addnorm.reference import generate_golden_reference
 
 
 def generate_test_params():
-    params = [
+    workloads = [
         (64, 768, 3072),
         (512, 768, 3072),
+        (64, 1024, 4096),
         (512, 1024, 4096),
     ]
-    topology_ids = {
-        (768, 3072): "m32_k96_n64_ps4_pi3_d8_g1",
-        (1024, 4096): "m32_k128_n32_ps4_pi2_d8_g1",
-    }
-    expanded = [
+    params = [
         (
             seq_len,
             hidden_size,
             intermediate_size,
-            topology_ids[(hidden_size, intermediate_size)],
+            str(
+                addnorm_ffn_addnorm_design(
+                    seq_len=seq_len,
+                    hidden_size=hidden_size,
+                    intermediate_size=intermediate_size,
+                )["topology_id"]
+            ),
         )
-        for seq_len, hidden_size, intermediate_size in params
+        for seq_len, hidden_size, intermediate_size in workloads
     ]
     names = [
         f"block3_{seq_len}x{hidden_size}x{intermediate_size}_{topology_id}"
-        for seq_len, hidden_size, intermediate_size, topology_id in expanded
+        for seq_len, hidden_size, intermediate_size, topology_id in params
     ]
-    return expanded, names
+    return params, names
 
 
 regular_params, regular_names = generate_test_params()
@@ -70,10 +74,6 @@ def test_block3_topologies_construct_and_match_reference_contract(
         topology_id=topology_id,
         context=aie_context,
     )
-
-    operator.block.weight_up_proj = golden["ffn_up_weight"].contiguous()
-    operator.block.weight_down_proj = golden["ffn_down_weight"].contiguous()
-    operator.block.ln2_weight = golden["ln2_weight"].contiguous()
 
     assert operator.topology_id == topology_id
     assert operator.topology_family == "pipelined_addnorm_ffn_addnorm"

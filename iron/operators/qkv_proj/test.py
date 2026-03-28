@@ -10,15 +10,32 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from iron.operators.qkv_proj.design import qkv_proj_design
 from iron.operators.qkv_proj.op import AIEQKVProj
 from iron.operators.qkv_proj.reference import generate_golden_reference
 
 
 def generate_test_params():
+    workloads = [
+        (64, 12, 64),
+        (512, 12, 64),
+        (64, 16, 64),
+        (512, 16, 64),
+    ]
     params = [
-        (64, 12, 64, "m64_k64_n16_ps1_ph1_pd1"),
-        (512, 12, 64, "m64_k64_n16_ps1_ph1_pd1"),
-        (512, 16, 64, "m64_k64_n16_ps1_ph1_pd1"),
+        (
+            seq_len,
+            num_heads,
+            head_dim,
+            str(
+                qkv_proj_design(
+                    seq_len=seq_len,
+                    hidden_size=num_heads * head_dim,
+                    num_heads=num_heads,
+                )["topology_id"]
+            ),
+        )
+        for seq_len, num_heads, head_dim in workloads
     ]
     names = [
         f"block1_{seq_len}_{num_heads}_{head_dim}_{topology_id}"
