@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from .peak_reference import (
+    PEAK_REFERENCE_ARTIFACT_VERSION,
+    BackendPeakReference,
+    load_peak_reference,
+    load_peak_references,
+    save_peak_reference,
+    save_peak_references,
+    upsert_peak_reference,
+)
+from .roofline import (
+    annotate_result_row_with_peak,
+    annotate_results_csv,
+    estimate_layer_bytes,
+    estimate_layer_flops,
+    flops_per_joule,
+    gflops_per_joule,
+    operational_intensity,
+    roofline_bound_from_metrics,
+    roofline_bound_ops_per_sec,
+)
+from .support_matrix import (
+    SUPPORT_MATRIX_FIELD_ORDER,
+    render_support_summary_text,
+    summarize_support_rows,
+)
+
+__all__ = [
+    "PEAK_REFERENCE_ARTIFACT_VERSION",
+    "BackendPeakReference",
+    "save_peak_reference",
+    "load_peak_reference",
+    "save_peak_references",
+    "load_peak_references",
+    "upsert_peak_reference",
+    "estimate_layer_flops",
+    "estimate_layer_bytes",
+    "operational_intensity",
+    "roofline_bound_ops_per_sec",
+    "roofline_bound_from_metrics",
+    "flops_per_joule",
+    "gflops_per_joule",
+    "annotate_result_row_with_peak",
+    "annotate_results_csv",
+    "SUPPORT_MATRIX_FIELD_ORDER",
+    "summarize_support_rows",
+    "render_support_summary_text",
+]
