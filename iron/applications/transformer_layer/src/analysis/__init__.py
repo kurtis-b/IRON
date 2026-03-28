@@ -18,11 +18,6 @@ from .bottlenecks import (
     build_row_summary,
     render_execution_mode_summaries,
 )
-from .gpu_compare_best_npu import (
-    benchmark_best_npu_vs_gpu,
-    load_compare_config,
-    select_best_npu_rows,
-)
 from .plot_design_pattern_results import SERIES_COLORS, generate_plots
 from .roofline import (
     annotate_result_row_with_peak,
@@ -55,9 +50,6 @@ __all__ = [
     "build_execution_mode_summary",
     "render_execution_mode_summaries",
     "analyze_results",
-    "load_compare_config",
-    "select_best_npu_rows",
-    "benchmark_best_npu_vs_gpu",
     "SERIES_COLORS",
     "generate_plots",
     "estimate_layer_flops",

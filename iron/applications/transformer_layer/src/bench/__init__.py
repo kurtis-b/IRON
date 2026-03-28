@@ -17,6 +17,17 @@ from .benchmark_power import (
     resolve_power_probe_runs,
     resolve_power_sample_interval_sec,
 )
+from .gpu_power import (
+    RocmSMIPowerMonitor,
+    create_rocm_power_monitor,
+    parse_rocm_smi_average_power_w,
+)
+from .measurement_log import (
+    MeasurementAuditLogger,
+    capture_timed_call,
+    default_measurement_log_path,
+    utc_now_iso_precise,
+)
 from .debug_log import (
     DEBUG_LOG_FIELD_ORDER,
     append_debug_event,
@@ -37,6 +48,13 @@ __all__ = [
     "resolve_power_sample_interval_sec",
     "resolve_power_probe_runs",
     "create_power_monitor",
+    "parse_rocm_smi_average_power_w",
+    "RocmSMIPowerMonitor",
+    "create_rocm_power_monitor",
+    "utc_now_iso_precise",
+    "default_measurement_log_path",
+    "capture_timed_call",
+    "MeasurementAuditLogger",
     "DEBUG_LOG_FIELD_ORDER",
     "utc_now_iso",
     "append_debug_event",

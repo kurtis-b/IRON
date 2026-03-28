@@ -8,10 +8,10 @@ from iron.applications.transformer_layer.gpu_compare_best_npu import (
     load_compare_config,
     select_best_npu_rows,
 )
-from iron.applications.transformer_layer.src.analysis import (
+from iron.applications.transformer_layer.src.analysis.gpu_compare_best_npu import (
     load_compare_config as structured_load_compare_config,
 )
-from iron.applications.transformer_layer.src.analysis import (
+from iron.applications.transformer_layer.src.analysis.gpu_compare_best_npu import (
     select_best_npu_rows as structured_select_best_npu_rows,
 )
 
