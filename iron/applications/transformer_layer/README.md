@@ -67,7 +67,8 @@ The app library code is being incrementally grouped under:
   and best-NPU-vs-iGPU compare helpers
   plus SVG/HTML plot generation helpers
 - `src/pipeline`: unattended orchestration helpers
-  including study-pipeline and JSON job launch support
+  including manifest-driven benchmark sweeps,
+  study-pipeline orchestration, and JSON job launch support
 
 The older `src/*.py` module paths remain as thin compatibility shims so the
 restructure can stay close to `devel` while imports are cleaned up
