@@ -35,23 +35,8 @@ def generate_test_params():
         embed_sz = num_heads * head_dim
         emb_tile = 64 if embed_sz == 64 else (96 if embed_sz == 768 else 128)
         for q_seq_tile, kv_seq_tile, parallel_heads, o_proj_acc_depth in topology_dims:
-            param = pytest.param(
-                seq_len,
-                head_dim,
-                num_heads,
-                q_seq_tile,
-                kv_seq_tile,
-                emb_tile,
-                parallel_heads,
-                o_proj_acc_depth,
-                id=(
-                    f"mha_out_proj_{num_heads}heads_{seq_len}seq_{head_dim}hdim_"
-                    f"{q_seq_tile}qseqtile_{kv_seq_tile}kvseqtile_{emb_tile}embtile_"
-                    f"{parallel_heads}pheads_{o_proj_acc_depth}acc"
-                ),
-            )
-            if num_heads == 1:
-                param = pytest.param(
+            params.append(
+                pytest.param(
                     seq_len,
                     head_dim,
                     num_heads,
@@ -65,12 +50,8 @@ def generate_test_params():
                         f"{q_seq_tile}qseqtile_{kv_seq_tile}kvseqtile_{emb_tile}embtile_"
                         f"{parallel_heads}pheads_{o_proj_acc_depth}acc"
                     ),
-                    marks=pytest.mark.xfail(
-                        reason="Known Block 2 bug: single-head retained workload is not yet correct",
-                        strict=True,
-                    ),
                 )
-            params.append(param)
+            )
 
     return params
 
