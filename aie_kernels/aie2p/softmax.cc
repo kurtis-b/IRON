@@ -11,30 +11,19 @@
 
 using namespace aie;
 
-void softmax_simple_bf16(
-    bfloat16 *restrict input_vector,
-    bfloat16 *restrict output_vector,
-    const int32_t vector_size)
+void softmax_simple_bf16(bfloat16 *restrict input_vector, bfloat16 *restrict output_vector, const int32_t vector_size)
 {
     event0();
 
-    auto it_log_in =
-        aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
-    auto it_log_out =
-        aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
-    auto it_exp_in =
-        aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
-    auto it_exp_out =
-        aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)output_vector);
-    auto it_scale =
-        aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)output_vector);
-    auto it_soft_out =
-        aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)output_vector);
+    auto it_log_in = aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
+    auto it_log_out = aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
+    auto it_exp_in = aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
+    auto it_exp_out = aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)output_vector);
+    auto it_scale = aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)output_vector);
+    auto it_soft_out = aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)output_vector);
 
-    aie::vector<bfloat16, SM_VEC_LEN>
-        in_elems, exp_val, input_bf16, log2e_vec, max_val_vec;
-    aie::accum<accfloat, SM_VEC_LEN>
-        out_vals, exp_val_accum, scaled_accum, exp_in_accum;
+    aie::vector<bfloat16, SM_VEC_LEN> in_elems, exp_val, input_bf16, log2e_vec, max_val_vec;
+    aie::accum<accfloat, SM_VEC_LEN> out_vals, exp_val_accum, scaled_accum, exp_in_accum;
 
     float max_val = std::numeric_limits<float>::lowest();
     float accum_exp_val = 0;
@@ -80,31 +69,24 @@ void softmax_simple_bf16(
     event1();
 }
 
-void partial_softmax_alias_bf16(
-    bfloat16 *restrict input_vector,
-    bfloat16 *restrict output_vector,
-    bfloat16 *restrict scale_buffer,
-    const int32_t vector_size,
-    const int32_t row_idx,
-    const int32_t num_rows,
-    const bfloat16 scale)
+void partial_softmax_alias_bf16(bfloat16 *restrict input_vector,
+                                bfloat16 *restrict output_vector,
+                                bfloat16 *restrict scale_buffer,
+                                const int32_t vector_size,
+                                const int32_t row_idx,
+                                const int32_t num_rows,
+                                const bfloat16 scale)
 {
     event0();
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
-    auto it_log_in =
-        aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
-    auto it_log_out =
-        aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
-    auto it_exp_in =
-        aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
-    auto it_exp_out =
-        aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)output_vector);
+    auto it_log_in = aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
+    auto it_log_out = aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
+    auto it_exp_in = aie::cbegin_restrict_vector<SM_VEC_LEN>((bfloat16 *)input_vector);
+    auto it_exp_out = aie::begin_restrict_vector<SM_VEC_LEN>((bfloat16 *)output_vector);
 
-    aie::vector<bfloat16, SM_VEC_LEN>
-        in_elems, exp_val, input_bf16, log2e_vec, max_val_vec;
-    aie::accum<accfloat, SM_VEC_LEN>
-        out_vals, exp_val_accum, scaled_accum, exp_in_accum;
+    aie::vector<bfloat16, SM_VEC_LEN> in_elems, exp_val, input_bf16, log2e_vec, max_val_vec;
+    aie::accum<accfloat, SM_VEC_LEN> out_vals, exp_val_accum, scaled_accum, exp_in_accum;
 
     float max_val = std::numeric_limits<float>::lowest();
     float accum_exp_val = 0;
@@ -155,10 +137,7 @@ void partial_softmax_alias_bf16(
 
 extern "C" {
 
-void softmax_bf16(
-    bfloat16 *restrict input,
-    bfloat16 *restrict output,
-    const int32_t input_size)
+void softmax_bf16(bfloat16 *restrict input, bfloat16 *restrict output, const int32_t input_size)
 {
     softmax_simple_bf16(input, output, input_size);
 }
@@ -173,32 +152,22 @@ void init_softmax_scale_buffer(bfloat16 *scale_buffer, const int32_t num_rows)
     }
 }
 
-void copy_softmax_scale_bf16(
-    bfloat16 *restrict input,
-    bfloat16 *restrict output,
-    const int32_t num_elements)
+void copy_softmax_scale_bf16(bfloat16 *restrict input, bfloat16 *restrict output, const int32_t num_elements)
 {
     for (int32_t idx = 0; idx < num_elements; ++idx) {
         output[idx] = input[idx];
     }
 }
 
-void partial_softmax_rows_bf16(
-    bfloat16 *restrict input,
-    bfloat16 *restrict output,
-    bfloat16 *restrict scale_buffer,
-    const int32_t row_width,
-    const int32_t num_rows)
+void partial_softmax_rows_bf16(bfloat16 *restrict input,
+                               bfloat16 *restrict output,
+                               bfloat16 *restrict scale_buffer,
+                               const int32_t row_width,
+                               const int32_t num_rows)
 {
     for (int32_t row = 0; row < num_rows; ++row) {
         partial_softmax_alias_bf16(
-            input + row * row_width,
-            output + row * row_width,
-            scale_buffer,
-            row_width,
-            row,
-            num_rows,
-            (bfloat16)log2e);
+            input + row * row_width, output + row * row_width, scale_buffer, row_width, row, num_rows, (bfloat16)log2e);
     }
 
     for (int32_t row = 0; row < num_rows; ++row) {
@@ -206,51 +175,42 @@ void partial_softmax_rows_bf16(
         const float m_cur = (float)scale_buffer[num_rows + row];
         const float l_prev = (float)scale_buffer[2 * num_rows + row];
         const float accum_exp_val = (float)scale_buffer[3 * num_rows + row];
-        const bfloat16 max_diff_exp = aie::reduce_max(
-            aie::exp2<bfloat16>(
-                aie::broadcast<float, SM_VEC_LEN>(m_prev - m_cur)));
+        const bfloat16 max_diff_exp =
+            aie::reduce_max(aie::exp2<bfloat16>(aie::broadcast<float, SM_VEC_LEN>(m_prev - m_cur)));
         scale_buffer[3 * num_rows + row] = (bfloat16)max_diff_exp;
-        scale_buffer[2 * num_rows + row] =
-            (bfloat16)((float)max_diff_exp * l_prev + accum_exp_val);
+        scale_buffer[2 * num_rows + row] = (bfloat16)((float)max_diff_exp * l_prev + accum_exp_val);
         scale_buffer[row] = scale_buffer[num_rows + row];
     }
 }
 
-void normalize_softmax_rows_bf16(
-    bfloat16 *restrict input,
-    bfloat16 *restrict scale_buffer,
-    bfloat16 *restrict output,
-    const int32_t row_width,
-    const int32_t num_rows)
+void normalize_softmax_rows_bf16(bfloat16 *restrict input,
+                                 bfloat16 *restrict scale_buffer,
+                                 bfloat16 *restrict output,
+                                 const int32_t row_width,
+                                 const int32_t num_rows)
 {
     for (int32_t row = 0; row < num_rows; ++row) {
-        const bfloat16 inv_sum =
-            (bfloat16)aie::inv((float)scale_buffer[2 * num_rows + row]);
-        auto it_in = aie::cbegin_restrict_vector<SM_VEC_LEN>(
-            input + row * row_width);
-        auto it_out = aie::begin_restrict_vector<SM_VEC_LEN>(
-            output + row * row_width);
+        const bfloat16 inv_sum = (bfloat16)aie::inv((float)scale_buffer[2 * num_rows + row]);
+        auto it_in = aie::cbegin_restrict_vector<SM_VEC_LEN>(input + row * row_width);
+        auto it_out = aie::begin_restrict_vector<SM_VEC_LEN>(output + row * row_width);
         const int32_t elem_iters = row_width / SM_VEC_LEN;
         for (int32_t i = 0; i < elem_iters; ++i) {
             aie::vector<bfloat16, SM_VEC_LEN> in_vec = *it_in++;
-            auto out_acc = aie::mul(
-                in_vec, aie::broadcast<bfloat16, SM_VEC_LEN>(inv_sum));
+            auto out_acc = aie::mul(in_vec, aie::broadcast<bfloat16, SM_VEC_LEN>(inv_sum));
             *it_out++ = out_acc.to_vector<bfloat16>();
         }
     }
 }
 
-void partial_softmax_bf16(
-    bfloat16 *restrict input,
-    bfloat16 *restrict output,
-    bfloat16 *restrict scale_buffer,
-    const int32_t input_size,
-    const int32_t row_idx,
-    const int32_t num_rows,
-    const bfloat16 scale)
+void partial_softmax_bf16(bfloat16 *restrict input,
+                          bfloat16 *restrict output,
+                          bfloat16 *restrict scale_buffer,
+                          const int32_t input_size,
+                          const int32_t row_idx,
+                          const int32_t num_rows,
+                          const bfloat16 scale)
 {
-    partial_softmax_alias_bf16(
-        input, output, scale_buffer, input_size, row_idx, num_rows, scale);
+    partial_softmax_alias_bf16(input, output, scale_buffer, input_size, row_idx, num_rows, scale);
 }
 
 } // extern "C"
