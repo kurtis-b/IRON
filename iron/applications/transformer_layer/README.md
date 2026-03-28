@@ -62,6 +62,7 @@ The app library code is being incrementally grouped under:
 - `src/patterns`: end-to-end and block pattern implementations
 - `src/bench`: shared benchmark-support modules
 - `src/analysis`: reusable roofline and reporting-support modules
+  including bottleneck summarization helpers
 
 The older `src/*.py` module paths remain as thin compatibility shims so the
 restructure can stay close to `devel` while imports are cleaned up

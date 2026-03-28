@@ -10,6 +10,14 @@ from .peak_reference import (
     save_peak_references,
     upsert_peak_reference,
 )
+from .bottlenecks import (
+    COMPONENT_FIELDS,
+    SUMMARY_FIELD_ORDER,
+    analyze_results,
+    build_execution_mode_summary,
+    build_row_summary,
+    render_execution_mode_summaries,
+)
 from .roofline import (
     annotate_result_row_with_peak,
     annotate_results_csv,
@@ -35,6 +43,12 @@ __all__ = [
     "save_peak_references",
     "load_peak_references",
     "upsert_peak_reference",
+    "COMPONENT_FIELDS",
+    "SUMMARY_FIELD_ORDER",
+    "build_row_summary",
+    "build_execution_mode_summary",
+    "render_execution_mode_summaries",
+    "analyze_results",
     "estimate_layer_flops",
     "estimate_layer_bytes",
     "operational_intensity",
