@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import argparse
 
-from iron.applications.transformer_layer.peak_reference import (
-    BackendPeakReference,
-    save_peak_reference,
-    upsert_peak_reference,
+from iron.applications.transformer_layer.src.analysis.calibrate_backend_peaks import (
+    run_calibrate_backend_peaks_cli,
+    write_backend_peak_reference,
 )
 
 
@@ -33,17 +34,12 @@ def parse_args():
 
 
 def main():
-    args = parse_args()
-    peak = BackendPeakReference(
-        backend=args.backend,
-        peak_ops_per_sec=args.peak_ops_per_sec,
-        peak_bytes_per_sec=args.peak_bytes_per_sec,
-        source_note=args.source_note,
-    )
-    if args.append:
-        upsert_peak_reference(args.output, peak)
-        return
-    save_peak_reference(args.output, peak)
+    run_calibrate_backend_peaks_cli(parse_args())
+
+
+__all__ = [
+    "write_backend_peak_reference",
+]
 
 
 if __name__ == "__main__":

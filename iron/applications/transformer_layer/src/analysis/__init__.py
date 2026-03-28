@@ -19,6 +19,11 @@ from .bottlenecks import (
     render_execution_mode_summaries,
 )
 from .plot_design_pattern_results import SERIES_COLORS, generate_plots
+from .annotate_roofline import annotate_results_file, run_annotate_roofline_cli
+from .calibrate_backend_peaks import (
+    run_calibrate_backend_peaks_cli,
+    write_backend_peak_reference,
+)
 from .roofline import (
     annotate_result_row_with_peak,
     annotate_results_csv,
@@ -52,6 +57,10 @@ __all__ = [
     "analyze_results",
     "SERIES_COLORS",
     "generate_plots",
+    "annotate_results_file",
+    "run_annotate_roofline_cli",
+    "write_backend_peak_reference",
+    "run_calibrate_backend_peaks_cli",
     "estimate_layer_flops",
     "estimate_layer_bytes",
     "operational_intensity",

@@ -65,7 +65,8 @@ The app library code is being incrementally grouped under:
 - `src/analysis`: reusable roofline and reporting-support modules
   including bottleneck summarization helpers
   and best-NPU-vs-iGPU compare helpers
-  plus SVG/HTML plot generation helpers
+  plus SVG/HTML plot generation, roofline annotation,
+  and backend-peak artifact helpers
 - `src/pipeline`: unattended orchestration helpers
   including manifest-driven benchmark sweeps,
   study-pipeline orchestration, parity validation,

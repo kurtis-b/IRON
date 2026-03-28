@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import argparse
 
-from iron.applications.transformer_layer.roofline import annotate_results_csv
+from iron.applications.transformer_layer.src.analysis.annotate_roofline import (
+    annotate_results_file,
+    run_annotate_roofline_cli,
+)
 
 
 def parse_args():
@@ -20,12 +23,12 @@ def parse_args():
 
 
 def main():
-    args = parse_args()
-    annotate_results_csv(
-        input_csv=args.input_csv,
-        peak_reference_path=args.peak_reference,
-        output_csv=args.output_csv,
-    )
+    run_annotate_roofline_cli(parse_args())
+
+
+__all__ = [
+    "annotate_results_file",
+]
 
 
 if __name__ == "__main__":
