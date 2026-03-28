@@ -57,7 +57,7 @@ def _validate_runlist_parity_isolated(
         command = [
             sys.executable,
             "-m",
-            "iron.applications.transformer_layer.operator_runlist_worker",
+            "iron.applications.transformer_layer.src.pipeline.operator_runlist_worker",
             "--request-json",
             str(request_path),
             "--response-json",
