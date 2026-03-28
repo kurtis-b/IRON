@@ -22,6 +22,18 @@ It also supports:
 - unattended pipeline execution
 - NPU pseudo-power and iGPU power measurement
 
+## Minimal-Diff Policy
+
+DesignPats should stay as close to `devel` as practical.
+
+- keep shared-kernel and shared-framework edits to a minimum
+- keep `Runlist` and `GEMM offload` as imported baselines with thesis-app glue
+  only
+- concentrate new thesis-specific work in the fused Dataflow blocks and the
+  thesis benchmark harness
+- avoid new shared-kernel changes unless a retained thesis case proves they are
+  required
+
 ## Execution Modes
 
 ### End-to-end modes
@@ -29,6 +41,18 @@ It also supports:
 - `dataflow`: three Dataflow blocks connected in one benchmarked pipeline
 - `runlist`: the runlist-based full-layer baseline
 - `gemm_offload`: the shared-runtime GEMM-offload baseline
+
+For `dataflow`, each block is intended to be internally fused and uses its own
+xclbin. The retained inter-block tensor contract is:
+
+- `Block 1` outputs `q/k/v [num_heads, seq, head_dim]`
+- head-major means each head is stored contiguously in memory
+- `Block 2` consumes that layout
+
+The detailed block contracts, topology dimensions, and pytest policy are
+documented in:
+
+- `docs/dataflow_operator_contracts.md`
 
 ### Block-study modes
 
@@ -47,6 +71,13 @@ The DesignPats app starts from hidden states only.
 
 There is no supported public benchmark surface that starts from supplied
 `Q/K/V/R`.
+
+The retained operator-test policy is:
+
+- one `generate_test_params()` helper
+- one test method
+- params composed from workload dimensions and topology dimensions
+- the design file owns the constructibility decision
 
 ## Studies
 

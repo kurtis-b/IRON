@@ -15,6 +15,18 @@ The DesignPats comparison is:
 
 `encoder_pipeline` is not part of this thesis direction.
 
+## Minimal-Diff Direction
+
+The guiding implementation rule is to stay as close to `devel` as practical.
+
+- `Dataflow` carries the thesis-specific new work
+- `Runlist` should remain close to the imported baseline, with hidden-states-only
+  thesis glue
+- `GEMM offload` should remain close to the imported baseline, with hidden-states-only
+  thesis glue
+- shared-kernel changes should be avoided unless a retained thesis case proves
+  they are required
+
 ## Dataflow
 
 `Dataflow` is organized as three blocks:
@@ -25,10 +37,19 @@ The DesignPats comparison is:
 
 Important retained implementation choices:
 
+- each Dataflow block is intended to remain internally fused
+- Dataflow uses device-buffer handoff between blocks rather than inter-block
+  streaming
+- `Block 1` outputs `q/k/v [num_heads, seq, head_dim]`
+- head-major means each attention head is stored contiguously in memory
 - `Block 2` uses the pipelined `mha_out_proj` operator
 - `Block 3` uses a dedicated DesignPats operator that pipelines the first Add &
   Norm stage into the Up projection cores
 - the benchmark boundary is hidden states only
+- operator-local topology testing is a retained policy, with one parametrized
+  test method per operator
+- the detailed block contracts and topology/test policy are documented in
+  `dataflow_operator_contracts.md`
 
 ## Runlist
 

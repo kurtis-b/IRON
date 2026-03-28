@@ -16,6 +16,16 @@ The DesignPats app evaluates:
 The benchmark boundary is hidden states only. There is no public study surface
 that begins from supplied `Q/K/V/R`.
 
+The authoritative block-contract and topology-policy note is:
+
+- `docs/dataflow_operator_contracts.md`
+
+The retained implementation policy is to stay as close to `devel` as practical:
+
+- keep shared-kernel and shared-framework edits minimal
+- keep `Runlist` and `GEMM offload` close to their imported baseline behavior
+- concentrate thesis-specific changes in Dataflow blocks and thesis-app glue
+
 ## Study Set
 
 The retained studies are:
@@ -60,6 +70,12 @@ End-to-end rows report implementation-local timings:
 - `Dataflow`: block timing breakdown
 - `Runlist`: projection plus stitched runlist timing
 - `GEMM offload`: projection plus GEMM timing, with host-side preprocessing and postprocessing
+
+For the retained Dataflow block contract:
+
+- `block1_qkv_proj` returns `q/k/v [num_heads, seq, head_dim]`
+- head-major means each head is laid out contiguously in memory
+- `block2_mha_out_proj` is responsible for consuming that layout
 
 ## FLOP Model
 
@@ -124,3 +140,13 @@ for:
 - `gemm_offload`
 
 The parity reference is the hidden-states-only CPU reference layer.
+
+## Operator Test Coverage
+
+The retained operator-test policy is:
+
+- one `generate_test_params()` helper per operator
+- one test method per operator
+- params built from workload dimensions and topology dimensions
+- constructibility owned by the design/operator layer, not prefiltered in the
+  test helper
