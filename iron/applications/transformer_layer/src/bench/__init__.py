@@ -10,6 +10,13 @@ from .benchmark_common import (
     write_dict_rows_csv,
     write_results_csv,
 )
+from .benchmark_power import (
+    create_power_monitor,
+    empty_power_stats,
+    parse_turbostat_pkgwatt_samples,
+    resolve_power_probe_runs,
+    resolve_power_sample_interval_sec,
+)
 from .debug_log import (
     DEBUG_LOG_FIELD_ORDER,
     append_debug_event,
@@ -25,6 +32,11 @@ __all__ = [
     "write_dict_rows_csv",
     "resolve_study_path",
     "load_study_manifest",
+    "empty_power_stats",
+    "parse_turbostat_pkgwatt_samples",
+    "resolve_power_sample_interval_sec",
+    "resolve_power_probe_runs",
+    "create_power_monitor",
     "DEBUG_LOG_FIELD_ORDER",
     "utc_now_iso",
     "append_debug_event",
