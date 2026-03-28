@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+
 from iron.common.utils import torch_dtype_map
 
 
@@ -14,32 +15,82 @@ def generate_golden_reference(
     b_col_maj=False,
     c_col_maj=False,
     partition_N=1,
+    batch_A=(1, 0),
+    batch_B=(1, 0),
+    batch_C=(1, 0),
 ):
     torch.manual_seed(seed)
     val_range = 4
     dtype_torch = torch_dtype_map[dtype]
+
+    if batch_C[0] > 1:
+        batch_size_A, batch_stride_dim_A = batch_A
+        batch_size_B, batch_stride_dim_B = batch_B
+        batch_size_C, batch_stride_dim_C = batch_C
+
+        if batch_stride_dim_A == 0:
+            input_a = torch.randn(batch_size_A, M, K, dtype=dtype_torch) * val_range
+        else:
+            input_a = torch.randn(M, batch_size_A, K, dtype=dtype_torch) * val_range
+
+        if batch_stride_dim_B == 0:
+            input_b = torch.rand(batch_size_B, K, N, dtype=dtype_torch) * val_range
+        else:
+            input_b = torch.rand(K, batch_size_B, N, dtype=dtype_torch) * val_range
+
+        input_a_perm = input_a if batch_stride_dim_A == 0 else input_a.permute(1, 0, 2)
+        input_b_perm = input_b if batch_stride_dim_B == 0 else input_b.permute(1, 0, 2)
+        output_perm = torch.matmul(input_a_perm, input_b_perm)
+        output = (
+            output_perm.permute(1, 0, 2) if batch_stride_dim_C == 1 else output_perm
+        )
+
+        if batch_stride_dim_A == 0:
+            input_a = input_a.reshape(batch_size_A * M, K)
+        else:
+            input_a = input_a.reshape(M, K * batch_size_A)
+
+        if b_col_maj:
+            if batch_stride_dim_B == 0:
+                input_b = input_b.transpose(-2, -1).reshape(batch_size_B * N, K)
+            else:
+                input_b = input_b.transpose(0, 2).reshape(N, K * batch_size_B)
+        else:
+            if batch_stride_dim_B == 0:
+                input_b = input_b.reshape(batch_size_B * K, N)
+            else:
+                input_b = input_b.reshape(K, N * batch_size_B)
+
+        if c_col_maj:
+            if batch_stride_dim_C == 0:
+                output = output.transpose(-2, -1).reshape(batch_size_C * N, M)
+            else:
+                output = output.transpose(0, 2).reshape(N, M * batch_size_C)
+        else:
+            if batch_stride_dim_C == 0:
+                output = output.reshape(batch_size_C * M, N)
+            else:
+                output = output.reshape(M, N * batch_size_C)
+
+        return {"input": input_a, "input_b": input_b, "output": output}
+
+    if partition_N != 1 and N % partition_N != 0:
+        raise ValueError(f"N ({N}) must be divisible by partition_N ({partition_N})")
+
     input_a = torch.randn(M, K, dtype=dtype_torch) * val_range
     input_b_full = torch.rand(K, N, dtype=dtype_torch) * val_range
     output_full = torch.matmul(input_a, input_b_full)
-    if False:
-        # The following inputs are useful for debugging;
-        # the A matrix becomes a matrix where each element encodes its row and column index,
-        # and the B matrix is an identity matrix.
-        col_digits = len(str(K - 1)) if K > 0 else 1
-        factor = 10 ** (col_digits + 1)
-        row_indices = torch.arange(M, dtype=torch.int64).unsqueeze(1)
-        col_indices = torch.arange(K, dtype=torch.int64).unsqueeze(0)
-        input_a = (row_indices * factor + col_indices).to(dtype=dtype_torch)
-        input_b_full = torch.zeros(K, N, dtype=dtype_torch)
-        diag_dim = min(K, N)
-        input_b_full[:diag_dim, :diag_dim] = torch.eye(diag_dim, dtype=dtype_torch)
+
     if b_col_maj:
         input_b_full = input_b_full.T
     if c_col_maj:
         output_full = output_full.T
 
-    # Create partitioned buffers for B
+    if partition_N == 1:
+        return {"input": input_a, "input_b": input_b_full, "output": output_full}
+
     input_b = []
+    output = []
     for i in range(partition_N):
         col_start = i * (N // partition_N)
         col_end = (i + 1) * (N // partition_N)
@@ -47,12 +98,6 @@ def generate_golden_reference(
             input_b.append(input_b_full[col_start:col_end, :])
         else:
             input_b.append(input_b_full[:, col_start:col_end])
-
-    # Create partitioned buffers for C (output)
-    output = []
-    for i in range(partition_N):
-        col_start = i * (N // partition_N)
-        col_end = (i + 1) * (N // partition_N)
         if c_col_maj:
             output.append(output_full[col_start:col_end, :])
         else:

@@ -27,7 +27,7 @@ class AIEOperatorBase(ABC):
             AIEOperatorBase._default_context = AIEContext()
         return AIEOperatorBase._default_context
 
-    def __init__(self, context=None):
+    def __init__(self, context=None, skip_add_to_list=False):
         self.artifacts = (
             []
         )  # CompilationArtifact objects are uniqued within the context
@@ -47,7 +47,9 @@ class AIEOperatorBase(ABC):
 
         if context is None:
             context = self.get_default_context()
-        context.register_operator(self)
+        self.context = context
+        if not skip_add_to_list:
+            context.register_operator(self)
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
