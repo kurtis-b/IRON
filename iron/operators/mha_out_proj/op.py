@@ -22,6 +22,42 @@ from iron.common.utils import torch_to_numpy, numpy_to_torch
 
 
 class AIEMHAOutProj(AIEOperatorBase):
+    def _canonicalize_head_major_qkv(
+        self,
+        tensor: torch.Tensor,
+        *,
+        name: str,
+    ) -> torch.Tensor:
+        if tensor.ndim == 2:
+            if tensor.shape != (self.seq_len, self.embed_sz):
+                raise AIEOperatorConstraintError(
+                    f"AIEMHAOutProj: expected {name} shape {(self.seq_len, self.embed_sz)}"
+                )
+            return (
+                tensor.view(self.seq_len, self.num_heads, self.d)
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+        if tensor.ndim == 3 and tensor.shape == (self.num_heads, self.seq_len, self.d):
+            return tensor.contiguous()
+        raise AIEOperatorConstraintError("AIEMHAOutProj: incompatible tensor shape(s)")
+
+    def _pack_qkv_head_major(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> np.ndarray:
+        q_np = torch_to_numpy(
+            q.permute(1, 0, 2).contiguous().view(self.seq_len, self.embed_sz)
+        )
+        k_np = torch_to_numpy(
+            k.permute(1, 0, 2).contiguous().view(self.seq_len, self.embed_sz)
+        )
+        v_np = torch_to_numpy(
+            v.permute(1, 0, 2).contiguous().view(self.seq_len, self.embed_sz)
+        )
+        return np.concatenate((q_np, k_np, v_np), axis=0)
 
     def __init__(
         self,
@@ -269,6 +305,9 @@ class AIEMHAOutProj(AIEOperatorBase):
         v: torch.Tensor,
         w_o: torch.Tensor = None,
     ):
+        q = self._canonicalize_head_major_qkv(q, name="q")
+        k = self._canonicalize_head_major_qkv(k, name="k")
+        v = self._canonicalize_head_major_qkv(v, name="v")
         applicable = (
             q.shape[-1] == self.d
             and k.shape[-1] == self.d
@@ -293,11 +332,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         v: torch.Tensor,
         w_o: torch.Tensor = None,
     ):
-        # Convert to numpy
-        q_np = torch_to_numpy(q)
-        k_np = torch_to_numpy(k)
-        v_np = torch_to_numpy(v)
-        qkv_np = np.concatenate((q_np, k_np, v_np), axis=0)
+        qkv_np = self._pack_qkv_head_major(q, k, v)
 
         # Write padded buffers
         self.write_buffer("QKV", qkv_np)

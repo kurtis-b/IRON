@@ -11,9 +11,28 @@ from iron.operators.gemm.op import AIEGEMM
 class AIEQKVProj:
     """Shared-runtime Q/K/V projection block built from three GEMMs."""
 
-    def __init__(self, *, seq_len: int, hidden_size: int, context) -> None:
+    @staticmethod
+    def _to_head_major(
+        tensor: torch.Tensor,
+        *,
+        seq_len: int,
+        hidden_size: int,
+        num_heads: int,
+    ) -> torch.Tensor:
+        head_dim = hidden_size // num_heads
+        return tensor.view(seq_len, num_heads, head_dim).permute(1, 0, 2).contiguous()
+
+    def __init__(
+        self,
+        *,
+        seq_len: int,
+        hidden_size: int,
+        context,
+        num_heads: int,
+    ) -> None:
         self.seq_len = seq_len
         self.hidden_size = hidden_size
+        self.num_heads = num_heads
         self.context = context
         gemm_common = {
             "tile_m": 64,
@@ -61,9 +80,24 @@ class AIEQKVProj:
     def forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = self.q_proj(hidden_states).contiguous()
-        k = self.k_proj(hidden_states).contiguous()
-        v = self.v_proj(hidden_states).contiguous()
+        q = self._to_head_major(
+            self.q_proj(hidden_states).contiguous(),
+            seq_len=self.seq_len,
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+        )
+        k = self._to_head_major(
+            self.k_proj(hidden_states).contiguous(),
+            seq_len=self.seq_len,
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+        )
+        v = self._to_head_major(
+            self.v_proj(hidden_states).contiguous(),
+            seq_len=self.seq_len,
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+        )
         return q, k, v
 
     def benchmark_metadata(self) -> dict[str, object]:

@@ -37,9 +37,18 @@ def _host_project_qkv(
     k = torch.matmul(hidden_states, weights["k_proj_weight"].T.contiguous())
     v = torch.matmul(hidden_states, weights["v_proj_weight"].T.contiguous())
     return (
-        q[:, : spec.hidden_size].contiguous(),
-        k[:, : spec.hidden_size].contiguous(),
-        v[:, : spec.hidden_size].contiguous(),
+        q[:, : spec.hidden_size]
+        .view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
+        .permute(1, 0, 2)
+        .contiguous(),
+        k[:, : spec.hidden_size]
+        .view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
+        .permute(1, 0, 2)
+        .contiguous(),
+        v[:, : spec.hidden_size]
+        .view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
+        .permute(1, 0, 2)
+        .contiguous(),
     )
 
 
@@ -48,13 +57,7 @@ def _host_attention_output(
     weights: dict[str, torch.Tensor],
     spec: TransformerLayerSpec,
 ) -> torch.Tensor:
-    q_matrix, k_matrix, v_matrix = _host_project_qkv(hidden_states, weights, spec)
-    q = q_matrix.view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
-    k = k_matrix.view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
-    v = v_matrix.view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
-    q = q.permute(1, 0, 2).contiguous()
-    k = k.permute(1, 0, 2).contiguous()
-    v = v.permute(1, 0, 2).contiguous()
+    q, k, v = _host_project_qkv(hidden_states, weights, spec)
     attn_scores = torch.matmul(q, k.transpose(-1, -2))
     attn_scores = attn_scores * (spec.attention_head_size**-0.5)
     attn_probs = torch.softmax(attn_scores.to(torch.float32), dim=-1).to(q.dtype)
@@ -95,6 +98,7 @@ class Block1QKVProjPattern(_BaseBlockPattern):
         self.block = AIEQKVProj(
             seq_len=spec.seq_len,
             hidden_size=spec.hidden_size,
+            num_heads=spec.num_attention_heads,
             context=self.context,
         )
 

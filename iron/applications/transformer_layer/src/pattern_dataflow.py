@@ -52,6 +52,7 @@ class DataflowPattern(nn.Module):
         self.block1 = AIEQKVProj(
             seq_len=spec.seq_len,
             hidden_size=spec.hidden_size,
+            num_heads=spec.num_attention_heads,
             context=self.context,
         )
         self.block2 = AIEMHAOutProj(

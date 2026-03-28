@@ -8,7 +8,7 @@ echo "1. Source XRT and ironenv."
 echo "   source /opt/xilinx/xrt/setup.sh && source ./ironenv/bin/activate"
 echo
 echo "2. Verify focused transformer_layer tests pass."
-echo "   python -m pytest -q iron/applications/transformer_layer/test_*_v2.py"
+echo "   python -m pytest -q iron/applications/transformer_layer/test_*.py"
 echo
 echo "3. Run a one-shot synthetic smoke for one DesignPats design pattern."
 echo "   python iron/applications/transformer_layer/npu_inference.py --execution-mode dataflow --seq-len 64 --warmup-runs 1 --runs-per-sample 1"
