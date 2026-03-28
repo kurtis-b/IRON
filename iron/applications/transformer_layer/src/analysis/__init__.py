@@ -23,6 +23,7 @@ from .gpu_compare_best_npu import (
     load_compare_config,
     select_best_npu_rows,
 )
+from .plot_design_pattern_results import SERIES_COLORS, generate_plots
 from .roofline import (
     annotate_result_row_with_peak,
     annotate_results_csv,
@@ -57,6 +58,8 @@ __all__ = [
     "load_compare_config",
     "select_best_npu_rows",
     "benchmark_best_npu_vs_gpu",
+    "SERIES_COLORS",
+    "generate_plots",
     "estimate_layer_flops",
     "estimate_layer_bytes",
     "operational_intensity",
