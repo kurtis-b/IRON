@@ -18,6 +18,11 @@ from .bottlenecks import (
     build_row_summary,
     render_execution_mode_summaries,
 )
+from .gpu_compare_best_npu import (
+    benchmark_best_npu_vs_gpu,
+    load_compare_config,
+    select_best_npu_rows,
+)
 from .roofline import (
     annotate_result_row_with_peak,
     annotate_results_csv,
@@ -49,6 +54,9 @@ __all__ = [
     "build_execution_mode_summary",
     "render_execution_mode_summaries",
     "analyze_results",
+    "load_compare_config",
+    "select_best_npu_rows",
+    "benchmark_best_npu_vs_gpu",
     "estimate_layer_flops",
     "estimate_layer_bytes",
     "operational_intensity",
