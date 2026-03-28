@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from iron.applications.transformer_layer.src.bench.benchmark_common import (
+from .benchmark_common import (
     load_study_manifest,
     parse_execution_modes,
     parse_seq_lens,
@@ -9,6 +9,12 @@ from iron.applications.transformer_layer.src.bench.benchmark_common import (
     summarize_latency_measurements,
     write_dict_rows_csv,
     write_results_csv,
+)
+from .debug_log import (
+    DEBUG_LOG_FIELD_ORDER,
+    append_debug_event,
+    classify_debug_exception,
+    utc_now_iso,
 )
 
 __all__ = [
@@ -19,4 +25,8 @@ __all__ = [
     "write_dict_rows_csv",
     "resolve_study_path",
     "load_study_manifest",
+    "DEBUG_LOG_FIELD_ORDER",
+    "utc_now_iso",
+    "append_debug_event",
+    "classify_debug_exception",
 ]

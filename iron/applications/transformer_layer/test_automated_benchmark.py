@@ -6,6 +6,19 @@ from pathlib import Path
 from iron.applications.transformer_layer.automated_benchmark import (
     _record_parity_results,
 )
+from iron.applications.transformer_layer.benchmark_common import parse_seq_lens
+from iron.applications.transformer_layer.debug_log import append_debug_event
+from iron.applications.transformer_layer.src.bench import (
+    append_debug_event as append_debug_event_structured,
+)
+from iron.applications.transformer_layer.src.bench import (
+    parse_seq_lens as parse_seq_lens_structured,
+)
+
+
+def test_restructured_bench_package_preserves_legacy_imports():
+    assert parse_seq_lens is parse_seq_lens_structured
+    assert append_debug_event is append_debug_event_structured
 
 
 def test_record_parity_results_skips_empty_rows(tmp_path: Path):
