@@ -94,9 +94,13 @@ class DataflowPattern(nn.Module):
                 "ln2_weight",
             ],
         )
-        self.block1.assign_weights(weights)
+        self.block1.q_proj.weight = weights["q_proj_weight"].contiguous()
+        self.block1.k_proj.weight = weights["k_proj_weight"].contiguous()
+        self.block1.v_proj.weight = weights["v_proj_weight"].contiguous()
         self.block2.w_o_proj = weights["out_proj_weight"].contiguous()
-        self.block3.assign_weights(weights)
+        self.block3.block.weight_up_proj = weights["ffn_up_weight"].contiguous()
+        self.block3.block.weight_down_proj = weights["ffn_down_weight"].contiguous()
+        self.block3.block.ln2_weight = weights["ln2_weight"].contiguous()
         self._weights_assigned = True
 
     def prepare_benchmark_inputs(self, layer_inputs: TransformerLayerInputs) -> None:
@@ -128,7 +132,7 @@ class DataflowPattern(nn.Module):
         block2_end = time.perf_counter()
 
         block3_start = block2_end
-        output = self.block3(attention_output, hidden_states)
+        output = self.block3.forward(attention_output, hidden_states)
         block3_end = time.perf_counter()
 
         return output.unsqueeze(0), {

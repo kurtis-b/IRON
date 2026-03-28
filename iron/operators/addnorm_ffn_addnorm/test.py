@@ -14,35 +14,40 @@ from iron.operators.addnorm_ffn_addnorm.reference import generate_golden_referen
 
 
 def generate_test_params():
-    params = []
-    for seq_len, hidden_size, intermediate_size in (
+    params = [
         (64, 768, 3072),
         (512, 768, 3072),
         (512, 1024, 4096),
-    ):
-        topologies = AIEAddNormFFNAddNorm.enumerate_topologies(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
+    ]
+    topology_ids = {
+        (768, 3072): "m32_k96_n64_ps4_pi3_d8_g1",
+        (1024, 4096): "m32_k128_n32_ps4_pi2_d8_g1",
+    }
+    expanded = [
+        (
+            seq_len,
+            hidden_size,
+            intermediate_size,
+            topology_ids[(hidden_size, intermediate_size)],
         )
-        for topology in topologies:
-            params.append(
-                pytest.param(
-                    seq_len,
-                    hidden_size,
-                    intermediate_size,
-                    topology["topology_id"],
-                    id=(
-                        f"block3_{seq_len}x{hidden_size}x{intermediate_size}_"
-                        f"{topology['topology_id']}"
-                    ),
-                )
-            )
-    return params
+        for seq_len, hidden_size, intermediate_size in params
+    ]
+    names = [
+        f"block3_{seq_len}x{hidden_size}x{intermediate_size}_{topology_id}"
+        for seq_len, hidden_size, intermediate_size, topology_id in expanded
+    ]
+    return expanded, names
+
+
+regular_params, regular_names = generate_test_params()
 
 
 @pytest.mark.parametrize(
     "seq_len,hidden_size,intermediate_size,topology_id",
-    generate_test_params(),
+    [
+        pytest.param(*params, id=name)
+        for params, name in zip(regular_params, regular_names)
+    ],
 )
 def test_block3_topologies_construct_and_match_reference_contract(
     seq_len,
@@ -66,7 +71,9 @@ def test_block3_topologies_construct_and_match_reference_contract(
         context=aie_context,
     )
 
-    operator.assign_weights(golden)
+    operator.block.weight_up_proj = golden["ffn_up_weight"].contiguous()
+    operator.block.weight_down_proj = golden["ffn_down_weight"].contiguous()
+    operator.block.ln2_weight = golden["ln2_weight"].contiguous()
 
     assert operator.topology_id == topology_id
     assert operator.topology_family == "pipelined_addnorm_ffn_addnorm"

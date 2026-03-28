@@ -24,6 +24,13 @@ implementations.
   when a combination is not actually constructible or functional
 - the lowering should be topology-driven, not split into dedicated structural
   branches such as "mixed parallel" special cases
+- each thesis-local operator directory should mirror the `mha` operator layout:
+  `design.py`, `op.py`, `reference.py`, and `test.py`
+- `design.py` should expose one retained design entrypoint plus optional `main()`
+- `reference.py` should expose only `generate_golden_reference()`
+- `test.py` should expose `generate_test_params()` and one test method
+- thesis-specific weight binding and benchmark metadata should stay in the
+  pattern layer, not as extra helper methods on the operator class
 
 ## Block 1
 
@@ -66,6 +73,12 @@ to DDR.
 - `num_heads % parallel_heads == 0`
 - `head_dim % parallel_head_dim == 0`
 - the combined topology must fit within the 8-column array
+
+Block 1 currently resolves its retained thesis topologies through the single
+design entrypoint in
+[`iron/operators/qkv_proj/design.py`](/home/cj/iron/iron/operators/qkv_proj/design.py)
+and translates them into the shared-runtime GEMM wrapper used by
+[`iron/operators/qkv_proj/op.py`](/home/cj/iron/iron/operators/qkv_proj/op.py).
 
 ## Block 2
 
@@ -137,11 +150,19 @@ to DDR.
 
 - `embedding_dim == num_heads * head_dim`
 - `parallel_seq in {1, 2, 4, 6, 8}`
-- `seq_len % (parallel_seq * tile_m) == 0`
+- the retained topology's internal `compile_rows` must be divisible by
+  `parallel_seq * tile_m`
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`
 - the combined topology must fit within the 8-column array
+
+Block 3 currently validates those constraints through the single design
+entrypoint in
+[`iron/operators/addnorm_ffn_addnorm/design.py`](/home/cj/iron/iron/operators/addnorm_ffn_addnorm/design.py)
+and then translates the thesis-facing topology into the imported
+`ffn_addnorm` runtime parameters. Shorter total `seq_len` values are still
+allowed because the imported runtime pads and chunks the final row block.
 
 ## Reference policy
 

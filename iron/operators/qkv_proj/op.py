@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import torch
 
+from iron.operators.qkv_proj.design import qkv_proj_design
 from iron.operators.gemm.op import AIEGEMM
 
 
@@ -29,16 +30,31 @@ class AIEQKVProj:
         hidden_size: int,
         context,
         num_heads: int,
+        topology_id: str | None = None,
     ) -> None:
         self.seq_len = seq_len
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.context = context
+        topology = qkv_proj_design(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            topology_id=topology_id,
+        )
+        self.topology_id = str(topology["topology_id"])
+        self.topology_family = str(topology["topology_family"])
+        self.parallel_seq = int(topology["parallel_seq"])
+        self.parallel_heads = int(topology["parallel_heads"])
+        self.parallel_head_dim = int(topology["parallel_head_dim"])
+        self.tile_m = int(topology["tile_m"])
+        self.tile_k = int(topology["tile_k"])
+        self.tile_n = int(topology["tile_n"])
         gemm_common = {
-            "tile_m": 64,
-            "tile_k": 64,
-            "tile_n": 16,
-            "num_aie_columns": 8,
+            "tile_m": self.tile_m,
+            "tile_k": self.tile_k,
+            "tile_n": self.tile_n,
+            "num_aie_columns": int(topology["num_aie_columns"]),
             "prio_accuracy": False,
             "emulate_bf16_mmul_with_bfp16": True,
             "use_static_weight": True,
@@ -72,11 +88,6 @@ class AIEQKVProj:
                 runtime_kernel_name=shared_xclbin.kernel_name,
             )
 
-    def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
-        self.q_proj.weight = weights["q_proj_weight"].contiguous()
-        self.k_proj.weight = weights["k_proj_weight"].contiguous()
-        self.v_proj.weight = weights["v_proj_weight"].contiguous()
-
     def forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -99,16 +110,3 @@ class AIEQKVProj:
             num_heads=self.num_heads,
         )
         return q, k, v
-
-    def benchmark_metadata(self) -> dict[str, object]:
-        gemm_ops = (self.q_proj, self.k_proj, self.v_proj)
-        unique_insts = {str(op.insts_artifact.path) for op in gemm_ops}
-        unique_xclbins = {
-            str((op.runtime_xclbin_artifact or op.xclbin_artifact).path)
-            for op in gemm_ops
-        }
-        return {
-            "npu_dispatch_count": 3,
-            "npu_unique_instruction_binary_count": len(unique_insts),
-            "npu_unique_xclbin_count": len(unique_xclbins),
-        }

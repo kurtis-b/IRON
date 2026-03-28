@@ -104,7 +104,9 @@ class Block1QKVProjPattern(_BaseBlockPattern):
 
     def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
         require_keys(weights, ["q_proj_weight", "k_proj_weight", "v_proj_weight"])
-        self.block.assign_weights(weights)
+        self.block.q_proj.weight = weights["q_proj_weight"].contiguous()
+        self.block.k_proj.weight = weights["k_proj_weight"].contiguous()
+        self.block.v_proj.weight = weights["v_proj_weight"].contiguous()
 
     def prepare_benchmark_inputs(self, layer_inputs: TransformerLayerInputs) -> None:
         layer_inputs.validate(self.spec)
@@ -127,6 +129,12 @@ class Block1QKVProjPattern(_BaseBlockPattern):
         return torch.stack((q, k, v), dim=0), {"block1_qkv_proj_sec": end - start}
 
     def get_benchmark_metadata(self) -> dict[str, object]:
+        gemm_ops = (self.block.q_proj, self.block.k_proj, self.block.v_proj)
+        unique_insts = {str(op.insts_artifact.path) for op in gemm_ops}
+        unique_xclbins = {
+            str((op.runtime_xclbin_artifact or op.xclbin_artifact).path)
+            for op in gemm_ops
+        }
         return {
             "compile_setup_time_ms": (
                 None
@@ -134,7 +142,9 @@ class Block1QKVProjPattern(_BaseBlockPattern):
                 else self.compile_setup_time_sec * 1000.0
             ),
             "process_model": "in_process",
-            **self.block.benchmark_metadata(),
+            "npu_dispatch_count": 3,
+            "npu_unique_instruction_binary_count": len(unique_insts),
+            "npu_unique_xclbin_count": len(unique_xclbins),
         }
 
     def forward(
@@ -258,7 +268,9 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
             ],
         )
         self._weights = weights
-        self.block.assign_weights(weights)
+        self.block.block.weight_up_proj = weights["ffn_up_weight"].contiguous()
+        self.block.block.weight_down_proj = weights["ffn_down_weight"].contiguous()
+        self.block.block.ln2_weight = weights["ln2_weight"].contiguous()
 
     def prepare_benchmark_inputs(self, layer_inputs: TransformerLayerInputs) -> None:
         layer_inputs.validate(self.spec)
@@ -283,7 +295,7 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
             self.prepare_benchmark_inputs(layer_inputs)
         self._prepare_runtime()
         start = time.perf_counter()
-        output = self.block(
+        output = self.block.forward(
             self._cached_attention_output,
             self._cached_residual,
         )
@@ -298,7 +310,9 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
                 else self.compile_setup_time_sec * 1000.0
             ),
             "process_model": "in_process",
-            **self.block.benchmark_metadata(),
+            "npu_dispatch_count": len(self.block.block.runlist),
+            "npu_unique_instruction_binary_count": 1,
+            "npu_unique_xclbin_count": 1,
         }
 
     def forward(
