@@ -15,17 +15,7 @@ from iron.operators.qkv_proj.op import AIEQKVProj
 
 from .input_bundle import TransformerLayerInputs
 from .layer_spec import TransformerLayerSpec
-from .utils import require_keys
-
-
-def _select_mha_out_proj_emb_tile(hidden_size: int) -> int:
-    if hidden_size % 128 == 0:
-        return 128
-    if hidden_size % 96 == 0:
-        return 96
-    raise ValueError(
-        "dataflow thesis pattern currently requires hidden_size divisible by 128 or 96 for Block 2 output tiling"
-    )
+from .utils import require_keys, select_mha_out_proj_emb_tile
 
 
 class DataflowPattern(nn.Module):
@@ -43,7 +33,7 @@ class DataflowPattern(nn.Module):
             )
         if spec.attention_head_size != 64:
             raise ValueError("dataflow thesis pattern currently supports head_dim=64")
-        mha_emb_tile = _select_mha_out_proj_emb_tile(spec.hidden_size)
+        mha_emb_tile = select_mha_out_proj_emb_tile(spec.hidden_size)
         self.spec = spec
         self.context = AIEContext(use_runlist=True)
         self._runtime_ready = False

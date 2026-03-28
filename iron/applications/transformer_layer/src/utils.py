@@ -79,3 +79,50 @@ def require_keys(
     missing = [key for key in required_keys if key not in weights]
     if missing:
         raise KeyError(f"Missing required weight keys: {', '.join(missing)}")
+
+
+def select_mha_out_proj_emb_tile(hidden_size: int) -> int:
+    if hidden_size % 128 == 0:
+        return 128
+    if hidden_size % 96 == 0:
+        return 96
+    raise ValueError(
+        "Block 2 currently requires hidden_size divisible by 128 or 96 for output-projection tiling"
+    )
+
+
+def host_project_qkv_head_major(
+    hidden_states: torch.Tensor,
+    weights: Mapping[str, torch.Tensor],
+    spec: TransformerLayerSpec,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q = torch.matmul(hidden_states, weights["q_proj_weight"].T.contiguous())
+    k = torch.matmul(hidden_states, weights["k_proj_weight"].T.contiguous())
+    v = torch.matmul(hidden_states, weights["v_proj_weight"].T.contiguous())
+    return (
+        q.view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
+        .permute(1, 0, 2)
+        .contiguous(),
+        k.view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
+        .permute(1, 0, 2)
+        .contiguous(),
+        v.view(spec.seq_len, spec.num_attention_heads, spec.attention_head_size)
+        .permute(1, 0, 2)
+        .contiguous(),
+    )
+
+
+def host_attention_output(
+    hidden_states: torch.Tensor,
+    weights: Mapping[str, torch.Tensor],
+    spec: TransformerLayerSpec,
+) -> torch.Tensor:
+    q, k, v = host_project_qkv_head_major(hidden_states, weights, spec)
+    attn_scores = torch.matmul(q, k.transpose(-1, -2))
+    attn_scores = attn_scores * (spec.attention_head_size**-0.5)
+    attn_probs = torch.softmax(attn_scores.to(torch.float32), dim=-1).to(q.dtype)
+    attn_context = torch.matmul(attn_probs, v)
+    attn_context = (
+        attn_context.transpose(0, 1).contiguous().view(spec.seq_len, spec.hidden_size)
+    )
+    return torch.matmul(attn_context, weights["out_proj_weight"].T.contiguous())

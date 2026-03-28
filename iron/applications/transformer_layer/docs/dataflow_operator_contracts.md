@@ -34,6 +34,8 @@ implementations.
   operator methods
 - thesis-specific weight binding and benchmark metadata should stay in the
   pattern layer, not as extra helper methods on the operator class
+- shared host-side benchmark-preparation helpers for the Dataflow thesis app
+  should live in `src/utils.py`, not duplicated across pattern modules
 
 ## Block 1
 
