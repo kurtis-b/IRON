@@ -147,7 +147,26 @@ void matmul_PV(bfloat16 *Q,
     }
 #endif
 
-#if DEBUG == 0 || DEBUG == 1
+#if DEBUG == 0 && IS_CAUSAL
+    using Vec8bf16 = aie::vector<bfloat16, 8>;
+    if (first_iter != 0) {
+        for (int32_t l = 0; l < 8; l++) {
+            Vec8bf16 scale_row = aie::load_v<8>(scale_buffer + 3 * B_q + l * 8);
+
+            for (int32_t k = 0; k < 8; k++) {
+                bfloat16 scale_val = scale_row[k];
+                Vec8bf16 scale_vec = aie::broadcast<bfloat16, 8>(scale_val);
+
+                for (int32_t j = 0; j < 8; j++) {
+                    Vec8bf16 o_vec =
+                        aie::load_v<8>(out + j * 64 + k * 8 + l * 512);
+                    o_vec = aie::mul(o_vec, scale_vec);
+                    aie::store_v(out + j * 64 + k * 8 + l * 512, o_vec);
+                }
+            }
+        }
+    }
+#elif DEBUG == 0 || DEBUG == 1
     if (first_iter != 0) {
         scale_O_tile_rows(out, scale_buffer, 3 * B_q, B_q);
     }
@@ -168,7 +187,23 @@ void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_bu
         aie::store_v(scale_buffer + 2 * B_q + i, l_vec);
     }
 
-#if DEBUG == 0 || DEBUG == 1
+#if DEBUG == 0 && IS_CAUSAL
+    using Vec8bf16 = aie::vector<bfloat16, 8>;
+    for (int32_t l = 0; l < 8; l++) {
+        Vec8bf16 scale_row = aie::load_v<8>(scale_buffer + 2 * B_q + l * 8);
+
+        for (int32_t k = 0; k < 8; k++) {
+            bfloat16 scale_val = scale_row[k];
+            Vec8bf16 scale_vec = aie::broadcast<bfloat16, 8>(scale_val);
+
+            for (int32_t j = 0; j < 8; j++) {
+                Vec8bf16 o_vec = aie::load_v<8>(O + j * 64 + k * 8 + l * 512);
+                o_vec = aie::mul(o_vec, scale_vec);
+                aie::store_v(O + j * 64 + k * 8 + l * 512, o_vec);
+            }
+        }
+    }
+#elif DEBUG == 0 || DEBUG == 1
     scale_O_tile_rows(O, scale_buffer, 2 * B_q, B_q);
 #else
     copy_O_tile_rows(O, B_q);
