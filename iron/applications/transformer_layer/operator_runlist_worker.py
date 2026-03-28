@@ -28,7 +28,7 @@ from iron.applications.transformer_layer.measurement_log import (
     MeasurementAuditLogger,
     capture_timed_call,
 )
-from iron.applications.transformer_layer.npu_inference import (
+from iron.applications.transformer_layer.src.bench.npu_inference import (
     INFERENCE_END_POINT,
     INFERENCE_START_POINT,
     _average_stage_timings_ms,

@@ -27,6 +27,11 @@ from .gpu_inference import (
     benchmark_gpu_layer,
     resolve_amd_gpu_device,
 )
+from .npu_inference import (
+    SUPPORTED_EXECUTION_MODES,
+    benchmark_pattern,
+    build_pattern,
+)
 from .measurement_log import (
     MeasurementAuditLogger,
     capture_timed_call,
@@ -59,6 +64,9 @@ __all__ = [
     "SUPPORTED_POWER_BACKENDS",
     "resolve_amd_gpu_device",
     "benchmark_gpu_layer",
+    "SUPPORTED_EXECUTION_MODES",
+    "build_pattern",
+    "benchmark_pattern",
     "utc_now_iso_precise",
     "default_measurement_log_path",
     "capture_timed_call",

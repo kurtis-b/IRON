@@ -61,7 +61,7 @@ The app library code is being incrementally grouped under:
 - `src/core`: shared data structures and reference logic
 - `src/patterns`: end-to-end and block pattern implementations
 - `src/bench`: shared benchmark-support modules
-  including measurement audit, GPU power, and reusable GPU inference helpers
+  including measurement audit, GPU/NPU power, and reusable GPU/NPU inference helpers
 - `src/analysis`: reusable roofline and reporting-support modules
   including bottleneck summarization helpers
   and best-NPU-vs-iGPU compare helpers
