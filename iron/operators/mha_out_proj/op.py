@@ -40,6 +40,15 @@ def _canonicalize_head_major_qkv(
     raise AIEOperatorConstraintError("AIEMHAOutProj: incompatible tensor shape(s)")
 
 
+def _flatten_head_major_qkv(
+    tensor: torch.Tensor,
+    *,
+    seq_len: int,
+    embed_sz: int,
+) -> np.ndarray:
+    return torch_to_numpy(tensor.permute(1, 0, 2).contiguous().view(seq_len, embed_sz))
+
+
 def _pack_qkv_head_major(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -48,9 +57,9 @@ def _pack_qkv_head_major(
     seq_len: int,
     embed_sz: int,
 ) -> np.ndarray:
-    q_np = torch_to_numpy(q.permute(1, 0, 2).contiguous().view(seq_len, embed_sz))
-    k_np = torch_to_numpy(k.permute(1, 0, 2).contiguous().view(seq_len, embed_sz))
-    v_np = torch_to_numpy(v.permute(1, 0, 2).contiguous().view(seq_len, embed_sz))
+    q_np = _flatten_head_major_qkv(q, seq_len=seq_len, embed_sz=embed_sz)
+    k_np = _flatten_head_major_qkv(k, seq_len=seq_len, embed_sz=embed_sz)
+    v_np = _flatten_head_major_qkv(v, seq_len=seq_len, embed_sz=embed_sz)
     return np.concatenate((q_np, k_np, v_np), axis=0)
 
 
@@ -275,14 +284,22 @@ class AIEMHAOutProj(AIEOperatorBase):
             static_data=static_w_o_proj,
         )
         self.add_buffer(
-            "QKV",
-            3 * self.embed_sz * self.seq_len,
+            "Q",
+            self.embed_sz * self.seq_len,
+        )
+        self.add_buffer(
+            "K",
+            self.embed_sz * self.seq_len,
+        )
+        self.add_buffer(
+            "V",
+            self.embed_sz * self.seq_len,
         )
         self.add_buffer(
             "O",
             self.embed_sz * self.seq_len,
         )
-        self.add_to_runlist("mha", "W_O", "QKV", "O")
+        self.add_to_runlist("mha", "W_O", "Q", "K", "V", "O")
 
     # TODO: Update forward and execute functions
     def forward(
@@ -340,16 +357,26 @@ class AIEMHAOutProj(AIEOperatorBase):
         v: torch.Tensor,
         w_o: torch.Tensor = None,
     ):
-        qkv_np = _pack_qkv_head_major(
+        q_np = _flatten_head_major_qkv(
             q,
+            seq_len=self.seq_len,
+            embed_sz=self.embed_sz,
+        )
+        k_np = _flatten_head_major_qkv(
             k,
+            seq_len=self.seq_len,
+            embed_sz=self.embed_sz,
+        )
+        v_np = _flatten_head_major_qkv(
             v,
             seq_len=self.seq_len,
             embed_sz=self.embed_sz,
         )
 
         # Write padded buffers
-        self.write_buffer("QKV", qkv_np)
+        self.write_buffer("Q", q_np)
+        self.write_buffer("K", k_np)
+        self.write_buffer("V", v_np)
         if w_o is not None:
             w_o_np = torch_to_numpy(w_o)
             self.write_buffer("W_O", w_o_np)

@@ -28,8 +28,8 @@ def generate_golden_reference(
             - 1: Self attention (QK^T, softmax, AV)
             - 2: MHA output projection
     Returns:
-        dict: Contains 'W_O' (output projection weights), 'QKV' (stacked query/key/value),
-              and 'O' (output)
+        dict: Contains 'W_O' (output projection weights), 'Q', 'K', 'V' inputs,
+              'QKV' (legacy stacked query/key/value), and 'O' (output)
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -109,6 +109,9 @@ def generate_golden_reference(
 
     return {
         "W_O": out_proj_weights,
+        "Q": Q,
+        "K": K,
+        "V": V,
         "QKV": QKV,
         "O": O,
     }
