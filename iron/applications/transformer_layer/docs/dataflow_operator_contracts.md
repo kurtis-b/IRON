@@ -106,7 +106,8 @@ That design file should expose three distinct topology views:
   benchmark manifests
 - a broader theoretical topology enumerator that explores every combination
   allowed by the Block 1 contract, fused GEMM tiling, array-column count,
-  matmul-kernel divisibility, compute-tile local-memory limits, and
+  matmul-kernel divisibility, the current batched-GEMM double-buffered
+  compute-tile local-memory limits, and
   thesis-facing parallel axes for a given workload
 - a heuristic-pruned practical exploration surface that favors higher lane and
   column parallelism, larger reusable tiles, larger sequence/output chunks, and

@@ -150,6 +150,20 @@ def test_theoretical_block1_topologies_include_nondefault_valid_variants():
     assert "m64_k64_n16_c8_ps2_ph1_pd1" in topology_ids
 
 
+def test_theoretical_block1_topologies_exclude_nonrunnable_l1_overflows():
+    topology_ids = {
+        str(topology["topology_id"])
+        for topology in qkv_proj_theoretical_topologies(
+            seq_len=512,
+            hidden_size=768,
+            num_heads=12,
+        )
+    }
+
+    assert "m32_k384_n48_c8_ps1_ph1_pd1" not in topology_ids
+    assert "m32_k256_n64_c8_ps1_ph1_pd1" not in topology_ids
+
+
 def test_theoretical_block1_topologies_are_unique_and_contract_valid():
     topologies = qkv_proj_theoretical_topologies(
         seq_len=512,
@@ -233,3 +247,6 @@ def test_practical_block1_topologies_are_ranked_and_pruned():
         assert int(topology["tile_n"]) >= 16
         assert int(topology["num_aie_columns"]) >= 4
         assert topology["topology_family"] == "shared_runtime_qkv_proj_practical"
+
+    practical_ids = {str(topology["topology_id"]) for topology in practical}
+    assert "m32_k384_n48_c8_ps1_ph1_pd1" not in practical_ids

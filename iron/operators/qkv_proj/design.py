@@ -51,6 +51,8 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
 
 _BLOCK1_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
 _BLOCK1_AIE_DATA_MEM_SIZE_BYTES = 65536
+_BLOCK1_GEMM_L1_BUFFER_COPIES = 2
+_BLOCK1_GEMM_TILE_FIXED_OVERHEAD_BYTES = 3392
 _BLOCK1_PRACTICAL_MIN_TILE_M = 32
 _BLOCK1_PRACTICAL_MIN_TILE_K = 64
 _BLOCK1_PRACTICAL_MIN_TILE_N = 16
@@ -423,11 +425,14 @@ def _block1_compute_tile_working_set_fits(
     tile_k: int,
     tile_n: int,
 ) -> bool:
-    bf16_bytes = 2
-    a_l1_bytes = tile_m * tile_k * bf16_bytes
-    b_l1_bytes = tile_k * tile_n * bf16_bytes
-    c_l1_bytes = tile_m * tile_n * bf16_bytes
-    return a_l1_bytes + b_l1_bytes + c_l1_bytes <= _BLOCK1_AIE_DATA_MEM_SIZE_BYTES
+    return (
+        _block1_compute_tile_working_set_bytes(
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+        )
+        <= _BLOCK1_AIE_DATA_MEM_SIZE_BYTES
+    )
 
 
 def _block1_compute_tile_working_set_bytes(
@@ -437,10 +442,14 @@ def _block1_compute_tile_working_set_bytes(
     tile_n: int,
 ) -> int:
     bf16_bytes = 2
-    return (
+    payload_bytes = (
         tile_m * tile_k * bf16_bytes
         + tile_k * tile_n * bf16_bytes
         + tile_m * tile_n * bf16_bytes
+    )
+    return (
+        _BLOCK1_GEMM_L1_BUFFER_COPIES * payload_bytes
+        + _BLOCK1_GEMM_TILE_FIXED_OVERHEAD_BYTES
     )
 
 
