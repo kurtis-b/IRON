@@ -20,7 +20,7 @@ from iron.common import (
     XclbinArtifact,
 )
 from iron.common.utils import numpy_to_torch, torch_to_numpy
-from iron.operators.qkv_proj.design import qkv_proj_design
+from iron.operators.qkv_proj.topology import qkv_proj_design
 
 
 class _ProjectionWeightView:

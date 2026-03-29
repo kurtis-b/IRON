@@ -10,7 +10,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from iron.operators.qkv_proj.design import (
+from iron.operators.qkv_proj.topology import (
     _block1_compute_tile_working_set_fits,
     _block1_practical_topologies,
     _block1_practical_sort_key,

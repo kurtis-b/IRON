@@ -13,7 +13,7 @@ from iron.operators.mha_out_proj.design import (
     mha_out_proj_practical_topologies,
     mha_out_proj_topologies,
 )
-from iron.operators.qkv_proj.design import (
+from iron.operators.qkv_proj.topology import (
     qkv_proj_practical_topologies,
     qkv_proj_topologies,
 )
