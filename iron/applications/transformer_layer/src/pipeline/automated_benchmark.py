@@ -200,6 +200,8 @@ def _decorate_row_for_case(
     normalized["attention_head_size"] = spec.attention_head_size
     for key, value in requested_block_topology_metadata(spec).items():
         normalized.setdefault(key, value)
+    for key, value in _case_topology_exploration_metadata(case).items():
+        normalized.setdefault(key, value)
     normalized.setdefault("run_status", "completed")
     normalized.setdefault("failure_component", None)
     normalized.setdefault("failure_category", None)
@@ -244,6 +246,7 @@ def _failure_result_row(
         "block2_topology_id": spec.block2_topology_id,
         "block3_topology_id": spec.block3_topology_id,
         **requested_block_topology_metadata(spec),
+        **_case_topology_exploration_metadata(case),
         "batch_size": spec.batch_size,
         "dtype": spec.dtype,
         "use_bias": spec.use_bias,
@@ -279,6 +282,21 @@ def _failure_result_row(
         "failure_category": event["challenge"],
         "failure_message": event["symptom"],
     }
+
+
+def _case_topology_exploration_metadata(case: dict[str, object]) -> dict[str, object]:
+    metadata = {}
+    for key in (
+        "exploration_block1_topology_id",
+        "exploration_block1_topology_family",
+        "exploration_block2_topology_id",
+        "exploration_block2_topology_family",
+        "exploration_block3_topology_id",
+        "exploration_block3_topology_family",
+    ):
+        if key in case:
+            metadata[key] = case[key]
+    return metadata
 
 
 def _load_csv_rows(path: str | Path) -> list[dict[str, object]]:

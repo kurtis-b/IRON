@@ -181,11 +181,26 @@ def test_load_study_manifest_expands_practical_topology_exploration(tmp_path: Pa
     assert len(manifest["study_cases"]) == 4
     assert manifest["study_cases"][0]["case_id"] == "practical_000"
     assert manifest["study_cases"][0]["layer_spec"]["seq_len"] == 64
+    saw_distinct_exploration_provenance = False
     for case in manifest["study_cases"]:
+        assert case["exploration_block1_topology_id"] is not None
+        assert case["exploration_block2_topology_id"] is not None
+        assert case["exploration_block3_topology_id"] is not None
         assert case["layer_spec"]["block1_topology_id"] is not None
         assert case["layer_spec"]["block2_topology_id"] is not None
         assert case["layer_spec"]["block3_topology_id"] is not None
         assert not str(case["layer_spec"]["block3_topology_id"]).startswith("cr")
+        assert str(case["exploration_block3_topology_id"]).startswith("cr")
+        if (
+            case["exploration_block1_topology_id"]
+            != case["layer_spec"]["block1_topology_id"]
+            or case["exploration_block2_topology_id"]
+            != case["layer_spec"]["block2_topology_id"]
+            or case["exploration_block3_topology_id"]
+            != case["layer_spec"]["block3_topology_id"]
+        ):
+            saw_distinct_exploration_provenance = True
+    assert saw_distinct_exploration_provenance
 
 
 def test_load_study_manifest_rejects_multiseq_topology_exploration(tmp_path: Path):
@@ -330,7 +345,16 @@ def test_decorate_row_for_case_backfills_requested_block_topology_metadata():
             "avg_latency_ms": 10.0,
         },
         study_id="study",
-        case={"case_id": "case", "case_label": "case"},
+        case={
+            "case_id": "case",
+            "case_label": "case",
+            "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+            "exploration_block1_topology_family": "shared_runtime_qkv_proj_practical",
+            "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
+            "exploration_block2_topology_family": "fused_mha_out_proj_practical",
+            "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+            "exploration_block3_topology_family": "pipelined_addnorm_ffn_addnorm_practical",
+        },
         spec=spec,
     )
 
@@ -340,6 +364,9 @@ def test_decorate_row_for_case_backfills_requested_block_topology_metadata():
     assert row["block2_topology_family"] == "fused_mha_out_proj"
     assert row["block3_topology_id"] == spec.block3_topology_id
     assert row["block3_topology_family"] == "pipelined_addnorm_ffn_addnorm"
+    assert row["exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_ph1_pd4"
+    assert row["exploration_block2_topology_id"] == "q32_kv64_e96_ps1_ph6_acc1"
+    assert row["exploration_block3_topology_id"] == "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1"
 
 
 def test_failure_result_row_includes_requested_block_topology_metadata():
@@ -352,7 +379,13 @@ def test_failure_result_row_includes_requested_block_topology_metadata():
 
     row = structured_failure_result_row(
         study_id="study",
-        case={"case_id": "case", "case_label": "case"},
+        case={
+            "case_id": "case",
+            "case_label": "case",
+            "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+            "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
+            "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+        },
         spec=spec,
         execution_mode="dataflow",
         warmup_runs=0,
@@ -366,6 +399,9 @@ def test_failure_result_row_includes_requested_block_topology_metadata():
     assert row["block2_topology_family"] == "fused_mha_out_proj"
     assert row["block3_topology_id"] == spec.block3_topology_id
     assert row["block3_topology_family"] == "pipelined_addnorm_ffn_addnorm"
+    assert row["exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_ph1_pd4"
+    assert row["exploration_block2_topology_id"] == "q32_kv64_e96_ps1_ph6_acc1"
+    assert row["exploration_block3_topology_id"] == "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1"
 
 
 def test_run_parity_checks_forwards_requested_block_topology_ids(

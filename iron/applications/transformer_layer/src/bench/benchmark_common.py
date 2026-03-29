@@ -134,6 +134,12 @@ def _expand_practical_topology_study_cases(
                 f"b2={combo['block2_runtime_topology_id'] or combo['block2_topology_id']}|"
                 f"b3={combo['block3_runtime_topology_id'] or combo['block3_topology_id']}"
             ),
+            "exploration_block1_topology_id": combo["block1_topology_id"],
+            "exploration_block1_topology_family": combo["block1_topology_family"],
+            "exploration_block2_topology_id": combo["block2_topology_id"],
+            "exploration_block2_topology_family": combo["block2_topology_family"],
+            "exploration_block3_topology_id": combo["block3_topology_id"],
+            "exploration_block3_topology_family": combo["block3_topology_family"],
             "layer_spec": {
                 **base_spec.to_dict(),
                 "block1_topology_id": (
