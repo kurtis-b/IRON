@@ -90,7 +90,7 @@ to DDR.
 Block 1 currently resolves its retained thesis topologies through the single
 design entrypoint in
 [`iron/operators/qkv_proj/design.py`](/home/cj/iron/iron/operators/qkv_proj/design.py)
-and translates them into the shared-runtime GEMM wrapper used by
+and lowers them through the local fused Block 1 design used by
 [`iron/operators/qkv_proj/op.py`](/home/cj/iron/iron/operators/qkv_proj/op.py).
 The retained `v2` implementation parallelizes the three independent Q/K/V
 projections as one wider GEMM and then reshapes the combined output back to

@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 
+from iron.operators.gemm.design_batched import my_matmul as _batched_gemm_design
+
 _BLOCK1_TOPOLOGIES = {
     (12, 64): [
         {
@@ -114,8 +116,8 @@ def qkv_proj_design(
 
     if parallel_seq not in (1, 2, 4, 6, 8):
         raise ValueError("Block 1 requires parallel_seq in {1, 2, 4, 6, 8}")
-    if seq_len % tile_m != 0:
-        raise ValueError("Block 1 requires seq_len divisible by tile_m")
+    if seq_len % (parallel_seq * tile_m) != 0:
+        raise ValueError("Block 1 requires seq_len divisible by parallel_seq * tile_m")
     if hidden_size % tile_k != 0:
         raise ValueError("Block 1 requires hidden_size divisible by tile_k")
     if hidden_size % tile_n != 0:
@@ -132,6 +134,49 @@ def qkv_proj_design(
         "topology_id": str(config["topology_id"]),
         "topology_family": str(config["topology_family"]),
     }
+
+
+def fused_qkv_proj(
+    *,
+    dev: str,
+    seq_len: int,
+    hidden_size: int,
+    combined_hidden_size: int,
+    tile_m: int,
+    tile_k: int,
+    tile_n: int,
+    num_aie_columns: int,
+    dtype_in_str: str,
+    dtype_out_str: str,
+    use_scalar: bool,
+    emulate_bf16_mmul_with_bfp16: bool,
+    prio_accuracy: bool,
+    trace_size: int,
+    archive: str | None = None,
+):
+    return _batched_gemm_design(
+        dev,
+        seq_len,
+        hidden_size,
+        combined_hidden_size,
+        tile_m,
+        tile_k,
+        tile_n,
+        num_aie_columns,
+        dtype_in_str,
+        dtype_out_str,
+        0,
+        0,
+        use_scalar,
+        emulate_bf16_mmul_with_bfp16,
+        prio_accuracy,
+        trace_size,
+        archive,
+        False,
+        (1, 0),
+        (1, 0),
+        (1, 0),
+    )
 
 
 def _topology_id(config: dict[str, int]) -> str:
