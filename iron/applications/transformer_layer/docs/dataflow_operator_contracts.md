@@ -159,12 +159,16 @@ The retained `v2` surface is currently pinned to `parallel_seq=1`,
 `q_seq_tile=32`, and `kv_seq_tile=64`, with `emb_tile` selected per retained
 workload family, `parallel_heads=1`, and `o_proj_acc_depth=1` for the checked-in
 runtime-supported study surface.
-That design file should expose two distinct topology views:
+That design file should expose three distinct topology views:
 - the narrow retained runtime-supported topology list used by operator tests and
   benchmark manifests
 - a broader theoretical topology enumerator that explores every combination
   allowed by the Block 2 contract, microkernel divisibility, lane-count limit,
   and per-stage local working-set limits for a given workload
+- a heuristic-pruned practical exploration surface that favors higher sequence
+  and head parallelism, larger Q/KV/output tiles, larger sequence and output
+  chunks, and fuller per-stage local-memory utilization while still retaining
+  the baseline runtime-supported study topologies
 The checked-in study manifests should continue to pin the baseline retained
 topology IDs for reproducibility even as that broader theoretical exploration
 surface grows.

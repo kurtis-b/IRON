@@ -85,6 +85,12 @@ _BLOCK2_TOPOLOGIES = {
 
 _BLOCK2_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
 _BLOCK2_AIE_DATA_MEM_SIZE_BYTES = 65536
+_BLOCK2_PRACTICAL_MIN_Q_SEQ_TILE = 32
+_BLOCK2_PRACTICAL_MIN_KV_SEQ_TILE = 64
+_BLOCK2_PRACTICAL_MIN_EMB_TILE = 64
+_BLOCK2_PRACTICAL_MIN_LANE_PARALLELISM = 2
+_BLOCK2_PRACTICAL_MIN_SEQUENCE_CHUNK = 64
+_BLOCK2_PRACTICAL_MAX_CANDIDATES = 64
 
 
 def mha_out_proj_topologies(
@@ -177,6 +183,79 @@ def mha_out_proj_theoretical_topologies(
     return topologies
 
 
+def mha_out_proj_practical_topologies(
+    *,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    max_candidates: int = _BLOCK2_PRACTICAL_MAX_CANDIDATES,
+) -> list[dict[str, int | str]]:
+    if max_candidates <= 0:
+        raise ValueError("Block 2 practical exploration requires max_candidates > 0")
+
+    theoretical = mha_out_proj_theoretical_topologies(
+        seq_len=seq_len,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+    retained_runtime_ids = {
+        _mha_out_proj_topology_id(
+            {
+                "parallel_seq": int(candidate["parallel_seq"]),
+                "q_seq_tile": int(candidate["q_seq_tile"]),
+                "kv_seq_tile": int(candidate["kv_seq_tile"]),
+                "emb_tile": int(candidate["emb_tile"]),
+                "parallel_heads": int(candidate["parallel_heads"]),
+                "o_proj_acc_depth": int(candidate["o_proj_acc_depth"]),
+            }
+        )
+        for candidate in mha_out_proj_topologies(
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+    }
+
+    ranked = sorted(
+        theoretical,
+        key=lambda candidate: _block2_practical_sort_key(candidate, head_dim=head_dim),
+        reverse=True,
+    )
+
+    selected: list[dict[str, int | str]] = []
+    selected_ids: set[str] = set()
+
+    def add_candidate(candidate: dict[str, int | str]) -> None:
+        selected.append(
+            {
+                **candidate,
+                "topology_family": "fused_mha_out_proj_practical",
+            }
+        )
+        selected_ids.add(str(candidate["topology_id"]))
+
+    for candidate in ranked:
+        topology_id = str(candidate["topology_id"])
+        if topology_id not in retained_runtime_ids:
+            continue
+        add_candidate(candidate)
+
+    for candidate in ranked:
+        topology_id = str(candidate["topology_id"])
+        if topology_id in selected_ids:
+            continue
+        if not _is_block2_practical_candidate(candidate):
+            continue
+        add_candidate(candidate)
+        if len(selected) >= max_candidates:
+            break
+
+    return sorted(
+        selected,
+        key=lambda candidate: _block2_practical_sort_key(candidate, head_dim=head_dim),
+        reverse=True,
+    )
+
+
 def mha_out_proj_design(
     *,
     seq_len: int,
@@ -261,6 +340,24 @@ def _block2_stage_working_sets_fit(
     emb_tile: int,
     head_dim: int,
 ) -> bool:
+    return (
+        _block2_stage_working_set_bytes(
+            q_seq_tile=q_seq_tile,
+            kv_seq_tile=kv_seq_tile,
+            emb_tile=emb_tile,
+            head_dim=head_dim,
+        )
+        <= _BLOCK2_AIE_DATA_MEM_SIZE_BYTES
+    )
+
+
+def _block2_stage_working_set_bytes(
+    *,
+    q_seq_tile: int,
+    kv_seq_tile: int,
+    emb_tile: int,
+    head_dim: int,
+) -> int:
     bf16_bytes = 2
 
     q_bytes = q_seq_tile * head_dim * bf16_bytes
@@ -277,7 +374,59 @@ def _block2_stage_working_sets_fit(
         qk_bytes + v_bytes + q_bytes + scale_bytes,
         q_bytes + wo_bytes + (2 * o_bytes),
     )
-    return max(stage_working_sets) <= _BLOCK2_AIE_DATA_MEM_SIZE_BYTES
+    return max(stage_working_sets)
+
+
+def _is_block2_practical_candidate(candidate: dict[str, int | str]) -> bool:
+    parallel_seq = int(candidate["parallel_seq"])
+    parallel_heads = int(candidate["parallel_heads"])
+    q_seq_tile = int(candidate["q_seq_tile"])
+    kv_seq_tile = int(candidate["kv_seq_tile"])
+    emb_tile = int(candidate["emb_tile"])
+
+    lane_parallelism = parallel_seq * parallel_heads
+    sequence_chunk = parallel_seq * q_seq_tile
+    return (
+        q_seq_tile >= _BLOCK2_PRACTICAL_MIN_Q_SEQ_TILE
+        and kv_seq_tile >= _BLOCK2_PRACTICAL_MIN_KV_SEQ_TILE
+        and emb_tile >= _BLOCK2_PRACTICAL_MIN_EMB_TILE
+        and lane_parallelism >= _BLOCK2_PRACTICAL_MIN_LANE_PARALLELISM
+        and sequence_chunk >= _BLOCK2_PRACTICAL_MIN_SEQUENCE_CHUNK
+    )
+
+
+def _block2_practical_sort_key(
+    candidate: dict[str, int | str],
+    *,
+    head_dim: int = 64,
+) -> tuple[int, ...]:
+    parallel_seq = int(candidate["parallel_seq"])
+    parallel_heads = int(candidate["parallel_heads"])
+    q_seq_tile = int(candidate["q_seq_tile"])
+    kv_seq_tile = int(candidate["kv_seq_tile"])
+    emb_tile = int(candidate["emb_tile"])
+    o_proj_acc_depth = int(candidate["o_proj_acc_depth"])
+
+    lane_parallelism = parallel_seq * parallel_heads
+    sequence_chunk = parallel_seq * q_seq_tile
+    output_chunk = emb_tile * o_proj_acc_depth
+    working_set = _block2_stage_working_set_bytes(
+        q_seq_tile=q_seq_tile,
+        kv_seq_tile=kv_seq_tile,
+        emb_tile=emb_tile,
+        head_dim=head_dim,
+    )
+
+    return (
+        lane_parallelism,
+        kv_seq_tile,
+        sequence_chunk,
+        emb_tile,
+        output_chunk,
+        -o_proj_acc_depth,
+        working_set,
+        q_seq_tile,
+    )
 
 
 def main():

@@ -11,6 +11,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from iron.operators.mha_out_proj.design import (
+    _block2_practical_sort_key,
+    mha_out_proj_practical_topologies,
     mha_out_proj_theoretical_topologies,
     mha_out_proj_topologies,
 )
@@ -179,3 +181,63 @@ def test_theoretical_block2_topologies_are_unique_and_contract_valid():
         assert 16 % parallel_heads == 0
         assert parallel_seq * parallel_heads <= 8
         assert 1024 % (emb_tile * o_proj_acc_depth) == 0
+
+
+def test_practical_block2_topologies_are_subset_of_theoretical_surface():
+    practical = mha_out_proj_practical_topologies(
+        seq_len=2048,
+        num_heads=16,
+        head_dim=64,
+    )
+    theoretical_ids = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_theoretical_topologies(
+            seq_len=2048,
+            num_heads=16,
+            head_dim=64,
+        )
+    }
+    practical_ids = [str(topology["topology_id"]) for topology in practical]
+
+    assert practical
+    assert len(practical) <= 64
+    assert len(practical) < len(theoretical_ids)
+    assert set(practical_ids) <= theoretical_ids
+
+
+def test_practical_block2_topologies_include_retained_runtime_surface():
+    practical_ids = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_practical_topologies(
+            seq_len=2048,
+            num_heads=16,
+            head_dim=64,
+        )
+    }
+    assert "q32_kv64_e128_ps1_ph1_acc1" in practical_ids
+
+
+def test_practical_block2_topologies_are_ranked_and_pruned():
+    practical = mha_out_proj_practical_topologies(
+        seq_len=2048,
+        num_heads=16,
+        head_dim=64,
+    )
+
+    assert practical == sorted(
+        practical,
+        key=lambda candidate: _block2_practical_sort_key(candidate, head_dim=64),
+        reverse=True,
+    )
+    for topology in practical:
+        lane_parallelism = int(topology["parallel_seq"]) * int(
+            topology["parallel_heads"]
+        )
+        sequence_chunk = int(topology["parallel_seq"]) * int(topology["q_seq_tile"])
+        if str(topology["topology_id"]) != "q32_kv64_e128_ps1_ph1_acc1":
+            assert int(topology["q_seq_tile"]) >= 32
+            assert int(topology["kv_seq_tile"]) >= 64
+            assert int(topology["emb_tile"]) >= 64
+            assert lane_parallelism >= 2
+            assert sequence_chunk >= 64
+        assert topology["topology_family"] == "fused_mha_out_proj_practical"
