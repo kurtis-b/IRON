@@ -6,6 +6,7 @@ import sys
 import logging
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -17,7 +18,11 @@ from iron.operators.mha_out_proj.topology import (
     mha_out_proj_theoretical_topologies,
     mha_out_proj_topologies,
 )
-from iron.operators.mha_out_proj.op import AIEMHAOutProj
+from iron.operators.mha_out_proj.op import (
+    AIEMHAOutProj,
+    _pack_block3_residual_output,
+    _unpack_block3_attention_output,
+)
 from iron.operators.mha_out_proj.reference import generate_golden_reference
 from iron.common.test_utils import run_test
 
@@ -153,6 +158,45 @@ def test_theoretical_block2_topologies_cover_supported_surface():
             )
         }
         assert supported_ids <= theoretical_ids
+
+
+def test_packed_block3_output_layout_reserves_a_half_and_places_residual_half():
+    seq_len = 64
+    embed_sz = 768
+    q_seq_tile = 32
+    emb_tile = 96
+    parallel_seq = 4
+    packed_rows = 128
+
+    residual = np.arange(seq_len * embed_sz, dtype=np.float32).reshape(
+        seq_len, embed_sz
+    )
+    packed = _pack_block3_residual_output(
+        residual,
+        seq_len=seq_len,
+        packed_rows=packed_rows,
+        embed_sz=embed_sz,
+        q_seq_tile=q_seq_tile,
+        emb_tile=emb_tile,
+        parallel_seq=parallel_seq,
+    )
+    unpacked = _unpack_block3_attention_output(
+        packed,
+        seq_len=seq_len,
+        packed_rows=packed_rows,
+        embed_sz=embed_sz,
+        q_seq_tile=q_seq_tile,
+        emb_tile=emb_tile,
+        parallel_seq=parallel_seq,
+    )
+
+    assert packed.shape == (2 * packed_rows * embed_sz,)
+    assert np.count_nonzero(unpacked) == 0
+    tile_elems = q_seq_tile * emb_tile
+    first_tile_residual = packed[tile_elems : 2 * tile_elems].reshape(
+        q_seq_tile, emb_tile
+    )
+    assert np.array_equal(first_tile_residual, residual[:q_seq_tile, :emb_tile])
 
 
 def test_supported_block2_topologies_include_promoted_runtime_variants():

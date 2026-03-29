@@ -64,6 +64,8 @@ def main():
     argparser.add_argument("--emb-tile", type=int, default=96)
     argparser.add_argument("--o-proj-acc-depth", type=int, default=1)
     argparser.add_argument("--parallel-heads", type=int, default=1)
+    argparser.add_argument("--packed-output-parallel-seq", type=int, default=None)
+    argparser.add_argument("--packed-output-rows", type=int, default=None)
     argparser.add_argument("--emulate-bf16-mmul-with-bfp16", type=bool, default=True)
     argparser.add_argument("--trace_size", type=int, default=0)
     argparser.add_argument("--kernel-archive", type=str, default="mha_kernels.a")
@@ -86,6 +88,8 @@ def main():
         emb_tile=args.emb_tile,
         o_proj_acc_depth=args.o_proj_acc_depth,
         parallel_heads=args.parallel_heads,
+        packed_output_parallel_seq=args.packed_output_parallel_seq,
+        packed_output_rows=args.packed_output_rows,
         emulate_bf16_mmul_with_bfp16=args.emulate_bf16_mmul_with_bfp16,
         kernel_archive=args.kernel_archive,
         trace_size=args.trace_size,
@@ -111,6 +115,8 @@ def fused_mha(
     emb_tile: int,
     o_proj_acc_depth: int,
     parallel_heads: int,
+    packed_output_parallel_seq: int | None,
+    packed_output_rows: int | None,
     emulate_bf16_mmul_with_bfp16: bool,
     kernel_archive: str,
     trace_size: int = 0,
@@ -190,10 +196,16 @@ def fused_mha(
         (seq_len, embed_sz),
         np.dtype[dtype],
     ]
-    O_ty = np.ndarray[
-        (seq_len, embed_sz),
-        np.dtype[dtype],
-    ]
+    if packed_output_parallel_seq is None:
+        O_ty = np.ndarray[
+            (seq_len, embed_sz),
+            np.dtype[dtype],
+        ]
+    else:
+        O_ty = np.ndarray[
+            (2 * packed_output_rows * embed_sz,),
+            np.dtype[dtype],
+        ]
 
     # Tensors living on the AIE-array
     q_ty = np.ndarray[(q_seq_tile, d), np.dtype[dtype]]
@@ -864,11 +876,49 @@ def fused_mha(
             tile._strides[3],
         ]
 
-    O_tiles = TensorTiler2D.group_tiler(
-        (seq_len, embed_sz),
-        (q_seq_tile, emb_tile),
-        (1, embed_sz // emb_tile // num_o_col_groups),
-    )
+    if packed_output_parallel_seq is None:
+        O_tiles = TensorTiler2D.group_tiler(
+            (seq_len, embed_sz),
+            (q_seq_tile, emb_tile),
+            (1, embed_sz // emb_tile // num_o_col_groups),
+        )
+    else:
+        if o_proj_acc_depth != 1:
+            raise ValueError(
+                "packed Block 3 handoff currently requires o_proj_acc_depth == 1"
+            )
+        if packed_output_rows is None:
+            raise ValueError("packed Block 3 handoff requires packed_output_rows")
+        if packed_output_rows < seq_len or packed_output_rows % q_seq_tile != 0:
+            raise ValueError(
+                "packed Block 3 handoff requires packed_output_rows to be "
+                "q_seq_tile-aligned and cover seq_len"
+            )
+        num_packed_q_seq_blocks = packed_output_rows // q_seq_tile
+        if num_packed_q_seq_blocks % packed_output_parallel_seq != 0:
+            raise ValueError(
+                "packed Block 3 handoff requires "
+                "(packed_output_rows / q_seq_tile) divisible by "
+                "packed_output_parallel_seq"
+            )
+        row_iters_per_a_tile = num_packed_q_seq_blocks // packed_output_parallel_seq
+        packed_tile_elems = 2 * q_seq_tile * emb_tile
+        O_tiles = []
+        for q_block_idx in range(num_q_seq_blocks):
+            a_tile = q_block_idx % packed_output_parallel_seq
+            row_iter = q_block_idx // packed_output_parallel_seq
+            for col_group in range(num_o_col_groups):
+                tile_index = (
+                    a_tile * row_iters_per_a_tile + row_iter
+                ) * num_o_col_groups + col_group
+                O_tiles.append(
+                    TensorAccessPattern(
+                        (2 * packed_output_rows * embed_sz,),
+                        offset=tile_index * packed_tile_elems,
+                        sizes=[1, 1, q_seq_tile, emb_tile],
+                        strides=[0, 0, emb_tile, 1],
+                    )
+                )
 
     def print_tap_seq_info(tap_seq, name):
         for idx, tap in enumerate(tap_seq):
