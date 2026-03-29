@@ -37,6 +37,12 @@ def test_bottleneck_analysis_restructure_preserves_legacy_imports_and_behavior(
                 "hidden_size",
                 "intermediate_size",
                 "num_attention_heads",
+                "block1_topology_id",
+                "block1_topology_family",
+                "block2_topology_id",
+                "block2_topology_family",
+                "block3_topology_id",
+                "block3_topology_family",
                 "avg_latency_ms",
                 "avg_block1_qkv_proj_latency_ms",
                 "avg_block2_mha_out_proj_latency_ms",
@@ -58,6 +64,12 @@ def test_bottleneck_analysis_restructure_preserves_legacy_imports_and_behavior(
                 "hidden_size": "768",
                 "intermediate_size": "3072",
                 "num_attention_heads": "12",
+                "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "block1_topology_family": "shared_runtime_qkv_proj",
+                "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+                "block2_topology_family": "fused_mha_out_proj",
+                "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
+                "block3_topology_family": "pipelined_addnorm_ffn_addnorm",
                 "avg_latency_ms": "10.0",
                 "avg_block1_qkv_proj_latency_ms": "3.0",
                 "avg_block2_mha_out_proj_latency_ms": "5.0",
@@ -72,5 +84,10 @@ def test_bottleneck_analysis_restructure_preserves_legacy_imports_and_behavior(
     summary_rows, aggregates, text_summary = analyze_results(input_csv)
     assert len(summary_rows) == 1
     assert summary_rows[0]["dominant_component"] == "block2_mha_out_proj"
+    assert summary_rows[0]["block2_topology_id"] == "q32_kv64_e96_ps1_ph1_acc1"
     assert "baseline_768:dataflow" in aggregates
+    assert aggregates["baseline_768:dataflow"]["block2_topology_ids"] == [
+        "q32_kv64_e96_ps1_ph1_acc1"
+    ]
     assert "block2_mha_out_proj dominates" in text_summary
+    assert "block2=q32_kv64_e96_ps1_ph1_acc1" in text_summary

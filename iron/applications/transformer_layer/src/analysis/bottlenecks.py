@@ -30,6 +30,12 @@ SUMMARY_FIELD_ORDER = [
     "hidden_size",
     "intermediate_size",
     "num_attention_heads",
+    "block1_topology_id",
+    "block1_topology_family",
+    "block2_topology_id",
+    "block2_topology_family",
+    "block3_topology_id",
+    "block3_topology_family",
     "avg_latency_ms",
     "dominant_component",
     "dominant_component_latency_ms",
@@ -54,6 +60,12 @@ def _optional_int(value: object) -> int | None:
     if value in (None, "", "None"):
         return None
     return int(float(value))
+
+
+def _nonempty_str(value: object) -> str | None:
+    if value in (None, "", "None"):
+        return None
+    return str(value)
 
 
 def _load_result_rows(input_csv: str | Path) -> list[dict[str, object]]:
@@ -129,6 +141,12 @@ def build_row_summary(row: dict[str, object]) -> dict[str, object]:
         "hidden_size": _optional_int(row.get("hidden_size")),
         "intermediate_size": _optional_int(row.get("intermediate_size")),
         "num_attention_heads": _optional_int(row.get("num_attention_heads")),
+        "block1_topology_id": row.get("block1_topology_id"),
+        "block1_topology_family": row.get("block1_topology_family"),
+        "block2_topology_id": row.get("block2_topology_id"),
+        "block2_topology_family": row.get("block2_topology_family"),
+        "block3_topology_id": row.get("block3_topology_id"),
+        "block3_topology_family": row.get("block3_topology_family"),
         "avg_latency_ms": total_latency_ms,
         "dominant_component": dominant_component,
         "dominant_component_latency_ms": dominant_latency_ms,
@@ -212,6 +230,33 @@ def build_execution_mode_summary(
                     if row.get("process_model") not in (None, "", "None")
                 }
             ),
+            "block1_topology_ids": sorted(
+                {
+                    topology_id
+                    for topology_id in (
+                        _nonempty_str(row.get("block1_topology_id")) for row in rows
+                    )
+                    if topology_id is not None
+                }
+            ),
+            "block2_topology_ids": sorted(
+                {
+                    topology_id
+                    for topology_id in (
+                        _nonempty_str(row.get("block2_topology_id")) for row in rows
+                    )
+                    if topology_id is not None
+                }
+            ),
+            "block3_topology_ids": sorted(
+                {
+                    topology_id
+                    for topology_id in (
+                        _nonempty_str(row.get("block3_topology_id")) for row in rows
+                    )
+                    if topology_id is not None
+                }
+            ),
         }
     return output
 
@@ -248,6 +293,14 @@ def render_execution_mode_summaries(
             if avg_fraction is not None
             else ""
         )
+        topology_parts = []
+        for block_key in ("block1", "block2", "block3"):
+            topology_ids = aggregate.get(f"{block_key}_topology_ids") or []
+            if topology_ids:
+                topology_parts.append(f"{block_key}={','.join(topology_ids)}")
+        topology_text = (
+            f"; topologies={' '.join(topology_parts)}" if topology_parts else ""
+        )
         seq_lens = ",".join(str(seq_len) for seq_len in aggregate["seq_lens"])
         example_row = rows_by_mode[mode_key][0]
         prefix = str(aggregate.get("execution_mode"))
@@ -256,7 +309,7 @@ def render_execution_mode_summaries(
             prefix = f"{case_label}:{prefix}"
         lines.append(
             f"{prefix}: {dominant_text}{fraction_text}; seq_lens={seq_lens}; "
-            f"example={example_row['bottleneck_summary']}"
+            f"example={example_row['bottleneck_summary']}{topology_text}"
         )
     return "\n".join(lines) + ("\n" if lines else "")
 
