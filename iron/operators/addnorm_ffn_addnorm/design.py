@@ -420,6 +420,12 @@ def fused_addnorm_ffn_addnorm(
         len(AR_ln2_l3l2_fifos),
         len(AR_ln2_l2l1_fifos),
     )
+    dims_to_stream_ar = [
+        ((2 * m) // r, r * k),
+        (k // s, s),
+        (r, k),
+        (s, 1),
+    ]
 
     # FFN streams
     # The same data may be sent through different shim tiles depending on the num aie cols available and num b tiles to distribute to reduce routing distance
@@ -476,6 +482,7 @@ def fused_addnorm_ffn_addnorm(
             .forward(
                 obj_type=AR_l1_ty,
                 name=f"AR_ln1_L2L1_{a_tile}",
+                dims_to_stream=dims_to_stream_ar,
                 placement=(
                     Tile(0, 1) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 1)
                 ),
@@ -492,6 +499,7 @@ def fused_addnorm_ffn_addnorm(
             .forward(
                 obj_type=AR_l1_ty,
                 name=f"AR_ln2_L2L1_{a_tile}",
+                dims_to_stream=dims_to_stream_ar,
                 placement=(
                     Tile(nB_tiles_distributed + 1, 1)
                     if nA_tiles_distributed < 3
@@ -874,6 +882,8 @@ def fused_addnorm_ffn_addnorm(
             packed_add_calc_sum_sumsq(elem_in_ar, ln1_sum_buf, ln1_sumsq_buf)
             in_ar.release(1)
 
+        zero_f32(ln2_sum_buf, m)
+        zero_f32(ln2_sumsq_buf, m)
         for col_idx in range_(K_div_k):
             elem_in_ar = in_ar.acquire(1)
             elem_in_down = in_down.acquire(1)
@@ -1145,70 +1155,72 @@ def fused_addnorm_ffn_addnorm(
 
                 packed_hidden_residual_shape = (2 * M * K,)
                 packed_tile_elems = 2 * m * k
-                for a_tile in range(nA_tiles_distributed):
-                    packed_tile_offset = (
-                        (a_tile * ln_iters_per_core + row_base)
-                        * K_div_k
-                        * packed_tile_elems
-                    )
-                    ln1_ar_tile = TensorAccessPattern(
-                        packed_hidden_residual_shape,
-                        offset=packed_tile_offset,
-                        sizes=[
-                            2 * nC_up_col_tiles_per_core,
-                            current_tb_n_rows * K_div_k,
-                            2 * m,
-                            k,
-                        ],
-                        strides=[0, packed_tile_elems, k, 1],
-                    )
-                    place = (
-                        Tile(0, 0) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 0)
-                    )
-                    ln1_ar_fill_taps = split_zero_stride_repeat_tap(
-                        ln1_ar_tile,
-                        packed_hidden_residual_shape,
-                        chunk_size=32,
-                    )
-                    for ln1_ar_fill_tap in ln1_ar_fill_taps:
+                for tile_row in range(current_tb_n_rows):
+                    row_tile_idx = row_base + tile_row
+                    for a_tile in range(nA_tiles_distributed):
+                        packed_tile_offset = (
+                            (a_tile * ln_iters_per_core + row_tile_idx)
+                            * K_div_k
+                            * packed_tile_elems
+                        )
+                        ln1_ar_tile = TensorAccessPattern(
+                            packed_hidden_residual_shape,
+                            offset=packed_tile_offset,
+                            sizes=[
+                                2 * nC_up_col_tiles_per_core,
+                                K_div_k,
+                                2 * m,
+                                k,
+                            ],
+                            strides=[0, packed_tile_elems, k, 1],
+                        )
+                        place = (
+                            Tile(0, 0)
+                            if nA_tiles_distributed < 3
+                            else Tile(a_tile * 2, 0)
+                        )
+                        ln1_ar_fill_taps = split_zero_stride_repeat_tap(
+                            ln1_ar_tile,
+                            packed_hidden_residual_shape,
+                            chunk_size=32,
+                        )
+                        for ln1_ar_fill_tap in ln1_ar_fill_taps:
+                            rt.fill(
+                                AR_ln1_l3l2_fifos[a_tile].prod(),
+                                packed_hidden_residual,
+                                tap=ln1_ar_fill_tap,
+                                wait=len(ln1_ar_fill_taps) > 1,
+                                task_group=tg,
+                                placement=place,
+                            )
+                            AR_taps.append(ln1_ar_fill_tap)
+                        logging.debug(
+                            f"    Placed LN1 packed AR input {a_tile} transfer at {place} with offset {ln1_ar_tile.offset}, sizes {[tap.sizes for tap in ln1_ar_fill_taps]}, strides {ln1_ar_tile.strides}"
+                        )
+
+                        ln2_ar_tile = TensorAccessPattern(
+                            packed_hidden_residual_shape,
+                            offset=packed_tile_offset,
+                            sizes=[3, K_div_k, 2 * m, k],
+                            strides=[0, packed_tile_elems, k, 1],
+                        )
+                        place = (
+                            Tile(nB_tiles_distributed + 1, 0)
+                            if nA_tiles_distributed < 3
+                            else Tile(a_tile * 2 + 1, 0)
+                        )
                         rt.fill(
-                            AR_ln1_l3l2_fifos[a_tile].prod(),
+                            AR_ln2_l3l2_fifos[a_tile].prod(),
                             packed_hidden_residual,
-                            tap=ln1_ar_fill_tap,
-                            wait=len(ln1_ar_fill_taps) > 1,
+                            tap=ln2_ar_tile,
                             task_group=tg,
                             placement=place,
                         )
-                        AR_taps.append(ln1_ar_fill_tap)
-                    logging.debug(
-                        f"    Placed LN1 packed AR input {a_tile} transfer at {place} with offset {ln1_ar_tile.offset}, sizes {[tap.sizes for tap in ln1_ar_fill_taps]}, strides {ln1_ar_tile.strides}"
-                    )
+                        AR_taps.append(ln2_ar_tile)
+                        logging.debug(
+                            f"    Placed LN2 packed AR input {a_tile} transfer at {place} with offset {ln2_ar_tile.offset}, sizes {ln2_ar_tile.sizes}, strides {ln2_ar_tile.strides}"
+                        )
 
-                    ln2_ar_tile = TensorAccessPattern(
-                        packed_hidden_residual_shape,
-                        offset=packed_tile_offset,
-                        sizes=[3, current_tb_n_rows * K_div_k, 2 * m, k],
-                        strides=[0, packed_tile_elems, k, 1],
-                    )
-                    place = (
-                        Tile(nB_tiles_distributed + 1, 0)
-                        if nA_tiles_distributed < 3
-                        else Tile(a_tile * 2 + 1, 0)
-                    )
-                    rt.fill(
-                        AR_ln2_l3l2_fifos[a_tile].prod(),
-                        packed_hidden_residual,
-                        tap=ln2_ar_tile,
-                        task_group=tg,
-                        placement=place,
-                    )
-                    AR_taps.append(ln2_ar_tile)
-                    logging.debug(
-                        f"    Placed LN2 packed AR input {a_tile} transfer at {place} with offset {ln2_ar_tile.offset}, sizes {ln2_ar_tile.sizes}, strides {ln2_ar_tile.strides}"
-                    )
-
-                    for tile_row in range(current_tb_n_rows):
-                        row_tile_idx = row_base + tile_row
                         c_offset = (
                             (row_tile_idx * nA_tiles_distributed + a_tile) * m * K
                         )
