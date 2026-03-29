@@ -340,6 +340,18 @@ def _run_parity_checks(
                     "--output-csv",
                     str(output_csv),
                 ]
+                if base_spec.block1_topology_id is not None:
+                    command.extend(
+                        ["--block1-topology-id", base_spec.block1_topology_id]
+                    )
+                if base_spec.block2_topology_id is not None:
+                    command.extend(
+                        ["--block2-topology-id", base_spec.block2_topology_id]
+                    )
+                if base_spec.block3_topology_id is not None:
+                    command.extend(
+                        ["--block3-topology-id", base_spec.block3_topology_id]
+                    )
                 subprocess.run(command, check=True)
                 mode_rows = _load_csv_rows(output_csv)
                 for row in mode_rows:

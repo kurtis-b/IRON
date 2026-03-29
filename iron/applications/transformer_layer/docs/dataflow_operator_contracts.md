@@ -201,6 +201,9 @@ At the study/app layer, retained topology selection should remain optional.
 `block3_topology_id` overrides so manifests and study cases can pin retained
 topologies explicitly; when omitted, each block should resolve its default
 retained topology through its local design entrypoint.
+When parity validation is enabled, the same requested topology overrides should
+be forwarded into the parity path so correctness checks exercise the same
+retained topology selection as the benchmark rows.
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`

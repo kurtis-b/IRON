@@ -3,6 +3,8 @@
 
 from pathlib import Path
 import csv
+import subprocess
+from types import SimpleNamespace
 
 from iron.applications.transformer_layer.automated_benchmark import (
     _record_parity_results,
@@ -29,6 +31,9 @@ from iron.applications.transformer_layer.src.pipeline.automated_benchmark import
 )
 from iron.applications.transformer_layer.src.pipeline.automated_benchmark import (
     _failure_result_row as structured_failure_result_row,
+)
+from iron.applications.transformer_layer.src.pipeline.automated_benchmark import (
+    _run_parity_checks as structured_run_parity_checks,
 )
 from iron.applications.transformer_layer.src.pipeline import (
     _record_parity_results as structured_record_parity_results,
@@ -160,3 +165,62 @@ def test_failure_result_row_includes_requested_block_topology_ids():
     assert row["block1_topology_id"] == spec.block1_topology_id
     assert row["block2_topology_id"] == spec.block2_topology_id
     assert row["block3_topology_id"] == spec.block3_topology_id
+
+
+def test_run_parity_checks_forwards_requested_block_topology_ids(
+    tmp_path: Path, monkeypatch
+):
+    captured = {}
+
+    def fake_run(command, check):
+        captured["command"] = list(command)
+        output_csv = Path(command[command.index("--output-csv") + 1])
+        output_csv.write_text(
+            "execution_mode,seq_len,max_abs_diff,mean_abs_diff\n"
+            "dataflow,64,0.0,0.0\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    rows = structured_run_parity_checks(
+        parity={"seq_lens": [64], "execution_modes": ["dataflow"]},
+        cases=[
+            {
+                "case_id": "case",
+                "case_label": "case",
+                "layer_spec": {
+                    "hidden_size": 768,
+                    "intermediate_size": 3072,
+                    "num_attention_heads": 12,
+                    "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                    "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+                    "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
+                },
+            }
+        ],
+        execution_modes=["dataflow"],
+        seq_lens=[64],
+        benchmark_rows=[
+            {
+                "study_case_id": "case",
+                "execution_mode": "dataflow",
+                "seq_len": 64,
+                "run_status": "completed",
+            }
+        ],
+        seed=0,
+        study_id="study",
+        args=SimpleNamespace(
+            hidden_size=None,
+            intermediate_size=None,
+            num_attention_heads=None,
+        ),
+    )
+
+    command = captured["command"]
+    assert "--block1-topology-id" in command
+    assert "--block2-topology-id" in command
+    assert "--block3-topology-id" in command
+    assert rows[0]["study_case_id"] == "case"
