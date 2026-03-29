@@ -134,6 +134,7 @@ def test_theoretical_block3_topologies_include_nondefault_valid_variants():
         )
     }
     assert "cr128_m32_k96_n64_c8_ps2_pi6_d8_g1" in topology_ids
+    assert "cr128_m32_k96_n64_c8_ps2_pi6_d8_g0" in topology_ids
     assert "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1" in topology_ids
     assert "cr128_m32_k192_n64_c8_ps4_pi3_d4_g1" in topology_ids
     assert "cr128_m32_k96_n128_c8_ps2_pi6_d8_g1" in topology_ids
@@ -215,6 +216,16 @@ def test_practical_block3_topologies_include_retained_runtime_surface():
     }
     assert (128, 32, 96, 64, 8, 8, 2, 6, 1) in practical_signatures
     assert (128, 32, 96, 64, 8, 8, 4, 3, 1) in practical_signatures
+
+
+def test_practical_block3_topologies_keep_validated_gelu_stage():
+    practical = addnorm_ffn_addnorm_practical_topologies(
+        seq_len=512,
+        hidden_size=768,
+        intermediate_size=3072,
+    )
+    assert practical
+    assert {int(topology["gelu_stage"]) for topology in practical} == {1}
 
 
 def test_practical_block3_topologies_are_ranked_and_pruned():

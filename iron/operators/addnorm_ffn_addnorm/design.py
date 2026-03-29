@@ -428,6 +428,7 @@ def _is_block3_practical_candidate(
     num_aie_columns = int(candidate["num_aie_columns"])
     parallel_seq = int(candidate["parallel_seq"])
     parallel_int_dim = int(candidate["parallel_int_dim"])
+    gelu_stage = int(candidate["gelu_stage"])
 
     lane_parallelism = parallel_seq * parallel_int_dim
     return (
@@ -438,6 +439,7 @@ def _is_block3_practical_candidate(
         and tile_n >= _BLOCK3_PRACTICAL_MIN_TILE_N
         and num_aie_columns >= _BLOCK3_PRACTICAL_MIN_AIE_COLUMNS
         and lane_parallelism >= _BLOCK3_PRACTICAL_MIN_LANE_PARALLELISM
+        and gelu_stage == 1
     )
 
 

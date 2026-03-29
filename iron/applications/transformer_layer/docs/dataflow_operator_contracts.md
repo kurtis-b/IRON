@@ -315,8 +315,11 @@ allowed because the imported runtime pads and chunks the final row block.
 The current retained Block 3 topology sweep widens only the lane-distribution
 axes already exercised by the imported `ffn_addnorm` design coverage, so the
 retained `768/3072` family now explores both `parallel_seq=2, parallel_int_dim=6`
-and `parallel_seq=4, parallel_int_dim=3` while keeping the proven tile sizes,
-depth, and GeLU staging fixed.
+and `parallel_seq=4, parallel_int_dim=3` while keeping the validated
+`gelu_stage=1` runtime path fixed; the broader theoretical surface still
+enumerates both GeLU staging placements, but the practical surface should stay
+on the currently validated staging until the imported `ffn_addnorm` runtime
+proves the alternate path.
 That design file should also expose three distinct topology views:
 - the narrow retained runtime-supported topology list used by operator tests and
   benchmark manifests
