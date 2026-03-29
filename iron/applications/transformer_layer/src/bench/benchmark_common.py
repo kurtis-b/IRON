@@ -7,6 +7,7 @@ import csv
 import json
 from pathlib import Path
 
+from ..core.layer_spec import TransformerLayerSpec
 from ..core.result_schema import RESULT_FIELD_ORDER, normalize_result_row
 
 
@@ -74,6 +75,10 @@ def resolve_study_path(manifest_path: str | Path, value: str | None) -> str | No
     if path.is_absolute():
         return str(path)
     return str((Path(manifest_path).resolve().parent / path).resolve())
+
+
+def _normalize_layer_spec_dict(payload: dict[str, object]) -> dict[str, object]:
+    return TransformerLayerSpec.from_dict(dict(payload)).to_dict()
 
 
 def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
@@ -164,6 +169,9 @@ def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
             if "layer_spec" not in raw_case:
                 raise KeyError("Each study_cases entry must include layer_spec")
             case = dict(raw_case)
+            if not isinstance(case["layer_spec"], dict):
+                raise TypeError("Each study_cases layer_spec must be an object")
+            case["layer_spec"] = _normalize_layer_spec_dict(case["layer_spec"])
             case.setdefault("case_id", f"case_{index}")
             case.setdefault("case_label", case["case_id"])
             if "execution_modes" in case and isinstance(case["execution_modes"], str):
@@ -172,5 +180,9 @@ def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
                 case["seq_lens"] = parse_seq_lens(case["seq_lens"])
             normalized_cases.append(case)
         manifest["study_cases"] = normalized_cases
+    else:
+        if not isinstance(manifest["layer_spec"], dict):
+            raise TypeError("layer_spec must be an object")
+        manifest["layer_spec"] = _normalize_layer_spec_dict(manifest["layer_spec"])
 
     return manifest

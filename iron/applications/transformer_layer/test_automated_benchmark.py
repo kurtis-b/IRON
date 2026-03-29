@@ -90,6 +90,63 @@ def test_checked_in_dataflow_manifests_pin_retained_block_topologies():
                 assert by_case_id[case_id][key] == value
 
 
+def test_load_study_manifest_normalizes_and_validates_layer_specs(tmp_path: Path):
+    manifest_path = tmp_path / "study.json"
+    manifest_path.write_text(
+        """
+        {
+          "study_id": "study",
+          "execution_modes": ["dataflow"],
+          "seq_lens": [64],
+          "layer_spec": {
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_attention_heads": 12,
+            "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1"
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    manifest = load_study_manifest(manifest_path)
+
+    assert manifest["layer_spec"]["seq_len"] == 128
+    assert manifest["layer_spec"]["batch_size"] == 1
+    assert manifest["layer_spec"]["block1_topology_id"] == "m64_k64_n16_ps1_ph1_pd1"
+
+
+def test_load_study_manifest_rejects_invalid_layer_specs(tmp_path: Path):
+    manifest_path = tmp_path / "study.json"
+    manifest_path.write_text(
+        """
+        {
+          "study_id": "study",
+          "execution_modes": ["dataflow"],
+          "seq_lens": [64],
+          "study_cases": [
+            {
+              "case_id": "invalid",
+              "layer_spec": {
+                "hidden_size": 769,
+                "intermediate_size": 3072,
+                "num_attention_heads": 12
+              }
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    try:
+        load_study_manifest(manifest_path)
+    except ValueError as exc:
+        assert "hidden_size must be divisible by num_attention_heads" in str(exc)
+    else:
+        raise AssertionError("Expected invalid study-case layer_spec to be rejected")
+
+
 def test_record_parity_results_skips_empty_rows(tmp_path: Path):
     debug_log_csv = tmp_path / "debug.csv"
     parity_output = tmp_path / "parity.csv"

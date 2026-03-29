@@ -114,6 +114,9 @@ Checked-in study manifests:
 The checked-in Dataflow study manifests pin the retained block topology IDs for
 the `768/3072/12` and `1024/4096/16` cases explicitly, so unattended studies do
 not depend on implicit topology defaults.
+Study manifests are normalized through `TransformerLayerSpec` during loading, so
+checked-in and ad hoc manifests are validated against the same retained layer
+surface before benchmarking begins.
 
 Retained benchmark surface:
 

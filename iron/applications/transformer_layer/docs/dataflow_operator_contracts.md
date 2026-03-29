@@ -215,6 +215,9 @@ The checked-in Dataflow study manifests should pin those retained topology IDs
 explicitly for the retained `768/3072/12` and `1024/4096/16` families so the
 benchmark surface remains reproducible even if default topology selection
 changes later.
+Study manifests should also be normalized through `TransformerLayerSpec` during
+loading so pinned topology IDs and the rest of the retained layer surface are
+validated before any benchmark or parity execution starts.
 When those requested topology IDs are present, benchmark rows, failure rows,
 and parity rows should also backfill the matching topology-family columns so
 the stable result schema remains informative even before runtime metadata is
