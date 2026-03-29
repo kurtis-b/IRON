@@ -37,11 +37,24 @@ def generate_test_params():
     ]
     params = []
     for seq_len, head_dim, num_heads in workloads:
-        for topology in mha_out_proj_topologies(
+        supported_ids = {
+            str(topology["topology_id"])
+            for topology in mha_out_proj_topologies(
+                num_heads=num_heads,
+                head_dim=head_dim,
+            )
+        }
+        for topology in mha_out_proj_practical_topologies(
+            seq_len=seq_len,
             num_heads=num_heads,
             head_dim=head_dim,
         ):
             topology_id = str(topology["topology_id"])
+            marks = ()
+            if topology_id not in supported_ids:
+                marks = pytest.mark.skip(
+                    reason="Block 2 practical topology is not runtime-supported yet"
+                )
             params.append(
                 pytest.param(
                     seq_len,
@@ -52,9 +65,9 @@ def generate_test_params():
                         f"mha_out_proj_{num_heads}heads_{seq_len}seq_{head_dim}hdim_"
                         f"{topology_id}"
                     ),
+                    marks=marks,
                 )
             )
-
     return params
 
 

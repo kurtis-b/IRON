@@ -19,6 +19,20 @@ from iron.operators.addnorm_ffn_addnorm.op import AIEAddNormFFNAddNorm
 from iron.operators.addnorm_ffn_addnorm.reference import generate_golden_reference
 
 
+def _block3_runtime_signature(topology: dict[str, int | str]) -> tuple[int, ...]:
+    return (
+        int(topology["compile_rows"]),
+        int(topology["tile_m"]),
+        int(topology["tile_k"]),
+        int(topology["tile_n"]),
+        int(topology["down_proj_depth"]),
+        int(topology["num_aie_columns"]),
+        int(topology["parallel_seq"]),
+        int(topology["parallel_int_dim"]),
+        int(topology["gelu_stage"]),
+    )
+
+
 def generate_test_params():
     workloads = [
         (64, 768, 3072),
@@ -28,18 +42,39 @@ def generate_test_params():
     ]
     params = []
     for seq_len, hidden_size, intermediate_size in workloads:
-        for topology in addnorm_ffn_addnorm_topologies(
+        supported_topologies = addnorm_ffn_addnorm_topologies(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        supported_ids_by_signature = {
+            _block3_runtime_signature(topology): str(topology["topology_id"])
+            for topology in supported_topologies
+        }
+        for topology in addnorm_ffn_addnorm_practical_topologies(
+            seq_len=seq_len,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
         ):
-            topology_id = str(topology["topology_id"])
+            practical_topology_id = str(topology["topology_id"])
+            topology_id = supported_ids_by_signature.get(
+                _block3_runtime_signature(topology)
+            )
+            marks = ()
+            if topology_id is None:
+                marks = pytest.mark.skip(
+                    reason="Block 3 practical topology is not runtime-supported yet"
+                )
             params.append(
                 pytest.param(
                     seq_len,
                     hidden_size,
                     intermediate_size,
                     topology_id,
-                    id=f"block3_{seq_len}x{hidden_size}x{intermediate_size}_{topology_id}",
+                    id=(
+                        f"block3_{seq_len}x{hidden_size}x{intermediate_size}_"
+                        f"{practical_topology_id}"
+                    ),
+                    marks=marks,
                 )
             )
     return params

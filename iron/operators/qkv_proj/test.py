@@ -31,7 +31,7 @@ def generate_test_params():
     ]
     params = []
     for seq_len, num_heads, head_dim in workloads:
-        for topology in _runtime_smoke_topologies(
+        for topology in _block1_practical_topologies(
             seq_len=seq_len,
             hidden_size=num_heads * head_dim,
             num_heads=num_heads,
@@ -47,43 +47,6 @@ def generate_test_params():
                 )
             )
     return params
-
-
-def _runtime_smoke_topologies(
-    *,
-    seq_len: int,
-    hidden_size: int,
-    num_heads: int,
-) -> list[dict[str, int | str]]:
-    topologies = qkv_proj_topologies(
-        seq_len=seq_len,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-    )
-    selected: list[dict[str, int | str]] = []
-    seen_ids: set[str] = set()
-    min_columns = min(int(topology["num_aie_columns"]) for topology in topologies)
-
-    def add_first(predicate) -> None:
-        for topology in topologies:
-            topology_id = str(topology["topology_id"])
-            if topology_id in seen_ids or not predicate(topology):
-                continue
-            selected.append(topology)
-            seen_ids.add(topology_id)
-            return
-
-    add_first(lambda _: True)
-    add_first(
-        lambda topology: int(topology["parallel_seq"]) > 1
-        or int(topology["parallel_heads"]) > 1
-        or int(topology["parallel_head_dim"]) > 1
-    )
-    add_first(lambda topology: int(topology["num_aie_columns"]) == min_columns)
-    add_first(
-        lambda topology: int(topology["tile_k"]) > 64 or int(topology["tile_n"]) > 16
-    )
-    return selected
 
 
 @pytest.mark.parametrize(
