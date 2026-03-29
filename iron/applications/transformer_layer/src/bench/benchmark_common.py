@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ..core.layer_spec import TransformerLayerSpec
 from ..core.result_schema import RESULT_FIELD_ORDER, normalize_result_row
+from ..core.topology_exploration import practical_layer_topology_combinations
 
 
 def parse_seq_lens(seq_lens: str) -> list[int]:
@@ -81,6 +82,68 @@ def _normalize_layer_spec_dict(payload: dict[str, object]) -> dict[str, object]:
     return TransformerLayerSpec.from_dict(dict(payload)).to_dict()
 
 
+def _normalize_topology_exploration_dict(
+    payload: dict[str, object],
+) -> dict[str, object]:
+    config = dict(payload)
+    surface = str(config.get("surface", "practical"))
+    if surface != "practical":
+        raise ValueError(
+            f"Unsupported topology_exploration surface: {surface!r}; only 'practical' is supported"
+        )
+
+    normalized: dict[str, object] = {"surface": surface}
+    for key in (
+        "max_block1_candidates",
+        "max_block2_candidates",
+        "max_block3_candidates",
+        "max_combinations",
+    ):
+        value = config.get(key)
+        if value is None:
+            continue
+        normalized_value = int(value)
+        if normalized_value <= 0:
+            raise ValueError(f"topology_exploration {key} must be > 0")
+        normalized[key] = normalized_value
+    return normalized
+
+
+def _expand_practical_topology_study_cases(
+    *,
+    layer_spec: dict[str, object],
+    topology_exploration: dict[str, object],
+    seq_len: int,
+) -> list[dict[str, object]]:
+    base_spec_payload = dict(layer_spec)
+    base_spec_payload["seq_len"] = seq_len
+    base_spec = TransformerLayerSpec.from_dict(base_spec_payload)
+    combinations = practical_layer_topology_combinations(
+        base_spec,
+        max_block1_candidates=topology_exploration.get("max_block1_candidates"),
+        max_block2_candidates=topology_exploration.get("max_block2_candidates"),
+        max_block3_candidates=topology_exploration.get("max_block3_candidates"),
+        max_combinations=topology_exploration.get("max_combinations"),
+    )
+    return [
+        {
+            "case_id": f"practical_{index:03d}",
+            "case_label": (
+                f"b1={combo['block1_topology_id']}|"
+                f"b2={combo['block2_topology_id']}|"
+                f"b3={combo['block3_topology_id']}"
+            ),
+            "layer_spec": {
+                **base_spec.to_dict(),
+                "block1_topology_id": combo["block1_topology_id"],
+                "block2_topology_id": combo["block2_topology_id"],
+                "block3_topology_id": combo["block3_topology_id"],
+            },
+        }
+        for index, combo in enumerate(combinations)
+    ]
+
+
 def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
     manifest_file = Path(manifest_path).resolve()
     manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
@@ -93,6 +156,11 @@ def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
     if has_layer_spec == has_study_cases:
         raise KeyError(
             "Study manifest must include exactly one of layer_spec or study_cases"
+        )
+    has_topology_exploration = "topology_exploration" in manifest
+    if has_topology_exploration and has_study_cases:
+        raise ValueError(
+            "Study manifest cannot combine topology_exploration with explicit study_cases"
         )
 
     manifest["manifest_path"] = str(manifest_file)
@@ -161,6 +229,14 @@ def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
             }
         manifest["sampling_schedule"] = normalized_schedule
 
+    topology_exploration = manifest.get("topology_exploration")
+    if topology_exploration is not None:
+        if not isinstance(topology_exploration, dict):
+            raise TypeError("topology_exploration must be an object")
+        manifest["topology_exploration"] = _normalize_topology_exploration_dict(
+            topology_exploration
+        )
+
     if has_study_cases:
         normalized_cases = []
         for index, raw_case in enumerate(manifest["study_cases"]):
@@ -184,5 +260,16 @@ def load_study_manifest(manifest_path: str | Path) -> dict[str, object]:
         if not isinstance(manifest["layer_spec"], dict):
             raise TypeError("layer_spec must be an object")
         manifest["layer_spec"] = _normalize_layer_spec_dict(manifest["layer_spec"])
+        if "topology_exploration" in manifest:
+            if len(manifest["seq_lens"]) != 1:
+                raise ValueError(
+                    "topology_exploration currently requires exactly one seq_len in the study manifest"
+                )
+            seq_len = int(manifest["seq_lens"][0])
+            manifest["study_cases"] = _expand_practical_topology_study_cases(
+                layer_spec=manifest["layer_spec"],
+                topology_exploration=manifest["topology_exploration"],
+                seq_len=seq_len,
+            )
 
     return manifest

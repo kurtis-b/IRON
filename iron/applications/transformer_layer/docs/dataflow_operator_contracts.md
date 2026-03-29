@@ -247,6 +247,10 @@ cross-products the three block-level practical surfaces into capped
 cross-block candidate combinations for future autotune/study generation,
 without pretending those broader practical IDs are already runnable through the
 retained runtime wrappers.
+Study manifests may optionally request that same practical surface through a
+`topology_exploration` object layered on top of a single base `layer_spec`, but
+that expansion should currently be limited to single-`seq_len` manifests so the
+generated combinations remain tied to one concrete workload geometry.
 For unattended study pipelines, `npu_study` step definitions should be allowed
 to carry the same `block1_topology_id`, `block2_topology_id`, and
 `block3_topology_id` overrides so pipeline-driven sweeps can pin retained

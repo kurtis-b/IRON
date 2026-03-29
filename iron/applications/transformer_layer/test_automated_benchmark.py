@@ -151,6 +151,72 @@ def test_load_study_manifest_rejects_invalid_layer_specs(tmp_path: Path):
         raise AssertionError("Expected invalid study-case layer_spec to be rejected")
 
 
+def test_load_study_manifest_expands_practical_topology_exploration(tmp_path: Path):
+    manifest_path = tmp_path / "study.json"
+    manifest_path.write_text(
+        """
+        {
+          "study_id": "study",
+          "execution_modes": ["dataflow"],
+          "seq_lens": [64],
+          "layer_spec": {
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_attention_heads": 12
+          },
+          "topology_exploration": {
+            "surface": "practical",
+            "max_block1_candidates": 2,
+            "max_block2_candidates": 1,
+            "max_block3_candidates": 2
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    manifest = load_study_manifest(manifest_path)
+
+    assert manifest["topology_exploration"]["surface"] == "practical"
+    assert len(manifest["study_cases"]) == 4
+    assert manifest["study_cases"][0]["case_id"] == "practical_000"
+    assert manifest["study_cases"][0]["layer_spec"]["seq_len"] == 64
+    for case in manifest["study_cases"]:
+        assert case["layer_spec"]["block1_topology_id"] is not None
+        assert case["layer_spec"]["block2_topology_id"] is not None
+        assert case["layer_spec"]["block3_topology_id"] is not None
+
+
+def test_load_study_manifest_rejects_multiseq_topology_exploration(tmp_path: Path):
+    manifest_path = tmp_path / "study.json"
+    manifest_path.write_text(
+        """
+        {
+          "study_id": "study",
+          "execution_modes": ["dataflow"],
+          "seq_lens": [64, 128],
+          "layer_spec": {
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_attention_heads": 12
+          },
+          "topology_exploration": {
+            "surface": "practical",
+            "max_block1_candidates": 2
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    try:
+        load_study_manifest(manifest_path)
+    except ValueError as exc:
+        assert "exactly one seq_len" in str(exc)
+    else:
+        raise AssertionError("Expected multiseq topology_exploration to be rejected")
+
+
 def test_record_parity_results_skips_empty_rows(tmp_path: Path):
     debug_log_csv = tmp_path / "debug.csv"
     parity_output = tmp_path / "parity.csv"
