@@ -24,6 +24,28 @@ from ..utils import (
 APP_DIR = Path(__file__).resolve().parents[2]
 REPO_ROOT = APP_DIR.parents[2]
 
+PARITY_FIELD_ORDER = [
+    "study_id",
+    "execution_mode",
+    "seq_len",
+    "hidden_size",
+    "intermediate_size",
+    "num_attention_heads",
+    "attention_head_size",
+    "block1_topology_id",
+    "block1_topology_family",
+    "block2_topology_id",
+    "block2_topology_family",
+    "block3_topology_id",
+    "block3_topology_family",
+    "batch_size",
+    "dtype",
+    "weights_source",
+    "seed",
+    "max_abs_diff",
+    "mean_abs_diff",
+]
+
 
 def error_stats(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float]:
     diff = (reference - candidate).abs().to(torch.float32)
@@ -152,6 +174,12 @@ def run_parity_suite(
     return rows
 
 
+def write_parity_rows_csv(
+    output_csv: str | Path, rows: list[dict[str, object]]
+) -> None:
+    write_dict_rows_csv(output_csv, rows, fieldnames=PARITY_FIELD_ORDER)
+
+
 def run_parity_cli(args) -> list[dict[str, object]]:
     rows = run_parity_suite(
         execution_modes=[args.execution_mode],
@@ -175,7 +203,7 @@ def run_parity_cli(args) -> list[dict[str, object]]:
             f"mean_abs_diff={row['mean_abs_diff']:.6f}"
         )
     if args.output_csv:
-        write_dict_rows_csv(args.output_csv, rows)
+        write_parity_rows_csv(args.output_csv, rows)
     return rows
 
 
@@ -183,5 +211,6 @@ __all__ = [
     "error_stats",
     "validate_pattern_parity",
     "run_parity_suite",
+    "write_parity_rows_csv",
     "run_parity_cli",
 ]

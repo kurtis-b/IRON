@@ -27,6 +27,7 @@ from ..bench import (
 from ..bench.npu_inference import benchmark_pattern
 from ..core.layer_spec import TransformerLayerSpec
 from ..utils import requested_block_topology_metadata
+from .validate_npu_parity import write_parity_rows_csv
 
 APP_DIR = Path(__file__).resolve().parents[2]
 
@@ -102,7 +103,7 @@ def _record_parity_results(
     parity_output = parity.get("output_csv")
     if parity_rows:
         if parity_output:
-            write_dict_rows_csv(parity_output, parity_rows)
+            write_parity_rows_csv(parity_output, parity_rows)
         append_debug_event(
             debug_log_csv,
             study_id=study_id,

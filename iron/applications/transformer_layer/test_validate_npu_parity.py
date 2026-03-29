@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+import csv
+from pathlib import Path
 from types import SimpleNamespace
 
 from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
@@ -10,6 +12,9 @@ from iron.applications.transformer_layer.src.pipeline import (
 )
 from iron.applications.transformer_layer.src.pipeline import (
     error_stats as structured_error_stats,
+)
+from iron.applications.transformer_layer.src.pipeline.validate_npu_parity import (
+    PARITY_FIELD_ORDER as structured_parity_field_order,
 )
 from iron.applications.transformer_layer.src.pipeline.validate_npu_parity import (
     run_parity_cli as structured_run_parity_cli,
@@ -145,3 +150,59 @@ def test_validate_pattern_parity_includes_requested_block_topology_families(
     assert row["block1_topology_family"] == "shared_runtime_qkv_proj"
     assert row["block2_topology_family"] == "fused_mha_out_proj"
     assert row["block3_topology_family"] == "pipelined_addnorm_ffn_addnorm"
+
+
+def test_run_parity_cli_writes_stable_topology_columns(tmp_path: Path, monkeypatch):
+    def fake_run_parity_suite(
+        *, execution_modes, seq_lens, base_spec, seed, study_id=None
+    ):
+        return [
+            {
+                "study_id": "study",
+                "execution_mode": "dataflow",
+                "seq_len": 64,
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_attention_heads": 12,
+                "attention_head_size": 64,
+                "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "block1_topology_family": "shared_runtime_qkv_proj",
+                "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+                "block2_topology_family": "fused_mha_out_proj",
+                "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
+                "block3_topology_family": "pipelined_addnorm_ffn_addnorm",
+                "batch_size": 1,
+                "dtype": "bfloat16",
+                "weights_source": "synthetic",
+                "seed": 7,
+                "max_abs_diff": 0.0,
+                "mean_abs_diff": 0.0,
+            }
+        ]
+
+    monkeypatch.setattr(
+        structured_validate_npu_parity_module,
+        "run_parity_suite",
+        fake_run_parity_suite,
+    )
+
+    output_csv = tmp_path / "parity.csv"
+    structured_run_parity_cli(
+        SimpleNamespace(
+            execution_mode="dataflow",
+            seq_lens="64",
+            hidden_size=768,
+            intermediate_size=3072,
+            num_attention_heads=12,
+            block1_topology_id="m64_k64_n16_ps1_ph1_pd1",
+            block2_topology_id="q32_kv64_e96_ps1_ph1_acc1",
+            block3_topology_id="m32_k96_n64_ps4_pi3_d8_g1",
+            seed=7,
+            output_csv=str(output_csv),
+        )
+    )
+
+    with output_csv.open(newline="", encoding="utf-8") as handle:
+        header = next(csv.reader(handle))
+
+    assert header == structured_parity_field_order
