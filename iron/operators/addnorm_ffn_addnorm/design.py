@@ -15,10 +15,21 @@ _BLOCK3_TOPOLOGIES = {
             "tile_n": 64,
             "down_proj_depth": 8,
             "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 6,
+            "gelu_stage": 1,
+        },
+        {
+            "compile_rows": 128,
+            "tile_m": 32,
+            "tile_k": 96,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
             "parallel_seq": 4,
             "parallel_int_dim": 3,
             "gelu_stage": 1,
-        }
+        },
     ],
     (1024, 4096): [
         {
