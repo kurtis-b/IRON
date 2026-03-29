@@ -132,7 +132,7 @@ def qkv_proj_topologies(
     ]
 
 
-def qkv_proj_theoretical_topologies(
+def _block1_theoretical_topologies(
     *,
     seq_len: int,
     hidden_size: int,
@@ -210,7 +210,7 @@ def qkv_proj_theoretical_topologies(
     return topologies
 
 
-def qkv_proj_practical_topologies(
+def _block1_practical_topologies(
     *,
     seq_len: int,
     hidden_size: int,
@@ -220,7 +220,7 @@ def qkv_proj_practical_topologies(
     if max_candidates <= 0:
         raise ValueError("Block 1 practical exploration requires max_candidates > 0")
 
-    theoretical = qkv_proj_theoretical_topologies(
+    theoretical = _block1_theoretical_topologies(
         seq_len=seq_len,
         hidden_size=hidden_size,
         num_heads=num_heads,
@@ -274,6 +274,21 @@ def qkv_proj_practical_topologies(
             break
 
     return sorted(selected, key=_block1_practical_sort_key, reverse=True)
+
+
+def qkv_proj_practical_topologies(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    num_heads: int,
+    max_candidates: int = _BLOCK1_PRACTICAL_MAX_CANDIDATES,
+) -> list[dict[str, int | str]]:
+    return _block1_practical_topologies(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        max_candidates=max_candidates,
+    )
 
 
 def main() -> None:
@@ -882,7 +897,7 @@ def _block1_runtime_supported_candidates(
             "parallel_heads": int(candidate["parallel_heads"]),
             "parallel_head_dim": int(candidate["parallel_head_dim"]),
         }
-        for candidate in qkv_proj_practical_topologies(
+        for candidate in _block1_practical_topologies(
             seq_len=seq_len,
             hidden_size=hidden_size,
             num_heads=num_heads,

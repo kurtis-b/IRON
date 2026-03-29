@@ -12,10 +12,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from iron.operators.qkv_proj.design import (
     _block1_compute_tile_working_set_fits,
+    _block1_practical_topologies,
     _block1_practical_sort_key,
+    _block1_theoretical_topologies,
     qkv_proj_design,
-    qkv_proj_practical_topologies,
-    qkv_proj_theoretical_topologies,
     qkv_proj_topologies,
 )
 from iron.operators.qkv_proj.op import AIEQKVProj
@@ -145,7 +145,7 @@ def test_theoretical_block1_topologies_cover_supported_surface():
         }
         theoretical_ids = {
             str(topology["topology_id"])
-            for topology in qkv_proj_theoretical_topologies(
+            for topology in _block1_theoretical_topologies(
                 seq_len=seq_len,
                 hidden_size=hidden_size,
                 num_heads=num_heads,
@@ -171,7 +171,7 @@ def test_runtime_block1_topologies_match_practical_surface():
         }
         practical_ids = {
             str(topology["topology_id"])
-            for topology in qkv_proj_practical_topologies(
+            for topology in _block1_practical_topologies(
                 seq_len=seq_len,
                 hidden_size=hidden_size,
                 num_heads=num_heads,
@@ -218,7 +218,7 @@ def test_block1_design_accepts_legacy_runtime_aliases():
 def test_theoretical_block1_topologies_include_nondefault_valid_variants():
     topology_ids = {
         str(topology["topology_id"])
-        for topology in qkv_proj_theoretical_topologies(
+        for topology in _block1_theoretical_topologies(
             seq_len=512,
             hidden_size=768,
             num_heads=12,
@@ -234,7 +234,7 @@ def test_theoretical_block1_topologies_include_nondefault_valid_variants():
 def test_theoretical_block1_topologies_exclude_nonrunnable_l1_overflows():
     topology_ids = {
         str(topology["topology_id"])
-        for topology in qkv_proj_theoretical_topologies(
+        for topology in _block1_theoretical_topologies(
             seq_len=512,
             hidden_size=768,
             num_heads=12,
@@ -246,7 +246,7 @@ def test_theoretical_block1_topologies_exclude_nonrunnable_l1_overflows():
 
 
 def test_theoretical_block1_topologies_are_unique_and_contract_valid():
-    topologies = qkv_proj_theoretical_topologies(
+    topologies = _block1_theoretical_topologies(
         seq_len=512,
         hidden_size=768,
         num_heads=12,
@@ -278,14 +278,14 @@ def test_theoretical_block1_topologies_are_unique_and_contract_valid():
 
 
 def test_practical_block1_topologies_are_subset_of_theoretical_surface():
-    practical = qkv_proj_practical_topologies(
+    practical = _block1_practical_topologies(
         seq_len=512,
         hidden_size=768,
         num_heads=12,
     )
     theoretical_ids = {
         str(topology["topology_id"])
-        for topology in qkv_proj_theoretical_topologies(
+        for topology in _block1_theoretical_topologies(
             seq_len=512,
             hidden_size=768,
             num_heads=12,
@@ -302,7 +302,7 @@ def test_practical_block1_topologies_are_subset_of_theoretical_surface():
 def test_practical_block1_topologies_include_retained_runtime_surface():
     practical_ids = {
         str(topology["topology_id"])
-        for topology in qkv_proj_practical_topologies(
+        for topology in _block1_practical_topologies(
             seq_len=512,
             hidden_size=768,
             num_heads=12,
@@ -315,7 +315,7 @@ def test_practical_block1_topologies_include_retained_runtime_surface():
 
 
 def test_practical_block1_topologies_are_ranked_and_pruned():
-    practical = qkv_proj_practical_topologies(
+    practical = _block1_practical_topologies(
         seq_len=512,
         hidden_size=768,
         num_heads=12,
