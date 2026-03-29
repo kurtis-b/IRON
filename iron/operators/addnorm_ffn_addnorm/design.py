@@ -6,24 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 
-from iron.operators.addnorm_ffn_addnorm.topology import (
-    addnorm_ffn_addnorm_design as _addnorm_ffn_addnorm_design,
-)
-
-
-def addnorm_ffn_addnorm_design(
-    *,
-    seq_len: int,
-    hidden_size: int,
-    intermediate_size: int,
-    topology_id: str | None = None,
-) -> dict[str, int | str]:
-    return _addnorm_ffn_addnorm_design(
-        seq_len=seq_len,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        topology_id=topology_id,
-    )
+from iron.operators.addnorm_ffn_addnorm.topology import addnorm_ffn_addnorm_design
+from iron.operators.ffn_addnorm.design import my_matmul as _ffn_addnorm_matmul
 
 
 def main() -> None:
@@ -46,6 +30,52 @@ def main() -> None:
             ),
             sort_keys=True,
         )
+    )
+
+
+def fused_addnorm_ffn_addnorm(
+    dev,
+    M,
+    K,
+    N,
+    m,
+    k,
+    n,
+    down_proj_depth,
+    n_aie_cols,
+    nA_tiles_distributed,
+    nB_tiles_distributed,
+    dtype_in_str,
+    dtype_out_str,
+    emulate_bf16_mmul_with_bfp16,
+    trace_size,
+    gelu_stage,
+    ln2_weight_file,
+    stage_only=None,
+    archive=None,
+    generate_taps=False,
+):
+    return _ffn_addnorm_matmul(
+        dev,
+        M,
+        K,
+        N,
+        m,
+        k,
+        n,
+        down_proj_depth,
+        n_aie_cols,
+        nA_tiles_distributed,
+        nB_tiles_distributed,
+        dtype_in_str,
+        dtype_out_str,
+        emulate_bf16_mmul_with_bfp16,
+        trace_size,
+        gelu_stage,
+        ln2_weight_file,
+        stage_only,
+        archive,
+        generate_taps,
     )
 
 

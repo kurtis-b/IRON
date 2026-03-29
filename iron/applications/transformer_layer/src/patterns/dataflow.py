@@ -152,13 +152,11 @@ class DataflowPattern(nn.Module):
         )
         maybe_add_artifact_path(unique_insts, self.block2.insts_artifact)
         maybe_add_artifact_path(unique_xclbins, self.block2.xclbin_artifact)
-        maybe_add_artifact_path(unique_insts, self.block3.block.insts_artifact)
-        maybe_add_artifact_path(unique_xclbins, self.block3.block.xclbin_artifact)
+        maybe_add_artifact_path(unique_insts, self.block3.insts_artifact)
+        maybe_add_artifact_path(unique_xclbins, self.block3.xclbin_artifact)
         return make_in_process_npu_metadata(
             compile_setup_time_sec=self.compile_setup_time_sec,
-            dispatch_count=1
-            + len(self.block2.runlist)
-            + len(self.block3.block.runlist),
+            dispatch_count=1 + len(self.block2.runlist) + len(self.block3.runlist),
             unique_instruction_binary_count=len(unique_insts),
             unique_xclbin_count=len(unique_xclbins),
             extra_fields={
