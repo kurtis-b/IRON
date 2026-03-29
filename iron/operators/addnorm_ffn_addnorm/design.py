@@ -222,6 +222,10 @@ def _addnorm_ffn_addnorm_practical_topologies_cached(
             intermediate_size=intermediate_size,
         )
     }
+    validated_runtime_signatures = _block3_validated_runtime_signatures(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
 
     ranked = sorted(theoretical, key=_block3_practical_sort_key, reverse=True)
 
@@ -246,7 +250,11 @@ def _addnorm_ffn_addnorm_practical_topologies_cached(
         topology_id = str(candidate["topology_id"])
         if topology_id in selected_ids:
             continue
-        if not _is_block3_practical_candidate(candidate, seq_len=seq_len):
+        if not _is_block3_practical_candidate(
+            candidate,
+            seq_len=seq_len,
+            validated_runtime_signatures=validated_runtime_signatures,
+        ):
             continue
         add_candidate(candidate)
         if len(selected) >= max_candidates:
@@ -420,6 +428,7 @@ def _is_block3_practical_candidate(
     candidate: dict[str, int | str],
     *,
     seq_len: int,
+    validated_runtime_signatures: set[tuple[int, ...]],
 ) -> bool:
     compile_rows = int(candidate["compile_rows"])
     tile_m = int(candidate["tile_m"])
@@ -428,9 +437,19 @@ def _is_block3_practical_candidate(
     num_aie_columns = int(candidate["num_aie_columns"])
     parallel_seq = int(candidate["parallel_seq"])
     parallel_int_dim = int(candidate["parallel_int_dim"])
+    down_proj_depth = int(candidate["down_proj_depth"])
     gelu_stage = int(candidate["gelu_stage"])
 
     lane_parallelism = parallel_seq * parallel_int_dim
+    runtime_signature = (
+        tile_k,
+        tile_n,
+        down_proj_depth,
+        num_aie_columns,
+        parallel_seq,
+        parallel_int_dim,
+        gelu_stage,
+    )
     return (
         compile_rows >= _BLOCK3_PRACTICAL_MIN_COMPILE_ROWS
         and compile_rows <= _block3_compile_row_limit(seq_len)
@@ -439,7 +458,7 @@ def _is_block3_practical_candidate(
         and tile_n >= _BLOCK3_PRACTICAL_MIN_TILE_N
         and num_aie_columns >= _BLOCK3_PRACTICAL_MIN_AIE_COLUMNS
         and lane_parallelism >= _BLOCK3_PRACTICAL_MIN_LANE_PARALLELISM
-        and gelu_stage == 1
+        and runtime_signature in validated_runtime_signatures
     )
 
 
@@ -468,6 +487,28 @@ def _block3_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ..
         -down_proj_depth,
         gelu_stage,
     )
+
+
+def _block3_validated_runtime_signatures(
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+) -> set[tuple[int, ...]]:
+    return {
+        (
+            int(candidate["tile_k"]),
+            int(candidate["tile_n"]),
+            int(candidate["down_proj_depth"]),
+            int(candidate["num_aie_columns"]),
+            int(candidate["parallel_seq"]),
+            int(candidate["parallel_int_dim"]),
+            int(candidate["gelu_stage"]),
+        )
+        for candidate in addnorm_ffn_addnorm_topologies(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+    }
 
 
 if __name__ == "__main__":

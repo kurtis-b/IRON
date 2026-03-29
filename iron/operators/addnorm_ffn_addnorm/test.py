@@ -228,6 +228,51 @@ def test_practical_block3_topologies_keep_validated_gelu_stage():
     assert {int(topology["gelu_stage"]) for topology in practical} == {1}
 
 
+def test_practical_block3_topologies_keep_validated_runtime_signature_families():
+    expected_768 = {
+        (96, 64, 8, 8, 2, 6, 1),
+        (96, 64, 8, 8, 4, 3, 1),
+    }
+    actual_768 = {
+        (
+            int(topology["tile_k"]),
+            int(topology["tile_n"]),
+            int(topology["down_proj_depth"]),
+            int(topology["num_aie_columns"]),
+            int(topology["parallel_seq"]),
+            int(topology["parallel_int_dim"]),
+            int(topology["gelu_stage"]),
+        )
+        for topology in addnorm_ffn_addnorm_practical_topologies(
+            seq_len=512,
+            hidden_size=768,
+            intermediate_size=3072,
+        )
+    }
+    expected_1024 = {
+        (128, 32, 8, 8, 4, 2, 1),
+    }
+    actual_1024 = {
+        (
+            int(topology["tile_k"]),
+            int(topology["tile_n"]),
+            int(topology["down_proj_depth"]),
+            int(topology["num_aie_columns"]),
+            int(topology["parallel_seq"]),
+            int(topology["parallel_int_dim"]),
+            int(topology["gelu_stage"]),
+        )
+        for topology in addnorm_ffn_addnorm_practical_topologies(
+            seq_len=512,
+            hidden_size=1024,
+            intermediate_size=4096,
+        )
+    }
+
+    assert actual_768 <= expected_768
+    assert actual_1024 <= expected_1024
+
+
 def test_practical_block3_topologies_are_ranked_and_pruned():
     practical = addnorm_ffn_addnorm_practical_topologies(
         seq_len=512,
