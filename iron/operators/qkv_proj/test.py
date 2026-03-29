@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from iron.operators.qkv_proj.design import (
     _block1_compute_tile_working_set_fits,
+    _block1_practical_sort_key,
+    qkv_proj_practical_topologies,
     qkv_proj_theoretical_topologies,
     qkv_proj_topologies,
 )
@@ -158,3 +160,56 @@ def test_theoretical_block1_topologies_are_unique_and_contract_valid():
             tile_k=tile_k,
             tile_n=tile_n,
         )
+
+
+def test_practical_block1_topologies_are_subset_of_theoretical_surface():
+    practical = qkv_proj_practical_topologies(
+        seq_len=512,
+        hidden_size=768,
+        num_heads=12,
+    )
+    theoretical_ids = {
+        str(topology["topology_id"])
+        for topology in qkv_proj_theoretical_topologies(
+            seq_len=512,
+            hidden_size=768,
+            num_heads=12,
+        )
+    }
+    practical_ids = [str(topology["topology_id"]) for topology in practical]
+
+    assert practical
+    assert len(practical) <= 64
+    assert len(practical) < len(theoretical_ids)
+    assert set(practical_ids) <= theoretical_ids
+
+
+def test_practical_block1_topologies_include_retained_runtime_surface():
+    practical_ids = {
+        str(topology["topology_id"])
+        for topology in qkv_proj_practical_topologies(
+            seq_len=512,
+            hidden_size=768,
+            num_heads=12,
+        )
+    }
+    assert "m64_k64_n16_c8_ps1_ph1_pd1" in practical_ids
+    assert "m64_k64_n32_c8_ps1_ph1_pd1" in practical_ids
+    assert "m32_k64_n16_c8_ps1_ph1_pd1" in practical_ids
+    assert "m32_k64_n32_c8_ps1_ph1_pd1" in practical_ids
+
+
+def test_practical_block1_topologies_are_ranked_and_pruned():
+    practical = qkv_proj_practical_topologies(
+        seq_len=512,
+        hidden_size=768,
+        num_heads=12,
+    )
+
+    assert practical == sorted(practical, key=_block1_practical_sort_key, reverse=True)
+    for topology in practical:
+        assert int(topology["tile_m"]) >= 32
+        assert int(topology["tile_k"]) >= 64
+        assert int(topology["tile_n"]) >= 16
+        assert int(topology["num_aie_columns"]) >= 4
+        assert topology["topology_family"] == "shared_runtime_qkv_proj_practical"
