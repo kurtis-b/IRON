@@ -94,16 +94,18 @@ and lowers them through the local fused Block 1 design used by
 [`iron/operators/qkv_proj/op.py`](/home/cj/iron/iron/operators/qkv_proj/op.py).
 The retained `v2` implementation parallelizes the three independent Q/K/V
 projections as one wider GEMM and then reshapes the combined output back to
-head-major `q/k/v` tensors on the wrapper surface. The current retained Block 1
-runtime-supported surface now includes the baseline fused tilings plus a small
-set of promoted higher-reuse fused tile shapes (`tile_k`, `tile_n`) that are
-already exercised by the local lowering, while still keeping the thesis-facing
-`parallel_seq`, `parallel_heads`, and `parallel_head_dim` axes pinned at `1`
-until the local fused lowering grows real lane-level parallel splits for those
-dimensions.
+head-major `q/k/v` tensors on the wrapper surface. The current Block 1
+runtime-supported surface is now workload-aware and admits the full practical
+fused candidate set for a given `seq_len`, including the validated
+`tile_k`/`tile_n`/array-column variations already exercised by the local fused
+lowering. The thesis-facing `parallel_seq`, `parallel_heads`, and
+`parallel_head_dim` fields are now accepted across that runtime-supported
+surface as validated topology parameters, but the current local lowering still
+materializes a single fused GEMM dispatch rather than distinct lane-level worker
+splits for those axes.
 That design file should expose three distinct topology views:
-- the narrow retained runtime-supported topology list used by operator tests and
-  benchmark manifests
+- a seq-len-aware runtime-supported topology list used by operator tests and the
+  workload-specific runtime-selection path
 - a broader theoretical topology enumerator that explores every combination
   allowed by the Block 1 contract, fused GEMM tiling, array-column count,
   matmul-kernel divisibility, the current batched-GEMM double-buffered

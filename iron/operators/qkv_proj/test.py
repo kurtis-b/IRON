@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from iron.operators.qkv_proj.design import (
     _block1_compute_tile_working_set_fits,
     _block1_practical_sort_key,
+    qkv_proj_design,
     qkv_proj_practical_topologies,
     qkv_proj_theoretical_topologies,
     qkv_proj_topologies,
@@ -30,7 +31,8 @@ def generate_test_params():
     ]
     params = []
     for seq_len, num_heads, head_dim in workloads:
-        for topology in qkv_proj_topologies(
+        for topology in _runtime_smoke_topologies(
+            seq_len=seq_len,
             hidden_size=num_heads * head_dim,
             num_heads=num_heads,
         ):
@@ -45,6 +47,43 @@ def generate_test_params():
                 )
             )
     return params
+
+
+def _runtime_smoke_topologies(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    num_heads: int,
+) -> list[dict[str, int | str]]:
+    topologies = qkv_proj_topologies(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+    )
+    selected: list[dict[str, int | str]] = []
+    seen_ids: set[str] = set()
+    min_columns = min(int(topology["num_aie_columns"]) for topology in topologies)
+
+    def add_first(predicate) -> None:
+        for topology in topologies:
+            topology_id = str(topology["topology_id"])
+            if topology_id in seen_ids or not predicate(topology):
+                continue
+            selected.append(topology)
+            seen_ids.add(topology_id)
+            return
+
+    add_first(lambda _: True)
+    add_first(
+        lambda topology: int(topology["parallel_seq"]) > 1
+        or int(topology["parallel_heads"]) > 1
+        or int(topology["parallel_head_dim"]) > 1
+    )
+    add_first(lambda topology: int(topology["num_aie_columns"]) == min_columns)
+    add_first(
+        lambda topology: int(topology["tile_k"]) > 64 or int(topology["tile_n"]) > 16
+    )
+    return selected
 
 
 @pytest.mark.parametrize(
@@ -99,12 +138,13 @@ def test_theoretical_block1_topologies_cover_supported_surface():
         supported_ids = {
             str(topology["topology_id"])
             for topology in qkv_proj_topologies(
+                seq_len=seq_len,
                 hidden_size=hidden_size,
                 num_heads=num_heads,
             )
         }
         theoretical_ids = {
-            str(topology["topology_id"]).replace("_c8", "")
+            str(topology["topology_id"])
             for topology in qkv_proj_theoretical_topologies(
                 seq_len=seq_len,
                 hidden_size=hidden_size,
@@ -114,10 +154,37 @@ def test_theoretical_block1_topologies_cover_supported_surface():
         assert supported_ids <= theoretical_ids
 
 
-def test_supported_block1_topologies_include_promoted_runtime_variants():
+def test_runtime_block1_topologies_match_practical_surface():
+    for seq_len, hidden_size, num_heads in (
+        (64, 768, 12),
+        (512, 768, 12),
+        (64, 1024, 16),
+        (512, 1024, 16),
+    ):
+        runtime_ids = {
+            str(topology["topology_id"])
+            for topology in qkv_proj_topologies(
+                seq_len=seq_len,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+            )
+        }
+        practical_ids = {
+            str(topology["topology_id"])
+            for topology in qkv_proj_practical_topologies(
+                seq_len=seq_len,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+            )
+        }
+        assert runtime_ids == practical_ids
+
+
+def test_supported_block1_topologies_include_practical_runtime_variants():
     topology_ids_768 = {
         str(topology["topology_id"])
         for topology in qkv_proj_topologies(
+            seq_len=512,
             hidden_size=768,
             num_heads=12,
         )
@@ -125,13 +192,27 @@ def test_supported_block1_topologies_include_promoted_runtime_variants():
     topology_ids_1024 = {
         str(topology["topology_id"])
         for topology in qkv_proj_topologies(
+            seq_len=512,
             hidden_size=1024,
             num_heads=16,
         )
     }
 
-    assert "m32_k256_n24_ps1_ph1_pd1" in topology_ids_768
-    assert "m32_k256_n16_ps1_ph1_pd1" in topology_ids_1024
+    assert "m32_k256_n24_c8_ps2_ph1_pd4" in topology_ids_768
+    assert "m32_k256_n24_c8_ps1_ph8_pd1" in topology_ids_1024
+
+
+def test_block1_design_accepts_legacy_runtime_aliases():
+    config = qkv_proj_design(
+        seq_len=64,
+        hidden_size=768,
+        num_heads=12,
+        topology_id="m32_k256_n24_ps1_ph1_pd1",
+    )
+
+    assert config["topology_id"] == "m32_k256_n24_ps1_ph1_pd1"
+    assert config["num_aie_columns"] == 8
+    assert config["tile_n"] == 24
 
 
 def test_theoretical_block1_topologies_include_nondefault_valid_variants():

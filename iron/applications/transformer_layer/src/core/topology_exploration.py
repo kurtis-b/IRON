@@ -40,6 +40,7 @@ def practical_block_topology_catalog(
     block1_supported_ids = {
         str(candidate["topology_id"])
         for candidate in qkv_proj_topologies(
+            seq_len=spec.seq_len,
             hidden_size=spec.hidden_size,
             num_heads=spec.num_attention_heads,
         )
@@ -58,6 +59,7 @@ def practical_block_topology_catalog(
             str(candidate["topology_family"]),
         )
         for candidate in qkv_proj_topologies(
+            seq_len=spec.seq_len,
             hidden_size=spec.hidden_size,
             num_heads=spec.num_attention_heads,
         )

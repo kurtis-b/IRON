@@ -120,8 +120,8 @@ def test_practical_layer_topology_combinations_runtime_only_exposes_runtime_ids(
     assert combinations
     assert all(bool(row["runtime_supported"]) for row in combinations)
     assert all(row["block1_runtime_topology_id"] is not None for row in combinations)
-    assert any(
-        row["block1_runtime_topology_id"] != row["block1_topology_id"]
+    assert all(
+        row["block1_runtime_topology_id"] == row["block1_topology_id"]
         for row in combinations
     )
     assert all(
