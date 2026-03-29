@@ -33,6 +33,9 @@ from iron.applications.transformer_layer.src.pipeline.automated_benchmark import
     _failure_result_row as structured_failure_result_row,
 )
 from iron.applications.transformer_layer.src.pipeline.automated_benchmark import (
+    _resolve_spec as structured_resolve_spec,
+)
+from iron.applications.transformer_layer.src.pipeline.automated_benchmark import (
     _run_parity_checks as structured_run_parity_checks,
 )
 from iron.applications.transformer_layer.src.pipeline import (
@@ -224,3 +227,22 @@ def test_run_parity_checks_forwards_requested_block_topology_ids(
     assert "--block2-topology-id" in command
     assert "--block3-topology-id" in command
     assert rows[0]["study_case_id"] == "case"
+
+
+def test_resolve_spec_applies_block_topology_id_overrides():
+    spec = structured_resolve_spec(
+        SimpleNamespace(
+            hidden_size=None,
+            intermediate_size=None,
+            num_attention_heads=None,
+            block1_topology_id="m64_k64_n16_ps1_ph1_pd1",
+            block2_topology_id="q32_kv64_e96_ps1_ph1_acc1",
+            block3_topology_id="m32_k96_n64_ps4_pi3_d8_g1",
+        ),
+        {"hidden_size": 768, "intermediate_size": 3072, "num_attention_heads": 12},
+        64,
+    )
+
+    assert spec.block1_topology_id == "m64_k64_n16_ps1_ph1_pd1"
+    assert spec.block2_topology_id == "q32_kv64_e96_ps1_ph1_acc1"
+    assert spec.block3_topology_id == "m32_k96_n64_ps4_pi3_d8_g1"

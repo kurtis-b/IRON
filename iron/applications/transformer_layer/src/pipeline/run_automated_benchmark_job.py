@@ -30,6 +30,9 @@ OPTION_MAP = {
     "hidden_size": "--hidden-size",
     "intermediate_size": "--intermediate-size",
     "num_attention_heads": "--num-attention-heads",
+    "block1_topology_id": "--block1-topology-id",
+    "block2_topology_id": "--block2-topology-id",
+    "block3_topology_id": "--block3-topology-id",
     "seed": "--seed",
     "parity_output_csv": "--parity-output-csv",
 }

@@ -204,6 +204,9 @@ retained topology through its local design entrypoint.
 When parity validation is enabled, the same requested topology overrides should
 be forwarded into the parity path so correctness checks exercise the same
 retained topology selection as the benchmark rows.
+For direct automation, the same retained topology overrides should also be
+accepted by the benchmark/job CLI layer so study manifests, ad hoc benchmark
+invocations, and unattended jobs all share the same topology-selection surface.
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`

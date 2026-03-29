@@ -63,6 +63,9 @@ def test_pipeline_restructure_preserves_legacy_imports_and_path_resolution(
             {
                 "study_manifest": "study/design_patterns_end_to_end.json",
                 "output_csv": "results/out.csv",
+                "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+                "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
                 "seed": 7,
             }
         ),
@@ -75,4 +78,7 @@ def test_pipeline_restructure_preserves_legacy_imports_and_path_resolution(
         str((tmp_path / "study/design_patterns_end_to_end.json").resolve()) in command
     )
     assert str((tmp_path / "results/out.csv").resolve()) in command
+    assert "--block1-topology-id" in command
+    assert "--block2-topology-id" in command
+    assert "--block3-topology-id" in command
     assert command[-2:] == ["--seed", "7"]

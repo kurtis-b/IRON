@@ -55,6 +55,9 @@ def parse_args():
     parser.add_argument("--hidden-size", type=int, default=None)
     parser.add_argument("--intermediate-size", type=int, default=None)
     parser.add_argument("--num-attention-heads", type=int, default=None)
+    parser.add_argument("--block1-topology-id", default=None)
+    parser.add_argument("--block2-topology-id", default=None)
+    parser.add_argument("--block3-topology-id", default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--peak-reference",

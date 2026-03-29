@@ -34,12 +34,18 @@ def _resolve_spec(
 ) -> TransformerLayerSpec:
     resolved_spec = dict(layer_spec)
     resolved_spec["seq_len"] = seq_len
-    if args.hidden_size is not None:
+    if getattr(args, "hidden_size", None) is not None:
         resolved_spec["hidden_size"] = args.hidden_size
-    if args.intermediate_size is not None:
+    if getattr(args, "intermediate_size", None) is not None:
         resolved_spec["intermediate_size"] = args.intermediate_size
-    if args.num_attention_heads is not None:
+    if getattr(args, "num_attention_heads", None) is not None:
         resolved_spec["num_attention_heads"] = args.num_attention_heads
+    if getattr(args, "block1_topology_id", None) is not None:
+        resolved_spec["block1_topology_id"] = args.block1_topology_id
+    if getattr(args, "block2_topology_id", None) is not None:
+        resolved_spec["block2_topology_id"] = args.block2_topology_id
+    if getattr(args, "block3_topology_id", None) is not None:
+        resolved_spec["block3_topology_id"] = args.block3_topology_id
     return TransformerLayerSpec.from_dict(resolved_spec)
 
 
