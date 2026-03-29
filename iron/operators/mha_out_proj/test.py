@@ -142,6 +142,26 @@ def test_theoretical_block2_topologies_cover_supported_surface():
         assert supported_ids <= theoretical_ids
 
 
+def test_supported_block2_topologies_include_promoted_runtime_variants():
+    topology_ids_12 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            num_heads=12,
+            head_dim=64,
+        )
+    }
+    topology_ids_16 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            num_heads=16,
+            head_dim=64,
+        )
+    }
+
+    assert "q32_kv64_e96_ps1_ph2_acc1" in topology_ids_12
+    assert "q32_kv64_e128_ps1_ph2_acc1" in topology_ids_16
+
+
 def test_theoretical_block2_topologies_include_nondefault_valid_variants():
     topology_ids = {
         str(topology["topology_id"])
