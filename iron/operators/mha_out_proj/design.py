@@ -7,6 +7,7 @@ import copy
 import argparse
 from pathlib import Path
 import logging
+from itertools import product
 
 from ml_dtypes import bfloat16
 import numpy as np
@@ -82,6 +83,9 @@ _BLOCK2_TOPOLOGIES = {
     ],
 }
 
+_BLOCK2_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
+_BLOCK2_AIE_DATA_MEM_SIZE_BYTES = 65536
+
 
 def mha_out_proj_topologies(
     *,
@@ -102,6 +106,75 @@ def mha_out_proj_topologies(
         }
         for candidate in topologies
     ]
+
+
+def mha_out_proj_theoretical_topologies(
+    *,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+) -> list[dict[str, int | str]]:
+    if seq_len <= 0:
+        raise ValueError("Block 2 requires seq_len > 0")
+    if num_heads <= 0:
+        raise ValueError("Block 2 requires num_heads > 0")
+    if head_dim <= 0:
+        raise ValueError("Block 2 requires head_dim > 0")
+
+    embed_sz = num_heads * head_dim
+    r, s, t = microkernel_mac_dim_map["npu2"]["bf16"][True]
+    if head_dim % s != 0:
+        raise ValueError(f"Block 2 requires head_dim divisible by {s}")
+
+    topologies: list[dict[str, int | str]] = []
+    for parallel_seq, parallel_heads, q_seq_tile, kv_seq_tile, emb_tile in product(
+        _BLOCK2_PARALLEL_SEQ_CHOICES,
+        _divisors(num_heads),
+        _divisors(seq_len),
+        _divisors(seq_len),
+        _divisors(embed_sz),
+    ):
+        if q_seq_tile % r != 0:
+            continue
+        if kv_seq_tile % t != 0:
+            continue
+        if emb_tile % t != 0:
+            continue
+        if seq_len % (parallel_seq * q_seq_tile) != 0:
+            continue
+        if seq_len % kv_seq_tile != 0:
+            continue
+        if parallel_seq * parallel_heads > 8:
+            continue
+        if not _block2_stage_working_sets_fit(
+            q_seq_tile=q_seq_tile,
+            kv_seq_tile=kv_seq_tile,
+            emb_tile=emb_tile,
+            head_dim=head_dim,
+        ):
+            continue
+
+        max_acc_depth = embed_sz // emb_tile
+        for o_proj_acc_depth in _divisors(max_acc_depth):
+            if embed_sz % (emb_tile * o_proj_acc_depth) != 0:
+                continue
+            candidate = {
+                "parallel_seq": parallel_seq,
+                "q_seq_tile": q_seq_tile,
+                "kv_seq_tile": kv_seq_tile,
+                "emb_tile": emb_tile,
+                "parallel_heads": parallel_heads,
+                "o_proj_acc_depth": o_proj_acc_depth,
+            }
+            topologies.append(
+                {
+                    **candidate,
+                    "topology_id": _mha_out_proj_topology_id(candidate),
+                    "topology_family": "fused_mha_out_proj_theoretical",
+                }
+            )
+
+    return topologies
 
 
 def mha_out_proj_design(
@@ -169,6 +242,42 @@ def _mha_out_proj_topology_id(config: dict[str, int]) -> str:
         f"_ps{config['parallel_seq']}_ph{config['parallel_heads']}"
         f"_acc{config['o_proj_acc_depth']}"
     )
+
+
+def _divisors(value: int) -> tuple[int, ...]:
+    divisors = set()
+    for i in range(1, int(math.isqrt(value)) + 1):
+        if value % i != 0:
+            continue
+        divisors.add(i)
+        divisors.add(value // i)
+    return tuple(sorted(divisors))
+
+
+def _block2_stage_working_sets_fit(
+    *,
+    q_seq_tile: int,
+    kv_seq_tile: int,
+    emb_tile: int,
+    head_dim: int,
+) -> bool:
+    bf16_bytes = 2
+
+    q_bytes = q_seq_tile * head_dim * bf16_bytes
+    k_bytes = head_dim * kv_seq_tile * bf16_bytes
+    qk_bytes = q_seq_tile * kv_seq_tile * bf16_bytes
+    v_bytes = kv_seq_tile * head_dim * bf16_bytes
+    scale_bytes = 4 * q_seq_tile * bf16_bytes
+    wo_bytes = head_dim * emb_tile * bf16_bytes
+    o_bytes = q_seq_tile * emb_tile * bf16_bytes
+
+    stage_working_sets = (
+        q_bytes + k_bytes + qk_bytes,
+        (2 * qk_bytes) + scale_bytes,
+        qk_bytes + v_bytes + q_bytes + scale_bytes,
+        q_bytes + wo_bytes + (2 * o_bytes),
+    )
+    return max(stage_working_sets) <= _BLOCK2_AIE_DATA_MEM_SIZE_BYTES
 
 
 def main():

@@ -10,7 +10,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from iron.operators.mha_out_proj.design import mha_out_proj_topologies
+from iron.operators.mha_out_proj.design import (
+    mha_out_proj_theoretical_topologies,
+    mha_out_proj_topologies,
+)
 from iron.operators.mha_out_proj.op import AIEMHAOutProj
 from iron.operators.mha_out_proj.reference import generate_golden_reference
 from iron.common.test_utils import run_test
@@ -114,3 +117,65 @@ def test_mha_out_proj(
         assert (
             len(errors["O"]) <= max_acceptable_errors
         ), f"Test failed with {len(errors['O'])} errors (max allowable: {max_acceptable_errors})"
+
+
+def test_theoretical_block2_topologies_cover_supported_surface():
+    for seq_len, num_heads in ((64, 1), (512, 12), (2048, 16)):
+        supported_ids = {
+            str(topology["topology_id"])
+            for topology in mha_out_proj_topologies(
+                num_heads=num_heads,
+                head_dim=64,
+            )
+        }
+        theoretical_ids = {
+            str(topology["topology_id"])
+            for topology in mha_out_proj_theoretical_topologies(
+                seq_len=seq_len,
+                num_heads=num_heads,
+                head_dim=64,
+            )
+        }
+        assert supported_ids <= theoretical_ids
+
+
+def test_theoretical_block2_topologies_include_nondefault_valid_variants():
+    topology_ids = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_theoretical_topologies(
+            seq_len=2048,
+            num_heads=16,
+            head_dim=64,
+        )
+    }
+    assert "q32_kv64_e128_ps1_ph1_acc1" in topology_ids
+    assert "q32_kv64_e128_ps1_ph2_acc1" in topology_ids
+    assert "q32_kv64_e128_ps1_ph1_acc2" in topology_ids
+    assert "q64_kv64_e128_ps1_ph1_acc1" in topology_ids
+
+
+def test_theoretical_block2_topologies_are_unique_and_contract_valid():
+    topologies = mha_out_proj_theoretical_topologies(
+        seq_len=2048,
+        num_heads=16,
+        head_dim=64,
+    )
+    assert topologies
+
+    topology_ids = [str(topology["topology_id"]) for topology in topologies]
+    assert len(topology_ids) == len(set(topology_ids))
+
+    for topology in topologies:
+        parallel_seq = int(topology["parallel_seq"])
+        parallel_heads = int(topology["parallel_heads"])
+        q_seq_tile = int(topology["q_seq_tile"])
+        kv_seq_tile = int(topology["kv_seq_tile"])
+        emb_tile = int(topology["emb_tile"])
+        o_proj_acc_depth = int(topology["o_proj_acc_depth"])
+
+        assert parallel_seq in (1, 2, 4, 6, 8)
+        assert 2048 % (parallel_seq * q_seq_tile) == 0
+        assert 2048 % kv_seq_tile == 0
+        assert 16 % parallel_heads == 0
+        assert parallel_seq * parallel_heads <= 8
+        assert 1024 % (emb_tile * o_proj_acc_depth) == 0

@@ -144,10 +144,18 @@ design entrypoint in
 and translates them into the fused runtime wrapper in
 [`iron/operators/mha_out_proj/op.py`](/home/cj/iron/iron/operators/mha_out_proj/op.py).
 The retained `v2` surface is currently pinned to `parallel_seq=1`,
-`q_seq_tile=32`, `kv_seq_tile=64`, `parallel_heads=1`, and
-`o_proj_acc_depth=1`, with `emb_tile` selected per retained workload family.
-That design file should also be the source of the retained topology list used by
-operator-local tests and future topology selection logic.
+`q_seq_tile=32`, and `kv_seq_tile=64`, with `emb_tile` selected per retained
+workload family, `parallel_heads=1`, and `o_proj_acc_depth=1` for the checked-in
+runtime-supported study surface.
+That design file should expose two distinct topology views:
+- the narrow retained runtime-supported topology list used by operator tests and
+  benchmark manifests
+- a broader theoretical topology enumerator that explores every combination
+  allowed by the Block 2 contract, microkernel divisibility, lane-count limit,
+  and per-stage local working-set limits for a given workload
+The checked-in study manifests should continue to pin the baseline retained
+topology IDs for reproducibility even as that broader theoretical exploration
+surface grows.
 Study metadata emitted by the in-process Dataflow patterns should include the
 selected Block 2 topology ID and family so retained topology choices are visible
 in benchmark outputs.
