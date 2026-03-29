@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 
@@ -81,6 +82,11 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         operator_dir = Path(__file__).parent
         base_dir = self.context.base_dir
         device_str = self.context.device_manager.device_str()
+        ln1_weight_np = torch_to_numpy(self.ln1_weight)
+        ln2_weight_np = torch_to_numpy(self.ln2_weight)
+        weights_fingerprint = hashlib.sha1(
+            ln1_weight_np.tobytes() + ln2_weight_np.tobytes()
+        ).hexdigest()[:10]
 
         file_name_total_base = (
             f"{prefix}{self.M}x{self.K}x{self.N}_"
@@ -89,17 +95,18 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
             f"{self.parallel_seq}_"
             f"{self.parallel_int_dim}_"
             f"None_"
-            f"{self.gelu_stage}"
+            f"{self.gelu_stage}_"
+            f"{weights_fingerprint}"
         )
 
         ln1_weight_file_name = (
             self.context.build_dir / f"{file_name_total_base}_ln1_weight_{self.K}.npy"
         )
-        np.save(ln1_weight_file_name, torch_to_numpy(self.ln1_weight))
+        np.save(ln1_weight_file_name, ln1_weight_np)
         ln2_weight_file_name = (
             self.context.build_dir / f"{file_name_total_base}_ln2_weight_{self.K}.npy"
         )
-        np.save(ln2_weight_file_name, torch_to_numpy(self.ln2_weight))
+        np.save(ln2_weight_file_name, ln2_weight_np)
 
         kernel_archive = f"anffn_{self.tile_m}x{self.tile_k}x{self.tile_n}.a"
 
@@ -278,10 +285,6 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         attention_output_np = self._pad_A(torch_to_numpy(attention_output))
         residual_np = self._pad_A(torch_to_numpy(residual))
         padded_rows = attention_output_np.shape[0]
-        packed_hidden_residual_padded = self._pack_hidden_residual(
-            attention_output_np,
-            residual_np,
-        )
         if B_Up is not None:
             B_Up_padded = self._pad_B(torch_to_numpy(B_Up), b_col_maj=False)
         else:
@@ -302,19 +305,12 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
             self.N,
         )
 
-        result_padded = np.zeros(
-            (padded_rows, self.K), dtype=packed_hidden_residual_padded.dtype
+        result_padded = self._execute_chunked_hidden_residual(
+            attention_output_np,
+            residual_np,
+            B_Up_padded,
+            B_Down_padded,
         )
-        for M_lo in range(0, padded_rows, self.M):
-            packed_hidden_residual_part = packed_hidden_residual_padded[
-                (2 * M_lo * self.K) : (2 * (M_lo + self.M) * self.K)
-            ]
-            result_part = self._execute_aie_operation(
-                packed_hidden_residual_part,
-                B_Up_padded,
-                B_Down_padded,
-            )
-            result_padded[M_lo : M_lo + self.M, :] = result_part
 
         result = numpy_to_torch(result_padded[:M, :K])
         return result.view(expected_output_shape)
@@ -352,6 +348,10 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
             packed_hidden_residual_np,
             M,
         )
+        attention_output_padded, residual_padded = self._unpack_hidden_residual(
+            packed_hidden_residual_padded,
+            padded_rows,
+        )
         if B_Up is not None:
             B_Up_padded = self._pad_B(torch_to_numpy(B_Up), b_col_maj=False)
         else:
@@ -361,22 +361,50 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         else:
             B_Down_padded = None
 
-        result_padded = np.zeros(
-            (padded_rows, self.K), dtype=packed_hidden_residual_padded.dtype
+        result_padded = self._execute_chunked_hidden_residual(
+            attention_output_padded,
+            residual_padded,
+            B_Up_padded,
+            B_Down_padded,
         )
-        for M_lo in range(0, padded_rows, self.M):
-            packed_hidden_residual_part = packed_hidden_residual_padded[
-                (2 * M_lo * self.K) : (2 * (M_lo + self.M) * self.K)
-            ]
-            result_part = self._execute_aie_operation(
-                packed_hidden_residual_part,
-                B_Up_padded,
-                B_Down_padded,
-            )
-            result_padded[M_lo : M_lo + self.M, :] = result_part
 
         result = numpy_to_torch(result_padded[:M, :K])
         return result.view(expected_output_shape)
+
+    def _execute_chunked_hidden_residual(
+        self,
+        attention_output_padded: np.ndarray,
+        residual_padded: np.ndarray,
+        B_Up_np: np.ndarray | None = None,
+        B_Down_np: np.ndarray | None = None,
+    ) -> np.ndarray:
+        padded_rows, hidden_size = attention_output_padded.shape
+        if residual_padded.shape != (padded_rows, hidden_size):
+            raise AIEOperatorConstraintError(
+                "AIEAddNormFFNAddNorm: attention_output and residual must have the same padded shape"
+            )
+        if hidden_size != self.K or padded_rows % self.M != 0:
+            raise AIEOperatorConstraintError(
+                "AIEAddNormFFNAddNorm: invalid padded hidden/residual chunking for execution"
+            )
+
+        result_padded = np.zeros(
+            (padded_rows, self.K), dtype=attention_output_padded.dtype
+        )
+        for M_lo in range(0, padded_rows, self.M):
+            chunk_hidden = attention_output_padded[M_lo : M_lo + self.M, :]
+            chunk_residual = residual_padded[M_lo : M_lo + self.M, :]
+            packed_hidden_residual_part = self._pack_hidden_residual(
+                chunk_hidden,
+                chunk_residual,
+            )
+            result_part = self._execute_aie_operation(
+                packed_hidden_residual_part,
+                B_Up_np,
+                B_Down_np,
+            )
+            result_padded[M_lo : M_lo + self.M, :] = result_part
+        return result_padded
 
     def _pad_A(self, A_np: np.ndarray) -> np.ndarray:
         M, K = A_np.shape
