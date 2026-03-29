@@ -24,6 +24,31 @@ _BLOCK1_RETAINED_AXES = {
     "parallel_head_dim": (1,),
 }
 
+_BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
+    (12, 64): (
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 24,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 1,
+            "parallel_head_dim": 1,
+        },
+    ),
+    (16, 64): (
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 16,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 1,
+            "parallel_head_dim": 1,
+        },
+    ),
+}
+
 _BLOCK1_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
 _BLOCK1_AIE_DATA_MEM_SIZE_BYTES = 65536
 _BLOCK1_PRACTICAL_MIN_TILE_M = 32
@@ -50,13 +75,24 @@ def qkv_proj_topologies(
         num_heads=num_heads,
         head_dim=head_dim,
     )
+    topologies.extend(
+        _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES.get((num_heads, head_dim), ())
+    )
+    unique_topologies = []
+    seen_topology_ids: set[str] = set()
+    for candidate in topologies:
+        topology_id = _topology_id(candidate)
+        if topology_id in seen_topology_ids:
+            continue
+        seen_topology_ids.add(topology_id)
+        unique_topologies.append(candidate)
     return [
         {
             **candidate,
             "topology_id": _topology_id(candidate),
             "topology_family": "shared_runtime_qkv_proj",
         }
-        for candidate in topologies
+        for candidate in unique_topologies
     ]
 
 

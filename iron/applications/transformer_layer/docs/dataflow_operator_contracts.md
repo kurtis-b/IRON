@@ -95,10 +95,12 @@ and lowers them through the local fused Block 1 design used by
 The retained `v2` implementation parallelizes the three independent Q/K/V
 projections as one wider GEMM and then reshapes the combined output back to
 head-major `q/k/v` tensors on the wrapper surface. The current retained Block 1
-topology sweep varies the fused GEMM tiling (`tile_m`, `tile_n`) while keeping
-the thesis-facing `parallel_seq`, `parallel_heads`, and `parallel_head_dim`
-axes pinned at `1` until the local fused lowering grows real lane-level
-parallel splits for those dimensions.
+runtime-supported surface now includes the baseline fused tilings plus a small
+set of promoted higher-reuse fused tile shapes (`tile_k`, `tile_n`) that are
+already exercised by the local lowering, while still keeping the thesis-facing
+`parallel_seq`, `parallel_heads`, and `parallel_head_dim` axes pinned at `1`
+until the local fused lowering grows real lane-level parallel splits for those
+dimensions.
 That design file should expose three distinct topology views:
 - the narrow retained runtime-supported topology list used by operator tests and
   benchmark manifests
