@@ -82,6 +82,7 @@ def fused_addnorm_ffn_addnorm(
     emulate_bf16_mmul_with_bfp16,
     trace_size,
     gelu_stage,
+    ln1_weight_file,
     ln2_weight_file,
     stage_only=None,
     archive=None,
@@ -90,19 +91,23 @@ def fused_addnorm_ffn_addnorm(
     def ceildiv(a: int, b: int) -> int:
         return (a + b - 1) // b
 
-    if ln2_weight_file is None:  # Generate default weights if not provided
+    if ln1_weight_file is None or ln2_weight_file is None:
         logging.warning(
             "Layer norm weight files not provided; using default weights of all ones."
         )
+        static_ln1_weights = np.ones(K, dtype=bfloat16)
         static_ln2_weights = np.ones(K, dtype=bfloat16)
     else:
+        static_ln1_weights = np.load(ln1_weight_file)
         static_ln2_weights = np.load(ln2_weight_file)
+        if static_ln1_weights.shape[0] != K:
+            raise ValueError("Static ln1 weights length does not match K")
         if static_ln2_weights.shape[0] != K:
             raise ValueError("Static ln2 weights length does not match K")
 
     if n_aie_cols < 2:
         raise AssertionError(
-            "n_aie_cols must be at least 2 due to 4 inputs (A, R, B_Up, B_Down)"
+            "n_aie_cols must be at least 2 due to packed AR, B_Up, and B_Down streams"
         )
     # n_aie_cols will be used to determine whether to send the same data to through different shim tiles, while
     # nB_tiles_distributed will be used to determine what data to send through which shim tiles
@@ -178,6 +183,10 @@ def fused_addnorm_ffn_addnorm(
         )
 
     # Add & Norm checks:
+    if static_ln1_weights.shape[0] != K:
+        raise ValueError(
+            "Static ln1 weights length does not match the specified weight length"
+        )
     if static_ln2_weights.shape[0] != K:
         raise ValueError(
             "Static ln2 weights length does not match the specified weight length"
@@ -247,22 +256,21 @@ def fused_addnorm_ffn_addnorm(
 
     # These will hold TensorAccessPattern objects that represent the runtime
     # npu_dma_memcpy_nd operations of this design. They are only used if generate_taps is true
-    A_taps = []
-    R_taps = []
+    AR_taps = []
     B_up_proj_taps = []
     B_down_proj_taps = []
     C_taps = []
 
     # Define tensor types
-    AR_ty = np.ndarray[(2 * M * K,), np.dtype[dtype_in]]
+    packed_hidden_residual_ty = np.ndarray[(2 * M * K,), np.dtype[dtype_in]]
     B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
     C_ty = np.ndarray[(M * K,), np.dtype[dtype_out]]
 
     # Add & Norm tensor types
     ln_weights_ty = np.ndarray[(K,), np.dtype[dtype_in]]
+    AR_l1_ty = np.ndarray[(2 * m * k,), np.dtype[dtype_in]]
 
     # GEMM tensor types
-    A_l2_ty = np.ndarray[(m * k,), np.dtype[dtype_in]]
     A_l1_ty = np.ndarray[(m, k), np.dtype[dtype_in]]
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
     B_up_proj_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
@@ -317,22 +325,45 @@ def fused_addnorm_ffn_addnorm(
         [A_l1_ty, A_l1_ty, A_l1_ty, np.int32],
     )
     # Add & Norm
-    ln2_zero_f32_kernel = Kernel(
+    ln_zero_f32_kernel = Kernel(
         "ln_zero_f32",
         archive_name,
         [sum_l1_ty, np.int32],
     )
-    ln2_calc_sum_sumsq_kernel = Kernel(
+    ln_calc_sum_sumsq_kernel = Kernel(
         "ln_calc_sum_sumsq",
         archive_name,
         [A_l1_ty, sum_l1_ty, sum_l1_ty],
     )
-    ln2_fused_add_layer_norm_kernel = Kernel(
-        "fused_add_layer_norm_1outs",
+    ln_add_calc_sum_sumsq_kernel = Kernel(
+        "ln_add_calc_sum_sumsq",
+        archive_name,
+        [A_l1_ty, A_l1_ty, sum_l1_ty, sum_l1_ty],
+    )
+    ln_packed_add_calc_sum_sumsq_kernel = Kernel(
+        "packed_ln_add_calc_sum_sumsq",
+        archive_name,
+        [AR_l1_ty, sum_l1_ty, sum_l1_ty],
+    )
+    ln_fused_add_layer_norm_from_inputs_kernel = Kernel(
+        "fused_add_layer_norm_1outs_from_inputs",
         archive_name,
         [
             A_l1_ty,
             A_l1_ty,
+            ln_weights_ty,
+            sum_l1_ty,
+            sum_l1_ty,
+            A_l1_ty,
+            np.int32,
+            np.int32,
+        ],
+    )
+    ln_packed_fused_add_layer_norm_from_inputs_kernel = Kernel(
+        "packed_fused_add_layer_norm_1outs_from_inputs",
+        archive_name,
+        [
+            AR_l1_ty,
             ln_weights_ty,
             sum_l1_ty,
             sum_l1_ty,
@@ -347,13 +378,14 @@ def fused_addnorm_ffn_addnorm(
     core_tiles = tiles[2:]
 
     # AIE-array data movement with object fifos
-    # A streams (direct to up projection) and R streams (residual for second Add & Norm)
-    A_l3l2_fifos = [None] * nA_tiles_distributed
-    A_l2l1_fifos = [None] * nA_tiles_distributed
-    R_l3l2_fifos = [None] * nA_tiles_distributed
-    R_l2l1_fifos = [None] * nA_tiles_distributed
+    # Dedicated packed [A | R] streams for LN1 and LN2. Replay is encoded in
+    # the runtime TAPs, so these stay on the direct L3->L1 path.
+    AR_ln1_l3l1_fifos = [None] * nA_tiles_distributed
+    AR_ln2_l3l1_fifos = [None] * nA_tiles_distributed
     logging.debug(
-        f"Len A_l2l1_fifos: {len(A_l2l1_fifos)} len A_l3l2_fifos: {len(A_l3l2_fifos)}, Len R_l2l1_fifos: {len(R_l2l1_fifos)}, len R_l3l2_fifos: {len(R_l3l2_fifos)}"
+        "Len AR_ln1_l3l1_fifos: %s, Len AR_ln2_l3l1_fifos: %s",
+        len(AR_ln1_l3l1_fifos),
+        len(AR_ln2_l3l1_fifos),
     )
 
     # FFN streams
@@ -365,6 +397,9 @@ def fused_addnorm_ffn_addnorm(
     logging.debug(
         f"Len B_up_proj_l3l2_fifos: {len(B_up_proj_l3l2_fifos)}, Len B_up_proj_l2l1_fifos: {len(B_up_proj_l2l1_fifos)}, len B_up_proj_l3l2_fifos: {len(B_up_proj_l3l2_fifos)}, len B_down_proj_l2l1_fifos: {len(B_down_proj_l2l1_fifos)},"
     )
+
+    # First AddNorm output pipelined into the up projection workers.
+    ln1_stage_l1l1_fifos = [None] * nA_tiles_distributed
 
     # C tiles pipelined from up_proj core to down_proj core
     C_up_proj_l1l1_fifos = [
@@ -392,55 +427,20 @@ def fused_addnorm_ffn_addnorm(
     )
 
     # Output tiles for second Add & Norm
-    ln2_copy_out = [None] * nA_tiles_distributed
-    ln2_copy_in = [None] * nA_tiles_distributed
     ln2_l1l2_fifos = [None] * nA_tiles_distributed
     ln2_l2l3_fifos = [None] * nA_tiles_distributed
 
-    # Input A (direct to up projection, using microkernel dims_to_stream like ffn/design.py)
-    dims_to_stream_a = [
-        (m // r, r * k),
-        (k // s, s),
-        (r, k),
-        (s, 1),
-    ]
+    # Dedicated packed [A | R] streams for LN1 and LN2 workers.
     for a_tile in range(nA_tiles_distributed):
-        A_l3l2_fifos[a_tile] = ObjectFifo(
-            A_l2_ty, name=f"A_L3L2_{a_tile}", depth=fifo_depth
-        )
-        A_l2l1_fifos[a_tile] = (
-            A_l3l2_fifos[a_tile]
-            .cons()
-            .forward(
-                obj_type=A_l1_ty,
-                name=f"A_L2L1_{a_tile}",
-                dims_to_stream=dims_to_stream_a,
-                placement=(
-                    Tile(a_tile % n_aie_cols, 1)
-                    if nA_tiles_distributed < 3
-                    else Tile((a_tile * 2) % n_aie_cols, 1)
-                ),
-            )
-        )
-        # Input R (residual directly to second Add & Norm)
-        R_l3l2_fifos[a_tile] = ObjectFifo(
-            A_l1_ty,
-            name=f"R_L3L2_{a_tile}",
+        AR_ln1_l3l1_fifos[a_tile] = ObjectFifo(
+            AR_l1_ty,
+            name=f"AR_ln1_L3L1_{a_tile}",
             depth=fifo_depth,
         )
-        R_l2l1_fifos[a_tile] = (
-            R_l3l2_fifos[a_tile]
-            .cons()
-            .forward(
-                obj_type=A_l1_ty,
-                name=f"R_L2L1_{a_tile}",
-                dims_to_stream=dims_to_stream_a,
-                placement=(
-                    Tile(a_tile % n_aie_cols, 1)
-                    if nA_tiles_distributed < 3
-                    else Tile((a_tile * 2 + 1) % n_aie_cols, 1)
-                ),
-            )
+        AR_ln2_l3l1_fifos[a_tile] = ObjectFifo(
+            AR_l1_ty,
+            name=f"AR_ln2_L3L1_{a_tile}",
+            depth=fifo_depth,
         )
 
     # Input B_Up
@@ -501,6 +501,13 @@ def fused_addnorm_ffn_addnorm(
         )
 
     # Up proj C
+    for a_tile in range(nA_tiles_distributed):
+        ln1_stage_l1l1_fifos[a_tile] = ObjectFifo(
+            A_l1_ty,
+            name=f"ln1_stage_L1L1_{a_tile}",
+            depth=fifo_depth,
+        )
+
     for a_tile in range(nA_tiles_distributed):
         for b_tile in range(nB_tiles_distributed):
             C_up_proj_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
@@ -587,6 +594,53 @@ def fused_addnorm_ffn_addnorm(
         )
 
     # Tasks for each worker to perform
+    def core_fn_add_norm1(
+        in_ar,
+        out_stage1,
+        sum_buf,
+        sumsq_buf,
+        weights,
+        zero_f32,
+        packed_add_calc_sum_sumsq,
+        packed_fused_add_layer_norm_from_inputs,
+        stage_only,
+    ):
+        loop = range_(1)
+        if nC_tiles_per_core > 1:
+            loop = range_(nC_tiles_per_core)
+        for output_tile_idx in loop:
+            if stage_only not in [0, None]:
+                for _ in range_(K_div_k):
+                    in_ar.release(1)
+                for _ in range_(K_div_k):
+                    out_stage1.acquire(1)
+                    out_stage1.release(1)
+                    in_ar.release(1)
+                continue
+
+            zero_f32(sum_buf, m)
+            zero_f32(sumsq_buf, m)
+            for _ in range_(K_div_k):
+                elem_in_ar = in_ar.acquire(1)
+                packed_add_calc_sum_sumsq(elem_in_ar, sum_buf, sumsq_buf)
+                in_ar.release(1)
+
+            for col_idx in range_(K_div_k):
+                col_i32 = index.casts(T.i32(), col_idx)
+                elem_in_ar = in_ar.acquire(1)
+                elem_out_stage1 = out_stage1.acquire(1)
+                packed_fused_add_layer_norm_from_inputs(
+                    elem_in_ar,
+                    weights,
+                    sum_buf,
+                    sumsq_buf,
+                    elem_out_stage1,
+                    K,
+                    col_i32,
+                )
+                out_stage1.release(1)
+                in_ar.release(1)
+
     def core_fn_up_proj(
         in_a,
         in_b,
@@ -596,12 +650,11 @@ def fused_addnorm_ffn_addnorm(
         gelu,
         stage_only,
     ):
-        loop = range(1)  # Workaround for issue #1547
+        loop = range_(1)
         if nC_tiles_per_core > 1:
             loop = range_(nC_tiles_per_core)
         for _ in loop:
-            # Check if up projection stage is enabled, None means all stages are enabled
-            if stage_only not in [0, None]:  # Skip computation for up projection stage
+            if stage_only not in [0, None]:
                 elem_out_matmul = out_c.acquire(1)
                 for _ in range_(K_div_k):
                     elem_in_a = in_a.acquire(1)
@@ -609,18 +662,19 @@ def fused_addnorm_ffn_addnorm(
                     in_a.release(1)
                     in_b.release(1)
                 out_c.release(1)
-            else:  # Perform up projection stage computation
-                elem_out_matmul = out_c.acquire(1)
-                zero(elem_out_matmul)
-                for _ in range_(K_div_k):
-                    elem_in_a = in_a.acquire(1)
-                    elem_in_b = in_b.acquire(1)
-                    matmul(elem_in_a, elem_in_b, elem_out_matmul)
-                    in_a.release(1)
-                    in_b.release(1)
-                if gelu:
-                    gelu(elem_out_matmul, elem_out_matmul, m * n)
-                out_c.release(1)
+                continue
+
+            elem_out_matmul = out_c.acquire(1)
+            zero(elem_out_matmul)
+            for _ in range_(K_div_k):
+                elem_in_a = in_a.acquire(1)
+                elem_in_b = in_b.acquire(1)
+                matmul(elem_in_a, elem_in_b, elem_out_matmul)
+                in_a.release(1)
+                in_b.release(1)
+            if gelu:
+                gelu(elem_out_matmul, elem_out_matmul, m * n)
+            out_c.release(1)
 
     def core_fn_down_proj(
         in_a,
@@ -720,57 +774,98 @@ def fused_addnorm_ffn_addnorm(
                     curr_acc_c.release(1)
 
     def core_fn_add_norm2(
-        of_in1,
-        of_in2,
-        sum_buf,
-        sumsq_buf,
-        weights,
-        of_out1,
-        fused_add_layer_norm,
-        calc_sum_sumsq,
+        in_ar,
+        in_down,
+        stage1_buf,
+        ln1_sum_buf,
+        ln1_sumsq_buf,
+        ln1_weights,
+        ln2_sum_buf,
+        ln2_sumsq_buf,
+        ln2_weights,
+        out_ln2,
+        fused_add_layer_norm_from_inputs,
+        add_calc_sum_sumsq,
+        packed_fused_add_layer_norm_from_inputs,
+        packed_add_calc_sum_sumsq,
         zero_f32,
         stage_only,
     ):
         # Check if second add & norm stage is enabled, None means all stages are enabled
         if stage_only not in [2, None]:  # Skip computation for second add & norm stage
-            for _ in range_(down_proj_depth):
-                elem_in1 = of_in1.acquire(1)
-                of_in1.release(1)
-            for _ in range_(down_proj_depth):
-                elem_in1 = of_in1.acquire(1)
-                elem_in2 = of_in2.acquire(1)
-                elem_out1 = of_out1.acquire(1)
-                of_out1.release(1)
-                of_in1.release(1)
-                of_in2.release(1)
-        else:
-            # Zero the buffers before accumulation
-            zero_f32(sum_buf, m)
-            zero_f32(sumsq_buf, m)
-            # First calculate the sum_buf and sum_buf of squares of the inputs as they come
-            for _ in range_(down_proj_depth):
-                elem_in1 = of_in1.acquire(1)
-                calc_sum_sumsq(elem_in1, sum_buf, sumsq_buf)
-                of_in1.release(1)
-            # Execute fused layer norm and add operations to output, with input from buffer in MT
-            for col_idx in range_(down_proj_depth):
-                col_i32 = index.casts(T.i32(), col_idx)
-                elem_in1 = of_in1.acquire(1)
-                elem_in2 = of_in2.acquire(1)
-                elem_out1 = of_out1.acquire(1)
-                fused_add_layer_norm(
-                    elem_in1,
-                    elem_in2,
-                    weights,
-                    sum_buf,
-                    sumsq_buf,
-                    elem_out1,
-                    K,
-                    col_i32,
-                )
-                of_out1.release(1)
-                of_in1.release(1)
-                of_in2.release(1)
+            for _ in range_(K_div_k):
+                in_ar.acquire(1)
+                in_ar.release(1)
+            for _ in range_(K_div_k):
+                in_ar.acquire(1)
+                in_down.acquire(1)
+                in_down.release(1)
+                in_ar.release(1)
+            for _ in range_(K_div_k):
+                in_ar.acquire(1)
+                in_down.acquire(1)
+                out_ln2.acquire(1)
+                out_ln2.release(1)
+                in_down.release(1)
+                in_ar.release(1)
+            return
+
+        zero_f32(ln1_sum_buf, m)
+        zero_f32(ln1_sumsq_buf, m)
+        for _ in range_(K_div_k):
+            elem_in_ar = in_ar.acquire(1)
+            packed_add_calc_sum_sumsq(elem_in_ar, ln1_sum_buf, ln1_sumsq_buf)
+            in_ar.release(1)
+
+        for col_idx in range_(K_div_k):
+            elem_in_ar = in_ar.acquire(1)
+            elem_in_down = in_down.acquire(1)
+            col_i32 = index.casts(T.i32(), col_idx)
+            packed_fused_add_layer_norm_from_inputs(
+                elem_in_ar,
+                ln1_weights,
+                ln1_sum_buf,
+                ln1_sumsq_buf,
+                stage1_buf,
+                K,
+                col_i32,
+            )
+            add_calc_sum_sumsq(
+                elem_in_down,
+                stage1_buf,
+                ln2_sum_buf,
+                ln2_sumsq_buf,
+            )
+            in_down.release(1)
+            in_ar.release(1)
+
+        for col_idx in range_(K_div_k):
+            elem_in_ar = in_ar.acquire(1)
+            elem_in_down = in_down.acquire(1)
+            elem_out_ln2 = out_ln2.acquire(1)
+            col_i32 = index.casts(T.i32(), col_idx)
+            packed_fused_add_layer_norm_from_inputs(
+                elem_in_ar,
+                ln1_weights,
+                ln1_sum_buf,
+                ln1_sumsq_buf,
+                stage1_buf,
+                K,
+                col_i32,
+            )
+            fused_add_layer_norm_from_inputs(
+                elem_in_down,
+                stage1_buf,
+                ln2_weights,
+                ln2_sum_buf,
+                ln2_sumsq_buf,
+                elem_out_ln2,
+                K,
+                col_i32,
+            )
+            out_ln2.release(1)
+            in_down.release(1)
+            in_ar.release(1)
 
     # Set up compute tiles
     workers = []
@@ -781,6 +876,8 @@ def fused_addnorm_ffn_addnorm(
                 # FFN cores will be placed horizontally, adjacent col will be for Add & Norm core
                 # The direction of reduction will be from left to right
                 tile_col, tile_row = core_tiles[a_tile * num_ffn_stages][b_tile]
+                ln1_tile_col = nB_tiles_distributed
+                ln1_tile_row = tile_row
                 ln2_tile_col = nB_tiles_distributed + 1
                 ln2_tile_row = tile_row
             else:
@@ -789,11 +886,65 @@ def fused_addnorm_ffn_addnorm(
                 tile_col, tile_row = core_tiles[-1 * (b_tile + 1)][
                     a_tile * num_ffn_stages
                 ]
+                ln1_tile_col = tile_col
+                ln1_tile_row = tile_row - 1
                 ln2_tile_col = tile_col + 1
                 ln2_tile_row = tile_row - 1
             stream_to_ln = b_tile == nB_tiles_distributed - 1
             if stream_to_ln:
+                ln1_weight_buffer = Buffer(
+                    type=ln_weights_ty,
+                    initial_value=static_ln1_weights,
+                    name=f"static_ln1_weights_{a_tile}",
+                )
+                ln1_sum_buffer = Buffer(
+                    type=sum_l1_ty,
+                    name=f"ln1_sum_buffer_{a_tile}",
+                )
+                ln1_sumsq_buffer = Buffer(
+                    type=sum_l1_ty,
+                    name=f"ln1_sumsq_buffer_{a_tile}",
+                )
+                workers.append(
+                    Worker(
+                        core_fn_add_norm1,
+                        [
+                            AR_ln1_l3l1_fifos[a_tile].cons(),
+                            ln1_stage_l1l1_fifos[a_tile].prod(),
+                            ln1_sum_buffer,
+                            ln1_sumsq_buffer,
+                            ln1_weight_buffer,
+                            ln_zero_f32_kernel,
+                            ln_packed_add_calc_sum_sumsq_kernel,
+                            ln_packed_fused_add_layer_norm_from_inputs_kernel,
+                            stage_only,
+                        ],
+                        placement=Tile(ln1_tile_col, ln1_tile_row),
+                        stack_size=0xF00,
+                    )
+                )
+                logging.debug(
+                    f"Placing add & norm stg 1 worker based on a_tile {a_tile} at {workers[-1]._tile}"
+                )
+
                 # Second Add & Norm stage
+                ln2_stage1_buffer = Buffer(
+                    type=A_l1_ty,
+                    name=f"ln2_stage1_buffer_{a_tile}",
+                )
+                ln2_stage1_weight_buffer = Buffer(
+                    type=ln_weights_ty,
+                    initial_value=static_ln1_weights,
+                    name=f"static_ln1_weights_ln2_{a_tile}",
+                )
+                ln2_stage1_sum_buffer = Buffer(
+                    type=sum_l1_ty,
+                    name=f"ln2_stage1_sum_buffer_{a_tile}",
+                )
+                ln2_stage1_sumsq_buffer = Buffer(
+                    type=sum_l1_ty,
+                    name=f"ln2_stage1_sumsq_buffer_{a_tile}",
+                )
                 ln2_weight_buffer = Buffer(
                     type=ln_weights_ty,
                     initial_value=static_ln2_weights,
@@ -801,25 +952,31 @@ def fused_addnorm_ffn_addnorm(
                 )
                 sum_buffer = Buffer(
                     type=sum_l1_ty,
-                    name=f"sum_buffer_{a_tile}",
+                    name=f"ln2_sum_buffer_{a_tile}",
                 )
                 sumsq_buffer = Buffer(
                     type=sum_l1_ty,
-                    name=f"sumsq_buffer_{a_tile}",
+                    name=f"ln2_sumsq_buffer_{a_tile}",
                 )
                 workers.append(
                     Worker(
                         core_fn_add_norm2,
                         [
+                            AR_ln2_l3l1_fifos[a_tile].cons(),
                             C_down_proj_out_l1l1_fifos[a_tile].cons(),
-                            R_l2l1_fifos[a_tile].cons(),
+                            ln2_stage1_buffer,
+                            ln2_stage1_sum_buffer,
+                            ln2_stage1_sumsq_buffer,
+                            ln2_stage1_weight_buffer,
                             sum_buffer,
                             sumsq_buffer,
                             ln2_weight_buffer,
                             ln2_l1l2_fifos[a_tile].prod(),
-                            ln2_fused_add_layer_norm_kernel,
-                            ln2_calc_sum_sumsq_kernel,
-                            ln2_zero_f32_kernel,
+                            ln_fused_add_layer_norm_from_inputs_kernel,
+                            ln_add_calc_sum_sumsq_kernel,
+                            ln_packed_fused_add_layer_norm_from_inputs_kernel,
+                            ln_packed_add_calc_sum_sumsq_kernel,
+                            ln_zero_f32_kernel,
                             stage_only,
                         ],
                         placement=Tile(
@@ -832,12 +989,13 @@ def fused_addnorm_ffn_addnorm(
                 logging.debug(
                     f"Placing add & norm stg 2 worker based on a_tile {a_tile} at {workers[-1]._tile}"
                 )
-            # Up projection stage
+
+            # Up projection stage.
             workers.append(
                 Worker(
                     core_fn_up_proj,
                     [
-                        A_l2l1_fifos[a_tile].cons(),
+                        ln1_stage_l1l1_fifos[a_tile].cons(),
                         B_up_proj_l2l1_fifos[b_tile].cons(),
                         C_up_proj_l1l1_fifos[a_tile][b_tile].prod(),
                         ffn_zero_kernel_up_proj,
@@ -908,7 +1066,12 @@ def fused_addnorm_ffn_addnorm(
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
-    with rt.sequence(AR_ty, B_ty, B_ty, C_ty) as (AR, B_Up, B_Down, C):
+    with rt.sequence(packed_hidden_residual_ty, B_ty, B_ty, C_ty) as (
+        packed_hidden_residual,
+        B_Up,
+        B_Down,
+        C,
+    ):
         rt.start(*workers)
 
         # Task groups will be used to determine when to sync/await/free DMA runtime ops
@@ -923,55 +1086,73 @@ def fused_addnorm_ffn_addnorm(
                     # For small input sizes, we may not even need a "pong" iteration
                     break
 
-                for tile_row in range(current_tb_n_rows):
-                    for a_tile in range(nA_tiles_distributed):
-                        logging.debug(
-                            f"TB: {tb}, PP: {pingpong}, row_base: {row_base}, current_tb_n_rows: {current_tb_n_rows}, tile_row: {tile_row}, A tile: {a_tile}"
-                        )
-                        # A input transfer (tiled k-chunks with stride-0 reuse across N output tiles, like ffn/design.py):
-                        A_offset = (
-                            row_base * m * nA_tiles_distributed * K
-                            + a_tile * current_tb_n_rows * m * K
-                            + tile_row * m * K
-                        )
-                        A_sizes = [nC_up_col_tiles_per_core, K_div_k, m, k]
-                        A_strides = [0, k, K, 1]
-                        AR_shape = (2 * M, K)
-                        A_tile = TensorAccessPattern(
-                            AR_shape,
-                            offset=A_offset,
-                            sizes=A_sizes,
-                            strides=A_strides,
-                        )
-                        place = (
-                            Tile(0, 0)
-                            if nA_tiles_distributed < 3
-                            else Tile(a_tile * 2, 0)
-                        )
-                        rt.fill(
-                            A_l3l2_fifos[a_tile].prod(),
-                            AR,
-                            tap=A_tile,
-                            task_group=tg,
-                            placement=place,
-                        )
-                        logging.debug(
-                            f"    Placed A input {a_tile} transfer at {place} with offset {A_tile.offset}, sizes {A_tile.sizes}, strides {A_tile.strides}"
-                        )
-                        # This line does not change MLIR output at all - it's just for recording data movement
-                        A_taps.append(A_tile)
+                packed_hidden_residual_shape = (2 * M * K,)
+                packed_tile_elems = 2 * m * k
+                for a_tile in range(nA_tiles_distributed):
+                    packed_tile_offset = (
+                        (a_tile * ln_iters_per_core + row_base)
+                        * K_div_k
+                        * packed_tile_elems
+                    )
+                    ln1_ar_tile = TensorAccessPattern(
+                        packed_hidden_residual_shape,
+                        offset=packed_tile_offset,
+                        sizes=[
+                            2 * nC_up_col_tiles_per_core,
+                            current_tb_n_rows * K_div_k,
+                            2 * m,
+                            k,
+                        ],
+                        strides=[0, packed_tile_elems, k, 1],
+                    )
+                    place = (
+                        Tile(0, 0) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 0)
+                    )
+                    rt.fill(
+                        AR_ln1_l3l1_fifos[a_tile].prod(),
+                        packed_hidden_residual,
+                        tap=ln1_ar_tile,
+                        task_group=tg,
+                        placement=place,
+                    )
+                    AR_taps.append(ln1_ar_tile)
+                    logging.debug(
+                        f"    Placed LN1 packed AR input {a_tile} transfer at {place} with offset {ln1_ar_tile.offset}, sizes {ln1_ar_tile.sizes}, strides {ln1_ar_tile.strides}"
+                    )
 
-                        C_sizes = [1, down_proj_depth, m, k]
+                    ln2_ar_tile = TensorAccessPattern(
+                        packed_hidden_residual_shape,
+                        offset=packed_tile_offset,
+                        sizes=[3, current_tb_n_rows * K_div_k, 2 * m, k],
+                        strides=[0, packed_tile_elems, k, 1],
+                    )
+                    place = (
+                        Tile(nB_tiles_distributed + 1, 0)
+                        if nA_tiles_distributed < 3
+                        else Tile(a_tile * 2 + 1, 0)
+                    )
+                    rt.fill(
+                        AR_ln2_l3l1_fifos[a_tile].prod(),
+                        packed_hidden_residual,
+                        tap=ln2_ar_tile,
+                        task_group=tg,
+                        placement=place,
+                    )
+                    AR_taps.append(ln2_ar_tile)
+                    logging.debug(
+                        f"    Placed LN2 packed AR input {a_tile} transfer at {place} with offset {ln2_ar_tile.offset}, sizes {ln2_ar_tile.sizes}, strides {ln2_ar_tile.strides}"
+                    )
+
+                    for tile_row in range(current_tb_n_rows):
+                        row_tile_idx = row_base + tile_row
+                        c_offset = (
+                            (row_tile_idx * nA_tiles_distributed + a_tile) * m * K
+                        )
                         C_tile = TensorAccessPattern(
                             (M, K),
-                            offset=A_offset,
-                            sizes=C_sizes,
-                            strides=A_strides,
-                        )
-                        place = (
-                            Tile(nB_tiles_distributed + 1, 0)
-                            if nA_tiles_distributed < 3
-                            else Tile(a_tile * 2 + 1, 0)
+                            offset=c_offset,
+                            sizes=[1, down_proj_depth, m, k],
+                            strides=[0, k, K, 1],
                         )
                         rt.drain(
                             ln2_l2l3_fifos[a_tile].cons(),
@@ -984,31 +1165,9 @@ def fused_addnorm_ffn_addnorm(
                         logging.debug(
                             f"    Placed C output {a_tile} transfer at {place} with offset {C_tile.offset}, sizes {C_tile.sizes}, strides {C_tile.strides}"
                         )
-                        # R input transfer:
-                        place = (
-                            Tile(nB_tiles_distributed + 1, 0)
-                            if nA_tiles_distributed < 3
-                            else Tile(a_tile * 2 + 1, 0)
-                        )
-                        R_tile = TensorAccessPattern(
-                            AR_shape,
-                            offset=M * K + A_offset,
-                            sizes=C_sizes,
-                            strides=A_strides,
-                        )
-                        rt.fill(
-                            R_l3l2_fifos[a_tile].prod(),
-                            AR,
-                            tap=R_tile,
-                            task_group=tg,
-                            placement=place,
-                        )
-                        logging.debug(
-                            f"    Placed R input {a_tile} transfer at {place} with offset {R_tile.offset}, sizes {R_tile.sizes}, strides {R_tile.strides}"
-                        )
-                        # This line does not change MLIR output at all - it's just for recording data movement
-                        R_taps.append(R_tile)
                         C_taps.append(C_tile)
+
+                for tile_row in range(current_tb_n_rows):
 
                     for b_tile in range(nB_tiles_distributed):
                         for stage in range(num_ffn_stages):
@@ -1102,8 +1261,7 @@ def fused_addnorm_ffn_addnorm(
         # If generate taps is true, return a representation of tensor access patterns
         # representing all the npu_dma_memcpy_nd runtime sequence operations per input/ouput tensor.
         return (
-            TensorAccessSequence.from_taps(A_taps),
-            TensorAccessSequence.from_taps(R_taps),
+            TensorAccessSequence.from_taps(AR_taps),
             TensorAccessSequence.from_taps(B_up_proj_taps),
             TensorAccessSequence.from_taps(B_down_proj_taps),
             TensorAccessSequence.from_taps(C_taps),

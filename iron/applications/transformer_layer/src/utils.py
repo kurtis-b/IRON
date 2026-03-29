@@ -139,6 +139,7 @@ def bind_addnorm_ffn_addnorm_weights(
 ) -> None:
     block.weight_up_proj = weights["ffn_up_weight"].contiguous()
     block.weight_down_proj = weights["ffn_down_weight"].contiguous()
+    block.ln1_weight = weights["ln1_weight"].contiguous()
     block.ln2_weight = weights["ln2_weight"].contiguous()
 
 

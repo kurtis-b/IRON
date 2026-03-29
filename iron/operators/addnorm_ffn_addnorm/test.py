@@ -5,6 +5,7 @@
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -112,7 +113,48 @@ def test_block3_topologies_construct_and_match_reference_contract(
     assert golden["residual"].shape == (seq_len, hidden_size)
     assert golden["ffn_up_weight"].shape == (hidden_size, intermediate_size)
     assert golden["ffn_down_weight"].shape == (intermediate_size, hidden_size)
+    assert golden["ln1_weight"].shape == (hidden_size,)
+    assert golden["ln2_weight"].shape == (hidden_size,)
     assert golden["output"].shape == (seq_len, hidden_size)
+
+
+def test_packed_hidden_residual_round_trips(aie_context):
+    operator = AIEAddNormFFNAddNorm(
+        seq_len=64,
+        hidden_size=768,
+        intermediate_size=3072,
+        context=aie_context,
+    )
+    hidden_states = generate_golden_reference(
+        seq_len=64,
+        hidden_size=768,
+        intermediate_size=3072,
+        seed=11,
+    )
+    padded_rows = ((64 + operator.M - 1) // operator.M) * operator.M
+    hidden_padded = np.zeros((padded_rows, 768), dtype=np.float32)
+    residual_padded = np.zeros((padded_rows, 768), dtype=np.float32)
+    hidden_padded[:64, :] = hidden_states["hidden_states"].float().numpy()
+    residual_padded[:64, :] = hidden_states["residual"].float().numpy()
+    packed = operator._pack_hidden_residual(
+        hidden_padded,
+        residual_padded,
+    )
+    unpacked_hidden, unpacked_residual = operator._unpack_hidden_residual(
+        packed, padded_rows
+    )
+
+    assert packed.shape == (2 * padded_rows * 768,)
+    assert unpacked_hidden.shape == (padded_rows, 768)
+    assert unpacked_residual.shape == (padded_rows, 768)
+    assert np.array_equal(
+        unpacked_hidden[:64, :],
+        hidden_padded[:64, :],
+    )
+    assert np.array_equal(
+        unpacked_residual[:64, :],
+        residual_padded[:64, :],
+    )
 
 
 def test_theoretical_block3_topologies_cover_supported_surface():

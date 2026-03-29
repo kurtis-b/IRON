@@ -1306,6 +1306,54 @@ void fused_add_layer_norm_1outs_fp32weights(const bfloat16 *input,
 }
 
 #ifdef BUILD_ADDNORM_REPLAY_FASTPATH
+void fused_add_layer_norm_1outs_from_inputs(const bfloat16 *input,
+                                            const bfloat16 *residual,
+                                            const bfloat16 *weights,
+                                            const float *sum,
+                                            const float *sumsq,
+                                            bfloat16 *output,
+                                            const int32_t cols,
+                                            const int32_t col_idx);
+
+void packed_fused_add_layer_norm_1outs_from_inputs(const bfloat16 *packed_input_and_residual,
+                                                   const bfloat16 *weights,
+                                                   const float *sum,
+                                                   const float *sumsq,
+                                                   bfloat16 *output,
+                                                   const int32_t cols,
+                                                   const int32_t col_idx)
+{
+    constexpr int packed_tile_elems = DIM_M * DIM_K;
+    fused_add_layer_norm_1outs_from_inputs(packed_input_and_residual,
+                                           packed_input_and_residual + packed_tile_elems,
+                                           weights,
+                                           sum,
+                                           sumsq,
+                                           output,
+                                           cols,
+                                           col_idx);
+}
+
+void fused_add_layer_norm_1outs_from_inputs(const bfloat16 *input,
+                                            const bfloat16 *residual,
+                                            const bfloat16 *weights,
+                                            const float *sum,
+                                            const float *sumsq,
+                                            bfloat16 *output,
+                                            const int32_t cols,
+                                            const int32_t col_idx)
+{
+    constexpr int r = 8;
+    constexpr int s = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_K % s == 0);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    fused_add_layer_norm_1_from_inputs<bfloat16, (DIM_M / r), (DIM_K / s), r, s>(
+        input, residual, weights, sum, sumsq, output, cols, col_idx);
+}
+
 void fused_add_layer_norm_1outs_from_inputs_fp32weights(const bfloat16 *input,
                                                         const bfloat16 *residual,
                                                         const int32_t *weights,
@@ -1407,6 +1455,14 @@ void ln_calc_sum_sumsq(const bfloat16 *A, float *pSum, float *pSumSq)
 }
 
 #ifdef BUILD_ADDNORM_REPLAY_FASTPATH
+void ln_add_calc_sum_sumsq(const bfloat16 *A, const bfloat16 *B, float *pSum, float *pSumSq);
+
+void packed_ln_add_calc_sum_sumsq(const bfloat16 *packed_input_and_residual, float *pSum, float *pSumSq)
+{
+    constexpr int packed_tile_elems = DIM_M * DIM_K;
+    ln_add_calc_sum_sumsq(packed_input_and_residual, packed_input_and_residual + packed_tile_elems, pSum, pSumSq);
+}
+
 void ln_add_calc_sum_sumsq(const bfloat16 *A, const bfloat16 *B, float *pSum, float *pSumSq)
 {
     constexpr int r = 8;

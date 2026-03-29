@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from iron.operators.ffn_addnorm.reference import (
-    generate_golden_reference as generate_ffn_addnorm_reference,
-)
+import torch
+
+from iron.common.utils import torch_dtype_map
 
 
 def generate_golden_reference(
@@ -13,21 +13,49 @@ def generate_golden_reference(
     seq_len: int,
     hidden_size: int,
     intermediate_size: int,
+    dtype: str = "bf16",
     seed: int = 42,
     debug_mode: int = -1,
 ) -> dict[str, object]:
-    golden = generate_ffn_addnorm_reference(
-        M=seq_len,
-        K=hidden_size,
-        N=intermediate_size,
-        seed=seed,
-        debug_mode=debug_mode,
+    del debug_mode  # Block 3 uses the functional reference path only.
+
+    torch.manual_seed(seed)
+    val_range = 4
+    dtype_torch = torch_dtype_map[dtype]
+
+    hidden_states = torch.rand(seq_len, hidden_size, dtype=dtype_torch) * val_range
+    residual = torch.rand(seq_len, hidden_size, dtype=dtype_torch) * val_range
+    ln1_weight = torch.rand(hidden_size, dtype=dtype_torch) * val_range
+    ln2_weight = torch.rand(hidden_size, dtype=dtype_torch) * val_range
+    up_weight = (
+        torch.randn(hidden_size, intermediate_size, dtype=dtype_torch) * val_range
     )
+    down_weight = (
+        torch.randn(intermediate_size, hidden_size, dtype=dtype_torch) * val_range
+    )
+
+    addnorm1 = torch.nn.functional.layer_norm(
+        hidden_states + residual,
+        normalized_shape=(hidden_size,),
+        weight=ln1_weight,
+        bias=None,
+    )
+    up_proj = torch.matmul(addnorm1, up_weight)
+    gelu = torch.nn.functional.gelu(up_proj)
+    down_proj = torch.matmul(gelu, down_weight)
+    output = torch.nn.functional.layer_norm(
+        down_proj + addnorm1,
+        normalized_shape=(hidden_size,),
+        weight=ln2_weight,
+        bias=None,
+    )
+
     return {
-        "hidden_states": golden["input"],
-        "residual": golden["input_residual"],
-        "ffn_up_weight": golden["input_b_up"],
-        "ffn_down_weight": golden["input_b_down"],
-        "ln2_weight": golden["weight2"],
-        "output": golden["output"],
+        "hidden_states": hidden_states,
+        "residual": residual,
+        "ffn_up_weight": up_weight,
+        "ffn_down_weight": down_weight,
+        "ln1_weight": ln1_weight,
+        "ln2_weight": ln2_weight,
+        "output": output,
     }
