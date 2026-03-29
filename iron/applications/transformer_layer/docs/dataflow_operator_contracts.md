@@ -298,8 +298,10 @@ Those `reference_npu_*` columns should also be reserved in the shared result
 schema so GPU compare CSVs expose them as stable fields rather than unordered
 extras.
 Bottleneck summary CSV/JSON/text outputs should also preserve the retained
-block topology IDs from the analyzed rows so dominant-component reports remain
-attributable to the resolved Dataflow topology surface.
+block topology IDs from the analyzed rows, plus any preserved
+practical-topology provenance fields, so dominant-component reports remain
+attributable to the resolved Dataflow topology surface and the original
+exploration candidate when those differ.
 Plot generation should be allowed to facet on retained topology columns too, so
 latency/throughput/power, bottleneck, and best-NPU-vs-iGPU plots can be grouped
 by resolved block topology when needed.

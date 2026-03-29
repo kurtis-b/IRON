@@ -36,6 +36,12 @@ SUMMARY_FIELD_ORDER = [
     "block2_topology_family",
     "block3_topology_id",
     "block3_topology_family",
+    "exploration_block1_topology_id",
+    "exploration_block1_topology_family",
+    "exploration_block2_topology_id",
+    "exploration_block2_topology_family",
+    "exploration_block3_topology_id",
+    "exploration_block3_topology_family",
     "avg_latency_ms",
     "dominant_component",
     "dominant_component_latency_ms",
@@ -147,6 +153,18 @@ def build_row_summary(row: dict[str, object]) -> dict[str, object]:
         "block2_topology_family": row.get("block2_topology_family"),
         "block3_topology_id": row.get("block3_topology_id"),
         "block3_topology_family": row.get("block3_topology_family"),
+        "exploration_block1_topology_id": row.get("exploration_block1_topology_id"),
+        "exploration_block1_topology_family": row.get(
+            "exploration_block1_topology_family"
+        ),
+        "exploration_block2_topology_id": row.get("exploration_block2_topology_id"),
+        "exploration_block2_topology_family": row.get(
+            "exploration_block2_topology_family"
+        ),
+        "exploration_block3_topology_id": row.get("exploration_block3_topology_id"),
+        "exploration_block3_topology_family": row.get(
+            "exploration_block3_topology_family"
+        ),
         "avg_latency_ms": total_latency_ms,
         "dominant_component": dominant_component,
         "dominant_component_latency_ms": dominant_latency_ms,
@@ -257,6 +275,36 @@ def build_execution_mode_summary(
                     if topology_id is not None
                 }
             ),
+            "exploration_block1_topology_ids": sorted(
+                {
+                    topology_id
+                    for topology_id in (
+                        _nonempty_str(row.get("exploration_block1_topology_id"))
+                        for row in rows
+                    )
+                    if topology_id is not None
+                }
+            ),
+            "exploration_block2_topology_ids": sorted(
+                {
+                    topology_id
+                    for topology_id in (
+                        _nonempty_str(row.get("exploration_block2_topology_id"))
+                        for row in rows
+                    )
+                    if topology_id is not None
+                }
+            ),
+            "exploration_block3_topology_ids": sorted(
+                {
+                    topology_id
+                    for topology_id in (
+                        _nonempty_str(row.get("exploration_block3_topology_id"))
+                        for row in rows
+                    )
+                    if topology_id is not None
+                }
+            ),
         }
     return output
 
@@ -298,6 +346,13 @@ def render_execution_mode_summaries(
             topology_ids = aggregate.get(f"{block_key}_topology_ids") or []
             if topology_ids:
                 topology_parts.append(f"{block_key}={','.join(topology_ids)}")
+            exploration_ids = (
+                aggregate.get(f"exploration_{block_key}_topology_ids") or []
+            )
+            if exploration_ids:
+                topology_parts.append(
+                    f"exploration_{block_key}={','.join(exploration_ids)}"
+                )
         topology_text = (
             f"; topologies={' '.join(topology_parts)}" if topology_parts else ""
         )

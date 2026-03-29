@@ -43,6 +43,12 @@ def test_bottleneck_analysis_restructure_preserves_legacy_imports_and_behavior(
                 "block2_topology_family",
                 "block3_topology_id",
                 "block3_topology_family",
+                "exploration_block1_topology_id",
+                "exploration_block1_topology_family",
+                "exploration_block2_topology_id",
+                "exploration_block2_topology_family",
+                "exploration_block3_topology_id",
+                "exploration_block3_topology_family",
                 "avg_latency_ms",
                 "avg_block1_qkv_proj_latency_ms",
                 "avg_block2_mha_out_proj_latency_ms",
@@ -70,6 +76,12 @@ def test_bottleneck_analysis_restructure_preserves_legacy_imports_and_behavior(
                 "block2_topology_family": "fused_mha_out_proj",
                 "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
                 "block3_topology_family": "pipelined_addnorm_ffn_addnorm",
+                "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+                "exploration_block1_topology_family": "shared_runtime_qkv_proj_practical",
+                "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
+                "exploration_block2_topology_family": "fused_mha_out_proj_practical",
+                "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+                "exploration_block3_topology_family": "pipelined_addnorm_ffn_addnorm_practical",
                 "avg_latency_ms": "10.0",
                 "avg_block1_qkv_proj_latency_ms": "3.0",
                 "avg_block2_mha_out_proj_latency_ms": "5.0",
@@ -85,9 +97,16 @@ def test_bottleneck_analysis_restructure_preserves_legacy_imports_and_behavior(
     assert len(summary_rows) == 1
     assert summary_rows[0]["dominant_component"] == "block2_mha_out_proj"
     assert summary_rows[0]["block2_topology_id"] == "q32_kv64_e96_ps1_ph1_acc1"
+    assert (
+        summary_rows[0]["exploration_block2_topology_id"] == "q32_kv64_e96_ps1_ph6_acc1"
+    )
     assert "baseline_768:dataflow" in aggregates
     assert aggregates["baseline_768:dataflow"]["block2_topology_ids"] == [
         "q32_kv64_e96_ps1_ph1_acc1"
     ]
+    assert aggregates["baseline_768:dataflow"]["exploration_block2_topology_ids"] == [
+        "q32_kv64_e96_ps1_ph6_acc1"
+    ]
     assert "block2_mha_out_proj dominates" in text_summary
     assert "block2=q32_kv64_e96_ps1_ph1_acc1" in text_summary
+    assert "exploration_block2=q32_kv64_e96_ps1_ph6_acc1" in text_summary
