@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from iron.common import AIEContext
+from iron.common.utils import numpy_to_torch, torch_to_numpy
 from iron.operators.addnorm_ffn_addnorm.op import AIEAddNormFFNAddNorm
 from iron.operators.mha_out_proj.op import AIEMHAOutProj
 from iron.operators.qkv_proj.op import AIEQKVProj
@@ -200,8 +201,7 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
             context=self.context,
         )
         self._weights: dict[str, torch.Tensor] | None = None
-        self._cached_attention_output: torch.Tensor | None = None
-        self._cached_residual: torch.Tensor | None = None
+        self._cached_packed_hidden_residual: torch.Tensor | None = None
 
     def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
         require_keys(
@@ -213,6 +213,7 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
                 "out_proj_weight",
                 "ffn_up_weight",
                 "ffn_down_weight",
+                "ln1_weight",
                 "ln2_weight",
             ],
         )
@@ -224,10 +225,28 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
         if self._weights is None:
             raise RuntimeError("assign_weights() must be called before execution")
         hidden_states = layer_inputs.hidden_states.squeeze(0).to(self.spec.torch_dtype)
-        self._cached_attention_output = host_attention_output(
+        attention_output = host_attention_output(
             hidden_states, self._weights, self.spec
         )
-        self._cached_residual = hidden_states
+        padded_rows = (
+            (attention_output.shape[0] + self.block.M - 1) // self.block.M
+        ) * self.block.M
+        attention_output_padded = torch.zeros(
+            (padded_rows, attention_output.shape[1]),
+            dtype=attention_output.dtype,
+        )
+        hidden_states_padded = torch.zeros(
+            (padded_rows, hidden_states.shape[1]),
+            dtype=hidden_states.dtype,
+        )
+        attention_output_padded[: attention_output.shape[0], :] = attention_output
+        hidden_states_padded[: hidden_states.shape[0], :] = hidden_states
+        self._cached_packed_hidden_residual = numpy_to_torch(
+            self.block._pack_hidden_residual(
+                torch_to_numpy(attention_output_padded),
+                torch_to_numpy(hidden_states_padded),
+            )
+        )
 
     def forward_with_stage_timings(
         self,
@@ -238,21 +257,18 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
             raise RuntimeError(
                 "Dataflow block studies currently require attention_mask=None"
             )
-        if self._cached_attention_output is None or self._cached_residual is None:
+        if self._cached_packed_hidden_residual is None:
             self.prepare_benchmark_inputs(layer_inputs)
         self._prepare_runtime()
         start = time.perf_counter()
-        output = self.block.forward(
-            self._cached_attention_output,
-            self._cached_residual,
-        )
+        output = self.block.forward_packed(self._cached_packed_hidden_residual)
         end = time.perf_counter()
         return output.unsqueeze(0), {"block3_addnorm_ffn_addnorm_sec": end - start}
 
     def get_benchmark_metadata(self) -> dict[str, object]:
         return make_in_process_npu_metadata(
             compile_setup_time_sec=self.compile_setup_time_sec,
-            dispatch_count=len(self.block.block.runlist),
+            dispatch_count=len(self.block.runlist),
             unique_instruction_binary_count=1,
             unique_xclbin_count=1,
             extra_fields={

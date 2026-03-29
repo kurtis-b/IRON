@@ -51,6 +51,13 @@ class DataflowPattern(nn.Module):
             topology_id=spec.block1_topology_id,
             context=self.context,
         )
+        self.block3 = AIEAddNormFFNAddNorm(
+            seq_len=spec.seq_len,
+            hidden_size=spec.hidden_size,
+            intermediate_size=spec.intermediate_size,
+            topology_id=spec.block3_topology_id,
+            context=self.context,
+        )
         self.block2 = AIEMHAOutProj(
             num_heads=spec.num_attention_heads,
             seq_len=spec.seq_len,
@@ -58,13 +65,9 @@ class DataflowPattern(nn.Module):
             topology_id=spec.block2_topology_id,
             static_weights=True,
             context=self.context,
-        )
-        self.block3 = AIEAddNormFFNAddNorm(
-            seq_len=spec.seq_len,
-            hidden_size=spec.hidden_size,
-            intermediate_size=spec.intermediate_size,
-            topology_id=spec.block3_topology_id,
-            context=self.context,
+            packed_output_parallel_seq=self.block3.parallel_seq,
+            packed_output_rows=((spec.seq_len + self.block3.M - 1) // self.block3.M)
+            * self.block3.M,
         )
 
     def _prepare_runtime(self) -> None:
@@ -88,6 +91,7 @@ class DataflowPattern(nn.Module):
                 "out_proj_weight",
                 "ffn_up_weight",
                 "ffn_down_weight",
+                "ln1_weight",
                 "ln2_weight",
             ],
         )
@@ -121,11 +125,11 @@ class DataflowPattern(nn.Module):
         block1_end = time.perf_counter()
 
         block2_start = block1_end
-        attention_output = self.block2(q, k, v)
+        packed_block3_input = self.block2.forward_packed(q, k, v, hidden_states)
         block2_end = time.perf_counter()
 
         block3_start = block2_end
-        output = self.block3.forward(attention_output, hidden_states)
+        output = self.block3.forward_packed(packed_block3_input)
         block3_end = time.perf_counter()
 
         return output.unsqueeze(0), {

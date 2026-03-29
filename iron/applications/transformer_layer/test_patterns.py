@@ -235,3 +235,11 @@ def test_block2_contract_packs_head_major_qkv_into_runtime_qkv_layout():
     )
     assert packed.shape == (9, 8)
     assert np.array_equal(packed.astype(np.float32), expected.float().numpy())
+
+
+def test_dataflow_pattern_configures_block2_packed_output_for_block3():
+    spec = TransformerLayerSpec(seq_len=64)
+    pattern = build_pattern("dataflow", spec)
+
+    assert pattern.block2.packed_output_parallel_seq == pattern.block3.parallel_seq
+    assert pattern.block2.packed_output_rows == pattern.block3.M
