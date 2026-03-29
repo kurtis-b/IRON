@@ -15,10 +15,12 @@ from aie.iron import (
     Program,
     Runtime,
     Worker,
+    WorkerRuntimeBarrier,
     str_to_dtype,
 )
 import aie.dialects.index as index
 from aie.dialects.aiex import *
+from aie.helpers.dialects.scf import if_
 from aie.helpers.taplib import TensorAccessPattern
 from aie.iron.controlflow import range_
 from aie.iron.device import NPU1, NPU1Col1, NPU1Col2, NPU2, Tile
@@ -57,6 +59,7 @@ def fused_addnorm_ffn_addnorm(
     gelu_stage,
     ln1_weight_file,
     ln2_weight_file,
+    stage_only=None,
     archive=None,
 ):
     def ceildiv(a: int, b: int) -> int:
@@ -96,6 +99,10 @@ def fused_addnorm_ffn_addnorm(
     dtype_out = str_to_dtype(dtype_out_str)
 
     mem_tile_n = n * nB_tiles_distributed
+    logging.debug(
+        f"n_aie_cores_needed:{n_aie_cores_needed}, mem_tile_n:{mem_tile_n}, m:{m}"
+    )
+
     # Calculate loop bounds for the reduction loop and total C tiles
     K_div_k = K // k
     if K_div_k % down_proj_depth != 0:
@@ -114,6 +121,16 @@ def fused_addnorm_ffn_addnorm(
         raise ValueError(
             "Block 3 grouped runtime currently supports ln_iters_per_core up to 2"
         )
+
+    logging.debug(
+        f"Up proj loop bounds: K_div_k={K_div_k}, n_col_groups={n_col_groups}, n_grouped_ffn_sweeps={n_grouped_ffn_sweeps}, nC_up_col_tiles_per_core={nC_up_col_tiles_per_core}, nC_tiles_per_core={nC_tiles_per_core}"
+    )
+    logging.debug(
+        f"Down proj loop bounds: nC_up_col_tiles_per_core={nC_up_col_tiles_per_core}, down_proj_depth={down_proj_depth}, n_col_groups={n_col_groups}"
+    )
+    logging.debug(
+        f"Add & Norm loop bounds: ln_iters_per_core={ln_iters_per_core}, nC_tiles_per_core={nC_tiles_per_core}"
+    )
 
     assert np.issubdtype(dtype_in, np.integer) == np.issubdtype(
         dtype_out, np.integer
@@ -381,6 +398,13 @@ def fused_addnorm_ffn_addnorm(
     AR_ln1_l2l1_fifos = [None] * nA_tiles_distributed
     AR_ln2_l3l2_fifos = [None] * nA_tiles_distributed
     AR_ln2_l2l1_fifos = [None] * nA_tiles_distributed
+    logging.debug(
+        "Len AR_ln1_l3l2_fifos: %s, Len AR_ln1_l2l1_fifos: %s, Len AR_ln2_l3l2_fifos: %s, Len AR_ln2_l2l1_fifos: %s",
+        len(AR_ln1_l3l2_fifos),
+        len(AR_ln1_l2l1_fifos),
+        len(AR_ln2_l3l2_fifos),
+        len(AR_ln2_l2l1_fifos),
+    )
     dims_to_stream_ar = [
         ((2 * m) // r, r * k),
         (k // s, s),
@@ -394,6 +418,9 @@ def fused_addnorm_ffn_addnorm(
     B_up_proj_l2l1_fifos = [None] * (nB_tiles_distributed)
     B_down_proj_l3l2_fifos = [None] * (nB_tiles_distributed)
     B_down_proj_l2l1_fifos = [None] * (nB_tiles_distributed)
+    logging.debug(
+        f"Len B_up_proj_l3l2_fifos: {len(B_up_proj_l3l2_fifos)}, Len B_up_proj_l2l1_fifos: {len(B_up_proj_l2l1_fifos)}, len B_up_proj_l3l2_fifos: {len(B_up_proj_l3l2_fifos)}, len B_down_proj_l2l1_fifos: {len(B_down_proj_l2l1_fifos)},"
+    )
 
     # First AddNorm output pipelined into the up projection workers.
     ln1_stage_l1l1_fifos = [None] * nA_tiles_distributed
@@ -410,12 +437,19 @@ def fused_addnorm_ffn_addnorm(
     C_down_proj_part_l2l1_fifos = [
         [None] * nB_tiles_distributed for _ in range(nA_tiles_distributed)
     ]
+    logging.debug(
+        f"len C_up_proj_l1l1_fifos: {len(C_up_proj_l1l1_fifos)}, len C_down_proj_part_l1l2_fifos: {len(C_down_proj_part_l1l2_fifos)}, len C_down_proj_part_l2l1_fifos: {len(C_down_proj_part_l2l1_fifos)}"
+    )
 
     # Output C tiles from down_proj core
     C_down_proj_reduce_l1l1_fifos = [
         [None] * (nB_tiles_distributed - 1) for _ in range(nA_tiles_distributed)
     ]
     C_down_proj_out_l1l1_fifos = [None] * nA_tiles_distributed
+    logging.debug(
+        f"len C_down_proj_reduce_l1l1_fifos: {len(C_down_proj_reduce_l1l1_fifos)}, len C_down_proj_out_l1l1_fifos: {len(C_down_proj_out_l1l1_fifos)}"
+    )
+
     # Output tiles for second Add & Norm
     ln2_l1l2_fifos = [None] * nA_tiles_distributed
     ln2_l2l3_fifos = [None] * nA_tiles_distributed
@@ -562,6 +596,10 @@ def fused_addnorm_ffn_addnorm(
                     ),
                 )
             )
+            logging.debug(
+                f"Placing C_down_proj_part fifos at {((b_tile + 1) % n_aie_cols, 1) if nA_tiles_distributed < 3 else ((a_tile * 2 + b_tile) % n_aie_cols, 1)}"
+            )
+
     # Down proj partial C for reduction
     for a_tile in range(nA_tiles_distributed):
         for b_tile in range(nB_tiles_distributed - 1):
@@ -615,11 +653,21 @@ def fused_addnorm_ffn_addnorm(
         zero_f32,
         packed_add_calc_sum_sumsq,
         packed_fused_add_layer_norm_from_inputs,
+        stage_only,
     ):
         loop = range_(1)
         if nC_tiles_per_core > 1:
             loop = range_(nC_tiles_per_core)
         for output_tile_idx in loop:
+            if stage_only not in [0, None]:
+                for _ in range_(K_div_k):
+                    in_ar.release(1)
+                for _ in range_(K_div_k):
+                    out_stage1.acquire(1)
+                    out_stage1.release(1)
+                    in_ar.release(1)
+                continue
+
             zero_f32(sum_buf, m)
             zero_f32(sumsq_buf, m)
             for _ in range_(K_div_k):
@@ -650,11 +698,22 @@ def fused_addnorm_ffn_addnorm(
         zero,
         matmul,
         gelu,
+        stage_only,
     ):
         loop = range_(1)
         if nC_tiles_per_core > 1:
             loop = range_(nC_tiles_per_core)
         for _ in loop:
+            if stage_only not in [0, None]:
+                elem_out_matmul = out_c.acquire(1)
+                for _ in range_(K_div_k):
+                    elem_in_a = in_a.acquire(1)
+                    elem_in_b = in_b.acquire(1)
+                    in_a.release(1)
+                    in_b.release(1)
+                out_c.release(1)
+                continue
+
             elem_out_matmul = out_c.acquire(1)
             zero(elem_out_matmul)
             for _ in range_(K_div_k):
@@ -680,7 +739,13 @@ def fused_addnorm_ffn_addnorm(
         gelu,
         buffer_to_reduce,
         is_end_of_down_proj,
+        stage_only,
     ):
+        if stage_only is not None:
+            raise NotImplementedError(
+                "Block 3 grouped runtime does not support stage_only overrides"
+            )
+
         for _ in range_(ln_iters_per_core * n_col_groups * n_grouped_ffn_sweeps):
             for _ in range_(down_proj_depth):
                 elem_acc_c = new_acc_c.acquire(1)
@@ -726,13 +791,28 @@ def fused_addnorm_ffn_addnorm(
         packed_fused_add_layer_norm_from_inputs,
         packed_add_calc_sum_sumsq,
         zero_f32,
+        stage_only,
     ):
+        compute_enabled = stage_only in [2, None]
+
+        def drain_ln1_prepass():
+            for _ in range_(K_div_k):
+                elem_in_ar = in_ar.acquire(1)
+                in_ar.release(1)
+
         def compute_ln1_prepass():
             zero_f32(ln1_sum_buf, m)
             zero_f32(ln1_sumsq_buf, m)
             for _ in range_(K_div_k):
                 elem_in_ar = in_ar.acquire(1)
                 packed_add_calc_sum_sumsq(elem_in_ar, ln1_sum_buf, ln1_sumsq_buf)
+                in_ar.release(1)
+
+        def drain_group_stats():
+            for _ in range_(down_proj_depth):
+                elem_in_ar = in_ar.acquire(1)
+                elem_in_down = in_down.acquire(1)
+                in_down.release(1)
                 in_ar.release(1)
 
         def compute_group_stats(group_base):
@@ -756,6 +836,15 @@ def fused_addnorm_ffn_addnorm(
                     ln2_sum_buf,
                     ln2_sumsq_buf,
                 )
+                in_down.release(1)
+                in_ar.release(1)
+
+        def drain_group_output():
+            for _ in range_(down_proj_depth):
+                elem_in_ar = in_ar.acquire(1)
+                elem_in_down = in_down.acquire(1)
+                elem_out_ln2 = out_ln2.acquire(1)
+                out_ln2.release(1)
                 in_down.release(1)
                 in_ar.release(1)
 
@@ -788,6 +877,15 @@ def fused_addnorm_ffn_addnorm(
                 out_ln2.release(1)
                 in_down.release(1)
                 in_ar.release(1)
+
+        if not compute_enabled:
+            for _ in range_(ln_iters_per_core):
+                drain_ln1_prepass()
+                for _ in range_(n_col_groups):
+                    drain_group_stats()
+                for _ in range_(n_col_groups):
+                    drain_group_output()
+            return
 
         for _ in range_(ln_iters_per_core):
             compute_ln1_prepass()
@@ -848,10 +946,14 @@ def fused_addnorm_ffn_addnorm(
                             ln_zero_f32_kernel,
                             ln_packed_add_calc_sum_sumsq_kernel,
                             ln_packed_fused_add_layer_norm_from_inputs_kernel,
+                            stage_only,
                         ],
                         placement=Tile(ln1_tile_col, ln1_tile_row),
                         stack_size=0xD00,
                     )
+                )
+                logging.debug(
+                    f"Placing add & norm stg 1 worker based on a_tile {a_tile} at {workers[-1]._tile}"
                 )
 
                 # Second Add & Norm stage
@@ -904,6 +1006,7 @@ def fused_addnorm_ffn_addnorm(
                             ln_packed_fused_add_layer_norm_from_inputs_kernel,
                             ln_packed_add_calc_sum_sumsq_kernel,
                             ln_zero_f32_kernel,
+                            stage_only,
                         ],
                         placement=Tile(
                             ln2_tile_col,
@@ -911,6 +1014,9 @@ def fused_addnorm_ffn_addnorm(
                         ),
                         stack_size=0xD00,
                     )
+                )
+                logging.debug(
+                    f"Placing add & norm stg 2 worker based on a_tile {a_tile} at {workers[-1]._tile}"
                 )
 
             # Up projection stage.
@@ -924,6 +1030,7 @@ def fused_addnorm_ffn_addnorm(
                         ffn_zero_kernel_up_proj,
                         ffn_matmul_kernel_up_proj,
                         ffn_gelu_kernel if gelu_stage == 0 else None,
+                        stage_only,
                     ],
                     placement=(
                         Tile(tile_col, tile_row + 1)
@@ -932,6 +1039,9 @@ def fused_addnorm_ffn_addnorm(
                     ),
                     stack_size=0xD00,
                 )
+            )
+            logging.debug(
+                f"Placing up projection worker based on a_tile {a_tile} b_tile {b_tile} at {workers[-1]._tile}"
             )
             # Down projection stage
             # Arguments at position 4, 8, 9, 11 below all relate to how the reduction across down projection
@@ -964,6 +1074,7 @@ def fused_addnorm_ffn_addnorm(
                             ].cons()
                         ),
                         stream_to_ln,
+                        stage_only,
                     ],
                     placement=(
                         Tile(tile_col, tile_row)
@@ -972,6 +1083,9 @@ def fused_addnorm_ffn_addnorm(
                     ),
                     stack_size=0xD00,
                 )
+            )
+            logging.debug(
+                f"Placing down projection worker based on a_tile {a_tile} b_tile {b_tile} at {workers[-1]._tile}"
             )
 
     # We are limited in the number of BDs. After synchronizing, we can reuse BDs.
@@ -1174,6 +1288,20 @@ def fused_addnorm_ffn_addnorm(
 
     # Create the program from the device type and runtime
     my_program = Program(dev_ty, rt)
+
+    for worker in workers:
+        if worker is None:
+            raise ValueError("Worker not properly created")
+        logging.debug(f"Worker {worker}")
+        for fifo in worker.fifos:
+            if fifo is None:
+                raise ValueError("FIFO in worker not properly created")
+            logging.debug(f"    FIFO {fifo}")
+            for ofe in fifo.all_of_endpoints():
+                if ofe is None:
+                    raise ValueError(
+                        f"ObjectFifoEndpoint not properly created for FIFO {fifo} in worker {worker}"
+                    )
     # Place components (assign them resources on the device) and generate an MLIR module
     module = my_program.resolve_program(SequentialPlacer())
     return module

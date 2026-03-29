@@ -29,7 +29,8 @@ work, see `dataflow_status.md`.
   branches such as "mixed parallel" special cases
 - each thesis-local operator directory should mirror the `mha` operator layout:
   `design.py`, `op.py`, `reference.py`, and `test.py`
-- `design.py` should expose one retained design entrypoint plus optional `main()`
+- `design.py` should expose the retained execution entrypoint only; optional
+  debug/CLI helpers should live in a separate `design_debug.py`
 - `reference.py` should expose only `generate_golden_reference()`
 - `test.py` should expose `generate_test_params()` and one test method
 - `op.py` should keep the same operator-method surface as `mha`; any small
