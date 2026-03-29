@@ -83,6 +83,27 @@ _BLOCK2_TOPOLOGIES = {
 }
 
 
+def mha_out_proj_topologies(
+    *,
+    num_heads: int,
+    head_dim: int,
+) -> list[dict[str, int | str]]:
+    try:
+        topologies = _BLOCK2_TOPOLOGIES[(num_heads, head_dim)]
+    except KeyError as exc:
+        raise ValueError(
+            "Block 2 currently supports only the retained thesis families 1x64, 12x64, and 16x64"
+        ) from exc
+    return [
+        {
+            **candidate,
+            "topology_id": _mha_out_proj_topology_id(candidate),
+            "topology_family": "fused_mha_out_proj",
+        }
+        for candidate in topologies
+    ]
+
+
 def mha_out_proj_design(
     *,
     seq_len: int,
@@ -90,12 +111,7 @@ def mha_out_proj_design(
     head_dim: int,
     topology_id: str | None = None,
 ) -> dict[str, int | str]:
-    try:
-        topologies = _BLOCK2_TOPOLOGIES[(num_heads, head_dim)]
-    except KeyError as exc:
-        raise ValueError(
-            "Block 2 currently supports only the retained thesis families 1x64, 12x64, and 16x64"
-        ) from exc
+    topologies = mha_out_proj_topologies(num_heads=num_heads, head_dim=head_dim)
 
     if topology_id is None:
         config = topologies[0]
@@ -104,7 +120,7 @@ def mha_out_proj_design(
             config = next(
                 candidate
                 for candidate in topologies
-                if _mha_out_proj_topology_id(candidate) == topology_id
+                if str(candidate["topology_id"]) == topology_id
             )
         except StopIteration as exc:
             raise ValueError(
@@ -142,8 +158,8 @@ def mha_out_proj_design(
 
     return {
         **config,
-        "topology_id": _mha_out_proj_topology_id(config),
-        "topology_family": "fused_mha_out_proj",
+        "topology_id": str(config["topology_id"]),
+        "topology_family": str(config["topology_family"]),
     }
 
 

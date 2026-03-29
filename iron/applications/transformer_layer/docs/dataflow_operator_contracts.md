@@ -92,6 +92,8 @@ design entrypoint in
 [`iron/operators/qkv_proj/design.py`](/home/cj/iron/iron/operators/qkv_proj/design.py)
 and translates them into the shared-runtime GEMM wrapper used by
 [`iron/operators/qkv_proj/op.py`](/home/cj/iron/iron/operators/qkv_proj/op.py).
+That design file should also be the source of the retained topology list used by
+operator-local tests and future topology selection logic.
 
 ## Block 2
 
@@ -137,6 +139,8 @@ and translates them into the fused runtime wrapper in
 The retained `v2` surface is currently pinned to `parallel_seq=1`,
 `q_seq_tile=32`, `kv_seq_tile=64`, `parallel_heads=1`, and
 `o_proj_acc_depth=1`, with `emb_tile` selected per retained workload family.
+That design file should also be the source of the retained topology list used by
+operator-local tests and future topology selection logic.
 
 ## Block 3
 
@@ -174,6 +178,14 @@ The retained `v2` surface is currently pinned to `parallel_seq=1`,
 - `parallel_seq in {1, 2, 4, 6, 8}`
 - the retained topology's internal `compile_rows` must be divisible by
   `parallel_seq * tile_m`
+
+Block 3 currently resolves its retained thesis topologies through the single
+design entrypoint in
+[`iron/operators/addnorm_ffn_addnorm/design.py`](/home/cj/iron/iron/operators/addnorm_ffn_addnorm/design.py)
+and translates them into the pipelined wrapper in
+[`iron/operators/addnorm_ffn_addnorm/op.py`](/home/cj/iron/iron/operators/addnorm_ffn_addnorm/op.py).
+That design file should also be the source of the retained topology list used by
+operator-local tests and future topology selection logic.
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`

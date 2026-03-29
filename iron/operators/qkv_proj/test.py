@@ -10,7 +10,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from iron.operators.qkv_proj.design import qkv_proj_design
+from iron.operators.qkv_proj.design import qkv_proj_topologies
 from iron.operators.qkv_proj.op import AIEQKVProj
 from iron.operators.qkv_proj.reference import generate_golden_reference
 
@@ -24,22 +24,20 @@ def generate_test_params():
     ]
     params = []
     for seq_len, num_heads, head_dim in workloads:
-        topology_id = str(
-            qkv_proj_design(
-                seq_len=seq_len,
-                hidden_size=num_heads * head_dim,
-                num_heads=num_heads,
-            )["topology_id"]
-        )
-        params.append(
-            pytest.param(
-                seq_len,
-                num_heads,
-                head_dim,
-                topology_id,
-                id=f"block1_{seq_len}_{num_heads}_{head_dim}_{topology_id}",
+        for topology in qkv_proj_topologies(
+            hidden_size=num_heads * head_dim,
+            num_heads=num_heads,
+        ):
+            topology_id = str(topology["topology_id"])
+            params.append(
+                pytest.param(
+                    seq_len,
+                    num_heads,
+                    head_dim,
+                    topology_id,
+                    id=f"block1_{seq_len}_{num_heads}_{head_dim}_{topology_id}",
+                )
             )
-        )
     return params
 
 

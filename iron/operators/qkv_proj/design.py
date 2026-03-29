@@ -32,6 +32,30 @@ _BLOCK1_TOPOLOGIES = {
 }
 
 
+def qkv_proj_topologies(
+    *,
+    hidden_size: int,
+    num_heads: int,
+) -> list[dict[str, int | str]]:
+    if hidden_size % num_heads != 0:
+        raise ValueError("Block 1 requires hidden_size divisible by num_heads")
+    head_dim = hidden_size // num_heads
+    try:
+        topologies = _BLOCK1_TOPOLOGIES[(num_heads, head_dim)]
+    except KeyError as exc:
+        raise ValueError(
+            "Block 1 currently supports only the retained thesis families 12x64 and 16x64"
+        ) from exc
+    return [
+        {
+            **candidate,
+            "topology_id": _topology_id(candidate),
+            "topology_family": "shared_runtime_qkv_proj",
+        }
+        for candidate in topologies
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="Block 1 QKV Projector Design",
@@ -62,15 +86,8 @@ def qkv_proj_design(
     num_heads: int,
     topology_id: str | None = None,
 ) -> dict[str, int | str]:
-    if hidden_size % num_heads != 0:
-        raise ValueError("Block 1 requires hidden_size divisible by num_heads")
     head_dim = hidden_size // num_heads
-    try:
-        topologies = _BLOCK1_TOPOLOGIES[(num_heads, head_dim)]
-    except KeyError as exc:
-        raise ValueError(
-            "Block 1 currently supports only the retained thesis families 12x64 and 16x64"
-        ) from exc
+    topologies = qkv_proj_topologies(hidden_size=hidden_size, num_heads=num_heads)
 
     if topology_id is None:
         config = topologies[0]
@@ -79,9 +96,10 @@ def qkv_proj_design(
             config = next(
                 candidate
                 for candidate in topologies
-                if _topology_id(candidate) == topology_id
+                if str(candidate["topology_id"]) == topology_id
             )
         except StopIteration as exc:
+            head_dim = hidden_size // num_heads
             raise ValueError(
                 f"Unknown Block 1 topology_id={topology_id!r} for {num_heads}x{head_dim}"
             ) from exc
@@ -111,8 +129,8 @@ def qkv_proj_design(
 
     return {
         **config,
-        "topology_id": _topology_id(config),
-        "topology_family": "shared_runtime_qkv_proj",
+        "topology_id": str(config["topology_id"]),
+        "topology_family": str(config["topology_family"]),
     }
 
 

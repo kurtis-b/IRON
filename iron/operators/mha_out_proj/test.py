@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from iron.operators.mha_out_proj.design import mha_out_proj_design
+from iron.operators.mha_out_proj.design import mha_out_proj_topologies
 from iron.operators.mha_out_proj.op import AIEMHAOutProj
 from iron.operators.mha_out_proj.reference import generate_golden_reference
 from iron.common.test_utils import run_test
@@ -31,25 +31,23 @@ def generate_test_params():
     ]
     params = []
     for seq_len, head_dim, num_heads in workloads:
-        topology_id = str(
-            mha_out_proj_design(
-                seq_len=seq_len,
-                num_heads=num_heads,
-                head_dim=head_dim,
-            )["topology_id"]
-        )
-        params.append(
-            pytest.param(
-                seq_len,
-                head_dim,
-                num_heads,
-                topology_id,
-                id=(
-                    f"mha_out_proj_{num_heads}heads_{seq_len}seq_{head_dim}hdim_"
-                    f"{topology_id}"
-                ),
+        for topology in mha_out_proj_topologies(
+            num_heads=num_heads,
+            head_dim=head_dim,
+        ):
+            topology_id = str(topology["topology_id"])
+            params.append(
+                pytest.param(
+                    seq_len,
+                    head_dim,
+                    num_heads,
+                    topology_id,
+                    id=(
+                        f"mha_out_proj_{num_heads}heads_{seq_len}seq_{head_dim}hdim_"
+                        f"{topology_id}"
+                    ),
+                )
             )
-        )
 
     return params
 

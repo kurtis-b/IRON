@@ -36,6 +36,27 @@ _BLOCK3_TOPOLOGIES = {
 }
 
 
+def addnorm_ffn_addnorm_topologies(
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+) -> list[dict[str, int | str]]:
+    try:
+        topologies = _BLOCK3_TOPOLOGIES[(hidden_size, intermediate_size)]
+    except KeyError as exc:
+        raise ValueError(
+            "Block 3 currently supports only the retained thesis families 768/3072 and 1024/4096"
+        ) from exc
+    return [
+        {
+            **candidate,
+            "topology_id": _topology_id(candidate),
+            "topology_family": "pipelined_addnorm_ffn_addnorm",
+        }
+        for candidate in topologies
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="Block 3 AddNormFFNAddNorm Design",
@@ -66,12 +87,10 @@ def addnorm_ffn_addnorm_design(
     intermediate_size: int,
     topology_id: str | None = None,
 ) -> dict[str, int | str]:
-    try:
-        topologies = _BLOCK3_TOPOLOGIES[(hidden_size, intermediate_size)]
-    except KeyError as exc:
-        raise ValueError(
-            "Block 3 currently supports only the retained thesis families 768/3072 and 1024/4096"
-        ) from exc
+    topologies = addnorm_ffn_addnorm_topologies(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
 
     if topology_id is None:
         config = max(
@@ -86,7 +105,7 @@ def addnorm_ffn_addnorm_design(
             config = next(
                 candidate
                 for candidate in topologies
-                if _topology_id(candidate) == topology_id
+                if str(candidate["topology_id"]) == topology_id
             )
         except StopIteration as exc:
             raise ValueError(
@@ -132,8 +151,8 @@ def addnorm_ffn_addnorm_design(
 
     return {
         **config,
-        "topology_id": _topology_id(config),
-        "topology_family": "pipelined_addnorm_ffn_addnorm",
+        "topology_id": str(config["topology_id"]),
+        "topology_family": str(config["topology_family"]),
     }
 
 

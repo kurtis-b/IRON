@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from iron.operators.addnorm_ffn_addnorm.design import addnorm_ffn_addnorm_design
+from iron.operators.addnorm_ffn_addnorm.design import addnorm_ffn_addnorm_topologies
 from iron.operators.addnorm_ffn_addnorm.op import AIEAddNormFFNAddNorm
 from iron.operators.addnorm_ffn_addnorm.reference import generate_golden_reference
 
@@ -23,22 +23,20 @@ def generate_test_params():
     ]
     params = []
     for seq_len, hidden_size, intermediate_size in workloads:
-        topology_id = str(
-            addnorm_ffn_addnorm_design(
-                seq_len=seq_len,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-            )["topology_id"]
-        )
-        params.append(
-            pytest.param(
-                seq_len,
-                hidden_size,
-                intermediate_size,
-                topology_id,
-                id=f"block3_{seq_len}x{hidden_size}x{intermediate_size}_{topology_id}",
+        for topology in addnorm_ffn_addnorm_topologies(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        ):
+            topology_id = str(topology["topology_id"])
+            params.append(
+                pytest.param(
+                    seq_len,
+                    hidden_size,
+                    intermediate_size,
+                    topology_id,
+                    id=f"block3_{seq_len}x{hidden_size}x{intermediate_size}_{topology_id}",
+                )
             )
-        )
     return params
 
 
