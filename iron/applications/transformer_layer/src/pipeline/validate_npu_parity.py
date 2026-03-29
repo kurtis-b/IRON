@@ -26,6 +26,8 @@ REPO_ROOT = APP_DIR.parents[2]
 
 PARITY_FIELD_ORDER = [
     "study_id",
+    "study_case_id",
+    "study_case_label",
     "execution_mode",
     "seq_len",
     "hidden_size",

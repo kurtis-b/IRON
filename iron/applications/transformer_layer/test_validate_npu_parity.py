@@ -206,3 +206,41 @@ def test_run_parity_cli_writes_stable_topology_columns(tmp_path: Path, monkeypat
         header = next(csv.reader(handle))
 
     assert header == structured_parity_field_order
+
+
+def test_write_parity_rows_csv_accepts_manifest_case_columns(tmp_path: Path):
+    output_csv = tmp_path / "parity.csv"
+    structured_validate_npu_parity_module.write_parity_rows_csv(
+        output_csv,
+        [
+            {
+                "study_id": "study",
+                "study_case_id": "baseline_768",
+                "study_case_label": "baseline_768",
+                "execution_mode": "dataflow",
+                "seq_len": 64,
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_attention_heads": 12,
+                "attention_head_size": 64,
+                "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "block1_topology_family": "shared_runtime_qkv_proj",
+                "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+                "block2_topology_family": "fused_mha_out_proj",
+                "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
+                "block3_topology_family": "pipelined_addnorm_ffn_addnorm",
+                "batch_size": 1,
+                "dtype": "bfloat16",
+                "weights_source": "synthetic",
+                "seed": 7,
+                "max_abs_diff": 0.0,
+                "mean_abs_diff": 0.0,
+            }
+        ],
+    )
+
+    with output_csv.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert rows[0]["study_case_id"] == "baseline_768"
+    assert rows[0]["study_case_label"] == "baseline_768"
