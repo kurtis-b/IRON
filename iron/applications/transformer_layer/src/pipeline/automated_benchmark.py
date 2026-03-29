@@ -389,6 +389,7 @@ def _run_parity_checks(
                     row["intermediate_size"] = base_spec.intermediate_size
                     row["num_attention_heads"] = base_spec.num_attention_heads
                     row["attention_head_size"] = base_spec.attention_head_size
+                    row.update(_case_topology_exploration_metadata(case))
                 rows.extend(mode_rows)
     return rows
 

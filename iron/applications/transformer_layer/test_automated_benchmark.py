@@ -445,6 +445,12 @@ def test_run_parity_checks_forwards_requested_block_topology_ids(
             {
                 "case_id": "case",
                 "case_label": "case",
+                "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+                "exploration_block1_topology_family": "shared_runtime_qkv_proj_practical",
+                "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
+                "exploration_block2_topology_family": "fused_mha_out_proj_practical",
+                "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+                "exploration_block3_topology_family": "pipelined_addnorm_ffn_addnorm_practical",
                 "layer_spec": {
                     "hidden_size": 768,
                     "intermediate_size": 3072,
@@ -479,6 +485,12 @@ def test_run_parity_checks_forwards_requested_block_topology_ids(
     assert "--block2-topology-id" in command
     assert "--block3-topology-id" in command
     assert rows[0]["study_case_id"] == "case"
+    assert rows[0]["exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_ph1_pd4"
+    assert rows[0]["exploration_block2_topology_id"] == "q32_kv64_e96_ps1_ph6_acc1"
+    assert (
+        rows[0]["exploration_block3_topology_id"]
+        == "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1"
+    )
 
 
 def test_resolve_spec_applies_block_topology_id_overrides():

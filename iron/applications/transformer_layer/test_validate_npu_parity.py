@@ -171,6 +171,12 @@ def test_run_parity_cli_writes_stable_topology_columns(tmp_path: Path, monkeypat
                 "block2_topology_family": "fused_mha_out_proj",
                 "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
                 "block3_topology_family": "pipelined_addnorm_ffn_addnorm",
+                "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+                "exploration_block1_topology_family": "shared_runtime_qkv_proj_practical",
+                "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
+                "exploration_block2_topology_family": "fused_mha_out_proj_practical",
+                "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+                "exploration_block3_topology_family": "pipelined_addnorm_ffn_addnorm_practical",
                 "batch_size": 1,
                 "dtype": "bfloat16",
                 "weights_source": "synthetic",
@@ -229,6 +235,12 @@ def test_write_parity_rows_csv_accepts_manifest_case_columns(tmp_path: Path):
                 "block2_topology_family": "fused_mha_out_proj",
                 "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
                 "block3_topology_family": "pipelined_addnorm_ffn_addnorm",
+                "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+                "exploration_block1_topology_family": "shared_runtime_qkv_proj_practical",
+                "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
+                "exploration_block2_topology_family": "fused_mha_out_proj_practical",
+                "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+                "exploration_block3_topology_family": "pipelined_addnorm_ffn_addnorm_practical",
                 "batch_size": 1,
                 "dtype": "bfloat16",
                 "weights_source": "synthetic",
@@ -244,3 +256,9 @@ def test_write_parity_rows_csv_accepts_manifest_case_columns(tmp_path: Path):
 
     assert rows[0]["study_case_id"] == "baseline_768"
     assert rows[0]["study_case_label"] == "baseline_768"
+    assert rows[0]["exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_ph1_pd4"
+    assert rows[0]["exploration_block2_topology_id"] == "q32_kv64_e96_ps1_ph6_acc1"
+    assert (
+        rows[0]["exploration_block3_topology_id"]
+        == "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1"
+    )
