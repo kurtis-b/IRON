@@ -255,7 +255,11 @@ should also expose a pure-Python practical-topology exploration catalog that
 cross-products the three block-level practical surfaces into capped
 cross-block candidate combinations for future autotune/study generation,
 without pretending those broader practical IDs are already runnable through the
-retained runtime wrappers.
+retained runtime wrappers; that catalog should annotate which per-block and
+cross-block candidates are runtime-supported today, and when a study manifest
+requests `topology_exploration` the generated runnable `study_cases` should use
+the corresponding runtime topology IDs rather than raw non-runnable practical
+IDs.
 Study manifests may optionally request that same practical surface through a
 `topology_exploration` object layered on top of a single base `layer_spec`, but
 that expansion should currently be limited to single-`seq_len` manifests so the

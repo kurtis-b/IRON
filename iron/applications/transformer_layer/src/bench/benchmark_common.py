@@ -124,20 +124,27 @@ def _expand_practical_topology_study_cases(
         max_block2_candidates=topology_exploration.get("max_block2_candidates"),
         max_block3_candidates=topology_exploration.get("max_block3_candidates"),
         max_combinations=topology_exploration.get("max_combinations"),
+        runtime_only=True,
     )
     return [
         {
             "case_id": f"practical_{index:03d}",
             "case_label": (
-                f"b1={combo['block1_topology_id']}|"
-                f"b2={combo['block2_topology_id']}|"
-                f"b3={combo['block3_topology_id']}"
+                f"b1={combo['block1_runtime_topology_id'] or combo['block1_topology_id']}|"
+                f"b2={combo['block2_runtime_topology_id'] or combo['block2_topology_id']}|"
+                f"b3={combo['block3_runtime_topology_id'] or combo['block3_topology_id']}"
             ),
             "layer_spec": {
                 **base_spec.to_dict(),
-                "block1_topology_id": combo["block1_topology_id"],
-                "block2_topology_id": combo["block2_topology_id"],
-                "block3_topology_id": combo["block3_topology_id"],
+                "block1_topology_id": (
+                    combo["block1_runtime_topology_id"] or combo["block1_topology_id"]
+                ),
+                "block2_topology_id": (
+                    combo["block2_runtime_topology_id"] or combo["block2_topology_id"]
+                ),
+                "block3_topology_id": (
+                    combo["block3_runtime_topology_id"] or combo["block3_topology_id"]
+                ),
             },
         }
         for index, combo in enumerate(combinations)

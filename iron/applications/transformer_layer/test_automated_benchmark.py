@@ -185,6 +185,7 @@ def test_load_study_manifest_expands_practical_topology_exploration(tmp_path: Pa
         assert case["layer_spec"]["block1_topology_id"] is not None
         assert case["layer_spec"]["block2_topology_id"] is not None
         assert case["layer_spec"]["block3_topology_id"] is not None
+        assert not str(case["layer_spec"]["block3_topology_id"]).startswith("cr")
 
 
 def test_load_study_manifest_rejects_multiseq_topology_exploration(tmp_path: Path):
