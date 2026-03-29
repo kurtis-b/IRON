@@ -195,6 +195,12 @@ in benchmark outputs.
 Those topology fields should also be reserved in the shared transformer-layer
 result schema so benchmark CSVs expose them as stable columns rather than
 unordered extra metadata.
+
+At the study/app layer, retained topology selection should remain optional.
+`TransformerLayerSpec` may carry `block1_topology_id`, `block2_topology_id`, and
+`block3_topology_id` overrides so manifests and study cases can pin retained
+topologies explicitly; when omitted, each block should resolve its default
+retained topology through its local design entrypoint.
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`

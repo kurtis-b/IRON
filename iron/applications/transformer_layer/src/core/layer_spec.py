@@ -27,6 +27,9 @@ class TransformerLayerSpec:
     weights_source: str = "synthetic"
     source_model_name: str | None = None
     source_layer_index: int | None = None
+    block1_topology_id: str | None = None
+    block2_topology_id: str | None = None
+    block3_topology_id: str | None = None
 
     def __post_init__(self):
         if self.hidden_size <= 0:

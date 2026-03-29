@@ -7,8 +7,6 @@ from collections.abc import Mapping
 
 import torch
 
-from iron.operators.mha_out_proj.design import mha_out_proj_design
-
 from .input_bundle import TransformerLayerInputs
 from .layer_spec import TransformerLayerSpec
 
@@ -81,16 +79,6 @@ def require_keys(
     missing = [key for key in required_keys if key not in weights]
     if missing:
         raise KeyError(f"Missing required weight keys: {', '.join(missing)}")
-
-
-def resolve_mha_out_proj_topology(
-    spec: TransformerLayerSpec,
-) -> dict[str, int | str]:
-    return mha_out_proj_design(
-        seq_len=spec.seq_len,
-        num_heads=spec.num_attention_heads,
-        head_dim=spec.attention_head_size,
-    )
 
 
 def host_project_qkv_head_major(

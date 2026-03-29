@@ -23,7 +23,6 @@ from ..utils import (
     host_attention_output,
     host_project_qkv_head_major,
     require_keys,
-    resolve_mha_out_proj_topology,
 )
 
 
@@ -58,6 +57,7 @@ class Block1QKVProjPattern(_BaseBlockPattern):
             seq_len=spec.seq_len,
             hidden_size=spec.hidden_size,
             num_heads=spec.num_attention_heads,
+            topology_id=spec.block1_topology_id,
             context=self.context,
         )
 
@@ -122,12 +122,11 @@ class Block2MHAOutProjPattern(_BaseBlockPattern):
         super().__init__(spec)
         if spec.attention_head_size != 64:
             raise ValueError("Block 2 currently supports attention_head_size=64 only")
-        block2_topology = resolve_mha_out_proj_topology(spec)
         self.block = AIEMHAOutProj(
             num_heads=spec.num_attention_heads,
             seq_len=spec.seq_len,
             d=spec.attention_head_size,
-            topology_id=str(block2_topology["topology_id"]),
+            topology_id=spec.block2_topology_id,
             static_weights=True,
             context=self.context,
         )
@@ -203,6 +202,7 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
             seq_len=spec.seq_len,
             hidden_size=spec.hidden_size,
             intermediate_size=spec.intermediate_size,
+            topology_id=spec.block3_topology_id,
             context=self.context,
         )
         self._weights: dict[str, torch.Tensor] | None = None

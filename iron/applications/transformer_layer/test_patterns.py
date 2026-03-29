@@ -20,6 +20,9 @@ from iron.applications.transformer_layer.src.patterns import (
     DataflowPattern as StructuredDataflowPattern,
 )
 from iron.applications.transformer_layer.src.patterns import GemmOnlyPattern
+from iron.operators.addnorm_ffn_addnorm.design import addnorm_ffn_addnorm_topologies
+from iron.operators.mha_out_proj.design import mha_out_proj_topologies
+from iron.operators.qkv_proj.design import qkv_proj_topologies
 from iron.applications.transformer_layer.src.utils import (
     make_in_process_npu_metadata,
     make_synthetic_layer_inputs,
@@ -119,6 +122,40 @@ def test_dataflow_patterns_report_selected_block_topologies_in_metadata():
         block2_metadata["block2_topology_family"]
         == block2_pattern.block.topology_family
     )
+
+
+def test_build_pattern_honors_block_topology_overrides():
+    spec = TransformerLayerSpec(
+        seq_len=64,
+        block1_topology_id=str(
+            qkv_proj_topologies(hidden_size=768, num_heads=12)[0]["topology_id"]
+        ),
+        block2_topology_id=str(
+            mha_out_proj_topologies(num_heads=12, head_dim=64)[0]["topology_id"]
+        ),
+        block3_topology_id=str(
+            addnorm_ffn_addnorm_topologies(
+                hidden_size=768,
+                intermediate_size=3072,
+            )[
+                0
+            ]["topology_id"]
+        ),
+    )
+
+    dataflow_pattern = build_pattern("dataflow", spec)
+    assert dataflow_pattern.block1.topology_id == spec.block1_topology_id
+    assert dataflow_pattern.block2.topology_id == spec.block2_topology_id
+    assert dataflow_pattern.block3.topology_id == spec.block3_topology_id
+
+    block1_pattern = build_pattern("block1_qkv_proj", spec)
+    assert block1_pattern.block.topology_id == spec.block1_topology_id
+
+    block2_pattern = build_pattern("block2_mha_out_proj", spec)
+    assert block2_pattern.block.topology_id == spec.block2_topology_id
+
+    block3_pattern = build_pattern("block3_addnorm_ffn_addnorm", spec)
+    assert block3_pattern.block.topology_id == spec.block3_topology_id
 
 
 def test_block1_contract_reshapes_projection_outputs_to_head_major():
