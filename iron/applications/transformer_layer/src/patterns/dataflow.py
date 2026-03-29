@@ -145,11 +145,10 @@ class DataflowPattern(nn.Module):
             if artifact is not None and getattr(artifact, "path", None) is not None:
                 artifact_set.add(str(artifact.path))
 
-        maybe_add_artifact_path(unique_insts, self.block1.qkv_proj.insts_artifact)
+        maybe_add_artifact_path(unique_insts, self.block1.insts_artifact)
         maybe_add_artifact_path(
             unique_xclbins,
-            self.block1.qkv_proj.runtime_xclbin_artifact
-            or self.block1.qkv_proj.xclbin_artifact,
+            self.block1.runtime_xclbin_artifact or self.block1.xclbin_artifact,
         )
         maybe_add_artifact_path(unique_insts, self.block2.insts_artifact)
         maybe_add_artifact_path(unique_xclbins, self.block2.xclbin_artifact)
