@@ -6,6 +6,7 @@ import csv
 import subprocess
 from types import SimpleNamespace
 
+import iron.applications.transformer_layer.src.pipeline.automated_benchmark as structured_automated_benchmark_module
 from iron.applications.transformer_layer.automated_benchmark import (
     _record_parity_results,
 )
@@ -38,6 +39,9 @@ from iron.applications.transformer_layer.src.pipeline.automated_benchmark import
 )
 from iron.applications.transformer_layer.src.pipeline.automated_benchmark import (
     _run_parity_checks as structured_run_parity_checks,
+)
+from iron.applications.transformer_layer.src.pipeline.automated_benchmark import (
+    run_manifest_benchmark as structured_run_manifest_benchmark,
 )
 from iron.applications.transformer_layer.src.pipeline import (
     _record_parity_results as structured_record_parity_results,
@@ -373,3 +377,106 @@ def test_resolve_spec_applies_block_topology_id_overrides():
     assert spec.block1_topology_id == "m64_k64_n16_ps1_ph1_pd1"
     assert spec.block2_topology_id == "q32_kv64_e96_ps1_ph1_acc1"
     assert spec.block3_topology_id == "m32_k96_n64_ps4_pi3_d8_g1"
+
+
+def test_run_manifest_benchmark_records_timeout_rows_when_continue_on_error(
+    tmp_path: Path, monkeypatch
+):
+    manifest_path = tmp_path / "study.json"
+    output_csv = tmp_path / "results.csv"
+    debug_log_csv = tmp_path / "debug.csv"
+    manifest_path.write_text(
+        """
+        {
+          "study_id": "study",
+          "study_cases": [
+            {
+              "case_id": "baseline_768",
+              "case_label": "baseline_768",
+              "layer_spec": {
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_attention_heads": 12
+              }
+            }
+          ],
+          "execution_modes": ["dataflow", "runlist"],
+          "seq_lens": [16384],
+          "continue_on_error": true,
+          "output_csv": "results.csv",
+          "debug_log_csv": "debug.csv"
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    def fake_benchmark_pattern(**kwargs):
+        if kwargs["execution_mode"] == "dataflow":
+            raise RuntimeError("runlist failed execution (ERT_CMD_STATE_TIMEOUT)")
+        return [
+            {
+                "backend": "npu",
+                "execution_mode": kwargs["execution_mode"],
+                "pattern_label": kwargs["execution_mode"],
+                "seq_len": kwargs["spec"].seq_len,
+                "batch_size": kwargs["spec"].batch_size,
+                "dtype": kwargs["spec"].dtype,
+                "weights_source": kwargs["spec"].weights_source,
+                "warmup_runs": kwargs["warmup_runs"],
+                "runs_per_sample": kwargs["runs_per_sample"],
+                "measured_inference_count": 1,
+                "timed_total_sec": 0.01,
+                "avg_latency_ms": 10.0,
+            }
+        ]
+
+    monkeypatch.setattr(
+        structured_automated_benchmark_module,
+        "benchmark_pattern",
+        fake_benchmark_pattern,
+    )
+
+    structured_run_manifest_benchmark(
+        SimpleNamespace(
+            study_manifest=str(manifest_path),
+            execution_modes="dataflow,runlist,gemm_offload",
+            seq_lens="64,128,256,512",
+            output_csv="transformer_layer_npu_suite.csv",
+            debug_log_csv=None,
+            peak_reference=None,
+            annotated_output_csv=None,
+            warmup_runs=None,
+            runs_per_sample=None,
+            seed=0,
+            power_backend="none",
+            power_sample_interval_sec=0.05,
+            quiescent_baseline_duration_sec=0.5,
+            run_parity_check=False,
+            skip_parity_check=False,
+            parity_output_csv=None,
+            hidden_size=None,
+            intermediate_size=None,
+            num_attention_heads=None,
+            block1_topology_id=None,
+            block2_topology_id=None,
+            block3_topology_id=None,
+            enable_measurement_log=False,
+            measurement_log_path=None,
+        )
+    )
+
+    with output_csv.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 2
+    failed_row = next(row for row in rows if row["execution_mode"] == "dataflow")
+    completed_row = next(row for row in rows if row["execution_mode"] == "runlist")
+
+    assert failed_row["run_status"] == "failed"
+    assert failed_row["failure_component"] == "runtime_execution"
+    assert failed_row["failure_category"] == "runtime_timeout"
+    assert completed_row["run_status"] == "completed"
+
+    debug_text = debug_log_csv.read_text(encoding="utf-8")
+    assert "benchmark_case_failed" in debug_text
+    assert "study_completed" in debug_text

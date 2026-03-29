@@ -40,7 +40,10 @@ For the retained Dataflow studies, the checked-in manifests pin the intended
 the `768 / 3072 / 12` and `1024 / 4096 / 16` families. Manifest loading
 normalizes those `layer_spec` payloads through `TransformerLayerSpec`, so both
 checked-in and ad hoc studies are validated against the same retained layer
-surface before benchmarking starts.
+surface before benchmarking starts. The checked-in long-ladder NPU manifests
+also use `continue_on_error=true` so known retained runtime failures are
+recorded as failure rows and support-matrix entries instead of aborting the
+entire study sweep.
 
 Retained model families:
 

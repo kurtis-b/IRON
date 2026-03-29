@@ -74,6 +74,15 @@ def classify_debug_exception(exc: Exception) -> dict[str, str]:
     symptom = f"{type(exc).__name__}: {exc}"
     lowered = symptom.lower()
 
+    if "ert_cmd_state_timeout" in lowered or "runlist failed execution" in lowered:
+        return {
+            "component": "runtime_execution",
+            "challenge": "runtime_timeout",
+            "symptom": symptom,
+            "impact_on_experiment": "The requested benchmark case ran longer than the current runtime would allow.",
+            "mitigation": "Retile the case, reduce the sequence length, or record the point as a timed-out failure row for the current retained surface.",
+            "status": "open",
+        }
     if "currently supports only" in lowered or "currently requires" in lowered:
         return {
             "component": "pattern_surface",

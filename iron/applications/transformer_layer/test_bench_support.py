@@ -15,6 +15,9 @@ from iron.applications.transformer_layer.src.bench import (
     MeasurementAuditLogger as StructuredMeasurementAuditLogger,
 )
 from iron.applications.transformer_layer.src.bench import (
+    classify_debug_exception as structured_classify_debug_exception,
+)
+from iron.applications.transformer_layer.src.bench import (
     default_measurement_log_path as structured_default_measurement_log_path,
 )
 from iron.applications.transformer_layer.src.bench import (
@@ -53,3 +56,12 @@ def test_bench_support_restructure_preserves_legacy_imports_and_behavior(
         card_label="card0",
     )
     assert parsed == 12.5
+
+
+def test_classify_debug_exception_recognizes_runtime_timeout():
+    event = structured_classify_debug_exception(
+        RuntimeError("runlist failed execution (ERT_CMD_STATE_TIMEOUT)")
+    )
+
+    assert event["component"] == "runtime_execution"
+    assert event["challenge"] == "runtime_timeout"

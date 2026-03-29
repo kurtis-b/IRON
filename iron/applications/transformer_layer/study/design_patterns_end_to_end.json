@@ -57,6 +57,7 @@
     "gemm_offload"
   ],
   "seq_lens": [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384],
+  "continue_on_error": true,
   "warmup_runs": 6,
   "runs_per_sample": 24,
   "sampling_schedule": {
