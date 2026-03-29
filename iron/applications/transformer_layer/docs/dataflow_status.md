@@ -121,9 +121,15 @@ Current runtime-supported surface:
 
 - `768 / 3072`
   - `cr128_m32_k96_n64_c8_ps2_pi6_d8_g1`
+  - `cr128_m32_k96_n64_c8_ps2_pi6_d8_g0`
   - `cr128_m32_k96_n64_c8_ps4_pi3_d8_g1`
+  - `cr128_m32_k96_n64_c8_ps4_pi3_d8_g0`
 - `1024 / 4096`
   - `cr128_m32_k128_n32_c8_ps4_pi2_d8_g1`
+  - `cr128_m32_k128_n32_c8_ps4_pi2_d8_g0`
+- `2048 / 8192`
+  - `cr128_m32_k64_n64_c8_ps2_pi4_d8_g1`
+  - `cr128_m32_k64_n64_c8_ps2_pi4_d8_g0`
 
 Verified today:
 
@@ -133,18 +139,30 @@ Verified today:
   - compile coverage
   - focused helper/layout tests
   - a `seq_len=64` runtime smoke through Dataflow
-- the full Block 3 runtime-supported surface is not yet numerically verified
-  against the Block 3 golden reference
+- the full Block 3 runtime-supported surface is numerically verified against
+  the Block 3 golden reference in
+  `iron/operators/addnorm_ffn_addnorm/test.py`
+- Block 3 now fingerprints `ln1_weight` and `ln2_weight` into its artifact
+  names because those layer-norm weights are compile-time constants embedded
+  into the generated MLIR/xclbin; without that, different test cases with the
+  same topology could incorrectly reuse stale compiled artifacts
+- the established `768 / 3072` and `1024 / 4096` families, including their
+  `gelu_stage=0` retained variants, currently pass the numerical operator test
+  matrix
+- the retained `2048 / 8192` family, including both `gelu_stage` variants,
+  now also passes the numerical operator test matrix
+- the full Block 3 numerical matrix in
+  `iron/operators/addnorm_ffn_addnorm/test.py::test_addnorm_ffn_addnorm`
+  currently passes end-to-end
 
 Work left:
 
-- add per-topology functional verification for the runtime-supported Block 3
-  surface
-- widen runtime support beyond the current retained signatures
-- validate whether `gelu_stage=0` should remain theoretical-only or become
-  runtime-supported
-- generalize beyond the retained `768 / 3072` and `1024 / 4096` families if
-  broader thesis families are needed
+- broaden support beyond the retained `768/3072`, `1024/4096`, and
+  `2048/8192` families
+- continue promoting additional theoretical/practical Block 3 topologies only
+  after the standalone runtime proves them constructible and numerically sound
+- broaden Dataflow-level Block 2 -> Block 3 verification now that the packed
+  handoff and the multi-group Block 3 runtime are both functional
 
 ## Cross-block and App-Layer Work
 
@@ -173,7 +191,7 @@ Work left:
 
 The highest-signal next verification work is:
 
-1. add numerical Block 3 functional tests for every runtime-supported topology
-2. add broader Block 2 packed-output verification when paired with Block 3
+1. add broader Block 2 packed-output verification when paired with Block 3
+2. add a checked-in study that exercises the practical topology-exploration path
 3. only then continue promoting additional practical/theoretical topologies into
    runtime-supported surfaces

@@ -325,17 +325,40 @@ faceting surface.
 Block 3 currently validates those constraints through the single design
 entrypoint in
 [`iron/operators/addnorm_ffn_addnorm/design.py`](/home/cj/iron/iron/operators/addnorm_ffn_addnorm/design.py)
-and then translates the thesis-facing topology into the imported
-`ffn_addnorm` runtime parameters. Shorter total `seq_len` values are still
-allowed because the imported runtime pads and chunks the final row block.
-The current retained Block 3 topology sweep widens only the lane-distribution
-axes already exercised by the imported `ffn_addnorm` design coverage, so the
-retained `768/3072` family now explores both `parallel_seq=2, parallel_int_dim=6`
-and `parallel_seq=4, parallel_int_dim=3` while keeping the validated
-runtime signature families fixed; the broader theoretical surface still
-enumerates other legal tile/lane/staging combinations, but the practical
-surface should stay on the currently validated imported `ffn_addnorm`
-signatures until that runtime proves additional families.
+and resolves the thesis-facing topology directly into the local pipelined
+Block 3 runtime. Shorter total `seq_len` values are still allowed because the
+runtime pads and chunks the final row blocks against the retained
+`compile_rows` capacity. The retained runtime surface currently includes:
+- `768/3072` with `parallel_seq=2, parallel_int_dim=6`, `gelu_stage in {0,1}`
+- `768/3072` with `parallel_seq=4, parallel_int_dim=3`, `gelu_stage in {0,1}`
+- `1024/4096` with `parallel_seq=4, parallel_int_dim=2`, `gelu_stage in {0,1}`
+- `2048/8192` with `parallel_seq=2, parallel_int_dim=4`, `gelu_stage in {0,1}`
+The broader theoretical surface still enumerates other legal
+tile/lane/staging combinations, but the practical surface should stay on the
+currently validated standalone signatures until the runtime proves additional
+families.
+Because `ln1_weight` and `ln2_weight` are compile-time constants embedded into
+the generated Block 3 MLIR/xclbin, Block 3 artifact names must include a
+deterministic fingerprint of those two weight tensors so tests and studies do
+not accidentally reuse stale compiled artifacts across different retained
+workloads.
+For grouped Block 3 families where `hidden_size / tile_k` exceeds
+`down_proj_depth`, the standalone runtime now uses a row-tile-local three-phase
+design rather than a banked LN2 design:
+- for one row tile, LN2 first consumes a full-width packed `[A | R]` prepass
+  and caches LN1 row statistics locally
+- next, for each `col_group`, LN1 regenerates the full-width stage-1 stream for
+  FFN while LN2 independently regenerates only the active group and accumulates
+  LN2 row statistics locally from `down + stage1`
+- finally, for each `col_group`, LN1/FFN recompute that group and LN2
+  regenerates only the active group again and emits that group's output slice
+Under this contract, `parallel_seq` duplicates the whole
+`AN1 -> Up-proj -> Down-proj -> AN2` pipeline across the array. If one pipeline
+still covers multiple row tiles because `compile_rows / (parallel_seq * tile_m)
+> 1`, those row tiles are processed sequentially through the three phases
+rather than through separate LN2 stats banks. LN2 therefore owns both LN1 and
+LN2 cached row statistics locally, and the grouped runtime no longer depends on
+a down-proj-to-LN2 statistics handoff.
 That design file should also expose three distinct topology views:
 - the narrow retained runtime-supported topology list used by operator tests and
   benchmark manifests

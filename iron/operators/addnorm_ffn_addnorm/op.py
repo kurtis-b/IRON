@@ -198,6 +198,22 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                                 "passThroughTile": "ln_passThroughTile",
                             },
                         ),
+                        KernelObjectArtifact.new(
+                            f"ln_passThrough_f32_{self.tile_m}x{self.tile_k}x{self.tile_n}.o",
+                            extra_flags=["-DBIT_WIDTH=32"],
+                            depends=[
+                                SourceArtifact.new(
+                                    base_dir
+                                    / "aie_kernels"
+                                    / "generic"
+                                    / "passThrough.cc"
+                                )
+                            ],
+                            rename_symbols={
+                                "passThroughLine": "ln_passThroughLine_f32",
+                                "passThroughTile": "ln_passThroughTile_f32",
+                            },
+                        ),
                     ],
                 ),
             ],

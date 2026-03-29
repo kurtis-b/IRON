@@ -29,9 +29,31 @@ _BLOCK3_TOPOLOGIES = {
             "tile_n": 64,
             "down_proj_depth": 8,
             "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 6,
+            "gelu_stage": 0,
+        },
+        {
+            "compile_rows": 128,
+            "tile_m": 32,
+            "tile_k": 96,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
             "parallel_seq": 4,
             "parallel_int_dim": 3,
             "gelu_stage": 1,
+        },
+        {
+            "compile_rows": 128,
+            "tile_m": 32,
+            "tile_k": 96,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 3,
+            "gelu_stage": 0,
         },
     ],
     (1024, 4096): [
@@ -45,7 +67,42 @@ _BLOCK3_TOPOLOGIES = {
             "parallel_seq": 4,
             "parallel_int_dim": 2,
             "gelu_stage": 1,
-        }
+        },
+        {
+            "compile_rows": 128,
+            "tile_m": 32,
+            "tile_k": 128,
+            "tile_n": 32,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 2,
+            "gelu_stage": 0,
+        },
+    ],
+    (2048, 8192): [
+        {
+            "compile_rows": 128,
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 1,
+        },
+        {
+            "compile_rows": 128,
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 0,
+        },
     ],
 }
 
@@ -71,7 +128,7 @@ def addnorm_ffn_addnorm_topologies(
         topologies = _BLOCK3_TOPOLOGIES[(hidden_size, intermediate_size)]
     except KeyError as exc:
         raise ValueError(
-            "Block 3 currently supports only the retained thesis families 768/3072 and 1024/4096"
+            "Block 3 currently supports only the retained thesis families 768/3072, 1024/4096, and 2048/8192"
         ) from exc
     return [
         {
@@ -142,10 +199,10 @@ def _addnorm_ffn_addnorm_theoretical_topologies_cached(
         if intermediate_size % (tile_n * parallel_int_dim) != 0:
             continue
 
-        down_proj_depth = hidden_size // tile_k
         if hidden_size % tile_k != 0:
             continue
-        if down_proj_depth <= 0:
+        k_tiles = hidden_size // tile_k
+        if k_tiles <= 0:
             continue
 
         if (
@@ -154,29 +211,35 @@ def _addnorm_ffn_addnorm_theoretical_topologies_cached(
         ):
             continue
 
-        for compile_rows in _block3_compile_row_candidates(
-            seq_len=seq_len,
-            parallel_seq=parallel_seq,
-            tile_m=tile_m,
-        ):
-            candidate = {
-                "compile_rows": compile_rows,
-                "tile_m": tile_m,
-                "tile_k": tile_k,
-                "tile_n": tile_n,
-                "down_proj_depth": down_proj_depth,
-                "num_aie_columns": num_aie_columns,
-                "parallel_seq": parallel_seq,
-                "parallel_int_dim": parallel_int_dim,
-                "gelu_stage": gelu_stage,
-            }
-            topologies.append(
-                {
-                    **candidate,
-                    "topology_id": _theoretical_topology_id(candidate),
-                    "topology_family": "pipelined_addnorm_ffn_addnorm_theoretical",
+        for down_proj_depth in _divisors(k_tiles):
+            if down_proj_depth <= 0:
+                continue
+            if k_tiles % down_proj_depth != 0:
+                continue
+
+            for compile_rows in _block3_compile_row_candidates(
+                seq_len=seq_len,
+                parallel_seq=parallel_seq,
+                tile_m=tile_m,
+            ):
+                candidate = {
+                    "compile_rows": compile_rows,
+                    "tile_m": tile_m,
+                    "tile_k": tile_k,
+                    "tile_n": tile_n,
+                    "down_proj_depth": down_proj_depth,
+                    "num_aie_columns": num_aie_columns,
+                    "parallel_seq": parallel_seq,
+                    "parallel_int_dim": parallel_int_dim,
+                    "gelu_stage": gelu_stage,
                 }
-            )
+                topologies.append(
+                    {
+                        **candidate,
+                        "topology_id": _theoretical_topology_id(candidate),
+                        "topology_family": "pipelined_addnorm_ffn_addnorm_theoretical",
+                    }
+                )
 
     return tuple(topologies)
 
@@ -323,6 +386,10 @@ def addnorm_ffn_addnorm_design(
         )
     if down_proj_depth <= 0:
         raise ValueError("Block 3 requires down_proj_depth > 0")
+    if (hidden_size // tile_k) % down_proj_depth != 0:
+        raise ValueError(
+            "Block 3 requires hidden_size / tile_k to be divisible by down_proj_depth"
+        )
     if gelu_stage not in (0, 1):
         raise ValueError("Block 3 requires gelu_stage to be 0 or 1")
     if not 1 <= num_aie_columns <= 8:

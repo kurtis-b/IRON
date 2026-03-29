@@ -51,6 +51,8 @@ def generate_test_params():
         (512, 768, 3072),
         (64, 1024, 4096),
         (512, 1024, 4096),
+        (64, 2048, 8192),
+        (512, 2048, 8192),
     ]
     params = []
     for seq_len, hidden_size, intermediate_size in workloads:
