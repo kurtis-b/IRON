@@ -192,6 +192,9 @@ operator-local tests and future topology selection logic.
 Study metadata emitted by the in-process Dataflow patterns should include the
 selected block topology IDs and families so retained topology choices are visible
 in benchmark outputs.
+Those topology fields should also be reserved in the shared transformer-layer
+result schema so benchmark CSVs expose them as stable columns rather than
+unordered extra metadata.
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`
