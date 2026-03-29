@@ -108,7 +108,7 @@ _BLOCK2_PRACTICAL_MIN_Q_SEQ_TILE = 32
 _BLOCK2_PRACTICAL_MIN_KV_SEQ_TILE = 64
 _BLOCK2_PRACTICAL_MIN_EMB_TILE = 64
 _BLOCK2_PRACTICAL_MIN_LANE_PARALLELISM = 2
-_BLOCK2_PRACTICAL_MIN_SEQUENCE_CHUNK = 64
+_BLOCK2_PRACTICAL_MIN_SEQUENCE_CHUNK = 32
 _BLOCK2_PRACTICAL_MAX_CANDIDATES = 64
 
 
@@ -422,14 +422,12 @@ def _block2_stage_working_set_bytes(
 
 
 def _is_block2_practical_candidate(candidate: dict[str, int | str]) -> bool:
-    parallel_seq = int(candidate["parallel_seq"])
-    parallel_heads = int(candidate["parallel_heads"])
     q_seq_tile = int(candidate["q_seq_tile"])
     kv_seq_tile = int(candidate["kv_seq_tile"])
     emb_tile = int(candidate["emb_tile"])
 
-    lane_parallelism = parallel_seq * parallel_heads
-    sequence_chunk = parallel_seq * q_seq_tile
+    lane_parallelism = _block2_effective_lowered_parallelism(candidate)
+    sequence_chunk = _block2_effective_sequence_chunk(candidate)
     return (
         q_seq_tile >= _BLOCK2_PRACTICAL_MIN_Q_SEQ_TILE
         and kv_seq_tile >= _BLOCK2_PRACTICAL_MIN_KV_SEQ_TILE
@@ -445,14 +443,14 @@ def _block2_practical_sort_key(
     head_dim: int = 64,
 ) -> tuple[int, ...]:
     parallel_seq = int(candidate["parallel_seq"])
-    parallel_heads = int(candidate["parallel_heads"])
     q_seq_tile = int(candidate["q_seq_tile"])
     kv_seq_tile = int(candidate["kv_seq_tile"])
     emb_tile = int(candidate["emb_tile"])
     o_proj_acc_depth = int(candidate["o_proj_acc_depth"])
 
-    lane_parallelism = parallel_seq * parallel_heads
-    sequence_chunk = parallel_seq * q_seq_tile
+    runtime_lowering_bonus = int(parallel_seq == 1)
+    lane_parallelism = _block2_effective_lowered_parallelism(candidate)
+    sequence_chunk = _block2_effective_sequence_chunk(candidate)
     output_chunk = emb_tile * o_proj_acc_depth
     working_set = _block2_stage_working_set_bytes(
         q_seq_tile=q_seq_tile,
@@ -462,15 +460,25 @@ def _block2_practical_sort_key(
     )
 
     return (
+        runtime_lowering_bonus,
         lane_parallelism,
         kv_seq_tile,
         sequence_chunk,
         emb_tile,
         output_chunk,
+        -parallel_seq,
         -o_proj_acc_depth,
         working_set,
         q_seq_tile,
     )
+
+
+def _block2_effective_lowered_parallelism(candidate: dict[str, int | str]) -> int:
+    return int(candidate["parallel_heads"])
+
+
+def _block2_effective_sequence_chunk(candidate: dict[str, int | str]) -> int:
+    return int(candidate["q_seq_tile"])
 
 
 def main():

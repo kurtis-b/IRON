@@ -254,6 +254,27 @@ def test_practical_block2_topologies_include_retained_runtime_surface():
         )
     }
     assert "q32_kv64_e128_ps1_ph1_acc1" in practical_ids
+    assert "q32_kv64_e128_ps1_ph2_acc1" in practical_ids
+
+
+def test_practical_block2_topologies_prioritize_real_lowered_axes():
+    practical_ids = [
+        str(topology["topology_id"])
+        for topology in mha_out_proj_practical_topologies(
+            seq_len=2048,
+            num_heads=16,
+            head_dim=64,
+        )
+    ]
+
+    promoted_parallel_head = "q32_kv64_e128_ps1_ph2_acc1"
+    unreal_parallel_seq = "q32_kv128_e128_ps8_ph1_acc1"
+
+    assert promoted_parallel_head in practical_ids
+    if unreal_parallel_seq in practical_ids:
+        assert practical_ids.index(promoted_parallel_head) < practical_ids.index(
+            unreal_parallel_seq
+        )
 
 
 def test_practical_block2_topologies_are_ranked_and_pruned():
@@ -269,16 +290,14 @@ def test_practical_block2_topologies_are_ranked_and_pruned():
         reverse=True,
     )
     for topology in practical:
-        lane_parallelism = int(topology["parallel_seq"]) * int(
-            topology["parallel_heads"]
-        )
-        sequence_chunk = int(topology["parallel_seq"]) * int(topology["q_seq_tile"])
+        lane_parallelism = int(topology["parallel_heads"])
+        sequence_chunk = int(topology["q_seq_tile"])
         if str(topology["topology_id"]) != "q32_kv64_e128_ps1_ph1_acc1":
             assert int(topology["q_seq_tile"]) >= 32
             assert int(topology["kv_seq_tile"]) >= 64
             assert int(topology["emb_tile"]) >= 64
             assert lane_parallelism >= 2
-            assert sequence_chunk >= 64
+            assert sequence_chunk >= 32
         assert topology["topology_family"] == "fused_mha_out_proj_practical"
 
     practical_ids = {str(topology["topology_id"]) for topology in practical}

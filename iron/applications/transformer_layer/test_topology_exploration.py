@@ -81,3 +81,25 @@ def test_practical_layer_topology_combinations_support_global_truncation():
     )
 
     assert len(combinations) == 3
+
+
+def test_practical_block2_catalog_prefers_real_lowered_axes():
+    spec = TransformerLayerSpec(
+        hidden_size=768,
+        intermediate_size=3072,
+        num_attention_heads=12,
+        seq_len=512,
+    )
+
+    catalog = practical_block_topology_catalog(
+        spec,
+        max_block1_candidates=1,
+        max_block2_candidates=2,
+        max_block3_candidates=1,
+    )
+
+    block2_ids = [row["topology_id"] for row in catalog["block2"]]
+
+    assert len(block2_ids) == 2
+    assert all("_ps1_" in topology_id for topology_id in block2_ids)
+    assert "q32_kv128_e128_ps8_ph1_acc1" not in block2_ids

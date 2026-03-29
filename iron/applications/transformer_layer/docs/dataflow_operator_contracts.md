@@ -172,7 +172,9 @@ That design file should expose three distinct topology views:
 - a heuristic-pruned practical exploration surface that favors higher sequence
   and head parallelism, larger Q/KV/output tiles, larger sequence and output
   chunks, and fuller per-stage local-memory utilization while still retaining
-  the baseline runtime-supported study topologies
+  the baseline runtime-supported study topologies; until `parallel_seq` grows a
+  true lowering, that practical ranking should prefer real lowered axes such as
+  `parallel_heads` over paper-only `parallel_seq` gains
 The checked-in study manifests should continue to pin the baseline retained
 topology IDs for reproducibility even as that broader theoretical exploration
 surface grows.
