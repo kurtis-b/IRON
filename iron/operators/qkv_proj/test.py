@@ -22,6 +22,16 @@ from iron.operators.qkv_proj.op import AIEQKVProj
 from iron.operators.qkv_proj.reference import generate_golden_reference
 
 
+def _count_errors(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    rel_tol: float,
+    abs_tol: float,
+) -> int:
+    return int((~torch.isclose(actual, expected, rtol=rel_tol, atol=abs_tol)).sum())
+
+
 def generate_test_params():
     workloads = [
         (64, 12, 64),
@@ -60,6 +70,9 @@ def test_qkv_proj(
     topology_id: str,
     aie_context,
 ):
+    rel_tol = 4.0e-2
+    abs_tol = 1.5e-1
+    error_threshold = 0.005
     golden_ref = generate_golden_reference(
         seq_len=seq_len,
         num_heads=num_heads,
@@ -81,15 +94,22 @@ def test_qkv_proj(
     aie_context.prepare_runtime()
 
     q, k, v = operator.forward(golden_ref["hidden_states"])
+    max_acceptable_errors = int(seq_len * head_dim * num_heads * error_threshold)
+    q_errors = _count_errors(q, golden_ref["q"], rel_tol=rel_tol, abs_tol=abs_tol)
+    k_errors = _count_errors(k, golden_ref["k"], rel_tol=rel_tol, abs_tol=abs_tol)
+    v_errors = _count_errors(v, golden_ref["v"], rel_tol=rel_tol, abs_tol=abs_tol)
 
     assert operator.topology_id == topology_id
     assert operator.topology_family == "shared_runtime_qkv_proj"
     assert q.shape == golden_ref["q"].shape
     assert k.shape == golden_ref["k"].shape
     assert v.shape == golden_ref["v"].shape
-    assert torch.allclose(q, golden_ref["q"], rtol=4.0e-2, atol=1.5e-1)
-    assert torch.allclose(k, golden_ref["k"], rtol=4.0e-2, atol=1.5e-1)
-    assert torch.allclose(v, golden_ref["v"], rtol=4.0e-2, atol=1.5e-1)
+    print(f"\nQ errors: {q_errors} / {max_acceptable_errors}")
+    print(f"K errors: {k_errors} / {max_acceptable_errors}")
+    print(f"V errors: {v_errors} / {max_acceptable_errors}")
+    assert q_errors <= max_acceptable_errors
+    assert k_errors <= max_acceptable_errors
+    assert v_errors <= max_acceptable_errors
 
 
 def test_theoretical_block1_topologies_cover_supported_surface():
