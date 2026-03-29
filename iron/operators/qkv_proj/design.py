@@ -25,6 +25,7 @@ _BLOCK1_RETAINED_AXES = {
 }
 
 _BLOCK1_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
+_BLOCK1_AIE_DATA_MEM_SIZE_BYTES = 65536
 
 
 def qkv_proj_topologies(
@@ -71,6 +72,7 @@ def qkv_proj_theoretical_topologies(
 
     head_dim = hidden_size // num_heads
     combined_hidden_size = hidden_size * 3
+    r = s = t = 8
 
     topologies: list[dict[str, int | str]] = []
     for (
@@ -90,11 +92,11 @@ def qkv_proj_theoretical_topologies(
         _divisors(hidden_size),
         _divisors(combined_hidden_size),
     ):
-        if tile_m % 8 != 0:
+        if tile_m % r != 0:
             continue
-        if tile_k % 8 != 0:
+        if tile_k % s != 0:
             continue
-        if tile_n % 8 != 0:
+        if tile_n % t != 0:
             continue
         if seq_len % (parallel_seq * tile_m) != 0:
             continue
@@ -104,7 +106,11 @@ def qkv_proj_theoretical_topologies(
             continue
         if parallel_seq * parallel_heads * parallel_head_dim > 8:
             continue
-        if combined_hidden_size % (tile_n * num_aie_columns) != 0:
+        if not _block1_compute_tile_working_set_fits(
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+        ):
             continue
 
         candidate = {
@@ -302,6 +308,19 @@ def _divisors(value: int) -> tuple[int, ...]:
         divisors.add(i)
         divisors.add(value // i)
     return tuple(sorted(divisors))
+
+
+def _block1_compute_tile_working_set_fits(
+    *,
+    tile_m: int,
+    tile_k: int,
+    tile_n: int,
+) -> bool:
+    bf16_bytes = 2
+    a_l1_bytes = tile_m * tile_k * bf16_bytes
+    b_l1_bytes = tile_k * tile_n * bf16_bytes
+    c_l1_bytes = tile_m * tile_n * bf16_bytes
+    return a_l1_bytes + b_l1_bytes + c_l1_bytes <= _BLOCK1_AIE_DATA_MEM_SIZE_BYTES
 
 
 def _topology_id(config: dict[str, int]) -> str:

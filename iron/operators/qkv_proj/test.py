@@ -11,6 +11,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from iron.operators.qkv_proj.design import (
+    _block1_compute_tile_working_set_fits,
     qkv_proj_theoretical_topologies,
     qkv_proj_topologies,
 )
@@ -152,4 +153,8 @@ def test_theoretical_block1_topologies_are_unique_and_contract_valid():
         assert 12 % parallel_heads == 0
         assert 64 % parallel_head_dim == 0
         assert parallel_seq * parallel_heads * parallel_head_dim <= 8
-        assert 2304 % (tile_n * num_aie_columns) == 0
+        assert _block1_compute_tile_working_set_fits(
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+        )

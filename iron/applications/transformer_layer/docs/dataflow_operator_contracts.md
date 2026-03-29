@@ -103,7 +103,8 @@ That design file should expose two distinct topology views:
 - the narrow retained runtime-supported topology list used by operator tests and
   benchmark manifests
 - a broader theoretical topology enumerator that explores every combination
-  allowed by the Block 1 contract, fused GEMM tiling, array-column count, and
+  allowed by the Block 1 contract, fused GEMM tiling, array-column count,
+  matmul-kernel divisibility, compute-tile local-memory limits, and
   thesis-facing parallel axes for a given workload
 The checked-in study manifests should continue to pin the baseline retained
 topology IDs for reproducibility even as that broader theoretical exploration
