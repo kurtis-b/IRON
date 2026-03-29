@@ -99,8 +99,15 @@ topology sweep varies the fused GEMM tiling (`tile_m`, `tile_n`) while keeping
 the thesis-facing `parallel_seq`, `parallel_heads`, and `parallel_head_dim`
 axes pinned at `1` until the local fused lowering grows real lane-level
 parallel splits for those dimensions.
-That design file should also be the source of the retained topology list used by
-operator-local tests and future topology selection logic.
+That design file should expose two distinct topology views:
+- the narrow retained runtime-supported topology list used by operator tests and
+  benchmark manifests
+- a broader theoretical topology enumerator that explores every combination
+  allowed by the Block 1 contract, fused GEMM tiling, array-column count, and
+  thesis-facing parallel axes for a given workload
+The checked-in study manifests should continue to pin the baseline retained
+topology IDs for reproducibility even as that broader theoretical exploration
+surface grows.
 
 ## Block 2
 

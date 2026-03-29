@@ -10,7 +10,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from iron.operators.qkv_proj.design import qkv_proj_topologies
+from iron.operators.qkv_proj.design import (
+    qkv_proj_theoretical_topologies,
+    qkv_proj_topologies,
+)
 from iron.operators.qkv_proj.op import AIEQKVProj
 from iron.operators.qkv_proj.reference import generate_golden_reference
 
@@ -82,3 +85,71 @@ def test_qkv_proj(
     assert torch.allclose(q, golden_ref["q"], rtol=4.0e-2, atol=1.5e-1)
     assert torch.allclose(k, golden_ref["k"], rtol=4.0e-2, atol=1.5e-1)
     assert torch.allclose(v, golden_ref["v"], rtol=4.0e-2, atol=1.5e-1)
+
+
+def test_theoretical_block1_topologies_cover_supported_surface():
+    for seq_len, hidden_size, num_heads in (
+        (64, 768, 12),
+        (512, 768, 12),
+        (512, 1024, 16),
+    ):
+        supported_ids = {
+            str(topology["topology_id"])
+            for topology in qkv_proj_topologies(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+            )
+        }
+        theoretical_ids = {
+            str(topology["topology_id"]).replace("_c8", "")
+            for topology in qkv_proj_theoretical_topologies(
+                seq_len=seq_len,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+            )
+        }
+        assert supported_ids <= theoretical_ids
+
+
+def test_theoretical_block1_topologies_include_nondefault_valid_variants():
+    topology_ids = {
+        str(topology["topology_id"])
+        for topology in qkv_proj_theoretical_topologies(
+            seq_len=512,
+            hidden_size=768,
+            num_heads=12,
+        )
+    }
+    assert "m64_k64_n16_c8_ps1_ph1_pd1" in topology_ids
+    assert "m32_k64_n16_c8_ps1_ph1_pd1" in topology_ids
+    assert "m64_k64_n24_c8_ps1_ph1_pd1" in topology_ids
+    assert "m64_k64_n16_c4_ps1_ph1_pd1" in topology_ids
+    assert "m64_k64_n16_c8_ps2_ph1_pd1" in topology_ids
+
+
+def test_theoretical_block1_topologies_are_unique_and_contract_valid():
+    topologies = qkv_proj_theoretical_topologies(
+        seq_len=512,
+        hidden_size=768,
+        num_heads=12,
+    )
+    assert topologies
+
+    topology_ids = [str(topology["topology_id"]) for topology in topologies]
+    assert len(topology_ids) == len(set(topology_ids))
+
+    for topology in topologies:
+        parallel_seq = int(topology["parallel_seq"])
+        parallel_heads = int(topology["parallel_heads"])
+        parallel_head_dim = int(topology["parallel_head_dim"])
+        tile_m = int(topology["tile_m"])
+        tile_k = int(topology["tile_k"])
+        tile_n = int(topology["tile_n"])
+        num_aie_columns = int(topology["num_aie_columns"])
+
+        assert parallel_seq in (1, 2, 4, 6, 8)
+        assert 512 % (parallel_seq * tile_m) == 0
+        assert 12 % parallel_heads == 0
+        assert 64 % parallel_head_dim == 0
+        assert parallel_seq * parallel_heads * parallel_head_dim <= 8
+        assert 2304 % (tile_n * num_aie_columns) == 0

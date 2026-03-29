@@ -24,6 +24,8 @@ _BLOCK1_RETAINED_AXES = {
     "parallel_head_dim": (1,),
 }
 
+_BLOCK1_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
+
 
 def qkv_proj_topologies(
     *,
@@ -50,6 +52,79 @@ def qkv_proj_topologies(
         }
         for candidate in topologies
     ]
+
+
+def qkv_proj_theoretical_topologies(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    num_heads: int,
+) -> list[dict[str, int | str]]:
+    if seq_len <= 0:
+        raise ValueError("Block 1 requires seq_len > 0")
+    if hidden_size <= 0:
+        raise ValueError("Block 1 requires hidden_size > 0")
+    if num_heads <= 0:
+        raise ValueError("Block 1 requires num_heads > 0")
+    if hidden_size % num_heads != 0:
+        raise ValueError("Block 1 requires hidden_size divisible by num_heads")
+
+    head_dim = hidden_size // num_heads
+    combined_hidden_size = hidden_size * 3
+
+    topologies: list[dict[str, int | str]] = []
+    for (
+        parallel_seq,
+        parallel_heads,
+        parallel_head_dim,
+        num_aie_columns,
+        tile_m,
+        tile_k,
+        tile_n,
+    ) in product(
+        _BLOCK1_PARALLEL_SEQ_CHOICES,
+        _divisors(num_heads),
+        _divisors(head_dim),
+        range(1, 9),
+        _divisors(seq_len),
+        _divisors(hidden_size),
+        _divisors(combined_hidden_size),
+    ):
+        if tile_m % 8 != 0:
+            continue
+        if tile_k % 8 != 0:
+            continue
+        if tile_n % 8 != 0:
+            continue
+        if seq_len % (parallel_seq * tile_m) != 0:
+            continue
+        if num_heads % parallel_heads != 0:
+            continue
+        if head_dim % parallel_head_dim != 0:
+            continue
+        if parallel_seq * parallel_heads * parallel_head_dim > 8:
+            continue
+        if combined_hidden_size % (tile_n * num_aie_columns) != 0:
+            continue
+
+        candidate = {
+            "tile_m": tile_m,
+            "tile_k": tile_k,
+            "tile_n": tile_n,
+            "num_aie_columns": num_aie_columns,
+            "parallel_seq": parallel_seq,
+            "parallel_heads": parallel_heads,
+            "parallel_head_dim": parallel_head_dim,
+        }
+        topologies.append(
+            {
+                **candidate,
+                "topology_id": _theoretical_topology_id(candidate),
+                "topology_family": "shared_runtime_qkv_proj_theoretical",
+            }
+        )
+
+    return topologies
 
 
 def main() -> None:
@@ -219,9 +294,28 @@ def _enumerate_block1_topologies(
     return topologies
 
 
+def _divisors(value: int) -> tuple[int, ...]:
+    divisors = set()
+    for i in range(1, int(value**0.5) + 1):
+        if value % i != 0:
+            continue
+        divisors.add(i)
+        divisors.add(value // i)
+    return tuple(sorted(divisors))
+
+
 def _topology_id(config: dict[str, int]) -> str:
     return (
         f"m{config['tile_m']}_k{config['tile_k']}_n{config['tile_n']}"
+        f"_ps{config['parallel_seq']}_ph{config['parallel_heads']}"
+        f"_pd{config['parallel_head_dim']}"
+    )
+
+
+def _theoretical_topology_id(config: dict[str, int]) -> str:
+    return (
+        f"m{config['tile_m']}_k{config['tile_k']}_n{config['tile_n']}"
+        f"_c{config['num_aie_columns']}"
         f"_ps{config['parallel_seq']}_ph{config['parallel_heads']}"
         f"_pd{config['parallel_head_dim']}"
     )
