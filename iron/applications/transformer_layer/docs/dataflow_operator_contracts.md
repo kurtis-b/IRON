@@ -161,8 +161,8 @@ and translates them into the fused runtime wrapper in
 The retained `v2` surface is currently pinned to `parallel_seq=1`,
 `q_seq_tile=32`, and `kv_seq_tile=64`, with `emb_tile` selected per retained
 workload family, `o_proj_acc_depth=1`, and a small runtime-supported
-`parallel_heads` sweep (`1` plus the promoted `2`-way split for the `12x64` and
-`16x64` retained families) for the checked-in runtime-supported study surface.
+`parallel_heads` sweep (`1`, `2`, and `4` for the `12x64` and `16x64` retained
+families) for the checked-in runtime-supported study surface.
 That design file should expose three distinct topology views:
 - the narrow retained runtime-supported topology list used by operator tests and
   benchmark manifests

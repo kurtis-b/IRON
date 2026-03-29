@@ -159,7 +159,9 @@ def test_supported_block2_topologies_include_promoted_runtime_variants():
     }
 
     assert "q32_kv64_e96_ps1_ph2_acc1" in topology_ids_12
+    assert "q32_kv64_e96_ps1_ph4_acc1" in topology_ids_12
     assert "q32_kv64_e128_ps1_ph2_acc1" in topology_ids_16
+    assert "q32_kv64_e128_ps1_ph4_acc1" in topology_ids_16
 
 
 def test_theoretical_block2_topologies_include_nondefault_valid_variants():

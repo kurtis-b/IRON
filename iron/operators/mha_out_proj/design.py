@@ -78,6 +78,14 @@ _BLOCK2_TOPOLOGIES = {
             "parallel_heads": 2,
             "o_proj_acc_depth": 1,
         },
+        {
+            "parallel_seq": 1,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 96,
+            "parallel_heads": 4,
+            "o_proj_acc_depth": 1,
+        },
     ],
     (16, 64): [
         {
@@ -94,6 +102,14 @@ _BLOCK2_TOPOLOGIES = {
             "kv_seq_tile": 64,
             "emb_tile": 128,
             "parallel_heads": 2,
+            "o_proj_acc_depth": 1,
+        },
+        {
+            "parallel_seq": 1,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 128,
+            "parallel_heads": 4,
             "o_proj_acc_depth": 1,
         },
     ],
