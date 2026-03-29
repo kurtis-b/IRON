@@ -294,6 +294,16 @@ axes already exercised by the imported `ffn_addnorm` design coverage, so the
 retained `768/3072` family now explores both `parallel_seq=2, parallel_int_dim=6`
 and `parallel_seq=4, parallel_int_dim=3` while keeping the proven tile sizes,
 depth, and GeLU staging fixed.
+That design file should also expose three distinct topology views:
+- the narrow retained runtime-supported topology list used by operator tests and
+  benchmark manifests
+- a broader theoretical topology enumerator that explores every combination
+  allowed by the Block 3 contract, imported FFN tiling equalities, compile-row
+  chunking choices, lane-count limit, and GeLU staging for a given workload
+- a heuristic-pruned practical exploration surface that favors higher sequence
+  and intermediate-dimension parallelism, larger compile-row chunks, larger
+  reusable tiles, and fuller array-column utilization while still retaining the
+  baseline runtime-supported study topologies
 
 ## Reference policy
 
