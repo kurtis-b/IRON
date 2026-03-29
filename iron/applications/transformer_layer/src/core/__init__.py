@@ -9,6 +9,10 @@ from .result_schema import (
     RESULT_FIELD_ORDER,
     normalize_result_row,
 )
+from .topology_exploration import (
+    practical_block_topology_catalog,
+    practical_layer_topology_combinations,
+)
 
 __all__ = [
     "TransformerLayerInputs",
@@ -17,4 +21,6 @@ __all__ = [
     "RESULT_FIELD_ORDER",
     "REQUIRED_RESULT_FIELDS",
     "normalize_result_row",
+    "practical_block_topology_catalog",
+    "practical_layer_topology_combinations",
 ]

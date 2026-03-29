@@ -241,6 +241,12 @@ extra fields.
 For direct automation, the same retained topology overrides should also be
 accepted by the benchmark/job CLI layer so study manifests, ad hoc benchmark
 invocations, and unattended jobs all share the same topology-selection surface.
+Alongside that strict runtime-supported override path, the application layer
+should also expose a pure-Python practical-topology exploration catalog that
+cross-products the three block-level practical surfaces into capped
+cross-block candidate combinations for future autotune/study generation,
+without pretending those broader practical IDs are already runnable through the
+retained runtime wrappers.
 For unattended study pipelines, `npu_study` step definitions should be allowed
 to carry the same `block1_topology_id`, `block2_topology_id`, and
 `block3_topology_id` overrides so pipeline-driven sweeps can pin retained
