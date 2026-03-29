@@ -275,15 +275,12 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                 "AIEAddNormFFNAddNorm: incompatible tensor shape(s)"
             )
 
-        attention_output_np = torch_to_numpy(attention_output)
-        residual_np = torch_to_numpy(residual)
-        packed_hidden_residual_np = self._pack_hidden_residual(
+        attention_output_np = self._pad_A(torch_to_numpy(attention_output))
+        residual_np = self._pad_A(torch_to_numpy(residual))
+        padded_rows = attention_output_np.shape[0]
+        packed_hidden_residual_padded = self._pack_hidden_residual(
             attention_output_np,
             residual_np,
-        )
-        packed_hidden_residual_padded, padded_rows = self._pad_packed_hidden_residual(
-            packed_hidden_residual_np,
-            M,
         )
         if B_Up is not None:
             B_Up_padded = self._pad_B(torch_to_numpy(B_Up), b_col_maj=False)

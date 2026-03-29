@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -43,28 +44,11 @@ def generate_test_params():
     ]
     params = []
     for seq_len, hidden_size, intermediate_size in workloads:
-        supported_topologies = addnorm_ffn_addnorm_topologies(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-        )
-        supported_ids_by_signature = {
-            _block3_runtime_signature(topology): str(topology["topology_id"])
-            for topology in supported_topologies
-        }
-        for topology in addnorm_ffn_addnorm_practical_topologies(
-            seq_len=seq_len,
+        for topology in addnorm_ffn_addnorm_topologies(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
         ):
-            practical_topology_id = str(topology["topology_id"])
-            topology_id = supported_ids_by_signature.get(
-                _block3_runtime_signature(topology)
-            )
-            marks = ()
-            if topology_id is None:
-                marks = pytest.mark.skip(
-                    reason="Block 3 practical topology is not runtime-supported yet"
-                )
+            topology_id = str(topology["topology_id"])
             params.append(
                 pytest.param(
                     seq_len,
@@ -73,9 +57,8 @@ def generate_test_params():
                     topology_id,
                     id=(
                         f"block3_{seq_len}x{hidden_size}x{intermediate_size}_"
-                        f"{practical_topology_id}"
+                        f"{topology_id}"
                     ),
-                    marks=marks,
                 )
             )
     return params
@@ -85,7 +68,7 @@ def generate_test_params():
     "seq_len,hidden_size,intermediate_size,topology_id",
     generate_test_params(),
 )
-def test_block3_topologies_construct_and_match_reference_contract(
+def test_addnorm_ffn_addnorm(
     seq_len,
     hidden_size,
     intermediate_size,
@@ -106,6 +89,17 @@ def test_block3_topologies_construct_and_match_reference_contract(
         topology_id=topology_id,
         context=aie_context,
     )
+    operator.weight_up_proj = golden["ffn_up_weight"].contiguous().T
+    operator.weight_down_proj = golden["ffn_down_weight"].contiguous().T
+    operator.ln1_weight = golden["ln1_weight"].contiguous()
+    operator.ln2_weight = golden["ln2_weight"].contiguous()
+    aie_context.compile_all()
+    aie_context.prepare_runtime()
+
+    output = operator.forward(
+        golden["hidden_states"],
+        golden["residual"],
+    )
 
     assert operator.topology_id == topology_id
     assert operator.topology_family == "pipelined_addnorm_ffn_addnorm"
@@ -116,6 +110,8 @@ def test_block3_topologies_construct_and_match_reference_contract(
     assert golden["ln1_weight"].shape == (hidden_size,)
     assert golden["ln2_weight"].shape == (hidden_size,)
     assert golden["output"].shape == (seq_len, hidden_size)
+    assert output.shape == golden["output"].shape
+    assert torch.allclose(output, golden["output"], rtol=4.0e-2, atol=1.5e-1)
 
 
 def test_packed_hidden_residual_round_trips(aie_context):

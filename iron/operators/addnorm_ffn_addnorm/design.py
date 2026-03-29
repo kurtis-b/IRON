@@ -266,6 +266,35 @@ def fused_addnorm_ffn_addnorm(
     B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
     C_ty = np.ndarray[(M * K,), np.dtype[dtype_out]]
 
+    def split_zero_stride_repeat_tap(
+        tap: TensorAccessPattern,
+        tensor_shape: tuple[int, ...],
+        chunk_size: int,
+    ) -> list[TensorAccessPattern]:
+        if int(tap.strides[0]) != 0:
+            return [tap]
+        repeat_count = int(tap.sizes[0])
+        if repeat_count <= chunk_size:
+            return [tap]
+        if repeat_count % chunk_size != 0:
+            raise ValueError(
+                "Cannot split repeat TAP evenly: "
+                f"repeat_count={repeat_count}, chunk_size={chunk_size}"
+            )
+        chunk_taps = []
+        for _ in range(repeat_count // chunk_size):
+            sizes = [int(s) for s in tap.sizes]
+            sizes[0] = chunk_size
+            chunk_taps.append(
+                TensorAccessPattern(
+                    tensor_shape,
+                    offset=int(tap.offset),
+                    sizes=sizes,
+                    strides=[int(s) for s in tap.strides],
+                )
+            )
+        return chunk_taps
+
     # Add & Norm tensor types
     ln_weights_ty = np.ndarray[(K,), np.dtype[dtype_in]]
     AR_l1_ty = np.ndarray[(2 * m * k,), np.dtype[dtype_in]]
@@ -948,7 +977,7 @@ def fused_addnorm_ffn_addnorm(
                             stage_only,
                         ],
                         placement=Tile(ln1_tile_col, ln1_tile_row),
-                        stack_size=0xF00,
+                        stack_size=0xD00,
                     )
                 )
                 logging.debug(
@@ -1011,7 +1040,7 @@ def fused_addnorm_ffn_addnorm(
                             ln2_tile_col,
                             ln2_tile_row,
                         ),
-                        stack_size=0xF00,
+                        stack_size=0xD00,
                     )
                 )
                 logging.debug(
@@ -1036,7 +1065,7 @@ def fused_addnorm_ffn_addnorm(
                         if nA_tiles_distributed < 3
                         else Tile(tile_col, tile_row)
                     ),
-                    stack_size=0xF00,
+                    stack_size=0xD00,
                 )
             )
             logging.debug(
@@ -1080,7 +1109,7 @@ def fused_addnorm_ffn_addnorm(
                         if nA_tiles_distributed < 3
                         else Tile(tile_col + 1, tile_row)
                     ),
-                    stack_size=0xF00,
+                    stack_size=0xD00,
                 )
             )
             logging.debug(
@@ -1136,16 +1165,23 @@ def fused_addnorm_ffn_addnorm(
                     place = (
                         Tile(0, 0) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 0)
                     )
-                    rt.fill(
-                        AR_ln1_l3l2_fifos[a_tile].prod(),
-                        packed_hidden_residual,
-                        tap=ln1_ar_tile,
-                        task_group=tg,
-                        placement=place,
+                    ln1_ar_fill_taps = split_zero_stride_repeat_tap(
+                        ln1_ar_tile,
+                        packed_hidden_residual_shape,
+                        chunk_size=32,
                     )
-                    AR_taps.append(ln1_ar_tile)
+                    for ln1_ar_fill_tap in ln1_ar_fill_taps:
+                        rt.fill(
+                            AR_ln1_l3l2_fifos[a_tile].prod(),
+                            packed_hidden_residual,
+                            tap=ln1_ar_fill_tap,
+                            wait=len(ln1_ar_fill_taps) > 1,
+                            task_group=tg,
+                            placement=place,
+                        )
+                        AR_taps.append(ln1_ar_fill_tap)
                     logging.debug(
-                        f"    Placed LN1 packed AR input {a_tile} transfer at {place} with offset {ln1_ar_tile.offset}, sizes {ln1_ar_tile.sizes}, strides {ln1_ar_tile.strides}"
+                        f"    Placed LN1 packed AR input {a_tile} transfer at {place} with offset {ln1_ar_tile.offset}, sizes {[tap.sizes for tap in ln1_ar_fill_taps]}, strides {ln1_ar_tile.strides}"
                     )
 
                     ln2_ar_tile = TensorAccessPattern(

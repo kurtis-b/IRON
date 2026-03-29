@@ -62,6 +62,8 @@ Retained workflow policy:
   selected retained Dataflow surface
 - unattended Dataflow plot steps facet on retained Block 2 topology so
   generated plots stay grouped by the resolved fused-attention configuration
+- the current implementation status, remaining runtime-support gaps, and
+  verification gaps are tracked in `dataflow_status.md`
 
 ## Runlist
 

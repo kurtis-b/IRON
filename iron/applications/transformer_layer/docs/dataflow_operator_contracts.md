@@ -9,6 +9,9 @@ This note captures the retained public contracts for the three fused Dataflow
 blocks, plus the topology and pytest policy that should drive the operator
 implementations.
 
+For the current implementation/verification status and the remaining support
+work, see `dataflow_status.md`.
+
 ## General policy
 
 - `dtype` is `bfloat16` only.
