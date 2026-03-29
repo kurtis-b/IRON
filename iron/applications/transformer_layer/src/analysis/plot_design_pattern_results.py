@@ -138,12 +138,22 @@ def _facet_groups(
         return [("all", rows)]
     grouped: dict[str, list[dict[str, str]]] = {}
     for row in rows:
-        raw_value = row.get(facet_key)
+        raw_value = _facet_value(row, facet_key)
         label = "unknown" if raw_value in (None, "", "None") else str(raw_value)
         grouped.setdefault(label, []).append(row)
-    if len(grouped) <= 1:
-        return [("all", rows)]
     return sorted(grouped.items())
+
+
+def _facet_value(row: dict[str, str], facet_key: str) -> object:
+    raw_value = row.get(facet_key)
+    if raw_value not in (None, "", "None"):
+        return raw_value
+    if facet_key.startswith("block") and (
+        facet_key.endswith("_topology_id") or facet_key.endswith("_topology_family")
+    ):
+        reference_key = f"reference_npu_{facet_key}"
+        return row.get(reference_key)
+    return raw_value
 
 
 def _bottleneck_series(
@@ -449,6 +459,7 @@ def generate_plots(
     bottleneck_csv: str | Path | None = None,
     gpu_compare_csv: str | Path | None = None,
     x_axis: str = "seq_len",
+    facet_key: str | None = None,
 ) -> dict[str, list[str]]:
     suite_rows = _load_csv_rows(input_csv)
     output_path = Path(output_dir)
@@ -460,7 +471,8 @@ def generate_plots(
     if x_axis not in {"seq_len", "hidden_size"}:
         raise ValueError(f"Unsupported x_axis: {x_axis}")
     x_label = "Sequence Length" if x_axis == "seq_len" else "Hidden Size"
-    facet_key = "study_case_label" if x_axis == "seq_len" else "seq_len"
+    if facet_key is None:
+        facet_key = "study_case_label" if x_axis == "seq_len" else "seq_len"
 
     axis_suffix = "Sequence Length" if x_axis == "seq_len" else "Hidden Size"
     main_specs = [
@@ -652,6 +664,7 @@ def parse_args():
     parser.add_argument(
         "--x-axis", choices=("seq_len", "hidden_size"), default="seq_len"
     )
+    parser.add_argument("--facet-key", default=None)
     return parser.parse_args()
 
 
@@ -663,6 +676,7 @@ def main():
         bottleneck_csv=args.bottleneck_csv,
         gpu_compare_csv=args.gpu_compare_csv,
         x_axis=args.x_axis,
+        facet_key=args.facet_key,
     )
 
 

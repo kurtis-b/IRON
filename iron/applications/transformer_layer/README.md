@@ -122,6 +122,9 @@ metadata under explicit `reference_npu_*` columns so best-NPU-vs-iGPU results
 remain attributable to the retained topology that won selection.
 Those `reference_npu_*` fields now live in the shared result schema as stable
 CSV columns rather than unordered extras.
+The plot generator can now facet on retained topology columns as well, so
+analysis plots can be grouped by resolved block topology instead of only by
+study case or hidden size.
 
 Retained benchmark surface:
 

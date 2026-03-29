@@ -239,6 +239,9 @@ extras.
 Bottleneck summary CSV/JSON/text outputs should also preserve the retained
 block topology IDs from the analyzed rows so dominant-component reports remain
 attributable to the resolved Dataflow topology surface.
+Plot generation should be allowed to facet on retained topology columns too, so
+latency/throughput/power, bottleneck, and best-NPU-vs-iGPU plots can be grouped
+by resolved block topology when needed.
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`

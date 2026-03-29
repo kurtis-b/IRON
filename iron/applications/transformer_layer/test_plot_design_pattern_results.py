@@ -112,3 +112,74 @@ def test_plot_generation_restructure_preserves_legacy_imports_and_outputs(
     assert (output_dir / "index.html").exists()
     assert any((output_dir / name).exists() for name in sections["main"])
     assert any((output_dir / name).exists() for name in sections["gpu_compare"])
+
+
+def test_plot_generation_can_facet_by_block_topology(tmp_path: Path):
+    suite_csv = tmp_path / "suite.csv"
+    gpu_csv = tmp_path / "gpu.csv"
+    output_dir = tmp_path / "plots"
+
+    _write_csv(
+        suite_csv,
+        [
+            {
+                "backend": "npu",
+                "run_status": "completed",
+                "execution_mode": "dataflow",
+                "pattern_label": "dataflow",
+                "seq_len": "64",
+                "study_case_id": "baseline_768",
+                "study_case_label": "baseline_768",
+                "avg_latency_ms": "10.0",
+                "throughput_flops_per_sec": "1000.0",
+                "avg_power_w": "5.0",
+                "flops_per_joule": "200.0",
+                "backend_pct_of_peak": "0.25",
+                "roofline_pct": "0.5",
+                "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+            },
+            {
+                "backend": "npu",
+                "run_status": "completed",
+                "execution_mode": "runlist",
+                "pattern_label": "runlist",
+                "seq_len": "64",
+                "study_case_id": "baseline_768",
+                "study_case_label": "baseline_768",
+                "avg_latency_ms": "12.0",
+                "throughput_flops_per_sec": "900.0",
+                "avg_power_w": "6.0",
+                "flops_per_joule": "150.0",
+                "backend_pct_of_peak": "0.2",
+                "roofline_pct": "0.4",
+                "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+            },
+        ],
+    )
+    _write_csv(
+        gpu_csv,
+        [
+            {
+                "backend": "gpu",
+                "run_status": "completed",
+                "execution_mode": "amd_igpu_reference",
+                "pattern_label": "amd_igpu_reference",
+                "seq_len": "64",
+                "study_case_id": "baseline_768",
+                "study_case_label": "baseline_768",
+                "avg_latency_ms": "8.0",
+                "throughput_flops_per_sec": "1100.0",
+                "reference_npu_block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+            }
+        ],
+    )
+
+    sections = generate_plots(
+        input_csv=suite_csv,
+        output_dir=output_dir,
+        gpu_compare_csv=gpu_csv,
+        facet_key="block2_topology_id",
+    )
+
+    assert any("q32_kv64_e96_ps1_ph1_acc1" in name for name in sections["main"])
+    assert any("q32_kv64_e96_ps1_ph1_acc1" in name for name in sections["gpu_compare"])

@@ -128,3 +128,28 @@ def test_build_step_command_forwards_block_topology_overrides(tmp_path: Path):
     assert "--block1-topology-id" in command
     assert "--block2-topology-id" in command
     assert "--block3-topology-id" in command
+
+
+def test_build_step_command_forwards_plot_facet_key(tmp_path: Path):
+    command = structured_build_step_command(
+        step={
+            "step_id": "plot_0",
+            "kind": "plot",
+            "input_csv": str(tmp_path / "results.csv"),
+            "output_dir": str(tmp_path / "plots"),
+            "facet_key": "block2_topology_id",
+        },
+        args=SimpleNamespace(
+            smoke=False,
+            warmup_runs=None,
+            runs_per_sample=None,
+            power_backend="none",
+            power_sample_interval_sec=0.05,
+            quiescent_baseline_duration_sec=0.5,
+        ),
+        output_root=None,
+        temp_dir=tmp_path,
+    )
+
+    assert "--facet-key" in command
+    assert "block2_topology_id" in command

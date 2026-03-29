@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument(
         "--x-axis", choices=("seq_len", "hidden_size"), default="seq_len"
     )
+    parser.add_argument("--facet-key", default=None)
     return parser.parse_args()
 
 
@@ -41,6 +42,7 @@ def main():
         bottleneck_csv=args.bottleneck_csv,
         gpu_compare_csv=args.gpu_compare_csv,
         x_axis=args.x_axis,
+        facet_key=args.facet_key,
     )
 
 

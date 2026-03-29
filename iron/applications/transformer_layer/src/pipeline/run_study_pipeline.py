@@ -380,6 +380,8 @@ def _build_step_command(
             "--x-axis",
             str(patched_step.get("x_axis", "seq_len")),
         ]
+        if patched_step.get("facet_key") is not None:
+            command.extend(["--facet-key", str(patched_step["facet_key"])])
         if patched_step.get("bottleneck_csv") is not None:
             command.extend(["--bottleneck-csv", str(patched_step["bottleneck_csv"])])
         if patched_step.get("gpu_compare_csv") is not None:
