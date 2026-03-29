@@ -137,15 +137,24 @@ class DataflowPattern(nn.Module):
     def get_benchmark_metadata(self) -> dict[str, object]:
         unique_insts = set()
         unique_xclbins = set()
+
+        def maybe_add_artifact_path(
+            artifact_set: set[str],
+            artifact,
+        ) -> None:
+            if artifact is not None and getattr(artifact, "path", None) is not None:
+                artifact_set.add(str(artifact.path))
+
         for gemm_op in (self.block1.q_proj, self.block1.k_proj, self.block1.v_proj):
-            unique_insts.add(str(gemm_op.insts_artifact.path))
-            unique_xclbins.add(
-                str((gemm_op.runtime_xclbin_artifact or gemm_op.xclbin_artifact).path)
+            maybe_add_artifact_path(unique_insts, gemm_op.insts_artifact)
+            maybe_add_artifact_path(
+                unique_xclbins,
+                gemm_op.runtime_xclbin_artifact or gemm_op.xclbin_artifact,
             )
-        unique_insts.add(str(self.block2.insts_artifact.path))
-        unique_xclbins.add(str(self.block2.xclbin_artifact.path))
-        unique_insts.add(str(self.block3.block.insts_artifact.path))
-        unique_xclbins.add(str(self.block3.block.xclbin_artifact.path))
+        maybe_add_artifact_path(unique_insts, self.block2.insts_artifact)
+        maybe_add_artifact_path(unique_xclbins, self.block2.xclbin_artifact)
+        maybe_add_artifact_path(unique_insts, self.block3.block.insts_artifact)
+        maybe_add_artifact_path(unique_xclbins, self.block3.block.xclbin_artifact)
         return make_in_process_npu_metadata(
             compile_setup_time_sec=self.compile_setup_time_sec,
             dispatch_count=3
@@ -153,6 +162,14 @@ class DataflowPattern(nn.Module):
             + len(self.block3.block.runlist),
             unique_instruction_binary_count=len(unique_insts),
             unique_xclbin_count=len(unique_xclbins),
+            extra_fields={
+                "block1_topology_id": self.block1.topology_id,
+                "block1_topology_family": self.block1.topology_family,
+                "block2_topology_id": self.block2.topology_id,
+                "block2_topology_family": self.block2.topology_family,
+                "block3_topology_id": self.block3.topology_id,
+                "block3_topology_family": self.block3.topology_family,
+            },
         )
 
     def forward(

@@ -97,6 +97,10 @@ class Block1QKVProjPattern(_BaseBlockPattern):
             dispatch_count=3,
             unique_instruction_binary_count=len(unique_insts),
             unique_xclbin_count=len(unique_xclbins),
+            extra_fields={
+                "block1_topology_id": self.block.topology_id,
+                "block1_topology_family": self.block.topology_family,
+            },
         )
 
     def forward(
@@ -172,6 +176,10 @@ class Block2MHAOutProjPattern(_BaseBlockPattern):
             dispatch_count=len(self.block.runlist),
             unique_instruction_binary_count=1,
             unique_xclbin_count=1,
+            extra_fields={
+                "block2_topology_id": self.block.topology_id,
+                "block2_topology_family": self.block.topology_family,
+            },
         )
 
     def forward(
@@ -253,6 +261,10 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
             dispatch_count=len(self.block.block.runlist),
             unique_instruction_binary_count=1,
             unique_xclbin_count=1,
+            extra_fields={
+                "block3_topology_id": self.block.topology_id,
+                "block3_topology_family": self.block.topology_family,
+            },
         )
 
     def forward(

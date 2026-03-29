@@ -141,6 +141,9 @@ The retained `v2` surface is currently pinned to `parallel_seq=1`,
 `o_proj_acc_depth=1`, with `emb_tile` selected per retained workload family.
 That design file should also be the source of the retained topology list used by
 operator-local tests and future topology selection logic.
+Study metadata emitted by the in-process Dataflow patterns should include the
+selected Block 2 topology ID and family so retained topology choices are visible
+in benchmark outputs.
 
 ## Block 3
 
@@ -186,6 +189,9 @@ and translates them into the pipelined wrapper in
 [`iron/operators/addnorm_ffn_addnorm/op.py`](/home/cj/iron/iron/operators/addnorm_ffn_addnorm/op.py).
 That design file should also be the source of the retained topology list used by
 operator-local tests and future topology selection logic.
+Study metadata emitted by the in-process Dataflow patterns should include the
+selected block topology IDs and families so retained topology choices are visible
+in benchmark outputs.
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`

@@ -82,6 +82,45 @@ def test_make_in_process_npu_metadata_formats_common_fields():
     }
 
 
+def test_make_in_process_npu_metadata_includes_extra_fields():
+    metadata = make_in_process_npu_metadata(
+        compile_setup_time_sec=0.25,
+        dispatch_count=7,
+        unique_instruction_binary_count=3,
+        unique_xclbin_count=2,
+        extra_fields={
+            "block2_topology_id": "q32_kv64_e128_ps1_ph1_acc1",
+            "block2_topology_family": "fused_mha_out_proj",
+        },
+    )
+    assert metadata["block2_topology_id"] == "q32_kv64_e128_ps1_ph1_acc1"
+    assert metadata["block2_topology_family"] == "fused_mha_out_proj"
+
+
+def test_dataflow_patterns_report_selected_block_topologies_in_metadata():
+    spec = TransformerLayerSpec(seq_len=64)
+
+    dataflow_pattern = build_pattern("dataflow", spec)
+    dataflow_metadata = dataflow_pattern.get_benchmark_metadata()
+    assert (
+        dataflow_metadata["block1_topology_id"] == dataflow_pattern.block1.topology_id
+    )
+    assert (
+        dataflow_metadata["block2_topology_id"] == dataflow_pattern.block2.topology_id
+    )
+    assert (
+        dataflow_metadata["block3_topology_id"] == dataflow_pattern.block3.topology_id
+    )
+
+    block2_pattern = build_pattern("block2_mha_out_proj", spec)
+    block2_metadata = block2_pattern.get_benchmark_metadata()
+    assert block2_metadata["block2_topology_id"] == block2_pattern.block.topology_id
+    assert (
+        block2_metadata["block2_topology_family"]
+        == block2_pattern.block.topology_family
+    )
+
+
 def test_block1_contract_reshapes_projection_outputs_to_head_major():
     matrix = torch.arange(24, dtype=torch.bfloat16).reshape(3, 8)
     head_major = AIEQKVProj._to_head_major(

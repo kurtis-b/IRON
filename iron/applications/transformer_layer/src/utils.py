@@ -160,11 +160,15 @@ def make_in_process_npu_metadata(
     dispatch_count: int,
     unique_instruction_binary_count: int,
     unique_xclbin_count: int,
+    extra_fields: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    metadata = {
         "compile_setup_time_ms": compile_setup_time_ms(compile_setup_time_sec),
         "npu_dispatch_count": dispatch_count,
         "npu_unique_instruction_binary_count": unique_instruction_binary_count,
         "npu_unique_xclbin_count": unique_xclbin_count,
         "process_model": "in_process",
     }
+    if extra_fields:
+        metadata.update(extra_fields)
+    return metadata
