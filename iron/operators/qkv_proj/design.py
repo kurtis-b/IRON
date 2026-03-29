@@ -88,209 +88,6 @@ _BLOCK1_PRACTICAL_MIN_AIE_COLUMNS = 4
 _BLOCK1_PRACTICAL_MAX_CANDIDATES = 64
 
 
-def ceildiv(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
-def qkv_proj_topologies(
-    *,
-    hidden_size: int,
-    num_heads: int,
-    seq_len: int | None = None,
-) -> list[dict[str, int | str]]:
-    if hidden_size % num_heads != 0:
-        raise ValueError("Block 1 requires hidden_size divisible by num_heads")
-    head_dim = hidden_size // num_heads
-    if (num_heads, head_dim) not in _BLOCK1_RETAINED_FAMILIES:
-        raise ValueError(
-            "Block 1 currently supports only the retained thesis families 12x64 and 16x64"
-        )
-    if seq_len is None:
-        unique_topologies = _block1_seq_independent_supported_candidates(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            head_dim=head_dim,
-        )
-        topology_id_fn = _theoretical_topology_id
-    else:
-        if seq_len <= 0:
-            raise ValueError("Block 1 requires seq_len > 0")
-        unique_topologies = _block1_runtime_supported_candidates(
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            head_dim=head_dim,
-        )
-        topology_id_fn = _theoretical_topology_id
-    return [
-        {
-            **candidate,
-            "topology_id": topology_id_fn(candidate),
-            "topology_family": "shared_runtime_qkv_proj",
-        }
-        for candidate in unique_topologies
-    ]
-
-
-def _block1_theoretical_topologies(
-    *,
-    seq_len: int,
-    hidden_size: int,
-    num_heads: int,
-) -> list[dict[str, int | str]]:
-    if seq_len <= 0:
-        raise ValueError("Block 1 requires seq_len > 0")
-    if hidden_size <= 0:
-        raise ValueError("Block 1 requires hidden_size > 0")
-    if num_heads <= 0:
-        raise ValueError("Block 1 requires num_heads > 0")
-    if hidden_size % num_heads != 0:
-        raise ValueError("Block 1 requires hidden_size divisible by num_heads")
-
-    head_dim = hidden_size // num_heads
-    combined_hidden_size = hidden_size * 3
-    r = s = t = 8
-
-    topologies: list[dict[str, int | str]] = []
-    for (
-        parallel_seq,
-        parallel_heads,
-        parallel_head_dim,
-        num_aie_columns,
-        tile_m,
-        tile_k,
-        tile_n,
-    ) in product(
-        _BLOCK1_PARALLEL_SEQ_CHOICES,
-        _divisors(num_heads),
-        _divisors(head_dim),
-        range(1, 9),
-        _divisors(seq_len),
-        _divisors(hidden_size),
-        _divisors(combined_hidden_size),
-    ):
-        if tile_m % r != 0:
-            continue
-        if tile_k % s != 0:
-            continue
-        if tile_n % t != 0:
-            continue
-        if seq_len % (parallel_seq * tile_m) != 0:
-            continue
-        if num_heads % parallel_heads != 0:
-            continue
-        if head_dim % parallel_head_dim != 0:
-            continue
-        if parallel_seq * parallel_heads * parallel_head_dim > 8:
-            continue
-        if not _block1_compute_tile_working_set_fits(
-            tile_m=tile_m,
-            tile_k=tile_k,
-            tile_n=tile_n,
-        ):
-            continue
-
-        candidate = {
-            "tile_m": tile_m,
-            "tile_k": tile_k,
-            "tile_n": tile_n,
-            "num_aie_columns": num_aie_columns,
-            "parallel_seq": parallel_seq,
-            "parallel_heads": parallel_heads,
-            "parallel_head_dim": parallel_head_dim,
-        }
-        topologies.append(
-            {
-                **candidate,
-                "topology_id": _theoretical_topology_id(candidate),
-                "topology_family": "shared_runtime_qkv_proj_theoretical",
-            }
-        )
-
-    return topologies
-
-
-def _block1_practical_topologies(
-    *,
-    seq_len: int,
-    hidden_size: int,
-    num_heads: int,
-    max_candidates: int = _BLOCK1_PRACTICAL_MAX_CANDIDATES,
-) -> list[dict[str, int | str]]:
-    if max_candidates <= 0:
-        raise ValueError("Block 1 practical exploration requires max_candidates > 0")
-
-    theoretical = _block1_theoretical_topologies(
-        seq_len=seq_len,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-    )
-    retained_runtime_ids = {
-        _theoretical_topology_id(
-            {
-                "tile_m": int(candidate["tile_m"]),
-                "tile_k": int(candidate["tile_k"]),
-                "tile_n": int(candidate["tile_n"]),
-                "num_aie_columns": int(candidate["num_aie_columns"]),
-                "parallel_seq": int(candidate["parallel_seq"]),
-                "parallel_heads": int(candidate["parallel_heads"]),
-                "parallel_head_dim": int(candidate["parallel_head_dim"]),
-            }
-        )
-        for candidate in qkv_proj_topologies(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-        )
-    }
-
-    ranked = sorted(theoretical, key=_block1_practical_sort_key, reverse=True)
-
-    selected: list[dict[str, int | str]] = []
-    selected_ids: set[str] = set()
-
-    def add_candidate(candidate: dict[str, int | str]) -> None:
-        selected.append(
-            {
-                **candidate,
-                "topology_family": "shared_runtime_qkv_proj_practical",
-            }
-        )
-        selected_ids.add(str(candidate["topology_id"]))
-
-    for candidate in ranked:
-        topology_id = str(candidate["topology_id"])
-        if topology_id not in retained_runtime_ids:
-            continue
-        add_candidate(candidate)
-
-    for candidate in ranked:
-        topology_id = str(candidate["topology_id"])
-        if topology_id in selected_ids:
-            continue
-        if not _is_block1_practical_candidate(candidate):
-            continue
-        add_candidate(candidate)
-        if len(selected) >= max_candidates:
-            break
-
-    return sorted(selected, key=_block1_practical_sort_key, reverse=True)
-
-
-def qkv_proj_practical_topologies(
-    *,
-    seq_len: int,
-    hidden_size: int,
-    num_heads: int,
-    max_candidates: int = _BLOCK1_PRACTICAL_MAX_CANDIDATES,
-) -> list[dict[str, int | str]]:
-    return _block1_practical_topologies(
-        seq_len=seq_len,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        max_candidates=max_candidates,
-    )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="Block 1 QKV Projector Design",
@@ -312,74 +109,6 @@ def main() -> None:
             sort_keys=True,
         )
     )
-
-
-def qkv_proj_design(
-    *,
-    seq_len: int,
-    hidden_size: int,
-    num_heads: int,
-    topology_id: str | None = None,
-) -> dict[str, int | str]:
-    head_dim = hidden_size // num_heads
-
-    if topology_id is None:
-        config = _block1_runtime_supported_candidates(
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            head_dim=head_dim,
-        )[0]
-        resolved_topology_id = _theoretical_topology_id(config)
-    else:
-        topologies = qkv_proj_topologies(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            seq_len=seq_len,
-        )
-        try:
-            config = next(
-                candidate
-                for candidate in topologies
-                if str(candidate["topology_id"]) == topology_id
-            )
-            resolved_topology_id = str(config["topology_id"])
-        except StopIteration as exc:
-            raise ValueError(
-                f"Unknown Block 1 topology_id={topology_id!r} for {num_heads}x{head_dim}"
-            ) from exc
-
-    tile_m = int(config["tile_m"])
-    tile_k = int(config["tile_k"])
-    tile_n = int(config["tile_n"])
-    parallel_seq = int(config["parallel_seq"])
-    parallel_heads = int(config["parallel_heads"])
-    parallel_head_dim = int(config["parallel_head_dim"])
-    num_aie_columns = int(config["num_aie_columns"])
-
-    if parallel_seq not in (1, 2, 4, 6, 8):
-        raise ValueError("Block 1 requires parallel_seq in {1, 2, 4, 6, 8}")
-    if seq_len % (parallel_seq * tile_m) != 0:
-        raise ValueError("Block 1 requires seq_len divisible by parallel_seq * tile_m")
-    if hidden_size % tile_k != 0:
-        raise ValueError("Block 1 requires hidden_size divisible by tile_k")
-    combined_hidden_size = hidden_size * 3
-    if combined_hidden_size % tile_n != 0:
-        raise ValueError("Block 1 requires combined_hidden_size divisible by tile_n")
-    if num_heads % parallel_heads != 0:
-        raise ValueError("Block 1 requires num_heads divisible by parallel_heads")
-    if head_dim % parallel_head_dim != 0:
-        raise ValueError("Block 1 requires head_dim divisible by parallel_head_dim")
-    if not 1 <= num_aie_columns <= 8:
-        raise ValueError("Block 1 requires 1 <= num_aie_columns <= 8")
-
-    return {
-        **config,
-        "topology_id": resolved_topology_id,
-        "topology_family": str(
-            config.get("topology_family", "shared_runtime_qkv_proj")
-        ),
-    }
 
 
 def fused_qkv_proj(
@@ -799,6 +528,133 @@ def fused_qkv_proj(
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 
 
+def ceildiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def qkv_proj_topologies(
+    *,
+    hidden_size: int,
+    num_heads: int,
+    seq_len: int | None = None,
+) -> list[dict[str, int | str]]:
+    if hidden_size % num_heads != 0:
+        raise ValueError("Block 1 requires hidden_size divisible by num_heads")
+    head_dim = hidden_size // num_heads
+    if (num_heads, head_dim) not in _BLOCK1_RETAINED_FAMILIES:
+        raise ValueError(
+            "Block 1 currently supports only the retained thesis families 12x64 and 16x64"
+        )
+    if seq_len is None:
+        unique_topologies = _block1_seq_independent_supported_candidates(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+        topology_id_fn = _theoretical_topology_id
+    else:
+        if seq_len <= 0:
+            raise ValueError("Block 1 requires seq_len > 0")
+        unique_topologies = _block1_runtime_supported_candidates(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+        topology_id_fn = _theoretical_topology_id
+    return [
+        {
+            **candidate,
+            "topology_id": topology_id_fn(candidate),
+            "topology_family": "shared_runtime_qkv_proj",
+        }
+        for candidate in unique_topologies
+    ]
+
+
+def qkv_proj_practical_topologies(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    num_heads: int,
+    max_candidates: int = _BLOCK1_PRACTICAL_MAX_CANDIDATES,
+) -> list[dict[str, int | str]]:
+    return _block1_practical_topologies(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        max_candidates=max_candidates,
+    )
+
+
+def qkv_proj_design(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    num_heads: int,
+    topology_id: str | None = None,
+) -> dict[str, int | str]:
+    head_dim = hidden_size // num_heads
+
+    if topology_id is None:
+        config = _block1_runtime_supported_candidates(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )[0]
+        resolved_topology_id = _theoretical_topology_id(config)
+    else:
+        topologies = qkv_proj_topologies(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            seq_len=seq_len,
+        )
+        try:
+            config = next(
+                candidate
+                for candidate in topologies
+                if str(candidate["topology_id"]) == topology_id
+            )
+            resolved_topology_id = str(config["topology_id"])
+        except StopIteration as exc:
+            raise ValueError(
+                f"Unknown Block 1 topology_id={topology_id!r} for {num_heads}x{head_dim}"
+            ) from exc
+
+    tile_m = int(config["tile_m"])
+    tile_k = int(config["tile_k"])
+    tile_n = int(config["tile_n"])
+    parallel_seq = int(config["parallel_seq"])
+    parallel_heads = int(config["parallel_heads"])
+    parallel_head_dim = int(config["parallel_head_dim"])
+    num_aie_columns = int(config["num_aie_columns"])
+
+    if parallel_seq not in (1, 2, 4, 6, 8):
+        raise ValueError("Block 1 requires parallel_seq in {1, 2, 4, 6, 8}")
+    if seq_len % (parallel_seq * tile_m) != 0:
+        raise ValueError("Block 1 requires seq_len divisible by parallel_seq * tile_m")
+    if hidden_size % tile_k != 0:
+        raise ValueError("Block 1 requires hidden_size divisible by tile_k")
+    combined_hidden_size = hidden_size * 3
+    if combined_hidden_size % tile_n != 0:
+        raise ValueError("Block 1 requires combined_hidden_size divisible by tile_n")
+    if num_heads % parallel_heads != 0:
+        raise ValueError("Block 1 requires num_heads divisible by parallel_heads")
+    if head_dim % parallel_head_dim != 0:
+        raise ValueError("Block 1 requires head_dim divisible by parallel_head_dim")
+    if not 1 <= num_aie_columns <= 8:
+        raise ValueError("Block 1 requires 1 <= num_aie_columns <= 8")
+
+    return {
+        **config,
+        "topology_id": resolved_topology_id,
+        "topology_family": str(
+            config.get("topology_family", "shared_runtime_qkv_proj")
+        ),
+    }
+
+
 def _enumerate_block1_topologies(
     *,
     hidden_size: int,
@@ -922,6 +778,150 @@ def _block1_runtime_supported_candidates(
         ordered.append(candidate)
         seen_ids.add(topology_id)
     return ordered
+
+
+def _block1_theoretical_topologies(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    num_heads: int,
+) -> list[dict[str, int | str]]:
+    if seq_len <= 0:
+        raise ValueError("Block 1 requires seq_len > 0")
+    if hidden_size <= 0:
+        raise ValueError("Block 1 requires hidden_size > 0")
+    if num_heads <= 0:
+        raise ValueError("Block 1 requires num_heads > 0")
+    if hidden_size % num_heads != 0:
+        raise ValueError("Block 1 requires hidden_size divisible by num_heads")
+
+    head_dim = hidden_size // num_heads
+    combined_hidden_size = hidden_size * 3
+    r = s = t = 8
+
+    topologies: list[dict[str, int | str]] = []
+    for (
+        parallel_seq,
+        parallel_heads,
+        parallel_head_dim,
+        num_aie_columns,
+        tile_m,
+        tile_k,
+        tile_n,
+    ) in product(
+        _BLOCK1_PARALLEL_SEQ_CHOICES,
+        _divisors(num_heads),
+        _divisors(head_dim),
+        range(1, 9),
+        _divisors(seq_len),
+        _divisors(hidden_size),
+        _divisors(combined_hidden_size),
+    ):
+        if tile_m % r != 0:
+            continue
+        if tile_k % s != 0:
+            continue
+        if tile_n % t != 0:
+            continue
+        if seq_len % (parallel_seq * tile_m) != 0:
+            continue
+        if num_heads % parallel_heads != 0:
+            continue
+        if head_dim % parallel_head_dim != 0:
+            continue
+        if parallel_seq * parallel_heads * parallel_head_dim > 8:
+            continue
+        if not _block1_compute_tile_working_set_fits(
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+        ):
+            continue
+
+        candidate = {
+            "tile_m": tile_m,
+            "tile_k": tile_k,
+            "tile_n": tile_n,
+            "num_aie_columns": num_aie_columns,
+            "parallel_seq": parallel_seq,
+            "parallel_heads": parallel_heads,
+            "parallel_head_dim": parallel_head_dim,
+        }
+        topologies.append(
+            {
+                **candidate,
+                "topology_id": _theoretical_topology_id(candidate),
+                "topology_family": "shared_runtime_qkv_proj_theoretical",
+            }
+        )
+
+    return topologies
+
+
+def _block1_practical_topologies(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    num_heads: int,
+    max_candidates: int = _BLOCK1_PRACTICAL_MAX_CANDIDATES,
+) -> list[dict[str, int | str]]:
+    if max_candidates <= 0:
+        raise ValueError("Block 1 practical exploration requires max_candidates > 0")
+
+    theoretical = _block1_theoretical_topologies(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+    )
+    retained_runtime_ids = {
+        _theoretical_topology_id(
+            {
+                "tile_m": int(candidate["tile_m"]),
+                "tile_k": int(candidate["tile_k"]),
+                "tile_n": int(candidate["tile_n"]),
+                "num_aie_columns": int(candidate["num_aie_columns"]),
+                "parallel_seq": int(candidate["parallel_seq"]),
+                "parallel_heads": int(candidate["parallel_heads"]),
+                "parallel_head_dim": int(candidate["parallel_head_dim"]),
+            }
+        )
+        for candidate in qkv_proj_topologies(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+        )
+    }
+
+    ranked = sorted(theoretical, key=_block1_practical_sort_key, reverse=True)
+
+    selected: list[dict[str, int | str]] = []
+    selected_ids: set[str] = set()
+
+    def add_candidate(candidate: dict[str, int | str]) -> None:
+        selected.append(
+            {
+                **candidate,
+                "topology_family": "shared_runtime_qkv_proj_practical",
+            }
+        )
+        selected_ids.add(str(candidate["topology_id"]))
+
+    for candidate in ranked:
+        topology_id = str(candidate["topology_id"])
+        if topology_id not in retained_runtime_ids:
+            continue
+        add_candidate(candidate)
+
+    for candidate in ranked:
+        topology_id = str(candidate["topology_id"])
+        if topology_id in selected_ids:
+            continue
+        if not _is_block1_practical_candidate(candidate):
+            continue
+        add_candidate(candidate)
+        if len(selected) >= max_candidates:
+            break
+
+    return sorted(selected, key=_block1_practical_sort_key, reverse=True)
 
 
 def _divisors(value: int) -> tuple[int, ...]:
