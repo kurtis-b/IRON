@@ -85,3 +85,63 @@ def test_run_parity_cli_forwards_block_topology_overrides(monkeypatch):
     assert captured["base_spec"].block1_topology_id == "m64_k64_n16_ps1_ph1_pd1"
     assert captured["base_spec"].block2_topology_id == "q32_kv64_e96_ps1_ph1_acc1"
     assert captured["base_spec"].block3_topology_id == "m32_k96_n64_ps4_pi3_d8_g1"
+
+
+def test_validate_pattern_parity_includes_requested_block_topology_families(
+    monkeypatch,
+):
+    class FakeReferenceTransformerLayer:
+        def __init__(self, spec):
+            self.spec = spec
+
+        def assign_weights(self, weights):
+            self.weights = weights
+
+        def __call__(self, layer_inputs):
+            return torch.zeros((1,), dtype=torch.float32)
+
+    class FakePattern:
+        def assign_weights(self, weights):
+            self.weights = weights
+
+        def prepare_benchmark_inputs(self, layer_inputs):
+            self.layer_inputs = layer_inputs
+
+        def __call__(self, layer_inputs):
+            return torch.zeros((1,), dtype=torch.float32)
+
+    monkeypatch.setattr(
+        structured_validate_npu_parity_module,
+        "ReferenceTransformerLayer",
+        FakeReferenceTransformerLayer,
+    )
+    monkeypatch.setattr(
+        structured_validate_npu_parity_module,
+        "build_pattern",
+        lambda execution_mode, spec: FakePattern(),
+    )
+    monkeypatch.setattr(
+        structured_validate_npu_parity_module,
+        "make_synthetic_layer_weights",
+        lambda spec, seed: {},
+    )
+    monkeypatch.setattr(
+        structured_validate_npu_parity_module,
+        "make_synthetic_layer_inputs",
+        lambda spec, seed: object(),
+    )
+
+    row = structured_validate_pattern_parity(
+        execution_mode="dataflow",
+        spec=TransformerLayerSpec(
+            seq_len=64,
+            block1_topology_id="m64_k64_n16_ps1_ph1_pd1",
+            block2_topology_id="q32_kv64_e96_ps1_ph1_acc1",
+            block3_topology_id="m32_k96_n64_ps4_pi3_d8_g1",
+        ),
+        seed=7,
+    )
+
+    assert row["block1_topology_family"] == "shared_runtime_qkv_proj"
+    assert row["block2_topology_family"] == "fused_mha_out_proj"
+    assert row["block3_topology_family"] == "pipelined_addnorm_ffn_addnorm"

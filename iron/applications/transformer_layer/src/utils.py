@@ -10,6 +10,12 @@ import torch
 from .input_bundle import TransformerLayerInputs
 from .layer_spec import TransformerLayerSpec
 
+_REQUESTED_BLOCK_TOPOLOGY_FAMILIES = {
+    "block1_topology_id": "shared_runtime_qkv_proj",
+    "block2_topology_id": "fused_mha_out_proj",
+    "block3_topology_id": "pipelined_addnorm_ffn_addnorm",
+}
+
 
 def dtype_from_name(dtype_name: str) -> torch.dtype:
     return TransformerLayerSpec(dtype=dtype_name).torch_dtype
@@ -159,4 +165,17 @@ def make_in_process_npu_metadata(
     }
     if extra_fields:
         metadata.update(extra_fields)
+    return metadata
+
+
+def requested_block_topology_metadata(
+    spec: TransformerLayerSpec,
+) -> dict[str, str | None]:
+    metadata: dict[str, str | None] = {}
+    for topology_key, topology_family in _REQUESTED_BLOCK_TOPOLOGY_FAMILIES.items():
+        topology_id = getattr(spec, topology_key)
+        if topology_id is None:
+            continue
+        metadata[topology_key] = topology_id
+        metadata[topology_key.replace("_id", "_family")] = topology_family
     return metadata

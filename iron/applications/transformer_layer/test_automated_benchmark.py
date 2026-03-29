@@ -115,7 +115,7 @@ def test_write_results_csv_reserves_block_topology_columns(tmp_path: Path):
     )
 
 
-def test_decorate_row_for_case_backfills_requested_block_topology_ids():
+def test_decorate_row_for_case_backfills_requested_block_topology_metadata():
     spec = TransformerLayerSpec(
         seq_len=64,
         block1_topology_id="m64_k64_n16_ps1_ph1_pd1",
@@ -143,11 +143,14 @@ def test_decorate_row_for_case_backfills_requested_block_topology_ids():
     )
 
     assert row["block1_topology_id"] == spec.block1_topology_id
+    assert row["block1_topology_family"] == "shared_runtime_qkv_proj"
     assert row["block2_topology_id"] == spec.block2_topology_id
+    assert row["block2_topology_family"] == "fused_mha_out_proj"
     assert row["block3_topology_id"] == spec.block3_topology_id
+    assert row["block3_topology_family"] == "pipelined_addnorm_ffn_addnorm"
 
 
-def test_failure_result_row_includes_requested_block_topology_ids():
+def test_failure_result_row_includes_requested_block_topology_metadata():
     spec = TransformerLayerSpec(
         seq_len=64,
         block1_topology_id="m64_k64_n16_ps1_ph1_pd1",
@@ -166,8 +169,11 @@ def test_failure_result_row_includes_requested_block_topology_ids():
     )
 
     assert row["block1_topology_id"] == spec.block1_topology_id
+    assert row["block1_topology_family"] == "shared_runtime_qkv_proj"
     assert row["block2_topology_id"] == spec.block2_topology_id
+    assert row["block2_topology_family"] == "fused_mha_out_proj"
     assert row["block3_topology_id"] == spec.block3_topology_id
+    assert row["block3_topology_family"] == "pipelined_addnorm_ffn_addnorm"
 
 
 def test_run_parity_checks_forwards_requested_block_topology_ids(

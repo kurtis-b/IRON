@@ -207,6 +207,10 @@ retained topology selection as the benchmark rows.
 For direct automation, the same retained topology overrides should also be
 accepted by the benchmark/job CLI layer so study manifests, ad hoc benchmark
 invocations, and unattended jobs all share the same topology-selection surface.
+When those requested topology IDs are present, benchmark rows, failure rows,
+and parity rows should also backfill the matching topology-family columns so
+the stable result schema remains informative even before runtime metadata is
+available.
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`

@@ -18,6 +18,7 @@ from ..core.reference_layer import ReferenceTransformerLayer
 from ..utils import (
     make_synthetic_layer_inputs,
     make_synthetic_layer_weights,
+    requested_block_topology_metadata,
 )
 
 APP_DIR = Path(__file__).resolve().parents[2]
@@ -114,6 +115,7 @@ def validate_pattern_parity(
         "block1_topology_id": spec.block1_topology_id,
         "block2_topology_id": spec.block2_topology_id,
         "block3_topology_id": spec.block3_topology_id,
+        **requested_block_topology_metadata(spec),
         "batch_size": spec.batch_size,
         "dtype": spec.dtype,
         "weights_source": spec.weights_source,
