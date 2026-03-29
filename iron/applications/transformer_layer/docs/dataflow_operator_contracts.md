@@ -207,6 +207,10 @@ retained topology selection as the benchmark rows.
 For direct automation, the same retained topology overrides should also be
 accepted by the benchmark/job CLI layer so study manifests, ad hoc benchmark
 invocations, and unattended jobs all share the same topology-selection surface.
+For unattended study pipelines, `npu_study` step definitions should be allowed
+to carry the same `block1_topology_id`, `block2_topology_id`, and
+`block3_topology_id` overrides so pipeline-driven sweeps can pin retained
+topologies without patching the underlying study manifest.
 When those requested topology IDs are present, benchmark rows, failure rows,
 and parity rows should also backfill the matching topology-family columns so
 the stable result schema remains informative even before runtime metadata is

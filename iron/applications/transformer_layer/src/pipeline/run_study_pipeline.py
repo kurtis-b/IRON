@@ -21,6 +21,11 @@ BOTTLENECK_ANALYSIS = APP_DIR / "analyze_design_pattern_bottlenecks.py"
 GPU_COMPARE = APP_DIR / "gpu_compare_best_npu.py"
 PLOT_RESULTS = APP_DIR / "plot_design_pattern_results.py"
 BENCHMARK_STEP_KINDS = {"npu_study", "gpu_compare"}
+BLOCK_TOPOLOGY_FLAG_MAP = {
+    "block1_topology_id": "--block1-topology-id",
+    "block2_topology_id": "--block2-topology-id",
+    "block3_topology_id": "--block3-topology-id",
+}
 
 
 def resolve_path(base_path: str | Path, value: str | None) -> str | None:
@@ -325,6 +330,9 @@ def _build_step_command(
                 str(args.quiescent_baseline_duration_sec),
             ]
         )
+        for key, flag in BLOCK_TOPOLOGY_FLAG_MAP.items():
+            if step.get(key) is not None:
+                command.extend([flag, str(step[key])])
         return command
     if kind == "gpu_compare":
         config_path = Path(str(step["config"]))

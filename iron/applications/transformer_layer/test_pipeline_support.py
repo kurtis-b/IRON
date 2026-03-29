@@ -3,6 +3,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from iron.applications.transformer_layer.run_automated_benchmark_job import (
     build_command,
@@ -23,6 +24,9 @@ from iron.applications.transformer_layer.src.pipeline import (
 )
 from iron.applications.transformer_layer.src.pipeline import (
     resolve_path as structured_resolve_path,
+)
+from iron.applications.transformer_layer.src.pipeline.run_study_pipeline import (
+    _build_step_command as structured_build_step_command,
 )
 
 
@@ -82,3 +86,45 @@ def test_pipeline_restructure_preserves_legacy_imports_and_path_resolution(
     assert "--block2-topology-id" in command
     assert "--block3-topology-id" in command
     assert command[-2:] == ["--seed", "7"]
+
+
+def test_build_step_command_forwards_block_topology_overrides(tmp_path: Path):
+    manifest_path = tmp_path / "study" / "design_patterns_end_to_end.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "study_id": "design_patterns_end_to_end",
+                "seq_lens": [64],
+                "execution_modes": ["dataflow"],
+                "warmup_runs": 0,
+                "runs_per_sample": 1,
+                "output_csv": "results/out.csv",
+            }
+        ),
+        encoding="utf-8",
+    )
+    command = structured_build_step_command(
+        step={
+            "step_id": "step_0",
+            "kind": "npu_study",
+            "manifest": str(manifest_path),
+            "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+            "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+            "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
+        },
+        args=SimpleNamespace(
+            smoke=False,
+            warmup_runs=None,
+            runs_per_sample=None,
+            power_backend="none",
+            power_sample_interval_sec=0.05,
+            quiescent_baseline_duration_sec=0.5,
+        ),
+        output_root=None,
+        temp_dir=tmp_path,
+    )
+
+    assert "--block1-topology-id" in command
+    assert "--block2-topology-id" in command
+    assert "--block3-topology-id" in command
