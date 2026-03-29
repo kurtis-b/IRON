@@ -20,6 +20,12 @@ SUPPORT_MATRIX_FIELD_ORDER = [
     "block2_topology_family",
     "block3_topology_id",
     "block3_topology_family",
+    "exploration_block1_topology_id",
+    "exploration_block1_topology_family",
+    "exploration_block2_topology_id",
+    "exploration_block2_topology_family",
+    "exploration_block3_topology_id",
+    "exploration_block3_topology_family",
     "run_status",
     "failure_category",
     "failure_message",
@@ -52,6 +58,24 @@ def summarize_support_rows(rows: list[dict[str, object]]) -> list[dict[str, obje
                 "block2_topology_family": row.get("block2_topology_family"),
                 "block3_topology_id": row.get("block3_topology_id"),
                 "block3_topology_family": row.get("block3_topology_family"),
+                "exploration_block1_topology_id": row.get(
+                    "exploration_block1_topology_id"
+                ),
+                "exploration_block1_topology_family": row.get(
+                    "exploration_block1_topology_family"
+                ),
+                "exploration_block2_topology_id": row.get(
+                    "exploration_block2_topology_id"
+                ),
+                "exploration_block2_topology_family": row.get(
+                    "exploration_block2_topology_family"
+                ),
+                "exploration_block3_topology_id": row.get(
+                    "exploration_block3_topology_id"
+                ),
+                "exploration_block3_topology_family": row.get(
+                    "exploration_block3_topology_family"
+                ),
                 "run_status": row.get("run_status", "completed"),
                 "failure_category": row.get("failure_category"),
                 "failure_message": row.get("failure_message"),

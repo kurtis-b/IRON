@@ -72,6 +72,12 @@ def test_summarize_support_rows_preserves_block_topology_metadata():
                 "block2_topology_family": "fused_mha_out_proj",
                 "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
                 "block3_topology_family": "pipelined_addnorm_ffn_addnorm",
+                "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+                "exploration_block1_topology_family": "shared_runtime_qkv_proj_practical",
+                "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
+                "exploration_block2_topology_family": "fused_mha_out_proj_practical",
+                "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+                "exploration_block3_topology_family": "pipelined_addnorm_ffn_addnorm_practical",
                 "run_status": "unsupported",
                 "failure_category": "unsupported_topology_or_placement",
             }
@@ -82,5 +88,10 @@ def test_summarize_support_rows_preserves_block_topology_metadata():
     assert row["block1_topology_id"] == "m64_k64_n16_ps1_ph1_pd1"
     assert row["block2_topology_family"] == "fused_mha_out_proj"
     assert row["block3_topology_id"] == "m32_k96_n64_ps4_pi3_d8_g1"
+    assert row["exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_ph1_pd4"
+    assert row["exploration_block2_topology_family"] == "fused_mha_out_proj_practical"
+    assert row["exploration_block3_topology_id"] == "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1"
     assert "block1_topology_id" in structured_support_matrix_field_order
     assert "block3_topology_family" in structured_support_matrix_field_order
+    assert "exploration_block1_topology_id" in structured_support_matrix_field_order
+    assert "exploration_block3_topology_family" in structured_support_matrix_field_order

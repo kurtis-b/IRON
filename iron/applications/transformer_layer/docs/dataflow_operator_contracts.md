@@ -287,9 +287,9 @@ and parity rows should also backfill the matching topology-family columns so
 the stable result schema remains informative even before runtime metadata is
 available.
 Support-matrix CSV outputs should preserve the same block topology IDs and
-families, with stable support-matrix column ordering, so unsupported or
-filtered rows remain attributable to the retained topology that was requested or
-resolved.
+families, plus any preserved practical-topology provenance fields, with stable
+support-matrix column ordering, so unsupported or filtered rows remain
+attributable to the retained topology that was requested or resolved.
 For the iGPU comparison study, GPU result rows should preserve the selected
 reference NPU row's block topology IDs and families under explicit
 `reference_npu_*` columns so best-NPU-vs-iGPU results remain attributable to
