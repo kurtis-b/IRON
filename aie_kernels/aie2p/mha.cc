@@ -158,8 +158,7 @@ void matmul_PV(bfloat16 *Q,
                 Vec8bf16 scale_vec = aie::broadcast<bfloat16, 8>(scale_val);
 
                 for (int32_t j = 0; j < 8; j++) {
-                    Vec8bf16 o_vec =
-                        aie::load_v<8>(out + j * 64 + k * 8 + l * 512);
+                    Vec8bf16 o_vec = aie::load_v<8>(out + j * 64 + k * 8 + l * 512);
                     o_vec = aie::mul(o_vec, scale_vec);
                     aie::store_v(out + j * 64 + k * 8 + l * 512, o_vec);
                 }
