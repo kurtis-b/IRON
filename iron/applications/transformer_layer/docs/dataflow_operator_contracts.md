@@ -94,7 +94,11 @@ and lowers them through the local fused Block 1 design used by
 [`iron/operators/qkv_proj/op.py`](/home/cj/iron/iron/operators/qkv_proj/op.py).
 The retained `v2` implementation parallelizes the three independent Q/K/V
 projections as one wider GEMM and then reshapes the combined output back to
-head-major `q/k/v` tensors on the wrapper surface.
+head-major `q/k/v` tensors on the wrapper surface. The current retained Block 1
+topology sweep varies the fused GEMM tiling (`tile_m`, `tile_n`) while keeping
+the thesis-facing `parallel_seq`, `parallel_heads`, and `parallel_head_dim`
+axes pinned at `1` until the local fused lowering grows real lane-level
+parallel splits for those dimensions.
 That design file should also be the source of the retained topology list used by
 operator-local tests and future topology selection logic.
 

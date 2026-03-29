@@ -158,6 +158,22 @@ def test_build_pattern_honors_block_topology_overrides():
     assert block3_pattern.block.topology_id == spec.block3_topology_id
 
 
+def test_build_pattern_honors_nondefault_block1_topology_override():
+    block1_topologies = qkv_proj_topologies(hidden_size=768, num_heads=12)
+    assert len(block1_topologies) > 1
+
+    spec = TransformerLayerSpec(
+        seq_len=64,
+        block1_topology_id=str(block1_topologies[-1]["topology_id"]),
+    )
+
+    dataflow_pattern = build_pattern("dataflow", spec)
+    assert dataflow_pattern.block1.topology_id == spec.block1_topology_id
+
+    block1_pattern = build_pattern("block1_qkv_proj", spec)
+    assert block1_pattern.block.topology_id == spec.block1_topology_id
+
+
 def test_block1_contract_reshapes_projection_outputs_to_head_major():
     matrix = torch.arange(24, dtype=torch.bfloat16).reshape(3, 8)
     head_major = AIEQKVProj._to_head_major(

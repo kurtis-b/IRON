@@ -4,33 +4,24 @@
 from __future__ import annotations
 
 import argparse
+from itertools import product
 import json
 
 from iron.operators.gemm.design_batched import my_matmul as _batched_gemm_design
 
-_BLOCK1_TOPOLOGIES = {
-    (12, 64): [
-        {
-            "tile_m": 64,
-            "tile_k": 64,
-            "tile_n": 16,
-            "num_aie_columns": 8,
-            "parallel_seq": 1,
-            "parallel_heads": 1,
-            "parallel_head_dim": 1,
-        }
-    ],
-    (16, 64): [
-        {
-            "tile_m": 64,
-            "tile_k": 64,
-            "tile_n": 16,
-            "num_aie_columns": 8,
-            "parallel_seq": 1,
-            "parallel_heads": 1,
-            "parallel_head_dim": 1,
-        }
-    ],
+_BLOCK1_RETAINED_FAMILIES = {
+    (12, 64),
+    (16, 64),
+}
+
+_BLOCK1_RETAINED_AXES = {
+    "tile_m": (64, 32),
+    "tile_k": (64,),
+    "tile_n": (16, 32),
+    "num_aie_columns": (8,),
+    "parallel_seq": (1,),
+    "parallel_heads": (1,),
+    "parallel_head_dim": (1,),
 }
 
 
@@ -42,12 +33,15 @@ def qkv_proj_topologies(
     if hidden_size % num_heads != 0:
         raise ValueError("Block 1 requires hidden_size divisible by num_heads")
     head_dim = hidden_size // num_heads
-    try:
-        topologies = _BLOCK1_TOPOLOGIES[(num_heads, head_dim)]
-    except KeyError as exc:
+    if (num_heads, head_dim) not in _BLOCK1_RETAINED_FAMILIES:
         raise ValueError(
             "Block 1 currently supports only the retained thesis families 12x64 and 16x64"
-        ) from exc
+        )
+    topologies = _enumerate_block1_topologies(
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
     return [
         {
             **candidate,
@@ -177,6 +171,52 @@ def fused_qkv_proj(
         (1, 0),
         (1, 0),
     )
+
+
+def _enumerate_block1_topologies(
+    *,
+    hidden_size: int,
+    num_heads: int,
+    head_dim: int,
+) -> list[dict[str, int]]:
+    topologies: list[dict[str, int]] = []
+    for (
+        tile_m,
+        tile_k,
+        tile_n,
+        num_aie_columns,
+        parallel_seq,
+        parallel_heads,
+        parallel_head_dim,
+    ) in product(
+        _BLOCK1_RETAINED_AXES["tile_m"],
+        _BLOCK1_RETAINED_AXES["tile_k"],
+        _BLOCK1_RETAINED_AXES["tile_n"],
+        _BLOCK1_RETAINED_AXES["num_aie_columns"],
+        _BLOCK1_RETAINED_AXES["parallel_seq"],
+        _BLOCK1_RETAINED_AXES["parallel_heads"],
+        _BLOCK1_RETAINED_AXES["parallel_head_dim"],
+    ):
+        if hidden_size % tile_k != 0:
+            continue
+        if hidden_size % tile_n != 0:
+            continue
+        if num_heads % parallel_heads != 0:
+            continue
+        if head_dim % parallel_head_dim != 0:
+            continue
+        topologies.append(
+            {
+                "tile_m": tile_m,
+                "tile_k": tile_k,
+                "tile_n": tile_n,
+                "num_aie_columns": num_aie_columns,
+                "parallel_seq": parallel_seq,
+                "parallel_heads": parallel_heads,
+                "parallel_head_dim": parallel_head_dim,
+            }
+        )
+    return topologies
 
 
 def _topology_id(config: dict[str, int]) -> str:
