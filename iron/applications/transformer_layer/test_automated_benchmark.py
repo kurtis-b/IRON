@@ -274,6 +274,12 @@ def test_write_results_csv_reserves_topology_columns(tmp_path: Path):
                 "block2_topology_family": "fused_mha_out_proj",
                 "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
                 "block3_topology_family": "pipelined_addnorm_ffn_addnorm",
+                "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+                "exploration_block1_topology_family": "shared_runtime_qkv_proj_practical",
+                "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
+                "exploration_block2_topology_family": "fused_mha_out_proj_practical",
+                "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+                "exploration_block3_topology_family": "pipelined_addnorm_ffn_addnorm_practical",
                 "reference_npu_execution_mode": "dataflow",
                 "reference_npu_avg_latency_ms": 9.5,
                 "reference_npu_block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
@@ -296,6 +302,12 @@ def test_write_results_csv_reserves_topology_columns(tmp_path: Path):
         "block2_topology_family",
         "block3_topology_id",
         "block3_topology_family",
+        "exploration_block1_topology_id",
+        "exploration_block1_topology_family",
+        "exploration_block2_topology_id",
+        "exploration_block2_topology_family",
+        "exploration_block3_topology_id",
+        "exploration_block3_topology_family",
         "reference_npu_execution_mode",
         "reference_npu_avg_latency_ms",
         "reference_npu_block1_topology_id",
@@ -309,6 +321,9 @@ def test_write_results_csv_reserves_topology_columns(tmp_path: Path):
 
     assert header.index("process_model") < header.index("block1_topology_id")
     assert header.index("block3_topology_family") < header.index(
+        "exploration_block1_topology_id"
+    )
+    assert header.index("exploration_block3_topology_family") < header.index(
         "reference_npu_execution_mode"
     )
     assert header.index("reference_npu_block3_topology_family") < header.index(
@@ -317,6 +332,9 @@ def test_write_results_csv_reserves_topology_columns(tmp_path: Path):
     assert RESULT_FIELD_ORDER.index("block1_topology_id") < RESULT_FIELD_ORDER.index(
         "run_status"
     )
+    assert RESULT_FIELD_ORDER.index(
+        "exploration_block1_topology_id"
+    ) < RESULT_FIELD_ORDER.index("run_status")
     assert RESULT_FIELD_ORDER.index(
         "reference_npu_execution_mode"
     ) < RESULT_FIELD_ORDER.index("run_status")

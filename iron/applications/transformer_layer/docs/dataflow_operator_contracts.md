@@ -232,9 +232,10 @@ operator-local tests and future topology selection logic.
 Study metadata emitted by the in-process Dataflow patterns should include the
 selected block topology IDs and families so retained topology choices are visible
 in benchmark outputs.
-Those topology fields should also be reserved in the shared transformer-layer
-result schema so benchmark CSVs expose them as stable columns rather than
-unordered extra metadata.
+Those topology fields, plus any preserved practical-topology provenance fields
+for manifest-expanded studies, should also be reserved in the shared
+transformer-layer result schema so benchmark CSVs expose them as stable columns
+rather than unordered extra metadata.
 
 At the study/app layer, retained topology selection should remain optional.
 `TransformerLayerSpec` may carry `block1_topology_id`, `block2_topology_id`, and
