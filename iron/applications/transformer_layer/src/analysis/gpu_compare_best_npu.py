@@ -109,6 +109,17 @@ def _spec_from_row(row: dict[str, str]) -> TransformerLayerSpec:
     )
 
 
+def _reference_npu_topology_metadata(npu_row: dict[str, str]) -> dict[str, str | None]:
+    return {
+        "reference_npu_block1_topology_id": npu_row.get("block1_topology_id"),
+        "reference_npu_block1_topology_family": npu_row.get("block1_topology_family"),
+        "reference_npu_block2_topology_id": npu_row.get("block2_topology_id"),
+        "reference_npu_block2_topology_family": npu_row.get("block2_topology_family"),
+        "reference_npu_block3_topology_id": npu_row.get("block3_topology_id"),
+        "reference_npu_block3_topology_family": npu_row.get("block3_topology_family"),
+    }
+
+
 def _unsupported_gpu_row(
     *,
     config: dict[str, object],
@@ -148,6 +159,7 @@ def _unsupported_gpu_row(
         "power_backend": config["power_backend"],
         "reference_npu_execution_mode": npu_row.get("execution_mode"),
         "reference_npu_avg_latency_ms": _optional_float(npu_row.get("avg_latency_ms")),
+        **_reference_npu_topology_metadata(npu_row),
     }
 
 
@@ -179,6 +191,7 @@ def benchmark_best_npu_vs_gpu(config: dict[str, object]) -> list[dict[str, objec
             row["reference_npu_avg_latency_ms"] = _optional_float(
                 npu_row.get("avg_latency_ms")
             )
+            row.update(_reference_npu_topology_metadata(npu_row))
         except Exception as exc:
             row = _unsupported_gpu_row(
                 config=config,

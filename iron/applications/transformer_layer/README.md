@@ -117,6 +117,9 @@ not depend on implicit topology defaults.
 Study manifests are normalized through `TransformerLayerSpec` during loading, so
 checked-in and ad hoc manifests are validated against the same retained layer
 surface before benchmarking begins.
+The iGPU compare output also preserves the selected NPU row's block topology
+metadata under explicit `reference_npu_*` columns so best-NPU-vs-iGPU results
+remain attributable to the retained topology that won selection.
 
 Retained benchmark surface:
 
