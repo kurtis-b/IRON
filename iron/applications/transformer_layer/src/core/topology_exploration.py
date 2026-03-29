@@ -5,11 +5,11 @@ from __future__ import annotations
 
 from itertools import islice, product
 
-from iron.operators.addnorm_ffn_addnorm.design import (
+from iron.operators.addnorm_ffn_addnorm.topology import (
     addnorm_ffn_addnorm_topologies,
     addnorm_ffn_addnorm_practical_topologies,
 )
-from iron.operators.mha_out_proj.design import (
+from iron.operators.mha_out_proj.topology import (
     mha_out_proj_practical_topologies,
     mha_out_proj_topologies,
 )

@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from iron.operators.mha_out_proj.design import (
+from iron.operators.mha_out_proj.topology import (
     _block2_stage_working_sets_fit,
     _block2_practical_sort_key,
     mha_out_proj_practical_topologies,

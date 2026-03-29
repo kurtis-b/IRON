@@ -20,8 +20,8 @@ from iron.applications.transformer_layer.src.patterns import (
     DataflowPattern as StructuredDataflowPattern,
 )
 from iron.applications.transformer_layer.src.patterns import GemmOnlyPattern
-from iron.operators.addnorm_ffn_addnorm.design import addnorm_ffn_addnorm_topologies
-from iron.operators.mha_out_proj.design import mha_out_proj_topologies
+from iron.operators.addnorm_ffn_addnorm.topology import addnorm_ffn_addnorm_topologies
+from iron.operators.mha_out_proj.topology import mha_out_proj_topologies
 from iron.operators.qkv_proj.topology import qkv_proj_topologies
 from iron.applications.transformer_layer.src.utils import (
     make_in_process_npu_metadata,

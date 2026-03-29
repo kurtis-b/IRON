@@ -18,7 +18,7 @@ from iron.common import (
     PythonGeneratedMLIRArtifact,
 )
 from iron.common.utils import torch_to_numpy, numpy_to_torch
-from iron.operators.mha_out_proj.design import mha_out_proj_design
+from iron.operators.mha_out_proj.topology import mha_out_proj_design
 
 
 def _canonicalize_head_major_qkv(

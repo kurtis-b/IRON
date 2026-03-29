@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import torch
 
-from iron.operators.addnorm_ffn_addnorm.design import addnorm_ffn_addnorm_design
+from iron.operators.addnorm_ffn_addnorm.topology import addnorm_ffn_addnorm_design
 from iron.operators.ffn_addnorm.op import AIEFFNAN
 
 

@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from iron.operators.addnorm_ffn_addnorm.design import (
+from iron.operators.addnorm_ffn_addnorm.topology import (
     _block3_practical_sort_key,
     addnorm_ffn_addnorm_practical_topologies,
     addnorm_ffn_addnorm_theoretical_topologies,
