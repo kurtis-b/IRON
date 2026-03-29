@@ -242,6 +242,8 @@ attributable to the resolved Dataflow topology surface.
 Plot generation should be allowed to facet on retained topology columns too, so
 latency/throughput/power, bottleneck, and best-NPU-vs-iGPU plots can be grouped
 by resolved block topology when needed.
+The checked-in unattended pipeline should use that surface for retained
+Dataflow-study plot steps rather than relying only on study-case grouping.
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`

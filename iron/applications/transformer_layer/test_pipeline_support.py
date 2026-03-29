@@ -153,3 +153,17 @@ def test_build_step_command_forwards_plot_facet_key(tmp_path: Path):
 
     assert "--facet-key" in command
     assert "block2_topology_id" in command
+
+
+def test_checked_in_pipeline_uses_topology_facet_for_retained_plot_steps():
+    pipeline = load_pipeline_config(
+        Path(__file__).resolve().parent / "study" / "designpats_pipeline.json"
+    )
+    steps_by_id = {step["step_id"]: step for step in pipeline["steps"]}
+
+    assert steps_by_id["dataflow_blocks_plots"]["facet_key"] == "block2_topology_id"
+    assert (
+        steps_by_id["design_patterns_end_to_end_plots"]["facet_key"]
+        == "block2_topology_id"
+    )
+    assert "facet_key" not in steps_by_id["reconfiguration_overhead_plots"]

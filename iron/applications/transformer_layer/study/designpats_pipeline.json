@@ -40,6 +40,7 @@
       "kind": "plot",
       "input_csv": "../results/dataflow_blocks_annotated.csv",
       "bottleneck_csv": "../results/dataflow_blocks_bottlenecks.csv",
+      "facet_key": "block2_topology_id",
       "output_dir": "../results/plots/dataflow_blocks",
       "benchmarking_step": false
     },
@@ -68,6 +69,7 @@
       "input_csv": "../results/design_patterns_end_to_end_annotated.csv",
       "bottleneck_csv": "../results/design_patterns_end_to_end_bottlenecks.csv",
       "gpu_compare_csv": "../results/gpu_compare_end_to_end_igpu.csv",
+      "facet_key": "block2_topology_id",
       "output_dir": "../results/plots/design_patterns_end_to_end",
       "benchmarking_step": false
     },

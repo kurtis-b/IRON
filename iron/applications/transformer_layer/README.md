@@ -125,6 +125,8 @@ CSV columns rather than unordered extras.
 The plot generator can now facet on retained topology columns as well, so
 analysis plots can be grouped by resolved block topology instead of only by
 study case or hidden size.
+The checked-in unattended pipeline uses that surface for the retained Dataflow
+studies by faceting their plot steps on `block2_topology_id`.
 
 Retained benchmark surface:
 
