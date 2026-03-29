@@ -251,6 +251,10 @@ Study manifests may optionally request that same practical surface through a
 `topology_exploration` object layered on top of a single base `layer_spec`, but
 that expansion should currently be limited to single-`seq_len` manifests so the
 generated combinations remain tied to one concrete workload geometry.
+The unattended pipeline's temp-manifest rewrite path should preserve that
+`topology_exploration` object as-is so the generated study-case expansion still
+happens inside the benchmark loader rather than being flattened by the pipeline
+wrapper.
 For unattended study pipelines, `npu_study` step definitions should be allowed
 to carry the same `block1_topology_id`, `block2_topology_id`, and
 `block3_topology_id` overrides so pipeline-driven sweeps can pin retained

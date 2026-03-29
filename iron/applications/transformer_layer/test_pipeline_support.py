@@ -16,6 +16,9 @@ from iron.applications.transformer_layer.run_study_pipeline import (
 from iron.applications.transformer_layer.src.pipeline import (
     build_command as structured_build_command,
 )
+from iron.applications.transformer_layer.src.bench import (
+    load_study_manifest as structured_load_study_manifest,
+)
 from iron.applications.transformer_layer.src.pipeline import (
     load_job_config as structured_load_job_config,
 )
@@ -128,6 +131,67 @@ def test_build_step_command_forwards_block_topology_overrides(tmp_path: Path):
     assert "--block1-topology-id" in command
     assert "--block2-topology-id" in command
     assert "--block3-topology-id" in command
+
+
+def test_build_step_command_preserves_topology_exploration_manifest(tmp_path: Path):
+    manifest_path = tmp_path / "study" / "topology_exploration.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "study_id": "topology_exploration",
+                "seq_lens": [64],
+                "execution_modes": ["dataflow"],
+                "warmup_runs": 0,
+                "runs_per_sample": 1,
+                "output_csv": "results/out.csv",
+                "layer_spec": {
+                    "hidden_size": 768,
+                    "intermediate_size": 3072,
+                    "num_attention_heads": 12,
+                },
+                "topology_exploration": {
+                    "surface": "practical",
+                    "max_block1_candidates": 2,
+                    "max_block2_candidates": 1,
+                    "max_block3_candidates": 2,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    command = structured_build_step_command(
+        step={
+            "step_id": "step_0",
+            "kind": "npu_study",
+            "manifest": str(manifest_path),
+        },
+        args=SimpleNamespace(
+            smoke=True,
+            warmup_runs=None,
+            runs_per_sample=None,
+            power_backend="none",
+            power_sample_interval_sec=0.05,
+            quiescent_baseline_duration_sec=0.5,
+        ),
+        output_root=None,
+        temp_dir=tmp_path,
+    )
+
+    manifest_arg = Path(command[command.index("--study-manifest") + 1])
+    patched_manifest = json.loads(manifest_arg.read_text(encoding="utf-8"))
+
+    assert patched_manifest["topology_exploration"]["surface"] == "practical"
+    assert patched_manifest["topology_exploration"]["max_block1_candidates"] == 2
+    assert patched_manifest["seq_lens"] == [64]
+
+    expanded_manifest = structured_load_study_manifest(manifest_arg)
+    assert len(expanded_manifest["study_cases"]) == 4
+    for case in expanded_manifest["study_cases"]:
+        assert case["layer_spec"]["block1_topology_id"] is not None
+        assert case["layer_spec"]["block2_topology_id"] is not None
+        assert case["layer_spec"]["block3_topology_id"] is not None
 
 
 def test_build_step_command_forwards_plot_facet_key(tmp_path: Path):
