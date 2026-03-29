@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from iron.operators.mha_out_proj.design import (
+    _block2_stage_working_sets_fit,
     _block2_practical_sort_key,
     mha_out_proj_practical_topologies,
     mha_out_proj_theoretical_topologies,
@@ -153,7 +154,19 @@ def test_theoretical_block2_topologies_include_nondefault_valid_variants():
     assert "q32_kv64_e128_ps1_ph1_acc1" in topology_ids
     assert "q32_kv64_e128_ps1_ph2_acc1" in topology_ids
     assert "q32_kv64_e128_ps1_ph1_acc2" in topology_ids
-    assert "q64_kv64_e128_ps1_ph1_acc1" in topology_ids
+    assert "q32_kv128_e64_ps1_ph1_acc1" in topology_ids
+
+
+def test_theoretical_block2_topologies_exclude_nonrunnable_l1_overflows():
+    topology_ids = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_theoretical_topologies(
+            seq_len=2048,
+            num_heads=16,
+            head_dim=64,
+        )
+    }
+    assert "q64_kv64_e128_ps1_ph1_acc1" not in topology_ids
 
 
 def test_theoretical_block2_topologies_are_unique_and_contract_valid():
@@ -181,6 +194,12 @@ def test_theoretical_block2_topologies_are_unique_and_contract_valid():
         assert 16 % parallel_heads == 0
         assert parallel_seq * parallel_heads <= 8
         assert 1024 % (emb_tile * o_proj_acc_depth) == 0
+        assert _block2_stage_working_sets_fit(
+            q_seq_tile=q_seq_tile,
+            kv_seq_tile=kv_seq_tile,
+            emb_tile=emb_tile,
+            head_dim=64,
+        )
 
 
 def test_practical_block2_topologies_are_subset_of_theoretical_surface():
@@ -241,3 +260,6 @@ def test_practical_block2_topologies_are_ranked_and_pruned():
             assert lane_parallelism >= 2
             assert sequence_chunk >= 64
         assert topology["topology_family"] == "fused_mha_out_proj_practical"
+
+    practical_ids = {str(topology["topology_id"]) for topology in practical}
+    assert "q64_kv64_e128_ps1_ph1_acc1" not in practical_ids

@@ -85,6 +85,9 @@ _BLOCK2_TOPOLOGIES = {
 
 _BLOCK2_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
 _BLOCK2_AIE_DATA_MEM_SIZE_BYTES = 65536
+_BLOCK2_FIFO_STAGE_COPIES = 2
+_BLOCK2_O_PROJ_LOCAL_OUTPUT_COPIES = 3
+_BLOCK2_STAGE_FIXED_OVERHEAD_BYTES = 4096
 _BLOCK2_PRACTICAL_MIN_Q_SEQ_TILE = 32
 _BLOCK2_PRACTICAL_MIN_KV_SEQ_TILE = 64
 _BLOCK2_PRACTICAL_MIN_EMB_TILE = 64
@@ -368,11 +371,36 @@ def _block2_stage_working_set_bytes(
     wo_bytes = head_dim * emb_tile * bf16_bytes
     o_bytes = q_seq_tile * emb_tile * bf16_bytes
 
+    qk_stage_bytes = (
+        (_BLOCK2_FIFO_STAGE_COPIES * q_bytes)
+        + (_BLOCK2_FIFO_STAGE_COPIES * k_bytes)
+        + (_BLOCK2_FIFO_STAGE_COPIES * qk_bytes)
+        + _BLOCK2_STAGE_FIXED_OVERHEAD_BYTES
+    )
+    softmax_stage_bytes = (
+        (2 * _BLOCK2_FIFO_STAGE_COPIES * qk_bytes)
+        + (_BLOCK2_FIFO_STAGE_COPIES * scale_bytes)
+        + _BLOCK2_STAGE_FIXED_OVERHEAD_BYTES
+    )
+    pv_stage_bytes = (
+        (_BLOCK2_FIFO_STAGE_COPIES * qk_bytes)
+        + (_BLOCK2_FIFO_STAGE_COPIES * v_bytes)
+        + (_BLOCK2_FIFO_STAGE_COPIES * q_bytes)
+        + (_BLOCK2_FIFO_STAGE_COPIES * scale_bytes)
+        + _BLOCK2_STAGE_FIXED_OVERHEAD_BYTES
+    )
+    o_proj_stage_bytes = (
+        q_bytes
+        + wo_bytes
+        + (_BLOCK2_O_PROJ_LOCAL_OUTPUT_COPIES * o_bytes)
+        + _BLOCK2_STAGE_FIXED_OVERHEAD_BYTES
+    )
+
     stage_working_sets = (
-        q_bytes + k_bytes + qk_bytes,
-        (2 * qk_bytes) + scale_bytes,
-        qk_bytes + v_bytes + q_bytes + scale_bytes,
-        q_bytes + wo_bytes + (2 * o_bytes),
+        qk_stage_bytes,
+        softmax_stage_bytes,
+        pv_stage_bytes,
+        o_proj_stage_bytes,
     )
     return max(stage_working_sets)
 

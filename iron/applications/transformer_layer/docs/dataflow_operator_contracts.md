@@ -167,7 +167,7 @@ That design file should expose three distinct topology views:
   benchmark manifests
 - a broader theoretical topology enumerator that explores every combination
   allowed by the Block 2 contract, microkernel divisibility, lane-count limit,
-  and per-stage local working-set limits for a given workload
+  and the current staged local-memory working-set limits for a given workload
 - a heuristic-pruned practical exploration surface that favors higher sequence
   and head parallelism, larger Q/KV/output tiles, larger sequence and output
   chunks, and fuller per-stage local-memory utilization while still retaining
