@@ -21,37 +21,30 @@ def generate_test_params():
         (64, 1024, 4096),
         (512, 1024, 4096),
     ]
-    params = [
-        (
-            seq_len,
-            hidden_size,
-            intermediate_size,
-            str(
-                addnorm_ffn_addnorm_design(
-                    seq_len=seq_len,
-                    hidden_size=hidden_size,
-                    intermediate_size=intermediate_size,
-                )["topology_id"]
-            ),
+    params = []
+    for seq_len, hidden_size, intermediate_size in workloads:
+        topology_id = str(
+            addnorm_ffn_addnorm_design(
+                seq_len=seq_len,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )["topology_id"]
         )
-        for seq_len, hidden_size, intermediate_size in workloads
-    ]
-    names = [
-        f"block3_{seq_len}x{hidden_size}x{intermediate_size}_{topology_id}"
-        for seq_len, hidden_size, intermediate_size, topology_id in params
-    ]
-    return params, names
-
-
-regular_params, regular_names = generate_test_params()
+        params.append(
+            pytest.param(
+                seq_len,
+                hidden_size,
+                intermediate_size,
+                topology_id,
+                id=f"block3_{seq_len}x{hidden_size}x{intermediate_size}_{topology_id}",
+            )
+        )
+    return params
 
 
 @pytest.mark.parametrize(
     "seq_len,hidden_size,intermediate_size,topology_id",
-    [
-        pytest.param(*params, id=name)
-        for params, name in zip(regular_params, regular_names)
-    ],
+    generate_test_params(),
 )
 def test_block3_topologies_construct_and_match_reference_contract(
     seq_len,

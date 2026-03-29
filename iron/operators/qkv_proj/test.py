@@ -22,37 +22,30 @@ def generate_test_params():
         (64, 16, 64),
         (512, 16, 64),
     ]
-    params = [
-        (
-            seq_len,
-            num_heads,
-            head_dim,
-            str(
-                qkv_proj_design(
-                    seq_len=seq_len,
-                    hidden_size=num_heads * head_dim,
-                    num_heads=num_heads,
-                )["topology_id"]
-            ),
+    params = []
+    for seq_len, num_heads, head_dim in workloads:
+        topology_id = str(
+            qkv_proj_design(
+                seq_len=seq_len,
+                hidden_size=num_heads * head_dim,
+                num_heads=num_heads,
+            )["topology_id"]
         )
-        for seq_len, num_heads, head_dim in workloads
-    ]
-    names = [
-        f"block1_{seq_len}_{num_heads}_{head_dim}_{topology_id}"
-        for seq_len, num_heads, head_dim, topology_id in params
-    ]
-    return params, names
-
-
-regular_params, regular_names = generate_test_params()
+        params.append(
+            pytest.param(
+                seq_len,
+                num_heads,
+                head_dim,
+                topology_id,
+                id=f"block1_{seq_len}_{num_heads}_{head_dim}_{topology_id}",
+            )
+        )
+    return params
 
 
 @pytest.mark.parametrize(
     "seq_len,num_heads,head_dim,topology_id",
-    [
-        pytest.param(*params, id=name)
-        for params, name in zip(regular_params, regular_names)
-    ],
+    generate_test_params(),
 )
 def test_qkv_proj(
     seq_len: int,
