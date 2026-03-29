@@ -49,6 +49,111 @@ microkernel_mac_dim_map = {
     },
 }
 
+_BLOCK2_TOPOLOGIES = {
+    (1, 64): [
+        {
+            "parallel_seq": 1,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 64,
+            "parallel_heads": 1,
+            "o_proj_acc_depth": 1,
+        }
+    ],
+    (12, 64): [
+        {
+            "parallel_seq": 1,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 96,
+            "parallel_heads": 1,
+            "o_proj_acc_depth": 1,
+        }
+    ],
+    (16, 64): [
+        {
+            "parallel_seq": 1,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 128,
+            "parallel_heads": 1,
+            "o_proj_acc_depth": 1,
+        }
+    ],
+}
+
+
+def mha_out_proj_design(
+    *,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    topology_id: str | None = None,
+) -> dict[str, int | str]:
+    try:
+        topologies = _BLOCK2_TOPOLOGIES[(num_heads, head_dim)]
+    except KeyError as exc:
+        raise ValueError(
+            "Block 2 currently supports only the retained thesis families 1x64, 12x64, and 16x64"
+        ) from exc
+
+    if topology_id is None:
+        config = topologies[0]
+    else:
+        try:
+            config = next(
+                candidate
+                for candidate in topologies
+                if _mha_out_proj_topology_id(candidate) == topology_id
+            )
+        except StopIteration as exc:
+            raise ValueError(
+                f"Unknown Block 2 topology_id={topology_id!r} for {num_heads}x{head_dim}"
+            ) from exc
+
+    parallel_seq = int(config["parallel_seq"])
+    q_seq_tile = int(config["q_seq_tile"])
+    kv_seq_tile = int(config["kv_seq_tile"])
+    emb_tile = int(config["emb_tile"])
+    parallel_heads = int(config["parallel_heads"])
+    o_proj_acc_depth = int(config["o_proj_acc_depth"])
+    embed_sz = num_heads * head_dim
+
+    if seq_len <= 0:
+        raise ValueError("Block 2 requires seq_len > 0")
+    if parallel_seq not in (1, 2, 4, 6, 8):
+        raise ValueError("Block 2 requires parallel_seq in {1, 2, 4, 6, 8}")
+    if seq_len % (parallel_seq * q_seq_tile) != 0:
+        raise ValueError(
+            "Block 2 requires seq_len divisible by parallel_seq * q_seq_tile"
+        )
+    if seq_len % kv_seq_tile != 0:
+        raise ValueError("Block 2 requires seq_len divisible by kv_seq_tile")
+    if num_heads % parallel_heads != 0:
+        raise ValueError("Block 2 requires num_heads divisible by parallel_heads")
+    if parallel_seq * parallel_heads > 8:
+        raise ValueError(
+            "Block 2 topology requires more parallel lanes than the retained surface supports"
+        )
+    if embed_sz % (emb_tile * o_proj_acc_depth) != 0:
+        raise ValueError(
+            "Block 2 requires embedding_dim divisible by emb_tile * o_proj_acc_depth"
+        )
+
+    return {
+        **config,
+        "topology_id": _mha_out_proj_topology_id(config),
+        "topology_family": "fused_mha_out_proj",
+    }
+
+
+def _mha_out_proj_topology_id(config: dict[str, int]) -> str:
+    return (
+        f"q{config['q_seq_tile']}_kv{config['kv_seq_tile']}_e{config['emb_tile']}"
+        f"_ps{config['parallel_seq']}_ph{config['parallel_heads']}"
+        f"_acc{config['o_proj_acc_depth']}"
+    )
+
 
 def main():
     argparser = argparse.ArgumentParser(

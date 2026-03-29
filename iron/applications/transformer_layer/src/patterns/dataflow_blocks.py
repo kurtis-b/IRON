@@ -23,7 +23,7 @@ from ..utils import (
     host_attention_output,
     host_project_qkv_head_major,
     require_keys,
-    select_mha_out_proj_emb_tile,
+    resolve_mha_out_proj_topology,
 )
 
 
@@ -118,12 +118,12 @@ class Block2MHAOutProjPattern(_BaseBlockPattern):
         super().__init__(spec)
         if spec.attention_head_size != 64:
             raise ValueError("Block 2 currently supports attention_head_size=64 only")
-        mha_emb_tile = select_mha_out_proj_emb_tile(spec.hidden_size)
+        block2_topology = resolve_mha_out_proj_topology(spec)
         self.block = AIEMHAOutProj(
             num_heads=spec.num_attention_heads,
             seq_len=spec.seq_len,
             d=spec.attention_head_size,
-            emb_tile=mha_emb_tile,
+            topology_id=str(block2_topology["topology_id"]),
             static_weights=True,
             context=self.context,
         )

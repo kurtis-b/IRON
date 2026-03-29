@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from iron.operators.mha_out_proj.design import mha_out_proj_design
 from iron.operators.mha_out_proj.op import AIEMHAOutProj
 from iron.operators.mha_out_proj.reference import generate_golden_reference
 from iron.common.test_utils import run_test
@@ -28,32 +29,27 @@ def generate_test_params():
         (1984, 64, 16),
         (2048, 64, 16),
     ]
-    topology_dims = [
-        (32, 64, 1, 1),
-    ]
-
     params = []
     for seq_len, head_dim, num_heads in workloads:
-        embed_sz = num_heads * head_dim
-        emb_tile = 64 if embed_sz == 64 else (96 if embed_sz == 768 else 128)
-        for q_seq_tile, kv_seq_tile, parallel_heads, o_proj_acc_depth in topology_dims:
-            params.append(
-                pytest.param(
-                    seq_len,
-                    head_dim,
-                    num_heads,
-                    q_seq_tile,
-                    kv_seq_tile,
-                    emb_tile,
-                    parallel_heads,
-                    o_proj_acc_depth,
-                    id=(
-                        f"mha_out_proj_{num_heads}heads_{seq_len}seq_{head_dim}hdim_"
-                        f"{q_seq_tile}qseqtile_{kv_seq_tile}kvseqtile_{emb_tile}embtile_"
-                        f"{parallel_heads}pheads_{o_proj_acc_depth}acc"
-                    ),
-                )
+        topology_id = str(
+            mha_out_proj_design(
+                seq_len=seq_len,
+                num_heads=num_heads,
+                head_dim=head_dim,
+            )["topology_id"]
+        )
+        params.append(
+            pytest.param(
+                seq_len,
+                head_dim,
+                num_heads,
+                topology_id,
+                id=(
+                    f"mha_out_proj_{num_heads}heads_{seq_len}seq_{head_dim}hdim_"
+                    f"{topology_id}"
+                ),
             )
+        )
 
     return params
 
@@ -66,18 +62,14 @@ regular_params = generate_test_params()
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "seq_len,head_dim,num_heads,q_seq_tile,kv_seq_tile,emb_tile,parallel_heads,o_proj_acc_depth",
+    "seq_len,head_dim,num_heads,topology_id",
     regular_params,
 )
 def test_mha_out_proj(
     seq_len,
     head_dim,
     num_heads,
-    q_seq_tile,
-    kv_seq_tile,
-    emb_tile,
-    parallel_heads,
-    o_proj_acc_depth,
+    topology_id,
     aie_context,
 ):
     golden_ref = generate_golden_reference(
@@ -91,11 +83,7 @@ def test_mha_out_proj(
         num_heads=num_heads,
         seq_len=seq_len,
         d=head_dim,
-        q_seq_tile=q_seq_tile,
-        kv_seq_tile=kv_seq_tile,
-        emb_tile=emb_tile,
-        parallel_heads=parallel_heads,
-        o_proj_acc_depth=o_proj_acc_depth,
+        topology_id=topology_id,
         debug=DEBUG_MODE,
         context=aie_context,
     )
@@ -117,6 +105,8 @@ def test_mha_out_proj(
 
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
+    assert operator.topology_id == topology_id
+    assert operator.topology_family == "fused_mha_out_proj"
     if errors:
         print(
             "({} errors out of {} max allowable)".format(

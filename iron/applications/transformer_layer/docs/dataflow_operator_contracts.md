@@ -129,6 +129,15 @@ and translates them into the shared-runtime GEMM wrapper used by
 - `parallel_seq * parallel_heads <= 8`
 - `embedding_dim % (emb_tile * o_proj_acc_depth) == 0`
 
+Block 2 currently resolves its retained thesis topologies through the single
+design entrypoint in
+[`iron/operators/mha_out_proj/design.py`](/home/cj/iron/iron/operators/mha_out_proj/design.py)
+and translates them into the fused runtime wrapper in
+[`iron/operators/mha_out_proj/op.py`](/home/cj/iron/iron/operators/mha_out_proj/op.py).
+The retained `v2` surface is currently pinned to `parallel_seq=1`,
+`q_seq_tile=32`, `kv_seq_tile=64`, `parallel_heads=1`, and
+`o_proj_acc_depth=1`, with `emb_tile` selected per retained workload family.
+
 ## Block 3
 
 ### Public tensor contract

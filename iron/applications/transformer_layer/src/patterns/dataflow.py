@@ -21,7 +21,7 @@ from ..utils import (
     bind_qkv_proj_weights,
     make_in_process_npu_metadata,
     require_keys,
-    select_mha_out_proj_emb_tile,
+    resolve_mha_out_proj_topology,
 )
 
 
@@ -40,7 +40,7 @@ class DataflowPattern(nn.Module):
             )
         if spec.attention_head_size != 64:
             raise ValueError("dataflow thesis pattern currently supports head_dim=64")
-        mha_emb_tile = select_mha_out_proj_emb_tile(spec.hidden_size)
+        block2_topology = resolve_mha_out_proj_topology(spec)
         self.spec = spec
         self.context = AIEContext(use_runlist=True)
         self._runtime_ready = False
@@ -56,7 +56,7 @@ class DataflowPattern(nn.Module):
             num_heads=spec.num_attention_heads,
             seq_len=spec.seq_len,
             d=spec.attention_head_size,
-            emb_tile=mha_emb_tile,
+            topology_id=str(block2_topology["topology_id"]),
             static_weights=True,
             context=self.context,
         )

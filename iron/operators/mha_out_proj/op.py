@@ -18,6 +18,7 @@ from iron.common import (
     PythonGeneratedMLIRArtifact,
 )
 from iron.common.utils import torch_to_numpy, numpy_to_torch
+from iron.operators.mha_out_proj.design import mha_out_proj_design
 
 
 def _canonicalize_head_major_qkv(
@@ -74,11 +75,43 @@ class AIEMHAOutProj(AIEOperatorBase):
         emb_tile: int = 96,
         parallel_heads: int = 1,
         o_proj_acc_depth: int = 1,
+        topology_id: str | None = None,
         static_weights: bool = False,
         debug: int = 0,
         context=None,
         skip_add_to_list=False,
     ):
+        config = None
+        if topology_id is not None:
+            config = mha_out_proj_design(
+                seq_len=seq_len,
+                num_heads=num_heads,
+                head_dim=d,
+                topology_id=topology_id,
+            )
+            q_seq_tile = int(config["q_seq_tile"])
+            kv_seq_tile = int(config["kv_seq_tile"])
+            emb_tile = int(config["emb_tile"])
+            parallel_heads = int(config["parallel_heads"])
+            o_proj_acc_depth = int(config["o_proj_acc_depth"])
+        else:
+            try:
+                candidate = mha_out_proj_design(
+                    seq_len=seq_len,
+                    num_heads=num_heads,
+                    head_dim=d,
+                )
+            except ValueError:
+                candidate = None
+            if candidate is not None and (
+                int(candidate["q_seq_tile"]) == q_seq_tile
+                and int(candidate["kv_seq_tile"]) == kv_seq_tile
+                and int(candidate["emb_tile"]) == emb_tile
+                and int(candidate["parallel_heads"]) == parallel_heads
+                and int(candidate["o_proj_acc_depth"]) == o_proj_acc_depth
+            ):
+                config = candidate
+
         self.num_heads = num_heads
         self.seq_len = seq_len
         self.d = d
@@ -87,6 +120,19 @@ class AIEMHAOutProj(AIEOperatorBase):
         self.emb_tile = emb_tile
         self.parallel_heads = parallel_heads
         self.o_proj_acc_depth = o_proj_acc_depth
+        self.topology_id = (
+            str(config["topology_id"])
+            if config is not None
+            else (
+                f"q{q_seq_tile}_kv{kv_seq_tile}_e{emb_tile}"
+                f"_ph{parallel_heads}_acc{o_proj_acc_depth}"
+            )
+        )
+        self.topology_family = (
+            str(config["topology_family"])
+            if config is not None
+            else "custom_fused_mha_out_proj"
+        )
         self.debug = debug
         self.embed_sz = d * num_heads
         assert d == 64, "Only d=64 is supported in this version"

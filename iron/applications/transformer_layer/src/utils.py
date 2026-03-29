@@ -7,6 +7,8 @@ from collections.abc import Mapping
 
 import torch
 
+from iron.operators.mha_out_proj.design import mha_out_proj_design
+
 from .input_bundle import TransformerLayerInputs
 from .layer_spec import TransformerLayerSpec
 
@@ -81,13 +83,13 @@ def require_keys(
         raise KeyError(f"Missing required weight keys: {', '.join(missing)}")
 
 
-def select_mha_out_proj_emb_tile(hidden_size: int) -> int:
-    if hidden_size % 128 == 0:
-        return 128
-    if hidden_size % 96 == 0:
-        return 96
-    raise ValueError(
-        "Block 2 currently requires hidden_size divisible by 128 or 96 for output-projection tiling"
+def resolve_mha_out_proj_topology(
+    spec: TransformerLayerSpec,
+) -> dict[str, int | str]:
+    return mha_out_proj_design(
+        seq_len=spec.seq_len,
+        num_heads=spec.num_attention_heads,
+        head_dim=spec.attention_head_size,
     )
 
 
