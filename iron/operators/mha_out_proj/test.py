@@ -160,8 +160,10 @@ def test_supported_block2_topologies_include_promoted_runtime_variants():
 
     assert "q32_kv64_e96_ps1_ph2_acc1" in topology_ids_12
     assert "q32_kv64_e96_ps1_ph4_acc1" in topology_ids_12
+    assert "q32_kv64_e96_ps1_ph6_acc1" in topology_ids_12
     assert "q32_kv64_e128_ps1_ph2_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps1_ph4_acc1" in topology_ids_16
+    assert "q32_kv64_e128_ps1_ph8_acc1" not in topology_ids_16
 
 
 def test_theoretical_block2_topologies_include_nondefault_valid_variants():
@@ -189,6 +191,7 @@ def test_theoretical_block2_topologies_exclude_nonrunnable_l1_overflows():
         )
     }
     assert "q64_kv64_e128_ps1_ph1_acc1" not in topology_ids
+    assert "q32_kv64_e128_ps1_ph8_acc1" not in topology_ids
 
 
 def test_theoretical_block2_topologies_are_unique_and_contract_valid():

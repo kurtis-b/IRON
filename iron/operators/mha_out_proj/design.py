@@ -86,6 +86,14 @@ _BLOCK2_TOPOLOGIES = {
             "parallel_heads": 4,
             "o_proj_acc_depth": 1,
         },
+        {
+            "parallel_seq": 1,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 96,
+            "parallel_heads": 6,
+            "o_proj_acc_depth": 1,
+        },
     ],
     (16, 64): [
         {
@@ -116,6 +124,7 @@ _BLOCK2_TOPOLOGIES = {
 }
 
 _BLOCK2_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
+_BLOCK2_MAX_LOWERED_PARALLEL_HEADS = 6
 _BLOCK2_AIE_DATA_MEM_SIZE_BYTES = 65536
 _BLOCK2_FIFO_STAGE_COPIES = 2
 _BLOCK2_O_PROJ_LOCAL_OUTPUT_COPIES = 3
@@ -186,6 +195,8 @@ def mha_out_proj_theoretical_topologies(
         if seq_len % kv_seq_tile != 0:
             continue
         if parallel_seq * parallel_heads > 8:
+            continue
+        if parallel_heads > _BLOCK2_MAX_LOWERED_PARALLEL_HEADS:
             continue
         if not _block2_stage_working_sets_fit(
             q_seq_tile=q_seq_tile,
