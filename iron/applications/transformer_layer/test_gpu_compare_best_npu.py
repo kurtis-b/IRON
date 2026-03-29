@@ -106,7 +106,7 @@ def test_benchmark_best_npu_vs_gpu_preserves_reference_npu_topology_metadata(
                         "synthetic",
                         "3.5",
                         "completed",
-                        "m64_k64_n16_ps1_ph1_pd1",
+                        "m64_k64_n16_c8_ps1_ph1_pd1",
                         "shared_runtime_qkv_proj",
                         "q32_kv64_e96_ps1_ph1_acc1",
                         "fused_mha_out_proj",
@@ -170,7 +170,7 @@ def test_benchmark_best_npu_vs_gpu_preserves_reference_npu_topology_metadata(
     )
 
     row = rows[0]
-    assert row["reference_npu_block1_topology_id"] == "m64_k64_n16_ps1_ph1_pd1"
+    assert row["reference_npu_block1_topology_id"] == "m64_k64_n16_c8_ps1_ph1_pd1"
     assert row["reference_npu_block2_topology_family"] == "fused_mha_out_proj"
     assert (
         row["reference_npu_block3_topology_family"] == "pipelined_addnorm_ffn_addnorm"

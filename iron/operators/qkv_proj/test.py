@@ -202,15 +202,15 @@ def test_supported_block1_topologies_include_practical_runtime_variants():
     assert "m32_k256_n24_c8_ps1_ph8_pd1" in topology_ids_1024
 
 
-def test_block1_design_accepts_legacy_runtime_aliases():
+def test_block1_design_accepts_canonical_runtime_topology_ids():
     config = qkv_proj_design(
         seq_len=64,
         hidden_size=768,
         num_heads=12,
-        topology_id="m32_k256_n24_ps1_ph1_pd1",
+        topology_id="m32_k256_n24_c8_ps1_ph1_pd1",
     )
 
-    assert config["topology_id"] == "m32_k256_n24_ps1_ph1_pd1"
+    assert config["topology_id"] == "m32_k256_n24_c8_ps1_ph1_pd1"
     assert config["num_aie_columns"] == 8
     assert config["tile_n"] == 24
 

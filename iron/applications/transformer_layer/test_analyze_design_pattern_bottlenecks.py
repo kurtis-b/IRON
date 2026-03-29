@@ -70,7 +70,7 @@ def test_bottleneck_analysis_restructure_preserves_legacy_imports_and_behavior(
                 "hidden_size": "768",
                 "intermediate_size": "3072",
                 "num_attention_heads": "12",
-                "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "block1_topology_id": "m64_k64_n16_c8_ps1_ph1_pd1",
                 "block1_topology_family": "shared_runtime_qkv_proj",
                 "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
                 "block2_topology_family": "fused_mha_out_proj",

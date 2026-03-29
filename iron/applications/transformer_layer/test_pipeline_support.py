@@ -70,7 +70,7 @@ def test_pipeline_restructure_preserves_legacy_imports_and_path_resolution(
             {
                 "study_manifest": "study/design_patterns_end_to_end.json",
                 "output_csv": "results/out.csv",
-                "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "block1_topology_id": "m64_k64_n16_c8_ps1_ph1_pd1",
                 "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
                 "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
                 "seed": 7,
@@ -112,7 +112,7 @@ def test_build_step_command_forwards_block_topology_overrides(tmp_path: Path):
             "step_id": "step_0",
             "kind": "npu_study",
             "manifest": str(manifest_path),
-            "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+            "block1_topology_id": "m64_k64_n16_c8_ps1_ph1_pd1",
             "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
             "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
         },
