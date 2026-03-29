@@ -7,7 +7,7 @@ import argparse
 from itertools import product
 import json
 
-from iron.operators.gemm.design_batched import my_matmul as _batched_gemm_design
+from iron.operators.qkv_proj.design_runtime import build_fused_qkv_proj_design
 
 _BLOCK1_RETAINED_FAMILIES = {
     (12, 64),
@@ -338,7 +338,9 @@ def qkv_proj_design(
     return {
         **config,
         "topology_id": resolved_topology_id,
-        "topology_family": str(config["topology_family"]),
+        "topology_family": str(
+            config.get("topology_family", "shared_runtime_qkv_proj")
+        ),
     }
 
 
@@ -360,28 +362,22 @@ def fused_qkv_proj(
     trace_size: int,
     archive: str | None = None,
 ):
-    return _batched_gemm_design(
-        dev,
-        seq_len,
-        hidden_size,
-        combined_hidden_size,
-        tile_m,
-        tile_k,
-        tile_n,
-        num_aie_columns,
-        dtype_in_str,
-        dtype_out_str,
-        0,
-        0,
-        use_scalar,
-        emulate_bf16_mmul_with_bfp16,
-        prio_accuracy,
-        trace_size,
-        archive,
-        False,
-        (1, 0),
-        (1, 0),
-        (1, 0),
+    return build_fused_qkv_proj_design(
+        dev=dev,
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        combined_hidden_size=combined_hidden_size,
+        tile_m=tile_m,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        num_aie_columns=num_aie_columns,
+        dtype_in_str=dtype_in_str,
+        dtype_out_str=dtype_out_str,
+        use_scalar=use_scalar,
+        emulate_bf16_mmul_with_bfp16=emulate_bf16_mmul_with_bfp16,
+        prio_accuracy=prio_accuracy,
+        trace_size=trace_size,
+        archive=archive,
     )
 
 
