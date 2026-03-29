@@ -189,6 +189,9 @@ def _decorate_row_for_case(
     normalized["intermediate_size"] = spec.intermediate_size
     normalized["num_attention_heads"] = spec.num_attention_heads
     normalized["attention_head_size"] = spec.attention_head_size
+    normalized.setdefault("block1_topology_id", spec.block1_topology_id)
+    normalized.setdefault("block2_topology_id", spec.block2_topology_id)
+    normalized.setdefault("block3_topology_id", spec.block3_topology_id)
     normalized.setdefault("run_status", "completed")
     normalized.setdefault("failure_component", None)
     normalized.setdefault("failure_category", None)
@@ -229,6 +232,9 @@ def _failure_result_row(
         "intermediate_size": spec.intermediate_size,
         "num_attention_heads": spec.num_attention_heads,
         "attention_head_size": spec.attention_head_size,
+        "block1_topology_id": spec.block1_topology_id,
+        "block2_topology_id": spec.block2_topology_id,
+        "block3_topology_id": spec.block3_topology_id,
         "batch_size": spec.batch_size,
         "dtype": spec.dtype,
         "use_bias": spec.use_bias,

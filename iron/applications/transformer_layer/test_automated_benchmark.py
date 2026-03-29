@@ -13,6 +13,7 @@ from iron.applications.transformer_layer.benchmark_common import (
 )
 from iron.applications.transformer_layer.benchmark_power import empty_power_stats
 from iron.applications.transformer_layer.debug_log import append_debug_event
+from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
 from iron.applications.transformer_layer.src.result_schema import RESULT_FIELD_ORDER
 from iron.applications.transformer_layer.src.bench import (
     append_debug_event as append_debug_event_structured,
@@ -22,6 +23,12 @@ from iron.applications.transformer_layer.src.bench import (
 )
 from iron.applications.transformer_layer.src.bench import (
     parse_seq_lens as parse_seq_lens_structured,
+)
+from iron.applications.transformer_layer.src.pipeline.automated_benchmark import (
+    _decorate_row_for_case as structured_decorate_row_for_case,
+)
+from iron.applications.transformer_layer.src.pipeline.automated_benchmark import (
+    _failure_result_row as structured_failure_result_row,
 )
 from iron.applications.transformer_layer.src.pipeline import (
     _record_parity_results as structured_record_parity_results,
@@ -98,3 +105,58 @@ def test_write_results_csv_reserves_block_topology_columns(tmp_path: Path):
     assert RESULT_FIELD_ORDER.index("block1_topology_id") < RESULT_FIELD_ORDER.index(
         "run_status"
     )
+
+
+def test_decorate_row_for_case_backfills_requested_block_topology_ids():
+    spec = TransformerLayerSpec(
+        seq_len=64,
+        block1_topology_id="m64_k64_n16_ps1_ph1_pd1",
+        block2_topology_id="q32_kv64_e96_ps1_ph1_acc1",
+        block3_topology_id="m32_k96_n64_ps4_pi3_d8_g1",
+    )
+    row = structured_decorate_row_for_case(
+        {
+            "study_id": "study",
+            "backend": "npu",
+            "execution_mode": "dataflow",
+            "seq_len": 64,
+            "batch_size": 1,
+            "dtype": "bfloat16",
+            "weights_source": "synthetic",
+            "warmup_runs": 0,
+            "runs_per_sample": 1,
+            "measured_inference_count": 1,
+            "timed_total_sec": 0.01,
+            "avg_latency_ms": 10.0,
+        },
+        study_id="study",
+        case={"case_id": "case", "case_label": "case"},
+        spec=spec,
+    )
+
+    assert row["block1_topology_id"] == spec.block1_topology_id
+    assert row["block2_topology_id"] == spec.block2_topology_id
+    assert row["block3_topology_id"] == spec.block3_topology_id
+
+
+def test_failure_result_row_includes_requested_block_topology_ids():
+    spec = TransformerLayerSpec(
+        seq_len=64,
+        block1_topology_id="m64_k64_n16_ps1_ph1_pd1",
+        block2_topology_id="q32_kv64_e96_ps1_ph1_acc1",
+        block3_topology_id="m32_k96_n64_ps4_pi3_d8_g1",
+    )
+
+    row = structured_failure_result_row(
+        study_id="study",
+        case={"case_id": "case", "case_label": "case"},
+        spec=spec,
+        execution_mode="dataflow",
+        warmup_runs=0,
+        runs_per_sample=1,
+        exc=RuntimeError("synthetic failure"),
+    )
+
+    assert row["block1_topology_id"] == spec.block1_topology_id
+    assert row["block2_topology_id"] == spec.block2_topology_id
+    assert row["block3_topology_id"] == spec.block3_topology_id
