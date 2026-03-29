@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from ..bench import append_debug_event
+from ..core.result_schema import RESULT_FIELD_ORDER
 
 APP_DIR = Path(__file__).resolve().parents[2]
 REPO_ROOT = APP_DIR.parents[2]
@@ -26,6 +27,7 @@ BLOCK_TOPOLOGY_FLAG_MAP = {
     "block2_topology_id": "--block2-topology-id",
     "block3_topology_id": "--block3-topology-id",
 }
+VALID_PLOT_FACET_KEYS = frozenset(RESULT_FIELD_ORDER)
 
 
 def resolve_path(base_path: str | Path, value: str | None) -> str | None:
@@ -35,6 +37,19 @@ def resolve_path(base_path: str | Path, value: str | None) -> str | None:
     if path.is_absolute():
         return str(path)
     return str((Path(base_path).resolve().parent / path).resolve())
+
+
+def _validate_plot_step(step: dict[str, object]) -> None:
+    facet_key = step.get("facet_key")
+    if facet_key is None:
+        return
+    if str(facet_key) not in VALID_PLOT_FACET_KEYS:
+        raise ValueError(
+            "Unsupported plot facet_key "
+            f"{facet_key!r}; expected a stable result-schema column such as "
+            "'study_case_label', 'seq_len', 'hidden_size', or "
+            "'block2_topology_id'"
+        )
 
 
 def load_pipeline_config(path: str | Path) -> dict[str, object]:
@@ -85,6 +100,8 @@ def load_pipeline_config(path: str | Path) -> dict[str, object]:
         ):
             if step.get(key) is not None:
                 step[key] = resolve_path(config_path, step[key])
+        if step.get("kind") == "plot":
+            _validate_plot_step(step)
         normalized_steps.append(step)
     config["steps"] = normalized_steps
     return config

@@ -244,6 +244,9 @@ latency/throughput/power, bottleneck, and best-NPU-vs-iGPU plots can be grouped
 by resolved block topology when needed.
 The checked-in unattended pipeline should use that surface for retained
 Dataflow-study plot steps rather than relying only on study-case grouping.
+Pipeline config loading should also reject invalid plot `facet_key` values
+early, using the stable result-schema columns as the supported unattended
+faceting surface.
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`

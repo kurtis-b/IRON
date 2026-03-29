@@ -167,3 +167,31 @@ def test_checked_in_pipeline_uses_topology_facet_for_retained_plot_steps():
         == "block2_topology_id"
     )
     assert "facet_key" not in steps_by_id["reconfiguration_overhead_plots"]
+
+
+def test_load_pipeline_config_rejects_invalid_plot_facet_key(tmp_path: Path):
+    pipeline_config_path = tmp_path / "pipeline.json"
+    pipeline_config_path.write_text(
+        json.dumps(
+            {
+                "pipeline_id": "designpats",
+                "steps": [
+                    {
+                        "step_id": "plot_0",
+                        "kind": "plot",
+                        "input_csv": "results/design_patterns_end_to_end_annotated.csv",
+                        "output_dir": "results/plots/design_patterns_end_to_end",
+                        "facet_key": "not_a_real_result_column",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        load_pipeline_config(pipeline_config_path)
+    except ValueError as exc:
+        assert "Unsupported plot facet_key" in str(exc)
+    else:
+        raise AssertionError("Expected invalid plot facet_key to be rejected")
