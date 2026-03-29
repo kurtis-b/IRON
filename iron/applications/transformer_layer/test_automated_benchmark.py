@@ -10,6 +10,7 @@ from iron.applications.transformer_layer.automated_benchmark import (
     _record_parity_results,
 )
 from iron.applications.transformer_layer.benchmark_common import (
+    load_study_manifest,
     parse_seq_lens,
     write_results_csv,
 )
@@ -48,6 +49,45 @@ def test_restructured_bench_package_preserves_legacy_imports():
     assert empty_power_stats is empty_power_stats_structured
     assert append_debug_event is append_debug_event_structured
     assert _record_parity_results is structured_record_parity_results
+
+
+def test_checked_in_dataflow_manifests_pin_retained_block_topologies():
+    app_dir = Path(__file__).resolve().parent
+    manifest_specs = {
+        "design_patterns_end_to_end.json": {
+            "baseline_768": {
+                "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+                "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
+            },
+            "baseline_1024": {
+                "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "block2_topology_id": "q32_kv64_e128_ps1_ph1_acc1",
+                "block3_topology_id": "m32_k128_n32_ps4_pi2_d8_g1",
+            },
+        },
+        "dataflow_blocks.json": {
+            "baseline_768": {
+                "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+                "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
+            },
+            "baseline_1024": {
+                "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "block2_topology_id": "q32_kv64_e128_ps1_ph1_acc1",
+                "block3_topology_id": "m32_k128_n32_ps4_pi2_d8_g1",
+            },
+        },
+    }
+
+    for manifest_name, expected_cases in manifest_specs.items():
+        manifest = load_study_manifest(app_dir / "study" / manifest_name)
+        by_case_id = {
+            case["case_id"]: case["layer_spec"] for case in manifest["study_cases"]
+        }
+        for case_id, expected in expected_cases.items():
+            for key, value in expected.items():
+                assert by_case_id[case_id][key] == value
 
 
 def test_record_parity_results_skips_empty_rows(tmp_path: Path):

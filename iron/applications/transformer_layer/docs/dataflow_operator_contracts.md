@@ -211,6 +211,10 @@ For unattended study pipelines, `npu_study` step definitions should be allowed
 to carry the same `block1_topology_id`, `block2_topology_id`, and
 `block3_topology_id` overrides so pipeline-driven sweeps can pin retained
 topologies without patching the underlying study manifest.
+The checked-in Dataflow study manifests should pin those retained topology IDs
+explicitly for the retained `768/3072/12` and `1024/4096/16` families so the
+benchmark surface remains reproducible even if default topology selection
+changes later.
 When those requested topology IDs are present, benchmark rows, failure rows,
 and parity rows should also backfill the matching topology-family columns so
 the stable result schema remains informative even before runtime metadata is

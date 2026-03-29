@@ -111,6 +111,10 @@ Checked-in study manifests:
 - `study/gpu_compare_end_to_end_igpu.json`
 - `study/designpats_pipeline.json`
 
+The checked-in Dataflow study manifests pin the retained block topology IDs for
+the `768/3072/12` and `1024/4096/16` cases explicitly, so unattended studies do
+not depend on implicit topology defaults.
+
 Retained benchmark surface:
 
 - model families:
