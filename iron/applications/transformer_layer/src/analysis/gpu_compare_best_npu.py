@@ -117,6 +117,24 @@ def _reference_npu_topology_metadata(npu_row: dict[str, str]) -> dict[str, str |
         "reference_npu_block2_topology_family": npu_row.get("block2_topology_family"),
         "reference_npu_block3_topology_id": npu_row.get("block3_topology_id"),
         "reference_npu_block3_topology_family": npu_row.get("block3_topology_family"),
+        "reference_npu_exploration_block1_topology_id": npu_row.get(
+            "exploration_block1_topology_id"
+        ),
+        "reference_npu_exploration_block1_topology_family": npu_row.get(
+            "exploration_block1_topology_family"
+        ),
+        "reference_npu_exploration_block2_topology_id": npu_row.get(
+            "exploration_block2_topology_id"
+        ),
+        "reference_npu_exploration_block2_topology_family": npu_row.get(
+            "exploration_block2_topology_family"
+        ),
+        "reference_npu_exploration_block3_topology_id": npu_row.get(
+            "exploration_block3_topology_id"
+        ),
+        "reference_npu_exploration_block3_topology_family": npu_row.get(
+            "exploration_block3_topology_family"
+        ),
     }
 
 

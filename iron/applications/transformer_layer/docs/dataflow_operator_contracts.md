@@ -293,7 +293,9 @@ attributable to the retained topology that was requested or resolved.
 For the iGPU comparison study, GPU result rows should preserve the selected
 reference NPU row's block topology IDs and families under explicit
 `reference_npu_*` columns so best-NPU-vs-iGPU results remain attributable to
-the retained topology that won NPU selection.
+the retained topology that won NPU selection; if the selected NPU row came from
+a manifest-expanded practical study, the preserved practical-topology
+provenance should also flow through those `reference_npu_*` fields.
 Those `reference_npu_*` columns should also be reserved in the shared result
 schema so GPU compare CSVs expose them as stable fields rather than unordered
 extras.
