@@ -16,10 +16,15 @@ from iron.applications.transformer_layer.src.analysis import (
     estimate_layer_flops as structured_estimate_layer_flops,
 )
 from iron.applications.transformer_layer.src.analysis import (
+    SUPPORT_MATRIX_FIELD_ORDER as structured_support_matrix_field_order,
+)
+from iron.applications.transformer_layer.src.analysis import (
     summarize_support_rows as structured_summarize_support_rows,
 )
 from iron.applications.transformer_layer.src.layer_spec import TransformerLayerSpec
-from iron.applications.transformer_layer.support_matrix import summarize_support_rows
+from iron.applications.transformer_layer.support_matrix import (
+    summarize_support_rows,
+)
 
 
 def test_restructured_analysis_package_preserves_legacy_imports():
@@ -46,3 +51,36 @@ def test_roofline_estimates_bytes_for_reconfig_modes_match_full_gemm_surface():
     assert estimate_layer_bytes(
         spec, execution_mode="gemm_offload_gemm_sequence"
     ) == estimate_layer_bytes(spec, execution_mode="gemm_offload")
+
+
+def test_summarize_support_rows_preserves_block_topology_metadata():
+    rows = summarize_support_rows(
+        [
+            {
+                "study_id": "study",
+                "study_case_id": "case",
+                "study_case_label": "case",
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_attention_heads": 12,
+                "attention_head_size": 64,
+                "seq_len": 64,
+                "execution_mode": "dataflow",
+                "block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "block1_topology_family": "shared_runtime_qkv_proj",
+                "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+                "block2_topology_family": "fused_mha_out_proj",
+                "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
+                "block3_topology_family": "pipelined_addnorm_ffn_addnorm",
+                "run_status": "unsupported",
+                "failure_category": "unsupported_topology_or_placement",
+            }
+        ]
+    )
+
+    row = rows[0]
+    assert row["block1_topology_id"] == "m64_k64_n16_ps1_ph1_pd1"
+    assert row["block2_topology_family"] == "fused_mha_out_proj"
+    assert row["block3_topology_id"] == "m32_k96_n64_ps4_pi3_d8_g1"
+    assert "block1_topology_id" in structured_support_matrix_field_order
+    assert "block3_topology_family" in structured_support_matrix_field_order

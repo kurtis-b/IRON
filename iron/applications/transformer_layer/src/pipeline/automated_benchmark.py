@@ -10,6 +10,7 @@ import sys
 import tempfile
 
 from ..analysis import (
+    SUPPORT_MATRIX_FIELD_ORDER,
     annotate_results_csv,
     render_support_summary_text,
     summarize_support_rows,
@@ -525,7 +526,11 @@ def run_manifest_benchmark(args) -> None:
             if support_matrix_csv or support_matrix_text:
                 support_rows = summarize_support_rows(all_rows)
                 if support_matrix_csv:
-                    write_dict_rows_csv(support_matrix_csv, support_rows)
+                    write_dict_rows_csv(
+                        support_matrix_csv,
+                        support_rows,
+                        fieldnames=SUPPORT_MATRIX_FIELD_ORDER,
+                    )
                 if support_matrix_text:
                     output_path = Path(support_matrix_text)
                     output_path.parent.mkdir(parents=True, exist_ok=True)

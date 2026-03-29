@@ -222,6 +222,10 @@ When those requested topology IDs are present, benchmark rows, failure rows,
 and parity rows should also backfill the matching topology-family columns so
 the stable result schema remains informative even before runtime metadata is
 available.
+Support-matrix CSV outputs should preserve the same block topology IDs and
+families, with stable support-matrix column ordering, so unsupported or
+filtered rows remain attributable to the retained topology that was requested or
+resolved.
 - `intermediate_size % parallel_int_dim == 0`
 - `embedding_dim % tile_k == 0`
 - `intermediate_size % tile_n == 0`
