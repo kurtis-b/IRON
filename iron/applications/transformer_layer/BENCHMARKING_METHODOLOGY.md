@@ -35,6 +35,13 @@ The retained studies are:
 3. `gpu_compare_end_to_end_igpu`
 4. `reconfiguration_overhead`
 
+For the retained Dataflow studies, the checked-in manifests pin the intended
+`block1_topology_id`, `block2_topology_id`, and `block3_topology_id` values for
+the `768 / 3072 / 12` and `1024 / 4096 / 16` families. Manifest loading
+normalizes those `layer_spec` payloads through `TransformerLayerSpec`, so both
+checked-in and ad hoc studies are validated against the same retained layer
+surface before benchmarking starts.
+
 Retained model families:
 
 - `768 / 3072 / 12`
@@ -62,6 +69,8 @@ Per completed row, the harness records:
 - throughput / operational intensity / roofline metrics
 - power / energy / efficiency metrics
 - dispatch count and artifact-count metadata
+- retained block topology IDs/families when the selected execution surface has
+  them
 
 Block-study rows report block-local timings.
 
@@ -70,6 +79,14 @@ End-to-end rows report implementation-local timings:
 - `Dataflow`: block timing breakdown
 - `Runlist`: projection plus stitched runlist timing
 - `GEMM offload`: projection plus GEMM timing, with host-side preprocessing and postprocessing
+
+Derived reporting surfaces preserve the same retained topology metadata:
+
+- parity CSV outputs keep stable topology columns
+- support-matrix outputs preserve topology IDs/families
+- bottleneck summaries retain the topology IDs from the summarized rows
+- iGPU compare rows preserve the selected best-NPU topology under
+  `reference_npu_*` columns
 
 For the retained Dataflow block contract:
 
@@ -126,6 +143,12 @@ The unattended pipeline is driven by:
 Between benchmark-producing steps, the pipeline waits for thermal recovery using
 `k10temp` `Tctl` rather than attempting external power cycling.
 
+For the retained Dataflow studies, the checked-in pipeline now facets plot
+steps on `block2_topology_id` so generated SVG/HTML outputs stay grouped by the
+resolved retained Block 2 topology rather than only by study case. Plot
+`facet_key` values are validated on pipeline-config load against the stable
+result-schema columns so mistyped retained topology keys fail early.
+
 ## Correctness
 
 End-to-end parity is run on the short-sequence surface:
@@ -140,6 +163,11 @@ for:
 - `gemm_offload`
 
 The parity reference is the hidden-states-only CPU reference layer.
+
+Parity uses the same optional retained `block1_topology_id`,
+`block2_topology_id`, and `block3_topology_id` override surface as the main
+benchmark path, so parity and benchmark rows stay aligned when a study pins a
+specific retained topology.
 
 ## Operator Test Coverage
 

@@ -51,6 +51,16 @@ Important retained implementation choices:
 - the detailed block contracts and topology/test policy are documented in
   `dataflow_operator_contracts.md`
 
+Retained workflow policy:
+
+- the checked-in Dataflow study manifests pin the intended retained block
+  topology IDs for the `768 / 3072 / 12` and `1024 / 4096 / 16` families
+- benchmark, parity, support-matrix, bottleneck, and iGPU-compare outputs keep
+  those topology IDs visible so downstream analysis stays attributable to the
+  selected retained Dataflow surface
+- unattended Dataflow plot steps facet on retained Block 2 topology so
+  generated plots stay grouped by the resolved fused-attention configuration
+
 ## Runlist
 
 `Runlist` keeps the stitched full-layer operator path as the baseline for a
