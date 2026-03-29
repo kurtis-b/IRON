@@ -145,19 +145,19 @@ class DataflowPattern(nn.Module):
             if artifact is not None and getattr(artifact, "path", None) is not None:
                 artifact_set.add(str(artifact.path))
 
-        for gemm_op in (self.block1.q_proj, self.block1.k_proj, self.block1.v_proj):
-            maybe_add_artifact_path(unique_insts, gemm_op.insts_artifact)
-            maybe_add_artifact_path(
-                unique_xclbins,
-                gemm_op.runtime_xclbin_artifact or gemm_op.xclbin_artifact,
-            )
+        maybe_add_artifact_path(unique_insts, self.block1.qkv_proj.insts_artifact)
+        maybe_add_artifact_path(
+            unique_xclbins,
+            self.block1.qkv_proj.runtime_xclbin_artifact
+            or self.block1.qkv_proj.xclbin_artifact,
+        )
         maybe_add_artifact_path(unique_insts, self.block2.insts_artifact)
         maybe_add_artifact_path(unique_xclbins, self.block2.xclbin_artifact)
         maybe_add_artifact_path(unique_insts, self.block3.block.insts_artifact)
         maybe_add_artifact_path(unique_xclbins, self.block3.block.xclbin_artifact)
         return make_in_process_npu_metadata(
             compile_setup_time_sec=self.compile_setup_time_sec,
-            dispatch_count=3
+            dispatch_count=1
             + len(self.block2.runlist)
             + len(self.block3.block.runlist),
             unique_instruction_binary_count=len(unique_insts),

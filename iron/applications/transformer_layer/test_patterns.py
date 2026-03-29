@@ -172,6 +172,17 @@ def test_block1_contract_reshapes_projection_outputs_to_head_major():
     assert torch.equal(head_major, expected)
 
 
+def test_block1_pattern_metadata_reports_fused_qkv_dispatch():
+    spec = TransformerLayerSpec(seq_len=64)
+    pattern = build_pattern("block1_qkv_proj", spec)
+
+    metadata = pattern.get_benchmark_metadata()
+
+    assert metadata["npu_dispatch_count"] == 1
+    assert metadata["npu_unique_instruction_binary_count"] == 1
+    assert metadata["npu_unique_xclbin_count"] == 1
+
+
 def test_block2_contract_packs_head_major_qkv_into_runtime_qkv_layout():
     q = torch.arange(24, dtype=torch.bfloat16).reshape(2, 3, 4)
     k = torch.arange(24, 48, dtype=torch.bfloat16).reshape(2, 3, 4)

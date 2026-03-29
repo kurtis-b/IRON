@@ -41,6 +41,8 @@ Important retained implementation choices:
 - Dataflow uses device-buffer handoff between blocks rather than inter-block
   streaming
 - `Block 1` outputs `q/k/v [num_heads, seq, head_dim]`
+- `Block 1` parallelizes the three projection matrices through one fused GEMM
+  and splits the result back into head-major `q/k/v` on the wrapper surface
 - head-major means each attention head is stored contiguously in memory
 - `Block 2` uses the pipelined `mha_out_proj` operator
 - `Block 3` uses a dedicated DesignPats operator that pipelines the first Add &

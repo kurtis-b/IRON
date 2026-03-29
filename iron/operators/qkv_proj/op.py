@@ -9,8 +9,34 @@ from iron.operators.qkv_proj.design import qkv_proj_design
 from iron.operators.gemm.op import AIEGEMM
 
 
+class _ProjectionWeightView:
+    def __init__(self, block: "AIEQKVProj", projection_index: int) -> None:
+        self._block = block
+        self._projection_index = projection_index
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self._block._projection_weight(self._projection_index)
+
+    @weight.setter
+    def weight(self, value: torch.Tensor) -> None:
+        self._block._set_projection_weight(self._projection_index, value)
+
+    @property
+    def insts_artifact(self):
+        return self._block.qkv_proj.insts_artifact
+
+    @property
+    def runtime_xclbin_artifact(self):
+        return self._block.qkv_proj.runtime_xclbin_artifact
+
+    @property
+    def xclbin_artifact(self):
+        return self._block.qkv_proj.xclbin_artifact
+
+
 class AIEQKVProj:
-    """Shared-runtime Q/K/V projection block built from three GEMMs."""
+    """Shared-runtime Q/K/V projection block built from one fused GEMM."""
 
     @staticmethod
     def _to_head_major(
@@ -22,6 +48,10 @@ class AIEQKVProj:
     ) -> torch.Tensor:
         head_dim = hidden_size // num_heads
         return tensor.view(seq_len, num_heads, head_dim).permute(1, 0, 2).contiguous()
+
+    @staticmethod
+    def _combined_hidden_size(hidden_size: int) -> int:
+        return hidden_size * 3
 
     def __init__(
         self,
@@ -61,50 +91,56 @@ class AIEQKVProj:
             "force_batched_design": True,
             "context": context,
         }
-        self.q_proj = AIEGEMM(M=seq_len, K=hidden_size, N=hidden_size, **gemm_common)
-        self.k_proj = AIEGEMM(M=seq_len, K=hidden_size, N=hidden_size, **gemm_common)
-        self.v_proj = AIEGEMM(M=seq_len, K=hidden_size, N=hidden_size, **gemm_common)
-        self._bind_shared_artifacts()
-
-    def _bind_shared_artifacts(self) -> None:
-        shared_xclbin = self.q_proj.get_runtime_xclbin_artifact(
-            prefix=f"qkv_proj_{self.seq_len}x{self.hidden_size}_runtime_"
+        self.qkv_proj = AIEGEMM(
+            M=seq_len,
+            K=hidden_size,
+            N=self._combined_hidden_size(hidden_size),
+            **gemm_common,
         )
-        shared_xclbin.kernel_name = "qkv_proj_runtime"
-        for workload_name, gemm_op in (
-            ("q_proj", self.q_proj),
-            ("k_proj", self.k_proj),
-            ("v_proj", self.v_proj),
-        ):
-            insts_artifact = gemm_op.get_insts_artifact(
-                prefix=(f"qkv_proj_{self.seq_len}x{self.hidden_size}_{workload_name}_"),
-                xclbin_input=shared_xclbin,
-                kernel_name=shared_xclbin.kernel_name,
+        self.q_proj = _ProjectionWeightView(self, 0)
+        self.k_proj = _ProjectionWeightView(self, 1)
+        self.v_proj = _ProjectionWeightView(self, 2)
+
+    def _projection_slice(self, projection_index: int) -> slice:
+        start = projection_index * self.hidden_size
+        end = start + self.hidden_size
+        return slice(start, end)
+
+    def _projection_weight(self, projection_index: int) -> torch.Tensor:
+        return self.qkv_proj.weight[self._projection_slice(projection_index)]
+
+    def _set_projection_weight(
+        self, projection_index: int, value: torch.Tensor
+    ) -> None:
+        expected_shape = (self.hidden_size, self.hidden_size)
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"AIEQKVProj: expected projection weight shape {expected_shape}, got {tuple(value.shape)}"
             )
-            gemm_op.bind_artifacts(
-                shared_xclbin,
-                insts_artifact,
-                runtime_xclbin_artifact=shared_xclbin,
-                runtime_kernel_name=shared_xclbin.kernel_name,
-            )
+        self.qkv_proj.weight[self._projection_slice(projection_index)] = (
+            value.contiguous()
+        )
 
     def forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv = self.qkv_proj(hidden_states).contiguous()
+        q_matrix, k_matrix, v_matrix = torch.split(qkv, self.hidden_size, dim=-1)
+
         q = self._to_head_major(
-            self.q_proj(hidden_states).contiguous(),
+            q_matrix,
             seq_len=self.seq_len,
             hidden_size=self.hidden_size,
             num_heads=self.num_heads,
         )
         k = self._to_head_major(
-            self.k_proj(hidden_states).contiguous(),
+            k_matrix,
             seq_len=self.seq_len,
             hidden_size=self.hidden_size,
             num_heads=self.num_heads,
         )
         v = self._to_head_major(
-            self.v_proj(hidden_states).contiguous(),
+            v_matrix,
             seq_len=self.seq_len,
             hidden_size=self.hidden_size,
             num_heads=self.num_heads,

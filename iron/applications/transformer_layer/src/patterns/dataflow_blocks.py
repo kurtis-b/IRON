@@ -86,17 +86,11 @@ class Block1QKVProjPattern(_BaseBlockPattern):
         return torch.stack((q, k, v), dim=0), {"block1_qkv_proj_sec": end - start}
 
     def get_benchmark_metadata(self) -> dict[str, object]:
-        gemm_ops = (self.block.q_proj, self.block.k_proj, self.block.v_proj)
-        unique_insts = {str(op.insts_artifact.path) for op in gemm_ops}
-        unique_xclbins = {
-            str((op.runtime_xclbin_artifact or op.xclbin_artifact).path)
-            for op in gemm_ops
-        }
         return make_in_process_npu_metadata(
             compile_setup_time_sec=self.compile_setup_time_sec,
-            dispatch_count=3,
-            unique_instruction_binary_count=len(unique_insts),
-            unique_xclbin_count=len(unique_xclbins),
+            dispatch_count=1,
+            unique_instruction_binary_count=1,
+            unique_xclbin_count=1,
             extra_fields={
                 "block1_topology_id": self.block.topology_id,
                 "block1_topology_family": self.block.topology_family,

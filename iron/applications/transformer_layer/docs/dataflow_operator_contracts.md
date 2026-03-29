@@ -92,6 +92,9 @@ design entrypoint in
 [`iron/operators/qkv_proj/design.py`](/home/cj/iron/iron/operators/qkv_proj/design.py)
 and translates them into the shared-runtime GEMM wrapper used by
 [`iron/operators/qkv_proj/op.py`](/home/cj/iron/iron/operators/qkv_proj/op.py).
+The retained `v2` implementation parallelizes the three independent Q/K/V
+projections as one wider GEMM and then reshapes the combined output back to
+head-major `q/k/v` tensors on the wrapper surface.
 That design file should also be the source of the retained topology list used by
 operator-local tests and future topology selection logic.
 
