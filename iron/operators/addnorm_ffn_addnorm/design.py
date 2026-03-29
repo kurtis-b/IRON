@@ -378,14 +378,18 @@ def fused_addnorm_ffn_addnorm(
     core_tiles = tiles[2:]
 
     # AIE-array data movement with object fifos
-    # Dedicated packed [A | R] streams for LN1 and LN2. Replay is encoded in
-    # the runtime TAPs, so these stay on the direct L3->L1 path.
-    AR_ln1_l3l1_fifos = [None] * nA_tiles_distributed
-    AR_ln2_l3l1_fifos = [None] * nA_tiles_distributed
+    # Dedicated packed [A | R] streams for LN1 and LN2. Replay stays encoded
+    # in the runtime TAPs; the ingress path is L3 -> L2 -> L1.
+    AR_ln1_l3l2_fifos = [None] * nA_tiles_distributed
+    AR_ln1_l2l1_fifos = [None] * nA_tiles_distributed
+    AR_ln2_l3l2_fifos = [None] * nA_tiles_distributed
+    AR_ln2_l2l1_fifos = [None] * nA_tiles_distributed
     logging.debug(
-        "Len AR_ln1_l3l1_fifos: %s, Len AR_ln2_l3l1_fifos: %s",
-        len(AR_ln1_l3l1_fifos),
-        len(AR_ln2_l3l1_fifos),
+        "Len AR_ln1_l3l2_fifos: %s, Len AR_ln1_l2l1_fifos: %s, Len AR_ln2_l3l2_fifos: %s, Len AR_ln2_l2l1_fifos: %s",
+        len(AR_ln1_l3l2_fifos),
+        len(AR_ln1_l2l1_fifos),
+        len(AR_ln2_l3l2_fifos),
+        len(AR_ln2_l2l1_fifos),
     )
 
     # FFN streams
@@ -432,15 +436,39 @@ def fused_addnorm_ffn_addnorm(
 
     # Dedicated packed [A | R] streams for LN1 and LN2 workers.
     for a_tile in range(nA_tiles_distributed):
-        AR_ln1_l3l1_fifos[a_tile] = ObjectFifo(
+        AR_ln1_l3l2_fifos[a_tile] = ObjectFifo(
             AR_l1_ty,
-            name=f"AR_ln1_L3L1_{a_tile}",
+            name=f"AR_ln1_L3L2_{a_tile}",
             depth=fifo_depth,
         )
-        AR_ln2_l3l1_fifos[a_tile] = ObjectFifo(
+        AR_ln1_l2l1_fifos[a_tile] = (
+            AR_ln1_l3l2_fifos[a_tile]
+            .cons()
+            .forward(
+                obj_type=AR_l1_ty,
+                name=f"AR_ln1_L2L1_{a_tile}",
+                placement=(
+                    Tile(0, 1) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 1)
+                ),
+            )
+        )
+        AR_ln2_l3l2_fifos[a_tile] = ObjectFifo(
             AR_l1_ty,
-            name=f"AR_ln2_L3L1_{a_tile}",
+            name=f"AR_ln2_L3L2_{a_tile}",
             depth=fifo_depth,
+        )
+        AR_ln2_l2l1_fifos[a_tile] = (
+            AR_ln2_l3l2_fifos[a_tile]
+            .cons()
+            .forward(
+                obj_type=AR_l1_ty,
+                name=f"AR_ln2_L2L1_{a_tile}",
+                placement=(
+                    Tile(nB_tiles_distributed + 1, 1)
+                    if nA_tiles_distributed < 3
+                    else Tile(a_tile * 2 + 1, 1)
+                ),
+            )
         )
 
     # Input B_Up
@@ -909,7 +937,7 @@ def fused_addnorm_ffn_addnorm(
                     Worker(
                         core_fn_add_norm1,
                         [
-                            AR_ln1_l3l1_fifos[a_tile].cons(),
+                            AR_ln1_l2l1_fifos[a_tile].cons(),
                             ln1_stage_l1l1_fifos[a_tile].prod(),
                             ln1_sum_buffer,
                             ln1_sumsq_buffer,
@@ -962,7 +990,7 @@ def fused_addnorm_ffn_addnorm(
                     Worker(
                         core_fn_add_norm2,
                         [
-                            AR_ln2_l3l1_fifos[a_tile].cons(),
+                            AR_ln2_l2l1_fifos[a_tile].cons(),
                             C_down_proj_out_l1l1_fifos[a_tile].cons(),
                             ln2_stage1_buffer,
                             ln2_stage1_sum_buffer,
@@ -1109,7 +1137,7 @@ def fused_addnorm_ffn_addnorm(
                         Tile(0, 0) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 0)
                     )
                     rt.fill(
-                        AR_ln1_l3l1_fifos[a_tile].prod(),
+                        AR_ln1_l3l2_fifos[a_tile].prod(),
                         packed_hidden_residual,
                         tap=ln1_ar_tile,
                         task_group=tg,
@@ -1132,7 +1160,7 @@ def fused_addnorm_ffn_addnorm(
                         else Tile(a_tile * 2 + 1, 0)
                     )
                     rt.fill(
-                        AR_ln2_l3l1_fifos[a_tile].prod(),
+                        AR_ln2_l3l2_fifos[a_tile].prod(),
                         packed_hidden_residual,
                         tap=ln2_ar_tile,
                         task_group=tg,
