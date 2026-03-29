@@ -164,7 +164,7 @@ def test_record_parity_results_skips_empty_rows(tmp_path: Path):
     assert "No parity rows matched" in text
 
 
-def test_write_results_csv_reserves_block_topology_columns(tmp_path: Path):
+def test_write_results_csv_reserves_topology_columns(tmp_path: Path):
     output_csv = tmp_path / "results.csv"
     write_results_csv(
         output_csv,
@@ -188,6 +188,14 @@ def test_write_results_csv_reserves_block_topology_columns(tmp_path: Path):
                 "block2_topology_family": "fused_mha_out_proj",
                 "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
                 "block3_topology_family": "pipelined_addnorm_ffn_addnorm",
+                "reference_npu_execution_mode": "dataflow",
+                "reference_npu_avg_latency_ms": 9.5,
+                "reference_npu_block1_topology_id": "m64_k64_n16_ps1_ph1_pd1",
+                "reference_npu_block1_topology_family": "shared_runtime_qkv_proj",
+                "reference_npu_block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
+                "reference_npu_block2_topology_family": "fused_mha_out_proj",
+                "reference_npu_block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
+                "reference_npu_block3_topology_family": "pipelined_addnorm_ffn_addnorm",
             }
         ],
     )
@@ -202,14 +210,30 @@ def test_write_results_csv_reserves_block_topology_columns(tmp_path: Path):
         "block2_topology_family",
         "block3_topology_id",
         "block3_topology_family",
+        "reference_npu_execution_mode",
+        "reference_npu_avg_latency_ms",
+        "reference_npu_block1_topology_id",
+        "reference_npu_block1_topology_family",
+        "reference_npu_block2_topology_id",
+        "reference_npu_block2_topology_family",
+        "reference_npu_block3_topology_id",
+        "reference_npu_block3_topology_family",
     ):
         assert field in header
 
     assert header.index("process_model") < header.index("block1_topology_id")
-    assert header.index("block3_topology_family") < header.index("run_status")
+    assert header.index("block3_topology_family") < header.index(
+        "reference_npu_execution_mode"
+    )
+    assert header.index("reference_npu_block3_topology_family") < header.index(
+        "run_status"
+    )
     assert RESULT_FIELD_ORDER.index("block1_topology_id") < RESULT_FIELD_ORDER.index(
         "run_status"
     )
+    assert RESULT_FIELD_ORDER.index(
+        "reference_npu_execution_mode"
+    ) < RESULT_FIELD_ORDER.index("run_status")
 
 
 def test_decorate_row_for_case_backfills_requested_block_topology_metadata():

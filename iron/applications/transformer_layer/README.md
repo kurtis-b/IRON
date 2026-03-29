@@ -120,6 +120,8 @@ surface before benchmarking begins.
 The iGPU compare output also preserves the selected NPU row's block topology
 metadata under explicit `reference_npu_*` columns so best-NPU-vs-iGPU results
 remain attributable to the retained topology that won selection.
+Those `reference_npu_*` fields now live in the shared result schema as stable
+CSV columns rather than unordered extras.
 
 Retained benchmark surface:
 

@@ -230,6 +230,9 @@ For the iGPU comparison study, GPU result rows should preserve the selected
 reference NPU row's block topology IDs and families under explicit
 `reference_npu_*` columns so best-NPU-vs-iGPU results remain attributable to
 the retained topology that won NPU selection.
+Those `reference_npu_*` columns should also be reserved in the shared result
+schema so GPU compare CSVs expose them as stable fields rather than unordered
+extras.
 Bottleneck summary CSV/JSON/text outputs should also preserve the retained
 block topology IDs from the analyzed rows so dominant-component reports remain
 attributable to the resolved Dataflow topology surface.
