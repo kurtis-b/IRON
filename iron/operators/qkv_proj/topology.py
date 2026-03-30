@@ -31,6 +31,24 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "parallel_heads": 1,
             "parallel_head_dim": 1,
         },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 24,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 2,
+            "parallel_head_dim": 1,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 24,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 4,
+            "parallel_head_dim": 1,
+        },
     ),
     (16, 64): (
         {
@@ -40,6 +58,33 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "num_aie_columns": 8,
             "parallel_seq": 1,
             "parallel_heads": 1,
+            "parallel_head_dim": 1,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 16,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 2,
+            "parallel_head_dim": 1,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 16,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 4,
+            "parallel_head_dim": 1,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 16,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 8,
             "parallel_head_dim": 1,
         },
     ),
@@ -291,7 +336,7 @@ def _block1_runtime_supported_candidates(
     seen_ids: set[str] = set()
     for candidate in practical:
         topology_id = _theoretical_topology_id(candidate)
-        if not _block1_runtime_candidate_allowed(candidate):
+        if not _block1_runtime_candidate_allowed(candidate, hidden_size=hidden_size):
             continue
         if topology_id not in preferred_ids:
             continue
@@ -299,7 +344,7 @@ def _block1_runtime_supported_candidates(
         seen_ids.add(topology_id)
     for candidate in practical:
         topology_id = _theoretical_topology_id(candidate)
-        if not _block1_runtime_candidate_allowed(candidate):
+        if not _block1_runtime_candidate_allowed(candidate, hidden_size=hidden_size):
             continue
         if topology_id in seen_ids:
             continue
@@ -509,11 +554,17 @@ def _is_block1_practical_candidate(candidate: dict[str, int | str]) -> bool:
     )
 
 
-def _block1_runtime_candidate_allowed(candidate: dict[str, int | str]) -> bool:
+def _block1_runtime_candidate_allowed(
+    candidate: dict[str, int | str], *, hidden_size: int
+) -> bool:
+    tile_n = int(candidate["tile_n"])
+    num_aie_columns = int(candidate["num_aie_columns"])
+    parallel_heads = int(candidate["parallel_heads"])
     return (
         int(candidate["parallel_seq"]) == 1
-        and int(candidate["parallel_heads"]) == 1
         and int(candidate["parallel_head_dim"]) == 1
+        and num_aie_columns % parallel_heads == 0
+        and hidden_size % (tile_n * num_aie_columns) == 0
     )
 
 

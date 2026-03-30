@@ -71,6 +71,9 @@ def fused_qkv_proj(
     tile_k: int,
     tile_n: int,
     num_aie_columns: int,
+    parallel_seq: int,
+    parallel_heads: int,
+    parallel_head_dim: int,
     dtype_in_str: str,
     dtype_out_str: str,
     use_scalar: bool,
@@ -80,6 +83,13 @@ def fused_qkv_proj(
     archive: str | None = None,
 ):
     del trace_size
+
+    if parallel_seq != 1:
+        raise AssertionError("Block 1 currently lowers parallel_seq only for 1")
+    if parallel_head_dim != 1:
+        raise AssertionError(
+            "Block 1 currently lowers parallel_head_dim only for 1"
+        )
 
     n_aie_rows = 4
     n_shim_mem_A = min(num_aie_columns, n_aie_rows)
@@ -131,6 +141,14 @@ def fused_qkv_proj(
     if combined_hidden_size % mem_tile_n != 0:
         raise AssertionError(
             "Block 1 fused output width must tile into mem-tile output blocks"
+        )
+    if parallel_heads < 1 or num_aie_columns % parallel_heads != 0:
+        raise AssertionError(
+            "Block 1 requires num_aie_columns divisible by parallel_heads"
+        )
+    if hidden_size % mem_tile_n != 0:
+        raise AssertionError(
+            "Block 1 currently requires hidden_size divisible by tile_n * num_aie_columns"
         )
     if seq_len % mem_tile_m_C != 0:
         raise AssertionError("Block 1 output must tile into mem-tile C blocks")
@@ -371,6 +389,9 @@ def fused_qkv_proj(
     n_c_col_tiles_per_core = combined_hidden_size // mem_tile_n
     n_c_row_tiles_per_core = seq_len // mem_tile_m_C
     tb_max_n_rows = 4
+    n_projection_tile_groups = hidden_size // mem_tile_n
+    columns_per_head_group = num_aie_columns // parallel_heads
+    head_group_width = hidden_size // parallel_heads
 
     A_tiles = TensorTiler2D.group_tiler(
         (seq_len, hidden_size),
@@ -388,6 +409,98 @@ def fused_qkv_proj(
         prune_step=False,
     )
 
+    def make_b_taps(col: int) -> list[TensorAccessPattern]:
+        if parallel_heads == 1:
+            return [B_tiles[col]]
+
+        head_group = col // columns_per_head_group
+        local_col = col % columns_per_head_group
+        taps = []
+        for projection_idx in range(3):
+            projection_offset = projection_idx * hidden_size
+            B_offset = projection_offset + head_group * head_group_width + local_col * tile_n
+            taps.append(
+                TensorAccessPattern(
+                    (hidden_size, combined_hidden_size),
+                    offset=B_offset,
+                    sizes=[n_projection_tile_groups, K_div_k, tile_k, tile_n],
+                    strides=[
+                        columns_per_head_group * tile_n,
+                        tile_k * combined_hidden_size,
+                        combined_hidden_size,
+                        1,
+                    ],
+                )
+            )
+        return taps
+
+    def make_a_tap(
+        row_base: int, tile_row: int, shim_idx: int, repeat_count: int
+    ) -> TensorAccessPattern:
+        A_row_offset = (row_base + tile_row) * mem_tile_m_C + shim_idx * mem_tile_m_A
+        return TensorAccessPattern(
+            (seq_len, hidden_size),
+            offset=A_row_offset * hidden_size,
+            sizes=[repeat_count, K_div_k, mem_tile_m_A, tile_k],
+            strides=[0, tile_k, hidden_size, 1],
+        )
+
+    def make_c_taps(
+        row_base: int, current_tb_n_rows: int, col: int
+    ) -> list[TensorAccessPattern]:
+        if parallel_heads == 1:
+            C_row_offset = row_base * mem_tile_m_C * combined_hidden_size
+            C_col_offset = col * tile_n
+            C_offset = C_col_offset + C_row_offset
+            return [
+                TensorAccessPattern(
+                    (seq_len, combined_hidden_size),
+                    offset=C_offset,
+                    sizes=[
+                        current_tb_n_rows,
+                        combined_hidden_size // mem_tile_n,
+                        mem_tile_m_C,
+                        tile_n,
+                    ],
+                    strides=[
+                        mem_tile_m_C * combined_hidden_size,
+                        mem_tile_n,
+                        combined_hidden_size,
+                        1,
+                    ],
+                )
+            ]
+
+        head_group = col // columns_per_head_group
+        local_col = col % columns_per_head_group
+        C_row_offset = row_base * mem_tile_m_C * combined_hidden_size
+        taps = []
+        for projection_idx in range(3):
+            projection_offset = projection_idx * hidden_size
+            C_col_offset = (
+                projection_offset + head_group * head_group_width + local_col * tile_n
+            )
+            C_offset = C_col_offset + C_row_offset
+            taps.append(
+                TensorAccessPattern(
+                    (seq_len, combined_hidden_size),
+                    offset=C_offset,
+                    sizes=[
+                        current_tb_n_rows,
+                        n_projection_tile_groups,
+                        mem_tile_m_C,
+                        tile_n,
+                    ],
+                    strides=[
+                        mem_tile_m_C * combined_hidden_size,
+                        columns_per_head_group * tile_n,
+                        combined_hidden_size,
+                        1,
+                    ],
+                )
+            )
+        return taps
+
     rt = Runtime()
     with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
         rt.start(*workers)
@@ -404,73 +517,111 @@ def fused_qkv_proj(
             for col in range(num_aie_columns):
                 rt.set_barrier(worker_barriers[row][col], 1)
 
-        tg = rt.task_group()
-        for tb in range((n_c_row_tiles_per_core + tb_max_n_rows - 1) // tb_max_n_rows):
-            for pingpong in [0, 1]:
-                row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
-                current_tb_n_rows = min(
-                    tb_max_n_rows // 2, n_c_row_tiles_per_core - row_base
-                )
-                if current_tb_n_rows <= 0:
-                    break
-                for col in range(num_aie_columns):
-                    C_row_offset = row_base * mem_tile_m_C * combined_hidden_size
-                    C_col_offset = col * tile_n
-                    C_offset = C_col_offset + C_row_offset
-                    C_tile = TensorAccessPattern(
-                        (seq_len, combined_hidden_size),
-                        offset=C_offset,
-                        sizes=[
-                            current_tb_n_rows,
-                            combined_hidden_size // mem_tile_n,
-                            mem_tile_m_C,
-                            tile_n,
-                        ],
-                        strides=[
-                            mem_tile_m_C * combined_hidden_size,
-                            mem_tile_n,
-                            combined_hidden_size,
-                            1,
-                        ],
+        if parallel_heads == 1:
+            tg = rt.task_group()
+            for tb in range((n_c_row_tiles_per_core + tb_max_n_rows - 1) // tb_max_n_rows):
+                for pingpong in [0, 1]:
+                    row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
+                    current_tb_n_rows = min(
+                        tb_max_n_rows // 2, n_c_row_tiles_per_core - row_base
                     )
-                    rt.drain(
-                        C_l2l3_fifos[col].cons(),
-                        C,
-                        tap=C_tile,
-                        wait=True,
-                        task_group=tg,
-                        placement=Tile(col, 0),
-                    )
-
-                    for tile_row in range(current_tb_n_rows):
-                        tile_offset = (
-                            (row_base + tile_row) * n_shim_mem_A + col
-                        ) % len(A_tiles)
-
-                        if col < n_aie_rows:
-                            rt.fill(
-                                A_l3l2_fifos[col].prod(),
-                                A,
-                                tap=A_tiles[tile_offset],
+                    if current_tb_n_rows <= 0:
+                        break
+                    for col in range(num_aie_columns):
+                        for C_tile in make_c_taps(row_base, current_tb_n_rows, col):
+                            rt.drain(
+                                C_l2l3_fifos[col].cons(),
+                                C,
+                                tap=C_tile,
+                                wait=True,
                                 task_group=tg,
-                                placement=Tile(
-                                    2 * col if num_aie_columns == 8 else col,
-                                    0,
-                                ),
+                                placement=Tile(col, 0),
                             )
 
-                        rt.fill(
-                            B_l3l2_fifos[col].prod(),
-                            B,
-                            tap=B_tiles[col],
-                            task_group=tg,
-                            placement=Tile(col, 0),
-                        )
+                        for tile_row in range(current_tb_n_rows):
+                            tile_offset = (
+                                (row_base + tile_row) * n_shim_mem_A + col
+                            ) % len(A_tiles)
 
-                if tb > 0 or (tb == 0 and pingpong > 0):
-                    rt.finish_task_group(tg)
-                    tg = rt.task_group()
-        rt.finish_task_group(tg)
+                            if col < n_aie_rows:
+                                rt.fill(
+                                    A_l3l2_fifos[col].prod(),
+                                    A,
+                                    tap=A_tiles[tile_offset],
+                                    task_group=tg,
+                                    placement=Tile(
+                                        2 * col if num_aie_columns == 8 else col,
+                                        0,
+                                    ),
+                                )
+
+                            for B_tile in make_b_taps(col):
+                                rt.fill(
+                                    B_l3l2_fifos[col].prod(),
+                                    B,
+                                    tap=B_tile,
+                                    task_group=tg,
+                                    placement=Tile(col, 0),
+                                )
+
+                    if tb > 0 or (tb == 0 and pingpong > 0):
+                        rt.finish_task_group(tg)
+                        tg = rt.task_group()
+            rt.finish_task_group(tg)
+        else:
+            for tb in range((n_c_row_tiles_per_core + tb_max_n_rows - 1) // tb_max_n_rows):
+                for pingpong in [0, 1]:
+                    row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
+                    current_tb_n_rows = min(
+                        tb_max_n_rows // 2, n_c_row_tiles_per_core - row_base
+                    )
+                    if current_tb_n_rows <= 0:
+                        break
+                    for projection_idx in range(3):
+                        tg = rt.task_group()
+                        for col in range(num_aie_columns):
+                            C_tile = make_c_taps(row_base, current_tb_n_rows, col)[
+                                projection_idx
+                            ]
+                            rt.drain(
+                                C_l2l3_fifos[col].cons(),
+                                C,
+                                tap=C_tile,
+                                wait=True,
+                                task_group=tg,
+                                placement=Tile(col, 0),
+                            )
+
+                            for tile_row in range(current_tb_n_rows):
+                                tile_offset = (
+                                    (row_base + tile_row) * n_shim_mem_A + col
+                                ) % len(A_tiles)
+
+                                if col < n_aie_rows:
+                                    rt.fill(
+                                        A_l3l2_fifos[col].prod(),
+                                        A,
+                                        tap=make_a_tap(
+                                            row_base,
+                                            tile_row,
+                                            col,
+                                            n_projection_tile_groups,
+                                        ),
+                                        task_group=tg,
+                                        placement=Tile(
+                                            2 * col if num_aie_columns == 8 else col,
+                                            0,
+                                        ),
+                                    )
+
+                                rt.fill(
+                                    B_l3l2_fifos[col].prod(),
+                                    B,
+                                    tap=make_b_taps(col)[projection_idx],
+                                    task_group=tg,
+                                    placement=Tile(col, 0),
+                                )
+                        rt.finish_task_group(tg)
         for row in range(n_aie_rows):
             for col in range(num_aie_columns):
                 rt.set_barrier(worker_barriers[row][col], 0)

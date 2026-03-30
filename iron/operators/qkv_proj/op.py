@@ -130,6 +130,7 @@ class AIEQKVProj(AIEOperatorBase):
     def _get_artifact_name_base(self, prefix: str, M: int, K: int, N: int) -> str:
         return (
             f"{prefix}{M}x{K}x{N}_{self.num_aie_columns}_{self.tile_m}x{self.tile_k}x{self.tile_n}"
+            f"_ps{self.parallel_seq}_ph{self.parallel_heads}_pd{self.parallel_head_dim}"
             "_0_0_bf16_bf16_sc0_acc0_embf161_round1_batchA1d0_batchB1d0_batchC1d0"
         )
 
@@ -165,6 +166,9 @@ class AIEQKVProj(AIEOperatorBase):
                 "tile_k": self.tile_k,
                 "tile_n": self.tile_n,
                 "num_aie_columns": self.num_aie_columns,
+                "parallel_seq": self.parallel_seq,
+                "parallel_heads": self.parallel_heads,
+                "parallel_head_dim": self.parallel_head_dim,
                 "dtype_in_str": "bf16",
                 "dtype_out_str": "bf16",
                 "use_scalar": False,
