@@ -246,15 +246,19 @@ The current runtime-supported Block 3 catalog is generated from:
 That runtime gate is intentionally narrower than the practical surface and
 still reflects the current `design.py` implementation:
 - `num_aie_columns == 8`
-- `tile_m in {32, 64}`
-- `tile_k >= 64`
+- `tile_m in {16, 32, 64}`
+- `tile_k >= 16`
 - `tile_n >= 16`
 - `down_proj_depth <= 8`
-- placement must satisfy the current horizontal/vertical Block 3 layout
+- placement must satisfy the current horizontal, vertical, or compact-sequence
+  Block 3 layouts
+- `parallel_seq > 4` currently requires the compact-sequence layout, so the
+  promoted `ps8` runtime surface is currently limited to `parallel_int_dim=1`
 
-So the practical Block 3 surface may explore `ps8` and smaller tile shapes,
-but those are not runtime-supported until the actual placement/dataflow design
-can lower them.
+So the practical Block 3 surface can still explore broader `ps8`/small-tile
+shapes than the current runtime-supported set, but `ps8` is no longer
+practical-only: the compact-sequence runtime path now supports strict-runtime-
+feasible `ps8, pi1` topologies.
 Study metadata emitted by the in-process Dataflow patterns should include the
 selected block topology IDs and families so retained topology choices are visible
 in benchmark outputs.

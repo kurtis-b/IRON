@@ -127,20 +127,24 @@ Current runtime-supported surface:
     current-layout runtime gate
 - that gate still reflects the current `design.py` implementation:
   - `num_aie_columns == 8`
-  - `tile_m in {32, 64}`
-  - `tile_k >= 64`
+  - `tile_m in {16, 32, 64}`
+  - `tile_k >= 16`
   - `tile_n >= 16`
   - `down_proj_depth <= 8`
-  - placement must satisfy the current horizontal/vertical Block 3 layout
+  - placement must satisfy the current horizontal, vertical, or compact-
+    sequence Block 3 layout
+  - `parallel_seq > 4` currently requires the compact-sequence layout, so the
+    promoted `ps8` runtime surface is currently limited to `parallel_int_dim=1`
 - current exercised runtime-supported counts are:
-  - `64 x 768 x 3072`: `6`
+  - `64 x 768 x 3072`: `8`
   - `512 x 768 x 3072`: `8`
-  - `64 x 1024 x 4096`: `4`
+  - `64 x 1024 x 4096`: `8`
   - `512 x 1024 x 4096`: `4`
-  - `64 x 2048 x 8192`: `2`
+  - `64 x 2048 x 8192`: `6`
   - `512 x 2048 x 8192`: `8`
-- `ps8` remains practical-only today; it does not yet satisfy the current
-  runtime placement/dataflow implementation
+- `ps8` is now runtime-supported for strict-runtime-feasible `parallel_int_dim=1`
+  compact-sequence Block 3 topologies; broader `ps8` shapes still remain
+  practical-only until the runtime layout is generalized further
 
 Current execution contract:
 
@@ -175,15 +179,19 @@ Verified today:
 - after the new runtime-catalog promotion rule, the application-side
   topology-exploration tests again pass and the expanded Block 3 numerical
   matrix is being re-validated against the generated runtime catalog
+- the current widened runtime surface, including the new `m16` and `ps8`
+  promotions, passes:
+  - `iron/operators/addnorm_ffn_addnorm/test.py` (`260 passed`)
+  - `iron/applications/transformer_layer/test_patterns.py`
+  - `iron/applications/transformer_layer/test_topology_exploration.py`
 
 Work left:
 
 - continue promoting additional theoretical/practical Block 3 topologies only
   after the standalone runtime proves them constructible and numerically sound
-- add real runtime placement/dataflow support for `ps8`
-- broaden runtime support below the current `tile_m in {32, 64}` and
-  `tile_k >= 64` implementation limits only after those smaller-tile shapes are
-  numerically validated
+- broaden `ps8` runtime support beyond the current compact-sequence `pi1` path
+- continue promoting smaller-`k` runtime candidates now that the hard
+  `tile_k >= 64` policy gate is gone
 - broaden Dataflow-level Block 2 -> Block 3 verification now that the packed
   handoff and the multi-group Block 3 runtime are both functional
 

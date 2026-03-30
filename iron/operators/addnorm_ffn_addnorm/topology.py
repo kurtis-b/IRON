@@ -398,7 +398,7 @@ _BLOCK3_PRACTICAL_MAX_CANDIDATES = (
 )
 _BLOCK3_RUNTIME_NUM_AIE_COLUMNS = 8
 _BLOCK3_RUNTIME_TILE_M_CHOICES = (16, 32, 64)
-_BLOCK3_RUNTIME_MIN_TILE_K = 64
+_BLOCK3_RUNTIME_MIN_TILE_K = 16
 _BLOCK3_RUNTIME_MIN_TILE_N = 16
 _BLOCK3_RUNTIME_MAX_CANDIDATES = 8
 _BLOCK3_RUNTIME_MAX_DOWN_PROJ_DEPTH = 8
@@ -906,8 +906,10 @@ def _block3_runtime_placement_feasible(candidate: dict[str, int | str]) -> bool:
     parallel_seq = int(candidate["parallel_seq"])
     parallel_int_dim = int(candidate["parallel_int_dim"])
     num_aie_columns = int(candidate["num_aie_columns"])
-    if parallel_seq > (num_aie_columns // 2):
+    if parallel_seq > num_aie_columns:
         return False
+    if parallel_seq > (num_aie_columns // 2):
+        return parallel_int_dim == 1
     if parallel_seq < 3:
         return parallel_int_dim <= num_aie_columns - 2
     return (
