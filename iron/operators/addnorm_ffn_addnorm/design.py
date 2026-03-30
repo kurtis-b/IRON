@@ -80,6 +80,12 @@ def fused_addnorm_ffn_addnorm(
         raise AssertionError(
             "n_aie_cols must be at least 2 due to packed AR, B_Up, and B_Down streams"
         )
+    compact_seq_layout = nA_tiles_distributed > (n_aie_cols // 2)
+    if compact_seq_layout and nB_tiles_distributed != 1:
+        raise AssertionError(
+            "Compact Block 3 sequence-lane layout currently requires parallel_int_dim == 1"
+        )
+    horizontal_layout = nA_tiles_distributed < 3 and not compact_seq_layout
     # n_aie_cols will be used to determine whether to send the same data to through different shim tiles, while
     # nB_tiles_distributed will be used to determine what data to send through which shim tiles
     # nA_tiles_distributed replicates the pipelined design across the NPU array
@@ -89,8 +95,8 @@ def fused_addnorm_ffn_addnorm(
     cores_per_col = 4
     num_ffn_stages = 2  # Up projection and fused down projection-GeLU stages
     n_aie_cores_needed = nA_tiles_distributed * (
-        1 + num_ffn_stages * nB_tiles_distributed
-    )  # nA_tiles_distributed essentially duplicates the design, which has one add & norm block (i.e. the 1) and an FFN block
+        2 + num_ffn_stages * nB_tiles_distributed
+    )  # nA_tiles_distributed duplicates the full Block 3 lane: LN1, FFN, and LN2
 
     dtype_in = str_to_dtype(dtype_in_str)
     dtype_out = str_to_dtype(dtype_out_str)
@@ -223,34 +229,44 @@ def fused_addnorm_ffn_addnorm(
     B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
     C_ty = np.ndarray[(M * K,), np.dtype[dtype_out]]
 
-    def split_zero_stride_repeat_tap(
+    def split_runtime_fill_tap(
         tap: TensorAccessPattern,
         tensor_shape: tuple[int, ...],
-        chunk_size: int,
+        *,
+        max_dim_size: int = 64,
+        repeat_chunk_size: int | None = None,
     ) -> list[TensorAccessPattern]:
-        if int(tap.strides[0]) != 0:
+        sizes = [int(size) for size in tap.sizes]
+        strides = [int(stride) for stride in tap.strides]
+        dim0_size = sizes[0]
+        chunk_size = (
+            repeat_chunk_size
+            if strides[0] == 0 and repeat_chunk_size is not None
+            else max_dim_size
+        )
+        if dim0_size <= chunk_size:
             return [tap]
-        repeat_count = int(tap.sizes[0])
-        if repeat_count <= chunk_size:
-            return [tap]
-        if repeat_count % chunk_size != 0:
+        if chunk_size > max_dim_size:
             raise ValueError(
-                "Cannot split repeat TAP evenly: "
-                f"repeat_count={repeat_count}, chunk_size={chunk_size}"
+                "Cannot split TAP leading dimension: "
+                f"size={dim0_size}, chunk_size={chunk_size}"
             )
-        chunk_taps = []
-        for _ in range(repeat_count // chunk_size):
-            sizes = [int(s) for s in tap.sizes]
-            sizes[0] = chunk_size
-            chunk_taps.append(
+        taps: list[TensorAccessPattern] = []
+        consumed = 0
+        while consumed < dim0_size:
+            current_chunk_size = min(chunk_size, dim0_size - consumed)
+            chunk_sizes = list(sizes)
+            chunk_sizes[0] = current_chunk_size
+            taps.append(
                 TensorAccessPattern(
                     tensor_shape,
-                    offset=int(tap.offset),
-                    sizes=sizes,
-                    strides=[int(s) for s in tap.strides],
+                    offset=int(tap.offset) + consumed * strides[0],
+                    sizes=chunk_sizes,
+                    strides=strides,
                 )
             )
-        return chunk_taps
+            consumed += current_chunk_size
+        return taps
 
     # Add & Norm tensor types
     ln_weights_ty = np.ndarray[(K,), np.dtype[dtype_in]]
@@ -389,6 +405,90 @@ def fused_addnorm_ffn_addnorm(
     tiles = [[(col, row) for col in range(0, n_aie_cols)] for row in range(0, 6)]
     core_tiles = tiles[2:]
 
+    def ln1_stream_tile(a_tile: int) -> Tile:
+        if horizontal_layout:
+            return Tile(0, 1)
+        if compact_seq_layout:
+            return Tile(a_tile, 1)
+        return Tile(a_tile * 2, 1)
+
+    def ln2_stream_tile(a_tile: int) -> Tile:
+        if horizontal_layout:
+            return Tile(nB_tiles_distributed + 1, 1)
+        if compact_seq_layout:
+            return Tile(a_tile, 1)
+        return Tile(a_tile * 2 + 1, 1)
+
+    def ln1_shim_tile(a_tile: int) -> Tile:
+        if horizontal_layout:
+            return Tile(0, 0)
+        if compact_seq_layout:
+            return Tile(a_tile, 0)
+        return Tile(a_tile * 2, 0)
+
+    def ln2_shim_tile(a_tile: int) -> Tile:
+        if horizontal_layout:
+            return Tile(nB_tiles_distributed + 1, 0)
+        if compact_seq_layout:
+            return Tile(a_tile, 0)
+        return Tile(a_tile * 2 + 1, 0)
+
+    def c_shim_tile(a_tile: int) -> Tile:
+        if horizontal_layout:
+            return Tile(nB_tiles_distributed + 1, 0)
+        if compact_seq_layout:
+            return Tile(a_tile, 0)
+        return Tile(a_tile * 2 + 1, 0)
+
+    def partial_c_memtile(a_tile: int, b_tile: int) -> Tile:
+        if horizontal_layout:
+            return Tile(
+                (a_tile * nB_tiles_distributed + b_tile + 1) % n_aie_cols,
+                1,
+            )
+        if compact_seq_layout:
+            return Tile(a_tile, 1)
+        return Tile(
+            ((b_tile % 2) + (a_tile * 2)) % n_aie_cols,
+            1,
+        )
+
+    def ln2_output_memtile(a_tile: int) -> Tile:
+        if horizontal_layout:
+            return Tile(n_aie_cols - 1 - a_tile, 1)
+        if compact_seq_layout:
+            return Tile(a_tile, 1)
+        return Tile((a_tile * nB_tiles_distributed + 1) % n_aie_cols, 1)
+
+    def worker_tiles(a_tile: int, b_tile: int) -> tuple[Tile, Tile, Tile, Tile]:
+        if compact_seq_layout:
+            if b_tile != 0:
+                raise AssertionError(
+                    "Compact Block 3 sequence-lane layout supports only one FFN lane"
+                )
+            tile_col = a_tile
+            return (
+                Tile(tile_col, 3),
+                Tile(tile_col, 4),
+                Tile(tile_col, 2),
+                Tile(tile_col, 5),
+            )
+        if horizontal_layout:
+            tile_col, tile_row = core_tiles[a_tile * num_ffn_stages][b_tile]
+            return (
+                Tile(tile_col, tile_row + 1),
+                Tile(tile_col, tile_row),
+                Tile(nB_tiles_distributed + 1, tile_row),
+                Tile(nB_tiles_distributed, tile_row),
+            )
+        tile_col, tile_row = core_tiles[-1 * (b_tile + 1)][a_tile * num_ffn_stages]
+        return (
+            Tile(tile_col, tile_row),
+            Tile(tile_col + 1, tile_row),
+            Tile(tile_col, tile_row - 1),
+            Tile(tile_col + 1, tile_row - 1),
+        )
+
     # AIE-array data movement with object fifos
     # Dedicated packed [A | R] streams for LN1 and LN2. Replay stays encoded
     # in the runtime TAPs; the ingress path is L3 -> L2 -> L1.
@@ -450,9 +550,7 @@ def fused_addnorm_ffn_addnorm(
                 name=f"AR_ln1_L2L1_{a_tile}",
                 depth=fifo_depth_ar_compute,
                 dims_to_stream=dims_to_stream_ar,
-                placement=(
-                    Tile(0, 1) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 1)
-                ),
+                placement=ln1_stream_tile(a_tile),
             )
         )
         AR_ln2_l3l2_fifos[a_tile] = ObjectFifo(
@@ -468,11 +566,7 @@ def fused_addnorm_ffn_addnorm(
                 name=f"AR_ln2_L2L1_{a_tile}",
                 depth=fifo_depth_ar_compute,
                 dims_to_stream=dims_to_stream_ar,
-                placement=(
-                    Tile(nB_tiles_distributed + 1, 1)
-                    if nA_tiles_distributed < 3
-                    else Tile(a_tile * 2 + 1, 1)
-                ),
+                placement=ln2_stream_tile(a_tile),
             )
         )
 
@@ -568,17 +662,7 @@ def fused_addnorm_ffn_addnorm(
                     obj_type=A_l1_ty,
                     name=f"C_down_L2L1_{b_tile}_{a_tile}",
                     depth=down_proj_depth,
-                    placement=(
-                        Tile(
-                            (a_tile * nB_tiles_distributed + b_tile + 1) % n_aie_cols,
-                            1,
-                        )
-                        if nA_tiles_distributed < 3
-                        else Tile(
-                            ((b_tile % 2) + (a_tile * 2)) % n_aie_cols,
-                            1,
-                        )
-                    ),
+                    placement=partial_c_memtile(a_tile, b_tile),
                 )
             )
     # Down proj partial C for reduction
@@ -616,11 +700,7 @@ def fused_addnorm_ffn_addnorm(
                 obj_type=A_l1_ty,
                 name=f"ln2_L2L3_{a_tile}",
                 dims_to_stream=dims_to_stream,
-                placement=(
-                    Tile(n_aie_cols - 1 - a_tile, 1)
-                    if nA_tiles_distributed < 3
-                    else Tile((a_tile * nB_tiles_distributed + 1) % n_aie_cols, 1)
-                ),
+                placement=ln2_output_memtile(a_tile),
             )
         )
 
@@ -821,25 +901,7 @@ def fused_addnorm_ffn_addnorm(
     workers = []
     for a_tile in range(nA_tiles_distributed):
         for b_tile in range(nB_tiles_distributed):
-            # Calculate the tile placement (indexing by core_tiles[row][col])
-            if nA_tiles_distributed < 3:
-                # FFN cores will be placed horizontally, adjacent col will be for Add & Norm core
-                # The direction of reduction will be from left to right
-                tile_col, tile_row = core_tiles[a_tile * num_ffn_stages][b_tile]
-                ln1_tile_col = nB_tiles_distributed + 1
-                ln1_tile_row = tile_row
-                ln2_tile_col = nB_tiles_distributed
-                ln2_tile_row = tile_row
-            else:
-                # FFN cores will be placed vertically
-                # The direction of reduction will be from up to down
-                tile_col, tile_row = core_tiles[-1 * (b_tile + 1)][
-                    a_tile * num_ffn_stages
-                ]
-                ln1_tile_col = tile_col
-                ln1_tile_row = tile_row - 1
-                ln2_tile_col = tile_col + 1
-                ln2_tile_row = tile_row - 1
+            up_tile, down_tile, ln1_tile, ln2_tile = worker_tiles(a_tile, b_tile)
             stream_to_ln = b_tile == nB_tiles_distributed - 1
             if stream_to_ln:
                 ln1_weight_buffer = Buffer(
@@ -868,7 +930,7 @@ def fused_addnorm_ffn_addnorm(
                             ln_packed_add_calc_sum_sumsq_kernel,
                             ln_packed_fused_add_layer_norm_from_inputs_kernel,
                         ],
-                        placement=Tile(ln1_tile_col, ln1_tile_row),
+                        placement=ln1_tile,
                         stack_size=0xD00,
                     )
                 )
@@ -924,10 +986,7 @@ def fused_addnorm_ffn_addnorm(
                             ln_packed_add_calc_sum_sumsq_kernel,
                             ln_zero_f32_kernel,
                         ],
-                        placement=Tile(
-                            ln2_tile_col,
-                            ln2_tile_row,
-                        ),
+                        placement=ln2_tile,
                         stack_size=0xD00,
                     )
                 )
@@ -944,11 +1003,7 @@ def fused_addnorm_ffn_addnorm(
                         ffn_matmul_kernel_up_proj,
                         ffn_gelu_kernel if gelu_stage == 0 else None,
                     ],
-                    placement=(
-                        Tile(tile_col, tile_row + 1)
-                        if nA_tiles_distributed < 3
-                        else Tile(tile_col, tile_row)
-                    ),
+                    placement=up_tile,
                     stack_size=0xD00,
                 )
             )
@@ -982,11 +1037,7 @@ def fused_addnorm_ffn_addnorm(
                         ),
                         stream_to_ln,
                     ],
-                    placement=(
-                        Tile(tile_col, tile_row)
-                        if nA_tiles_distributed < 3
-                        else Tile(tile_col + 1, tile_row)
-                    ),
+                    placement=down_tile,
                     stack_size=0xD00,
                 )
             )
@@ -1012,6 +1063,35 @@ def fused_addnorm_ffn_addnorm(
         packed_fill_chunk_size = 64
         tg = rt.task_group()
 
+        def emit_fill_with_task_group_reuse(
+            fifo,
+            tensor,
+            fill_taps: list[TensorAccessPattern],
+            *,
+            placement: Tile,
+        ):
+            nonlocal tg
+            if len(fill_taps) == 1:
+                rt.fill(
+                    fifo.prod(),
+                    tensor,
+                    tap=fill_taps[0],
+                    task_group=tg,
+                    placement=placement,
+                )
+                return
+            for fill_tap in fill_taps:
+                split_tg = rt.task_group()
+                rt.fill(
+                    fifo.prod(),
+                    tensor,
+                    tap=fill_tap,
+                    wait=True,
+                    task_group=split_tg,
+                    placement=placement,
+                )
+                rt.finish_task_group(split_tg)
+
         def emit_ln2_prepass(row_tile_idx: int):
             nonlocal tg
             for a_tile in range(nA_tiles_distributed):
@@ -1026,15 +1106,11 @@ def fused_addnorm_ffn_addnorm(
                     sizes=[1, K_div_k, 2 * m, k],
                     strides=[0, packed_tile_elems, k, 1],
                 )
-                ln2_place = (
-                    Tile(nB_tiles_distributed + 1, 0)
-                    if nA_tiles_distributed < 3
-                    else Tile(a_tile * 2 + 1, 0)
-                )
-                ln2_ar_fill_taps = split_zero_stride_repeat_tap(
+                ln2_place = ln2_shim_tile(a_tile)
+                ln2_ar_fill_taps = split_runtime_fill_tap(
                     ln2_ar_tile,
                     packed_hidden_residual_shape,
-                    chunk_size=packed_fill_chunk_size,
+                    repeat_chunk_size=packed_fill_chunk_size,
                 )
                 for ln2_ar_fill_tap in ln2_ar_fill_taps:
                     rt.fill(
@@ -1050,12 +1126,15 @@ def fused_addnorm_ffn_addnorm(
 
         def emit_grouped_phase(row_tile_idx: int, col_group: int, *, emit_output: bool):
             nonlocal tg
+            row_packed_tile_offsets = [
+                (a_tile * ln_iters_per_core + row_tile_idx)
+                * K_div_k
+                * packed_tile_elems
+                for a_tile in range(nA_tiles_distributed)
+            ]
+            ln2_tg = rt.task_group()
             for a_tile in range(nA_tiles_distributed):
-                row_packed_tile_offset = (
-                    (a_tile * ln_iters_per_core + row_tile_idx)
-                    * K_div_k
-                    * packed_tile_elems
-                )
+                row_packed_tile_offset = row_packed_tile_offsets[a_tile]
                 packed_tile_offset = (
                     row_packed_tile_offset
                     + col_group * down_proj_depth * packed_tile_elems
@@ -1066,15 +1145,11 @@ def fused_addnorm_ffn_addnorm(
                     sizes=[1, down_proj_depth, 2 * m, k],
                     strides=[0, packed_tile_elems, k, 1],
                 )
-                ln2_place = (
-                    Tile(nB_tiles_distributed + 1, 0)
-                    if nA_tiles_distributed < 3
-                    else Tile(a_tile * 2 + 1, 0)
-                )
-                ln2_ar_fill_taps = split_zero_stride_repeat_tap(
+                ln2_place = ln2_shim_tile(a_tile)
+                ln2_ar_fill_taps = split_runtime_fill_tap(
                     ln2_ar_tile,
                     packed_hidden_residual_shape,
-                    chunk_size=packed_fill_chunk_size,
+                    repeat_chunk_size=packed_fill_chunk_size,
                 )
                 for ln2_ar_fill_tap in ln2_ar_fill_taps:
                     rt.fill(
@@ -1085,35 +1160,97 @@ def fused_addnorm_ffn_addnorm(
                         task_group=tg,
                         placement=ln2_place,
                     )
+            rt.finish_task_group(ln2_tg)
 
-                ln1_ar_tile = TensorAccessPattern(
-                    packed_hidden_residual_shape,
-                    offset=row_packed_tile_offset,
-                    sizes=[2 * nC_up_col_tiles_per_core, K_div_k, 2 * m, k],
-                    strides=[0, packed_tile_elems, k, 1],
+            for col_tile_base in range(
+                0, nC_up_col_tiles_per_core, packed_fill_chunk_size
+            ):
+                current_col_tile_block = min(
+                    packed_fill_chunk_size,
+                    nC_up_col_tiles_per_core - col_tile_base,
                 )
-                place = Tile(0, 0) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 0)
-                ln1_ar_fill_taps = split_zero_stride_repeat_tap(
-                    ln1_ar_tile,
-                    packed_hidden_residual_shape,
-                    chunk_size=packed_fill_chunk_size,
-                )
-                for ln1_ar_fill_tap in ln1_ar_fill_taps:
+                block_tg = rt.task_group()
+                for a_tile in range(nA_tiles_distributed):
+                    ln1_ar_tile = TensorAccessPattern(
+                        packed_hidden_residual_shape,
+                        offset=row_packed_tile_offsets[a_tile],
+                        sizes=[2 * current_col_tile_block, K_div_k, 2 * m, k],
+                        strides=[0, packed_tile_elems, k, 1],
+                    )
+                    place = ln1_shim_tile(a_tile)
+                    ln1_ar_fill_taps = split_runtime_fill_tap(
+                        ln1_ar_tile,
+                        packed_hidden_residual_shape,
+                        repeat_chunk_size=packed_fill_chunk_size,
+                    )
+                    for ln1_ar_fill_tap in ln1_ar_fill_taps:
+                        rt.fill(
+                            AR_ln1_l3l2_fifos[a_tile].prod(),
+                            packed_hidden_residual,
+                            tap=ln1_ar_fill_tap,
+                            wait=True,
+                            task_group=block_tg,
+                            placement=place,
+                        )
+
+                for b_tile in range(nB_tiles_distributed):
+                    B_up_proj_col_offset = b_tile * n + col_tile_base * mem_tile_n
+                    B_up_proj_sizes = [current_col_tile_block, K_div_k, k, n]
+                    B_up_proj_strides = [mem_tile_n, k * N, N, 1]
+                    B_up_proj_tile = TensorAccessPattern(
+                        (N, K),
+                        offset=B_up_proj_col_offset,
+                        sizes=B_up_proj_sizes,
+                        strides=B_up_proj_strides,
+                    )
+                    place = (
+                        Tile(b_tile + 1, 0)
+                        if nA_tiles_distributed < 3
+                        else Tile(b_tile * 2, 0)
+                    )
                     rt.fill(
-                        AR_ln1_l3l2_fifos[a_tile].prod(),
-                        packed_hidden_residual,
-                        tap=ln1_ar_fill_tap,
-                        wait=True,
-                        task_group=tg,
+                        B_up_proj_l3l2_fifos[b_tile].prod(),
+                        B_Up,
+                        tap=B_up_proj_tile,
+                        task_group=block_tg,
                         placement=place,
                     )
 
-                if emit_output:
-                    c_place = (
-                        Tile(nB_tiles_distributed + 1, 0)
-                        if nA_tiles_distributed < 3
-                        else Tile(a_tile * 2 + 1, 0)
+                    B_down_proj_col_offset = (
+                        b_tile * n * K
+                        + col_group * k * down_proj_depth
+                        + col_tile_base * mem_tile_n * K
                     )
+                    B_down_proj_sizes = [
+                        current_col_tile_block,
+                        down_proj_depth,
+                        n,
+                        k,
+                    ]
+                    B_down_proj_strides = [mem_tile_n * K, k, K, 1]
+                    B_down_proj_tile = TensorAccessPattern(
+                        (K, N),
+                        offset=B_down_proj_col_offset,
+                        sizes=B_down_proj_sizes,
+                        strides=B_down_proj_strides,
+                    )
+                    place = (
+                        Tile(b_tile + 1, 0)
+                        if nA_tiles_distributed < 3
+                        else Tile(b_tile * 2 + 1, 0)
+                    )
+                    rt.fill(
+                        B_down_proj_l3l2_fifos[b_tile].prod(),
+                        B_Down,
+                        tap=B_down_proj_tile,
+                        task_group=block_tg,
+                        placement=place,
+                    )
+                rt.finish_task_group(block_tg)
+
+            for a_tile in range(nA_tiles_distributed):
+                if emit_output:
+                    c_place = c_shim_tile(a_tile)
                     c_offset = (
                         row_tile_idx * nA_tiles_distributed + a_tile
                     ) * m * K + col_group * k * down_proj_depth
@@ -1131,55 +1268,9 @@ def fused_addnorm_ffn_addnorm(
                         task_group=tg,
                         placement=c_place,
                     )
-
-            for b_tile in range(nB_tiles_distributed):
-                B_up_proj_col_offset = b_tile * n
-                B_up_proj_sizes = [nC_up_col_tiles_per_core, K_div_k, k, n]
-                B_up_proj_strides = [mem_tile_n, k * N, N, 1]
-                B_up_proj_tile = TensorAccessPattern(
-                    (N, K),
-                    offset=B_up_proj_col_offset,
-                    sizes=B_up_proj_sizes,
-                    strides=B_up_proj_strides,
-                )
-                place = (
-                    Tile(b_tile + 1, 0)
-                    if nA_tiles_distributed < 3
-                    else Tile(b_tile * 2, 0)
-                )
-                rt.fill(
-                    B_up_proj_l3l2_fifos[b_tile].prod(),
-                    B_Up,
-                    tap=B_up_proj_tile,
-                    task_group=tg,
-                    placement=place,
-                )
-
-                B_down_proj_col_offset = (
-                    b_tile * n * K + col_group * k * down_proj_depth
-                )
-                B_down_proj_sizes = [nC_up_col_tiles_per_core, down_proj_depth, n, k]
-                B_down_proj_strides = [mem_tile_n * K, k, K, 1]
-                B_down_proj_tile = TensorAccessPattern(
-                    (K, N),
-                    offset=B_down_proj_col_offset,
-                    sizes=B_down_proj_sizes,
-                    strides=B_down_proj_strides,
-                )
-                place = (
-                    Tile(b_tile + 1, 0)
-                    if nA_tiles_distributed < 3
-                    else Tile(b_tile * 2 + 1, 0)
-                )
-                rt.fill(
-                    B_down_proj_l3l2_fifos[b_tile].prod(),
-                    B_Down,
-                    tap=B_down_proj_tile,
-                    task_group=tg,
-                    placement=place,
-                )
-            rt.finish_task_group(tg)
-            tg = rt.task_group()
+            if emit_output:
+                rt.finish_task_group(tg)
+                tg = rt.task_group()
 
         for row_tile_idx in range(ln_iters_per_core):
             emit_ln2_prepass(row_tile_idx)

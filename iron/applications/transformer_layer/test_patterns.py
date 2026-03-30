@@ -32,6 +32,41 @@ from iron.operators.mha_out_proj.op import _pack_qkv_head_major
 from iron.operators.qkv_proj.op import AIEQKVProj
 
 
+def _first_dataflow_compatible_block3_topology(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_heads: int,
+    head_dim: int,
+    block2_topology_id: str | None = None,
+    reverse: bool = False,
+) -> dict[str, int | str]:
+    block2_topologies = mha_out_proj_topologies(num_heads=num_heads, head_dim=head_dim)
+    if block2_topology_id is not None:
+        block2_topologies = [
+            candidate
+            for candidate in block2_topologies
+            if str(candidate["topology_id"]) == block2_topology_id
+        ]
+    block3_topologies = addnorm_ffn_addnorm_topologies(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    if reverse:
+        block3_topologies = list(reversed(block3_topologies))
+    for block3_candidate in block3_topologies:
+        parallel_seq = int(block3_candidate["parallel_seq"])
+        for block2_candidate in block2_topologies:
+            q_seq_tile = int(block2_candidate["q_seq_tile"])
+            if seq_len % q_seq_tile != 0:
+                continue
+            if ((seq_len // q_seq_tile) % parallel_seq) == 0:
+                return block3_candidate
+    raise AssertionError("expected at least one dataflow-compatible Block 3 topology")
+
+
 def test_restructured_src_packages_preserve_legacy_imports():
     assert TransformerLayerSpec is CoreSpec
     assert LegacyDataflowPattern is StructuredDataflowPattern
@@ -125,22 +160,26 @@ def test_dataflow_patterns_report_selected_block_topologies_in_metadata():
 
 
 def test_build_pattern_honors_block_topology_overrides():
+    block2_topology_id = str(
+        mha_out_proj_topologies(num_heads=12, head_dim=64)[0]["topology_id"]
+    )
+    block3_topology_id = str(
+        _first_dataflow_compatible_block3_topology(
+            seq_len=64,
+            hidden_size=768,
+            intermediate_size=3072,
+            num_heads=12,
+            head_dim=64,
+            block2_topology_id=block2_topology_id,
+        )["topology_id"]
+    )
     spec = TransformerLayerSpec(
         seq_len=64,
         block1_topology_id=str(
             qkv_proj_topologies(hidden_size=768, num_heads=12)[0]["topology_id"]
         ),
-        block2_topology_id=str(
-            mha_out_proj_topologies(num_heads=12, head_dim=64)[0]["topology_id"]
-        ),
-        block3_topology_id=str(
-            addnorm_ffn_addnorm_topologies(
-                hidden_size=768,
-                intermediate_size=3072,
-            )[
-                0
-            ]["topology_id"]
-        ),
+        block2_topology_id=block2_topology_id,
+        block3_topology_id=block3_topology_id,
     )
 
     dataflow_pattern = build_pattern("dataflow", spec)
@@ -175,15 +214,18 @@ def test_build_pattern_honors_nondefault_block1_topology_override():
 
 
 def test_build_pattern_honors_nondefault_block3_topology_override():
-    block3_topologies = addnorm_ffn_addnorm_topologies(
+    compatible_block3 = _first_dataflow_compatible_block3_topology(
+        seq_len=64,
         hidden_size=768,
         intermediate_size=3072,
+        num_heads=12,
+        head_dim=64,
+        reverse=True,
     )
-    assert len(block3_topologies) > 1
 
     spec = TransformerLayerSpec(
         seq_len=64,
-        block3_topology_id=str(block3_topologies[-1]["topology_id"]),
+        block3_topology_id=str(compatible_block3["topology_id"]),
     )
 
     dataflow_pattern = build_pattern("dataflow", spec)

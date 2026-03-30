@@ -62,9 +62,8 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         self.down_proj_depth = int(config["down_proj_depth"])
         self.gelu_stage = int(config["gelu_stage"])
         self.num_aie_columns = int(config["num_aie_columns"])
-        self.compile_rows = int(config["compile_rows"])
 
-        self.M = self.compile_rows
+        self.M = seq_len
         self.K = hidden_size
         self.N = intermediate_size
 
@@ -289,24 +288,22 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         N2, K3 = B_Down_shape
 
         applicable = (
-            K == K2 and K == K3 and N == N2 and M > 0 and K <= self.K and N <= self.N
+            M == self.M
+            and K == self.K
+            and K == K2
+            and K == K3
+            and N == self.N
+            and N == N2
         )
         if not applicable:
             raise AIEOperatorConstraintError(
                 "AIEAddNormFFNAddNorm: incompatible tensor shape(s)"
             )
 
-        attention_output_np = self._pad_A(torch_to_numpy(attention_output))
-        residual_np = self._pad_A(torch_to_numpy(residual))
-        padded_rows = attention_output_np.shape[0]
-        if B_Up is not None:
-            B_Up_padded = self._pad_B(torch_to_numpy(B_Up), b_col_maj=False)
-        else:
-            B_Up_padded = None
-        if B_Down is not None:
-            B_Down_padded = self._pad_B(torch_to_numpy(B_Down), b_col_maj=True)
-        else:
-            B_Down_padded = None
+        attention_output_np = torch_to_numpy(attention_output)
+        residual_np = torch_to_numpy(residual)
+        B_Up_np = torch_to_numpy(B_Up) if B_Up is not None else None
+        B_Down_np = torch_to_numpy(B_Down) if B_Down is not None else None
 
         logging.debug(
             "Executing Block 3 for dimensions M=%s, K=%s, N=%s using compiled operator "
@@ -319,14 +316,13 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
             self.N,
         )
 
-        result_padded = self._execute_chunked_hidden_residual(
-            attention_output_np,
-            residual_np,
-            B_Up_padded,
-            B_Down_padded,
+        result_np = self._execute_aie_operation(
+            self._pack_hidden_residual(attention_output_np, residual_np),
+            B_Up_np,
+            B_Down_np,
         )
 
-        result = numpy_to_torch(result_padded[:M, :K])
+        result = numpy_to_torch(result_np)
         return result.view(expected_output_shape)
 
     def forward_packed(
@@ -351,84 +347,27 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         K2, N = B_Up_shape
         N2, K3 = B_Down_shape
         applicable = (
-            K == K2 and K == K3 and N == N2 and M > 0 and K <= self.K and N <= self.N
+            M == self.M
+            and K == self.K
+            and K == K2
+            and K == K3
+            and N == self.N
+            and N == N2
         )
         if not applicable:
             raise AIEOperatorConstraintError(
                 "AIEAddNormFFNAddNorm: incompatible tensor shape(s)"
             )
-
-        packed_hidden_residual_padded, padded_rows = self._pad_packed_hidden_residual(
-            packed_hidden_residual_np,
-            M,
-        )
-        attention_output_padded, residual_padded = self._unpack_hidden_residual(
-            packed_hidden_residual_padded,
-            padded_rows,
-        )
-        if B_Up is not None:
-            B_Up_padded = self._pad_B(torch_to_numpy(B_Up), b_col_maj=False)
-        else:
-            B_Up_padded = None
-        if B_Down is not None:
-            B_Down_padded = self._pad_B(torch_to_numpy(B_Down), b_col_maj=True)
-        else:
-            B_Down_padded = None
-
-        result_padded = self._execute_chunked_hidden_residual(
-            attention_output_padded,
-            residual_padded,
-            B_Up_padded,
-            B_Down_padded,
-        )
-
-        result = numpy_to_torch(result_padded[:M, :K])
-        return result.view(expected_output_shape)
-
-    def _execute_chunked_hidden_residual(
-        self,
-        attention_output_padded: np.ndarray,
-        residual_padded: np.ndarray,
-        B_Up_np: np.ndarray | None = None,
-        B_Down_np: np.ndarray | None = None,
-    ) -> np.ndarray:
-        padded_rows, hidden_size = attention_output_padded.shape
-        if residual_padded.shape != (padded_rows, hidden_size):
-            raise AIEOperatorConstraintError(
-                "AIEAddNormFFNAddNorm: attention_output and residual must have the same padded shape"
-            )
-        if hidden_size != self.K or padded_rows % self.M != 0:
-            raise AIEOperatorConstraintError(
-                "AIEAddNormFFNAddNorm: invalid padded hidden/residual chunking for execution"
-            )
-
-        result_padded = np.zeros(
-            (padded_rows, self.K), dtype=attention_output_padded.dtype
-        )
-        for M_lo in range(0, padded_rows, self.M):
-            chunk_hidden = attention_output_padded[M_lo : M_lo + self.M, :]
-            chunk_residual = residual_padded[M_lo : M_lo + self.M, :]
-            packed_hidden_residual_part = self._pack_hidden_residual(
-                chunk_hidden,
-                chunk_residual,
-            )
-            result_part = self._execute_aie_operation(
-                packed_hidden_residual_part,
+        B_Up_np = torch_to_numpy(B_Up) if B_Up is not None else None
+        B_Down_np = torch_to_numpy(B_Down) if B_Down is not None else None
+        result = numpy_to_torch(
+            self._execute_aie_operation(
+                packed_hidden_residual_np,
                 B_Up_np,
                 B_Down_np,
             )
-            result_padded[M_lo : M_lo + self.M, :] = result_part
-        return result_padded
-
-    def _pad_A(self, A_np: np.ndarray) -> np.ndarray:
-        M, K = A_np.shape
-        if M % self.M == 0 and K == self.K:
-            return A_np
-
-        M_multiple = (M + self.M - 1) // self.M * self.M
-        A_padded = np.zeros((M_multiple, self.K), dtype=A_np.dtype)
-        A_padded[:M, :K] = A_np
-        return A_padded
+        )
+        return result.view(expected_output_shape)
 
     def _canonicalize_packed_hidden_residual(
         self,
@@ -440,20 +379,24 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                 raise AIEOperatorConstraintError(
                     "AIEAddNormFFNAddNorm: invalid flat packed_hidden_residual length"
                 )
-            padded_rows = packed_hidden_residual.numel() // (2 * self.K)
-            if padded_rows < self.seq_len:
+            rows = packed_hidden_residual.numel() // (2 * self.K)
+            if rows != self.M:
                 raise AIEOperatorConstraintError(
-                    "AIEAddNormFFNAddNorm: packed_hidden_residual does not cover seq_len"
+                    "AIEAddNormFFNAddNorm: packed_hidden_residual must exactly match seq_len"
                 )
             return (
                 torch_to_numpy(packed_hidden_residual),
-                self.seq_len,
+                rows,
             )
         if packed_hidden_residual.ndim == 3 and packed_hidden_residual.shape[0] == 2:
             packed_hidden_residual = packed_hidden_residual.contiguous()
             if packed_hidden_residual.shape[2] != self.K:
                 raise AIEOperatorConstraintError(
                     "AIEAddNormFFNAddNorm: incompatible packed_hidden_residual hidden size"
+                )
+            if packed_hidden_residual.shape[1] != self.M:
+                raise AIEOperatorConstraintError(
+                    "AIEAddNormFFNAddNorm: packed_hidden_residual rows must exactly match seq_len"
                 )
             return (
                 self._pack_hidden_residual(
@@ -467,6 +410,10 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
             and packed_hidden_residual.shape[0] % 2 == 0
         ):
             rows = packed_hidden_residual.shape[0] // 2
+            if rows != self.M:
+                raise AIEOperatorConstraintError(
+                    "AIEAddNormFFNAddNorm: packed_hidden_residual rows must exactly match seq_len"
+                )
             packed_hidden_residual = packed_hidden_residual.contiguous().view(
                 2, rows, packed_hidden_residual.shape[1]
             )
@@ -599,43 +546,6 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                 )
 
         return attention_output_np, residual_np
-
-    def _pad_packed_hidden_residual(
-        self,
-        packed_hidden_residual_np: np.ndarray,
-        rows: int,
-    ) -> tuple[np.ndarray, int]:
-        if packed_hidden_residual_np.size != 2 * rows * self.K:
-            existing_rows = packed_hidden_residual_np.size // (2 * self.K)
-            if (
-                packed_hidden_residual_np.size != 2 * existing_rows * self.K
-                or existing_rows < rows
-            ):
-                raise AIEOperatorConstraintError(
-                    "AIEAddNormFFNAddNorm: invalid packed_hidden_residual buffer size"
-                )
-            if existing_rows % self.M == 0:
-                return packed_hidden_residual_np, existing_rows
-        if rows % self.M == 0:
-            return packed_hidden_residual_np, rows
-
-        padded_rows = (rows + self.M - 1) // self.M * self.M
-        attention_output_np, residual_np = self._unpack_hidden_residual(
-            packed_hidden_residual_np,
-            rows,
-        )
-        attention_output_padded = np.zeros(
-            (padded_rows, self.K), dtype=packed_hidden_residual_np.dtype
-        )
-        residual_padded = np.zeros(
-            (padded_rows, self.K), dtype=packed_hidden_residual_np.dtype
-        )
-        attention_output_padded[:rows, :] = attention_output_np
-        residual_padded[:rows, :] = residual_np
-        return (
-            self._pack_hidden_residual(attention_output_padded, residual_padded),
-            padded_rows,
-        )
 
     def _pad_B(self, B_np: np.ndarray, b_col_maj: bool) -> np.ndarray:
         if b_col_maj:

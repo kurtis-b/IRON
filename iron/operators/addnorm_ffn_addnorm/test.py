@@ -13,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from iron.operators.addnorm_ffn_addnorm.topology import (
     _block3_practical_sort_key,
+    _is_block3_practical_candidate,
+    addnorm_ffn_addnorm_design,
     addnorm_ffn_addnorm_practical_topologies,
     addnorm_ffn_addnorm_theoretical_topologies,
     addnorm_ffn_addnorm_topologies,
@@ -31,20 +33,6 @@ def _count_errors(
     return int((~torch.isclose(actual, expected, rtol=rel_tol, atol=abs_tol)).sum())
 
 
-def _block3_runtime_signature(topology: dict[str, int | str]) -> tuple[int, ...]:
-    return (
-        int(topology["compile_rows"]),
-        int(topology["tile_m"]),
-        int(topology["tile_k"]),
-        int(topology["tile_n"]),
-        int(topology["down_proj_depth"]),
-        int(topology["num_aie_columns"]),
-        int(topology["parallel_seq"]),
-        int(topology["parallel_int_dim"]),
-        int(topology["gelu_stage"]),
-    )
-
-
 def generate_test_params():
     workloads = [
         (64, 768, 3072),
@@ -57,6 +45,7 @@ def generate_test_params():
     params = []
     for seq_len, hidden_size, intermediate_size in workloads:
         for topology in addnorm_ffn_addnorm_topologies(
+            seq_len=seq_len,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
         ):
@@ -150,41 +139,32 @@ def test_packed_hidden_residual_round_trips(aie_context):
         intermediate_size=3072,
         seed=11,
     )
-    padded_rows = ((64 + operator.M - 1) // operator.M) * operator.M
-    hidden_padded = np.zeros((padded_rows, 768), dtype=np.float32)
-    residual_padded = np.zeros((padded_rows, 768), dtype=np.float32)
-    hidden_padded[:64, :] = hidden_states["hidden_states"].float().numpy()
-    residual_padded[:64, :] = hidden_states["residual"].float().numpy()
+    hidden_padded = hidden_states["hidden_states"].float().numpy()
+    residual_padded = hidden_states["residual"].float().numpy()
     packed = operator._pack_hidden_residual(
         hidden_padded,
         residual_padded,
     )
-    unpacked_hidden, unpacked_residual = operator._unpack_hidden_residual(
-        packed, padded_rows
-    )
+    unpacked_hidden, unpacked_residual = operator._unpack_hidden_residual(packed, 64)
 
-    assert packed.shape == (2 * padded_rows * 768,)
-    assert unpacked_hidden.shape == (padded_rows, 768)
-    assert unpacked_residual.shape == (padded_rows, 768)
-    assert np.array_equal(
-        unpacked_hidden[:64, :],
-        hidden_padded[:64, :],
-    )
-    assert np.array_equal(
-        unpacked_residual[:64, :],
-        residual_padded[:64, :],
-    )
+    assert packed.shape == (2 * 64 * 768,)
+    assert unpacked_hidden.shape == (64, 768)
+    assert unpacked_residual.shape == (64, 768)
+    assert np.array_equal(unpacked_hidden, hidden_padded)
+    assert np.array_equal(unpacked_residual, residual_padded)
 
 
 def test_theoretical_block3_topologies_cover_supported_surface():
     for seq_len, hidden_size, intermediate_size in (
         (64, 768, 3072),
         (512, 768, 3072),
+        (64, 1024, 4096),
         (512, 1024, 4096),
+        (64, 2048, 8192),
+        (512, 2048, 8192),
     ):
         supported_ids = {
             (
-                int(topology["compile_rows"]),
                 int(topology["tile_m"]),
                 int(topology["tile_k"]),
                 int(topology["tile_n"]),
@@ -195,13 +175,13 @@ def test_theoretical_block3_topologies_cover_supported_surface():
                 int(topology["gelu_stage"]),
             )
             for topology in addnorm_ffn_addnorm_topologies(
+                seq_len=seq_len,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
             )
         }
         theoretical_ids = {
             (
-                int(topology["compile_rows"]),
                 int(topology["tile_m"]),
                 int(topology["tile_k"]),
                 int(topology["tile_n"]),
@@ -229,11 +209,11 @@ def test_theoretical_block3_topologies_include_nondefault_valid_variants():
             intermediate_size=3072,
         )
     }
-    assert "cr128_m32_k96_n64_c8_ps2_pi6_d8_g1" in topology_ids
-    assert "cr128_m32_k96_n64_c8_ps2_pi6_d8_g0" in topology_ids
-    assert "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1" in topology_ids
-    assert "cr128_m32_k192_n64_c8_ps4_pi3_d4_g1" in topology_ids
-    assert "cr128_m32_k96_n128_c8_ps2_pi6_d8_g1" in topology_ids
+    assert "m32_k96_n64_c8_ps2_pi6_d8_g1" in topology_ids
+    assert "m32_k96_n64_c8_ps2_pi6_d8_g0" in topology_ids
+    assert "m32_k96_n64_c8_ps4_pi3_d8_g1" in topology_ids
+    assert "m32_k192_n64_c8_ps4_pi3_d4_g1" in topology_ids
+    assert "m32_k96_n128_c8_ps2_pi6_d8_g1" in topology_ids
 
 
 def test_theoretical_block3_topologies_are_unique_and_contract_valid():
@@ -248,7 +228,6 @@ def test_theoretical_block3_topologies_are_unique_and_contract_valid():
     assert len(topology_ids) == len(set(topology_ids))
 
     for topology in topologies:
-        compile_rows = int(topology["compile_rows"])
         tile_m = int(topology["tile_m"])
         tile_k = int(topology["tile_k"])
         tile_n = int(topology["tile_n"])
@@ -258,15 +237,39 @@ def test_theoretical_block3_topologies_are_unique_and_contract_valid():
         parallel_int_dim = int(topology["parallel_int_dim"])
         gelu_stage = int(topology["gelu_stage"])
 
-        assert compile_rows % (parallel_seq * tile_m) == 0
+        assert 512 % (parallel_seq * tile_m) == 0
         assert 768 % tile_k == 0
-        assert down_proj_depth == 768 // tile_k
+        assert (768 // tile_k) % down_proj_depth == 0
         assert 3072 % tile_n == 0
         assert 3072 % parallel_int_dim == 0
         assert 3072 % (tile_n * parallel_int_dim) == 0
         assert 1 <= num_aie_columns <= 8
-        assert parallel_seq * (1 + 2 * parallel_int_dim) <= num_aie_columns * 4
+        assert parallel_seq * (2 + 2 * parallel_int_dim) <= num_aie_columns * 4
         assert gelu_stage in (0, 1)
+
+
+def test_default_block3_design_chooses_highest_core_runtime_topology():
+    runtime_topologies = addnorm_ffn_addnorm_topologies(
+        seq_len=512,
+        hidden_size=2048,
+        intermediate_size=8192,
+    )
+    default_2048 = addnorm_ffn_addnorm_design(
+        seq_len=512,
+        hidden_size=2048,
+        intermediate_size=8192,
+    )
+
+    expected = max(
+        runtime_topologies,
+        key=lambda topology: (
+            int(topology["parallel_seq"]) * (2 + 2 * int(topology["parallel_int_dim"])),
+            int(topology["parallel_seq"]),
+            int(topology["parallel_int_dim"]),
+        ),
+    )
+
+    assert default_2048["topology_id"] == str(expected["topology_id"])
 
 
 def test_practical_block3_topologies_are_subset_of_theoretical_surface():
@@ -286,32 +289,9 @@ def test_practical_block3_topologies_are_subset_of_theoretical_surface():
     practical_ids = [str(topology["topology_id"]) for topology in practical]
 
     assert practical
-    assert len(practical) <= 64
+    assert len(practical) <= 16
     assert len(practical) < len(theoretical_ids)
     assert set(practical_ids) <= theoretical_ids
-
-
-def test_practical_block3_topologies_include_retained_runtime_surface():
-    practical_signatures = {
-        (
-            int(topology["compile_rows"]),
-            int(topology["tile_m"]),
-            int(topology["tile_k"]),
-            int(topology["tile_n"]),
-            int(topology["down_proj_depth"]),
-            int(topology["num_aie_columns"]),
-            int(topology["parallel_seq"]),
-            int(topology["parallel_int_dim"]),
-            int(topology["gelu_stage"]),
-        )
-        for topology in addnorm_ffn_addnorm_practical_topologies(
-            seq_len=512,
-            hidden_size=768,
-            intermediate_size=3072,
-        )
-    }
-    assert (128, 32, 96, 64, 8, 8, 2, 6, 1) in practical_signatures
-    assert (128, 32, 96, 64, 8, 8, 4, 3, 1) in practical_signatures
 
 
 def test_practical_block3_topologies_keep_validated_gelu_stage():
@@ -321,52 +301,47 @@ def test_practical_block3_topologies_keep_validated_gelu_stage():
         intermediate_size=3072,
     )
     assert practical
-    assert {int(topology["gelu_stage"]) for topology in practical} == {1}
+    assert {int(topology["gelu_stage"]) for topology in practical} == {0, 1}
 
 
-def test_practical_block3_topologies_keep_validated_runtime_signature_families():
-    expected_768 = {
-        (96, 64, 8, 8, 2, 6, 1),
-        (96, 64, 8, 8, 4, 3, 1),
-    }
-    actual_768 = {
-        (
-            int(topology["tile_k"]),
-            int(topology["tile_n"]),
-            int(topology["down_proj_depth"]),
-            int(topology["num_aie_columns"]),
-            int(topology["parallel_seq"]),
-            int(topology["parallel_int_dim"]),
-            int(topology["gelu_stage"]),
+def test_practical_block3_topologies_keep_parallel_seq_buckets_when_feasible():
+    for seq_len, hidden_size, intermediate_size in (
+        (64, 768, 3072),
+        (512, 768, 3072),
+        (64, 1024, 4096),
+        (512, 1024, 4096),
+        (64, 2048, 8192),
+        (512, 2048, 8192),
+    ):
+        practical = addnorm_ffn_addnorm_practical_topologies(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
         )
-        for topology in addnorm_ffn_addnorm_practical_topologies(
-            seq_len=512,
-            hidden_size=768,
-            intermediate_size=3072,
-        )
-    }
-    expected_1024 = {
-        (128, 32, 8, 8, 4, 2, 1),
-    }
-    actual_1024 = {
-        (
-            int(topology["tile_k"]),
-            int(topology["tile_n"]),
-            int(topology["down_proj_depth"]),
-            int(topology["num_aie_columns"]),
-            int(topology["parallel_seq"]),
-            int(topology["parallel_int_dim"]),
-            int(topology["gelu_stage"]),
-        )
-        for topology in addnorm_ffn_addnorm_practical_topologies(
-            seq_len=512,
-            hidden_size=1024,
-            intermediate_size=4096,
-        )
-    }
+        counts_by_parallel_seq = {1: 0, 2: 0, 4: 0, 8: 0}
+        feasible_counts_by_parallel_seq = {1: 0, 2: 0, 4: 0, 8: 0}
 
-    assert actual_768 <= expected_768
-    assert actual_1024 <= expected_1024
+        for topology in practical:
+            counts_by_parallel_seq[int(topology["parallel_seq"])] += 1
+
+        for topology in addnorm_ffn_addnorm_theoretical_topologies(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        ):
+            if _is_block3_practical_candidate(
+                topology,
+                seq_len=seq_len,
+                hidden_size=hidden_size,
+            ):
+                ps = int(topology["parallel_seq"])
+                if ps in feasible_counts_by_parallel_seq:
+                    feasible_counts_by_parallel_seq[ps] += 1
+
+        for parallel_seq in (1, 2, 4, 8):
+            if feasible_counts_by_parallel_seq[parallel_seq] > 0:
+                assert counts_by_parallel_seq[parallel_seq] > 0
+            assert counts_by_parallel_seq[parallel_seq] <= 4
 
 
 def test_practical_block3_topologies_are_ranked_and_pruned():
@@ -377,29 +352,76 @@ def test_practical_block3_topologies_are_ranked_and_pruned():
     )
 
     assert practical == sorted(practical, key=_block3_practical_sort_key, reverse=True)
-    retained_signatures = {
-        (128, 32, 96, 64, 8, 8, 2, 6, 1),
-        (128, 32, 96, 64, 8, 8, 4, 3, 1),
-    }
+    practical_counts_by_parallel_seq = {1: 0, 2: 0, 4: 0, 8: 0}
     for topology in practical:
-        signature = (
-            int(topology["compile_rows"]),
-            int(topology["tile_m"]),
-            int(topology["tile_k"]),
-            int(topology["tile_n"]),
-            int(topology["down_proj_depth"]),
-            int(topology["num_aie_columns"]),
-            int(topology["parallel_seq"]),
-            int(topology["parallel_int_dim"]),
-            int(topology["gelu_stage"]),
+        parallel_seq = int(topology["parallel_seq"])
+        practical_counts_by_parallel_seq[parallel_seq] = (
+            practical_counts_by_parallel_seq.get(parallel_seq, 0) + 1
         )
-        if signature not in retained_signatures:
-            assert int(topology["compile_rows"]) >= 128
-            assert int(topology["tile_m"]) >= 32
-            assert int(topology["tile_k"]) >= 64
-            assert int(topology["tile_n"]) >= 32
-            assert int(topology["num_aie_columns"]) >= 4
-            assert (
-                int(topology["parallel_seq"]) * int(topology["parallel_int_dim"]) >= 8
-            )
+        assert int(topology["tile_m"]) in (16, 32, 64)
+        assert parallel_seq in (1, 2, 4, 8)
+        assert int(topology["tile_k"]) >= 16
+        assert int(topology["tile_n"]) >= 16
+        assert int(topology["num_aie_columns"]) == 8
+        assert parallel_seq * int(topology["parallel_int_dim"]) >= 8
         assert topology["topology_family"] == "pipelined_addnorm_ffn_addnorm_practical"
+    assert all(count <= 4 for count in practical_counts_by_parallel_seq.values())
+
+
+def test_practical_block3_topologies_keep_only_highest_depth_per_shape():
+    for seq_len, hidden_size, intermediate_size in (
+        (64, 768, 3072),
+        (512, 768, 3072),
+        (64, 1024, 4096),
+        (512, 1024, 4096),
+        (64, 2048, 8192),
+        (512, 2048, 8192),
+    ):
+        practical = addnorm_ffn_addnorm_practical_topologies(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        feasible_max_depth_by_shape: dict[tuple[int, ...], int] = {}
+        for topology in addnorm_ffn_addnorm_theoretical_topologies(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        ):
+            if not _is_block3_practical_candidate(
+                topology,
+                seq_len=seq_len,
+                hidden_size=hidden_size,
+            ):
+                continue
+            shape_key = (
+                int(topology["tile_m"]),
+                int(topology["tile_k"]),
+                int(topology["tile_n"]),
+                int(topology["num_aie_columns"]),
+                int(topology["parallel_seq"]),
+                int(topology["parallel_int_dim"]),
+                int(topology["gelu_stage"]),
+            )
+            feasible_max_depth_by_shape[shape_key] = max(
+                feasible_max_depth_by_shape.get(shape_key, 0),
+                int(topology["down_proj_depth"]),
+            )
+
+        seen_shapes: set[tuple[int, ...]] = set()
+        for topology in practical:
+            shape_key = (
+                int(topology["tile_m"]),
+                int(topology["tile_k"]),
+                int(topology["tile_n"]),
+                int(topology["num_aie_columns"]),
+                int(topology["parallel_seq"]),
+                int(topology["parallel_int_dim"]),
+                int(topology["gelu_stage"]),
+            )
+            assert shape_key not in seen_shapes
+            seen_shapes.add(shape_key)
+            assert (
+                int(topology["down_proj_depth"])
+                == feasible_max_depth_by_shape[shape_key]
+            )

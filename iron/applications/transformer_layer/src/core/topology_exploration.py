@@ -122,12 +122,14 @@ def practical_block_topology_catalog(
     block3_supported_ids = {
         str(candidate["topology_id"])
         for candidate in addnorm_ffn_addnorm_topologies(
+            seq_len=spec.seq_len,
             hidden_size=spec.hidden_size,
             intermediate_size=spec.intermediate_size,
         )
     }
     block3_runtime_signature_map = {
         (
+            int(candidate["tile_m"]),
             int(candidate["tile_k"]),
             int(candidate["tile_n"]),
             int(candidate["down_proj_depth"]),
@@ -140,6 +142,7 @@ def practical_block_topology_catalog(
             str(candidate["topology_family"]),
         )
         for candidate in addnorm_ffn_addnorm_topologies(
+            seq_len=spec.seq_len,
             hidden_size=spec.hidden_size,
             intermediate_size=spec.intermediate_size,
         )
@@ -262,6 +265,7 @@ def _block3_catalog_candidate(
     runtime_signature_map: dict[tuple[int, ...], tuple[str, str]],
 ) -> dict[str, object]:
     runtime_signature = (
+        int(candidate["tile_m"]),
         int(candidate["tile_k"]),
         int(candidate["tile_n"]),
         int(candidate["down_proj_depth"]),

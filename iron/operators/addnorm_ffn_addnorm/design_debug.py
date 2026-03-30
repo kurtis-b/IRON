@@ -246,34 +246,36 @@ def fused_addnorm_ffn_addnorm(
     B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
     C_ty = np.ndarray[(M * K,), np.dtype[dtype_out]]
 
-    def split_zero_stride_repeat_tap(
+    def split_runtime_fill_tap(
         tap: TensorAccessPattern,
         tensor_shape: tuple[int, ...],
-        chunk_size: int,
+        *,
+        max_dim_size: int = 64,
+        repeat_chunk_size: int | None = None,
     ) -> list[TensorAccessPattern]:
         if int(tap.strides[0]) != 0:
             return [tap]
         repeat_count = int(tap.sizes[0])
-        if repeat_count <= chunk_size:
+        if repeat_count <= max_dim_size:
             return [tap]
-        if repeat_count % chunk_size != 0:
+        chunk_size = repeat_chunk_size or max_dim_size
+        if chunk_size > max_dim_size or repeat_count % chunk_size != 0:
             raise ValueError(
                 "Cannot split repeat TAP evenly: "
                 f"repeat_count={repeat_count}, chunk_size={chunk_size}"
             )
-        chunk_taps = []
-        for _ in range(repeat_count // chunk_size):
-            sizes = [int(s) for s in tap.sizes]
-            sizes[0] = chunk_size
-            chunk_taps.append(
-                TensorAccessPattern(
-                    tensor_shape,
-                    offset=int(tap.offset),
-                    sizes=sizes,
-                    strides=[int(s) for s in tap.strides],
-                )
+        return [
+            TensorAccessPattern(
+                tensor_shape,
+                offset=int(tap.offset),
+                sizes=[
+                    chunk_size if dim == 0 else int(size)
+                    for dim, size in enumerate(tap.sizes)
+                ],
+                strides=[int(s) for s in tap.strides],
             )
-        return chunk_taps
+            for _ in range(repeat_count // chunk_size)
+        ]
 
     # Add & Norm tensor types
     ln_weights_ty = np.ndarray[(K,), np.dtype[dtype_in]]
@@ -1128,10 +1130,10 @@ def fused_addnorm_ffn_addnorm(
                     if nA_tiles_distributed < 3
                     else Tile(a_tile * 2 + 1, 0)
                 )
-                ln2_ar_fill_taps = split_zero_stride_repeat_tap(
+                ln2_ar_fill_taps = split_runtime_fill_tap(
                     ln2_ar_tile,
                     packed_hidden_residual_shape,
-                    chunk_size=packed_fill_chunk_size,
+                    repeat_chunk_size=packed_fill_chunk_size,
                 )
                 for ln2_ar_fill_tap in ln2_ar_fill_taps:
                     rt.fill(
@@ -1168,10 +1170,10 @@ def fused_addnorm_ffn_addnorm(
                     if nA_tiles_distributed < 3
                     else Tile(a_tile * 2 + 1, 0)
                 )
-                ln2_ar_fill_taps = split_zero_stride_repeat_tap(
+                ln2_ar_fill_taps = split_runtime_fill_tap(
                     ln2_ar_tile,
                     packed_hidden_residual_shape,
-                    chunk_size=packed_fill_chunk_size,
+                    repeat_chunk_size=packed_fill_chunk_size,
                 )
                 for ln2_ar_fill_tap in ln2_ar_fill_taps:
                     rt.fill(
@@ -1190,10 +1192,10 @@ def fused_addnorm_ffn_addnorm(
                     strides=[0, packed_tile_elems, k, 1],
                 )
                 place = Tile(0, 0) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 0)
-                ln1_ar_fill_taps = split_zero_stride_repeat_tap(
+                ln1_ar_fill_taps = split_runtime_fill_tap(
                     ln1_ar_tile,
                     packed_hidden_residual_shape,
-                    chunk_size=packed_fill_chunk_size,
+                    repeat_chunk_size=packed_fill_chunk_size,
                 )
                 for ln1_ar_fill_tap in ln1_ar_fill_taps:
                     rt.fill(

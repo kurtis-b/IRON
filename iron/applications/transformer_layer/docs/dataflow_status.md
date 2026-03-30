@@ -119,17 +119,36 @@ Current state:
 
 Current runtime-supported surface:
 
-- `768 / 3072`
-  - `cr128_m32_k96_n64_c8_ps2_pi6_d8_g1`
-  - `cr128_m32_k96_n64_c8_ps2_pi6_d8_g0`
-  - `cr128_m32_k96_n64_c8_ps4_pi3_d8_g1`
-  - `cr128_m32_k96_n64_c8_ps4_pi3_d8_g0`
-- `1024 / 4096`
-  - `cr128_m32_k128_n32_c8_ps4_pi2_d8_g1`
-  - `cr128_m32_k128_n32_c8_ps4_pi2_d8_g0`
-- `2048 / 8192`
-  - `cr128_m32_k64_n64_c8_ps2_pi4_d8_g1`
-  - `cr128_m32_k64_n64_c8_ps2_pi4_d8_g0`
+- the runtime catalog is now generated per workload rather than pinned only to a
+  short retained ID list
+- runtime promotion currently comes from:
+  - the established retained Block 3 thesis topologies
+  - plus broader practical Block 3 candidates that also satisfy the strict
+    current-layout runtime gate
+- that gate still reflects the current `design.py` implementation:
+  - `num_aie_columns == 8`
+  - `tile_m in {32, 64}`
+  - `tile_k >= 64`
+  - `tile_n >= 16`
+  - `down_proj_depth <= 8`
+  - placement must satisfy the current horizontal/vertical Block 3 layout
+- current exercised runtime-supported counts are:
+  - `64 x 768 x 3072`: `6`
+  - `512 x 768 x 3072`: `8`
+  - `64 x 1024 x 4096`: `4`
+  - `512 x 1024 x 4096`: `4`
+  - `64 x 2048 x 8192`: `2`
+  - `512 x 2048 x 8192`: `8`
+- `ps8` remains practical-only today; it does not yet satisfy the current
+  runtime placement/dataflow implementation
+
+Current execution contract:
+
+- Block 3 no longer exposes `compile_rows` as a topology dimension
+- the runtime requires exact sequence-length fit:
+  - `seq_len % (parallel_seq * tile_m) == 0`
+- artifacts are compiled for the concrete requested `seq_len`; the current
+  Block 3 runtime does not pad or chunk rows internally
 
 Verified today:
 
@@ -151,16 +170,20 @@ Verified today:
   matrix
 - the retained `2048 / 8192` family, including both `gelu_stage` variants,
   now also passes the numerical operator test matrix
-- the full Block 3 numerical matrix in
+- the older retained/runtime surface passed the full Block 3 numerical matrix in
   `iron/operators/addnorm_ffn_addnorm/test.py::test_addnorm_ffn_addnorm`
-  currently passes end-to-end
+- after the new runtime-catalog promotion rule, the application-side
+  topology-exploration tests again pass and the expanded Block 3 numerical
+  matrix is being re-validated against the generated runtime catalog
 
 Work left:
 
-- broaden support beyond the retained `768/3072`, `1024/4096`, and
-  `2048/8192` families
 - continue promoting additional theoretical/practical Block 3 topologies only
   after the standalone runtime proves them constructible and numerically sound
+- add real runtime placement/dataflow support for `ps8`
+- broaden runtime support below the current `tile_m in {32, 64}` and
+  `tile_k >= 64` implementation limits only after those smaller-tile shapes are
+  numerically validated
 - broaden Dataflow-level Block 2 -> Block 3 verification now that the packed
   handoff and the multi-group Block 3 runtime are both functional
 

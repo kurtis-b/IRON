@@ -225,16 +225,36 @@ in benchmark outputs.
 
 - `embedding_dim == num_heads * head_dim`
 - `parallel_seq in {1, 2, 4, 6, 8}`
-- the retained topology's internal `compile_rows` must be divisible by
-  `parallel_seq * tile_m`
+- `seq_len % (parallel_seq * tile_m) == 0`
 
 Block 3 currently resolves its retained thesis topologies through the single
 design entrypoint in
 [`iron/operators/addnorm_ffn_addnorm/design.py`](/home/cj/iron/iron/operators/addnorm_ffn_addnorm/design.py)
 and translates them into the pipelined wrapper in
 [`iron/operators/addnorm_ffn_addnorm/op.py`](/home/cj/iron/iron/operators/addnorm_ffn_addnorm/op.py).
-That design file should also be the source of the retained topology list used by
-operator-local tests and future topology selection logic.
+That design file is now paired with a workload-aware Block 3 topology layer that
+exposes:
+- a seq-len-aware runtime-supported catalog
+- a broader practical exploration catalog
+- the full theoretical surface for the current Block 3 contract
+
+The current runtime-supported Block 3 catalog is generated from:
+- the retained thesis runtime topologies
+- plus broader practical candidates that still satisfy the strict current
+  Block 3 runtime gate
+
+That runtime gate is intentionally narrower than the practical surface and
+still reflects the current `design.py` implementation:
+- `num_aie_columns == 8`
+- `tile_m in {32, 64}`
+- `tile_k >= 64`
+- `tile_n >= 16`
+- `down_proj_depth <= 8`
+- placement must satisfy the current horizontal/vertical Block 3 layout
+
+So the practical Block 3 surface may explore `ps8` and smaller tile shapes,
+but those are not runtime-supported until the actual placement/dataflow design
+can lower them.
 Study metadata emitted by the in-process Dataflow patterns should include the
 selected block topology IDs and families so retained topology choices are visible
 in benchmark outputs.
@@ -327,13 +347,15 @@ Block 3 currently validates those constraints through the single design
 entrypoint in
 [`iron/operators/addnorm_ffn_addnorm/design.py`](/home/cj/iron/iron/operators/addnorm_ffn_addnorm/design.py)
 and resolves the thesis-facing topology directly into the local pipelined
-Block 3 runtime. Shorter total `seq_len` values are still allowed because the
-runtime pads and chunks the final row blocks against the retained
-`compile_rows` capacity. The retained runtime surface currently includes:
+Block 3 runtime. The current runtime contract is exact rather than padded:
+`seq_len` must be divisible by `parallel_seq * tile_m`, and one compiled Block
+3 artifact is built for that concrete `seq_len`. The retained runtime surface
+currently includes:
 - `768/3072` with `parallel_seq=2, parallel_int_dim=6`, `gelu_stage in {0,1}`
 - `768/3072` with `parallel_seq=4, parallel_int_dim=3`, `gelu_stage in {0,1}`
 - `1024/4096` with `parallel_seq=4, parallel_int_dim=2`, `gelu_stage in {0,1}`
 - `2048/8192` with `parallel_seq=2, parallel_int_dim=4`, `gelu_stage in {0,1}`
+- `2048/8192` with `parallel_seq=4, parallel_int_dim=2`, `gelu_stage in {0,1}`
 The broader theoretical surface still enumerates other legal
 tile/lane/staging combinations, but the practical surface should stay on the
 currently validated standalone signatures until the runtime proves additional
@@ -355,8 +377,8 @@ design rather than a banked LN2 design:
   regenerates only the active group again and emits that group's output slice
 Under this contract, `parallel_seq` duplicates the whole
 `AN1 -> Up-proj -> Down-proj -> AN2` pipeline across the array. If one pipeline
-still covers multiple row tiles because `compile_rows / (parallel_seq * tile_m)
-> 1`, those row tiles are processed sequentially through the three phases
+runs over multiple row tiles because `seq_len / (parallel_seq * tile_m) > 1`,
+those row tiles are processed sequentially through the three phases
 rather than through separate LN2 stats banks. LN2 therefore owns both LN1 and
 LN2 cached row statistics locally, and the grouped runtime no longer depends on
 a down-proj-to-LN2 statistics handoff.
@@ -364,12 +386,12 @@ That design file should also expose three distinct topology views:
 - the narrow retained runtime-supported topology list used by operator tests and
   benchmark manifests
 - a broader theoretical topology enumerator that explores every combination
-  allowed by the Block 3 contract, imported FFN tiling equalities, compile-row
-  chunking choices, lane-count limit, and GeLU staging for a given workload
+  allowed by the Block 3 contract, imported FFN tiling equalities,
+  `seq_len`-fit, lane-count limit, and GeLU staging for a given workload
 - a heuristic-pruned practical exploration surface that favors higher sequence
-  and intermediate-dimension parallelism, larger compile-row chunks, larger
-  reusable tiles, and fuller array-column utilization while still retaining the
-  baseline runtime-supported study topologies
+  and intermediate-dimension parallelism, larger reusable tiles, and fuller
+  array-column utilization while still retaining the baseline runtime-supported
+  study topologies
 
 ## Reference policy
 

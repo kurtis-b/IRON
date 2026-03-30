@@ -385,12 +385,23 @@ _BLOCK3_COMPUTE_TILE_BYTES = 64 * 1024
 _BLOCK3_STACK_BYTES = 0xD00
 _BLOCK3_BF16_BYTES = 2
 _BLOCK3_F32_BYTES = 4
-_BLOCK3_PRACTICAL_MIN_TILE_M = 32
-_BLOCK3_PRACTICAL_MIN_TILE_K = 64
-_BLOCK3_PRACTICAL_MIN_TILE_N = 32
-_BLOCK3_PRACTICAL_MIN_AIE_COLUMNS = 4
+_BLOCK3_PRACTICAL_TILE_M_CHOICES = (16, 32, 64)
+_BLOCK3_PRACTICAL_MIN_TILE_K = 16
+_BLOCK3_PRACTICAL_MIN_TILE_N = 16
+_BLOCK3_PRACTICAL_MIN_AIE_COLUMNS = 8
 _BLOCK3_PRACTICAL_MIN_LANE_PARALLELISM = 8
-_BLOCK3_PRACTICAL_MAX_CANDIDATES = 64
+_BLOCK3_PRACTICAL_PARALLEL_SEQ_CHOICES = (1, 2, 4, 8)
+_BLOCK3_PRACTICAL_MAX_CANDIDATES_PER_PS = 4
+_BLOCK3_PRACTICAL_MAX_CANDIDATES = (
+    len(_BLOCK3_PRACTICAL_PARALLEL_SEQ_CHOICES)
+    * _BLOCK3_PRACTICAL_MAX_CANDIDATES_PER_PS
+)
+_BLOCK3_RUNTIME_NUM_AIE_COLUMNS = 8
+_BLOCK3_RUNTIME_TILE_M_CHOICES = (16, 32, 64)
+_BLOCK3_RUNTIME_MIN_TILE_K = 64
+_BLOCK3_RUNTIME_MIN_TILE_N = 16
+_BLOCK3_RUNTIME_MAX_CANDIDATES = 8
+_BLOCK3_RUNTIME_MAX_DOWN_PROJ_DEPTH = 8
 
 
 def addnorm_ffn_addnorm_topologies(
@@ -399,25 +410,77 @@ def addnorm_ffn_addnorm_topologies(
     hidden_size: int,
     intermediate_size: int,
 ) -> list[dict[str, int | str]]:
-    try:
-        topologies = _BLOCK3_TOPOLOGIES[(hidden_size, intermediate_size)]
-    except KeyError as exc:
-        raise ValueError(
-            "Block 3 currently supports only the retained thesis families 768/3072, 1024/4096, and 2048/8192"
-        ) from exc
+    if seq_len is None:
+        raise ValueError("Block 3 runtime topologies require seq_len")
     return [
+        dict(candidate)
+        for candidate in _addnorm_ffn_addnorm_runtime_topologies_cached(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+    ]
+
+
+@lru_cache(maxsize=None)
+def _addnorm_ffn_addnorm_runtime_topologies_cached(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> tuple[dict[str, int | str], ...]:
+    retained = list(_BLOCK3_TOPOLOGIES.get((hidden_size, intermediate_size), ()))
+    practical = addnorm_ffn_addnorm_practical_topologies(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    selected = [
+        dict(candidate)
+        for candidate in retained
+        if _block3_runtime_candidate_allowed(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            candidate=candidate,
+        )
+    ]
+    selected.extend(
+        dict(candidate)
+        for candidate in practical
+        if _block3_runtime_candidate_allowed(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            candidate=candidate,
+        )
+    )
+    deduped_selected: list[dict[str, int | str]] = []
+    seen_signatures: set[tuple[int, ...]] = set()
+    for candidate in selected:
+        signature = _block3_signature(candidate)
+        if signature in seen_signatures:
+            continue
+        deduped_selected.append(candidate)
+        seen_signatures.add(signature)
+    selected = _block3_select_runtime_candidates(
+        hidden_size=hidden_size,
+        candidates=deduped_selected,
+        limit=_BLOCK3_RUNTIME_MAX_CANDIDATES,
+    )
+    return tuple(
         {
             **candidate,
             "topology_id": _topology_id(candidate),
             "topology_family": "pipelined_addnorm_ffn_addnorm",
         }
-        for candidate in topologies
-        if _block3_runtime_feasible(
-            hidden_size=hidden_size,
-            candidate=candidate,
-            seq_len=seq_len,
+        for candidate in sorted(
+            selected,
+            key=lambda topology: _block3_runtime_sort_key(
+                hidden_size=hidden_size,
+                candidate=topology,
+            ),
+            reverse=True,
         )
-    ]
+    )
 
 
 def addnorm_ffn_addnorm_theoretical_topologies(
@@ -561,54 +624,39 @@ def _addnorm_ffn_addnorm_practical_topologies_cached(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    retained_signatures = {
-        _block3_signature(candidate)
-        for candidate in addnorm_ffn_addnorm_topologies(
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-        )
-    }
-    validated_runtime_signatures = _block3_validated_runtime_signatures(
-        seq_len=seq_len,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-    )
-
-    ranked = sorted(theoretical, key=_block3_practical_sort_key, reverse=True)
-
-    selected: list[dict[str, int | str]] = []
-    selected_ids: set[str] = set()
-
-    def add_candidate(candidate: dict[str, int | str]) -> None:
-        selected.append(
-            {
-                **candidate,
-                "topology_family": "pipelined_addnorm_ffn_addnorm_practical",
-            }
-        )
-        selected_ids.add(str(candidate["topology_id"]))
-
-    for candidate in ranked:
-        if _block3_signature(candidate) not in retained_signatures:
-            continue
-        add_candidate(candidate)
-
-    for candidate in ranked:
-        topology_id = str(candidate["topology_id"])
-        if topology_id in selected_ids:
-            continue
-        if not _is_block3_practical_candidate(
+    practical = [
+        candidate
+        for candidate in theoretical
+        if _is_block3_practical_candidate(
             candidate,
             seq_len=seq_len,
-            validated_runtime_signatures=validated_runtime_signatures,
-        ):
-            continue
-        add_candidate(candidate)
-        if len(selected) >= max_candidates:
-            break
+            hidden_size=hidden_size,
+        )
+    ]
+    practical = _block3_prune_practical_depth_variants(practical)
 
-    return tuple(sorted(selected, key=_block3_practical_sort_key, reverse=True))
+    selected: list[dict[str, int | str]] = []
+    for parallel_seq in _BLOCK3_PRACTICAL_PARALLEL_SEQ_CHOICES:
+        bucket = sorted(
+            (
+                candidate
+                for candidate in practical
+                if int(candidate["parallel_seq"]) == parallel_seq
+            ),
+            key=_block3_practical_sort_key,
+            reverse=True,
+        )
+        selected.extend(bucket[:_BLOCK3_PRACTICAL_MAX_CANDIDATES_PER_PS])
+
+    return tuple(
+        {
+            **candidate,
+            "topology_family": "pipelined_addnorm_ffn_addnorm_practical",
+        }
+        for candidate in sorted(selected, key=_block3_practical_sort_key, reverse=True)[
+            :max_candidates
+        ]
+    )
 
 
 def addnorm_ffn_addnorm_design(
@@ -764,6 +812,26 @@ def _block3_compute_tiles_fit_current_pipeline(
     tile_n: int,
     parallel_int_dim: int,
 ) -> bool:
+    return (
+        _block3_max_compute_tile_bytes_current_pipeline(
+            hidden_size=hidden_size,
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+            parallel_int_dim=parallel_int_dim,
+        )
+        <= _BLOCK3_COMPUTE_TILE_BYTES
+    )
+
+
+def _block3_max_compute_tile_bytes_current_pipeline(
+    *,
+    hidden_size: int,
+    tile_m: int,
+    tile_k: int,
+    tile_n: int,
+    parallel_int_dim: int,
+) -> int:
     # Model the mandatory resident storage for the current fused Block 3
     # pipeline assuming every eligible compute-side FIFO can drop to depth 1.
     # The memtile-staged partial-accumulation path remains fixed and therefore
@@ -797,15 +865,245 @@ def _block3_compute_tiles_fit_current_pipeline(
         + _BLOCK3_STACK_BYTES
     )
 
-    return (
-        max(
-            ln1_tile_bytes,
-            up_proj_tile_bytes,
-            down_proj_tile_bytes,
-            ln2_tile_bytes,
-        )
-        <= _BLOCK3_COMPUTE_TILE_BYTES
+    return max(
+        ln1_tile_bytes,
+        up_proj_tile_bytes,
+        down_proj_tile_bytes,
+        ln2_tile_bytes,
     )
+
+
+def _block3_runtime_candidate_allowed(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    candidate: dict[str, int | str],
+) -> bool:
+    tile_m = int(candidate["tile_m"])
+    tile_k = int(candidate["tile_k"])
+    tile_n = int(candidate["tile_n"])
+    down_proj_depth = int(candidate["down_proj_depth"])
+    if int(candidate["num_aie_columns"]) != _BLOCK3_RUNTIME_NUM_AIE_COLUMNS:
+        return False
+    if tile_m not in _BLOCK3_RUNTIME_TILE_M_CHOICES:
+        return False
+    if tile_k < _BLOCK3_RUNTIME_MIN_TILE_K:
+        return False
+    if tile_n < _BLOCK3_RUNTIME_MIN_TILE_N:
+        return False
+    if down_proj_depth > _BLOCK3_RUNTIME_MAX_DOWN_PROJ_DEPTH:
+        return False
+    if not _block3_runtime_placement_feasible(candidate):
+        return False
+    return _block3_runtime_feasible(
+        hidden_size=hidden_size,
+        candidate=candidate,
+        seq_len=seq_len,
+    )
+
+
+def _block3_runtime_placement_feasible(candidate: dict[str, int | str]) -> bool:
+    parallel_seq = int(candidate["parallel_seq"])
+    parallel_int_dim = int(candidate["parallel_int_dim"])
+    num_aie_columns = int(candidate["num_aie_columns"])
+    if parallel_seq > (num_aie_columns // 2):
+        return False
+    if parallel_seq < 3:
+        return parallel_int_dim <= num_aie_columns - 2
+    return (
+        parallel_int_dim <= _BLOCK3_AIE_ROWS_PER_COL
+        and parallel_seq <= num_aie_columns // 2
+        and (2 * parallel_seq) <= num_aie_columns
+    )
+
+
+def _block3_practical_placement_feasible(candidate: dict[str, int | str]) -> bool:
+    num_aie_columns = int(candidate["num_aie_columns"])
+    return (
+        _block3_required_core_count(
+            parallel_seq=int(candidate["parallel_seq"]),
+            parallel_int_dim=int(candidate["parallel_int_dim"]),
+        )
+        <= num_aie_columns * _BLOCK3_AIE_ROWS_PER_COL
+    )
+
+
+def _block3_prune_runtime_tile_dominated(
+    candidates: list[dict[str, int | str]],
+) -> list[dict[str, int | str]]:
+    grouped: dict[tuple[int, int, int, int, int], list[dict[str, int | str]]] = {}
+    for candidate in candidates:
+        key = (
+            int(candidate["tile_m"]),
+            int(candidate["parallel_seq"]),
+            int(candidate["parallel_int_dim"]),
+            int(candidate["down_proj_depth"]),
+            int(candidate["gelu_stage"]),
+        )
+        grouped.setdefault(key, []).append(candidate)
+
+    pruned: list[dict[str, int | str]] = []
+    for group in grouped.values():
+        for candidate in group:
+            tile_m = int(candidate["tile_m"])
+            tile_k = int(candidate["tile_k"])
+            tile_n = int(candidate["tile_n"])
+            dominated = any(
+                int(other["tile_m"]) >= tile_m
+                and int(other["tile_k"]) >= tile_k
+                and int(other["tile_n"]) >= tile_n
+                and (
+                    int(other["tile_m"]) > tile_m
+                    or int(other["tile_k"]) > tile_k
+                    or int(other["tile_n"]) > tile_n
+                )
+                for other in group
+                if other is not candidate
+            )
+            if not dominated:
+                pruned.append(candidate)
+    return pruned
+
+
+def _block3_prune_runtime_chunk_dominated(
+    candidates: list[dict[str, int | str]],
+) -> list[dict[str, int | str]]:
+    grouped: dict[tuple[int, int, int, int], list[dict[str, int | str]]] = {}
+    for candidate in candidates:
+        key = (
+            int(candidate["tile_m"]),
+            int(candidate["parallel_seq"]),
+            int(candidate["parallel_int_dim"]),
+            int(candidate["gelu_stage"]),
+        )
+        grouped.setdefault(key, []).append(candidate)
+
+    pruned: list[dict[str, int | str]] = []
+    for group in grouped.values():
+        for candidate in group:
+            sequence_chunk = int(candidate["parallel_seq"]) * int(candidate["tile_m"])
+            output_chunk = int(candidate["parallel_int_dim"]) * int(candidate["tile_n"])
+            grouped_hidden_chunk = int(candidate["down_proj_depth"]) * int(
+                candidate["tile_k"]
+            )
+            dominated = any(
+                int(other["parallel_seq"]) * int(other["tile_m"]) >= sequence_chunk
+                and int(other["parallel_int_dim"]) * int(other["tile_n"])
+                >= output_chunk
+                and int(other["down_proj_depth"]) * int(other["tile_k"])
+                >= grouped_hidden_chunk
+                and (
+                    int(other["parallel_seq"]) * int(other["tile_m"]) > sequence_chunk
+                    or int(other["parallel_int_dim"]) * int(other["tile_n"])
+                    > output_chunk
+                    or int(other["down_proj_depth"]) * int(other["tile_k"])
+                    > grouped_hidden_chunk
+                )
+                for other in group
+                if other is not candidate
+            )
+            if not dominated:
+                pruned.append(candidate)
+    return pruned
+
+
+def _block3_runtime_sort_key(
+    *,
+    hidden_size: int,
+    candidate: dict[str, int | str],
+) -> tuple[int, ...]:
+    parallel_seq = int(candidate["parallel_seq"])
+    parallel_int_dim = int(candidate["parallel_int_dim"])
+    tile_m = int(candidate["tile_m"])
+    tile_k = int(candidate["tile_k"])
+    tile_n = int(candidate["tile_n"])
+    down_proj_depth = int(candidate["down_proj_depth"])
+    gelu_stage = int(candidate["gelu_stage"])
+    core_count = _block3_required_core_count(
+        parallel_seq=parallel_seq,
+        parallel_int_dim=parallel_int_dim,
+    )
+    lane_parallelism = parallel_seq * parallel_int_dim
+    sequence_chunk = parallel_seq * tile_m
+    grouped_hidden_chunk = down_proj_depth * tile_k
+    output_chunk = parallel_int_dim * tile_n
+    max_compute_tile_bytes = _block3_max_compute_tile_bytes_current_pipeline(
+        hidden_size=hidden_size,
+        tile_m=tile_m,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        parallel_int_dim=parallel_int_dim,
+    )
+    return (
+        core_count,
+        lane_parallelism,
+        sequence_chunk,
+        tile_m,
+        grouped_hidden_chunk,
+        max_compute_tile_bytes,
+        output_chunk,
+        tile_k,
+        tile_n,
+        gelu_stage,
+    )
+
+
+def _block3_select_runtime_candidates(
+    *,
+    hidden_size: int,
+    candidates: list[dict[str, int | str]],
+    limit: int,
+) -> list[dict[str, int | str]]:
+    ranked = sorted(
+        candidates,
+        key=lambda candidate: _block3_runtime_sort_key(
+            hidden_size=hidden_size,
+            candidate=candidate,
+        ),
+        reverse=True,
+    )
+    chosen: list[dict[str, int | str]] = []
+    chosen_signatures: set[tuple[int, ...]] = set()
+    by_shape: dict[tuple[int, int, int], list[dict[str, int | str]]] = {}
+    for candidate in ranked:
+        shape_key = (
+            int(candidate["parallel_seq"]),
+            int(candidate["parallel_int_dim"]),
+            int(candidate["gelu_stage"]),
+        )
+        by_shape.setdefault(shape_key, []).append(candidate)
+
+    for shape_key in sorted(
+        by_shape,
+        key=lambda key: (
+            _block3_required_core_count(
+                parallel_seq=key[0],
+                parallel_int_dim=key[1],
+            ),
+            key[0] * key[1],
+            key[0],
+            key[1],
+            key[2],
+        ),
+        reverse=True,
+    ):
+        candidate = by_shape[shape_key][0]
+        signature = _block3_signature(candidate)
+        if signature not in chosen_signatures:
+            chosen.append(candidate)
+            chosen_signatures.add(signature)
+        if len(chosen) >= limit:
+            return chosen
+
+    for candidate in ranked:
+        signature = _block3_signature(candidate)
+        if signature in chosen_signatures:
+            continue
+        chosen.append(candidate)
+        chosen_signatures.add(signature)
+        if len(chosen) >= limit:
+            break
+    return chosen
 
 
 def _theoretical_topology_id(config: dict[str, int]) -> str:
@@ -840,11 +1138,33 @@ def _block3_signature(candidate: dict[str, int | str]) -> tuple[int, ...]:
     )
 
 
+def _block3_prune_practical_depth_variants(
+    candidates: list[dict[str, int | str]],
+) -> list[dict[str, int | str]]:
+    best_by_shape: dict[tuple[int, ...], dict[str, int | str]] = {}
+    for candidate in candidates:
+        shape_key = (
+            int(candidate["tile_m"]),
+            int(candidate["tile_k"]),
+            int(candidate["tile_n"]),
+            int(candidate["num_aie_columns"]),
+            int(candidate["parallel_seq"]),
+            int(candidate["parallel_int_dim"]),
+            int(candidate["gelu_stage"]),
+        )
+        current = best_by_shape.get(shape_key)
+        if current is None or int(candidate["down_proj_depth"]) > int(
+            current["down_proj_depth"]
+        ):
+            best_by_shape[shape_key] = candidate
+    return list(best_by_shape.values())
+
+
 def _is_block3_practical_candidate(
     candidate: dict[str, int | str],
     *,
     seq_len: int,
-    validated_runtime_signatures: set[tuple[int, ...]],
+    hidden_size: int,
 ) -> bool:
     tile_m = int(candidate["tile_m"])
     tile_k = int(candidate["tile_k"])
@@ -852,31 +1172,25 @@ def _is_block3_practical_candidate(
     num_aie_columns = int(candidate["num_aie_columns"])
     parallel_seq = int(candidate["parallel_seq"])
     parallel_int_dim = int(candidate["parallel_int_dim"])
-    down_proj_depth = int(candidate["down_proj_depth"])
-    gelu_stage = int(candidate["gelu_stage"])
 
     lane_parallelism = parallel_seq * parallel_int_dim
-    runtime_signature = (
-        tile_k,
-        tile_n,
-        down_proj_depth,
-        num_aie_columns,
-        parallel_seq,
-        parallel_int_dim,
-        gelu_stage,
-    )
     return (
-        _block3_supports_seq_len(
+        num_aie_columns >= _BLOCK3_PRACTICAL_MIN_AIE_COLUMNS
+        and _block3_supports_seq_len(
             seq_len=seq_len,
             parallel_seq=parallel_seq,
             tile_m=tile_m,
         )
-        and tile_m >= _BLOCK3_PRACTICAL_MIN_TILE_M
+        and _block3_practical_placement_feasible(candidate)
+        and _block3_runtime_feasible(
+            hidden_size=hidden_size,
+            candidate=candidate,
+            seq_len=seq_len,
+        )
+        and tile_m in _BLOCK3_PRACTICAL_TILE_M_CHOICES
         and tile_k >= _BLOCK3_PRACTICAL_MIN_TILE_K
         and tile_n >= _BLOCK3_PRACTICAL_MIN_TILE_N
-        and num_aie_columns >= _BLOCK3_PRACTICAL_MIN_AIE_COLUMNS
         and lane_parallelism >= _BLOCK3_PRACTICAL_MIN_LANE_PARALLELISM
-        and runtime_signature in validated_runtime_signatures
     )
 
 
@@ -890,41 +1204,22 @@ def _block3_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ..
     parallel_int_dim = int(candidate["parallel_int_dim"])
     gelu_stage = int(candidate["gelu_stage"])
 
+    core_count = _block3_required_core_count(
+        parallel_seq=parallel_seq,
+        parallel_int_dim=parallel_int_dim,
+    )
     lane_parallelism = parallel_seq * parallel_int_dim
     sequence_chunk = parallel_seq * tile_m
-    output_chunk = tile_n * parallel_int_dim
+    grouped_hidden_chunk = tile_k * down_proj_depth
     return (
+        core_count,
         lane_parallelism,
         num_aie_columns,
-        output_chunk,
-        tile_k,
         sequence_chunk,
+        grouped_hidden_chunk,
         tile_m,
+        tile_k,
         tile_n,
         -down_proj_depth,
         gelu_stage,
     )
-
-
-def _block3_validated_runtime_signatures(
-    *,
-    seq_len: int,
-    hidden_size: int,
-    intermediate_size: int,
-) -> set[tuple[int, ...]]:
-    return {
-        (
-            int(candidate["tile_k"]),
-            int(candidate["tile_n"]),
-            int(candidate["down_proj_depth"]),
-            int(candidate["num_aie_columns"]),
-            int(candidate["parallel_seq"]),
-            int(candidate["parallel_int_dim"]),
-            int(candidate["gelu_stage"]),
-        )
-        for candidate in addnorm_ffn_addnorm_topologies(
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-        )
-    }

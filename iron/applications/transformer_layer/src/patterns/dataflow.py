@@ -10,7 +10,9 @@ import torch.nn as nn
 
 from iron.common import AIEContext
 from iron.operators.addnorm_ffn_addnorm.op import AIEAddNormFFNAddNorm
+from iron.operators.addnorm_ffn_addnorm.topology import addnorm_ffn_addnorm_topologies
 from iron.operators.mha_out_proj.op import AIEMHAOutProj
+from iron.operators.mha_out_proj.topology import mha_out_proj_topologies
 from iron.operators.qkv_proj.op import AIEQKVProj
 
 from ..core.input_bundle import TransformerLayerInputs
@@ -44,6 +46,7 @@ class DataflowPattern(nn.Module):
         self._runtime_ready = False
         self._weights_assigned = False
         self.compile_setup_time_sec: float | None = None
+        block2_topology_id, block3_topology_id = _resolve_dataflow_topology_ids(spec)
         self.block1 = AIEQKVProj(
             seq_len=spec.seq_len,
             hidden_size=spec.hidden_size,
@@ -55,19 +58,18 @@ class DataflowPattern(nn.Module):
             seq_len=spec.seq_len,
             hidden_size=spec.hidden_size,
             intermediate_size=spec.intermediate_size,
-            topology_id=spec.block3_topology_id,
+            topology_id=block3_topology_id,
             context=self.context,
         )
         self.block2 = AIEMHAOutProj(
             num_heads=spec.num_attention_heads,
             seq_len=spec.seq_len,
             d=spec.attention_head_size,
-            topology_id=spec.block2_topology_id,
+            topology_id=block2_topology_id,
             static_weights=True,
             context=self.context,
             packed_output_parallel_seq=self.block3.parallel_seq,
-            packed_output_rows=((spec.seq_len + self.block3.M - 1) // self.block3.M)
-            * self.block3.M,
+            packed_output_rows=self.block3.M,
         )
 
     def _prepare_runtime(self) -> None:
@@ -183,3 +185,62 @@ class DataflowPattern(nn.Module):
             attention_mask=attention_mask,
         )
         return output
+
+
+def _block2_block3_packed_handoff_compatible(
+    *,
+    seq_len: int,
+    block2_candidate: dict[str, int | str],
+    block3_candidate: dict[str, int | str],
+) -> bool:
+    q_seq_tile = int(block2_candidate["q_seq_tile"])
+    parallel_seq = int(block3_candidate["parallel_seq"])
+    if seq_len % q_seq_tile != 0:
+        return False
+    return ((seq_len // q_seq_tile) % parallel_seq) == 0
+
+
+def _resolve_dataflow_topology_ids(
+    spec: TransformerLayerSpec,
+) -> tuple[str | None, str | None]:
+    block2_candidates = tuple(
+        candidate
+        for candidate in mha_out_proj_topologies(
+            num_heads=spec.num_attention_heads,
+            head_dim=spec.attention_head_size,
+        )
+        if spec.block2_topology_id is None
+        or str(candidate["topology_id"]) == spec.block2_topology_id
+    )
+    block3_candidates = tuple(
+        candidate
+        for candidate in addnorm_ffn_addnorm_topologies(
+            seq_len=spec.seq_len,
+            hidden_size=spec.hidden_size,
+            intermediate_size=spec.intermediate_size,
+        )
+        if spec.block3_topology_id is None
+        or str(candidate["topology_id"]) == spec.block3_topology_id
+    )
+    if not block2_candidates:
+        raise ValueError(
+            f"Unknown Block 2 topology_id={spec.block2_topology_id!r} for dataflow pattern"
+        )
+    if not block3_candidates:
+        raise ValueError(
+            f"Unknown Block 3 topology_id={spec.block3_topology_id!r} for dataflow pattern"
+        )
+    for block3_candidate in block3_candidates:
+        for block2_candidate in block2_candidates:
+            if _block2_block3_packed_handoff_compatible(
+                seq_len=spec.seq_len,
+                block2_candidate=block2_candidate,
+                block3_candidate=block3_candidate,
+            ):
+                return (
+                    str(block2_candidate["topology_id"]),
+                    str(block3_candidate["topology_id"]),
+                )
+    raise ValueError(
+        "No compatible Block 2 / Block 3 topology pair exists for the packed dataflow handoff"
+    )
