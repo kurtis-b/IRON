@@ -34,12 +34,15 @@ Current runtime-supported surface:
   - `12 x 64`
   - `16 x 64`
 - runtime support is `seq_len`-aware
-- for the currently exercised retained workloads, the runtime-supported surface
-  equals the practical surface:
-  - `seq_len=64, hidden=768, heads=12`: `64` topologies
-  - `seq_len=512, hidden=768, heads=12`: `64` topologies
-  - `seq_len=64, hidden=1024, heads=16`: `64` topologies
-  - `seq_len=512, hidden=1024, heads=16`: `64` topologies
+- the current local lowering only runtime-supports the tile/column part of the
+  topology surface; the thesis-facing parallel axes remain fixed to
+  `parallel_seq=1`, `parallel_heads=1`, and `parallel_head_dim=1`
+- for the currently exercised retained workloads, that runtime-supported
+  surface is:
+  - `seq_len=64, hidden=768, heads=12`: `5` topologies
+  - `seq_len=512, hidden=768, heads=12`: `5` topologies
+  - `seq_len=64, hidden=1024, heads=16`: `5` topologies
+  - `seq_len=512, hidden=1024, heads=16`: `5` topologies
 
 Verified today:
 
@@ -52,6 +55,8 @@ Work left:
   - `parallel_seq`
   - `parallel_heads`
   - `parallel_head_dim`
+- only promote broader Block 1 runtime topologies after those axes are lowered
+  for real; until then keep them in the practical/theoretical catalogs only
 - if wider thesis families are needed, generalize beyond the retained `12 x 64`
   and `16 x 64` families
 - if a staged Block 1 pipeline is desired, introduce real internal worker

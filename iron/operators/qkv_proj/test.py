@@ -41,7 +41,7 @@ def generate_test_params():
     ]
     params = []
     for seq_len, num_heads, head_dim in workloads:
-        for topology in _block1_practical_topologies(
+        for topology in qkv_proj_topologies(
             seq_len=seq_len,
             hidden_size=num_heads * head_dim,
             num_heads=num_heads,
@@ -137,7 +137,7 @@ def test_theoretical_block1_topologies_cover_supported_surface():
         assert supported_ids <= theoretical_ids
 
 
-def test_runtime_block1_topologies_match_practical_surface():
+def test_runtime_block1_topologies_are_subset_of_practical_surface():
     for seq_len, hidden_size, num_heads in (
         (64, 768, 12),
         (512, 768, 12),
@@ -160,7 +160,26 @@ def test_runtime_block1_topologies_match_practical_surface():
                 num_heads=num_heads,
             )
         }
-        assert runtime_ids == practical_ids
+        assert runtime_ids <= practical_ids
+
+
+def test_runtime_block1_topologies_pin_thesis_parallel_axes_to_one():
+    for seq_len, hidden_size, num_heads in (
+        (64, 768, 12),
+        (512, 768, 12),
+        (64, 1024, 16),
+        (512, 1024, 16),
+    ):
+        runtime_topologies = qkv_proj_topologies(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+        )
+        assert runtime_topologies
+        for topology in runtime_topologies:
+            assert int(topology["parallel_seq"]) == 1
+            assert int(topology["parallel_heads"]) == 1
+            assert int(topology["parallel_head_dim"]) == 1
 
 
 def test_supported_block1_topologies_include_practical_runtime_variants():
@@ -181,8 +200,8 @@ def test_supported_block1_topologies_include_practical_runtime_variants():
         )
     }
 
-    assert "m32_k256_n24_c8_ps2_ph1_pd4" in topology_ids_768
-    assert "m32_k256_n24_c8_ps1_ph8_pd1" in topology_ids_1024
+    assert "m32_k256_n24_c8_ps1_ph1_pd1" in topology_ids_768
+    assert "m32_k256_n16_c8_ps1_ph1_pd1" in topology_ids_1024
 
 
 def test_block1_design_accepts_canonical_runtime_topology_ids():

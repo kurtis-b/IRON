@@ -99,14 +99,13 @@ and lowers them through the local standalone fused Block 1 design used by
 The retained `v2` implementation parallelizes the three independent Q/K/V
 projections as one wider GEMM and then reshapes the combined output back to
 head-major `q/k/v` tensors on the wrapper surface. The current Block 1
-runtime-supported surface is now workload-aware and admits the full practical
-fused candidate set for a given `seq_len`, including the validated
-`tile_k`/`tile_n`/array-column variations already exercised by the local fused
-lowering. The thesis-facing `parallel_seq`, `parallel_heads`, and
-`parallel_head_dim` fields are now accepted across that runtime-supported
-surface as validated topology parameters, but the current local lowering still
-materializes a single fused GEMM dispatch rather than distinct lane-level worker
-splits for those axes.
+runtime-supported surface is workload-aware, but only over the tile/array part
+of the topology space already exercised by the local fused lowering. The
+thesis-facing `parallel_seq`, `parallel_heads`, and `parallel_head_dim` fields
+remain practical/theoretical exploration parameters for now; the current
+runtime-supported Block 1 surface pins them to `1` and still materializes a
+single fused GEMM dispatch rather than distinct lane-level worker splits for
+those axes.
 That design file should expose three distinct topology views:
 - a seq-len-aware runtime-supported topology list used by operator tests and the
   workload-specific runtime-selection path

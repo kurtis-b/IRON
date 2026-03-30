@@ -291,12 +291,16 @@ def _block1_runtime_supported_candidates(
     seen_ids: set[str] = set()
     for candidate in practical:
         topology_id = _theoretical_topology_id(candidate)
+        if not _block1_runtime_candidate_allowed(candidate):
+            continue
         if topology_id not in preferred_ids:
             continue
         ordered.append(candidate)
         seen_ids.add(topology_id)
     for candidate in practical:
         topology_id = _theoretical_topology_id(candidate)
+        if not _block1_runtime_candidate_allowed(candidate):
+            continue
         if topology_id in seen_ids:
             continue
         ordered.append(candidate)
@@ -502,6 +506,14 @@ def _is_block1_practical_candidate(candidate: dict[str, int | str]) -> bool:
         and tile_k >= _BLOCK1_PRACTICAL_MIN_TILE_K
         and tile_n >= _BLOCK1_PRACTICAL_MIN_TILE_N
         and num_aie_columns >= _BLOCK1_PRACTICAL_MIN_AIE_COLUMNS
+    )
+
+
+def _block1_runtime_candidate_allowed(candidate: dict[str, int | str]) -> bool:
+    return (
+        int(candidate["parallel_seq"]) == 1
+        and int(candidate["parallel_heads"]) == 1
+        and int(candidate["parallel_head_dim"]) == 1
     )
 
 
