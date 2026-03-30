@@ -12,7 +12,6 @@ from itertools import product
 _BLOCK3_TOPOLOGIES = {
     (768, 3072): [
         {
-            "compile_rows": 128,
             "tile_m": 32,
             "tile_k": 96,
             "tile_n": 64,
@@ -23,7 +22,6 @@ _BLOCK3_TOPOLOGIES = {
             "gelu_stage": 1,
         },
         {
-            "compile_rows": 128,
             "tile_m": 32,
             "tile_k": 96,
             "tile_n": 64,
@@ -34,7 +32,46 @@ _BLOCK3_TOPOLOGIES = {
             "gelu_stage": 0,
         },
         {
-            "compile_rows": 128,
+            "tile_m": 64,
+            "tile_k": 96,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 6,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 64,
+            "tile_k": 96,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 6,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 128,
+            "tile_k": 96,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 6,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 128,
+            "tile_k": 96,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 6,
+            "gelu_stage": 0,
+        },
+        {
             "tile_m": 32,
             "tile_k": 96,
             "tile_n": 64,
@@ -45,8 +82,47 @@ _BLOCK3_TOPOLOGIES = {
             "gelu_stage": 1,
         },
         {
-            "compile_rows": 128,
             "tile_m": 32,
+            "tile_k": 96,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 3,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 64,
+            "tile_k": 96,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 3,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 64,
+            "tile_k": 96,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 3,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 128,
+            "tile_k": 96,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 3,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 128,
             "tile_k": 96,
             "tile_n": 64,
             "down_proj_depth": 8,
@@ -58,7 +134,6 @@ _BLOCK3_TOPOLOGIES = {
     ],
     (1024, 4096): [
         {
-            "compile_rows": 128,
             "tile_m": 32,
             "tile_k": 128,
             "tile_n": 32,
@@ -69,7 +144,6 @@ _BLOCK3_TOPOLOGIES = {
             "gelu_stage": 1,
         },
         {
-            "compile_rows": 128,
             "tile_m": 32,
             "tile_k": 128,
             "tile_n": 32,
@@ -79,10 +153,109 @@ _BLOCK3_TOPOLOGIES = {
             "parallel_int_dim": 2,
             "gelu_stage": 0,
         },
+        {
+            "tile_m": 64,
+            "tile_k": 128,
+            "tile_n": 32,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 2,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 64,
+            "tile_k": 128,
+            "tile_n": 32,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 2,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 128,
+            "tile_k": 128,
+            "tile_n": 32,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 2,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 128,
+            "tile_k": 128,
+            "tile_n": 32,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 2,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 128,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 128,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 64,
+            "tile_k": 128,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 64,
+            "tile_k": 128,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 128,
+            "tile_k": 128,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 128,
+            "tile_k": 128,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 0,
+        },
     ],
     (2048, 8192): [
         {
-            "compile_rows": 128,
             "tile_m": 32,
             "tile_k": 64,
             "tile_n": 64,
@@ -93,7 +266,6 @@ _BLOCK3_TOPOLOGIES = {
             "gelu_stage": 1,
         },
         {
-            "compile_rows": 128,
             "tile_m": 32,
             "tile_k": 64,
             "tile_n": 64,
@@ -101,6 +273,106 @@ _BLOCK3_TOPOLOGIES = {
             "num_aie_columns": 8,
             "parallel_seq": 2,
             "parallel_int_dim": 4,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 128,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 128,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_int_dim": 4,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 2,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 2,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 2,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 2,
+            "gelu_stage": 0,
+        },
+        {
+            "tile_m": 128,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 2,
+            "gelu_stage": 1,
+        },
+        {
+            "tile_m": 128,
+            "tile_k": 64,
+            "tile_n": 64,
+            "down_proj_depth": 8,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_int_dim": 2,
             "gelu_stage": 0,
         },
     ],
@@ -109,8 +381,10 @@ _BLOCK3_TOPOLOGIES = {
 _BLOCK3_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
 _BLOCK3_AIE_ROWS_PER_COL = 4
 _BLOCK3_AIE_COLUMNS = 8
-_BLOCK3_MIN_COMPILE_ROWS = 128
-_BLOCK3_PRACTICAL_MIN_COMPILE_ROWS = 128
+_BLOCK3_COMPUTE_TILE_BYTES = 64 * 1024
+_BLOCK3_STACK_BYTES = 0xD00
+_BLOCK3_BF16_BYTES = 2
+_BLOCK3_F32_BYTES = 4
 _BLOCK3_PRACTICAL_MIN_TILE_M = 32
 _BLOCK3_PRACTICAL_MIN_TILE_K = 64
 _BLOCK3_PRACTICAL_MIN_TILE_N = 32
@@ -121,6 +395,7 @@ _BLOCK3_PRACTICAL_MAX_CANDIDATES = 64
 
 def addnorm_ffn_addnorm_topologies(
     *,
+    seq_len: int | None = None,
     hidden_size: int,
     intermediate_size: int,
 ) -> list[dict[str, int | str]]:
@@ -137,6 +412,11 @@ def addnorm_ffn_addnorm_topologies(
             "topology_family": "pipelined_addnorm_ffn_addnorm",
         }
         for candidate in topologies
+        if _block3_runtime_feasible(
+            hidden_size=hidden_size,
+            candidate=candidate,
+            seq_len=seq_len,
+        )
     ]
 
 
@@ -182,7 +462,7 @@ def _addnorm_ffn_addnorm_theoretical_topologies_cached(
     ) in product(
         _BLOCK3_PARALLEL_SEQ_CHOICES,
         _divisors(intermediate_size),
-        _divisors(_block3_compile_row_limit(seq_len)),
+        _divisors(seq_len),
         _divisors(hidden_size),
         _divisors(intermediate_size),
         range(1, _BLOCK3_AIE_COLUMNS + 1),
@@ -193,6 +473,12 @@ def _addnorm_ffn_addnorm_theoretical_topologies_cached(
         if tile_k % 8 != 0:
             continue
         if tile_n % 8 != 0:
+            continue
+        if not _block3_supports_seq_len(
+            seq_len=seq_len,
+            parallel_seq=parallel_seq,
+            tile_m=tile_m,
+        ):
             continue
         if intermediate_size % parallel_int_dim != 0:
             continue
@@ -206,7 +492,10 @@ def _addnorm_ffn_addnorm_theoretical_topologies_cached(
             continue
 
         if (
-            parallel_seq * (1 + 2 * parallel_int_dim)
+            _block3_required_core_count(
+                parallel_seq=parallel_seq,
+                parallel_int_dim=parallel_int_dim,
+            )
             > num_aie_columns * _BLOCK3_AIE_ROWS_PER_COL
         ):
             continue
@@ -217,29 +506,23 @@ def _addnorm_ffn_addnorm_theoretical_topologies_cached(
             if k_tiles % down_proj_depth != 0:
                 continue
 
-            for compile_rows in _block3_compile_row_candidates(
-                seq_len=seq_len,
-                parallel_seq=parallel_seq,
-                tile_m=tile_m,
-            ):
-                candidate = {
-                    "compile_rows": compile_rows,
-                    "tile_m": tile_m,
-                    "tile_k": tile_k,
-                    "tile_n": tile_n,
-                    "down_proj_depth": down_proj_depth,
-                    "num_aie_columns": num_aie_columns,
-                    "parallel_seq": parallel_seq,
-                    "parallel_int_dim": parallel_int_dim,
-                    "gelu_stage": gelu_stage,
+            candidate = {
+                "tile_m": tile_m,
+                "tile_k": tile_k,
+                "tile_n": tile_n,
+                "down_proj_depth": down_proj_depth,
+                "num_aie_columns": num_aie_columns,
+                "parallel_seq": parallel_seq,
+                "parallel_int_dim": parallel_int_dim,
+                "gelu_stage": gelu_stage,
+            }
+            topologies.append(
+                {
+                    **candidate,
+                    "topology_id": _theoretical_topology_id(candidate),
+                    "topology_family": "pipelined_addnorm_ffn_addnorm_theoretical",
                 }
-                topologies.append(
-                    {
-                        **candidate,
-                        "topology_id": _theoretical_topology_id(candidate),
-                        "topology_family": "pipelined_addnorm_ffn_addnorm_theoretical",
-                    }
-                )
+            )
 
     return tuple(topologies)
 
@@ -281,11 +564,13 @@ def _addnorm_ffn_addnorm_practical_topologies_cached(
     retained_signatures = {
         _block3_signature(candidate)
         for candidate in addnorm_ffn_addnorm_topologies(
+            seq_len=seq_len,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
         )
     }
     validated_runtime_signatures = _block3_validated_runtime_signatures(
+        seq_len=seq_len,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
@@ -334,14 +619,23 @@ def addnorm_ffn_addnorm_design(
     topology_id: str | None = None,
 ) -> dict[str, int | str]:
     topologies = addnorm_ffn_addnorm_topologies(
+        seq_len=seq_len,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
+    if not topologies:
+        raise ValueError(
+            f"No Block 3 runtime topology supports seq_len={seq_len} for {hidden_size}/{intermediate_size}"
+        )
 
     if topology_id is None:
         config = max(
             topologies,
             key=lambda topology: (
+                _block3_required_core_count(
+                    parallel_seq=int(topology["parallel_seq"]),
+                    parallel_int_dim=int(topology["parallel_int_dim"]),
+                ),
                 int(topology["parallel_seq"]),
                 int(topology["parallel_int_dim"]),
             ),
@@ -358,7 +652,6 @@ def addnorm_ffn_addnorm_design(
                 f"Unknown Block 3 topology_id={topology_id!r} for {hidden_size}/{intermediate_size}"
             ) from exc
 
-    compile_rows = int(config["compile_rows"])
     tile_m = int(config["tile_m"])
     tile_k = int(config["tile_k"])
     tile_n = int(config["tile_n"])
@@ -372,10 +665,12 @@ def addnorm_ffn_addnorm_design(
         raise ValueError("Block 3 requires seq_len > 0")
     if parallel_seq not in (1, 2, 4, 6, 8):
         raise ValueError("Block 3 requires parallel_seq in {1, 2, 4, 6, 8}")
-    if compile_rows <= 0 or compile_rows % (parallel_seq * tile_m) != 0:
-        raise ValueError(
-            "Block 3 requires compile_rows divisible by parallel_seq * tile_m"
-        )
+    if not _block3_supports_seq_len(
+        seq_len=seq_len,
+        parallel_seq=parallel_seq,
+        tile_m=tile_m,
+    ):
+        raise ValueError("Block 3 requires seq_len divisible by parallel_seq * tile_m")
     if hidden_size <= 0 or hidden_size % tile_k != 0:
         raise ValueError("Block 3 requires hidden_size divisible by tile_k")
     if intermediate_size <= 0 or intermediate_size % tile_n != 0:
@@ -394,7 +689,13 @@ def addnorm_ffn_addnorm_design(
         raise ValueError("Block 3 requires gelu_stage to be 0 or 1")
     if not 1 <= num_aie_columns <= 8:
         raise ValueError("Block 3 requires 1 <= num_aie_columns <= 8")
-    if parallel_seq * (1 + 2 * parallel_int_dim) > num_aie_columns * 4:
+    if (
+        _block3_required_core_count(
+            parallel_seq=parallel_seq,
+            parallel_int_dim=parallel_int_dim,
+        )
+        > num_aie_columns * 4
+    ):
         raise ValueError(
             "Block 3 topology requires more cores than the selected array columns provide"
         )
@@ -414,9 +715,102 @@ def _topology_id(config: dict[str, int]) -> str:
     )
 
 
+def _block3_required_core_count(*, parallel_seq: int, parallel_int_dim: int) -> int:
+    return parallel_seq * (2 + 2 * parallel_int_dim)
+
+
+def _block3_supports_seq_len(
+    *,
+    seq_len: int,
+    parallel_seq: int,
+    tile_m: int,
+) -> bool:
+    return seq_len > 0 and seq_len % (parallel_seq * tile_m) == 0
+
+
+def _block3_runtime_feasible(
+    *,
+    hidden_size: int,
+    candidate: dict[str, int | str],
+    seq_len: int | None,
+) -> bool:
+    tile_m = int(candidate["tile_m"])
+    tile_k = int(candidate["tile_k"])
+    tile_n = int(candidate["tile_n"])
+    parallel_seq = int(candidate["parallel_seq"])
+    parallel_int_dim = int(candidate["parallel_int_dim"])
+
+    if seq_len is not None and not _block3_supports_seq_len(
+        seq_len=seq_len,
+        parallel_seq=parallel_seq,
+        tile_m=tile_m,
+    ):
+        return False
+
+    return _block3_compute_tiles_fit_current_pipeline(
+        hidden_size=hidden_size,
+        tile_m=tile_m,
+        tile_k=tile_k,
+        tile_n=tile_n,
+        parallel_int_dim=parallel_int_dim,
+    )
+
+
+def _block3_compute_tiles_fit_current_pipeline(
+    *,
+    hidden_size: int,
+    tile_m: int,
+    tile_k: int,
+    tile_n: int,
+    parallel_int_dim: int,
+) -> bool:
+    # Model the mandatory resident storage for the current fused Block 3
+    # pipeline assuming every eligible compute-side FIFO can drop to depth 1.
+    # The memtile-staged partial-accumulation path remains fixed and therefore
+    # still contributes one input and one output A-tile buffer on down-proj.
+    a_bytes = tile_m * tile_k * _BLOCK3_BF16_BYTES
+    ar_bytes = 2 * a_bytes
+    b_up_bytes = tile_k * tile_n * _BLOCK3_BF16_BYTES
+    b_down_bytes = tile_n * tile_k * _BLOCK3_BF16_BYTES
+    c_up_bytes = tile_m * tile_n * _BLOCK3_BF16_BYTES
+    ln_weight_bytes = hidden_size * _BLOCK3_BF16_BYTES
+    stats_bytes = tile_m * _BLOCK3_F32_BYTES
+
+    ln1_tile_bytes = (
+        ar_bytes + a_bytes + ln_weight_bytes + 2 * stats_bytes + _BLOCK3_STACK_BYTES
+    )
+    up_proj_tile_bytes = a_bytes + b_up_bytes + c_up_bytes + _BLOCK3_STACK_BYTES
+    down_proj_tile_bytes = (
+        c_up_bytes
+        + b_down_bytes
+        + (2 * a_bytes)  # mandatory staged partial tiles via the memtile path
+        + a_bytes  # current reduction/output stream
+        + (a_bytes if parallel_int_dim > 1 else 0)  # previous reduction input
+        + _BLOCK3_STACK_BYTES
+    )
+    ln2_tile_bytes = (
+        ar_bytes
+        + a_bytes  # stage1 scratch
+        + a_bytes  # final output FIFO object
+        + 2 * ln_weight_bytes
+        + 4 * stats_bytes
+        + _BLOCK3_STACK_BYTES
+    )
+
+    return (
+        max(
+            ln1_tile_bytes,
+            up_proj_tile_bytes,
+            down_proj_tile_bytes,
+            ln2_tile_bytes,
+        )
+        <= _BLOCK3_COMPUTE_TILE_BYTES
+    )
+
+
 def _theoretical_topology_id(config: dict[str, int]) -> str:
     return (
-        f"cr{config['compile_rows']}_m{config['tile_m']}_k{config['tile_k']}"
+        f"m{config['tile_m']}_k{config['tile_k']}"
         f"_n{config['tile_n']}_c{config['num_aie_columns']}"
         f"_ps{config['parallel_seq']}_pi{config['parallel_int_dim']}"
         f"_d{config['down_proj_depth']}_g{config['gelu_stage']}"
@@ -433,30 +827,8 @@ def _divisors(value: int) -> tuple[int, ...]:
     return tuple(sorted(divisors))
 
 
-def _next_multiple(value: int, factor: int) -> int:
-    return ((value + factor - 1) // factor) * factor
-
-
-def _block3_compile_row_limit(seq_len: int) -> int:
-    return max(_BLOCK3_MIN_COMPILE_ROWS, seq_len)
-
-
-def _block3_compile_row_candidates(
-    *,
-    seq_len: int,
-    parallel_seq: int,
-    tile_m: int,
-) -> tuple[int, ...]:
-    base_rows = parallel_seq * tile_m
-    if base_rows <= 0:
-        return tuple()
-    limit = _next_multiple(_block3_compile_row_limit(seq_len), base_rows)
-    return tuple(range(base_rows, limit + 1, base_rows))
-
-
 def _block3_signature(candidate: dict[str, int | str]) -> tuple[int, ...]:
     return (
-        int(candidate["compile_rows"]),
         int(candidate["tile_m"]),
         int(candidate["tile_k"]),
         int(candidate["tile_n"]),
@@ -474,7 +846,6 @@ def _is_block3_practical_candidate(
     seq_len: int,
     validated_runtime_signatures: set[tuple[int, ...]],
 ) -> bool:
-    compile_rows = int(candidate["compile_rows"])
     tile_m = int(candidate["tile_m"])
     tile_k = int(candidate["tile_k"])
     tile_n = int(candidate["tile_n"])
@@ -495,8 +866,11 @@ def _is_block3_practical_candidate(
         gelu_stage,
     )
     return (
-        compile_rows >= _BLOCK3_PRACTICAL_MIN_COMPILE_ROWS
-        and compile_rows <= _block3_compile_row_limit(seq_len)
+        _block3_supports_seq_len(
+            seq_len=seq_len,
+            parallel_seq=parallel_seq,
+            tile_m=tile_m,
+        )
         and tile_m >= _BLOCK3_PRACTICAL_MIN_TILE_M
         and tile_k >= _BLOCK3_PRACTICAL_MIN_TILE_K
         and tile_n >= _BLOCK3_PRACTICAL_MIN_TILE_N
@@ -507,7 +881,6 @@ def _is_block3_practical_candidate(
 
 
 def _block3_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ...]:
-    compile_rows = int(candidate["compile_rows"])
     tile_m = int(candidate["tile_m"])
     tile_k = int(candidate["tile_k"])
     tile_n = int(candidate["tile_n"])
@@ -525,8 +898,8 @@ def _block3_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ..
         num_aie_columns,
         output_chunk,
         tile_k,
-        compile_rows,
         sequence_chunk,
+        tile_m,
         tile_n,
         -down_proj_depth,
         gelu_stage,
@@ -535,6 +908,7 @@ def _block3_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ..
 
 def _block3_validated_runtime_signatures(
     *,
+    seq_len: int,
     hidden_size: int,
     intermediate_size: int,
 ) -> set[tuple[int, ...]]:
@@ -549,6 +923,7 @@ def _block3_validated_runtime_signatures(
             int(candidate["gelu_stage"]),
         )
         for candidate in addnorm_ffn_addnorm_topologies(
+            seq_len=seq_len,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
         )

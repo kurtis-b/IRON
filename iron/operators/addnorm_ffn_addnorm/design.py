@@ -110,10 +110,6 @@ def fused_addnorm_ffn_addnorm(
         * n_col_groups
         * n_grouped_ffn_sweeps
     )
-    if ln_iters_per_core > 2:
-        raise ValueError(
-            "Block 3 grouped runtime currently supports ln_iters_per_core up to 2"
-        )
 
     assert np.issubdtype(dtype_in, np.integer) == np.issubdtype(
         dtype_out, np.integer
@@ -208,10 +204,8 @@ def fused_addnorm_ffn_addnorm(
     assert k % s == 0
     assert n % t == 0
 
-    # If you get errors during CDO generation due to running out of program
-    # memory, it may be because too much code is generated due to ObjectFIFO
-    # loop unrollings. Reducing the depth to 1 here will work around that at
-    # a big performance cost.
+    # Base FIFO depth. Individual compute-tile FIFOs may be reduced to depth 1
+    # when their object size would otherwise overrun compute-tile memory.
     fifo_depth = 2
 
     if dev == "npu":
@@ -270,11 +264,32 @@ def fused_addnorm_ffn_addnorm(
     C_up_proj_l1_ty = np.ndarray[(m, n), np.dtype[dtype_in]]
     sum_l1_ty = np.ndarray[(m,), np.dtype[str_to_dtype("f32")]]
 
+    dtype_in_bytes = np.dtype(dtype_in).itemsize
+    dtype_out_bytes = np.dtype(dtype_out).itemsize
+
+    ar_l1_bytes = 2 * m * k * dtype_in_bytes
+    a_l1_bytes = m * k * dtype_in_bytes
+    b_up_l1_bytes = k * n * dtype_in_bytes
+    b_down_l1_bytes = n * k * dtype_in_bytes
+    c_up_l1_bytes = m * n * dtype_in_bytes
+
+    def compute_tile_fifo_depth(object_bytes: int) -> int:
+        # Depth-2 double buffering is fine for smaller tiles, but larger tiles
+        # can overflow the 64 KiB compute-tile memory once local buffers are
+        # included. Keep the memtile-staged partial-accumulation path separate.
+        return 1 if object_bytes * fifo_depth >= 16 * 1024 else fifo_depth
+
+    fifo_depth_ar_compute = compute_tile_fifo_depth(ar_l1_bytes)
+    fifo_depth_a_compute = compute_tile_fifo_depth(a_l1_bytes)
+    fifo_depth_b_up_compute = compute_tile_fifo_depth(b_up_l1_bytes)
+    fifo_depth_b_down_compute = compute_tile_fifo_depth(b_down_l1_bytes)
+    fifo_depth_c_up_compute = compute_tile_fifo_depth(c_up_l1_bytes)
+
     # AIE Core Function declarations
     archive_name = f"ffn_{m}x{k}x{n}_archive.a" if archive is None else archive
     # No need to use separate buffers for accumulation and transfer to L2, so
     # we only need the zero and matmul kernels
-    fifo_depth_out = fifo_depth
+    fifo_depth_out = fifo_depth_a_compute
     # Up projection
     matmul_func_name = f"ffn_matmul_{dtype_in_str}_{dtype_out_str}"
     ffn_zero_kernel_up_proj = Kernel(
@@ -433,6 +448,7 @@ def fused_addnorm_ffn_addnorm(
             .forward(
                 obj_type=AR_l1_ty,
                 name=f"AR_ln1_L2L1_{a_tile}",
+                depth=fifo_depth_ar_compute,
                 dims_to_stream=dims_to_stream_ar,
                 placement=(
                     Tile(0, 1) if nA_tiles_distributed < 3 else Tile(a_tile * 2, 1)
@@ -450,6 +466,7 @@ def fused_addnorm_ffn_addnorm(
             .forward(
                 obj_type=AR_l1_ty,
                 name=f"AR_ln2_L2L1_{a_tile}",
+                depth=fifo_depth_ar_compute,
                 dims_to_stream=dims_to_stream_ar,
                 placement=(
                     Tile(nB_tiles_distributed + 1, 1)
@@ -471,6 +488,7 @@ def fused_addnorm_ffn_addnorm(
             .forward(
                 obj_type=B_up_proj_l1_ty,
                 name=f"B_up_L2L1_{b_tile}",
+                depth=fifo_depth_b_up_compute,
                 dims_to_stream=dims_to_stream,
                 placement=(
                     Tile((b_tile + 2) % n_aie_cols, 1)
@@ -499,6 +517,7 @@ def fused_addnorm_ffn_addnorm(
             .forward(
                 obj_type=B_down_proj_l1_ty,
                 name=f"B_down_L2L1_{b_tile}",
+                depth=fifo_depth_b_down_compute,
                 dims_to_stream=dims_to_stream,
                 placement=(
                     Tile((b_tile + 2) % n_aie_cols, 1)
@@ -521,7 +540,7 @@ def fused_addnorm_ffn_addnorm(
         ln1_stage_l1l1_fifos[a_tile] = ObjectFifo(
             A_l1_ty,
             name=f"ln1_stage_L1L1_{a_tile}",
-            depth=fifo_depth,
+            depth=fifo_depth_a_compute,
         )
 
     for a_tile in range(nA_tiles_distributed):
@@ -529,7 +548,7 @@ def fused_addnorm_ffn_addnorm(
             C_up_proj_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
                 C_up_proj_l1_ty,
                 name=f"C_up_L1L1_{a_tile}_{b_tile}",
-                depth=fifo_depth,
+                depth=fifo_depth_c_up_compute,
             )
 
     # Down proj partial C
@@ -568,7 +587,7 @@ def fused_addnorm_ffn_addnorm(
             C_down_proj_reduce_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
                 A_l1_ty,
                 name=f"C_down_L1L1_{a_tile}_{b_tile}",
-                depth=fifo_depth,
+                depth=fifo_depth_a_compute,
             )
 
     # Down proj output C, m-by-k tiles
@@ -588,7 +607,7 @@ def fused_addnorm_ffn_addnorm(
         ln2_l1l2_fifos[a_tile] = ObjectFifo(
             A_l1_ty,
             name=f"ln2_L1L2_{a_tile}",
-            depth=fifo_depth,
+            depth=fifo_depth_a_compute,
         )
         ln2_l2l3_fifos[a_tile] = (
             ln2_l1l2_fifos[a_tile]
@@ -945,11 +964,9 @@ def fused_addnorm_ffn_addnorm(
                         C_down_proj_part_l2l1_fifos[a_tile][b_tile].cons(depth=1),
                         C_down_proj_part_l1l2_fifos[a_tile][b_tile].prod(),
                         (
-                            C_down_proj_out_l1l1_fifos[a_tile].prod(fifo_depth)
+                            C_down_proj_out_l1l1_fifos[a_tile].prod()
                             if stream_to_ln
-                            else C_down_proj_reduce_l1l1_fifos[a_tile][b_tile].prod(
-                                fifo_depth
-                            )
+                            else C_down_proj_reduce_l1l1_fifos[a_tile][b_tile].prod()
                         ),
                         ffn_zero_kernel_down_proj,
                         ffn_matmul_kernel_down_proj,

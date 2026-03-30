@@ -17,7 +17,11 @@ from iron.common import AIEContext
 def aie_context(request):
     """Create a fresh AIEContext for each test"""
     verbose_mlir = request.config.option.verbose > 0
-    return AIEContext(mlir_verbose=verbose_mlir)
+    context = AIEContext(mlir_verbose=verbose_mlir)
+    try:
+        yield context
+    finally:
+        context.reset_runtime()
 
 
 def pytest_addoption(parser):
