@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import numpy as np
+from pathlib import Path
+import pytest
+import subprocess
+import sys
 import torch
 
 from iron.applications.transformer_layer.npu_inference import build_pattern
@@ -20,6 +25,9 @@ from iron.applications.transformer_layer.src.patterns import (
     DataflowPattern as StructuredDataflowPattern,
 )
 from iron.applications.transformer_layer.src.patterns import GemmOnlyPattern
+from iron.applications.transformer_layer.src.patterns.dataflow import (
+    _block2_block3_packed_handoff_compatible,
+)
 from iron.operators.addnorm_ffn_addnorm.topology import addnorm_ffn_addnorm_topologies
 from iron.operators.mha_out_proj.topology import mha_out_proj_topologies
 from iron.operators.qkv_proj.topology import qkv_proj_topologies
@@ -30,6 +38,8 @@ from iron.applications.transformer_layer.src.utils import (
 )
 from iron.operators.mha_out_proj.op import _pack_qkv_head_major
 from iron.operators.qkv_proj.op import AIEQKVProj
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _first_dataflow_compatible_block3_topology(
@@ -57,14 +67,44 @@ def _first_dataflow_compatible_block3_topology(
     if reverse:
         block3_topologies = list(reversed(block3_topologies))
     for block3_candidate in block3_topologies:
-        parallel_seq = int(block3_candidate["parallel_seq"])
         for block2_candidate in block2_topologies:
-            q_seq_tile = int(block2_candidate["q_seq_tile"])
-            if seq_len % q_seq_tile != 0:
-                continue
-            if ((seq_len // q_seq_tile) % parallel_seq) == 0:
+            if _block2_block3_packed_handoff_compatible(
+                seq_len=seq_len,
+                block2_candidate=block2_candidate,
+                block3_candidate=block3_candidate,
+            ):
                 return block3_candidate
     raise AssertionError("expected at least one dataflow-compatible Block 3 topology")
+
+
+def _run_dataflow_parity_isolated(
+    spec: TransformerLayerSpec,
+    *,
+    seed: int,
+) -> dict[str, float]:
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import json; "
+            "from iron.applications.transformer_layer.src.layer_spec import "
+            "TransformerLayerSpec; "
+            "from iron.applications.transformer_layer.src.pipeline.validate_npu_parity "
+            "import validate_pattern_parity; "
+            f"spec = TransformerLayerSpec.from_dict({spec.to_dict()!r}); "
+            f"row = validate_pattern_parity(execution_mode='dataflow', spec=spec, seed={seed}); "
+            "print(json.dumps({'max_abs_diff': row['max_abs_diff'], "
+            "'mean_abs_diff': row['mean_abs_diff']}))"
+        ),
+    ]
+    result = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
 
 
 def test_restructured_src_packages_preserve_legacy_imports():
@@ -285,3 +325,61 @@ def test_dataflow_pattern_configures_block2_packed_output_for_block3():
 
     assert pattern.block2.packed_output_parallel_seq == pattern.block3.parallel_seq
     assert pattern.block2.packed_output_rows == pattern.block3.M
+    assert pattern.block2.q_seq_tile == pattern.block3.tile_m
+    assert pattern.block2.emb_tile == pattern.block3.tile_k
+
+
+@pytest.mark.parametrize(
+    "spec_kwargs,max_abs_diff,max_mean_abs_diff",
+    (
+        pytest.param(
+            {
+                "seq_len": 64,
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_attention_heads": 12,
+                "block3_topology_id": "m32_k96_n64_ps2_pi6_d8_g1",
+            },
+            2.5e-1,
+            8.0e-3,
+            id="dataflow_64x768x3072_compatible_pi6",
+        ),
+        pytest.param(
+            {
+                "seq_len": 512,
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_attention_heads": 12,
+                "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
+            },
+            2.5e-1,
+            8.0e-3,
+            id="dataflow_512x768x3072_compatible_pi3",
+        ),
+        pytest.param(
+            {
+                "seq_len": 512,
+                "hidden_size": 1024,
+                "intermediate_size": 4096,
+                "num_attention_heads": 16,
+                "block3_topology_id": "m32_k128_n32_ps4_pi2_d8_g1",
+            },
+            2.5e-1,
+            8.0e-3,
+            id="dataflow_512x1024x4096_pi2",
+        ),
+    ),
+)
+def test_dataflow_pattern_runs_packed_block2_block3_handoff_against_reference(
+    spec_kwargs,
+    max_abs_diff,
+    max_mean_abs_diff,
+):
+    spec = TransformerLayerSpec(
+        use_bias=False,
+        weights_source="synthetic",
+        **spec_kwargs,
+    )
+    stats = _run_dataflow_parity_isolated(spec, seed=7)
+    assert float(stats["max_abs_diff"]) <= max_abs_diff
+    assert float(stats["mean_abs_diff"]) <= max_mean_abs_diff

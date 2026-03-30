@@ -259,6 +259,15 @@ So the practical Block 3 surface can still explore broader `ps8`/small-tile
 shapes than the current runtime-supported set, but `ps8` is no longer
 practical-only: the compact-sequence runtime path now supports strict-runtime-
 feasible `ps8, pi1` topologies.
+For the current packed Dataflow handoff from Block 2 into Block 3, a selected
+runtime pair is only structurally compatible when:
+- Block 2 `q_seq_tile ==` Block 3 `tile_m`
+- Block 2 `emb_tile ==` Block 3 `tile_k`
+- `seq_len / q_seq_tile` remains divisible by Block 3 `parallel_seq`
+
+That compatibility rule is stricter than "both operators are independently
+runtime-supported." The app-layer Dataflow resolver should enforce those tile
+shape checks before it picks a packed Block 2 -> Block 3 pair.
 Study metadata emitted by the in-process Dataflow patterns should include the
 selected block topology IDs and families so retained topology choices are visible
 in benchmark outputs.

@@ -194,8 +194,13 @@ def _block2_block3_packed_handoff_compatible(
     block3_candidate: dict[str, int | str],
 ) -> bool:
     q_seq_tile = int(block2_candidate["q_seq_tile"])
+    emb_tile = int(block2_candidate["emb_tile"])
     parallel_seq = int(block3_candidate["parallel_seq"])
+    tile_m = int(block3_candidate["tile_m"])
+    tile_k = int(block3_candidate["tile_k"])
     if seq_len % q_seq_tile != 0:
+        return False
+    if q_seq_tile != tile_m or emb_tile != tile_k:
         return False
     return ((seq_len // q_seq_tile) % parallel_seq) == 0
 

@@ -1066,6 +1066,31 @@ def _block3_select_runtime_candidates(
     )
     chosen: list[dict[str, int | str]] = []
     chosen_signatures: set[tuple[int, ...]] = set()
+    by_tile_pair: dict[tuple[int, int], list[dict[str, int | str]]] = {}
+    for candidate in ranked:
+        tile_pair = (
+            int(candidate["tile_m"]),
+            int(candidate["tile_k"]),
+        )
+        by_tile_pair.setdefault(tile_pair, []).append(candidate)
+
+    for tile_pair in sorted(
+        by_tile_pair,
+        key=lambda key: _block3_runtime_sort_key(
+            hidden_size=hidden_size,
+            candidate=by_tile_pair[key][0],
+        ),
+        reverse=True,
+    ):
+        candidate = by_tile_pair[tile_pair][0]
+        signature = _block3_signature(candidate)
+        if signature in chosen_signatures:
+            continue
+        chosen.append(candidate)
+        chosen_signatures.add(signature)
+        if len(chosen) >= limit:
+            return chosen
+
     by_shape: dict[tuple[int, int, int], list[dict[str, int | str]]] = {}
     for candidate in ranked:
         shape_key = (

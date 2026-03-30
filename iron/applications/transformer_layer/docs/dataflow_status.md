@@ -89,8 +89,9 @@ Verified today:
 - supported Block 2 runtime topologies are functionally verified in
   `iron/operators/mha_out_proj/test.py`
 - the packed Block 2 output path used for the Block 2 -> Block 3 handoff has
-  focused layout tests and a compile-plus-runtime smoke, but not a broad
-  per-topology verification sweep yet
+  focused layout tests plus representative app-level parity coverage when it is
+  paired with a tile-compatible Block 3 runtime topology, but not a full
+  compatible-pair sweep yet
 
 Work left:
 
@@ -151,6 +152,10 @@ Current execution contract:
 - Block 3 no longer exposes `compile_rows` as a topology dimension
 - the runtime requires exact sequence-length fit:
   - `seq_len % (parallel_seq * tile_m) == 0`
+- for the current packed Block 2 -> Block 3 handoff, the selected Dataflow
+  pair must also satisfy:
+  - Block 2 `q_seq_tile ==` Block 3 `tile_m`
+  - Block 2 `emb_tile ==` Block 3 `tile_k`
 - artifacts are compiled for the concrete requested `seq_len`; the current
   Block 3 runtime does not pad or chunk rows internally
 
@@ -161,7 +166,8 @@ Verified today:
 - the current packed Block 2 -> Block 3 path has:
   - compile coverage
   - focused helper/layout tests
-  - a `seq_len=64` runtime smoke through Dataflow
+  - representative Dataflow parity coverage across compatible `768 / 3072` and
+    `1024 / 4096` runtime cases
 - the full Block 3 runtime-supported surface is numerically verified against
   the Block 3 golden reference in
   `iron/operators/addnorm_ffn_addnorm/test.py`
@@ -192,8 +198,8 @@ Work left:
 - broaden `ps8` runtime support beyond the current compact-sequence `pi1` path
 - continue promoting smaller-`k` runtime candidates now that the hard
   `tile_k >= 64` policy gate is gone
-- broaden Dataflow-level Block 2 -> Block 3 verification now that the packed
-  handoff and the multi-group Block 3 runtime are both functional
+- broaden Dataflow-level Block 2 -> Block 3 verification further only as more
+  tile-compatible runtime pairs are promoted into the app-visible catalog
 
 ## Cross-block and App-Layer Work
 

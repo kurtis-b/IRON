@@ -137,8 +137,8 @@ def bind_mha_out_proj_weights(block, weights: Mapping[str, torch.Tensor]) -> Non
 def bind_addnorm_ffn_addnorm_weights(
     block, weights: Mapping[str, torch.Tensor]
 ) -> None:
-    block.weight_up_proj = weights["ffn_up_weight"].contiguous().T
-    block.weight_down_proj = weights["ffn_down_weight"].contiguous().T
+    block.weight_up_proj = weights["ffn_up_weight"].contiguous()
+    block.weight_down_proj = weights["ffn_down_weight"].contiguous()
     block.ln1_weight = weights["ln1_weight"].contiguous()
     block.ln2_weight = weights["ln2_weight"].contiguous()
 

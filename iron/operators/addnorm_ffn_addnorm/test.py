@@ -154,6 +154,51 @@ def test_packed_hidden_residual_round_trips(aie_context):
     assert np.array_equal(unpacked_residual, residual_padded)
 
 
+def test_forward_packed_uses_bound_static_weights(aie_context):
+    rel_tol = 4.0e-2
+    abs_tol = 1.5e-1
+    error_threshold = 0.005
+    seq_len = 64
+    hidden_size = 768
+    intermediate_size = 3072
+    topology_id = "m32_k192_n16_ps2_pi6_d4_g1"
+
+    golden = generate_golden_reference(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        seed=17,
+    )
+    operator = AIEAddNormFFNAddNorm(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        topology_id=topology_id,
+        context=aie_context,
+    )
+    operator.weight_up_proj = golden["ffn_up_weight"].contiguous().T
+    operator.weight_down_proj = golden["ffn_down_weight"].contiguous().T
+    operator.ln1_weight = golden["ln1_weight"].contiguous()
+    operator.ln2_weight = golden["ln2_weight"].contiguous()
+
+    packed = torch.cat((golden["hidden_states"], golden["residual"]), dim=0)
+
+    aie_context.compile_all()
+    aie_context.prepare_runtime()
+    output = operator.forward_packed(packed)
+
+    output_errors = _count_errors(
+        output,
+        golden["output"],
+        rel_tol=rel_tol,
+        abs_tol=abs_tol,
+    )
+    max_acceptable_errors = int(seq_len * hidden_size * error_threshold)
+
+    assert output.shape == golden["output"].shape
+    assert output_errors <= max_acceptable_errors
+
+
 def test_theoretical_block3_topologies_cover_supported_surface():
     for seq_len, hidden_size, intermediate_size in (
         (64, 768, 3072),
