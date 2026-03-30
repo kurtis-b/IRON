@@ -84,14 +84,9 @@ def fused_qkv_proj(
 ):
     del trace_size
 
-    if parallel_seq != 1:
-        raise AssertionError("Block 1 currently lowers parallel_seq only for 1")
-    if parallel_head_dim != 1:
-        raise AssertionError(
-            "Block 1 currently lowers parallel_head_dim only for 1"
-        )
-
-    n_aie_rows = 4
+    if parallel_seq not in (1, 2, 4):
+        raise AssertionError("Block 1 currently lowers parallel_seq only for {1, 2, 4}")
+    n_aie_rows = parallel_seq
     n_shim_mem_A = min(num_aie_columns, n_aie_rows)
     n_A_tiles_per_shim = n_aie_rows // num_aie_columns if num_aie_columns < 4 else 1
 
@@ -145,6 +140,12 @@ def fused_qkv_proj(
     if parallel_heads < 1 or num_aie_columns % parallel_heads != 0:
         raise AssertionError(
             "Block 1 requires num_aie_columns divisible by parallel_heads"
+        )
+    if parallel_head_dim < 1:
+        raise AssertionError("Block 1 requires parallel_head_dim >= 1")
+    if num_aie_columns % (parallel_heads * parallel_head_dim) != 0:
+        raise AssertionError(
+            "Block 1 requires num_aie_columns divisible by parallel_heads * parallel_head_dim"
         )
     if hidden_size % mem_tile_n != 0:
         raise AssertionError(
@@ -392,6 +393,10 @@ def fused_qkv_proj(
     n_projection_tile_groups = hidden_size // mem_tile_n
     columns_per_head_group = num_aie_columns // parallel_heads
     head_group_width = hidden_size // parallel_heads
+    parallel_output_groups = parallel_heads * parallel_head_dim
+    columns_per_output_group = num_aie_columns // parallel_output_groups
+    packed_group_width = hidden_size // parallel_output_groups
+    use_packed_output_groups = parallel_head_dim > 1
 
     A_tiles = TensorTiler2D.group_tiler(
         (seq_len, hidden_size),
@@ -410,15 +415,42 @@ def fused_qkv_proj(
     )
 
     def make_b_taps(col: int) -> list[TensorAccessPattern]:
-        if parallel_heads == 1:
+        if not use_packed_output_groups and parallel_heads == 1:
             return [B_tiles[col]]
+        if use_packed_output_groups:
+            output_group = col // columns_per_output_group
+            local_col = col % columns_per_output_group
+            taps = []
+            for projection_idx in range(3):
+                projection_offset = projection_idx * hidden_size
+                B_offset = (
+                    projection_offset
+                    + output_group * packed_group_width
+                    + local_col * tile_n
+                )
+                taps.append(
+                    TensorAccessPattern(
+                        (hidden_size, combined_hidden_size),
+                        offset=B_offset,
+                        sizes=[n_projection_tile_groups, K_div_k, tile_k, tile_n],
+                        strides=[
+                            columns_per_output_group * tile_n,
+                            tile_k * combined_hidden_size,
+                            combined_hidden_size,
+                            1,
+                        ],
+                    )
+                )
+            return taps
 
         head_group = col // columns_per_head_group
         local_col = col % columns_per_head_group
         taps = []
         for projection_idx in range(3):
             projection_offset = projection_idx * hidden_size
-            B_offset = projection_offset + head_group * head_group_width + local_col * tile_n
+            B_offset = (
+                projection_offset + head_group * head_group_width + local_col * tile_n
+            )
             taps.append(
                 TensorAccessPattern(
                     (hidden_size, combined_hidden_size),
@@ -448,7 +480,7 @@ def fused_qkv_proj(
     def make_c_taps(
         row_base: int, current_tb_n_rows: int, col: int
     ) -> list[TensorAccessPattern]:
-        if parallel_heads == 1:
+        if not use_packed_output_groups and parallel_heads == 1:
             C_row_offset = row_base * mem_tile_m_C * combined_hidden_size
             C_col_offset = col * tile_n
             C_offset = C_col_offset + C_row_offset
@@ -470,6 +502,38 @@ def fused_qkv_proj(
                     ],
                 )
             ]
+        if use_packed_output_groups:
+            output_group = col // columns_per_output_group
+            local_col = col % columns_per_output_group
+            C_row_offset = row_base * mem_tile_m_C * combined_hidden_size
+            taps = []
+            for projection_idx in range(3):
+                projection_offset = projection_idx * hidden_size
+                C_col_offset = (
+                    projection_offset
+                    + output_group * packed_group_width
+                    + local_col * tile_n
+                )
+                C_offset = C_col_offset + C_row_offset
+                taps.append(
+                    TensorAccessPattern(
+                        (seq_len, combined_hidden_size),
+                        offset=C_offset,
+                        sizes=[
+                            current_tb_n_rows,
+                            n_projection_tile_groups,
+                            mem_tile_m_C,
+                            tile_n,
+                        ],
+                        strides=[
+                            mem_tile_m_C * combined_hidden_size,
+                            columns_per_output_group * tile_n,
+                            combined_hidden_size,
+                            1,
+                        ],
+                    )
+                )
+            return taps
 
         head_group = col // columns_per_head_group
         local_col = col % columns_per_head_group
@@ -517,9 +581,11 @@ def fused_qkv_proj(
             for col in range(num_aie_columns):
                 rt.set_barrier(worker_barriers[row][col], 1)
 
-        if parallel_heads == 1:
+        if parallel_heads == 1 and not use_packed_output_groups:
             tg = rt.task_group()
-            for tb in range((n_c_row_tiles_per_core + tb_max_n_rows - 1) // tb_max_n_rows):
+            for tb in range(
+                (n_c_row_tiles_per_core + tb_max_n_rows - 1) // tb_max_n_rows
+            ):
                 for pingpong in [0, 1]:
                     row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
                     current_tb_n_rows = min(
@@ -569,7 +635,9 @@ def fused_qkv_proj(
                         tg = rt.task_group()
             rt.finish_task_group(tg)
         else:
-            for tb in range((n_c_row_tiles_per_core + tb_max_n_rows - 1) // tb_max_n_rows):
+            for tb in range(
+                (n_c_row_tiles_per_core + tb_max_n_rows - 1) // tb_max_n_rows
+            ):
                 for pingpong in [0, 1]:
                     row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
                     current_tb_n_rows = min(

@@ -100,11 +100,18 @@ The retained `v2` implementation parallelizes the three independent Q/K/V
 projections as one wider GEMM and then reshapes the combined output back to
 head-major `q/k/v` tensors on the wrapper surface. The current Block 1
 runtime-supported surface is workload-aware over the tile/array part of the
-topology space, and it now lowers a real retained-family `parallel_heads` sweep
-by making the Block 1 `B` fills and `C` drains head-group aware on the
-canonical `c8` path. The remaining thesis-facing fields `parallel_seq` and
-`parallel_head_dim` still remain practical/theoretical exploration parameters
-for now, and the runtime-supported Block 1 surface pins both to `1`.
+topology space, and it now lowers real retained-family sweeps for all three
+thesis-facing axes on the canonical `c8` path:
+- `parallel_seq` changes the active compute-row count and the Block 1 row tiling
+  used by the runtime sequence
+- `parallel_heads` makes the Block 1 `B` fills and `C` drains head-group aware
+- `parallel_head_dim` uses a packed internal `B/C` layout so head-dim groups are
+  contiguous to the lowered design while the wrapper still exposes the original
+  public `q/k/v` layout
+The current runtime-supported Block 1 surface still limits `parallel_seq` to
+`{1, 2, 4}` because the local design only lowers up to the available four
+compute rows, while the broader theoretical/practical catalogs continue to
+explore the larger thesis space.
 That design file should expose three distinct topology views:
 - a seq-len-aware runtime-supported topology list used by operator tests and the
   workload-specific runtime-selection path

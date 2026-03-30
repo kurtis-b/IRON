@@ -163,7 +163,7 @@ def test_runtime_block1_topologies_are_subset_of_practical_surface():
         assert runtime_ids <= practical_ids
 
 
-def test_runtime_block1_topologies_pin_unlowered_parallel_axes_to_one():
+def test_runtime_block1_topologies_lower_parallel_axes_honestly():
     for seq_len, hidden_size, num_heads in (
         (64, 768, 12),
         (512, 768, 12),
@@ -176,11 +176,20 @@ def test_runtime_block1_topologies_pin_unlowered_parallel_axes_to_one():
             num_heads=num_heads,
         )
         assert runtime_topologies
-        assert any(int(topology["parallel_heads"]) > 1 for topology in runtime_topologies)
+        assert any(int(topology["parallel_seq"]) > 1 for topology in runtime_topologies)
+        assert any(
+            int(topology["parallel_heads"]) > 1 for topology in runtime_topologies
+        )
+        assert any(
+            int(topology["parallel_head_dim"]) > 1 for topology in runtime_topologies
+        )
         for topology in runtime_topologies:
-            assert int(topology["parallel_seq"]) == 1
-            assert int(topology["parallel_head_dim"]) == 1
-            assert int(topology["num_aie_columns"]) % int(topology["parallel_heads"]) == 0
+            assert int(topology["parallel_seq"]) in (1, 2, 4)
+            assert (
+                int(topology["num_aie_columns"])
+                % (int(topology["parallel_heads"]) * int(topology["parallel_head_dim"]))
+                == 0
+            )
 
 
 def test_supported_block1_topologies_include_practical_runtime_variants():
@@ -202,7 +211,11 @@ def test_supported_block1_topologies_include_practical_runtime_variants():
     }
 
     assert "m32_k256_n24_c8_ps1_ph4_pd1" in topology_ids_768
+    assert "m32_k256_n24_c8_ps2_ph1_pd1" in topology_ids_768
+    assert "m32_k256_n24_c8_ps1_ph1_pd4" in topology_ids_768
     assert "m32_k256_n16_c8_ps1_ph8_pd1" in topology_ids_1024
+    assert "m32_k256_n16_c8_ps4_ph1_pd1" in topology_ids_1024
+    assert "m32_k256_n16_c8_ps1_ph1_pd8" in topology_ids_1024
 
 
 def test_block1_design_accepts_canonical_runtime_topology_ids():

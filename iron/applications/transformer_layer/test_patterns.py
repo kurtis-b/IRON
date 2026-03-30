@@ -216,7 +216,9 @@ def test_build_pattern_honors_block_topology_overrides():
     spec = TransformerLayerSpec(
         seq_len=64,
         block1_topology_id=str(
-            qkv_proj_topologies(hidden_size=768, num_heads=12)[0]["topology_id"]
+            qkv_proj_topologies(seq_len=64, hidden_size=768, num_heads=12)[0][
+                "topology_id"
+            ]
         ),
         block2_topology_id=block2_topology_id,
         block3_topology_id=block3_topology_id,
@@ -238,7 +240,7 @@ def test_build_pattern_honors_block_topology_overrides():
 
 
 def test_build_pattern_honors_nondefault_block1_topology_override():
-    block1_topologies = qkv_proj_topologies(hidden_size=768, num_heads=12)
+    block1_topologies = qkv_proj_topologies(seq_len=64, hidden_size=768, num_heads=12)
     assert len(block1_topologies) > 1
 
     spec = TransformerLayerSpec(

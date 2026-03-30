@@ -49,6 +49,51 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "parallel_heads": 4,
             "parallel_head_dim": 1,
         },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 24,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 1,
+            "parallel_head_dim": 2,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 24,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 1,
+            "parallel_head_dim": 4,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 24,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 1,
+            "parallel_head_dim": 8,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 24,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_heads": 1,
+            "parallel_head_dim": 1,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 24,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_heads": 1,
+            "parallel_head_dim": 1,
+        },
     ),
     (16, 64): (
         {
@@ -85,6 +130,51 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "num_aie_columns": 8,
             "parallel_seq": 1,
             "parallel_heads": 8,
+            "parallel_head_dim": 1,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 16,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 1,
+            "parallel_head_dim": 2,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 16,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 1,
+            "parallel_head_dim": 4,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 16,
+            "num_aie_columns": 8,
+            "parallel_seq": 1,
+            "parallel_heads": 1,
+            "parallel_head_dim": 8,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 16,
+            "num_aie_columns": 8,
+            "parallel_seq": 2,
+            "parallel_heads": 1,
+            "parallel_head_dim": 1,
+        },
+        {
+            "tile_m": 32,
+            "tile_k": 256,
+            "tile_n": 16,
+            "num_aie_columns": 8,
+            "parallel_seq": 4,
+            "parallel_heads": 1,
             "parallel_head_dim": 1,
         },
     ),
@@ -559,11 +649,12 @@ def _block1_runtime_candidate_allowed(
 ) -> bool:
     tile_n = int(candidate["tile_n"])
     num_aie_columns = int(candidate["num_aie_columns"])
+    parallel_seq = int(candidate["parallel_seq"])
     parallel_heads = int(candidate["parallel_heads"])
+    parallel_head_dim = int(candidate["parallel_head_dim"])
     return (
-        int(candidate["parallel_seq"]) == 1
-        and int(candidate["parallel_head_dim"]) == 1
-        and num_aie_columns % parallel_heads == 0
+        parallel_seq in (1, 2, 4)
+        and num_aie_columns % (parallel_heads * parallel_head_dim) == 0
         and hidden_size % (tile_n * num_aie_columns) == 0
     )
 

@@ -36,16 +36,16 @@ Current runtime-supported surface:
 - runtime support is `seq_len`-aware
 - the current local lowering now runtime-supports:
   - tile/column variants
+  - a real `parallel_seq` sweep with active row counts in `{1, 2, 4}`
   - a real `parallel_heads` sweep on the canonical retained `c8` topologies
-- the remaining thesis-facing axes still fixed at runtime are:
-  - `parallel_seq=1`
-  - `parallel_head_dim=1`
+  - a real `parallel_head_dim` sweep on the canonical retained `c8`
+    topologies through a packed internal `B/C` layout
 - for the currently exercised retained workloads, that runtime-supported
   surface is:
-  - `seq_len=64, hidden=768, heads=12`: `7` topologies
-  - `seq_len=512, hidden=768, heads=12`: `7` topologies
-  - `seq_len=64, hidden=1024, heads=16`: `12` topologies
-  - `seq_len=512, hidden=1024, heads=16`: `10` topologies
+  - `seq_len=64, hidden=768, heads=12`: `58` topologies
+  - `seq_len=512, hidden=768, heads=12`: `51` topologies
+  - `seq_len=64, hidden=1024, heads=16`: `39` topologies
+  - `seq_len=512, hidden=1024, heads=16`: `40` topologies
 
 Verified today:
 
@@ -54,14 +54,13 @@ Verified today:
 
 Work left:
 
-- turn the paper topology axes into real lowering axes:
-  - `parallel_seq`
-  - `parallel_head_dim`
-- only promote broader Block 1 runtime topologies after the remaining thesis
-  axes are lowered for real; until then keep them in the
-  practical/theoretical catalogs only
 - if wider thesis families are needed, generalize beyond the retained `12 x 64`
   and `16 x 64` families
+- if higher sequence-lane support is needed, extend the current `parallel_seq`
+  runtime lowering beyond `{1, 2, 4}`
+- continue promoting broader Block 1 runtime topologies only after standalone
+  validation; the practical/theoretical catalogs are still broader than the
+  runtime-supported study surface
 - if a staged Block 1 pipeline is desired, introduce real internal worker
   stages rather than the current single fused GEMM shape
 
