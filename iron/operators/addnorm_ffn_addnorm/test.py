@@ -271,6 +271,59 @@ def test_supported_block3_topologies_generalize_beyond_retained_families():
     assert "m16_k120_n160_ps4_pi3_d8_g1" in topology_ids_960
 
 
+def test_supported_block3_topologies_exclude_only_known_bad_skinny_wide_variants():
+    topology_ids_512_768 = {
+        str(topology["topology_id"])
+        for topology in addnorm_ffn_addnorm_topologies(
+            seq_len=512,
+            hidden_size=768,
+            intermediate_size=3072,
+        )
+    }
+    topology_ids_64_1024 = {
+        str(topology["topology_id"])
+        for topology in addnorm_ffn_addnorm_topologies(
+            seq_len=64,
+            hidden_size=1024,
+            intermediate_size=4096,
+        )
+    }
+    topology_ids_64_960 = {
+        str(topology["topology_id"])
+        for topology in addnorm_ffn_addnorm_topologies(
+            seq_len=64,
+            hidden_size=960,
+            intermediate_size=3840,
+        )
+    }
+    topology_ids_512_1536 = {
+        str(topology["topology_id"])
+        for topology in addnorm_ffn_addnorm_topologies(
+            seq_len=512,
+            hidden_size=1536,
+            intermediate_size=6144,
+        )
+    }
+    topology_ids_512_960 = {
+        str(topology["topology_id"])
+        for topology in addnorm_ffn_addnorm_topologies(
+            seq_len=512,
+            hidden_size=960,
+            intermediate_size=3840,
+        )
+    }
+
+    assert "m64_k24_n256_ps4_pi3_d8_g1" not in topology_ids_512_768
+    assert "m16_k24_n640_ps4_pi3_d8_g1" not in topology_ids_64_960
+    assert "m64_k24_n256_ps4_pi3_d8_g1" not in topology_ids_512_1536
+    assert "m32_k16_n512_ps4_pi3_d8_g1" not in topology_ids_512_1536
+    assert "m64_k24_n256_ps4_pi3_d8_g1" not in topology_ids_512_960
+
+    # These variants were caught by the old broad fence but now run cleanly.
+    assert "m32_k16_n512_ps2_pi4_d8_g1" in topology_ids_64_1024
+    assert "m64_k16_n320_ps4_pi3_d6_g1" in topology_ids_512_960
+
+
 def test_supported_block3_topologies_promote_generated_retained_variants():
     topology_ids_64_768 = {
         str(topology["topology_id"])

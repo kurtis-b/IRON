@@ -979,9 +979,13 @@ def _block3_runtime_candidate_allowed(
         return False
     if tile_n < _BLOCK3_RUNTIME_MIN_TILE_N:
         return False
-    if tile_k < 32 and tile_n > 128:
-        return False
     if down_proj_depth > _BLOCK3_RUNTIME_MAX_DOWN_PROJ_DEPTH:
+        return False
+    if _block3_is_known_bad_runtime_candidate(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        candidate=candidate,
+    ):
         return False
     if not _block3_runtime_placement_feasible(candidate):
         return False
@@ -990,6 +994,26 @@ def _block3_runtime_candidate_allowed(
         candidate=candidate,
         seq_len=seq_len,
     )
+
+
+def _block3_is_known_bad_runtime_candidate(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    candidate: dict[str, int | str],
+) -> bool:
+    tile_k = int(candidate["tile_k"])
+    tile_n = int(candidate["tile_n"])
+
+    # The broad skinny-wide fence is no longer needed. The remaining failures
+    # are isolated runtime/layout issues that have been reproduced directly:
+    # - `tile_k=24` with very wide `tile_n` still produces runtime NaNs
+    # - `512 x 1536` with `tile_k=16, tile_n=512` still fails shim BD lowering
+    if tile_k == 24 and tile_n > 128:
+        return True
+    if seq_len == 512 and hidden_size == 1536 and tile_k == 16 and tile_n == 512:
+        return True
+    return False
 
 
 def _block3_runtime_placement_feasible(candidate: dict[str, int | str]) -> bool:

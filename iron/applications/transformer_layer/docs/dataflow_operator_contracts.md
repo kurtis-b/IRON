@@ -426,9 +426,11 @@ through the current layout/runtime gate and pruned back to a compact validated
 set. The older retained thesis IDs are still preserved as preferred baselines,
 but retained workloads no longer stop there: additional generated candidates
 can now fill the remaining runtime slots when they satisfy the current runtime
-gate. That gate still excludes very skinny-wide shapes with `tile_k < 32` and
-`tile_n > 128`, because those candidates currently hit runtime NaNs or shim BD
-exhaustion even though they are structurally legal.
+gate. The old broad skinny-wide fence is gone; the remaining exclusions are
+now a short explicit list of reproduced bad shapes instead:
+- `tile_k=24` with `tile_n > 128`, which still produces runtime NaNs
+- `512 x 1536 x 6144` with `tile_k=16` and `tile_n=512`, which still fails
+  shim BD lowering
 Because `ln1_weight` and `ln2_weight` are compile-time constants embedded into
 the generated Block 3 MLIR/xclbin, Block 3 artifact names must include a
 deterministic fingerprint of those two weight tensors so tests and studies do

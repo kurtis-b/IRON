@@ -226,8 +226,11 @@ Current runtime-supported surface:
   - `tile_m in {16, 32, 64}`
   - `tile_k >= 16`
   - `tile_n >= 16`
-  - extremely skinny-wide runtime shapes with `tile_k < 32` and `tile_n > 128`
-    remain excluded until the current shim/runtime layout proves them stable
+  - the old broad skinny-wide fence is gone; only a short explicit list of
+    reproduced unstable shapes remains excluded:
+    - `tile_k=24` with `tile_n > 128` still produces runtime NaNs
+    - `512 x 1536 x 6144` with `tile_k=16` and `tile_n=512` still fails shim
+      BD lowering
   - `down_proj_depth <= 8`
   - placement must satisfy the current horizontal, vertical, or compact-
     sequence Block 3 layout

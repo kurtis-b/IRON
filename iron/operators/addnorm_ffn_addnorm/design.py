@@ -1452,9 +1452,8 @@ def fused_addnorm_ffn_addnorm(
                         task_group=tg,
                         placement=c_place,
                     )
-            if emit_output:
-                rt.finish_task_group(tg)
-                tg = rt.task_group()
+            rt.finish_task_group(tg)
+            tg = rt.task_group()
 
         for row_tile_idx in range(ln_iters_per_core):
             emit_ln2_prepass(row_tile_idx)
