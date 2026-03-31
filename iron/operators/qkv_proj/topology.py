@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
-
 from itertools import product
 
+_BLOCK1_RUNTIME_NUM_AIE_COLUMNS = 8
 _BLOCK1_RETAINED_FAMILIES = {
     (12, 64),
     (16, 64),
@@ -16,8 +16,7 @@ _BLOCK1_RETAINED_AXES = {
     "tile_n": (16, 32),
     "num_aie_columns": (8,),
     "parallel_seq": (1,),
-    "parallel_heads": (1,),
-    "parallel_head_dim": (1,),
+    "parallel_emb": (1,),
 }
 
 _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
@@ -28,8 +27,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 24,
             "num_aie_columns": 8,
             "parallel_seq": 1,
-            "parallel_heads": 1,
-            "parallel_head_dim": 1,
+            "parallel_emb": 1,
         },
         {
             "tile_m": 32,
@@ -37,8 +35,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 24,
             "num_aie_columns": 8,
             "parallel_seq": 1,
-            "parallel_heads": 2,
-            "parallel_head_dim": 1,
+            "parallel_emb": 2,
         },
         {
             "tile_m": 32,
@@ -46,8 +43,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 24,
             "num_aie_columns": 8,
             "parallel_seq": 1,
-            "parallel_heads": 4,
-            "parallel_head_dim": 1,
+            "parallel_emb": 4,
         },
         {
             "tile_m": 32,
@@ -55,26 +51,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 24,
             "num_aie_columns": 8,
             "parallel_seq": 1,
-            "parallel_heads": 1,
-            "parallel_head_dim": 2,
-        },
-        {
-            "tile_m": 32,
-            "tile_k": 256,
-            "tile_n": 24,
-            "num_aie_columns": 8,
-            "parallel_seq": 1,
-            "parallel_heads": 1,
-            "parallel_head_dim": 4,
-        },
-        {
-            "tile_m": 32,
-            "tile_k": 256,
-            "tile_n": 24,
-            "num_aie_columns": 8,
-            "parallel_seq": 1,
-            "parallel_heads": 1,
-            "parallel_head_dim": 8,
+            "parallel_emb": 8,
         },
         {
             "tile_m": 32,
@@ -82,8 +59,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 24,
             "num_aie_columns": 8,
             "parallel_seq": 2,
-            "parallel_heads": 1,
-            "parallel_head_dim": 1,
+            "parallel_emb": 1,
         },
         {
             "tile_m": 32,
@@ -91,8 +67,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 24,
             "num_aie_columns": 8,
             "parallel_seq": 4,
-            "parallel_heads": 1,
-            "parallel_head_dim": 1,
+            "parallel_emb": 1,
         },
     ),
     (16, 64): (
@@ -102,8 +77,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 16,
             "num_aie_columns": 8,
             "parallel_seq": 1,
-            "parallel_heads": 1,
-            "parallel_head_dim": 1,
+            "parallel_emb": 1,
         },
         {
             "tile_m": 32,
@@ -111,8 +85,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 16,
             "num_aie_columns": 8,
             "parallel_seq": 1,
-            "parallel_heads": 2,
-            "parallel_head_dim": 1,
+            "parallel_emb": 2,
         },
         {
             "tile_m": 32,
@@ -120,8 +93,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 16,
             "num_aie_columns": 8,
             "parallel_seq": 1,
-            "parallel_heads": 4,
-            "parallel_head_dim": 1,
+            "parallel_emb": 4,
         },
         {
             "tile_m": 32,
@@ -129,35 +101,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 16,
             "num_aie_columns": 8,
             "parallel_seq": 1,
-            "parallel_heads": 8,
-            "parallel_head_dim": 1,
-        },
-        {
-            "tile_m": 32,
-            "tile_k": 256,
-            "tile_n": 16,
-            "num_aie_columns": 8,
-            "parallel_seq": 1,
-            "parallel_heads": 1,
-            "parallel_head_dim": 2,
-        },
-        {
-            "tile_m": 32,
-            "tile_k": 256,
-            "tile_n": 16,
-            "num_aie_columns": 8,
-            "parallel_seq": 1,
-            "parallel_heads": 1,
-            "parallel_head_dim": 4,
-        },
-        {
-            "tile_m": 32,
-            "tile_k": 256,
-            "tile_n": 16,
-            "num_aie_columns": 8,
-            "parallel_seq": 1,
-            "parallel_heads": 1,
-            "parallel_head_dim": 8,
+            "parallel_emb": 8,
         },
         {
             "tile_m": 32,
@@ -165,8 +109,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 16,
             "num_aie_columns": 8,
             "parallel_seq": 2,
-            "parallel_heads": 1,
-            "parallel_head_dim": 1,
+            "parallel_emb": 1,
         },
         {
             "tile_m": 32,
@@ -174,8 +117,7 @@ _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES = {
             "tile_n": 16,
             "num_aie_columns": 8,
             "parallel_seq": 4,
-            "parallel_heads": 1,
-            "parallel_head_dim": 1,
+            "parallel_emb": 1,
         },
     ),
 }
@@ -184,11 +126,18 @@ _BLOCK1_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
 _BLOCK1_AIE_DATA_MEM_SIZE_BYTES = 65536
 _BLOCK1_GEMM_L1_BUFFER_COPIES = 2
 _BLOCK1_GEMM_TILE_FIXED_OVERHEAD_BYTES = 3392
-_BLOCK1_PRACTICAL_MIN_TILE_M = 32
-_BLOCK1_PRACTICAL_MIN_TILE_K = 64
-_BLOCK1_PRACTICAL_MIN_TILE_N = 16
-_BLOCK1_PRACTICAL_MIN_AIE_COLUMNS = 4
-_BLOCK1_PRACTICAL_MAX_CANDIDATES = 64
+_BLOCK1_MICROKERNEL_TILE_M = 8
+_BLOCK1_MICROKERNEL_TILE_K = 8
+_BLOCK1_MICROKERNEL_TILE_N = 8
+_BLOCK1_PRACTICAL_MIN_TILE_M = _BLOCK1_MICROKERNEL_TILE_M
+_BLOCK1_PRACTICAL_MIN_TILE_K = _BLOCK1_MICROKERNEL_TILE_K
+_BLOCK1_PRACTICAL_MIN_TILE_N = _BLOCK1_MICROKERNEL_TILE_N
+_BLOCK1_PRACTICAL_MAX_CANDIDATES = 20
+_BLOCK1_RUNTIME_MAX_CANDIDATES = 12
+_BLOCK1_SEQ_INDEPENDENT_MAX_CANDIDATES = 12
+_BLOCK1_SEED_TILE_M_CHOICES = (8, 16, 32, 64)
+_BLOCK1_SEED_TILE_K_MAX = 256
+_BLOCK1_SEED_TILE_N_MAX = 64
 
 
 def qkv_proj_topologies(
@@ -200,10 +149,6 @@ def qkv_proj_topologies(
     if hidden_size % num_heads != 0:
         raise ValueError("Block 1 requires hidden_size divisible by num_heads")
     head_dim = hidden_size // num_heads
-    if (num_heads, head_dim) not in _BLOCK1_RETAINED_FAMILIES:
-        raise ValueError(
-            "Block 1 currently supports only the retained thesis families 12x64 and 16x64"
-        )
     if seq_len is None:
         unique_topologies = _block1_seq_independent_supported_candidates(
             hidden_size=hidden_size,
@@ -285,8 +230,7 @@ def qkv_proj_design(
     tile_k = int(config["tile_k"])
     tile_n = int(config["tile_n"])
     parallel_seq = int(config["parallel_seq"])
-    parallel_heads = int(config["parallel_heads"])
-    parallel_head_dim = int(config["parallel_head_dim"])
+    parallel_emb = int(config["parallel_emb"])
     num_aie_columns = int(config["num_aie_columns"])
 
     if parallel_seq not in (1, 2, 4, 6, 8):
@@ -298,12 +242,14 @@ def qkv_proj_design(
     combined_hidden_size = hidden_size * 3
     if combined_hidden_size % tile_n != 0:
         raise ValueError("Block 1 requires combined_hidden_size divisible by tile_n")
-    if num_heads % parallel_heads != 0:
-        raise ValueError("Block 1 requires num_heads divisible by parallel_heads")
-    if head_dim % parallel_head_dim != 0:
-        raise ValueError("Block 1 requires head_dim divisible by parallel_head_dim")
+    if parallel_emb < 1:
+        raise ValueError("Block 1 requires parallel_emb >= 1")
+    if hidden_size % parallel_emb != 0:
+        raise ValueError("Block 1 requires hidden_size divisible by parallel_emb")
     if not 1 <= num_aie_columns <= 8:
         raise ValueError("Block 1 requires 1 <= num_aie_columns <= 8")
+    if num_aie_columns % parallel_emb != 0:
+        raise ValueError("Block 1 requires num_aie_columns divisible by parallel_emb")
 
     return {
         **config,
@@ -328,24 +274,20 @@ def _enumerate_block1_topologies(
         tile_n,
         num_aie_columns,
         parallel_seq,
-        parallel_heads,
-        parallel_head_dim,
+        parallel_emb,
     ) in product(
         _BLOCK1_RETAINED_AXES["tile_m"],
         _BLOCK1_RETAINED_AXES["tile_k"],
         _BLOCK1_RETAINED_AXES["tile_n"],
         _BLOCK1_RETAINED_AXES["num_aie_columns"],
         _BLOCK1_RETAINED_AXES["parallel_seq"],
-        _BLOCK1_RETAINED_AXES["parallel_heads"],
-        _BLOCK1_RETAINED_AXES["parallel_head_dim"],
+        _BLOCK1_RETAINED_AXES["parallel_emb"],
     ):
         if hidden_size % tile_k != 0:
             continue
         if combined_hidden_size % tile_n != 0:
             continue
-        if num_heads % parallel_heads != 0:
-            continue
-        if head_dim % parallel_head_dim != 0:
+        if hidden_size % parallel_emb != 0:
             continue
         topologies.append(
             {
@@ -354,8 +296,7 @@ def _enumerate_block1_topologies(
                 "tile_n": tile_n,
                 "num_aie_columns": num_aie_columns,
                 "parallel_seq": parallel_seq,
-                "parallel_heads": parallel_heads,
-                "parallel_head_dim": parallel_head_dim,
+                "parallel_emb": parallel_emb,
             }
         )
     return topologies
@@ -367,13 +308,22 @@ def _block1_seq_independent_supported_candidates(
     num_heads: int,
     head_dim: int,
 ) -> list[dict[str, int]]:
-    topologies = _enumerate_block1_topologies(
+    topologies = _block1_runtime_seed_candidates(
         hidden_size=hidden_size,
         num_heads=num_heads,
         head_dim=head_dim,
     )
-    topologies.extend(
-        _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES.get((num_heads, head_dim), ())
+
+    topologies = _block1_select_candidates(
+        topologies,
+        sort_key=_block1_runtime_sort_key,
+        preferred_ids={
+            _theoretical_topology_id(candidate)
+            for candidate in _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES.get(
+                (num_heads, head_dim), ()
+            )
+        },
+        limit=_BLOCK1_SEQ_INDEPENDENT_MAX_CANDIDATES,
     )
     unique_topologies = []
     seen_topology_ids: set[str] = set()
@@ -384,6 +334,63 @@ def _block1_seq_independent_supported_candidates(
         seen_topology_ids.add(topology_id)
         unique_topologies.append(candidate)
     return unique_topologies
+
+
+def _block1_runtime_seed_candidates(
+    *,
+    hidden_size: int,
+    num_heads: int,
+    head_dim: int,
+) -> list[dict[str, int]]:
+    combined_hidden_size = hidden_size * 3
+    topologies = list(
+        _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES.get((num_heads, head_dim), ())
+    )
+    seed_tile_ks = _preferred_divisors(
+        hidden_size,
+        minimum=_BLOCK1_PRACTICAL_MIN_TILE_K,
+        maximum=min(hidden_size, _BLOCK1_SEED_TILE_K_MAX),
+    )
+    seed_tile_ns = _preferred_divisors(
+        combined_hidden_size,
+        minimum=_BLOCK1_PRACTICAL_MIN_TILE_N,
+        maximum=min(combined_hidden_size, _BLOCK1_SEED_TILE_N_MAX),
+    )
+    for (
+        tile_m,
+        tile_k,
+        tile_n,
+        parallel_seq,
+        parallel_emb,
+    ) in product(
+        _BLOCK1_SEED_TILE_M_CHOICES,
+        seed_tile_ks,
+        seed_tile_ns,
+        (1, 2, 4),
+        tuple(
+            divisor
+            for divisor in _divisors(hidden_size)
+            if divisor <= _BLOCK1_RUNTIME_NUM_AIE_COLUMNS
+        ),
+    ):
+        candidate = {
+            "tile_m": tile_m,
+            "tile_k": tile_k,
+            "tile_n": tile_n,
+            "num_aie_columns": _BLOCK1_RUNTIME_NUM_AIE_COLUMNS,
+            "parallel_seq": parallel_seq,
+            "parallel_emb": parallel_emb,
+        }
+        if not _block1_compute_tile_working_set_fits(
+            tile_m=tile_m,
+            tile_k=tile_k,
+            tile_n=tile_n,
+        ):
+            continue
+        if not _block1_runtime_candidate_allowed(candidate, hidden_size=hidden_size):
+            continue
+        topologies.append(candidate)
+    return topologies
 
 
 def _block1_runtime_supported_candidates(
@@ -400,8 +407,7 @@ def _block1_runtime_supported_candidates(
             "tile_n": int(candidate["tile_n"]),
             "num_aie_columns": int(candidate["num_aie_columns"]),
             "parallel_seq": int(candidate["parallel_seq"]),
-            "parallel_heads": int(candidate["parallel_heads"]),
-            "parallel_head_dim": int(candidate["parallel_head_dim"]),
+            "parallel_emb": int(candidate["parallel_emb"]),
         }
         for candidate in _block1_practical_topologies(
             seq_len=seq_len,
@@ -409,38 +415,26 @@ def _block1_runtime_supported_candidates(
             num_heads=num_heads,
         )
     ]
+    runtime_pool = [
+        candidate
+        for candidate in practical
+        if _block1_runtime_candidate_allowed(candidate, hidden_size=hidden_size)
+    ]
     preferred_ids = {
-        _theoretical_topology_id(
-            {
-                **candidate,
-                "num_aie_columns": 8,
-            }
-        )
+        _theoretical_topology_id(candidate)
         for candidate in _block1_seq_independent_supported_candidates(
             hidden_size=hidden_size,
             num_heads=num_heads,
             head_dim=head_dim,
         )
+        if seq_len % (int(candidate["parallel_seq"]) * int(candidate["tile_m"])) == 0
     }
-    ordered: list[dict[str, int]] = []
-    seen_ids: set[str] = set()
-    for candidate in practical:
-        topology_id = _theoretical_topology_id(candidate)
-        if not _block1_runtime_candidate_allowed(candidate, hidden_size=hidden_size):
-            continue
-        if topology_id not in preferred_ids:
-            continue
-        ordered.append(candidate)
-        seen_ids.add(topology_id)
-    for candidate in practical:
-        topology_id = _theoretical_topology_id(candidate)
-        if not _block1_runtime_candidate_allowed(candidate, hidden_size=hidden_size):
-            continue
-        if topology_id in seen_ids:
-            continue
-        ordered.append(candidate)
-        seen_ids.add(topology_id)
-    return ordered
+    return _block1_select_candidates(
+        runtime_pool,
+        sort_key=_block1_runtime_sort_key,
+        preferred_ids=preferred_ids,
+        limit=_BLOCK1_RUNTIME_MAX_CANDIDATES,
+    )
 
 
 def _block1_theoretical_topologies(
@@ -465,16 +459,14 @@ def _block1_theoretical_topologies(
     topologies: list[dict[str, int | str]] = []
     for (
         parallel_seq,
-        parallel_heads,
-        parallel_head_dim,
+        parallel_emb,
         num_aie_columns,
         tile_m,
         tile_k,
         tile_n,
     ) in product(
         _BLOCK1_PARALLEL_SEQ_CHOICES,
-        _divisors(num_heads),
-        _divisors(head_dim),
+        _divisors(hidden_size),
         range(1, 9),
         _divisors(seq_len),
         _divisors(hidden_size),
@@ -488,17 +480,15 @@ def _block1_theoretical_topologies(
             continue
         if seq_len % (parallel_seq * tile_m) != 0:
             continue
-        if num_heads % parallel_heads != 0:
-            continue
-        if head_dim % parallel_head_dim != 0:
-            continue
-        if parallel_seq * parallel_heads * parallel_head_dim > 8:
+        if hidden_size % parallel_emb != 0:
             continue
         if not _block1_compute_tile_working_set_fits(
             tile_m=tile_m,
             tile_k=tile_k,
             tile_n=tile_n,
         ):
+            continue
+        if num_aie_columns % parallel_emb != 0:
             continue
 
         candidate = {
@@ -507,8 +497,7 @@ def _block1_theoretical_topologies(
             "tile_n": tile_n,
             "num_aie_columns": num_aie_columns,
             "parallel_seq": parallel_seq,
-            "parallel_heads": parallel_heads,
-            "parallel_head_dim": parallel_head_dim,
+            "parallel_emb": parallel_emb,
         }
         topologies.append(
             {
@@ -536,55 +525,32 @@ def _block1_practical_topologies(
         hidden_size=hidden_size,
         num_heads=num_heads,
     )
-    retained_runtime_ids = {
-        _theoretical_topology_id(
-            {
-                "tile_m": int(candidate["tile_m"]),
-                "tile_k": int(candidate["tile_k"]),
-                "tile_n": int(candidate["tile_n"]),
-                "num_aie_columns": int(candidate["num_aie_columns"]),
-                "parallel_seq": int(candidate["parallel_seq"]),
-                "parallel_heads": int(candidate["parallel_heads"]),
-                "parallel_head_dim": int(candidate["parallel_head_dim"]),
-            }
-        )
-        for candidate in qkv_proj_topologies(
+    practical = [
+        candidate
+        for candidate in theoretical
+        if _is_block1_practical_candidate(candidate)
+    ]
+    preferred_ids = {
+        _theoretical_topology_id(candidate)
+        for candidate in _block1_seq_independent_supported_candidates(
             hidden_size=hidden_size,
             num_heads=num_heads,
+            head_dim=hidden_size // num_heads,
         )
     }
-
-    ranked = sorted(theoretical, key=_block1_practical_sort_key, reverse=True)
-
-    selected: list[dict[str, int | str]] = []
-    selected_ids: set[str] = set()
-
-    def add_candidate(candidate: dict[str, int | str]) -> None:
-        selected.append(
-            {
-                **candidate,
-                "topology_family": "shared_runtime_qkv_proj_practical",
-            }
-        )
-        selected_ids.add(str(candidate["topology_id"]))
-
-    for candidate in ranked:
-        topology_id = str(candidate["topology_id"])
-        if topology_id not in retained_runtime_ids:
-            continue
-        add_candidate(candidate)
-
-    for candidate in ranked:
-        topology_id = str(candidate["topology_id"])
-        if topology_id in selected_ids:
-            continue
-        if not _is_block1_practical_candidate(candidate):
-            continue
-        add_candidate(candidate)
-        if len(selected) >= max_candidates:
-            break
-
-    return sorted(selected, key=_block1_practical_sort_key, reverse=True)
+    selected = _block1_select_candidates(
+        practical,
+        sort_key=_block1_practical_sort_key,
+        preferred_ids=preferred_ids,
+        limit=max_candidates,
+    )
+    return [
+        {
+            **candidate,
+            "topology_family": "shared_runtime_qkv_proj_practical",
+        }
+        for candidate in selected
+    ]
 
 
 def _divisors(value: int) -> tuple[int, ...]:
@@ -640,7 +606,7 @@ def _is_block1_practical_candidate(candidate: dict[str, int | str]) -> bool:
         tile_m >= _BLOCK1_PRACTICAL_MIN_TILE_M
         and tile_k >= _BLOCK1_PRACTICAL_MIN_TILE_K
         and tile_n >= _BLOCK1_PRACTICAL_MIN_TILE_N
-        and num_aie_columns >= _BLOCK1_PRACTICAL_MIN_AIE_COLUMNS
+        and num_aie_columns == _BLOCK1_RUNTIME_NUM_AIE_COLUMNS
     )
 
 
@@ -650,12 +616,38 @@ def _block1_runtime_candidate_allowed(
     tile_n = int(candidate["tile_n"])
     num_aie_columns = int(candidate["num_aie_columns"])
     parallel_seq = int(candidate["parallel_seq"])
-    parallel_heads = int(candidate["parallel_heads"])
-    parallel_head_dim = int(candidate["parallel_head_dim"])
+    parallel_emb = int(candidate["parallel_emb"])
     return (
         parallel_seq in (1, 2, 4)
-        and num_aie_columns % (parallel_heads * parallel_head_dim) == 0
+        and num_aie_columns == _BLOCK1_RUNTIME_NUM_AIE_COLUMNS
+        and num_aie_columns % parallel_emb == 0
         and hidden_size % (tile_n * num_aie_columns) == 0
+    )
+
+
+def _block1_runtime_sort_key(candidate: dict[str, int | str]) -> tuple[int, ...]:
+    tile_m = int(candidate["tile_m"])
+    tile_k = int(candidate["tile_k"])
+    tile_n = int(candidate["tile_n"])
+    num_aie_columns = int(candidate["num_aie_columns"])
+    parallel_seq = int(candidate["parallel_seq"])
+    parallel_emb = int(candidate["parallel_emb"])
+
+    lane_parallelism = parallel_seq * parallel_emb
+    core_count = parallel_seq * num_aie_columns
+    compute_working_set = _block1_compute_tile_working_set_bytes(
+        tile_m=tile_m,
+        tile_k=tile_k,
+        tile_n=tile_n,
+    )
+
+    return (
+        core_count,
+        lane_parallelism,
+        tile_k,
+        compute_working_set,
+        tile_n,
+        tile_m,
     )
 
 
@@ -665,12 +657,10 @@ def _block1_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ..
     tile_n = int(candidate["tile_n"])
     num_aie_columns = int(candidate["num_aie_columns"])
     parallel_seq = int(candidate["parallel_seq"])
-    parallel_heads = int(candidate["parallel_heads"])
-    parallel_head_dim = int(candidate["parallel_head_dim"])
+    parallel_emb = int(candidate["parallel_emb"])
 
-    lane_parallelism = parallel_seq * parallel_heads * parallel_head_dim
-    output_chunk = tile_n * num_aie_columns
-    sequence_chunk = parallel_seq * tile_m
+    lane_parallelism = parallel_seq * parallel_emb
+    core_count = parallel_seq * num_aie_columns
     compute_working_set = _block1_compute_tile_working_set_bytes(
         tile_m=tile_m,
         tile_k=tile_k,
@@ -678,21 +668,81 @@ def _block1_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ..
     )
 
     return (
+        core_count,
         lane_parallelism,
-        num_aie_columns,
         tile_k,
-        output_chunk,
-        sequence_chunk,
         compute_working_set,
         tile_n,
         tile_m,
     )
 
 
+def _preferred_divisors(
+    value: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> tuple[int, ...]:
+    return tuple(
+        divisor
+        for divisor in _divisors(value)
+        if minimum <= divisor <= maximum and divisor % 8 == 0
+    )
+
+
+def _block1_select_candidates(
+    candidates: list[dict[str, int | str]] | tuple[dict[str, int | str], ...],
+    *,
+    sort_key,
+    preferred_ids: set[str],
+    limit: int,
+) -> list[dict[str, int | str]]:
+    ranked = sorted(candidates, key=sort_key, reverse=True)
+    selected: list[dict[str, int | str]] = []
+    selected_ids: set[str] = set()
+
+    def add_candidate(candidate: dict[str, int | str]) -> None:
+        topology_id = _theoretical_topology_id(
+            {
+                "tile_m": int(candidate["tile_m"]),
+                "tile_k": int(candidate["tile_k"]),
+                "tile_n": int(candidate["tile_n"]),
+                "num_aie_columns": int(candidate["num_aie_columns"]),
+                "parallel_seq": int(candidate["parallel_seq"]),
+                "parallel_emb": int(candidate["parallel_emb"]),
+            }
+        )
+        if topology_id in selected_ids:
+            return
+        selected.append(candidate)
+        selected_ids.add(topology_id)
+
+    for candidate in ranked:
+        topology_id = _theoretical_topology_id(
+            {
+                "tile_m": int(candidate["tile_m"]),
+                "tile_k": int(candidate["tile_k"]),
+                "tile_n": int(candidate["tile_n"]),
+                "num_aie_columns": int(candidate["num_aie_columns"]),
+                "parallel_seq": int(candidate["parallel_seq"]),
+                "parallel_emb": int(candidate["parallel_emb"]),
+            }
+        )
+        if topology_id not in preferred_ids:
+            continue
+        add_candidate(candidate)
+
+    for candidate in ranked:
+        if len(selected) >= limit:
+            break
+        add_candidate(candidate)
+
+    return sorted(selected, key=sort_key, reverse=True)
+
+
 def _theoretical_topology_id(config: dict[str, int]) -> str:
     return (
         f"m{config['tile_m']}_k{config['tile_k']}_n{config['tile_n']}"
         f"_c{config['num_aie_columns']}"
-        f"_ps{config['parallel_seq']}_ph{config['parallel_heads']}"
-        f"_pd{config['parallel_head_dim']}"
+        f"_ps{config['parallel_seq']}_pe{config['parallel_emb']}"
     )

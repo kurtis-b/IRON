@@ -60,12 +60,17 @@ work, see `dataflow_status.md`.
   - `W_K [embedding_dim, num_heads, head_dim]`
   - `W_V [embedding_dim, num_heads, head_dim]`
 - outputs written to DDR:
-  - `q [num_heads, seq, head_dim]`
-  - `k [num_heads, seq, head_dim]`
-  - `v [num_heads, seq, head_dim]`
+  - canonical handoff layout:
+    - `q [seq, embedding_dim]`
+    - `k [seq, embedding_dim]`
+    - `v [seq, embedding_dim]`
+  - wrapper surface:
+    - `q [num_heads, seq, head_dim]`
+    - `k [num_heads, seq, head_dim]`
+    - `v [num_heads, seq, head_dim]`
 
-Block 1 therefore writes transposed-vs-input sequence/head order when it drains
-to DDR.
+Block 1 therefore drains separate flat `Q/K/V` buffers directly, and the wrapper
+only reshapes to head-major when that public surface is requested.
 
 ### Variable workload dimensions
 
@@ -76,8 +81,7 @@ to DDR.
 ### Variable topology dimensions
 
 - `parallel_seq`
-- `parallel_heads`
-- `parallel_head_dim`
+- `parallel_emb`
 - `tile_m`
 - `tile_k`
 - `tile_n`
@@ -87,8 +91,8 @@ to DDR.
 - `embedding_dim == num_heads * head_dim`
 - `parallel_seq in {1, 2, 4, 6, 8}`
 - `seq_len % (parallel_seq * tile_m) == 0`
-- `num_heads % parallel_heads == 0`
-- `head_dim % parallel_head_dim == 0`
+- `embedding_dim % parallel_emb == 0`
+- `num_aie_columns % parallel_emb == 0`
 - the combined topology must fit within the 8-column array
 
 Block 1 currently resolves its retained thesis topologies through the single
@@ -97,45 +101,57 @@ design entrypoint in
 and lowers them through the local standalone fused Block 1 design used by
 [`iron/operators/qkv_proj/op.py`](/home/cj/iron/iron/operators/qkv_proj/op.py).
 The retained `v2` implementation parallelizes the three independent Q/K/V
-projections as one wider GEMM and then reshapes the combined output back to
-head-major `q/k/v` tensors on the wrapper surface. The current Block 1
+projections as one wider GEMM, drains separate `Q/K/V` DDR buffers directly,
+and reshapes to head-major `q/k/v` only on the wrapper surface when needed. The
+current Block 1
 runtime-supported surface is workload-aware over the tile/array part of the
-topology space, and it now lowers real retained-family sweeps for all three
-thesis-facing axes on the canonical `c8` path:
+topology space, and it now lowers real sweeps for both Block 1 topology axes on
+the canonical `c8` path:
 - `parallel_seq` changes the active compute-row count and the Block 1 row tiling
   used by the runtime sequence
-- `parallel_heads` makes the Block 1 `B` fills and `C` drains head-group aware
-- `parallel_head_dim` uses a packed internal `B/C` layout so head-dim groups are
-  contiguous to the lowered design while the wrapper still exposes the original
-  public `q/k/v` layout
-The current runtime-supported Block 1 surface still limits `parallel_seq` to
-`{1, 2, 4}` because the local design only lowers up to the available four
-compute rows, while the broader theoretical/practical catalogs continue to
-explore the larger thesis space.
+- `parallel_emb` partitions each projection's embedding width into contiguous
+  output groups and makes the Block 1 `B` fills and direct `Q/K/V` drains
+  embedding-group aware
+The runtime-supported Block 1 catalog is now generated from the broader
+theoretical/practical space instead of being pinned to the retained `12x64` and
+`16x64` thesis families. It still limits `parallel_seq` to `{1, 2, 4}` because
+the local design only lowers up to the available four compute rows, while the
+broader theoretical/practical catalogs continue to explore the larger thesis
+space. The practical surface is pruned to a compact ranked selection, and the
+runtime-supported surface is pruned further so studies keep a compact set of
+runtime-validated Block 1 candidates per workload.
 That design file should expose three distinct topology views:
 - a seq-len-aware runtime-supported topology list used by operator tests and the
   workload-specific runtime-selection path
 - a broader theoretical topology enumerator that explores every combination
   allowed by the Block 1 contract, fused GEMM tiling, array-column count,
   matmul-kernel divisibility, the current batched-GEMM double-buffered
-  compute-tile local-memory limits, and
-  thesis-facing parallel axes for a given workload
-- a heuristic-pruned practical exploration surface that favors higher lane and
-  column parallelism, larger reusable tiles, larger sequence/output chunks, and
-  better compute-tile utilization while still retaining the baseline
-  runtime-supported study topologies
+  compute-tile local-memory limits, and the current `parallel_seq` /
+  `parallel_emb` lowering axes for a given workload
+- a heuristic-pruned practical exploration surface that keeps only
+  microkernel-valid tile sizes on the current `c8` path and then favors higher
+  core/lane parallelism, larger reusable `tile_k` choices, and fuller
+  compute-tile utilization while still retaining the baseline runtime-supported
+  study topologies
 The checked-in study manifests should continue to pin the baseline retained
 topology IDs for reproducibility even as that broader theoretical exploration
-surface grows.
+surface grows; legacy head-based Block 1 topology IDs are still accepted as
+aliases for compatibility, but the canonical Block 1 surface is now expressed
+in terms of `parallel_seq` and `parallel_emb`.
 
 ## Block 2
 
 ### Public tensor contract
 
 - inputs:
-  - `q [num_heads, seq, head_dim]`
-  - `k [num_heads, seq, head_dim]`
-  - `v [num_heads, seq, head_dim]`
+  - accepted canonical layout:
+    - `q [seq, embedding_dim]`
+    - `k [seq, embedding_dim]`
+    - `v [seq, embedding_dim]`
+  - also accepted:
+    - `q [num_heads, seq, head_dim]`
+    - `k [num_heads, seq, head_dim]`
+    - `v [num_heads, seq, head_dim]`
 - output:
   - `hidden_states [seq, embedding_dim]`
 

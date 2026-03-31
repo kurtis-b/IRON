@@ -26,41 +26,50 @@ Current state:
 - `pipelined`: no
 - current implementation shape:
   - one fused `QKV` projection invocation
-  - host-side split back into `q/k/v`
+  - direct device drains into separate flat `Q/K/V` buffers
+  - wrapper can expose either flat `Q/K/V` or head-major `q/k/v`
 
 Current runtime-supported surface:
 
-- retained workload families only:
-  - `12 x 64`
-  - `16 x 64`
 - runtime support is `seq_len`-aware
 - the current local lowering now runtime-supports:
-  - tile/column variants
+  - a generated/pruned `c8` runtime catalog instead of a retained-only family
+    table
   - a real `parallel_seq` sweep with active row counts in `{1, 2, 4}`
-  - a real `parallel_heads` sweep on the canonical retained `c8` topologies
-  - a real `parallel_head_dim` sweep on the canonical retained `c8`
-    topologies through a packed internal `B/C` layout
+  - a real `parallel_emb` sweep on the canonical `c8` path through contiguous
+    embedding-group `B` fills and direct `Q/K/V` drains
+  - broader workload-family support beyond the retained `12x64` and `16x64`
+    study families
+- the runtime-supported surface is now pruned to at most `12` candidates per
+  workload, and the practical exploration surface is pruned to at most `20`
+  candidates per workload
 - for the currently exercised retained workloads, that runtime-supported
   surface is:
-  - `seq_len=64, hidden=768, heads=12`: `58` topologies
-  - `seq_len=512, hidden=768, heads=12`: `51` topologies
-  - `seq_len=64, hidden=1024, heads=16`: `39` topologies
-  - `seq_len=512, hidden=1024, heads=16`: `40` topologies
+  - `seq_len=64, hidden=768, heads=12`: `12` topologies
+  - `seq_len=512, hidden=768, heads=12`: `12` topologies
+  - `seq_len=64, hidden=1024, heads=16`: `12` topologies
+  - `seq_len=512, hidden=1024, heads=16`: `12` topologies
+- representative generalized workloads that now produce runtime/practical
+  Block 1 catalogs include:
+  - `seq_len=512, hidden=1536, heads=24`: runtime `12`, practical `20`
+  - `seq_len=512, hidden=960, heads=12`: runtime `12`, practical `20`
 
 Verified today:
 
 - supported Block 1 runtime topologies are functionally verified in
   `iron/operators/qkv_proj/test.py`
+- the Block 1 -> Block 2 flat `Q/K/V` handoff is functionally verified in the
+  local operator tests and used by the structured Dataflow pattern
 
 Work left:
 
-- if wider thesis families are needed, generalize beyond the retained `12 x 64`
-  and `16 x 64` families
 - if higher sequence-lane support is needed, extend the current `parallel_seq`
   runtime lowering beyond `{1, 2, 4}`
-- continue promoting broader Block 1 runtime topologies only after standalone
-  validation; the practical/theoretical catalogs are still broader than the
-  runtime-supported study surface
+- if a wider embedding-group sweep is needed, continue validating and promoting
+  additional `parallel_emb` variants as they are selected by studies
+- continue validating and promoting additional generalized workload families as
+  they get exercised in studies; the practical/theoretical catalogs are still
+  broader than the pruned runtime-supported study surface
 - if a staged Block 1 pipeline is desired, introduce real internal worker
   stages rather than the current single fused GEMM shape
 

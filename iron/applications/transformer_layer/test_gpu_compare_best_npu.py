@@ -106,17 +106,17 @@ def test_benchmark_best_npu_vs_gpu_preserves_reference_npu_topology_metadata(
                         "synthetic",
                         "3.5",
                         "completed",
-                        "m64_k64_n16_c8_ps1_ph1_pd1",
+                        "m64_k64_n16_c8_ps1_pe1",
                         "shared_runtime_qkv_proj",
                         "q32_kv64_e96_ps1_ph1_acc1",
                         "fused_mha_out_proj",
                         "m32_k96_n64_ps4_pi3_d8_g1",
                         "pipelined_addnorm_ffn_addnorm",
-                        "m32_k256_n24_c8_ps2_ph1_pd4",
+                        "m32_k256_n24_c8_ps2_pe4",
                         "shared_runtime_qkv_proj_practical",
                         "q32_kv64_e96_ps1_ph6_acc1",
                         "fused_mha_out_proj_practical",
-                        "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+                        "m16_k384_n16_c8_ps4_pi3_d2_g1",
                         "pipelined_addnorm_ffn_addnorm_practical",
                     ]
                 ),
@@ -170,14 +170,13 @@ def test_benchmark_best_npu_vs_gpu_preserves_reference_npu_topology_metadata(
     )
 
     row = rows[0]
-    assert row["reference_npu_block1_topology_id"] == "m64_k64_n16_c8_ps1_ph1_pd1"
+    assert row["reference_npu_block1_topology_id"] == "m64_k64_n16_c8_ps1_pe1"
     assert row["reference_npu_block2_topology_family"] == "fused_mha_out_proj"
     assert (
         row["reference_npu_block3_topology_family"] == "pipelined_addnorm_ffn_addnorm"
     )
     assert (
-        row["reference_npu_exploration_block1_topology_id"]
-        == "m32_k256_n24_c8_ps2_ph1_pd4"
+        row["reference_npu_exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_pe4"
     )
     assert (
         row["reference_npu_exploration_block2_topology_family"]
@@ -185,5 +184,5 @@ def test_benchmark_best_npu_vs_gpu_preserves_reference_npu_topology_metadata(
     )
     assert (
         row["reference_npu_exploration_block3_topology_id"]
-        == "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1"
+        == "m16_k384_n16_c8_ps4_pi3_d2_g1"
     )

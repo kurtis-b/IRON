@@ -52,8 +52,7 @@ def practical_block_topology_catalog(
             int(candidate["tile_n"]),
             int(candidate["num_aie_columns"]),
             int(candidate["parallel_seq"]),
-            int(candidate["parallel_heads"]),
-            int(candidate["parallel_head_dim"]),
+            int(candidate["parallel_emb"]),
         ): (
             str(candidate["topology_id"]),
             str(candidate["topology_family"]),
@@ -297,8 +296,7 @@ def _block1_catalog_candidate(
         int(candidate["tile_n"]),
         int(candidate["num_aie_columns"]),
         int(candidate["parallel_seq"]),
-        int(candidate["parallel_heads"]),
-        int(candidate["parallel_head_dim"]),
+        int(candidate["parallel_emb"]),
     )
     runtime_match = runtime_signature_map.get(runtime_signature)
     return {

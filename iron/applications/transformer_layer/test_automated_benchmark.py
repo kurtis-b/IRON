@@ -60,24 +60,24 @@ def test_checked_in_dataflow_manifests_pin_retained_block_topologies():
     manifest_specs = {
         "design_patterns_end_to_end.json": {
             "baseline_768": {
-                "block1_topology_id": "m64_k64_n16_c8_ps1_ph1_pd1",
+                "block1_topology_id": "m64_k64_n16_c8_ps1_pe1",
                 "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
                 "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
             },
             "baseline_1024": {
-                "block1_topology_id": "m64_k64_n16_c8_ps1_ph1_pd1",
+                "block1_topology_id": "m64_k64_n16_c8_ps1_pe1",
                 "block2_topology_id": "q32_kv64_e128_ps1_ph1_acc1",
                 "block3_topology_id": "m32_k128_n32_ps4_pi2_d8_g1",
             },
         },
         "dataflow_blocks.json": {
             "baseline_768": {
-                "block1_topology_id": "m64_k64_n16_c8_ps1_ph1_pd1",
+                "block1_topology_id": "m64_k64_n16_c8_ps1_pe1",
                 "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
                 "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
             },
             "baseline_1024": {
-                "block1_topology_id": "m64_k64_n16_c8_ps1_ph1_pd1",
+                "block1_topology_id": "m64_k64_n16_c8_ps1_pe1",
                 "block2_topology_id": "q32_kv64_e128_ps1_ph1_acc1",
                 "block3_topology_id": "m32_k128_n32_ps4_pi2_d8_g1",
             },
@@ -106,7 +106,7 @@ def test_load_study_manifest_normalizes_and_validates_layer_specs(tmp_path: Path
             "hidden_size": 768,
             "intermediate_size": 3072,
             "num_attention_heads": 12,
-            "block1_topology_id": "m64_k64_n16_c8_ps1_ph1_pd1"
+            "block1_topology_id": "m64_k64_n16_c8_ps1_pe1"
           }
         }
         """,
@@ -117,7 +117,7 @@ def test_load_study_manifest_normalizes_and_validates_layer_specs(tmp_path: Path
 
     assert manifest["layer_spec"]["seq_len"] == 128
     assert manifest["layer_spec"]["batch_size"] == 1
-    assert manifest["layer_spec"]["block1_topology_id"] == "m64_k64_n16_c8_ps1_ph1_pd1"
+    assert manifest["layer_spec"]["block1_topology_id"] == "m64_k64_n16_c8_ps1_pe1"
 
 
 def test_load_study_manifest_rejects_invalid_layer_specs(tmp_path: Path):
@@ -189,8 +189,6 @@ def test_load_study_manifest_expands_practical_topology_exploration(tmp_path: Pa
         assert case["layer_spec"]["block1_topology_id"] is not None
         assert case["layer_spec"]["block2_topology_id"] is not None
         assert case["layer_spec"]["block3_topology_id"] is not None
-        assert not str(case["layer_spec"]["block3_topology_id"]).startswith("cr")
-        assert str(case["exploration_block3_topology_id"]).startswith("cr")
         if (
             case["exploration_block1_topology_id"]
             != case["layer_spec"]["block1_topology_id"]
@@ -268,31 +266,31 @@ def test_write_results_csv_reserves_topology_columns(tmp_path: Path):
                 "measured_inference_count": 1,
                 "timed_total_sec": 0.01,
                 "avg_latency_ms": 10.0,
-                "block1_topology_id": "m64_k64_n16_c8_ps1_ph1_pd1",
+                "block1_topology_id": "m64_k64_n16_c8_ps1_pe1",
                 "block1_topology_family": "shared_runtime_qkv_proj",
                 "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
                 "block2_topology_family": "fused_mha_out_proj",
                 "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
                 "block3_topology_family": "pipelined_addnorm_ffn_addnorm",
-                "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+                "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_pe4",
                 "exploration_block1_topology_family": "shared_runtime_qkv_proj_practical",
                 "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
                 "exploration_block2_topology_family": "fused_mha_out_proj_practical",
-                "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+                "exploration_block3_topology_id": "m16_k384_n16_c8_ps4_pi3_d2_g1",
                 "exploration_block3_topology_family": "pipelined_addnorm_ffn_addnorm_practical",
                 "reference_npu_execution_mode": "dataflow",
                 "reference_npu_avg_latency_ms": 9.5,
-                "reference_npu_block1_topology_id": "m64_k64_n16_c8_ps1_ph1_pd1",
+                "reference_npu_block1_topology_id": "m64_k64_n16_c8_ps1_pe1",
                 "reference_npu_block1_topology_family": "shared_runtime_qkv_proj",
                 "reference_npu_block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
                 "reference_npu_block2_topology_family": "fused_mha_out_proj",
                 "reference_npu_block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
                 "reference_npu_block3_topology_family": "pipelined_addnorm_ffn_addnorm",
-                "reference_npu_exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+                "reference_npu_exploration_block1_topology_id": "m32_k256_n24_c8_ps2_pe4",
                 "reference_npu_exploration_block1_topology_family": "shared_runtime_qkv_proj_practical",
                 "reference_npu_exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
                 "reference_npu_exploration_block2_topology_family": "fused_mha_out_proj_practical",
-                "reference_npu_exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+                "reference_npu_exploration_block3_topology_id": "m16_k384_n16_c8_ps4_pi3_d2_g1",
                 "reference_npu_exploration_block3_topology_family": "pipelined_addnorm_ffn_addnorm_practical",
             }
         ],
@@ -358,7 +356,7 @@ def test_write_results_csv_reserves_topology_columns(tmp_path: Path):
 def test_decorate_row_for_case_backfills_requested_block_topology_metadata():
     spec = TransformerLayerSpec(
         seq_len=64,
-        block1_topology_id="m64_k64_n16_c8_ps1_ph1_pd1",
+        block1_topology_id="m64_k64_n16_c8_ps1_pe1",
         block2_topology_id="q32_kv64_e96_ps1_ph1_acc1",
         block3_topology_id="m32_k96_n64_ps4_pi3_d8_g1",
     )
@@ -381,11 +379,11 @@ def test_decorate_row_for_case_backfills_requested_block_topology_metadata():
         case={
             "case_id": "case",
             "case_label": "case",
-            "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+            "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_pe4",
             "exploration_block1_topology_family": "shared_runtime_qkv_proj_practical",
             "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
             "exploration_block2_topology_family": "fused_mha_out_proj_practical",
-            "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+            "exploration_block3_topology_id": "m16_k384_n16_c8_ps4_pi3_d2_g1",
             "exploration_block3_topology_family": "pipelined_addnorm_ffn_addnorm_practical",
         },
         spec=spec,
@@ -397,15 +395,15 @@ def test_decorate_row_for_case_backfills_requested_block_topology_metadata():
     assert row["block2_topology_family"] == "fused_mha_out_proj"
     assert row["block3_topology_id"] == spec.block3_topology_id
     assert row["block3_topology_family"] == "pipelined_addnorm_ffn_addnorm"
-    assert row["exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_ph1_pd4"
+    assert row["exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_pe4"
     assert row["exploration_block2_topology_id"] == "q32_kv64_e96_ps1_ph6_acc1"
-    assert row["exploration_block3_topology_id"] == "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1"
+    assert row["exploration_block3_topology_id"] == "m16_k384_n16_c8_ps4_pi3_d2_g1"
 
 
 def test_failure_result_row_includes_requested_block_topology_metadata():
     spec = TransformerLayerSpec(
         seq_len=64,
-        block1_topology_id="m64_k64_n16_c8_ps1_ph1_pd1",
+        block1_topology_id="m64_k64_n16_c8_ps1_pe1",
         block2_topology_id="q32_kv64_e96_ps1_ph1_acc1",
         block3_topology_id="m32_k96_n64_ps4_pi3_d8_g1",
     )
@@ -415,9 +413,9 @@ def test_failure_result_row_includes_requested_block_topology_metadata():
         case={
             "case_id": "case",
             "case_label": "case",
-            "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+            "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_pe4",
             "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
-            "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+            "exploration_block3_topology_id": "m16_k384_n16_c8_ps4_pi3_d2_g1",
         },
         spec=spec,
         execution_mode="dataflow",
@@ -432,9 +430,9 @@ def test_failure_result_row_includes_requested_block_topology_metadata():
     assert row["block2_topology_family"] == "fused_mha_out_proj"
     assert row["block3_topology_id"] == spec.block3_topology_id
     assert row["block3_topology_family"] == "pipelined_addnorm_ffn_addnorm"
-    assert row["exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_ph1_pd4"
+    assert row["exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_pe4"
     assert row["exploration_block2_topology_id"] == "q32_kv64_e96_ps1_ph6_acc1"
-    assert row["exploration_block3_topology_id"] == "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1"
+    assert row["exploration_block3_topology_id"] == "m16_k384_n16_c8_ps4_pi3_d2_g1"
 
 
 def test_run_parity_checks_forwards_requested_block_topology_ids(
@@ -460,17 +458,17 @@ def test_run_parity_checks_forwards_requested_block_topology_ids(
             {
                 "case_id": "case",
                 "case_label": "case",
-                "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_ph1_pd4",
+                "exploration_block1_topology_id": "m32_k256_n24_c8_ps2_pe4",
                 "exploration_block1_topology_family": "shared_runtime_qkv_proj_practical",
                 "exploration_block2_topology_id": "q32_kv64_e96_ps1_ph6_acc1",
                 "exploration_block2_topology_family": "fused_mha_out_proj_practical",
-                "exploration_block3_topology_id": "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1",
+                "exploration_block3_topology_id": "m16_k384_n16_c8_ps4_pi3_d2_g1",
                 "exploration_block3_topology_family": "pipelined_addnorm_ffn_addnorm_practical",
                 "layer_spec": {
                     "hidden_size": 768,
                     "intermediate_size": 3072,
                     "num_attention_heads": 12,
-                    "block1_topology_id": "m64_k64_n16_c8_ps1_ph1_pd1",
+                    "block1_topology_id": "m64_k64_n16_c8_ps1_pe1",
                     "block2_topology_id": "q32_kv64_e96_ps1_ph1_acc1",
                     "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
                 },
@@ -500,12 +498,9 @@ def test_run_parity_checks_forwards_requested_block_topology_ids(
     assert "--block2-topology-id" in command
     assert "--block3-topology-id" in command
     assert rows[0]["study_case_id"] == "case"
-    assert rows[0]["exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_ph1_pd4"
+    assert rows[0]["exploration_block1_topology_id"] == "m32_k256_n24_c8_ps2_pe4"
     assert rows[0]["exploration_block2_topology_id"] == "q32_kv64_e96_ps1_ph6_acc1"
-    assert (
-        rows[0]["exploration_block3_topology_id"]
-        == "cr128_m32_k96_n64_c8_ps4_pi3_d8_g1"
-    )
+    assert rows[0]["exploration_block3_topology_id"] == "m16_k384_n16_c8_ps4_pi3_d2_g1"
 
 
 def test_resolve_spec_applies_block_topology_id_overrides():
@@ -514,7 +509,7 @@ def test_resolve_spec_applies_block_topology_id_overrides():
             hidden_size=None,
             intermediate_size=None,
             num_attention_heads=None,
-            block1_topology_id="m64_k64_n16_c8_ps1_ph1_pd1",
+            block1_topology_id="m64_k64_n16_c8_ps1_pe1",
             block2_topology_id="q32_kv64_e96_ps1_ph1_acc1",
             block3_topology_id="m32_k96_n64_ps4_pi3_d8_g1",
         ),
@@ -522,7 +517,7 @@ def test_resolve_spec_applies_block_topology_id_overrides():
         64,
     )
 
-    assert spec.block1_topology_id == "m64_k64_n16_c8_ps1_ph1_pd1"
+    assert spec.block1_topology_id == "m64_k64_n16_c8_ps1_pe1"
     assert spec.block2_topology_id == "q32_kv64_e96_ps1_ph1_acc1"
     assert spec.block3_topology_id == "m32_k96_n64_ps4_pi3_d8_g1"
 

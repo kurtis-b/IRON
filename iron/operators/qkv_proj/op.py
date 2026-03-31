@@ -19,7 +19,7 @@ from iron.common import (
     SourceArtifact,
     XclbinArtifact,
 )
-from iron.common.utils import numpy_to_torch, torch_to_numpy
+from iron.common.utils import torch_to_numpy
 from iron.operators.qkv_proj.topology import qkv_proj_design
 
 
@@ -51,62 +51,6 @@ class _ProjectionWeightView:
 
 class AIEQKVProj(AIEOperatorBase):
     """Block 1 fused Q/K/V projection."""
-
-    @staticmethod
-    def _pack_parallel_head_dim_layout(
-        tensor: torch.Tensor,
-        *,
-        hidden_size: int,
-        num_heads: int,
-        parallel_heads: int,
-        parallel_head_dim: int,
-    ) -> torch.Tensor:
-        if parallel_head_dim == 1:
-            return tensor.contiguous()
-        head_dim = hidden_size // num_heads
-        heads_per_group = num_heads // parallel_heads
-        head_dim_chunk = head_dim // parallel_head_dim
-        view = tensor.view(
-            tensor.shape[0],
-            3,
-            parallel_heads,
-            heads_per_group,
-            parallel_head_dim,
-            head_dim_chunk,
-        )
-        return (
-            view.permute(0, 1, 2, 4, 3, 5)
-            .contiguous()
-            .view(tensor.shape[0], 3 * hidden_size)
-        )
-
-    @staticmethod
-    def _unpack_parallel_head_dim_layout(
-        tensor: torch.Tensor,
-        *,
-        hidden_size: int,
-        num_heads: int,
-        parallel_heads: int,
-        parallel_head_dim: int,
-    ) -> torch.Tensor:
-        if parallel_head_dim == 1:
-            return tensor.contiguous()
-        head_dim = hidden_size // num_heads
-        heads_per_group = num_heads // parallel_heads
-        head_dim_chunk = head_dim // parallel_head_dim
-        view = tensor.view(
-            tensor.shape[0],
-            3,
-            parallel_heads,
-            parallel_head_dim,
-            heads_per_group,
-            head_dim_chunk,
-        )
-        return (
-            view.permute(0, 1, 2, 4, 3, 5)
-            .contiguous()
-            .view(tensor.shape[0], 3 * hidden_size)
-        )
 
     @staticmethod
     def _to_head_major(
@@ -145,8 +89,7 @@ class AIEQKVProj(AIEOperatorBase):
         self.topology_id = str(topology["topology_id"])
         self.topology_family = str(topology["topology_family"])
         self.parallel_seq = int(topology["parallel_seq"])
-        self.parallel_heads = int(topology["parallel_heads"])
-        self.parallel_head_dim = int(topology["parallel_head_dim"])
+        self.parallel_emb = int(topology["parallel_emb"])
         self.tile_m = int(topology["tile_m"])
         self.tile_k = int(topology["tile_k"])
         self.tile_n = int(topology["tile_n"])
@@ -186,7 +129,7 @@ class AIEQKVProj(AIEOperatorBase):
     def _get_artifact_name_base(self, prefix: str, M: int, K: int, N: int) -> str:
         return (
             f"{prefix}{M}x{K}x{N}_{self.num_aie_columns}_{self.tile_m}x{self.tile_k}x{self.tile_n}"
-            f"_ps{self.parallel_seq}_ph{self.parallel_heads}_pd{self.parallel_head_dim}"
+            f"_ps{self.parallel_seq}_pe{self.parallel_emb}"
             "_0_0_bf16_bf16_sc0_acc0_embf161_round1_batchA1d0_batchB1d0_batchC1d0"
         )
 
@@ -223,8 +166,7 @@ class AIEQKVProj(AIEOperatorBase):
                 "tile_n": self.tile_n,
                 "num_aie_columns": self.num_aie_columns,
                 "parallel_seq": self.parallel_seq,
-                "parallel_heads": self.parallel_heads,
-                "parallel_head_dim": self.parallel_head_dim,
+                "parallel_emb": self.parallel_emb,
                 "dtype_in_str": "bf16",
                 "dtype_out_str": "bf16",
                 "use_scalar": False,
@@ -317,8 +259,10 @@ class AIEQKVProj(AIEOperatorBase):
             self.K * self.N,
             static_data=torch_to_numpy(self._packed_weight_matrix()),
         )
-        self.add_buffer("C", self.M * self.N)
-        self.add_to_runlist("qkv_proj", "A", "B", "C")
+        self.add_buffer("Q", self.M * self.hidden_size)
+        self.add_buffer("K", self.M * self.hidden_size)
+        self.add_buffer("V", self.M * self.hidden_size)
+        self.add_to_runlist("qkv_proj", "A", "B", "Q", "K", "V")
 
     def _projection_slice(self, projection_index: int) -> slice:
         start = projection_index * self.hidden_size
@@ -345,18 +289,28 @@ class AIEQKVProj(AIEOperatorBase):
         return padded
 
     def _packed_weight_matrix(self) -> torch.Tensor:
-        packed = self.weight.T.contiguous()
-        if self.parallel_head_dim > 1:
-            packed = self._pack_parallel_head_dim_layout(
-                packed,
-                hidden_size=self.hidden_size,
-                num_heads=self.num_heads,
-                parallel_heads=self.parallel_heads,
-                parallel_head_dim=self.parallel_head_dim,
-            )
-        return packed
+        return self.weight.T.contiguous()
 
-    def _execute_fused_qkv(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _validate_hidden_states(self, hidden_states: torch.Tensor) -> None:
+        if hidden_states.ndim != 2:
+            raise AIEOperatorConstraintError(
+                "AIEQKVProj: expected a 2D hidden_states tensor"
+            )
+        if hidden_states.shape[0] != self.seq_len:
+            raise AIEOperatorConstraintError(
+                "AIEQKVProj: hidden_states sequence length must match the compiled operator"
+            )
+
+    def _read_projection_output(self, buffer_name: str, seq_len: int) -> torch.Tensor:
+        return self.read_buffer_as_torch(
+            buffer_name,
+            shape=(self.M, self.hidden_size),
+            dtype=bfloat16,
+        )[:seq_len]
+
+    def _execute_flat_qkv(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_states_np = torch_to_numpy(hidden_states)
         seq_len, hidden_size = hidden_states_np.shape
 
@@ -372,36 +326,22 @@ class AIEQKVProj(AIEOperatorBase):
         self.write_buffer("A", self._pad_hidden_states(hidden_states_np))
         self.run_runlist()
 
-        qkv = self.read_buffer(
-            "C",
-            shape=(1, self.M, self.N),
-            dtype=bfloat16,
-        )[0, :seq_len, : self._combined_hidden_size(self.hidden_size)]
-        qkv_torch = numpy_to_torch(np.array(qkv, copy=True))
-        if self.parallel_head_dim > 1:
-            qkv_torch = self._unpack_parallel_head_dim_layout(
-                qkv_torch,
-                hidden_size=self.hidden_size,
-                num_heads=self.num_heads,
-                parallel_heads=self.parallel_heads,
-                parallel_head_dim=self.parallel_head_dim,
-            )
-        return qkv_torch
+        return (
+            self._read_projection_output("Q", seq_len),
+            self._read_projection_output("K", seq_len),
+            self._read_projection_output("V", seq_len),
+        )
+
+    def forward_flat(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._validate_hidden_states(hidden_states)
+        return self._execute_flat_qkv(hidden_states)
 
     def forward(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if hidden_states.ndim != 2:
-            raise AIEOperatorConstraintError(
-                "AIEQKVProj: expected a 2D hidden_states tensor"
-            )
-        if hidden_states.shape[0] != self.seq_len:
-            raise AIEOperatorConstraintError(
-                "AIEQKVProj: hidden_states sequence length must match the compiled operator"
-            )
-
-        qkv = self._execute_fused_qkv(hidden_states).contiguous()
-        q_matrix, k_matrix, v_matrix = torch.split(qkv, self.hidden_size, dim=-1)
+        q_matrix, k_matrix, v_matrix = self.forward_flat(hidden_states)
         q = self._to_head_major(
             q_matrix,
             seq_len=self.seq_len,
