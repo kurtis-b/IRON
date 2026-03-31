@@ -459,7 +459,6 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                 "(rows / tile_m) divisible by parallel_seq"
             )
 
-        row_iters_per_a_tile = num_row_tiles // self.parallel_seq
         k_div_tile = K // self.tile_k
         tile_elems = self.tile_m * self.tile_k
         packed_hidden_residual_np = np.zeros(
@@ -467,14 +466,10 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         )
 
         for row_tile_idx in range(num_row_tiles):
-            a_tile = row_tile_idx % self.parallel_seq
-            row_iter = row_tile_idx // self.parallel_seq
             row_start = row_tile_idx * self.tile_m
             for k_tile_idx in range(k_div_tile):
                 col_start = k_tile_idx * self.tile_k
-                tile_index = (
-                    a_tile * row_iters_per_a_tile + row_iter
-                ) * k_div_tile + k_tile_idx
+                tile_index = row_tile_idx * k_div_tile + k_tile_idx
                 tile_offset = tile_index * (2 * tile_elems)
                 packed_hidden_residual_np[tile_offset : tile_offset + tile_elems] = (
                     attention_output_np[
@@ -510,7 +505,6 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                 "(rows / tile_m) divisible by parallel_seq"
             )
 
-        row_iters_per_a_tile = num_row_tiles // self.parallel_seq
         k_div_tile = self.K // self.tile_k
         tile_elems = self.tile_m * self.tile_k
         attention_output_np = np.zeros(
@@ -519,14 +513,10 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         residual_np = np.zeros((rows, self.K), dtype=packed_hidden_residual_np.dtype)
 
         for row_tile_idx in range(num_row_tiles):
-            a_tile = row_tile_idx % self.parallel_seq
-            row_iter = row_tile_idx // self.parallel_seq
             row_start = row_tile_idx * self.tile_m
             for k_tile_idx in range(k_div_tile):
                 col_start = k_tile_idx * self.tile_k
-                tile_index = (
-                    a_tile * row_iters_per_a_tile + row_iter
-                ) * k_div_tile + k_tile_idx
+                tile_index = row_tile_idx * k_div_tile + k_tile_idx
                 tile_offset = tile_index * (2 * tile_elems)
                 attention_output_np[
                     row_start : row_start + self.tile_m,

@@ -1282,7 +1282,7 @@ def fused_addnorm_ffn_addnorm(
                 return
             for a_tile in range(nA_tiles_distributed):
                 packed_tile_offset = (
-                    (a_tile * ln_iters_per_core + row_tile_idx)
+                    (row_tile_idx * nA_tiles_distributed + a_tile)
                     * K_div_k
                     * packed_tile_elems
                 )
@@ -1313,7 +1313,7 @@ def fused_addnorm_ffn_addnorm(
         def emit_grouped_phase(row_tile_idx: int, col_group: int, *, emit_output: bool):
             nonlocal tg
             row_packed_tile_offsets = [
-                (a_tile * ln_iters_per_core + row_tile_idx)
+                (row_tile_idx * nA_tiles_distributed + a_tile)
                 * K_div_k
                 * packed_tile_elems
                 for a_tile in range(nA_tiles_distributed)

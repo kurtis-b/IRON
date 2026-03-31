@@ -193,14 +193,11 @@ def _block2_block3_packed_handoff_compatible(
     block2_candidate: dict[str, int | str],
     block3_candidate: dict[str, int | str],
 ) -> bool:
-    block2_parallel_seq = int(block2_candidate["parallel_seq"])
     q_seq_tile = int(block2_candidate["q_seq_tile"])
     emb_tile = int(block2_candidate["emb_tile"])
     parallel_seq = int(block3_candidate["parallel_seq"])
     tile_m = int(block3_candidate["tile_m"])
     tile_k = int(block3_candidate["tile_k"])
-    if block2_parallel_seq != 1:
-        return False
     if seq_len % q_seq_tile != 0:
         return False
     if q_seq_tile != tile_m or emb_tile != tile_k:
@@ -240,7 +237,16 @@ def _resolve_dataflow_topology_ids(
             f"Unknown Block 3 topology_id={spec.block3_topology_id!r} for dataflow pattern"
         )
     for block3_candidate in block3_candidates:
-        for block2_candidate in block2_candidates:
+        preferred_block2_candidates = sorted(
+            block2_candidates,
+            key=lambda candidate: (
+                int(candidate["parallel_seq"]) != int(block3_candidate["parallel_seq"]),
+                int(candidate["parallel_heads"]) != 1,
+                -int(candidate["parallel_heads"]),
+                -int(candidate["o_proj_acc_depth"]),
+            ),
+        )
+        for block2_candidate in preferred_block2_candidates:
             if _block2_block3_packed_handoff_compatible(
                 seq_len=spec.seq_len,
                 block2_candidate=block2_candidate,

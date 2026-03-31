@@ -102,11 +102,14 @@ Current runtime-supported surface:
     `seq_len` is divisible by `192`, and `ps8` is currently validated on
     retained workloads whose `seq_len` is divisible by `256`
   - a narrower validated `parallel_seq` subset on the retained `1x64` family:
-    `seq_len=64`, `parallel_seq=2`, `parallel_heads == 1`, `q_seq_tile == 32`,
-    `kv_seq_tile == 64`, `emb_tile == 64`, `o_proj_acc_depth == 1`
+    `parallel_heads == 1`, `q_seq_tile == 32`, `kv_seq_tile == 64`,
+    `emb_tile == 64`, `o_proj_acc_depth == 1`, with `ps2` validated at
+    `seq_len=64`, `ps2/ps4/ps6` validated at `seq_len=384`, and
+    `ps2/ps4/ps8` validated at `seq_len=512`
 - the current exercised runtime-supported surface is:
   - `seq_len=64, heads=1, head_dim=64`: `2` topologies
-  - `seq_len=512, heads=1, head_dim=64`: `1` topology
+  - `seq_len=384, heads=1, head_dim=64`: `4` topologies
+  - `seq_len=512, heads=1, head_dim=64`: `4` topologies
   - `seq_len=64, heads=12, head_dim=64`: `7` topologies
   - `seq_len=512, heads=12, head_dim=64`: `10` topologies
   - `seq_len=64, heads=16, head_dim=64`: `6` topologies
@@ -117,6 +120,14 @@ Current runtime-supported surface:
     - `q32_kv64_e64_ps2_ph1_acc1`
   - `1 x 64, seq_len=512`
     - `q32_kv64_e64_ps1_ph1_acc1`
+    - `q32_kv64_e64_ps2_ph1_acc1`
+    - `q32_kv64_e64_ps4_ph1_acc1`
+    - `q32_kv64_e64_ps8_ph1_acc1`
+  - `1 x 64, seq_len=384`
+    - `q32_kv64_e64_ps1_ph1_acc1`
+    - `q32_kv64_e64_ps2_ph1_acc1`
+    - `q32_kv64_e64_ps4_ph1_acc1`
+    - `q32_kv64_e64_ps6_ph1_acc1`
   - `12 x 64, seq_len=64`
     - `q32_kv64_e96_ps1_ph1_acc1`
     - `q32_kv64_e96_ps1_ph2_acc1`
@@ -152,19 +163,24 @@ Verified today:
 - supported Block 2 runtime topologies are functionally verified in
   `iron/operators/mha_out_proj/test.py`
 - the packed Block 2 output path used for the Block 2 -> Block 3 handoff has
-  focused layout tests, direct dense-vs-packed parity coverage on the retained
-  `ps1` runtime path, and representative app-level parity coverage when it is
-  paired with a tile-compatible Block 3 runtime topology, but not a full
-  compatible-pair sweep yet
+  focused layout tests, direct dense-vs-packed parity coverage on both the
+  retained `ps1` runtime path, a representative composed `ps2/ph2` path, and a
+  representative mismatched-target packed case where Block 2 runs at `ps2` and
+  writes the canonical packed layout for Block 3 `ps1`, and
+  representative app-level parity coverage when it is paired with a
+  tile-compatible Block 3 runtime topology, but not a full compatible-pair
+  sweep yet
 
 Work left:
 
 - broaden the current real `parallel_seq` lowering beyond the validated
-  `parallel_heads == 1`, `q32/kv64/acc1`, retained-family subset; today the
-  `1x64` family still only validates the short-sequence `seq_len=64, ps2` case
+  `q32/kv64/acc1`, retained-family subset; on the `1x64` family the current
+  widened support is still limited to `parallel_heads == 1`
 - broaden the packed Block 2 output mode beyond the current restricted path
-  used for Block 3 handoff; the current packed handoff still requires
-  `Block 2 parallel_seq == 1`
+  used for Block 3 handoff; the current packed handoff no longer requires
+  `Block 2 parallel_seq == Block 3 parallel_seq`, but it still requires
+  matching `(q_seq_tile, emb_tile) == (tile_m, tile_k)` and a Block 3-compatible
+  packed row count
 - widen runtime support across more of the practical/theoretical Block 2 space,
   especially if higher `o_proj_acc_depth` or wider family support is needed
 - remove the remaining pytest skips in the practical matrix as those topologies
@@ -223,6 +239,7 @@ Current execution contract:
   pair must also satisfy:
   - Block 2 `q_seq_tile ==` Block 3 `tile_m`
   - Block 2 `emb_tile ==` Block 3 `tile_k`
+  - `(seq_len / Block 2 q_seq_tile)` divisible by Block 3 `parallel_seq`
 - artifacts are compiled for the concrete requested `seq_len`; the current
   Block 3 runtime does not pad or chunk rows internally
 

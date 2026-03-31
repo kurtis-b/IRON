@@ -25,6 +25,7 @@ from iron.operators.mha_out_proj.op import (
     _unpack_block3_attention_output,
 )
 from iron.operators.mha_out_proj.reference import generate_golden_reference
+from iron.common.utils import torch_to_numpy
 from iron.common.test_utils import run_test
 
 DEBUG_MODE = 0
@@ -202,6 +203,58 @@ def test_packed_block3_output_layout_reserves_a_half_and_places_residual_half():
     assert np.array_equal(first_tile_residual, residual[:q_seq_tile, :emb_tile])
 
 
+def test_packed_block3_output_layout_is_canonical_across_parallel_seq():
+    seq_len = 64
+    embed_sz = 768
+    q_seq_tile = 32
+    emb_tile = 96
+    packed_rows = 128
+
+    residual = np.arange(seq_len * embed_sz, dtype=np.float32).reshape(
+        seq_len, embed_sz
+    )
+    packed_ps1 = _pack_block3_residual_output(
+        residual,
+        seq_len=seq_len,
+        packed_rows=packed_rows,
+        embed_sz=embed_sz,
+        q_seq_tile=q_seq_tile,
+        emb_tile=emb_tile,
+        parallel_seq=1,
+    )
+    packed_ps4 = _pack_block3_residual_output(
+        residual,
+        seq_len=seq_len,
+        packed_rows=packed_rows,
+        embed_sz=embed_sz,
+        q_seq_tile=q_seq_tile,
+        emb_tile=emb_tile,
+        parallel_seq=4,
+    )
+
+    assert np.array_equal(packed_ps1, packed_ps4)
+    assert np.array_equal(
+        _unpack_block3_attention_output(
+            packed_ps4,
+            seq_len=seq_len,
+            packed_rows=packed_rows,
+            embed_sz=embed_sz,
+            q_seq_tile=q_seq_tile,
+            emb_tile=emb_tile,
+            parallel_seq=1,
+        ),
+        _unpack_block3_attention_output(
+            packed_ps4,
+            seq_len=seq_len,
+            packed_rows=packed_rows,
+            embed_sz=embed_sz,
+            q_seq_tile=q_seq_tile,
+            emb_tile=emb_tile,
+            parallel_seq=4,
+        ),
+    )
+
+
 def test_block2_packed_output_uses_distinct_artifacts(aie_context):
     plain = AIEMHAOutProj(
         num_heads=12,
@@ -243,6 +296,14 @@ def test_supported_block2_topologies_include_promoted_runtime_variants():
             head_dim=64,
         )
     }
+    topology_ids_1_seq384 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=384,
+            num_heads=1,
+            head_dim=64,
+        )
+    }
     topology_ids_12 = {
         str(topology["topology_id"])
         for topology in mha_out_proj_topologies(
@@ -277,8 +338,12 @@ def test_supported_block2_topologies_include_promoted_runtime_variants():
     }
 
     assert "q32_kv64_e64_ps2_ph1_acc1" in topology_ids_1_seq64
-    assert "q32_kv64_e64_ps2_ph1_acc1" not in topology_ids_1
-    assert "q32_kv64_e64_ps4_ph1_acc1" not in topology_ids_1
+    assert "q32_kv64_e64_ps2_ph1_acc1" in topology_ids_1
+    assert "q32_kv64_e64_ps4_ph1_acc1" in topology_ids_1
+    assert "q32_kv64_e64_ps8_ph1_acc1" in topology_ids_1
+    assert "q32_kv64_e64_ps2_ph1_acc1" in topology_ids_1_seq384
+    assert "q32_kv64_e64_ps4_ph1_acc1" in topology_ids_1_seq384
+    assert "q32_kv64_e64_ps6_ph1_acc1" in topology_ids_1_seq384
     assert "q32_kv64_e96_ps1_ph2_acc1" in topology_ids_12
     assert "q32_kv64_e96_ps1_ph4_acc1" in topology_ids_12
     assert "q32_kv64_e96_ps1_ph6_acc1" in topology_ids_12
@@ -397,6 +462,134 @@ def test_block2_packed_output_matches_dense_output(aie_context):
     )
 
     assert torch.equal(dense_out, packed_out)
+
+
+def test_block2_sequence_parallel_packed_output_matches_dense_output(aie_context):
+    seq_len = 64
+    head_dim = 64
+    num_heads = 12
+    topology_id = "q32_kv64_e96_ps2_ph2_acc1"
+    golden_ref = generate_golden_reference(
+        seq_len=seq_len,
+        d=head_dim,
+        heads=num_heads,
+        seed=31,
+        debug=DEBUG_MODE,
+    )
+
+    plain = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        topology_id=topology_id,
+        context=aie_context,
+    )
+    packed = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        topology_id=topology_id,
+        context=aie_context,
+        packed_output_parallel_seq=2,
+        packed_output_rows=seq_len,
+    )
+
+    aie_context.compile_all()
+    aie_context.prepare_runtime()
+
+    dense_out = plain.forward(
+        golden_ref["Q"],
+        golden_ref["K"],
+        golden_ref["V"],
+        golden_ref["W_O"],
+    )
+    packed_out = packed.forward_packed(
+        golden_ref["Q"],
+        golden_ref["K"],
+        golden_ref["V"],
+        golden_ref["Q"],
+        golden_ref["W_O"],
+    )
+
+    unpacked_attention = _unpack_block3_attention_output(
+        torch_to_numpy(packed_out),
+        seq_len=seq_len,
+        packed_rows=seq_len,
+        embed_sz=num_heads * head_dim,
+        q_seq_tile=packed.q_seq_tile,
+        emb_tile=packed.emb_tile,
+        parallel_seq=packed.packed_output_parallel_seq,
+    )
+
+    assert np.array_equal(
+        dense_out.detach().cpu().float().numpy(),
+        unpacked_attention.astype(np.float32),
+    )
+
+
+def test_block2_sequence_parallel_packed_output_matches_dense_output_with_mismatched_target_parallel_seq(
+    aie_context,
+):
+    seq_len = 64
+    head_dim = 64
+    num_heads = 12
+    topology_id = "q32_kv64_e96_ps2_ph2_acc1"
+    golden_ref = generate_golden_reference(
+        seq_len=seq_len,
+        d=head_dim,
+        heads=num_heads,
+        seed=37,
+        debug=DEBUG_MODE,
+    )
+
+    plain = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        topology_id=topology_id,
+        context=aie_context,
+    )
+    packed = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        topology_id=topology_id,
+        context=aie_context,
+        packed_output_parallel_seq=1,
+        packed_output_rows=seq_len,
+    )
+
+    aie_context.compile_all()
+    aie_context.prepare_runtime()
+
+    dense_out = plain.forward(
+        golden_ref["Q"],
+        golden_ref["K"],
+        golden_ref["V"],
+        golden_ref["W_O"],
+    )
+    packed_out = packed.forward_packed(
+        golden_ref["Q"],
+        golden_ref["K"],
+        golden_ref["V"],
+        golden_ref["Q"],
+        golden_ref["W_O"],
+    )
+
+    unpacked_attention = _unpack_block3_attention_output(
+        torch_to_numpy(packed_out),
+        seq_len=seq_len,
+        packed_rows=seq_len,
+        embed_sz=num_heads * head_dim,
+        q_seq_tile=packed.q_seq_tile,
+        emb_tile=packed.emb_tile,
+        parallel_seq=packed.packed_output_parallel_seq,
+    )
+
+    assert np.array_equal(
+        dense_out.detach().cpu().float().numpy(),
+        unpacked_attention.astype(np.float32),
+    )
 
 
 def test_theoretical_block2_topologies_include_nondefault_valid_variants():
@@ -569,6 +762,12 @@ def test_practical_block2_sort_key_favors_higher_acc_depth():
     "seq_len,num_heads,topology_id",
     (
         (64, 1, "q32_kv64_e64_ps2_ph1_acc1"),
+        (512, 1, "q32_kv64_e64_ps2_ph1_acc1"),
+        (512, 1, "q32_kv64_e64_ps4_ph1_acc1"),
+        (512, 1, "q32_kv64_e64_ps8_ph1_acc1"),
+        (384, 1, "q32_kv64_e64_ps2_ph1_acc1"),
+        (384, 1, "q32_kv64_e64_ps4_ph1_acc1"),
+        (384, 1, "q32_kv64_e64_ps6_ph1_acc1"),
         (64, 12, "q32_kv64_e96_ps2_ph2_acc1"),
         (64, 12, "q32_kv64_e96_ps2_ph4_acc1"),
         (512, 12, "q32_kv64_e96_ps2_ph1_acc1"),

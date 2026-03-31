@@ -182,10 +182,6 @@ def fused_mha(
             6,
             8,
         ), "parallel sequence lowering currently supports ps in {2, 4, 6, 8}"
-        if packed_output_parallel_seq is not None:
-            raise ValueError(
-                "packed Block 3 handoff currently requires Block 2 parallel_seq == 1"
-            )
 
     assert (
         q_seq_tile % r == 0
@@ -1173,10 +1169,6 @@ def fused_mha(
             (1, embed_sz // emb_tile // num_o_col_groups),
         )
     else:
-        if sequence_parallel_mode:
-            raise ValueError(
-                "packed Block 3 handoff currently requires Block 2 parallel_seq == 1"
-            )
         if o_proj_acc_depth != 1:
             raise ValueError(
                 "packed Block 3 handoff currently requires o_proj_acc_depth == 1"
@@ -1195,24 +1187,45 @@ def fused_mha(
                 "(packed_output_rows / q_seq_tile) divisible by "
                 "packed_output_parallel_seq"
             )
-        row_iters_per_a_tile = num_packed_q_seq_blocks // packed_output_parallel_seq
         packed_tile_elems = 2 * q_seq_tile * emb_tile
-        O_tiles = []
-        for q_block_idx in range(num_q_seq_blocks):
-            a_tile = q_block_idx % packed_output_parallel_seq
-            row_iter = q_block_idx // packed_output_parallel_seq
-            for col_group in range(num_o_col_groups):
-                tile_index = (
-                    a_tile * row_iters_per_a_tile + row_iter
-                ) * num_o_col_groups + col_group
-                O_tiles.append(
-                    TensorAccessPattern(
-                        (2 * packed_output_rows * embed_sz,),
-                        offset=tile_index * packed_tile_elems,
-                        sizes=[1, 1, q_seq_tile, emb_tile],
-                        strides=[0, 0, emb_tile, 1],
+        if sequence_parallel_mode:
+            outer_group_count = 2 if parallel_lanes > 6 else 1
+            tile_group_stride = num_o_col_groups * packed_tile_elems
+            O_tiles = []
+            for q_group_idx in range(num_q_seq_blocks // parallel_seq):
+                base_q_block = q_group_idx * parallel_seq
+                for outer_group in range(outer_group_count):
+                    outer_a_tile = outer_group * parallel_seq_join_distribute
+                    for col_group in range(num_o_col_groups):
+                        tile_index = (
+                            base_q_block + outer_a_tile
+                        ) * num_o_col_groups + col_group
+                        O_tiles.append(
+                            TensorAccessPattern(
+                                (2 * packed_output_rows * embed_sz,),
+                                offset=tile_index * packed_tile_elems,
+                                sizes=[
+                                    parallel_seq_join_distribute,
+                                    1,
+                                    q_seq_tile,
+                                    emb_tile,
+                                ],
+                                strides=[tile_group_stride, 0, emb_tile, 1],
+                            )
+                        )
+        else:
+            O_tiles = []
+            for q_block_idx in range(num_q_seq_blocks):
+                for col_group in range(num_o_col_groups):
+                    tile_index = q_block_idx * num_o_col_groups + col_group
+                    O_tiles.append(
+                        TensorAccessPattern(
+                            (2 * packed_output_rows * embed_sz,),
+                            offset=tile_index * packed_tile_elems,
+                            sizes=[1, 1, q_seq_tile, emb_tile],
+                            strides=[0, 0, emb_tile, 1],
+                        )
                     )
-                )
 
     def print_tap_seq_info(tap_seq, name):
         for idx, tap in enumerate(tap_seq):

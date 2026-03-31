@@ -196,9 +196,10 @@ path:
   `seq_len` is divisible by `192`, and `ps8` is currently validated on retained
   workloads whose `seq_len` is divisible by `256`
 - a narrower `parallel_seq` subset on the retained `1x64` family, currently
-  validated only for `seq_len=64`, `parallel_seq=2`, `parallel_heads == 1`,
-  `q_seq_tile == 32`, `kv_seq_tile == 64`, `emb_tile == 64`, and
-  `o_proj_acc_depth == 1`
+  validated with `parallel_heads == 1`, `q_seq_tile == 32`,
+  `kv_seq_tile == 64`, `emb_tile == 64`, and `o_proj_acc_depth == 1`; this
+  currently covers `ps2` at `seq_len=64`, `ps2/ps4/ps6` at `seq_len=384`, and
+  `ps2/ps4/ps8` at `seq_len=512`
 For the retained runtime-supported study surface, `emb_tile` is still selected
 per retained workload family, and the current lowered design still does not
 support the `16x64 / parallel_heads=8` retained-shape variant because it
@@ -221,9 +222,16 @@ surface grows.
 Study metadata emitted by the in-process Dataflow patterns should include the
 selected Block 2 topology ID and family so retained topology choices are visible
 in benchmark outputs.
-The current packed Block 2 -> Block 3 handoff remains a stricter subset of the
-standalone Block 2 runtime: it currently requires `Block 2 parallel_seq == 1`,
-matching the existing packed-output layout contract used by Block 3.
+The current packed Block 2 -> Block 3 handoff now uses a canonical tile-packed
+buffer order that is independent of Block 2 `parallel_seq`. Compatibility now
+requires:
+- `Block 2 q_seq_tile == Block 3 tile_m`
+- `Block 2 emb_tile == Block 3 tile_k`
+- `(seq_len / Block 2 q_seq_tile)` divisible by `Block 3 parallel_seq`
+The default Dataflow topology resolver still prefers a matching Block 2
+`parallel_seq` when the selected Block 3 topology is sequence-parallel, while
+keeping the conservative `ph1` path as the default unless a composed Block 2
+topology is explicitly requested.
 
 ## Block 3
 

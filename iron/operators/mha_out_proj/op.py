@@ -127,19 +127,14 @@ def _pack_block3_residual_output(
         )
 
     num_col_groups = embed_sz // emb_tile
-    row_iters_per_a_tile = num_packed_q_seq_blocks // parallel_seq
     tile_elems = q_seq_tile * emb_tile
     packed_np = np.zeros((2 * packed_rows * embed_sz,), dtype=residual_np.dtype)
 
     for q_block_idx in range(num_q_seq_blocks):
-        a_tile = q_block_idx % parallel_seq
-        row_iter = q_block_idx // parallel_seq
         row_start = q_block_idx * q_seq_tile
         for col_group in range(num_col_groups):
             col_start = col_group * emb_tile
-            tile_index = (
-                a_tile * row_iters_per_a_tile + row_iter
-            ) * num_col_groups + col_group
+            tile_index = q_block_idx * num_col_groups + col_group
             tile_offset = tile_index * (2 * tile_elems)
             packed_np[tile_offset + tile_elems : tile_offset + (2 * tile_elems)] = (
                 residual_np[
@@ -162,21 +157,15 @@ def _unpack_block3_attention_output(
     parallel_seq: int,
 ) -> np.ndarray:
     num_q_seq_blocks = seq_len // q_seq_tile
-    num_packed_q_seq_blocks = packed_rows // q_seq_tile
     num_col_groups = embed_sz // emb_tile
-    row_iters_per_a_tile = num_packed_q_seq_blocks // parallel_seq
     tile_elems = q_seq_tile * emb_tile
     output_np = np.zeros((seq_len, embed_sz), dtype=packed_np.dtype)
 
     for q_block_idx in range(num_q_seq_blocks):
-        a_tile = q_block_idx % parallel_seq
-        row_iter = q_block_idx // parallel_seq
         row_start = q_block_idx * q_seq_tile
         for col_group in range(num_col_groups):
             col_start = col_group * emb_tile
-            tile_index = (
-                a_tile * row_iters_per_a_tile + row_iter
-            ) * num_col_groups + col_group
+            tile_index = q_block_idx * num_col_groups + col_group
             tile_offset = tile_index * (2 * tile_elems)
             output_np[
                 row_start : row_start + q_seq_tile,
@@ -269,10 +258,6 @@ class AIEMHAOutProj(AIEOperatorBase):
         self.embed_sz = d * num_heads
         assert d == 64, "Only d=64 is supported in this version"
         if self.packed_output_parallel_seq is not None:
-            if self.parallel_seq != 1:
-                raise AIEOperatorConstraintError(
-                    "AIEMHAOutProj: packed Block 3 handoff currently requires Block 2 parallel_seq == 1"
-                )
             if self.seq_len % self.q_seq_tile != 0:
                 raise AIEOperatorConstraintError(
                     "AIEMHAOutProj: packed Block 3 handoff requires seq_len divisible by q_seq_tile"

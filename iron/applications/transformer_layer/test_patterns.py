@@ -335,6 +335,36 @@ def test_dataflow_pattern_configures_block2_packed_output_for_block3():
     assert pattern.block2.emb_tile == pattern.block3.tile_k
 
 
+def test_dataflow_pattern_prefers_matching_block2_parallel_seq_for_packed_handoff():
+    spec = TransformerLayerSpec(
+        seq_len=64,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_attention_heads=12,
+        block3_topology_id="m32_k96_n64_ps2_pi6_d8_g1",
+    )
+
+    pattern = build_pattern("dataflow", spec)
+
+    assert pattern.block2.parallel_seq == pattern.block3.parallel_seq == 2
+
+
+def test_packed_handoff_compatibility_does_not_require_matching_parallel_seq():
+    assert _block2_block3_packed_handoff_compatible(
+        seq_len=64,
+        block2_candidate={
+            "parallel_seq": 4,
+            "q_seq_tile": 32,
+            "emb_tile": 96,
+        },
+        block3_candidate={
+            "parallel_seq": 2,
+            "tile_m": 32,
+            "tile_k": 96,
+        },
+    )
+
+
 @pytest.mark.parametrize(
     "spec_kwargs,max_abs_diff,max_mean_abs_diff",
     (
@@ -373,6 +403,32 @@ def test_dataflow_pattern_configures_block2_packed_output_for_block3():
             2.5e-1,
             8.0e-3,
             id="dataflow_512x1024x4096_pi2",
+        ),
+        pytest.param(
+            {
+                "seq_len": 64,
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_attention_heads": 12,
+                "block2_topology_id": "q32_kv64_e96_ps2_ph2_acc1",
+                "block3_topology_id": "m32_k96_n64_ps2_pi6_d8_g1",
+            },
+            2.5e-1,
+            1.6e-2,
+            id="dataflow_64x768x3072_block2_ps2_ph2_to_block3_ps2",
+        ),
+        pytest.param(
+            {
+                "seq_len": 512,
+                "hidden_size": 1024,
+                "intermediate_size": 4096,
+                "num_attention_heads": 16,
+                "block2_topology_id": "q32_kv64_e128_ps4_ph1_acc1",
+                "block3_topology_id": "m32_k128_n64_ps2_pi4_d8_g1",
+            },
+            2.5e-1,
+            8.0e-3,
+            id="dataflow_512x1024x4096_block2_ps4_to_block3_ps2",
         ),
     ),
 )
