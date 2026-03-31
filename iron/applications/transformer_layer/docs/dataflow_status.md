@@ -95,20 +95,22 @@ Current runtime-supported surface:
   - the retained `parallel_heads` sweep on the established `ps1` path
   - a validated `parallel_seq` subset on the retained `12x64` and `16x64`
     families, with `parallel_seq in {2, 4, 6, 8}` lowered as real sequence lanes
-    when `parallel_heads == 1`, `q_seq_tile == 32`, `kv_seq_tile == 64`, and
-    `o_proj_acc_depth == 1`; `ps6` is currently validated on retained
-    workloads whose `seq_len` is divisible by `192`, and `ps8` is currently
-    validated on retained workloads whose `seq_len` is divisible by `256`
+    when `q_seq_tile == 32`, `kv_seq_tile == 64`, `o_proj_acc_depth == 1`, and
+    `parallel_seq * parallel_heads <= 8`; the validated composed subset now
+    includes `ps2/ph2`, `ps2/ph4`, and `ps4/ph2` where sequence divisibility
+    allows them, `ps6` is currently validated on retained workloads whose
+    `seq_len` is divisible by `192`, and `ps8` is currently validated on
+    retained workloads whose `seq_len` is divisible by `256`
   - a narrower validated `parallel_seq` subset on the retained `1x64` family:
     `seq_len=64`, `parallel_seq=2`, `parallel_heads == 1`, `q_seq_tile == 32`,
     `kv_seq_tile == 64`, `emb_tile == 64`, `o_proj_acc_depth == 1`
 - the current exercised runtime-supported surface is:
   - `seq_len=64, heads=1, head_dim=64`: `2` topologies
   - `seq_len=512, heads=1, head_dim=64`: `1` topology
-  - `seq_len=64, heads=12, head_dim=64`: `5` topologies
-  - `seq_len=512, heads=12, head_dim=64`: `7` topologies
-  - `seq_len=64, heads=16, head_dim=64`: `4` topologies
-  - `seq_len=512, heads=16, head_dim=64`: `6` topologies
+  - `seq_len=64, heads=12, head_dim=64`: `7` topologies
+  - `seq_len=512, heads=12, head_dim=64`: `10` topologies
+  - `seq_len=64, heads=16, head_dim=64`: `6` topologies
+  - `seq_len=512, heads=16, head_dim=64`: `9` topologies
 - concretely:
   - `1 x 64, seq_len=64`
     - `q32_kv64_e64_ps1_ph1_acc1`
@@ -121,21 +123,29 @@ Current runtime-supported surface:
     - `q32_kv64_e96_ps1_ph4_acc1`
     - `q32_kv64_e96_ps1_ph6_acc1`
     - `q32_kv64_e96_ps2_ph1_acc1`
+    - `q32_kv64_e96_ps2_ph2_acc1`
+    - `q32_kv64_e96_ps2_ph4_acc1`
   - `12 x 64, seq_len=512`
-    - the same set plus `q32_kv64_e96_ps4_ph1_acc1` and
-      `q32_kv64_e96_ps8_ph1_acc1`
+    - the same set plus `q32_kv64_e96_ps4_ph1_acc1`,
+      `q32_kv64_e96_ps4_ph2_acc1`, and `q32_kv64_e96_ps8_ph1_acc1`
   - `12 x 64, seq_len=384`
-    - the `ps1` retained set plus `q32_kv64_e96_ps6_ph1_acc1`
+    - the `ps1` retained set plus `q32_kv64_e96_ps2_ph2_acc1`,
+      `q32_kv64_e96_ps2_ph4_acc1`, `q32_kv64_e96_ps4_ph2_acc1`, and
+      `q32_kv64_e96_ps6_ph1_acc1`
   - `16 x 64, seq_len=64`
     - `q32_kv64_e128_ps1_ph1_acc1`
     - `q32_kv64_e128_ps1_ph2_acc1`
     - `q32_kv64_e128_ps1_ph4_acc1`
     - `q32_kv64_e128_ps2_ph1_acc1`
+    - `q32_kv64_e128_ps2_ph2_acc1`
+    - `q32_kv64_e128_ps2_ph4_acc1`
   - `16 x 64, seq_len=512`
-    - the same set plus `q32_kv64_e128_ps4_ph1_acc1` and
-      `q32_kv64_e128_ps8_ph1_acc1`
+    - the same set plus `q32_kv64_e128_ps4_ph1_acc1`,
+      `q32_kv64_e128_ps4_ph2_acc1`, and `q32_kv64_e128_ps8_ph1_acc1`
   - `16 x 64, seq_len=384`
-    - the `ps1` retained set plus `q32_kv64_e128_ps6_ph1_acc1`
+    - the `ps1` retained set plus `q32_kv64_e128_ps2_ph2_acc1`,
+      `q32_kv64_e128_ps2_ph4_acc1`, `q32_kv64_e128_ps4_ph2_acc1`, and
+      `q32_kv64_e128_ps6_ph1_acc1`
 
 Verified today:
 

@@ -534,9 +534,7 @@ def _block2_practical_sort_key(
 def _block2_effective_lowered_parallelism(candidate: dict[str, int | str]) -> int:
     parallel_seq = int(candidate["parallel_seq"])
     parallel_heads = int(candidate["parallel_heads"])
-    if parallel_seq in _BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES and (
-        parallel_seq == 1 or parallel_heads == 1
-    ):
+    if parallel_seq in _BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES:
         return parallel_seq * parallel_heads
     return parallel_heads
 
@@ -544,10 +542,7 @@ def _block2_effective_lowered_parallelism(candidate: dict[str, int | str]) -> in
 def _block2_effective_sequence_chunk(candidate: dict[str, int | str]) -> int:
     parallel_seq = int(candidate["parallel_seq"])
     q_seq_tile = int(candidate["q_seq_tile"])
-    parallel_heads = int(candidate["parallel_heads"])
-    if parallel_seq in _BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES and (
-        parallel_seq == 1 or parallel_heads == 1
-    ):
+    if parallel_seq in _BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES:
         return parallel_seq * q_seq_tile
     return q_seq_tile
 
@@ -597,7 +592,6 @@ def _block2_runtime_candidate_allowed(
             num_heads in (12, 16)
             and q_seq_tile == 32
             and kv_seq_tile == 64
-            and parallel_heads == 1
             and o_proj_acc_depth == 1
         )
     return True
@@ -610,30 +604,27 @@ def _block2_promoted_parallel_seq_candidates(
     head_dim: int,
     retained: list[dict[str, int]],
 ) -> list[dict[str, int]]:
-    base_seq_candidate = next(
-        (
-            copy.deepcopy(candidate)
-            for candidate in retained
-            if int(candidate["parallel_seq"]) == 1
-            and int(candidate["parallel_heads"]) == 1
-            and int(candidate["o_proj_acc_depth"]) == 1
-            and int(candidate["q_seq_tile"]) == 32
-            and int(candidate["kv_seq_tile"]) == 64
-        ),
-        None,
-    )
-    if base_seq_candidate is None:
+    base_seq_candidates = [
+        copy.deepcopy(candidate)
+        for candidate in retained
+        if int(candidate["parallel_seq"]) == 1
+        and int(candidate["o_proj_acc_depth"]) == 1
+        and int(candidate["q_seq_tile"]) == 32
+        and int(candidate["kv_seq_tile"]) == 64
+    ]
+    if not base_seq_candidates:
         return []
 
     promoted: list[dict[str, int]] = []
-    for parallel_seq in (2, 4, 6, 8):
-        candidate = copy.deepcopy(base_seq_candidate)
-        candidate["parallel_seq"] = parallel_seq
-        if _block2_runtime_candidate_allowed(
-            candidate,
-            seq_len=seq_len,
-            num_heads=num_heads,
-            head_dim=head_dim,
-        ):
-            promoted.append(candidate)
+    for base_seq_candidate in base_seq_candidates:
+        for parallel_seq in (2, 4, 6, 8):
+            candidate = copy.deepcopy(base_seq_candidate)
+            candidate["parallel_seq"] = parallel_seq
+            if _block2_runtime_candidate_allowed(
+                candidate,
+                seq_len=seq_len,
+                num_heads=num_heads,
+                head_dim=head_dim,
+            ):
+                promoted.append(candidate)
     return promoted

@@ -153,6 +153,6 @@ def test_practical_block2_catalog_prefers_real_lowered_axes():
     block2_ids = [row["topology_id"] for row in catalog["block2"]]
 
     assert len(block2_ids) == 2
-    assert all("_ps8_" in topology_id for topology_id in block2_ids)
     assert all("_acc8" in topology_id for topology_id in block2_ids)
     assert "q32_kv128_e96_ps8_ph1_acc8" in block2_ids
+    assert "q32_kv128_e96_ps4_ph2_acc8" in block2_ids
