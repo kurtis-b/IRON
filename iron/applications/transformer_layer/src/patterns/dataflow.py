@@ -123,7 +123,7 @@ class DataflowPattern(nn.Module):
 
         hidden_states = layer_inputs.hidden_states.squeeze(0).to(self.spec.torch_dtype)
         block1_start = time.perf_counter()
-        q, k, v = self.block1.forward(hidden_states)
+        q, k, v = self.block1.forward_flat(hidden_states)
         block1_end = time.perf_counter()
 
         block2_start = block1_end

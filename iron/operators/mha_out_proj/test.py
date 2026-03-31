@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -221,6 +222,48 @@ def test_supported_block2_topologies_include_promoted_runtime_variants():
     assert "q32_kv64_e128_ps1_ph2_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps1_ph4_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps1_ph8_acc1" not in topology_ids_16
+
+
+def test_block2_accepts_flat_qkv_without_head_major_reshape(aie_context):
+    seq_len = 64
+    head_dim = 64
+    num_heads = 12
+    topology_id = str(
+        mha_out_proj_topologies(num_heads=num_heads, head_dim=head_dim)[0][
+            "topology_id"
+        ]
+    )
+    golden_ref = generate_golden_reference(
+        seq_len=seq_len,
+        d=head_dim,
+        heads=num_heads,
+        seed=17,
+        debug=DEBUG_MODE,
+    )
+    operator = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        topology_id=topology_id,
+        debug=DEBUG_MODE,
+        context=aie_context,
+    )
+    aie_context.compile_all()
+    aie_context.prepare_runtime()
+
+    q_head = golden_ref["Q"].view(seq_len, num_heads, head_dim).permute(1, 0, 2)
+    k_head = golden_ref["K"].view(seq_len, num_heads, head_dim).permute(1, 0, 2)
+    v_head = golden_ref["V"].view(seq_len, num_heads, head_dim).permute(1, 0, 2)
+
+    o_head = operator.forward(q_head, k_head, v_head, golden_ref["W_O"])
+    o_flat = operator.forward(
+        golden_ref["Q"],
+        golden_ref["K"],
+        golden_ref["V"],
+        golden_ref["W_O"],
+    )
+
+    assert torch.equal(o_head, o_flat)
 
 
 def test_theoretical_block2_topologies_include_nondefault_valid_variants():

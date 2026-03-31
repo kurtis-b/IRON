@@ -35,7 +35,7 @@ def _canonicalize_head_major_qkv(
             raise AIEOperatorConstraintError(
                 f"AIEMHAOutProj: expected {name} shape {(seq_len, embed_sz)}"
             )
-        return tensor.view(seq_len, num_heads, d).permute(1, 0, 2).contiguous()
+        return tensor.contiguous()
     if tensor.ndim == 3 and tensor.shape == (num_heads, seq_len, d):
         return tensor.contiguous()
     raise AIEOperatorConstraintError("AIEMHAOutProj: incompatible tensor shape(s)")
@@ -47,6 +47,8 @@ def _flatten_head_major_qkv(
     seq_len: int,
     embed_sz: int,
 ) -> np.ndarray:
+    if tensor.ndim == 2:
+        return torch_to_numpy(tensor)
     return torch_to_numpy(tensor.permute(1, 0, 2).contiguous().view(seq_len, embed_sz))
 
 
@@ -62,6 +64,20 @@ def _pack_qkv_head_major(
     k_np = _flatten_head_major_qkv(k, seq_len=seq_len, embed_sz=embed_sz)
     v_np = _flatten_head_major_qkv(v, seq_len=seq_len, embed_sz=embed_sz)
     return np.concatenate((q_np, k_np, v_np), axis=0)
+
+
+def _is_canonical_qkv_tensor(
+    tensor: torch.Tensor,
+    *,
+    seq_len: int,
+    num_heads: int,
+    d: int,
+    embed_sz: int,
+) -> bool:
+    return tensor.shape in (
+        (seq_len, embed_sz),
+        (num_heads, seq_len, d),
+    )
 
 
 def _canonicalize_residual_output(
@@ -523,17 +539,32 @@ class AIEMHAOutProj(AIEOperatorBase):
             name="v",
         )
         applicable = (
-            q.shape[-1] == self.d
-            and k.shape[-1] == self.d
-            and v.shape[-1] == self.d
-            and q.shape[-2] == self.seq_len
-            and k.shape[-2] == self.seq_len
-            and v.shape[-2] == self.seq_len
-            and self.seq_len % 64 == 0,  # Sequence length must be multiple of 64
+            _is_canonical_qkv_tensor(
+                q,
+                seq_len=self.seq_len,
+                num_heads=self.num_heads,
+                d=self.d,
+                embed_sz=self.embed_sz,
+            )
+            and _is_canonical_qkv_tensor(
+                k,
+                seq_len=self.seq_len,
+                num_heads=self.num_heads,
+                d=self.d,
+                embed_sz=self.embed_sz,
+            )
+            and _is_canonical_qkv_tensor(
+                v,
+                seq_len=self.seq_len,
+                num_heads=self.num_heads,
+                d=self.d,
+                embed_sz=self.embed_sz,
+            )
+            and self.seq_len % 64 == 0
         )
         if not applicable:
             raise AIEOperatorConstraintError(
-                "AIEElementwiseAdd: incompatible tensor shape(s)"
+                "AIEMHAOutProj: incompatible tensor shape(s)"
             )
 
         ret = self._execute_aie_operation(q, k, v, w_o)
