@@ -271,6 +271,32 @@ def test_supported_block3_topologies_generalize_beyond_retained_families():
     assert "m16_k120_n160_ps4_pi3_d8_g1" in topology_ids_960
 
 
+def test_supported_block3_topologies_promote_generated_retained_variants():
+    topology_ids_64_768 = {
+        str(topology["topology_id"])
+        for topology in addnorm_ffn_addnorm_topologies(
+            seq_len=64,
+            hidden_size=768,
+            intermediate_size=3072,
+        )
+    }
+    topology_ids_512_1024 = {
+        str(topology["topology_id"])
+        for topology in addnorm_ffn_addnorm_topologies(
+            seq_len=512,
+            hidden_size=1024,
+            intermediate_size=4096,
+        )
+    }
+
+    assert len(topology_ids_64_768) == 8
+    assert len(topology_ids_512_1024) == 8
+    assert "m32_k96_n64_ps2_pi6_d8_g1" in topology_ids_64_768
+    assert "m16_k128_n128_ps4_pi3_d6_g1" in topology_ids_64_768
+    assert "m32_k128_n64_ps2_pi4_d8_g1" in topology_ids_512_1024
+    assert "m64_k64_n128_ps8_pi1_d8_g1" in topology_ids_512_1024
+
+
 def test_generalized_block3_runtime_topology_runs_numerically(aie_context):
     seq_len = 64
     hidden_size = 1536
@@ -442,9 +468,19 @@ def test_practical_block3_topologies_keep_parallel_seq_buckets_when_feasible():
         )
         counts_by_parallel_seq = {1: 0, 2: 0, 4: 0, 8: 0}
         feasible_counts_by_parallel_seq = {1: 0, 2: 0, 4: 0, 8: 0}
+        runtime_counts_by_parallel_seq = {1: 0, 2: 0, 4: 0, 8: 0}
 
         for topology in practical:
             counts_by_parallel_seq[int(topology["parallel_seq"])] += 1
+
+        for topology in addnorm_ffn_addnorm_topologies(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        ):
+            ps = int(topology["parallel_seq"])
+            if ps in runtime_counts_by_parallel_seq:
+                runtime_counts_by_parallel_seq[ps] += 1
 
         for topology in addnorm_ffn_addnorm_theoretical_topologies(
             seq_len=seq_len,
@@ -463,7 +499,9 @@ def test_practical_block3_topologies_keep_parallel_seq_buckets_when_feasible():
         for parallel_seq in (1, 2, 4, 8):
             if feasible_counts_by_parallel_seq[parallel_seq] > 0:
                 assert counts_by_parallel_seq[parallel_seq] > 0
-            assert counts_by_parallel_seq[parallel_seq] <= 4
+            assert counts_by_parallel_seq[parallel_seq] <= (
+                4 + runtime_counts_by_parallel_seq[parallel_seq]
+            )
 
 
 def test_practical_block3_topologies_are_ranked_and_pruned():
@@ -475,6 +513,16 @@ def test_practical_block3_topologies_are_ranked_and_pruned():
 
     assert practical == sorted(practical, key=_block3_practical_sort_key, reverse=True)
     practical_counts_by_parallel_seq = {1: 0, 2: 0, 4: 0, 8: 0}
+    runtime_counts_by_parallel_seq = {1: 0, 2: 0, 4: 0, 8: 0}
+    for topology in addnorm_ffn_addnorm_topologies(
+        seq_len=512,
+        hidden_size=768,
+        intermediate_size=3072,
+    ):
+        parallel_seq = int(topology["parallel_seq"])
+        runtime_counts_by_parallel_seq[parallel_seq] = (
+            runtime_counts_by_parallel_seq.get(parallel_seq, 0) + 1
+        )
     for topology in practical:
         parallel_seq = int(topology["parallel_seq"])
         practical_counts_by_parallel_seq[parallel_seq] = (
@@ -487,7 +535,11 @@ def test_practical_block3_topologies_are_ranked_and_pruned():
         assert int(topology["num_aie_columns"]) == 8
         assert parallel_seq * int(topology["parallel_int_dim"]) >= 8
         assert topology["topology_family"] == "pipelined_addnorm_ffn_addnorm_practical"
-    assert all(count <= 4 for count in practical_counts_by_parallel_seq.values())
+    assert all(
+        practical_counts_by_parallel_seq[parallel_seq]
+        <= 4 + runtime_counts_by_parallel_seq[parallel_seq]
+        for parallel_seq in practical_counts_by_parallel_seq
+    )
 
 
 def test_practical_block3_topologies_keep_only_highest_depth_per_shape():
@@ -560,6 +612,10 @@ def test_practical_block3_topologies_keep_only_highest_depth_per_shape():
             assert shape_key not in seen_shapes
             seen_shapes.add(shape_key)
             actual_depth = int(topology["down_proj_depth"])
-            max_depth = feasible_max_depth_by_shape[shape_key]
             runtime_depth = runtime_shape_depths.get(shape_key)
-            assert actual_depth == max_depth or actual_depth == runtime_depth
+            max_depth = feasible_max_depth_by_shape.get(shape_key)
+            if max_depth is None:
+                assert runtime_depth is not None
+                assert actual_depth == runtime_depth
+            else:
+                assert actual_depth == max_depth or actual_depth == runtime_depth

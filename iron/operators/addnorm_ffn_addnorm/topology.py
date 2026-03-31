@@ -495,18 +495,23 @@ def _block3_runtime_supported_candidates(
             candidate=candidate,
         )
     ]
-    if preferred_ids:
-        runtime_pool = [
-            candidate
-            for candidate in runtime_pool
-            if _topology_id(candidate) in preferred_ids
-        ]
+    preferred_candidates = [
+        candidate
+        for candidate in runtime_pool
+        if _topology_id(candidate) in preferred_ids
+    ]
     runtime_pool = _block3_prune_runtime_tile_dominated(runtime_pool)
     runtime_pool = _block3_prune_runtime_chunk_dominated(runtime_pool)
 
     deduped_pool: list[dict[str, int | str]] = []
     seen_signatures: set[tuple[int, ...]] = set()
     for candidate in runtime_pool:
+        signature = _block3_signature(candidate)
+        if signature in seen_signatures:
+            continue
+        deduped_pool.append(candidate)
+        seen_signatures.add(signature)
+    for candidate in preferred_candidates:
         signature = _block3_signature(candidate)
         if signature in seen_signatures:
             continue
@@ -973,6 +978,8 @@ def _block3_runtime_candidate_allowed(
     if tile_k < _BLOCK3_RUNTIME_MIN_TILE_K:
         return False
     if tile_n < _BLOCK3_RUNTIME_MIN_TILE_N:
+        return False
+    if tile_k < 32 and tile_n > 128:
         return False
     if down_proj_depth > _BLOCK3_RUNTIME_MAX_DOWN_PROJ_DEPTH:
         return False

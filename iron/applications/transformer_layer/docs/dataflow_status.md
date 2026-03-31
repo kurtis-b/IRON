@@ -219,29 +219,32 @@ Current runtime-supported surface:
   gate and pruned to a compact runtime-supported set
 - the older retained Block 3 thesis IDs are preserved as preferred baselines
   inside that generated runtime pool rather than acting as the sole runtime
-  source
+  source; retained workloads now also promote additional generated candidates
+  when they satisfy the current runtime gate
 - that gate still reflects the current `design.py` implementation:
   - `num_aie_columns == 8`
   - `tile_m in {16, 32, 64}`
   - `tile_k >= 16`
   - `tile_n >= 16`
+  - extremely skinny-wide runtime shapes with `tile_k < 32` and `tile_n > 128`
+    remain excluded until the current shim/runtime layout proves them stable
   - `down_proj_depth <= 8`
   - placement must satisfy the current horizontal, vertical, or compact-
     sequence Block 3 layout
   - `parallel_seq > 4` currently requires the compact-sequence layout, so the
     promoted `ps8` runtime surface is currently limited to `parallel_int_dim=1`
 - current exercised runtime-supported counts are:
-  - `64 x 768 x 3072`: `2`
-  - `512 x 768 x 3072`: `4`
-  - `64 x 1024 x 4096`: `2`
-  - `512 x 1024 x 4096`: `4`
-  - `64 x 2048 x 8192`: `2`
+  - `64 x 768 x 3072`: `8`
+  - `512 x 768 x 3072`: `8`
+  - `64 x 1024 x 4096`: `8`
+  - `512 x 1024 x 4096`: `8`
+  - `64 x 2048 x 8192`: `8`
   - `512 x 2048 x 8192`: `8`
 - representative generalized workloads that now also produce runtime/practical
   Block 3 catalogs include:
   - `64 x 1536 x 6144`: runtime `8`, practical `13`
   - `512 x 1536 x 6144`: runtime `8`, practical `16`
-  - `64 x 960 x 3840`: runtime `8`, practical `13`
+  - `64 x 960 x 3840`: runtime `8`, practical `12`
   - `512 x 960 x 3840`: runtime `8`, practical `16`
 - `ps8` is now runtime-supported for strict-runtime-feasible `parallel_int_dim=1`
   compact-sequence Block 3 topologies; broader `ps8` shapes still remain

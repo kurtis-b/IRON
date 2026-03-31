@@ -420,17 +420,15 @@ entrypoint in
 and resolves the thesis-facing topology directly into the local pipelined
 Block 3 runtime. The current runtime contract is exact rather than padded:
 `seq_len` must be divisible by `parallel_seq * tile_m`, and one compiled Block
-3 artifact is built for that concrete `seq_len`. The retained runtime surface
-currently includes:
-- `768/3072` with `parallel_seq=2, parallel_int_dim=6`, `gelu_stage in {0,1}`
-- `768/3072` with `parallel_seq=4, parallel_int_dim=3`, `gelu_stage in {0,1}`
-- `1024/4096` with `parallel_seq=4, parallel_int_dim=2`, `gelu_stage in {0,1}`
-- `2048/8192` with `parallel_seq=2, parallel_int_dim=4`, `gelu_stage in {0,1}`
-- `2048/8192` with `parallel_seq=4, parallel_int_dim=2`, `gelu_stage in {0,1}`
-The broader theoretical surface still enumerates other legal
-tile/lane/staging combinations, but the practical surface should stay on the
-currently validated standalone signatures until the runtime proves additional
-families.
+3 artifact is built for that concrete `seq_len`. The Block 3 runtime catalog is
+now generated per workload from the broader theoretical surface, then filtered
+through the current layout/runtime gate and pruned back to a compact validated
+set. The older retained thesis IDs are still preserved as preferred baselines,
+but retained workloads no longer stop there: additional generated candidates
+can now fill the remaining runtime slots when they satisfy the current runtime
+gate. That gate still excludes very skinny-wide shapes with `tile_k < 32` and
+`tile_n > 128`, because those candidates currently hit runtime NaNs or shim BD
+exhaustion even though they are structurally legal.
 Because `ln1_weight` and `ln2_weight` are compile-time constants embedded into
 the generated Block 3 MLIR/xclbin, Block 3 artifact names must include a
 deterministic fingerprint of those two weight tensors so tests and studies do
@@ -454,8 +452,10 @@ rather than through separate LN2 stats banks. LN2 therefore owns both LN1 and
 LN2 cached row statistics locally, and the grouped runtime no longer depends on
 a down-proj-to-LN2 statistics handoff.
 That design file should also expose three distinct topology views:
-- the narrow retained runtime-supported topology list used by operator tests and
-  benchmark manifests
+- a seq-len-aware runtime-supported topology list used by operator tests and
+  benchmark manifests; for retained workloads that list now keeps the validated
+  baseline IDs and also promotes additional generated runtime candidates when
+  they pass the current gate
 - a broader theoretical topology enumerator that explores every combination
   allowed by the Block 3 contract, imported FFN tiling equalities,
   `seq_len`-fit, lane-count limit, and GeLU staging for a given workload
