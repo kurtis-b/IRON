@@ -52,7 +52,11 @@ def _first_dataflow_compatible_block3_topology(
     block2_topology_id: str | None = None,
     reverse: bool = False,
 ) -> dict[str, int | str]:
-    block2_topologies = mha_out_proj_topologies(num_heads=num_heads, head_dim=head_dim)
+    block2_topologies = mha_out_proj_topologies(
+        seq_len=seq_len,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
     if block2_topology_id is not None:
         block2_topologies = [
             candidate
@@ -201,7 +205,7 @@ def test_dataflow_patterns_report_selected_block_topologies_in_metadata():
 
 def test_build_pattern_honors_block_topology_overrides():
     block2_topology_id = str(
-        mha_out_proj_topologies(num_heads=12, head_dim=64)[0]["topology_id"]
+        mha_out_proj_topologies(seq_len=64, num_heads=12, head_dim=64)[0]["topology_id"]
     )
     block3_topology_id = str(
         _first_dataflow_compatible_block3_topology(

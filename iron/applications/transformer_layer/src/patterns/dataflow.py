@@ -193,11 +193,14 @@ def _block2_block3_packed_handoff_compatible(
     block2_candidate: dict[str, int | str],
     block3_candidate: dict[str, int | str],
 ) -> bool:
+    block2_parallel_seq = int(block2_candidate["parallel_seq"])
     q_seq_tile = int(block2_candidate["q_seq_tile"])
     emb_tile = int(block2_candidate["emb_tile"])
     parallel_seq = int(block3_candidate["parallel_seq"])
     tile_m = int(block3_candidate["tile_m"])
     tile_k = int(block3_candidate["tile_k"])
+    if block2_parallel_seq != 1:
+        return False
     if seq_len % q_seq_tile != 0:
         return False
     if q_seq_tile != tile_m or emb_tile != tile_k:
@@ -211,6 +214,7 @@ def _resolve_dataflow_topology_ids(
     block2_candidates = tuple(
         candidate
         for candidate in mha_out_proj_topologies(
+            seq_len=spec.seq_len,
             num_heads=spec.num_attention_heads,
             head_dim=spec.attention_head_size,
         )

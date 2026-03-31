@@ -84,6 +84,7 @@ def practical_block_topology_catalog(
     block2_supported_ids = {
         str(candidate["topology_id"])
         for candidate in mha_out_proj_topologies(
+            seq_len=spec.seq_len,
             num_heads=spec.num_attention_heads,
             head_dim=head_dim,
         )

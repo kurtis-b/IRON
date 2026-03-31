@@ -184,32 +184,37 @@ design entrypoint in
 [`iron/operators/mha_out_proj/design.py`](/home/cj/iron/iron/operators/mha_out_proj/design.py)
 and translates them into the fused runtime wrapper in
 [`iron/operators/mha_out_proj/op.py`](/home/cj/iron/iron/operators/mha_out_proj/op.py).
-The retained `v2` surface is currently pinned to `parallel_seq=1`,
-`q_seq_tile=32`, and `kv_seq_tile=64`, with `emb_tile` selected per retained
-workload family, `o_proj_acc_depth=1`, and a small runtime-supported
-`parallel_heads` sweep (`1`, `2`, `4`, and `6` for the `12x64` retained family;
-`1`, `2`, and `4` for the `16x64` retained family) for the checked-in
-runtime-supported study surface; the current lowered design does not support the
-`16x64 / parallel_heads=8` retained-shape variant because it overruns the
-available DMA-channel fanout during AIE lowering.
+The retained `v2` surface now lowers two topology axes on the validated runtime
+path:
+- `parallel_heads` on the established retained `ps1` path
+- a seq-len-aware `parallel_seq` subset on the retained `12x64` and `16x64`
+  families, with `parallel_seq in {2, 4}` lowered as real sequence lanes when
+  `parallel_heads == 1`, `q_seq_tile == 32`, `kv_seq_tile == 64`, and
+  `o_proj_acc_depth == 1`
+For the retained runtime-supported study surface, `emb_tile` is still selected
+per retained workload family, and the current lowered design still does not
+support the `16x64 / parallel_heads=8` retained-shape variant because it
+overruns the available DMA-channel fanout during AIE lowering.
 That design file should expose three distinct topology views:
-- the narrow retained runtime-supported topology list used by operator tests and
-  benchmark manifests
+- a seq-len-aware runtime-supported topology list used by operator tests,
+  benchmark manifests, and app-level runtime matching
 - a broader theoretical topology enumerator that explores every combination
   allowed by the Block 2 contract, microkernel divisibility, lane-count limit,
   and the current staged local-memory working-set limits for a given workload
 - a heuristic-pruned practical exploration surface that favors higher sequence
   and head parallelism, larger Q/KV/output tiles, larger sequence and output
   chunks, and fuller per-stage local-memory utilization while still retaining
-  the baseline runtime-supported study topologies; until `parallel_seq` grows a
-  true lowering, that practical ranking should prefer real lowered axes such as
-  `parallel_heads` over paper-only `parallel_seq` gains
+  the baseline runtime-supported study topologies; practical ranking should
+  continue to prefer real lowered axes over paper-only gains
 The checked-in study manifests should continue to pin the baseline retained
 topology IDs for reproducibility even as that broader theoretical exploration
 surface grows.
 Study metadata emitted by the in-process Dataflow patterns should include the
 selected Block 2 topology ID and family so retained topology choices are visible
 in benchmark outputs.
+The current packed Block 2 -> Block 3 handoff remains a stricter subset of the
+standalone Block 2 runtime: it currently requires `Block 2 parallel_seq == 1`,
+matching the existing packed-output layout contract used by Block 3.
 
 ## Block 3
 

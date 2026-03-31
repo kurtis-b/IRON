@@ -124,6 +124,7 @@ _BLOCK2_TOPOLOGIES = {
 }
 
 _BLOCK2_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
+_BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES = (1, 2, 4)
 _BLOCK2_MAX_LOWERED_PARALLEL_HEADS = 6
 _BLOCK2_AIE_DATA_MEM_SIZE_BYTES = 65536
 _BLOCK2_FIFO_STAGE_COPIES = 2
@@ -139,15 +140,39 @@ _BLOCK2_PRACTICAL_MAX_CANDIDATES = 64
 
 def mha_out_proj_topologies(
     *,
+    seq_len: int | None = None,
     num_heads: int,
     head_dim: int,
 ) -> list[dict[str, int | str]]:
     try:
-        topologies = _BLOCK2_TOPOLOGIES[(num_heads, head_dim)]
+        retained = copy.deepcopy(_BLOCK2_TOPOLOGIES[(num_heads, head_dim)])
     except KeyError as exc:
         raise ValueError(
             "Block 2 currently supports only the retained thesis families 1x64, 12x64, and 16x64"
         ) from exc
+
+    topologies = retained
+    if seq_len is not None:
+        if seq_len <= 0:
+            raise ValueError("Block 2 requires seq_len > 0")
+        retained_seq_candidates = [
+            candidate
+            for candidate in retained
+            if _block2_runtime_candidate_allowed(
+                candidate,
+                seq_len=seq_len,
+                num_heads=num_heads,
+                head_dim=head_dim,
+            )
+        ]
+        promoted_seq_candidates = _block2_promoted_parallel_seq_candidates(
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            retained=retained,
+        )
+        topologies = retained_seq_candidates + promoted_seq_candidates
+
     return [
         {
             **candidate,
@@ -256,6 +281,7 @@ def mha_out_proj_practical_topologies(
             }
         )
         for candidate in mha_out_proj_topologies(
+            seq_len=seq_len,
             num_heads=num_heads,
             head_dim=head_dim,
         )
@@ -309,7 +335,11 @@ def mha_out_proj_design(
     head_dim: int,
     topology_id: str | None = None,
 ) -> dict[str, int | str]:
-    topologies = mha_out_proj_topologies(num_heads=num_heads, head_dim=head_dim)
+    topologies = mha_out_proj_topologies(
+        seq_len=seq_len,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
 
     if topology_id is None:
         config = topologies[0]
@@ -475,7 +505,6 @@ def _block2_practical_sort_key(
     emb_tile = int(candidate["emb_tile"])
     o_proj_acc_depth = int(candidate["o_proj_acc_depth"])
 
-    runtime_lowering_bonus = int(parallel_seq == 1)
     lane_parallelism = _block2_effective_lowered_parallelism(candidate)
     sequence_chunk = _block2_effective_sequence_chunk(candidate)
     output_chunk = emb_tile * o_proj_acc_depth
@@ -487,7 +516,6 @@ def _block2_practical_sort_key(
     )
 
     return (
-        runtime_lowering_bonus,
         lane_parallelism,
         kv_seq_tile,
         sequence_chunk,
@@ -501,8 +529,98 @@ def _block2_practical_sort_key(
 
 
 def _block2_effective_lowered_parallelism(candidate: dict[str, int | str]) -> int:
-    return int(candidate["parallel_heads"])
+    parallel_seq = int(candidate["parallel_seq"])
+    parallel_heads = int(candidate["parallel_heads"])
+    if parallel_seq in _BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES and (
+        parallel_seq == 1 or parallel_heads == 1
+    ):
+        return parallel_seq * parallel_heads
+    return parallel_heads
 
 
 def _block2_effective_sequence_chunk(candidate: dict[str, int | str]) -> int:
-    return int(candidate["q_seq_tile"])
+    parallel_seq = int(candidate["parallel_seq"])
+    q_seq_tile = int(candidate["q_seq_tile"])
+    parallel_heads = int(candidate["parallel_heads"])
+    if parallel_seq in _BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES and (
+        parallel_seq == 1 or parallel_heads == 1
+    ):
+        return parallel_seq * q_seq_tile
+    return q_seq_tile
+
+
+def _block2_runtime_candidate_allowed(
+    candidate: dict[str, int | str],
+    *,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+) -> bool:
+    parallel_seq = int(candidate["parallel_seq"])
+    q_seq_tile = int(candidate["q_seq_tile"])
+    kv_seq_tile = int(candidate["kv_seq_tile"])
+    emb_tile = int(candidate["emb_tile"])
+    parallel_heads = int(candidate["parallel_heads"])
+    o_proj_acc_depth = int(candidate["o_proj_acc_depth"])
+    embed_sz = num_heads * head_dim
+
+    if head_dim != 64:
+        return False
+    if parallel_seq not in _BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES:
+        return False
+    if seq_len % (parallel_seq * q_seq_tile) != 0:
+        return False
+    if seq_len % kv_seq_tile != 0:
+        return False
+    if num_heads % parallel_heads != 0:
+        return False
+    if parallel_seq * parallel_heads > 8:
+        return False
+    if embed_sz % (emb_tile * o_proj_acc_depth) != 0:
+        return False
+    if parallel_seq > 1:
+        return (
+            num_heads in (12, 16)
+            and head_dim == 64
+            and parallel_heads == 1
+            and q_seq_tile == 32
+            and kv_seq_tile == 64
+            and o_proj_acc_depth == 1
+        )
+    return True
+
+
+def _block2_promoted_parallel_seq_candidates(
+    *,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    retained: list[dict[str, int]],
+) -> list[dict[str, int]]:
+    base_seq_candidate = next(
+        (
+            copy.deepcopy(candidate)
+            for candidate in retained
+            if int(candidate["parallel_seq"]) == 1
+            and int(candidate["parallel_heads"]) == 1
+            and int(candidate["o_proj_acc_depth"]) == 1
+            and int(candidate["q_seq_tile"]) == 32
+            and int(candidate["kv_seq_tile"]) == 64
+        ),
+        None,
+    )
+    if base_seq_candidate is None:
+        return []
+
+    promoted: list[dict[str, int]] = []
+    for parallel_seq in (2, 4):
+        candidate = copy.deepcopy(base_seq_candidate)
+        candidate["parallel_seq"] = parallel_seq
+        if _block2_runtime_candidate_allowed(
+            candidate,
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        ):
+            promoted.append(candidate)
+    return promoted

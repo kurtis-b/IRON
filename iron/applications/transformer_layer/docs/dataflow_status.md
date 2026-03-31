@@ -90,32 +90,56 @@ Current state:
 
 Current runtime-supported surface:
 
-- `1 x 64`
-  - `q32_kv64_e64_ps1_ph1_acc1`
-- `12 x 64`
-  - `q32_kv64_e96_ps1_ph1_acc1`
-  - `q32_kv64_e96_ps1_ph2_acc1`
-  - `q32_kv64_e96_ps1_ph4_acc1`
-  - `q32_kv64_e96_ps1_ph6_acc1`
-- `16 x 64`
-  - `q32_kv64_e128_ps1_ph1_acc1`
-  - `q32_kv64_e128_ps1_ph2_acc1`
-  - `q32_kv64_e128_ps1_ph4_acc1`
+- runtime support is now `seq_len`-aware
+- the current local lowering now runtime-supports:
+  - the retained `parallel_heads` sweep on the established `ps1` path
+  - a validated `parallel_seq` subset on the retained `12x64` and `16x64`
+    families, with `parallel_seq in {2, 4}` lowered as real sequence lanes
+    when `parallel_heads == 1`, `q_seq_tile == 32`, `kv_seq_tile == 64`, and
+    `o_proj_acc_depth == 1`
+- the current exercised runtime-supported surface is:
+  - `seq_len=64, heads=1, head_dim=64`: `1` topology
+  - `seq_len=512, heads=1, head_dim=64`: `1` topology
+  - `seq_len=64, heads=12, head_dim=64`: `5` topologies
+  - `seq_len=512, heads=12, head_dim=64`: `6` topologies
+  - `seq_len=64, heads=16, head_dim=64`: `4` topologies
+  - `seq_len=512, heads=16, head_dim=64`: `5` topologies
+- concretely:
+  - `1 x 64`
+    - `q32_kv64_e64_ps1_ph1_acc1`
+  - `12 x 64, seq_len=64`
+    - `q32_kv64_e96_ps1_ph1_acc1`
+    - `q32_kv64_e96_ps1_ph2_acc1`
+    - `q32_kv64_e96_ps1_ph4_acc1`
+    - `q32_kv64_e96_ps1_ph6_acc1`
+    - `q32_kv64_e96_ps2_ph1_acc1`
+  - `12 x 64, seq_len=512`
+    - the same set plus `q32_kv64_e96_ps4_ph1_acc1`
+  - `16 x 64, seq_len=64`
+    - `q32_kv64_e128_ps1_ph1_acc1`
+    - `q32_kv64_e128_ps1_ph2_acc1`
+    - `q32_kv64_e128_ps1_ph4_acc1`
+    - `q32_kv64_e128_ps2_ph1_acc1`
+  - `16 x 64, seq_len=512`
+    - the same set plus `q32_kv64_e128_ps4_ph1_acc1`
 
 Verified today:
 
 - supported Block 2 runtime topologies are functionally verified in
   `iron/operators/mha_out_proj/test.py`
 - the packed Block 2 output path used for the Block 2 -> Block 3 handoff has
-  focused layout tests plus representative app-level parity coverage when it is
+  focused layout tests, direct dense-vs-packed parity coverage on the retained
+  `ps1` runtime path, and representative app-level parity coverage when it is
   paired with a tile-compatible Block 3 runtime topology, but not a full
   compatible-pair sweep yet
 
 Work left:
 
-- implement real topology-level `parallel_seq` lowering
+- broaden the current real `parallel_seq` lowering beyond the validated
+  `parallel_heads == 1`, `q32/kv64/acc1`, retained `12x64` / `16x64` subset
 - broaden the packed Block 2 output mode beyond the current restricted path
-  used for Block 3 handoff
+  used for Block 3 handoff; the current packed handoff still requires
+  `Block 2 parallel_seq == 1`
 - widen runtime support across more of the practical/theoretical Block 2 space,
   especially if higher `o_proj_acc_depth` or wider family support is needed
 - remove the remaining pytest skips in the practical matrix as those topologies

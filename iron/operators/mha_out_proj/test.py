@@ -46,6 +46,7 @@ def generate_test_params():
         supported_ids = {
             str(topology["topology_id"])
             for topology in mha_out_proj_topologies(
+                seq_len=seq_len,
                 num_heads=num_heads,
                 head_dim=head_dim,
             )
@@ -146,6 +147,7 @@ def test_theoretical_block2_topologies_cover_supported_surface():
         supported_ids = {
             str(topology["topology_id"])
             for topology in mha_out_proj_topologies(
+                seq_len=seq_len,
                 num_heads=num_heads,
                 head_dim=64,
             )
@@ -200,10 +202,43 @@ def test_packed_block3_output_layout_reserves_a_half_and_places_residual_half():
     assert np.array_equal(first_tile_residual, residual[:q_seq_tile, :emb_tile])
 
 
+def test_block2_packed_output_uses_distinct_artifacts(aie_context):
+    plain = AIEMHAOutProj(
+        num_heads=12,
+        seq_len=64,
+        d=64,
+        topology_id="q32_kv64_e96_ps1_ph1_acc1",
+        context=aie_context,
+    )
+    packed = AIEMHAOutProj(
+        num_heads=12,
+        seq_len=64,
+        d=64,
+        topology_id="q32_kv64_e96_ps1_ph1_acc1",
+        context=aie_context,
+        packed_output_parallel_seq=1,
+        packed_output_rows=64,
+    )
+
+    aie_context.compile_all()
+
+    assert plain.xclbin_artifact.path.name != packed.xclbin_artifact.path.name
+    assert plain.insts_artifact.path.name != packed.insts_artifact.path.name
+
+
 def test_supported_block2_topologies_include_promoted_runtime_variants():
+    topology_ids_1 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=512,
+            num_heads=1,
+            head_dim=64,
+        )
+    }
     topology_ids_12 = {
         str(topology["topology_id"])
         for topology in mha_out_proj_topologies(
+            seq_len=512,
             num_heads=12,
             head_dim=64,
         )
@@ -211,16 +246,23 @@ def test_supported_block2_topologies_include_promoted_runtime_variants():
     topology_ids_16 = {
         str(topology["topology_id"])
         for topology in mha_out_proj_topologies(
+            seq_len=512,
             num_heads=16,
             head_dim=64,
         )
     }
 
+    assert "q32_kv64_e64_ps2_ph1_acc1" not in topology_ids_1
+    assert "q32_kv64_e64_ps4_ph1_acc1" not in topology_ids_1
     assert "q32_kv64_e96_ps1_ph2_acc1" in topology_ids_12
     assert "q32_kv64_e96_ps1_ph4_acc1" in topology_ids_12
     assert "q32_kv64_e96_ps1_ph6_acc1" in topology_ids_12
+    assert "q32_kv64_e96_ps2_ph1_acc1" in topology_ids_12
+    assert "q32_kv64_e96_ps4_ph1_acc1" in topology_ids_12
     assert "q32_kv64_e128_ps1_ph2_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps1_ph4_acc1" in topology_ids_16
+    assert "q32_kv64_e128_ps2_ph1_acc1" in topology_ids_16
+    assert "q32_kv64_e128_ps4_ph1_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps1_ph8_acc1" not in topology_ids_16
 
 
@@ -229,9 +271,11 @@ def test_block2_accepts_flat_qkv_without_head_major_reshape(aie_context):
     head_dim = 64
     num_heads = 12
     topology_id = str(
-        mha_out_proj_topologies(num_heads=num_heads, head_dim=head_dim)[0][
-            "topology_id"
-        ]
+        mha_out_proj_topologies(
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )[0]["topology_id"]
     )
     golden_ref = generate_golden_reference(
         seq_len=seq_len,
@@ -264,6 +308,54 @@ def test_block2_accepts_flat_qkv_without_head_major_reshape(aie_context):
     )
 
     assert torch.equal(o_head, o_flat)
+
+
+def test_block2_packed_output_matches_dense_output(aie_context):
+    seq_len = 64
+    head_dim = 64
+    num_heads = 12
+    golden_ref = generate_golden_reference(
+        seq_len=seq_len,
+        d=head_dim,
+        heads=num_heads,
+        seed=29,
+        debug=DEBUG_MODE,
+    )
+
+    plain = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        topology_id="q32_kv64_e96_ps1_ph1_acc1",
+        context=aie_context,
+    )
+    packed = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        topology_id="q32_kv64_e96_ps1_ph1_acc1",
+        context=aie_context,
+        packed_output_parallel_seq=1,
+        packed_output_rows=seq_len,
+    )
+
+    aie_context.compile_all()
+    aie_context.prepare_runtime()
+
+    dense_out = plain.forward(
+        golden_ref["Q"],
+        golden_ref["K"],
+        golden_ref["V"],
+        golden_ref["W_O"],
+    )
+    packed_out = packed.forward(
+        golden_ref["Q"],
+        golden_ref["K"],
+        golden_ref["V"],
+        golden_ref["W_O"],
+    )
+
+    assert torch.equal(dense_out, packed_out)
 
 
 def test_theoretical_block2_topologies_include_nondefault_valid_variants():
@@ -395,8 +487,10 @@ def test_practical_block2_topologies_are_ranked_and_pruned():
         reverse=True,
     )
     for topology in practical:
-        lane_parallelism = int(topology["parallel_heads"])
-        sequence_chunk = int(topology["q_seq_tile"])
+        lane_parallelism = int(topology["parallel_heads"]) * int(
+            topology["parallel_seq"]
+        )
+        sequence_chunk = int(topology["q_seq_tile"]) * int(topology["parallel_seq"])
         if str(topology["topology_id"]) != "q32_kv64_e128_ps1_ph1_acc1":
             assert int(topology["q_seq_tile"]) >= 32
             assert int(topology["kv_seq_tile"]) >= 64
@@ -407,3 +501,46 @@ def test_practical_block2_topologies_are_ranked_and_pruned():
 
     practical_ids = {str(topology["topology_id"]) for topology in practical}
     assert "q64_kv64_e128_ps1_ph1_acc1" not in practical_ids
+
+
+@pytest.mark.parametrize(
+    "topology_id",
+    (
+        "q32_kv64_e96_ps2_ph1_acc1",
+        "q32_kv64_e96_ps4_ph1_acc1",
+    ),
+)
+def test_block2_sequence_parallel_topologies_run_numerically(topology_id, aie_context):
+    seq_len = 512
+    head_dim = 64
+    num_heads = 12
+    golden_ref = generate_golden_reference(
+        seq_len=seq_len,
+        d=head_dim,
+        heads=num_heads,
+        seed=23,
+        debug=DEBUG_MODE,
+    )
+
+    operator = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        topology_id=topology_id,
+        debug=DEBUG_MODE,
+        context=aie_context,
+    )
+    input_buffers = {
+        "Q": golden_ref["Q"].flatten(),
+        "K": golden_ref["K"].flatten(),
+        "V": golden_ref["V"].flatten(),
+        "W_O": golden_ref["W_O"].flatten(),
+    }
+    output_buffers = {"O": golden_ref["O"].flatten()}
+
+    errors, _, _ = run_test(
+        operator, input_buffers, output_buffers, rel_tol=4.0e-2, abs_tol=1.5e-1
+    )
+    max_acceptable_errors = int(seq_len * head_dim * num_heads * 0.005)
+    if errors:
+        assert len(errors["O"]) <= max_acceptable_errors

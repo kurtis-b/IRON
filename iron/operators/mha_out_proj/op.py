@@ -194,6 +194,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         num_heads: int,
         seq_len: int,
         d: int,
+        parallel_seq: int = 1,
         q_seq_tile: int = 32,
         kv_seq_tile: int = 64,
         emb_tile: int = 96,
@@ -218,6 +219,7 @@ class AIEMHAOutProj(AIEOperatorBase):
             q_seq_tile = int(config["q_seq_tile"])
             kv_seq_tile = int(config["kv_seq_tile"])
             emb_tile = int(config["emb_tile"])
+            parallel_seq = int(config["parallel_seq"])
             parallel_heads = int(config["parallel_heads"])
             o_proj_acc_depth = int(config["o_proj_acc_depth"])
         else:
@@ -230,7 +232,8 @@ class AIEMHAOutProj(AIEOperatorBase):
             except ValueError:
                 candidate = None
             if candidate is not None and (
-                int(candidate["q_seq_tile"]) == q_seq_tile
+                int(candidate["parallel_seq"]) == parallel_seq
+                and int(candidate["q_seq_tile"]) == q_seq_tile
                 and int(candidate["kv_seq_tile"]) == kv_seq_tile
                 and int(candidate["emb_tile"]) == emb_tile
                 and int(candidate["parallel_heads"]) == parallel_heads
@@ -241,6 +244,7 @@ class AIEMHAOutProj(AIEOperatorBase):
         self.num_heads = num_heads
         self.seq_len = seq_len
         self.d = d
+        self.parallel_seq = parallel_seq
         self.q_seq_tile = q_seq_tile
         self.kv_seq_tile = kv_seq_tile
         self.emb_tile = emb_tile
@@ -253,7 +257,7 @@ class AIEMHAOutProj(AIEOperatorBase):
             if config is not None
             else (
                 f"q{q_seq_tile}_kv{kv_seq_tile}_e{emb_tile}"
-                f"_ph{parallel_heads}_acc{o_proj_acc_depth}"
+                f"_ps{parallel_seq}_ph{parallel_heads}_acc{o_proj_acc_depth}"
             )
         )
         self.topology_family = (
@@ -265,6 +269,10 @@ class AIEMHAOutProj(AIEOperatorBase):
         self.embed_sz = d * num_heads
         assert d == 64, "Only d=64 is supported in this version"
         if self.packed_output_parallel_seq is not None:
+            if self.parallel_seq != 1:
+                raise AIEOperatorConstraintError(
+                    "AIEMHAOutProj: packed Block 3 handoff currently requires Block 2 parallel_seq == 1"
+                )
             if self.seq_len % self.q_seq_tile != 0:
                 raise AIEOperatorConstraintError(
                     "AIEMHAOutProj: packed Block 3 handoff requires seq_len divisible by q_seq_tile"
@@ -310,7 +318,16 @@ class AIEMHAOutProj(AIEOperatorBase):
         # ---
         operator_dir = Path(__file__).parent
 
-        file_name_base = f"mha_o_proj_{self.num_heads}h_{self.seq_len}s_{self.d}d_{self.q_seq_tile}qseqtile_{self.kv_seq_tile}kvseqtile_{self.emb_tile}e_{self.parallel_heads}ph_{self.o_proj_acc_depth}acc"
+        file_name_base = (
+            f"mha_o_proj_{self.num_heads}h_{self.seq_len}s_{self.d}d_"
+            f"{self.q_seq_tile}qseqtile_{self.kv_seq_tile}kvseqtile_{self.emb_tile}e_"
+            f"{self.parallel_seq}ps_{self.parallel_heads}ph_{self.o_proj_acc_depth}acc"
+        )
+        if self.packed_output_parallel_seq is not None:
+            file_name_base += (
+                f"_packps{self.packed_output_parallel_seq}"
+                f"_packrows{self.packed_output_rows}"
+            )
 
         mm_source = str(self.context.base_dir / "aie_kernels" / "aie2p" / "mm.cc")
         softmax_source = str(
@@ -373,6 +390,7 @@ class AIEMHAOutProj(AIEOperatorBase):
                 "heads": self.num_heads,
                 "seq_len": self.seq_len,
                 "d": self.d,
+                "parallel_seq": self.parallel_seq,
                 "q_seq_tile": self.q_seq_tile,
                 "kv_seq_tile": self.kv_seq_tile,
                 "emb_tile": self.emb_tile,
