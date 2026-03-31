@@ -579,6 +579,17 @@ def _block2_runtime_candidate_allowed(
     if embed_sz % (emb_tile * o_proj_acc_depth) != 0:
         return False
     if parallel_seq > 1:
+        if (
+            num_heads == 1
+            and parallel_seq == 2
+            and seq_len == parallel_seq * q_seq_tile
+            and q_seq_tile == 32
+            and kv_seq_tile == 64
+            and emb_tile == 64
+            and parallel_heads == 1
+            and o_proj_acc_depth == 1
+        ):
+            return True
         return (
             num_heads in (12, 16)
             and head_dim == 64

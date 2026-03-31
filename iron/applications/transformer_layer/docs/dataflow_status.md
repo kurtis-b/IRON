@@ -97,15 +97,21 @@ Current runtime-supported surface:
     families, with `parallel_seq in {2, 4}` lowered as real sequence lanes
     when `parallel_heads == 1`, `q_seq_tile == 32`, `kv_seq_tile == 64`, and
     `o_proj_acc_depth == 1`
+  - a narrower validated `parallel_seq` subset on the retained `1x64` family:
+    `seq_len=64`, `parallel_seq=2`, `parallel_heads == 1`, `q_seq_tile == 32`,
+    `kv_seq_tile == 64`, `emb_tile == 64`, `o_proj_acc_depth == 1`
 - the current exercised runtime-supported surface is:
-  - `seq_len=64, heads=1, head_dim=64`: `1` topology
+  - `seq_len=64, heads=1, head_dim=64`: `2` topologies
   - `seq_len=512, heads=1, head_dim=64`: `1` topology
   - `seq_len=64, heads=12, head_dim=64`: `5` topologies
   - `seq_len=512, heads=12, head_dim=64`: `6` topologies
   - `seq_len=64, heads=16, head_dim=64`: `4` topologies
   - `seq_len=512, heads=16, head_dim=64`: `5` topologies
 - concretely:
-  - `1 x 64`
+  - `1 x 64, seq_len=64`
+    - `q32_kv64_e64_ps1_ph1_acc1`
+    - `q32_kv64_e64_ps2_ph1_acc1`
+  - `1 x 64, seq_len=512`
     - `q32_kv64_e64_ps1_ph1_acc1`
   - `12 x 64, seq_len=64`
     - `q32_kv64_e96_ps1_ph1_acc1`
@@ -136,7 +142,8 @@ Verified today:
 Work left:
 
 - broaden the current real `parallel_seq` lowering beyond the validated
-  `parallel_heads == 1`, `q32/kv64/acc1`, retained `12x64` / `16x64` subset
+  `parallel_heads == 1`, `q32/kv64/acc1`, retained-family subset; today the
+  `1x64` family only validates the short-sequence `seq_len=64, ps2` case
 - broaden the packed Block 2 output mode beyond the current restricted path
   used for Block 3 handoff; the current packed handoff still requires
   `Block 2 parallel_seq == 1`

@@ -191,6 +191,10 @@ path:
   families, with `parallel_seq in {2, 4}` lowered as real sequence lanes when
   `parallel_heads == 1`, `q_seq_tile == 32`, `kv_seq_tile == 64`, and
   `o_proj_acc_depth == 1`
+- a narrower `parallel_seq` subset on the retained `1x64` family, currently
+  validated only for `seq_len=64`, `parallel_seq=2`, `parallel_heads == 1`,
+  `q_seq_tile == 32`, `kv_seq_tile == 64`, `emb_tile == 64`, and
+  `o_proj_acc_depth == 1`
 For the retained runtime-supported study surface, `emb_tile` is still selected
 per retained workload family, and the current lowered design still does not
 support the `16x64 / parallel_heads=8` retained-shape variant because it

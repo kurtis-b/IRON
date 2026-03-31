@@ -227,6 +227,14 @@ def test_block2_packed_output_uses_distinct_artifacts(aie_context):
 
 
 def test_supported_block2_topologies_include_promoted_runtime_variants():
+    topology_ids_1_seq64 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=64,
+            num_heads=1,
+            head_dim=64,
+        )
+    }
     topology_ids_1 = {
         str(topology["topology_id"])
         for topology in mha_out_proj_topologies(
@@ -252,6 +260,7 @@ def test_supported_block2_topologies_include_promoted_runtime_variants():
         )
     }
 
+    assert "q32_kv64_e64_ps2_ph1_acc1" in topology_ids_1_seq64
     assert "q32_kv64_e64_ps2_ph1_acc1" not in topology_ids_1
     assert "q32_kv64_e64_ps4_ph1_acc1" not in topology_ids_1
     assert "q32_kv64_e96_ps1_ph2_acc1" in topology_ids_12
@@ -504,16 +513,17 @@ def test_practical_block2_topologies_are_ranked_and_pruned():
 
 
 @pytest.mark.parametrize(
-    "topology_id",
+    "seq_len,num_heads,topology_id",
     (
-        "q32_kv64_e96_ps2_ph1_acc1",
-        "q32_kv64_e96_ps4_ph1_acc1",
+        (64, 1, "q32_kv64_e64_ps2_ph1_acc1"),
+        (512, 12, "q32_kv64_e96_ps2_ph1_acc1"),
+        (512, 12, "q32_kv64_e96_ps4_ph1_acc1"),
     ),
 )
-def test_block2_sequence_parallel_topologies_run_numerically(topology_id, aie_context):
-    seq_len = 512
+def test_block2_sequence_parallel_topologies_run_numerically(
+    seq_len, num_heads, topology_id, aie_context
+):
     head_dim = 64
-    num_heads = 12
     golden_ref = generate_golden_reference(
         seq_len=seq_len,
         d=head_dim,
