@@ -124,7 +124,7 @@ _BLOCK2_TOPOLOGIES = {
 }
 
 _BLOCK2_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
-_BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES = (1, 2, 4)
+_BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6)
 _BLOCK2_MAX_LOWERED_PARALLEL_HEADS = 6
 _BLOCK2_AIE_DATA_MEM_SIZE_BYTES = 65536
 _BLOCK2_FIFO_STAGE_COPIES = 2
@@ -592,10 +592,9 @@ def _block2_runtime_candidate_allowed(
             return True
         return (
             num_heads in (12, 16)
-            and head_dim == 64
-            and parallel_heads == 1
             and q_seq_tile == 32
             and kv_seq_tile == 64
+            and parallel_heads == 1
             and o_proj_acc_depth == 1
         )
     return True
@@ -624,7 +623,7 @@ def _block2_promoted_parallel_seq_candidates(
         return []
 
     promoted: list[dict[str, int]] = []
-    for parallel_seq in (2, 4):
+    for parallel_seq in (2, 4, 6):
         candidate = copy.deepcopy(base_seq_candidate)
         candidate["parallel_seq"] = parallel_seq
         if _block2_runtime_candidate_allowed(

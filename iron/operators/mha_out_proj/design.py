@@ -127,6 +127,11 @@ def fused_mha(
     embed_sz = heads * d
     sequence_parallel_mode = parallel_seq > 1
     parallel_lanes = parallel_seq if sequence_parallel_mode else parallel_heads
+    parallel_seq_join_distribute = (
+        parallel_seq // 2
+        if sequence_parallel_mode and parallel_seq > 4
+        else parallel_seq
+    )
 
     of_depth = 2
     o_proj_weight_consumer_depth = 1
@@ -172,7 +177,8 @@ def fused_mha(
         assert parallel_seq in (
             2,
             4,
-        ), "parallel sequence lowering currently supports ps in {2, 4}"
+            6,
+        ), "parallel sequence lowering currently supports ps in {2, 4, 6}"
         assert (
             parallel_heads == 1
         ), "parallel sequence lowering currently requires parallel_heads == 1"
@@ -310,18 +316,39 @@ def fused_mha(
 
     if sequence_parallel_mode:
         inQ = ObjectFifo(
-            np.ndarray[(parallel_seq * q_seq_tile, d), np.dtype[dtype]],
+            np.ndarray[(parallel_seq_join_distribute * q_seq_tile, d), np.dtype[dtype]],
             name="inQ",
             depth=of_depth,
         )
         memQ = inQ.cons().split(
-            offsets=[q_seq_tile * d * i for i in range(parallel_seq)],
-            obj_types=[q_ty] * parallel_seq,
-            names=[f"memQ{i}" for i in range(parallel_seq)],
-            dims_to_stream=[q_dims] * parallel_seq,
-            depths=[of_depth] * parallel_seq,
-            placement=Tile(col=0, row=1),
+            offsets=[q_seq_tile * d * i for i in range(parallel_seq_join_distribute)],
+            obj_types=[q_ty] * parallel_seq_join_distribute,
+            names=[f"memQ{i}" for i in range(parallel_seq_join_distribute)],
+            dims_to_stream=[q_dims] * parallel_seq_join_distribute,
+            depths=[of_depth] * parallel_seq_join_distribute,
+            placement=Tile(col=6 if parallel_seq > 4 else 0, row=1),
         )
+        if parallel_seq > 4:
+            inQ2 = ObjectFifo(
+                np.ndarray[
+                    (parallel_seq_join_distribute * q_seq_tile, d), np.dtype[dtype]
+                ],
+                name="inQ2",
+                depth=of_depth,
+            )
+            memQ += inQ2.cons().split(
+                offsets=[
+                    q_seq_tile * d * i for i in range(parallel_seq_join_distribute)
+                ],
+                obj_types=[q_ty] * parallel_seq_join_distribute,
+                names=[
+                    f"memQ{i + parallel_seq_join_distribute}"
+                    for i in range(parallel_seq_join_distribute)
+                ],
+                dims_to_stream=[q_dims] * parallel_seq_join_distribute,
+                depths=[of_depth] * parallel_seq_join_distribute,
+                placement=Tile(col=7, row=1),
+            )
     else:
         inQ = ObjectFifo(
             np.ndarray[(q_seq_tile, d * parallel_heads), np.dtype[dtype]],
@@ -497,6 +524,7 @@ def fused_mha(
     outOProj = []
     outOProjAccumIn = []
     outOProjAccumOut = []
+
     for i in range(parallel_lanes):
         outOProj.append(
             ObjectFifo(q_ty, depth=o_proj_partial_depth, name=f"outOProj{i}")
@@ -508,7 +536,14 @@ def fused_mha(
             .forward(
                 name=f"outOProjAccumIn{i}",
                 depth=o_proj_acc_depth,
-                placement=Tile(col=6 + (i % 2), row=1),
+                placement=Tile(
+                    col=(
+                        4 + (i % 2)
+                        if sequence_parallel_mode and parallel_seq > 4
+                        else (6 + (i % 2))
+                    ),
+                    row=1,
+                ),
             )
         )  # Local to 1 parallel lane
 
@@ -517,22 +552,49 @@ def fused_mha(
         for i in range(parallel_heads - 1):
             outOPart.append(
                 ObjectFifo(o_ty, depth=o_proj_partial_depth, name=f"outOPart{i}")
-            )  # Local to 1 parallel block of heads
+            )
 
     o_dims = [(q_seq_tile // r, r * emb_tile), (r, t), (emb_tile // t, r * t), (t, 1)]
     if sequence_parallel_mode:
         memO = ObjectFifo(
-            np.ndarray[(parallel_seq * q_seq_tile, emb_tile), np.dtype[dtype]],
+            np.ndarray[
+                (parallel_seq_join_distribute * q_seq_tile, emb_tile),
+                np.dtype[dtype],
+            ],
             name="memO",
             dims_to_stream=o_dims,
         )
         outO = memO.prod().join(
-            offsets=[q_seq_tile * emb_tile * i for i in range(parallel_seq)],
-            obj_types=[o_ty] * parallel_seq,
-            names=[f"outO{i}" for i in range(parallel_seq)],
-            depths=[of_depth] * parallel_seq,
-            placement=Tile(col=7, row=1),
+            offsets=[
+                q_seq_tile * emb_tile * i for i in range(parallel_seq_join_distribute)
+            ],
+            obj_types=[o_ty] * parallel_seq_join_distribute,
+            names=[f"outO{i}" for i in range(parallel_seq_join_distribute)],
+            depths=[of_depth] * parallel_seq_join_distribute,
+            placement=Tile(col=6 if parallel_seq > 4 else 7, row=1),
         )
+        if parallel_seq > 4:
+            memO2 = ObjectFifo(
+                np.ndarray[
+                    (parallel_seq_join_distribute * q_seq_tile, emb_tile),
+                    np.dtype[dtype],
+                ],
+                name="memO2",
+                dims_to_stream=o_dims,
+            )
+            outO += memO2.prod().join(
+                offsets=[
+                    q_seq_tile * emb_tile * i
+                    for i in range(parallel_seq_join_distribute)
+                ],
+                obj_types=[o_ty] * parallel_seq_join_distribute,
+                names=[
+                    f"outO{i + parallel_seq_join_distribute}"
+                    for i in range(parallel_seq_join_distribute)
+                ],
+                depths=[of_depth] * parallel_seq_join_distribute,
+                placement=Tile(col=7, row=1),
+            )
     else:
         memO = ObjectFifo(
             o_ty,
@@ -553,15 +615,18 @@ def fused_mha(
         of_a_out,
         zero,
         matmul_QK,
-        q_block_bias,
         q_block_stride,
+        q_block_rtp,
+        barrier,
         idx_buffer,
     ):
+        barrier.wait_for_value(1)
+        current_q_block = q_block_rtp[0]
 
         for _ in range_(sys.maxsize):
 
             idx_buffer[0] = 0
-            idx_buffer[1] = q_block_bias
+            idx_buffer[1] = current_q_block
 
             for _ in range_(num_qkv_head_block_per_parallel_head):
 
@@ -583,6 +648,8 @@ def fused_mha(
 
                 of_q.release(1)
 
+            current_q_block += q_block_stride
+
     def softmax(
         of_in_a,
         of_out_p,
@@ -590,8 +657,9 @@ def fused_mha(
         partial_softmax,
         init_scale_buffer,
         memcopy_kernel_scale,
-        q_block_bias,
         q_block_stride,
+        q_block_rtp,
+        barrier,
         idx_buffer,
         scale_buffer,
     ):
@@ -599,11 +667,14 @@ def fused_mha(
         # VJUNG: The index buffer count how many Q and KV block this worker has processed
         # From this info we can infer the position in A and P
 
+        barrier.wait_for_value(1)
+        current_q_block = q_block_rtp[0]
+
         for _ in range_(sys.maxsize):
 
             # VJUNG: Required otherwise the buffer is maintained when doing warmup!
             idx_buffer[0] = 0
-            idx_buffer[1] = q_block_bias
+            idx_buffer[1] = current_q_block
 
             for _ in range_(num_qkv_head_block_per_parallel_head):
 
@@ -635,6 +706,8 @@ def fused_mha(
                     idx_buffer[0] += 1
                 idx_buffer[0] = 0
 
+            current_q_block += q_block_stride
+
     def batched_matmul_pv(
         of_p,
         of_v,
@@ -643,16 +716,19 @@ def fused_mha(
         zero,
         matmul_PV,
         rescale_O,
-        q_block_bias,
         q_block_stride,
+        q_block_rtp,
+        barrier,
         idx_buffer,
     ):
+        barrier.wait_for_value(1)
+        current_q_block = q_block_rtp[0]
 
         for _ in range_(sys.maxsize):
 
             # VJUNG: Required otherwise the buffer is maintained when doing warmup!
             idx_buffer[0] = 0
-            idx_buffer[1] = q_block_bias
+            idx_buffer[1] = current_q_block
 
             for _ in range_(num_qkv_head_block_per_parallel_head):
 
@@ -734,6 +810,8 @@ def fused_mha(
 
                 idx_buffer[0] = 0
                 of_o_out.release(1)
+
+            current_q_block += q_block_stride
 
     def matmul_o_proj(
         of_o_in,
@@ -818,7 +896,23 @@ def fused_mha(
     softmax_workers = []
     matmul_pv_workers = []
     o_proj_workers = []
-    q_block_stride = 0
+    q_block_rtps = [
+        [
+            Buffer(
+                np.ndarray[(1,), np.dtype[np.int32]],
+                name=f"q_block_rtp_{stage}_{lane}",
+                initial_value=None,
+                use_write_rtp=True,
+            )
+            for lane in range(parallel_lanes)
+        ]
+        for stage in range(3)
+    ]
+    worker_barriers = [
+        [WorkerRuntimeBarrier(initial_value=0) for _ in range(parallel_lanes)]
+        for _ in range(3)
+    ]
+    q_block_stride = parallel_seq if sequence_parallel_mode else 0
     for i in range(parallel_lanes):
         idx_buffer_qk = Buffer(
             initial_value=np.zeros(shape=(2,), dtype=np.int32),
@@ -833,8 +927,9 @@ def fused_mha(
                     memA[i].prod(),
                     zero_kernel,
                     matmul_QK,
-                    0,
                     q_block_stride,
+                    q_block_rtps[0][i],
+                    worker_barriers[0][i],
                     idx_buffer_qk,
                 ],
                 stack_size=0xD00,
@@ -860,8 +955,9 @@ def fused_mha(
                     partial_softmax_kernel,
                     scale_buffer_init_kernel,
                     memcopy_kernel_scale,
-                    0,
                     q_block_stride,
+                    q_block_rtps[1][i],
+                    worker_barriers[1][i],
                     idx_buffer_softmax,
                     scale_buffer_softmax,
                 ],
@@ -885,8 +981,9 @@ def fused_mha(
                     zero_kernel_q,
                     matmul_PV,
                     rescale_O,
-                    0,
                     q_block_stride,
+                    q_block_rtps[2][i],
+                    worker_barriers[2][i],
                     idx_buffer_pv,
                 ],
                 stack_size=0xD00,
@@ -933,7 +1030,11 @@ def fused_mha(
     # across the heads, not the sequence length (i.e. how it's done in the MHA operator),
     # because the cores execute on each head. However, we have to keep in mind that
     # K/v need to have the full sequence length passed for each head.
-    q_tile_rows = parallel_seq * q_seq_tile if sequence_parallel_mode else q_seq_tile
+    q_tile_rows = (
+        parallel_seq_join_distribute * q_seq_tile
+        if sequence_parallel_mode
+        else q_seq_tile
+    )
     q_tiles_base = TensorTiler2D.group_tiler(
         (seq_len, embed_sz),
         (q_tile_rows, d),
@@ -1003,10 +1104,11 @@ def fused_mha(
         ]
     if sequence_parallel_mode:
         WO_tiles = duplicate_split_taps_for_parallel_seq(WO_tiles)
-
     if packed_output_parallel_seq is None:
         o_tile_rows = (
-            parallel_seq * q_seq_tile if sequence_parallel_mode else q_seq_tile
+            parallel_seq_join_distribute * q_seq_tile
+            if sequence_parallel_mode
+            else q_seq_tile
         )
         O_tiles = TensorTiler2D.group_tiler(
             (seq_len, embed_sz),
@@ -1134,6 +1236,17 @@ def fused_mha(
     rt = Runtime()
     with rt.sequence(W_O_ty, Q_ty, K_ty, V_ty, O_ty) as (W_O, Q, K, V, O):
 
+        def set_q_block_rtps():
+            for stage in range(3):
+                for lane in range(parallel_lanes):
+                    q_block_rtps[stage][lane][0] = lane if sequence_parallel_mode else 0
+
+        rt.inline_ops(set_q_block_rtps, ())
+
+        for stage in range(3):
+            for lane in range(parallel_lanes):
+                rt.set_barrier(worker_barriers[stage][lane], 1)
+
         for i in range(parallel_lanes):
             rt.start(matmul_workers[i])
             rt.start(softmax_workers[i])
@@ -1151,17 +1264,37 @@ def fused_mha(
                 # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
                 tg = rt.task_group()
 
-                rt.fill(
-                    inQ.prod(),
-                    Q,
-                    tap=Q_tiles[q_block_idx],
-                    placement=Tile(col=0, row=0),
-                    task_group=tg,
-                )
+                if sequence_parallel_mode and parallel_seq > 4:
+                    rt.fill(
+                        inQ.prod(),
+                        Q,
+                        tap=Q_tiles[2 * q_block_idx],
+                        placement=Tile(col=6, row=0),
+                        task_group=tg,
+                    )
+                    rt.fill(
+                        inQ2.prod(),
+                        Q,
+                        tap=Q_tiles[2 * q_block_idx + 1],
+                        placement=Tile(col=7, row=0),
+                        task_group=tg,
+                    )
+                else:
+                    rt.fill(
+                        inQ.prod(),
+                        Q,
+                        tap=Q_tiles[q_block_idx],
+                        placement=Tile(col=0, row=0),
+                        task_group=tg,
+                    )
                 logging.debug(
                     f"Scheduling fills for q block {q_block_idx}, col group {col_group} for Q, K, V, W_O, and O"
                 )
-                logging.debug(f"  Q tap: {Q_tiles[q_block_idx]}")
+                if sequence_parallel_mode and parallel_seq > 4:
+                    logging.debug(f"  Q tap 0: {Q_tiles[2 * q_block_idx]}")
+                    logging.debug(f"  Q tap 1: {Q_tiles[2 * q_block_idx + 1]}")
+                else:
+                    logging.debug(f"  Q tap: {Q_tiles[q_block_idx]}")
                 for head_idx in range(heads // parallel_heads):
                     tg_head = rt.task_group()
                     rt.fill(
@@ -1195,17 +1328,42 @@ def fused_mha(
                         f"    W_O tap: {WO_tiles[head_idx * num_o_col_groups + col_group]}"
                     )
 
-                rt.drain(
-                    memO.cons(),
-                    O,
-                    tap=O_tiles[q_block_idx * num_o_col_groups + col_group],
-                    wait=True,
-                    placement=Tile(col=7, row=0),
-                    task_group=tg,
-                )
-                logging.debug(
-                    f"  O tap: {O_tiles[q_block_idx * num_o_col_groups + col_group]}"
-                )
+                if sequence_parallel_mode and parallel_seq > 4:
+                    rt.drain(
+                        memO.cons(),
+                        O,
+                        tap=O_tiles[(2 * q_block_idx) * num_o_col_groups + col_group],
+                        wait=True,
+                        placement=Tile(col=6, row=0),
+                        task_group=tg,
+                    )
+                    rt.drain(
+                        memO2.cons(),
+                        O,
+                        tap=O_tiles[
+                            (2 * q_block_idx + 1) * num_o_col_groups + col_group
+                        ],
+                        wait=True,
+                        placement=Tile(col=7, row=0),
+                        task_group=tg,
+                    )
+                    logging.debug(
+                        "  O taps: %s / %s",
+                        O_tiles[(2 * q_block_idx) * num_o_col_groups + col_group],
+                        O_tiles[(2 * q_block_idx + 1) * num_o_col_groups + col_group],
+                    )
+                else:
+                    rt.drain(
+                        memO.cons(),
+                        O,
+                        tap=O_tiles[q_block_idx * num_o_col_groups + col_group],
+                        wait=True,
+                        placement=Tile(col=7, row=0),
+                        task_group=tg,
+                    )
+                    logging.debug(
+                        f"  O tap: {O_tiles[q_block_idx * num_o_col_groups + col_group]}"
+                    )
 
                 rt.finish_task_group(tg)
 

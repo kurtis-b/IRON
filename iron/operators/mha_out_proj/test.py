@@ -251,10 +251,26 @@ def test_supported_block2_topologies_include_promoted_runtime_variants():
             head_dim=64,
         )
     }
+    topology_ids_12_seq384 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=384,
+            num_heads=12,
+            head_dim=64,
+        )
+    }
     topology_ids_16 = {
         str(topology["topology_id"])
         for topology in mha_out_proj_topologies(
             seq_len=512,
+            num_heads=16,
+            head_dim=64,
+        )
+    }
+    topology_ids_16_seq384 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=384,
             num_heads=16,
             head_dim=64,
         )
@@ -268,10 +284,12 @@ def test_supported_block2_topologies_include_promoted_runtime_variants():
     assert "q32_kv64_e96_ps1_ph6_acc1" in topology_ids_12
     assert "q32_kv64_e96_ps2_ph1_acc1" in topology_ids_12
     assert "q32_kv64_e96_ps4_ph1_acc1" in topology_ids_12
+    assert "q32_kv64_e96_ps6_ph1_acc1" in topology_ids_12_seq384
     assert "q32_kv64_e128_ps1_ph2_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps1_ph4_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps2_ph1_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps4_ph1_acc1" in topology_ids_16
+    assert "q32_kv64_e128_ps6_ph1_acc1" in topology_ids_16_seq384
     assert "q32_kv64_e128_ps1_ph8_acc1" not in topology_ids_16
 
 
@@ -518,6 +536,8 @@ def test_practical_block2_topologies_are_ranked_and_pruned():
         (64, 1, "q32_kv64_e64_ps2_ph1_acc1"),
         (512, 12, "q32_kv64_e96_ps2_ph1_acc1"),
         (512, 12, "q32_kv64_e96_ps4_ph1_acc1"),
+        (384, 12, "q32_kv64_e96_ps6_ph1_acc1"),
+        (384, 16, "q32_kv64_e128_ps6_ph1_acc1"),
     ),
 )
 def test_block2_sequence_parallel_topologies_run_numerically(
