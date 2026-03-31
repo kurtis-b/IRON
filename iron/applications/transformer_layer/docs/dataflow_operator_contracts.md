@@ -188,10 +188,11 @@ The retained `v2` surface now lowers two topology axes on the validated runtime
 path:
 - `parallel_heads` on the established retained `ps1` path
 - a seq-len-aware `parallel_seq` subset on the retained `12x64` and `16x64`
-  families, with `parallel_seq in {2, 4, 6}` lowered as real sequence lanes
+  families, with `parallel_seq in {2, 4, 6, 8}` lowered as real sequence lanes
   when `parallel_heads == 1`, `q_seq_tile == 32`, `kv_seq_tile == 64`, and
   `o_proj_acc_depth == 1`; `ps6` is currently validated on retained workloads
-  whose `seq_len` is divisible by `192`
+  whose `seq_len` is divisible by `192`, and `ps8` is currently validated on
+  retained workloads whose `seq_len` is divisible by `256`
 - a narrower `parallel_seq` subset on the retained `1x64` family, currently
   validated only for `seq_len=64`, `parallel_seq=2`, `parallel_heads == 1`,
   `q_seq_tile == 32`, `kv_seq_tile == 64`, `emb_tile == 64`, and
@@ -207,10 +208,11 @@ That design file should expose three distinct topology views:
   allowed by the Block 2 contract, microkernel divisibility, lane-count limit,
   and the current staged local-memory working-set limits for a given workload
 - a heuristic-pruned practical exploration surface that favors higher sequence
-  and head parallelism, larger Q/KV/output tiles, larger sequence and output
-  chunks, and fuller per-stage local-memory utilization while still retaining
-  the baseline runtime-supported study topologies; practical ranking should
-  continue to prefer real lowered axes over paper-only gains
+  and head parallelism, larger Q/KV/output tiles, larger
+  `o_proj_acc_depth`, larger sequence and output chunks, and fuller per-stage
+  local-memory utilization while still retaining the baseline runtime-supported
+  study topologies; practical ranking should continue to prefer real lowered
+  axes over paper-only gains
 The checked-in study manifests should continue to pin the baseline retained
 topology IDs for reproducibility even as that broader theoretical exploration
 surface grows.

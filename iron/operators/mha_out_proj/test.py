@@ -284,11 +284,13 @@ def test_supported_block2_topologies_include_promoted_runtime_variants():
     assert "q32_kv64_e96_ps1_ph6_acc1" in topology_ids_12
     assert "q32_kv64_e96_ps2_ph1_acc1" in topology_ids_12
     assert "q32_kv64_e96_ps4_ph1_acc1" in topology_ids_12
+    assert "q32_kv64_e96_ps8_ph1_acc1" in topology_ids_12
     assert "q32_kv64_e96_ps6_ph1_acc1" in topology_ids_12_seq384
     assert "q32_kv64_e128_ps1_ph2_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps1_ph4_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps2_ph1_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps4_ph1_acc1" in topology_ids_16
+    assert "q32_kv64_e128_ps8_ph1_acc1" in topology_ids_16
     assert "q32_kv64_e128_ps6_ph1_acc1" in topology_ids_16_seq384
     assert "q32_kv64_e128_ps1_ph8_acc1" not in topology_ids_16
 
@@ -397,6 +399,7 @@ def test_theoretical_block2_topologies_include_nondefault_valid_variants():
     assert "q32_kv64_e128_ps1_ph1_acc1" in topology_ids
     assert "q32_kv64_e128_ps1_ph2_acc1" in topology_ids
     assert "q32_kv64_e128_ps1_ph1_acc2" in topology_ids
+    assert "q32_kv64_e128_ps1_ph1_acc8" in topology_ids
     assert "q32_kv128_e64_ps1_ph1_acc1" in topology_ids
 
 
@@ -411,6 +414,7 @@ def test_theoretical_block2_topologies_exclude_nonrunnable_l1_overflows():
     }
     assert "q64_kv64_e128_ps1_ph1_acc1" not in topology_ids
     assert "q32_kv64_e128_ps1_ph8_acc1" not in topology_ids
+    assert "q32_kv64_e64_ps1_ph1_acc16" not in topology_ids
 
 
 def test_theoretical_block2_topologies_are_unique_and_contract_valid():
@@ -530,13 +534,34 @@ def test_practical_block2_topologies_are_ranked_and_pruned():
     assert "q64_kv64_e128_ps1_ph1_acc1" not in practical_ids
 
 
+def test_practical_block2_sort_key_favors_higher_acc_depth():
+    lower_acc = {
+        "parallel_seq": 1,
+        "q_seq_tile": 32,
+        "kv_seq_tile": 64,
+        "emb_tile": 128,
+        "parallel_heads": 1,
+        "o_proj_acc_depth": 1,
+    }
+    higher_acc = {
+        **lower_acc,
+        "o_proj_acc_depth": 8,
+    }
+
+    assert _block2_practical_sort_key(
+        higher_acc, head_dim=64
+    ) > _block2_practical_sort_key(lower_acc, head_dim=64)
+
+
 @pytest.mark.parametrize(
     "seq_len,num_heads,topology_id",
     (
         (64, 1, "q32_kv64_e64_ps2_ph1_acc1"),
         (512, 12, "q32_kv64_e96_ps2_ph1_acc1"),
         (512, 12, "q32_kv64_e96_ps4_ph1_acc1"),
+        (512, 12, "q32_kv64_e96_ps8_ph1_acc1"),
         (384, 12, "q32_kv64_e96_ps6_ph1_acc1"),
+        (512, 16, "q32_kv64_e128_ps8_ph1_acc1"),
         (384, 16, "q32_kv64_e128_ps6_ph1_acc1"),
     ),
 )

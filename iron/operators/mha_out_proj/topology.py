@@ -124,7 +124,7 @@ _BLOCK2_TOPOLOGIES = {
 }
 
 _BLOCK2_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
-_BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6)
+_BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
 _BLOCK2_MAX_LOWERED_PARALLEL_HEADS = 6
 _BLOCK2_AIE_DATA_MEM_SIZE_BYTES = 65536
 _BLOCK2_FIFO_STAGE_COPIES = 2
@@ -136,6 +136,7 @@ _BLOCK2_PRACTICAL_MIN_EMB_TILE = 64
 _BLOCK2_PRACTICAL_MIN_LANE_PARALLELISM = 2
 _BLOCK2_PRACTICAL_MIN_SEQUENCE_CHUNK = 32
 _BLOCK2_PRACTICAL_MAX_CANDIDATES = 64
+_BLOCK2_MAX_O_PROJ_ACC_DEPTH = 8
 
 
 def mha_out_proj_topologies(
@@ -233,6 +234,8 @@ def mha_out_proj_theoretical_topologies(
 
         max_acc_depth = embed_sz // emb_tile
         for o_proj_acc_depth in _divisors(max_acc_depth):
+            if o_proj_acc_depth > _BLOCK2_MAX_O_PROJ_ACC_DEPTH:
+                continue
             if embed_sz % (emb_tile * o_proj_acc_depth) != 0:
                 continue
             candidate = {
@@ -517,12 +520,12 @@ def _block2_practical_sort_key(
 
     return (
         lane_parallelism,
+        o_proj_acc_depth,
         kv_seq_tile,
         sequence_chunk,
         emb_tile,
         output_chunk,
         -parallel_seq,
-        -o_proj_acc_depth,
         working_set,
         q_seq_tile,
     )
@@ -623,7 +626,7 @@ def _block2_promoted_parallel_seq_candidates(
         return []
 
     promoted: list[dict[str, int]] = []
-    for parallel_seq in (2, 4, 6):
+    for parallel_seq in (2, 4, 6, 8):
         candidate = copy.deepcopy(base_seq_candidate)
         candidate["parallel_seq"] = parallel_seq
         if _block2_runtime_candidate_allowed(

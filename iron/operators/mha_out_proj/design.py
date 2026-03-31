@@ -178,7 +178,8 @@ def fused_mha(
             2,
             4,
             6,
-        ), "parallel sequence lowering currently supports ps in {2, 4, 6}"
+            8,
+        ), "parallel sequence lowering currently supports ps in {2, 4, 6, 8}"
         assert (
             parallel_heads == 1
         ), "parallel sequence lowering currently requires parallel_heads == 1"
@@ -371,16 +372,14 @@ def fused_mha(
     k_dims = [(kv_seq_tile // t, t * d), (d // s, s), (t, d), (s, 1)]
     if sequence_parallel_mode:
         inK = ObjectFifo(
-            np.ndarray[(parallel_seq * kv_seq_tile, d), np.dtype[dtype]],
+            np.ndarray[(kv_seq_tile, d), np.dtype[dtype]],
             name="inK",
             depth=of_depth,
         )
-        memK = inK.cons().split(
-            offsets=[kv_seq_tile * d * i for i in range(parallel_seq)],
-            obj_types=[k_ty] * parallel_seq,
-            names=[f"memK{i}" for i in range(parallel_seq)],
-            dims_to_stream=[k_dims] * parallel_seq,
-            depths=[of_depth] * parallel_seq,
+        memK = inK.cons().forward(
+            name="memK",
+            dims_to_stream=k_dims,
+            depth=of_depth,
             placement=Tile(col=1, row=1),
         )
     else:
@@ -407,16 +406,14 @@ def fused_mha(
 
     if sequence_parallel_mode:
         inV = ObjectFifo(
-            np.ndarray[(parallel_seq * kv_seq_tile, d), np.dtype[dtype]],
+            v_ty,
             name="inV",
             depth=of_depth,
         )
-        memV = inV.cons().split(
-            offsets=[kv_seq_tile * d * i for i in range(parallel_seq)],
-            obj_types=[v_ty] * parallel_seq,
-            names=[f"memV{i}" for i in range(parallel_seq)],
-            dims_to_stream=[v_dims] * parallel_seq,
-            depths=[of_depth] * parallel_seq,
+        memV = inV.cons().forward(
+            name="memV",
+            dims_to_stream=v_dims,
+            depth=of_depth,
             placement=Tile(col=2, row=1),
         )
     else:
@@ -493,16 +490,14 @@ def fused_mha(
 
     if sequence_parallel_mode:
         inOW = ObjectFifo(
-            np.ndarray[(parallel_seq * d, emb_tile), np.dtype[dtype]],
+            wo_ty,
             name="inOW",
             depth=of_depth,
         )
-        memOW = inOW.cons().split(
-            offsets=[d * emb_tile * i for i in range(parallel_seq)],
-            obj_types=[wo_ty] * parallel_seq,
-            names=[f"memOW{i}" for i in range(parallel_seq)],
-            dims_to_stream=[ow_dims] * parallel_seq,
-            depths=[o_proj_weight_consumer_depth] * parallel_seq,
+        memOW = inOW.cons().forward(
+            name="memOW",
+            dims_to_stream=ow_dims,
+            depth=o_proj_weight_consumer_depth,
             placement=Tile(col=3, row=1),
         )
     else:
@@ -525,6 +520,13 @@ def fused_mha(
     outOProjAccumIn = []
     outOProjAccumOut = []
 
+    def sequence_accum_memtile_col(lane_idx: int) -> int:
+        if parallel_seq <= 4:
+            return 6 + (lane_idx % 2)
+        if parallel_seq == 6:
+            return 4 + (lane_idx % 2)
+        return (0, 4, 5)[lane_idx % 3]
+
     for i in range(parallel_lanes):
         outOProj.append(
             ObjectFifo(q_ty, depth=o_proj_partial_depth, name=f"outOProj{i}")
@@ -538,8 +540,8 @@ def fused_mha(
                 depth=o_proj_acc_depth,
                 placement=Tile(
                     col=(
-                        4 + (i % 2)
-                        if sequence_parallel_mode and parallel_seq > 4
+                        sequence_accum_memtile_col(i)
+                        if sequence_parallel_mode
                         else (6 + (i % 2))
                     ),
                     row=1,
@@ -923,7 +925,7 @@ def fused_mha(
                 batched_matmul_qk,
                 fn_args=[
                     memQ[i].cons(),
-                    memK[i].cons(),
+                    memK.cons() if sequence_parallel_mode else memK[i].cons(),
                     memA[i].prod(),
                     zero_kernel,
                     matmul_QK,
@@ -975,7 +977,7 @@ def fused_mha(
                 batched_matmul_pv,
                 fn_args=[
                     memP[i].cons(),
-                    memV[i].cons(),
+                    memV.cons() if sequence_parallel_mode else memV[i].cons(),
                     scaleOF[i].cons(),
                     outOProj[i].prod(),
                     zero_kernel_q,
@@ -996,7 +998,7 @@ def fused_mha(
                 matmul_o_proj,
                 fn_args=[
                     outOProj[i].cons(),
-                    memOW[i].cons(),
+                    memOW.cons() if sequence_parallel_mode else memOW[i].cons(),
                     outOProjAccumIn[i].cons(depth=1),
                     outOProjAccumOut[i].prod(),
                     (
@@ -1057,29 +1059,6 @@ def fused_mha(
     K_tiles = k_tiles_base
     V_tiles = v_tiles_base
 
-    def duplicate_split_taps_for_parallel_seq(
-        taps: TensorAccessSequence,
-    ) -> list[TensorAccessPattern]:
-        duplicated: list[TensorAccessPattern] = []
-        for tap in taps:
-            sizes = list(tap.sizes)
-            strides = list(tap.strides)
-            sizes[0] = parallel_seq
-            strides[0] = 0
-            duplicated.append(
-                TensorAccessPattern(
-                    tap._tensor_dims,
-                    offset=tap.offset,
-                    sizes=sizes,
-                    strides=strides,
-                )
-            )
-        return duplicated
-
-    if sequence_parallel_mode:
-        K_tiles = duplicate_split_taps_for_parallel_seq(K_tiles)
-        V_tiles = duplicate_split_taps_for_parallel_seq(V_tiles)
-
     # NOTE: Dividing by num_o_col_groups to get the correct number of tiles expected
     # in the runtime seequence. Also not including o_proj_acc_depth in the tile col
     # dim because the WO buffers operate on tiles with size emb_tile. If we
@@ -1102,8 +1081,6 @@ def fused_mha(
             tile._strides[2],
             tile._strides[3],
         ]
-    if sequence_parallel_mode:
-        WO_tiles = duplicate_split_taps_for_parallel_seq(WO_tiles)
     if packed_output_parallel_seq is None:
         o_tile_rows = (
             parallel_seq_join_distribute * q_seq_tile
