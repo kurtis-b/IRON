@@ -144,7 +144,7 @@ def test_mha_out_proj(
 
 
 def test_theoretical_block2_topologies_cover_supported_surface():
-    for seq_len, num_heads in ((64, 1), (512, 12), (2048, 16)):
+    for seq_len, num_heads in ((64, 1), (64, 24), (512, 12), (2048, 16)):
         supported_ids = {
             str(topology["topology_id"])
             for topology in mha_out_proj_topologies(
@@ -162,6 +162,71 @@ def test_theoretical_block2_topologies_cover_supported_surface():
             )
         }
         assert supported_ids <= theoretical_ids
+
+
+def test_supported_block2_topologies_generalize_beyond_retained_families():
+    topology_ids_24 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=64,
+            num_heads=24,
+            head_dim=64,
+        )
+    }
+
+    assert topology_ids_24
+    assert len(topology_ids_24) <= 12
+    assert "q32_kv64_e128_ps1_ph6_acc1" in topology_ids_24
+
+
+def test_generalized_block2_runtime_topology_runs_numerically(aie_context):
+    seq_len = 64
+    head_dim = 64
+    num_heads = 24
+    topology_id = str(
+        mha_out_proj_topologies(
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )[0]["topology_id"]
+    )
+    golden_ref = generate_golden_reference(
+        seq_len=seq_len,
+        d=head_dim,
+        heads=num_heads,
+        debug=DEBUG_MODE,
+    )
+
+    operator = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        topology_id=topology_id,
+        debug=DEBUG_MODE,
+        context=aie_context,
+    )
+    input_buffers = {
+        "Q": golden_ref["Q"].flatten(),
+        "K": golden_ref["K"].flatten(),
+        "V": golden_ref["V"].flatten(),
+        "W_O": golden_ref["W_O"].flatten(),
+    }
+    output_buffers = {"O": golden_ref["O"].flatten()}
+
+    errors, _, _ = run_test(
+        operator,
+        input_buffers,
+        output_buffers,
+        rel_tol=4.0e-2,
+        abs_tol=1.5e-1,
+    )
+
+    error_threshold = 0.005
+    max_acceptable_errors = int(seq_len * head_dim * num_heads * error_threshold)
+    output_error_count = len(errors["O"]) if errors else 0
+
+    assert operator.topology_id == topology_id
+    assert output_error_count <= max_acceptable_errors
 
 
 def test_packed_block3_output_layout_reserves_a_half_and_places_residual_half():

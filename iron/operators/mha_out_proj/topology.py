@@ -136,6 +136,7 @@ _BLOCK2_PRACTICAL_MIN_EMB_TILE = 64
 _BLOCK2_PRACTICAL_MIN_LANE_PARALLELISM = 2
 _BLOCK2_PRACTICAL_MIN_SEQUENCE_CHUNK = 32
 _BLOCK2_PRACTICAL_MAX_CANDIDATES = 64
+_BLOCK2_RUNTIME_MAX_CANDIDATES = 12
 _BLOCK2_MAX_O_PROJ_ACC_DEPTH = 8
 
 
@@ -145,34 +146,21 @@ def mha_out_proj_topologies(
     num_heads: int,
     head_dim: int,
 ) -> list[dict[str, int | str]]:
-    try:
-        retained = copy.deepcopy(_BLOCK2_TOPOLOGIES[(num_heads, head_dim)])
-    except KeyError as exc:
-        raise ValueError(
-            "Block 2 currently supports only the retained thesis families 1x64, 12x64, and 16x64"
-        ) from exc
-
-    topologies = retained
-    if seq_len is not None:
+    if seq_len is None:
+        try:
+            topologies = copy.deepcopy(_BLOCK2_TOPOLOGIES[(num_heads, head_dim)])
+        except KeyError as exc:
+            raise ValueError(
+                "Block 2 runtime topologies require seq_len for non-retained families"
+            ) from exc
+    else:
         if seq_len <= 0:
             raise ValueError("Block 2 requires seq_len > 0")
-        retained_seq_candidates = [
-            candidate
-            for candidate in retained
-            if _block2_runtime_candidate_allowed(
-                candidate,
-                seq_len=seq_len,
-                num_heads=num_heads,
-                head_dim=head_dim,
-            )
-        ]
-        promoted_seq_candidates = _block2_promoted_parallel_seq_candidates(
+        topologies = _block2_runtime_supported_candidates(
             seq_len=seq_len,
             num_heads=num_heads,
             head_dim=head_dim,
-            retained=retained,
         )
-        topologies = retained_seq_candidates + promoted_seq_candidates
 
     return [
         {
@@ -328,6 +316,55 @@ def mha_out_proj_practical_topologies(
         selected,
         key=lambda candidate: _block2_practical_sort_key(candidate, head_dim=head_dim),
         reverse=True,
+    )
+
+
+def _block2_runtime_supported_candidates(
+    *,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+) -> list[dict[str, int]]:
+    runtime_pool = [
+        {
+            "parallel_seq": int(candidate["parallel_seq"]),
+            "q_seq_tile": int(candidate["q_seq_tile"]),
+            "kv_seq_tile": int(candidate["kv_seq_tile"]),
+            "emb_tile": int(candidate["emb_tile"]),
+            "parallel_heads": int(candidate["parallel_heads"]),
+            "o_proj_acc_depth": int(candidate["o_proj_acc_depth"]),
+        }
+        for candidate in mha_out_proj_theoretical_topologies(
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+        if _block2_runtime_candidate_allowed(
+            candidate,
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+    ]
+    preferred_ids = _block2_preferred_runtime_ids(
+        seq_len=seq_len,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+    if preferred_ids:
+        runtime_pool = [
+            candidate
+            for candidate in runtime_pool
+            if _mha_out_proj_topology_id(candidate) in preferred_ids
+        ]
+    return _block2_select_candidates(
+        runtime_pool,
+        sort_key=lambda candidate: _block2_runtime_sort_key(
+            candidate,
+            head_dim=head_dim,
+        ),
+        preferred_ids=preferred_ids,
+        limit=_BLOCK2_RUNTIME_MAX_CANDIDATES,
     )
 
 
@@ -547,6 +584,14 @@ def _block2_effective_sequence_chunk(candidate: dict[str, int | str]) -> int:
     return q_seq_tile
 
 
+def _block2_runtime_sort_key(
+    candidate: dict[str, int | str],
+    *,
+    head_dim: int = 64,
+) -> tuple[int, ...]:
+    return _block2_practical_sort_key(candidate, head_dim=head_dim)
+
+
 def _block2_runtime_candidate_allowed(
     candidate: dict[str, int | str],
     *,
@@ -566,6 +611,12 @@ def _block2_runtime_candidate_allowed(
         return False
     if parallel_seq not in _BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES:
         return False
+    if q_seq_tile != 32:
+        return False
+    if kv_seq_tile != 64:
+        return False
+    if o_proj_acc_depth != 1:
+        return False
     if seq_len % (parallel_seq * q_seq_tile) != 0:
         return False
     if seq_len % kv_seq_tile != 0:
@@ -576,23 +627,97 @@ def _block2_runtime_candidate_allowed(
         return False
     if embed_sz % (emb_tile * o_proj_acc_depth) != 0:
         return False
+    if num_heads == 1 and (emb_tile != 64 or parallel_heads != 1):
+        return False
     if parallel_seq > 1:
-        if (
-            num_heads == 1
-            and q_seq_tile == 32
-            and kv_seq_tile == 64
-            and emb_tile == 64
-            and parallel_heads == 1
-            and o_proj_acc_depth == 1
-        ):
+        if num_heads == 1:
             return True
-        return (
-            num_heads in (12, 16)
-            and q_seq_tile == 32
-            and kv_seq_tile == 64
-            and o_proj_acc_depth == 1
-        )
+        return num_heads in (12, 16)
     return True
+
+
+def _block2_preferred_runtime_ids(
+    *,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+) -> set[str]:
+    retained = copy.deepcopy(_BLOCK2_TOPOLOGIES.get((num_heads, head_dim), ()))
+    if not retained:
+        return set()
+
+    preferred_ids = {
+        _mha_out_proj_topology_id(candidate)
+        for candidate in retained
+        if _block2_runtime_candidate_allowed(
+            candidate,
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+    }
+    preferred_ids.update(
+        _mha_out_proj_topology_id(candidate)
+        for candidate in _block2_promoted_parallel_seq_candidates(
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            retained=retained,
+        )
+    )
+    return preferred_ids
+
+
+def _block2_select_candidates(
+    candidates: list[dict[str, int | str]] | tuple[dict[str, int | str], ...],
+    *,
+    sort_key,
+    preferred_ids: set[str],
+    limit: int,
+) -> list[dict[str, int | str]]:
+    ranked = sorted(candidates, key=sort_key, reverse=True)
+    selected: list[dict[str, int | str]] = []
+    selected_ids: set[str] = set()
+
+    def add_candidate(candidate: dict[str, int | str]) -> None:
+        topology_id = _mha_out_proj_topology_id(
+            {
+                "parallel_seq": int(candidate["parallel_seq"]),
+                "q_seq_tile": int(candidate["q_seq_tile"]),
+                "kv_seq_tile": int(candidate["kv_seq_tile"]),
+                "emb_tile": int(candidate["emb_tile"]),
+                "parallel_heads": int(candidate["parallel_heads"]),
+                "o_proj_acc_depth": int(candidate["o_proj_acc_depth"]),
+            }
+        )
+        if topology_id in selected_ids:
+            return
+        selected.append(candidate)
+        selected_ids.add(topology_id)
+
+    for candidate in ranked:
+        if len(selected) >= limit:
+            break
+        topology_id = _mha_out_proj_topology_id(
+            {
+                "parallel_seq": int(candidate["parallel_seq"]),
+                "q_seq_tile": int(candidate["q_seq_tile"]),
+                "kv_seq_tile": int(candidate["kv_seq_tile"]),
+                "emb_tile": int(candidate["emb_tile"]),
+                "parallel_heads": int(candidate["parallel_heads"]),
+                "o_proj_acc_depth": int(candidate["o_proj_acc_depth"]),
+            }
+        )
+        if topology_id not in preferred_ids:
+            continue
+        add_candidate(candidate)
+
+    for candidate in ranked:
+        if len(selected) >= limit:
+            break
+        add_candidate(candidate)
+
+    return sorted(selected, key=sort_key, reverse=True)
 
 
 def _block2_promoted_parallel_seq_candidates(

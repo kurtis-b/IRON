@@ -92,6 +92,9 @@ Current runtime-supported surface:
 
 - runtime support is now `seq_len`-aware
 - the current local lowering now runtime-supports:
+  - a generated/pruned runtime catalog filtered from the broader theoretical
+    surface instead of only returning the retained family table when `seq_len`
+    is provided
   - the retained `parallel_heads` sweep on the established `ps1` path
   - a validated `parallel_seq` subset on the retained `12x64` and `16x64`
     families, with `parallel_seq in {2, 4, 6, 8}` lowered as real sequence lanes
@@ -114,6 +117,12 @@ Current runtime-supported surface:
   - `seq_len=512, heads=12, head_dim=64`: `10` topologies
   - `seq_len=64, heads=16, head_dim=64`: `6` topologies
   - `seq_len=512, heads=16, head_dim=64`: `9` topologies
+  - representative generalized `head_dim=64` workloads now also produce
+    runtime/practical Block 2 catalogs:
+    - `seq_len=64, heads=24`: runtime `12`
+    - `seq_len=512, heads=24`: runtime `12`
+    - `seq_len=64, heads=8`: runtime `12`
+    - `seq_len=512, heads=8`: runtime `12`
 - concretely:
   - `1 x 64, seq_len=64`
     - `q32_kv64_e64_ps1_ph1_acc1`
@@ -174,8 +183,10 @@ Verified today:
 Work left:
 
 - broaden the current real `parallel_seq` lowering beyond the validated
-  `q32/kv64/acc1`, retained-family subset; on the `1x64` family the current
-  widened support is still limited to `parallel_heads == 1`
+  `q32/kv64/acc1` subset; on retained families that now includes the composed
+  `ps/ph` cases listed above, on the `1x64` family the widened support is still
+  limited to `parallel_heads == 1`, and on generalized families the current
+  generated runtime catalog is still anchored on the `ps1` head-parallel path
 - broaden the packed Block 2 output mode beyond the current restricted path
   used for Block 3 handoff; the current packed handoff no longer requires
   `Block 2 parallel_seq == Block 3 parallel_seq`, but it still requires
@@ -203,12 +214,12 @@ Current state:
 
 Current runtime-supported surface:
 
-- the runtime catalog is now generated per workload rather than pinned only to a
-  short retained ID list
-- runtime promotion currently comes from:
-  - the established retained Block 3 thesis topologies
-  - plus broader practical Block 3 candidates that also satisfy the strict
-    current-layout runtime gate
+- the runtime catalog is now generated per workload from the broader
+  theoretical surface, then filtered through the strict current-layout runtime
+  gate and pruned to a compact runtime-supported set
+- the older retained Block 3 thesis IDs are preserved as preferred baselines
+  inside that generated runtime pool rather than acting as the sole runtime
+  source
 - that gate still reflects the current `design.py` implementation:
   - `num_aie_columns == 8`
   - `tile_m in {16, 32, 64}`
@@ -220,12 +231,18 @@ Current runtime-supported surface:
   - `parallel_seq > 4` currently requires the compact-sequence layout, so the
     promoted `ps8` runtime surface is currently limited to `parallel_int_dim=1`
 - current exercised runtime-supported counts are:
-  - `64 x 768 x 3072`: `8`
-  - `512 x 768 x 3072`: `8`
-  - `64 x 1024 x 4096`: `8`
+  - `64 x 768 x 3072`: `2`
+  - `512 x 768 x 3072`: `4`
+  - `64 x 1024 x 4096`: `2`
   - `512 x 1024 x 4096`: `4`
-  - `64 x 2048 x 8192`: `6`
+  - `64 x 2048 x 8192`: `2`
   - `512 x 2048 x 8192`: `8`
+- representative generalized workloads that now also produce runtime/practical
+  Block 3 catalogs include:
+  - `64 x 1536 x 6144`: runtime `8`, practical `13`
+  - `512 x 1536 x 6144`: runtime `8`, practical `16`
+  - `64 x 960 x 3840`: runtime `8`, practical `13`
+  - `512 x 960 x 3840`: runtime `8`, practical `16`
 - `ps8` is now runtime-supported for strict-runtime-feasible `parallel_int_dim=1`
   compact-sequence Block 3 topologies; broader `ps8` shapes still remain
   practical-only until the runtime layout is generalized further
@@ -270,8 +287,8 @@ Verified today:
   topology-exploration tests again pass and the expanded Block 3 numerical
   matrix is being re-validated against the generated runtime catalog
 - the current widened runtime surface, including the new `m16` and `ps8`
-  promotions, passes:
-  - `iron/operators/addnorm_ffn_addnorm/test.py` (`260 passed`)
+  promotions plus the generated runtime-catalog refactor, passes:
+  - `iron/operators/addnorm_ffn_addnorm/test.py`
   - `iron/applications/transformer_layer/test_patterns.py`
   - `iron/applications/transformer_layer/test_topology_exploration.py`
 

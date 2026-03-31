@@ -186,6 +186,12 @@ and translates them into the fused runtime wrapper in
 [`iron/operators/mha_out_proj/op.py`](/home/cj/iron/iron/operators/mha_out_proj/op.py).
 The retained `v2` surface now lowers two topology axes on the validated runtime
 path:
+- when `seq_len` is provided, the runtime-supported Block 2 catalog is now
+  generated from the broader theoretical surface and pruned back to a compact
+  runtime set instead of being limited to the retained family table; retained
+  workloads still resolve to the preferred validated retained/promoted IDs,
+  while generalized `head_dim=64` workloads can surface broader generated
+  runtime candidates
 - `parallel_heads` on the established retained `ps1` path
 - a seq-len-aware `parallel_seq` subset on the retained `12x64` and `16x64`
   families, with `parallel_seq in {2, 4, 6, 8}` lowered as real sequence lanes
@@ -200,6 +206,10 @@ path:
   `kv_seq_tile == 64`, `emb_tile == 64`, and `o_proj_acc_depth == 1`; this
   currently covers `ps2` at `seq_len=64`, `ps2/ps4/ps6` at `seq_len=384`, and
   `ps2/ps4/ps8` at `seq_len=512`
+Representative generalized `head_dim=64` workloads such as `24x64` and `8x64`
+now also resolve non-empty seq-len-aware runtime/practical catalogs through
+that same path, though the honest current runtime gate is still the narrower
+validated `q32/kv64/acc1` subset.
 For the retained runtime-supported study surface, `emb_tile` is still selected
 per retained workload family, and the current lowered design still does not
 support the `16x64 / parallel_heads=8` retained-shape variant because it
@@ -280,10 +290,13 @@ exposes:
 - a broader practical exploration catalog
 - the full theoretical surface for the current Block 3 contract
 
-The current runtime-supported Block 3 catalog is generated from:
-- the retained thesis runtime topologies
-- plus broader practical candidates that still satisfy the strict current
-  Block 3 runtime gate
+The current runtime-supported Block 3 catalog is generated from the broader
+theoretical surface, filtered through the strict current Block 3 runtime gate,
+and then pruned to a compact runtime-supported set while preserving retained
+thesis topology IDs as preferred baselines where they still satisfy that gate.
+In practice, retained workloads currently stay on those preferred validated
+baseline IDs, while generalized workloads use the broader generated runtime
+pool.
 
 That runtime gate is intentionally narrower than the practical surface and
 still reflects the current `design.py` implementation:
@@ -301,6 +314,9 @@ So the practical Block 3 surface can still explore broader `ps8`/small-tile
 shapes than the current runtime-supported set, but `ps8` is no longer
 practical-only: the compact-sequence runtime path now supports strict-runtime-
 feasible `ps8, pi1` topologies.
+Representative generalized workloads such as `1536/6144` and `960/3840` now
+also produce seq-len-aware runtime/practical Block 3 catalogs through that same
+generated-runtime path.
 For the current packed Dataflow handoff from Block 2 into Block 3, a selected
 runtime pair is only structurally compatible when:
 - Block 2 `q_seq_tile ==` Block 3 `tile_m`

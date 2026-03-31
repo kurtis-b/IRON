@@ -429,41 +429,20 @@ def _addnorm_ffn_addnorm_runtime_topologies_cached(
     hidden_size: int,
     intermediate_size: int,
 ) -> tuple[dict[str, int | str], ...]:
-    retained = list(_BLOCK3_TOPOLOGIES.get((hidden_size, intermediate_size), ()))
-    practical = addnorm_ffn_addnorm_practical_topologies(
+    runtime_pool = _block3_runtime_supported_candidates(
         seq_len=seq_len,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    selected = [
-        dict(candidate)
-        for candidate in retained
-        if _block3_runtime_candidate_allowed(
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            candidate=candidate,
-        )
-    ]
-    selected.extend(
-        dict(candidate)
-        for candidate in practical
-        if _block3_runtime_candidate_allowed(
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            candidate=candidate,
-        )
+    preferred_ids = _block3_preferred_runtime_ids(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
     )
-    deduped_selected: list[dict[str, int | str]] = []
-    seen_signatures: set[tuple[int, ...]] = set()
-    for candidate in selected:
-        signature = _block3_signature(candidate)
-        if signature in seen_signatures:
-            continue
-        deduped_selected.append(candidate)
-        seen_signatures.add(signature)
     selected = _block3_select_runtime_candidates(
         hidden_size=hidden_size,
-        candidates=deduped_selected,
+        candidates=runtime_pool,
+        preferred_ids=preferred_ids,
         limit=_BLOCK3_RUNTIME_MAX_CANDIDATES,
     )
     return tuple(
@@ -481,6 +460,77 @@ def _addnorm_ffn_addnorm_runtime_topologies_cached(
             reverse=True,
         )
     )
+
+
+def _block3_runtime_supported_candidates(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> list[dict[str, int | str]]:
+    preferred_ids = _block3_preferred_runtime_ids(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    runtime_pool = [
+        {
+            "tile_m": int(candidate["tile_m"]),
+            "tile_k": int(candidate["tile_k"]),
+            "tile_n": int(candidate["tile_n"]),
+            "down_proj_depth": int(candidate["down_proj_depth"]),
+            "num_aie_columns": int(candidate["num_aie_columns"]),
+            "parallel_seq": int(candidate["parallel_seq"]),
+            "parallel_int_dim": int(candidate["parallel_int_dim"]),
+            "gelu_stage": int(candidate["gelu_stage"]),
+        }
+        for candidate in addnorm_ffn_addnorm_theoretical_topologies(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        if _block3_runtime_candidate_allowed(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            candidate=candidate,
+        )
+    ]
+    if preferred_ids:
+        runtime_pool = [
+            candidate
+            for candidate in runtime_pool
+            if _topology_id(candidate) in preferred_ids
+        ]
+    runtime_pool = _block3_prune_runtime_tile_dominated(runtime_pool)
+    runtime_pool = _block3_prune_runtime_chunk_dominated(runtime_pool)
+
+    deduped_pool: list[dict[str, int | str]] = []
+    seen_signatures: set[tuple[int, ...]] = set()
+    for candidate in runtime_pool:
+        signature = _block3_signature(candidate)
+        if signature in seen_signatures:
+            continue
+        deduped_pool.append(candidate)
+        seen_signatures.add(signature)
+    return deduped_pool
+
+
+def _block3_preferred_runtime_ids(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> set[str]:
+    preferred_ids: set[str] = set()
+    for candidate in _BLOCK3_TOPOLOGIES.get((hidden_size, intermediate_size), ()):
+        if not _block3_runtime_candidate_allowed(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            candidate=candidate,
+        ):
+            continue
+        preferred_ids.add(_topology_id(candidate))
+    return preferred_ids
 
 
 def addnorm_ffn_addnorm_theoretical_topologies(
@@ -636,6 +686,23 @@ def _addnorm_ffn_addnorm_practical_topologies_cached(
     practical = _block3_prune_practical_depth_variants(practical)
 
     selected: list[dict[str, int | str]] = []
+    selected_signatures: set[tuple[int, ...]] = set()
+
+    runtime_signatures = {
+        _block3_signature(candidate)
+        for candidate in addnorm_ffn_addnorm_topologies(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+    }
+    for candidate in sorted(theoretical, key=_block3_practical_sort_key, reverse=True):
+        signature = _block3_signature(candidate)
+        if signature not in runtime_signatures or signature in selected_signatures:
+            continue
+        selected.append(candidate)
+        selected_signatures.add(signature)
+
     for parallel_seq in _BLOCK3_PRACTICAL_PARALLEL_SEQ_CHOICES:
         bucket = sorted(
             (
@@ -646,7 +713,23 @@ def _addnorm_ffn_addnorm_practical_topologies_cached(
             key=_block3_practical_sort_key,
             reverse=True,
         )
-        selected.extend(bucket[:_BLOCK3_PRACTICAL_MAX_CANDIDATES_PER_PS])
+        for candidate in bucket:
+            if (
+                len(
+                    [
+                        selected_candidate
+                        for selected_candidate in selected
+                        if int(selected_candidate["parallel_seq"]) == parallel_seq
+                    ]
+                )
+                >= _BLOCK3_PRACTICAL_MAX_CANDIDATES_PER_PS
+            ):
+                break
+            signature = _block3_signature(candidate)
+            if signature in selected_signatures:
+                continue
+            selected.append(candidate)
+            selected_signatures.add(signature)
 
     return tuple(
         {
@@ -1054,6 +1137,7 @@ def _block3_select_runtime_candidates(
     *,
     hidden_size: int,
     candidates: list[dict[str, int | str]],
+    preferred_ids: set[str],
     limit: int,
 ) -> list[dict[str, int | str]]:
     ranked = sorted(
@@ -1066,6 +1150,21 @@ def _block3_select_runtime_candidates(
     )
     chosen: list[dict[str, int | str]] = []
     chosen_signatures: set[tuple[int, ...]] = set()
+
+    def add_candidate(candidate: dict[str, int | str]) -> None:
+        signature = _block3_signature(candidate)
+        if signature in chosen_signatures:
+            return
+        chosen.append(candidate)
+        chosen_signatures.add(signature)
+
+    for candidate in ranked:
+        if len(chosen) >= limit:
+            return chosen
+        if _topology_id(candidate) not in preferred_ids:
+            continue
+        add_candidate(candidate)
+
     by_tile_pair: dict[tuple[int, int], list[dict[str, int | str]]] = {}
     for candidate in ranked:
         tile_pair = (
@@ -1083,11 +1182,7 @@ def _block3_select_runtime_candidates(
         reverse=True,
     ):
         candidate = by_tile_pair[tile_pair][0]
-        signature = _block3_signature(candidate)
-        if signature in chosen_signatures:
-            continue
-        chosen.append(candidate)
-        chosen_signatures.add(signature)
+        add_candidate(candidate)
         if len(chosen) >= limit:
             return chosen
 
@@ -1115,19 +1210,12 @@ def _block3_select_runtime_candidates(
         reverse=True,
     ):
         candidate = by_shape[shape_key][0]
-        signature = _block3_signature(candidate)
-        if signature not in chosen_signatures:
-            chosen.append(candidate)
-            chosen_signatures.add(signature)
+        add_candidate(candidate)
         if len(chosen) >= limit:
             return chosen
 
     for candidate in ranked:
-        signature = _block3_signature(candidate)
-        if signature in chosen_signatures:
-            continue
-        chosen.append(candidate)
-        chosen_signatures.add(signature)
+        add_candidate(candidate)
         if len(chosen) >= limit:
             break
     return chosen

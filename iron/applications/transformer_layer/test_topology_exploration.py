@@ -89,6 +89,10 @@ def test_practical_layer_topology_combinations_support_global_truncation():
 
 def test_practical_catalog_runtime_only_filters_before_truncation():
     spec = TransformerLayerSpec(seq_len=512)
+    full_runtime_catalog = practical_block_topology_catalog(
+        spec,
+        runtime_only=True,
+    )
 
     catalog = practical_block_topology_catalog(
         spec,
@@ -98,9 +102,9 @@ def test_practical_catalog_runtime_only_filters_before_truncation():
         runtime_only=True,
     )
 
-    assert len(catalog["block1"]) == 2
-    assert len(catalog["block2"]) == 2
-    assert len(catalog["block3"]) == 2
+    assert len(catalog["block1"]) == min(2, len(full_runtime_catalog["block1"]))
+    assert len(catalog["block2"]) == min(2, len(full_runtime_catalog["block2"]))
+    assert len(catalog["block3"]) == min(2, len(full_runtime_catalog["block3"]))
     assert all(bool(row["runtime_supported"]) for row in catalog["block1"])
     assert all(bool(row["runtime_supported"]) for row in catalog["block2"])
     assert all(bool(row["runtime_supported"]) for row in catalog["block3"])

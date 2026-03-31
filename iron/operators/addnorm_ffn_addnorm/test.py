@@ -161,7 +161,7 @@ def test_forward_packed_uses_bound_static_weights(aie_context):
     seq_len = 64
     hidden_size = 768
     intermediate_size = 3072
-    topology_id = "m32_k192_n16_ps2_pi6_d4_g1"
+    topology_id = "m32_k96_n64_ps2_pi6_d8_g1"
 
     golden = generate_golden_reference(
         seq_len=seq_len,
@@ -243,6 +243,83 @@ def test_theoretical_block3_topologies_cover_supported_surface():
             )
         }
         assert supported_ids <= theoretical_ids
+
+
+def test_supported_block3_topologies_generalize_beyond_retained_families():
+    topology_ids_1536 = {
+        str(topology["topology_id"])
+        for topology in addnorm_ffn_addnorm_topologies(
+            seq_len=64,
+            hidden_size=1536,
+            intermediate_size=6144,
+        )
+    }
+    topology_ids_960 = {
+        str(topology["topology_id"])
+        for topology in addnorm_ffn_addnorm_topologies(
+            seq_len=64,
+            hidden_size=960,
+            intermediate_size=3840,
+        )
+    }
+
+    assert topology_ids_1536
+    assert topology_ids_960
+    assert len(topology_ids_1536) <= 8
+    assert len(topology_ids_960) <= 8
+    assert "m16_k192_n64_ps4_pi3_d8_g1" in topology_ids_1536
+    assert "m16_k120_n160_ps4_pi3_d8_g1" in topology_ids_960
+
+
+def test_generalized_block3_runtime_topology_runs_numerically(aie_context):
+    seq_len = 64
+    hidden_size = 1536
+    intermediate_size = 6144
+    topology_id = str(
+        addnorm_ffn_addnorm_topologies(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )[0]["topology_id"]
+    )
+    rel_tol = 4.0e-2
+    abs_tol = 1.5e-1
+    error_threshold = 0.005
+    golden = generate_golden_reference(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        seed=19,
+    )
+
+    operator = AIEAddNormFFNAddNorm(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        topology_id=topology_id,
+        context=aie_context,
+    )
+    operator.weight_up_proj = golden["ffn_up_weight"].contiguous().T
+    operator.weight_down_proj = golden["ffn_down_weight"].contiguous().T
+    operator.ln1_weight = golden["ln1_weight"].contiguous()
+    operator.ln2_weight = golden["ln2_weight"].contiguous()
+    aie_context.compile_all()
+    aie_context.prepare_runtime()
+
+    output = operator.forward(
+        golden["hidden_states"],
+        golden["residual"],
+    )
+    output_errors = _count_errors(
+        output,
+        golden["output"],
+        rel_tol=rel_tol,
+        abs_tol=abs_tol,
+    )
+    max_acceptable_errors = int(seq_len * hidden_size * error_threshold)
+
+    assert operator.topology_id == topology_id
+    assert output_errors <= max_acceptable_errors
 
 
 def test_theoretical_block3_topologies_include_nondefault_valid_variants():
@@ -427,6 +504,22 @@ def test_practical_block3_topologies_keep_only_highest_depth_per_shape():
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
         )
+        runtime_shape_depths = {
+            (
+                int(topology["tile_m"]),
+                int(topology["tile_k"]),
+                int(topology["tile_n"]),
+                int(topology["num_aie_columns"]),
+                int(topology["parallel_seq"]),
+                int(topology["parallel_int_dim"]),
+                int(topology["gelu_stage"]),
+            ): int(topology["down_proj_depth"])
+            for topology in addnorm_ffn_addnorm_topologies(
+                seq_len=seq_len,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
+        }
         feasible_max_depth_by_shape: dict[tuple[int, ...], int] = {}
         for topology in addnorm_ffn_addnorm_theoretical_topologies(
             seq_len=seq_len,
@@ -466,7 +559,7 @@ def test_practical_block3_topologies_keep_only_highest_depth_per_shape():
             )
             assert shape_key not in seen_shapes
             seen_shapes.add(shape_key)
-            assert (
-                int(topology["down_proj_depth"])
-                == feasible_max_depth_by_shape[shape_key]
-            )
+            actual_depth = int(topology["down_proj_depth"])
+            max_depth = feasible_max_depth_by_shape[shape_key]
+            runtime_depth = runtime_shape_depths.get(shape_key)
+            assert actual_depth == max_depth or actual_depth == runtime_depth
