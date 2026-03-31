@@ -106,7 +106,7 @@ and reshapes to head-major `q/k/v` only on the wrapper surface when needed. The
 current Block 1
 runtime-supported surface is workload-aware over the tile/array part of the
 topology space, and it now lowers real sweeps for both Block 1 topology axes on
-the canonical `c8` path:
+the canonical `c6/c8` runtime paths:
 - `parallel_seq` changes the active compute-row count and the Block 1 row tiling
   used by the runtime sequence
 - `parallel_emb` partitions each projection's embedding width into contiguous
@@ -129,15 +129,14 @@ That design file should expose three distinct topology views:
   compute-tile local-memory limits, and the current `parallel_seq` /
   `parallel_emb` lowering axes for a given workload
 - a heuristic-pruned practical exploration surface that keeps only
-  microkernel-valid tile sizes on the current `c8` path and then favors higher
-  core/lane parallelism, larger reusable `tile_k` choices, and fuller
-  compute-tile utilization while still retaining the baseline runtime-supported
-  study topologies
+  microkernel-valid tile sizes on the current `c6/c8` runtime paths and then
+  favors higher core/lane parallelism plus fuller compute-tile utilization with
+  squarer `MxK` and `KxN` GEMM tiles while still retaining the baseline
+  runtime-supported study topologies
 The checked-in study manifests should continue to pin the baseline retained
 topology IDs for reproducibility even as that broader theoretical exploration
-surface grows; legacy head-based Block 1 topology IDs are still accepted as
-aliases for compatibility, but the canonical Block 1 surface is now expressed
-in terms of `parallel_seq` and `parallel_emb`.
+surface grows. The canonical Block 1 surface is expressed in terms of
+`parallel_seq` and `parallel_emb`.
 
 ## Block 2
 

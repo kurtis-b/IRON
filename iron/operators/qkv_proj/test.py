@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from iron.operators.qkv_proj.topology import (
     _block1_compute_tile_working_set_fits,
+    _block1_compute_tile_shape_score,
     _block1_practical_topologies,
     _block1_practical_sort_key,
     _block1_theoretical_topologies,
@@ -163,6 +164,46 @@ def test_qkv_proj_generalized_runtime_workloads(
         num_heads=num_heads,
         head_dim=head_dim,
         seed=11,
+    )
+
+    operator = AIEQKVProj(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        num_heads=num_heads,
+        topology_id=topology_id,
+        context=aie_context,
+    )
+    operator.q_proj.weight = golden_ref["q_proj_weight"].contiguous()
+    operator.k_proj.weight = golden_ref["k_proj_weight"].contiguous()
+    operator.v_proj.weight = golden_ref["v_proj_weight"].contiguous()
+    aie_context.compile_all()
+    aie_context.prepare_runtime()
+
+    q, k, v = operator.forward(golden_ref["hidden_states"])
+    max_acceptable_errors = int(seq_len * head_dim * num_heads * error_threshold)
+    q_errors = _count_errors(q, golden_ref["q"], rel_tol=rel_tol, abs_tol=abs_tol)
+    k_errors = _count_errors(k, golden_ref["k"], rel_tol=rel_tol, abs_tol=abs_tol)
+    v_errors = _count_errors(v, golden_ref["v"], rel_tol=rel_tol, abs_tol=abs_tol)
+
+    assert q_errors <= max_acceptable_errors
+    assert k_errors <= max_acceptable_errors
+    assert v_errors <= max_acceptable_errors
+
+
+def test_qkv_proj_known_runtime_k24_n32_topology_compiles_and_runs(aie_context):
+    seq_len = 64
+    num_heads = 24
+    head_dim = 64
+    hidden_size = num_heads * head_dim
+    topology_id = "m16_k24_n32_c8_ps4_pe8"
+    rel_tol = 4.0e-2
+    abs_tol = 1.5e-1
+    error_threshold = 0.005
+    golden_ref = generate_golden_reference(
+        seq_len=seq_len,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        seed=17,
     )
 
     operator = AIEQKVProj(
@@ -348,12 +389,24 @@ def test_runtime_block1_topologies_are_pruned_and_generalized():
 
     assert 0 < len(retained_runtime) <= 12
     assert 0 < len(generalized_runtime) <= 12
-    assert all(int(topology["num_aie_columns"]) == 8 for topology in retained_runtime)
     assert all(
-        int(topology["num_aie_columns"]) == 8 for topology in generalized_runtime
+        int(topology["num_aie_columns"]) in (6, 8) for topology in retained_runtime
+    )
+    assert all(
+        int(topology["num_aie_columns"]) in (6, 8) for topology in generalized_runtime
     )
     assert any(int(topology["parallel_seq"]) > 1 for topology in retained_runtime)
     assert any(int(topology["parallel_emb"]) > 1 for topology in generalized_runtime)
+
+
+def test_runtime_block1_topologies_can_select_c6_for_768_family():
+    runtime_topologies = qkv_proj_topologies(
+        seq_len=64,
+        hidden_size=768,
+        num_heads=12,
+    )
+
+    assert any(int(topology["num_aie_columns"]) == 6 for topology in runtime_topologies)
 
 
 def test_block1_design_accepts_canonical_runtime_topology_ids():
@@ -379,6 +432,25 @@ def test_block1_design_accepts_canonical_parallel_emb_runtime_ids():
 
     assert config["topology_id"] == "m32_k256_n24_c8_ps1_pe4"
     assert config["parallel_emb"] == 4
+
+
+def test_block1_design_accepts_c6_runtime_topology_ids():
+    topology_id = _first_block1_runtime_topology_id(
+        seq_len=64,
+        hidden_size=768,
+        num_heads=12,
+        predicate=lambda topology: int(topology["num_aie_columns"]) == 6,
+    )
+
+    config = qkv_proj_design(
+        seq_len=64,
+        hidden_size=768,
+        num_heads=12,
+        topology_id=topology_id,
+    )
+
+    assert config["topology_id"] == topology_id
+    assert config["num_aie_columns"] == 6
 
 
 def test_theoretical_block1_topologies_include_nondefault_valid_variants():
@@ -489,8 +561,17 @@ def test_practical_block1_topologies_are_ranked_and_pruned():
         assert int(topology["tile_m"]) % 8 == 0
         assert int(topology["tile_k"]) % 8 == 0
         assert int(topology["tile_n"]) % 8 == 0
-        assert int(topology["num_aie_columns"]) == 8
+        assert int(topology["num_aie_columns"]) in (6, 8)
         assert topology["topology_family"] == "shared_runtime_qkv_proj_practical"
 
     practical_ids = {str(topology["topology_id"]) for topology in practical}
     assert "m32_k384_n48_c8_ps1_pe1" not in practical_ids
+
+
+def test_block1_compute_tile_shape_score_prefers_fuller_square_tiles():
+    assert _block1_compute_tile_shape_score(tile_m=64, tile_k=64, tile_n=64) > (
+        _block1_compute_tile_shape_score(tile_m=32, tile_k=256, tile_n=24)
+    )
+    assert _block1_compute_tile_shape_score(tile_m=64, tile_k=96, tile_n=48) > (
+        _block1_compute_tile_shape_score(tile_m=32, tile_k=256, tile_n=24)
+    )

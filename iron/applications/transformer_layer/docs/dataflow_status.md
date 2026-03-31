@@ -33,11 +33,11 @@ Current runtime-supported surface:
 
 - runtime support is `seq_len`-aware
 - the current local lowering now runtime-supports:
-  - a generated/pruned `c8` runtime catalog instead of a retained-only family
-    table
+  - a generated/pruned `c6/c8` runtime catalog instead of a retained-only
+    family table
   - a real `parallel_seq` sweep with active row counts in `{1, 2, 4}`
-  - a real `parallel_emb` sweep on the canonical `c8` path through contiguous
-    embedding-group `B` fills and direct `Q/K/V` drains
+  - a real `parallel_emb` sweep on the canonical `c6/c8` paths through
+    contiguous embedding-group `B` fills and direct `Q/K/V` drains
   - broader workload-family support beyond the retained `12x64` and `16x64`
     study families
 - the runtime-supported surface is now pruned to at most `12` candidates per
@@ -51,6 +51,8 @@ Current runtime-supported surface:
   - `seq_len=512, hidden=1024, heads=16`: `12` topologies
 - representative generalized workloads that now produce runtime/practical
   Block 1 catalogs include:
+  - `seq_len=64, hidden=1536, heads=24`: runtime `12`, practical `20`
+  - `seq_len=64, hidden=960, heads=12`: runtime `12`, practical `20`
   - `seq_len=512, hidden=1536, heads=24`: runtime `12`, practical `20`
   - `seq_len=512, hidden=960, heads=12`: runtime `12`, practical `20`
 

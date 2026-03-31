@@ -4,7 +4,7 @@
 from __future__ import annotations
 from itertools import product
 
-_BLOCK1_RUNTIME_NUM_AIE_COLUMNS = 8
+_BLOCK1_RUNTIME_NUM_AIE_COLUMNS_CHOICES = (6, 8)
 _BLOCK1_RETAINED_FAMILIES = {
     (12, 64),
     (16, 64),
@@ -322,7 +322,11 @@ def _block1_seq_independent_supported_candidates(
             for candidate in _BLOCK1_PROMOTED_RUNTIME_TOPOLOGIES.get(
                 (num_heads, head_dim), ()
             )
-        },
+        }
+        | _block1_best_ids_by_num_aie_columns(
+            topologies,
+            sort_key=_block1_runtime_sort_key,
+        ),
         limit=_BLOCK1_SEQ_INDEPENDENT_MAX_CANDIDATES,
     )
     unique_topologies = []
@@ -360,24 +364,26 @@ def _block1_runtime_seed_candidates(
         tile_m,
         tile_k,
         tile_n,
+        num_aie_columns,
         parallel_seq,
         parallel_emb,
     ) in product(
         _BLOCK1_SEED_TILE_M_CHOICES,
         seed_tile_ks,
         seed_tile_ns,
+        _BLOCK1_RUNTIME_NUM_AIE_COLUMNS_CHOICES,
         (1, 2, 4),
         tuple(
             divisor
             for divisor in _divisors(hidden_size)
-            if divisor <= _BLOCK1_RUNTIME_NUM_AIE_COLUMNS
+            if divisor <= max(_BLOCK1_RUNTIME_NUM_AIE_COLUMNS_CHOICES)
         ),
     ):
         candidate = {
             "tile_m": tile_m,
             "tile_k": tile_k,
             "tile_n": tile_n,
-            "num_aie_columns": _BLOCK1_RUNTIME_NUM_AIE_COLUMNS,
+            "num_aie_columns": num_aie_columns,
             "parallel_seq": parallel_seq,
             "parallel_emb": parallel_emb,
         }
@@ -400,7 +406,7 @@ def _block1_runtime_supported_candidates(
     num_heads: int,
     head_dim: int,
 ) -> list[dict[str, int]]:
-    practical = [
+    runtime_pool = [
         {
             "tile_m": int(candidate["tile_m"]),
             "tile_k": int(candidate["tile_k"]),
@@ -409,16 +415,13 @@ def _block1_runtime_supported_candidates(
             "parallel_seq": int(candidate["parallel_seq"]),
             "parallel_emb": int(candidate["parallel_emb"]),
         }
-        for candidate in _block1_practical_topologies(
+        for candidate in _block1_theoretical_topologies(
             seq_len=seq_len,
             hidden_size=hidden_size,
             num_heads=num_heads,
         )
-    ]
-    runtime_pool = [
-        candidate
-        for candidate in practical
-        if _block1_runtime_candidate_allowed(candidate, hidden_size=hidden_size)
+        if _is_block1_practical_candidate(candidate)
+        and _block1_runtime_candidate_allowed(candidate, hidden_size=hidden_size)
     ]
     preferred_ids = {
         _theoretical_topology_id(candidate)
@@ -429,6 +432,12 @@ def _block1_runtime_supported_candidates(
         )
         if seq_len % (int(candidate["parallel_seq"]) * int(candidate["tile_m"])) == 0
     }
+    preferred_ids.update(
+        _block1_best_ids_by_num_aie_columns(
+            runtime_pool,
+            sort_key=_block1_runtime_sort_key,
+        )
+    )
     return _block1_select_candidates(
         runtime_pool,
         sort_key=_block1_runtime_sort_key,
@@ -538,6 +547,21 @@ def _block1_practical_topologies(
             head_dim=hidden_size // num_heads,
         )
     }
+    preferred_ids.update(
+        _block1_best_ids_by_num_aie_columns(
+            practical,
+            sort_key=_block1_practical_sort_key,
+        )
+    )
+    preferred_ids.update(
+        _theoretical_topology_id(candidate)
+        for candidate in _block1_runtime_supported_candidates(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            head_dim=hidden_size // num_heads,
+        )
+    )
     selected = _block1_select_candidates(
         practical,
         sort_key=_block1_practical_sort_key,
@@ -606,7 +630,7 @@ def _is_block1_practical_candidate(candidate: dict[str, int | str]) -> bool:
         tile_m >= _BLOCK1_PRACTICAL_MIN_TILE_M
         and tile_k >= _BLOCK1_PRACTICAL_MIN_TILE_K
         and tile_n >= _BLOCK1_PRACTICAL_MIN_TILE_N
-        and num_aie_columns == _BLOCK1_RUNTIME_NUM_AIE_COLUMNS
+        and num_aie_columns in _BLOCK1_RUNTIME_NUM_AIE_COLUMNS_CHOICES
     )
 
 
@@ -619,7 +643,7 @@ def _block1_runtime_candidate_allowed(
     parallel_emb = int(candidate["parallel_emb"])
     return (
         parallel_seq in (1, 2, 4)
-        and num_aie_columns == _BLOCK1_RUNTIME_NUM_AIE_COLUMNS
+        and num_aie_columns in _BLOCK1_RUNTIME_NUM_AIE_COLUMNS_CHOICES
         and num_aie_columns % parallel_emb == 0
         and hidden_size % (tile_n * num_aie_columns) == 0
     )
@@ -635,7 +659,7 @@ def _block1_runtime_sort_key(candidate: dict[str, int | str]) -> tuple[int, ...]
 
     lane_parallelism = parallel_seq * parallel_emb
     core_count = parallel_seq * num_aie_columns
-    compute_working_set = _block1_compute_tile_working_set_bytes(
+    shape_score = _block1_compute_tile_shape_score(
         tile_m=tile_m,
         tile_k=tile_k,
         tile_n=tile_n,
@@ -644,10 +668,7 @@ def _block1_runtime_sort_key(candidate: dict[str, int | str]) -> tuple[int, ...]
     return (
         core_count,
         lane_parallelism,
-        tile_k,
-        compute_working_set,
-        tile_n,
-        tile_m,
+        shape_score,
     )
 
 
@@ -661,7 +682,7 @@ def _block1_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ..
 
     lane_parallelism = parallel_seq * parallel_emb
     core_count = parallel_seq * num_aie_columns
-    compute_working_set = _block1_compute_tile_working_set_bytes(
+    shape_score = _block1_compute_tile_shape_score(
         tile_m=tile_m,
         tile_k=tile_k,
         tile_n=tile_n,
@@ -670,10 +691,36 @@ def _block1_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ..
     return (
         core_count,
         lane_parallelism,
-        tile_k,
+        shape_score,
+    )
+
+
+def _block1_compute_tile_shape_score(
+    *,
+    tile_m: int,
+    tile_k: int,
+    tile_n: int,
+) -> tuple[int, int, int, int]:
+    # Block 1 is not internally pipelined, so rank tile shapes by how much
+    # compute-tile memory they use after discounting elongated GEMM tiles. Favor
+    # square-ish MxK and KxN matrices first, then use the MxN output face and
+    # overall working-set fullness as tie-breakers.
+    compute_working_set = _block1_compute_tile_working_set_bytes(
+        tile_m=tile_m,
+        tile_k=tile_k,
+        tile_n=tile_n,
+    )
+    left_ratio = 1024 * min(tile_m, tile_k) // max(tile_m, tile_k)
+    right_ratio = 1024 * min(tile_k, tile_n) // max(tile_k, tile_n)
+    output_ratio = 1024 * min(tile_m, tile_n) // max(tile_m, tile_n)
+    balanced_utilization = compute_working_set * left_ratio * right_ratio
+    output_face_delta = abs(tile_m - tile_n)
+    full_shape_delta = max(tile_m, tile_k, tile_n) - min(tile_m, tile_k, tile_n)
+    return (
+        balanced_utilization,
+        output_ratio,
         compute_working_set,
-        tile_n,
-        tile_m,
+        -output_face_delta - full_shape_delta,
     )
 
 
@@ -718,6 +765,8 @@ def _block1_select_candidates(
         selected_ids.add(topology_id)
 
     for candidate in ranked:
+        if len(selected) >= limit:
+            break
         topology_id = _theoretical_topology_id(
             {
                 "tile_m": int(candidate["tile_m"]),
@@ -738,6 +787,22 @@ def _block1_select_candidates(
         add_candidate(candidate)
 
     return sorted(selected, key=sort_key, reverse=True)
+
+
+def _block1_best_ids_by_num_aie_columns(
+    candidates: list[dict[str, int | str]] | tuple[dict[str, int | str], ...],
+    *,
+    sort_key,
+) -> set[str]:
+    best_ids: set[str] = set()
+    seen_columns: set[int] = set()
+    for candidate in sorted(candidates, key=sort_key, reverse=True):
+        num_aie_columns = int(candidate["num_aie_columns"])
+        if num_aie_columns in seen_columns:
+            continue
+        seen_columns.add(num_aie_columns)
+        best_ids.add(_theoretical_topology_id(candidate))
+    return best_ids
 
 
 def _theoretical_topology_id(config: dict[str, int]) -> str:

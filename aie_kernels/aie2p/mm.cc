@@ -1199,7 +1199,21 @@ matmul_vectorized_8x8x8_bf16_bf16(const bfloat16 *__restrict pA, const bfloat16 
 
     ::aie::set_rounding(round_mode);
 
-    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0)) {
+    // LLVM-AIE currently crashes in the 2x2 bf16 8x8x8 path for k=24,n=32.
+    // Falling back to the 2x1 expansion keeps the runtime-supported shape
+    // available without changing the public Block 1 topology surface.
+    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0) && (k == 24) && (n == 32)) {
+        return matmul_vectorized_2x1_mmul<bfloat16,
+                                          bfloat16,
+                                          (m / r),
+                                          (k / s),
+                                          (n / t),
+                                          r,
+                                          s,
+                                          t,
+                                          is_b_row_maj,
+                                          is_c_row_maj>(pA, pB, pC);
+    } else if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0)) {
         return matmul_vectorized_2x2_mmul<bfloat16,
                                           bfloat16,
                                           (m / r),
@@ -1250,7 +1264,18 @@ static inline void matmul_init_vectorized_8x8x8_bf16_bf16(const bfloat16 *__rest
 
     ::aie::set_rounding(round_mode);
 
-    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0)) {
+    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0) && (k == 24) && (n == 32)) {
+        return matmul_init_vectorized_2x1_mmul<bfloat16,
+                                               bfloat16,
+                                               (m / r),
+                                               (k / s),
+                                               (n / t),
+                                               r,
+                                               s,
+                                               t,
+                                               is_b_row_maj,
+                                               is_c_row_maj>(pA, pB, pC);
+    } else if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0)) {
         return matmul_init_vectorized_2x2_mmul<bfloat16,
                                                bfloat16,
                                                (m / r),
@@ -1500,7 +1525,18 @@ static inline void matmul_with_acc_vectorized_8x8x8_bf16_bf16(const bfloat16 *__
 
     ::aie::set_rounding(round_mode);
 
-    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0)) {
+    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0) && (k == 24) && (n == 32)) {
+        return matmul_with_acc_vectorized_2x1_mmul<bfloat16,
+                                                   bfloat16,
+                                                   (m / r),
+                                                   (k / s),
+                                                   (n / t),
+                                                   r,
+                                                   s,
+                                                   t,
+                                                   is_b_row_maj,
+                                                   is_c_row_maj>(pA, pB, pAcc, pC);
+    } else if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0)) {
         return matmul_with_acc_vectorized_2x2_mmul<bfloat16,
                                                    bfloat16,
                                                    (m / r),
