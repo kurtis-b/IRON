@@ -553,12 +553,38 @@ def fused_mha(
     outOProjAccumIn = []
     outOProjAccumOut = []
 
-    def sequence_accum_memtile_col(lane_idx: int) -> int:
-        if parallel_lanes <= 4:
-            return 6 + (lane_idx % 2)
-        if parallel_lanes == 6:
-            return 4 + (lane_idx % 2)
-        return (0, 4, 5)[lane_idx % 3]
+    accum_memtile_cols: list[int] = []
+    # The accumulation FIFOs consume BD IDs proportional to acc depth. Greedily
+    # spread them across memtile columns, taking the existing Q/K/V/W_O and O
+    # fanout into account, so higher-acc retained shapes do not concentrate all
+    # staging on a few memtiles.
+    base_memtile_load = {col: 0 for col in range(8)}
+    base_memtile_load[1] += parallel_heads
+    base_memtile_load[2] += parallel_heads
+    base_memtile_load[3] += parallel_heads
+    if sequence_parallel_mode:
+        if parallel_lanes > 6:
+            base_memtile_load[6] += outer_lane_count + parallel_seq_join_distribute
+            base_memtile_load[7] += outer_lane_count + parallel_seq_join_distribute
+        else:
+            base_memtile_load[0] += outer_lane_count
+            base_memtile_load[7] += parallel_seq_join_distribute
+        candidate_memtile_cols = list(range(8))
+    else:
+        # Reserve memtile 7 for the final joined O drain and spread the non-sequence
+        # accumulation FIFOs across the free memtiles next to the O-proj row.
+        base_memtile_load[0] += parallel_heads
+        base_memtile_load[7] += 1
+        candidate_memtile_cols = [4, 5, 6]
+
+    current_memtile_load = dict(base_memtile_load)
+    for lane_idx in range(parallel_lanes):
+        col = min(candidate_memtile_cols, key=lambda c: (current_memtile_load[c], c))
+        accum_memtile_cols.append(col)
+        current_memtile_load[col] += 2 * o_proj_acc_depth
+
+    def accum_memtile_col(lane_idx: int) -> int:
+        return accum_memtile_cols[lane_idx]
 
     for i in range(parallel_lanes):
         outOProj.append(
@@ -572,11 +598,7 @@ def fused_mha(
                 name=f"outOProjAccumIn{i}",
                 depth=o_proj_acc_depth,
                 placement=Tile(
-                    col=(
-                        sequence_accum_memtile_col(i)
-                        if sequence_parallel_mode
-                        else (6 + (i % 2))
-                    ),
+                    col=accum_memtile_col(i),
                     row=1,
                 ),
             )
@@ -1169,10 +1191,6 @@ def fused_mha(
             (1, embed_sz // emb_tile // num_o_col_groups),
         )
     else:
-        if o_proj_acc_depth != 1:
-            raise ValueError(
-                "packed Block 3 handoff currently requires o_proj_acc_depth == 1"
-            )
         if packed_output_rows is None:
             raise ValueError("packed Block 3 handoff requires packed_output_rows")
         if packed_output_rows < seq_len or packed_output_rows % q_seq_tile != 0:
@@ -1188,9 +1206,10 @@ def fused_mha(
                 "packed_output_parallel_seq"
             )
         packed_tile_elems = 2 * q_seq_tile * emb_tile
+        k_tiles_per_q_block = embed_sz // emb_tile
         if sequence_parallel_mode:
             outer_group_count = 2 if parallel_lanes > 6 else 1
-            tile_group_stride = num_o_col_groups * packed_tile_elems
+            tile_group_stride = k_tiles_per_q_block * packed_tile_elems
             O_tiles = []
             for q_group_idx in range(num_q_seq_blocks // parallel_seq):
                 base_q_block = q_group_idx * parallel_seq
@@ -1199,31 +1218,38 @@ def fused_mha(
                     for col_group in range(num_o_col_groups):
                         tile_index = (
                             base_q_block + outer_a_tile
-                        ) * num_o_col_groups + col_group
+                        ) * k_tiles_per_q_block + col_group * o_proj_acc_depth
                         O_tiles.append(
                             TensorAccessPattern(
                                 (2 * packed_output_rows * embed_sz,),
                                 offset=tile_index * packed_tile_elems,
                                 sizes=[
+                                    o_proj_acc_depth,
                                     parallel_seq_join_distribute,
-                                    1,
                                     q_seq_tile,
                                     emb_tile,
                                 ],
-                                strides=[tile_group_stride, 0, emb_tile, 1],
+                                strides=[
+                                    packed_tile_elems,
+                                    tile_group_stride,
+                                    emb_tile,
+                                    1,
+                                ],
                             )
                         )
         else:
             O_tiles = []
             for q_block_idx in range(num_q_seq_blocks):
                 for col_group in range(num_o_col_groups):
-                    tile_index = q_block_idx * num_o_col_groups + col_group
+                    tile_index = (
+                        q_block_idx * k_tiles_per_q_block + col_group * o_proj_acc_depth
+                    )
                     O_tiles.append(
                         TensorAccessPattern(
                             (2 * packed_output_rows * embed_sz,),
                             offset=tile_index * packed_tile_elems,
-                            sizes=[1, 1, q_seq_tile, emb_tile],
-                            strides=[0, 0, emb_tile, 1],
+                            sizes=[o_proj_acc_depth, 1, q_seq_tile, emb_tile],
+                            strides=[packed_tile_elems, 0, emb_tile, 1],
                         )
                     )
 

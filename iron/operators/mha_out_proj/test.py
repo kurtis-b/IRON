@@ -325,14 +325,14 @@ def test_block2_packed_output_uses_distinct_artifacts(aie_context):
         num_heads=12,
         seq_len=64,
         d=64,
-        topology_id="q32_kv64_e96_ps1_ph1_acc1",
+        topology_id="q32_kv64_e96_ps2_ph1_acc1",
         context=aie_context,
     )
     packed = AIEMHAOutProj(
         num_heads=12,
         seq_len=64,
         d=64,
-        topology_id="q32_kv64_e96_ps1_ph1_acc1",
+        topology_id="q32_kv64_e96_ps2_ph1_acc1",
         context=aie_context,
         packed_output_parallel_seq=1,
         packed_output_rows=64,
@@ -409,32 +409,137 @@ def test_supported_block2_topologies_include_promoted_runtime_variants():
     assert "q32_kv64_e64_ps2_ph1_acc1" in topology_ids_1_seq384
     assert "q32_kv64_e64_ps4_ph1_acc1" in topology_ids_1_seq384
     assert "q32_kv64_e64_ps6_ph1_acc1" in topology_ids_1_seq384
-    assert "q32_kv64_e96_ps1_ph2_acc1" in topology_ids_12
-    assert "q32_kv64_e96_ps1_ph4_acc1" in topology_ids_12
-    assert "q32_kv64_e96_ps1_ph6_acc1" in topology_ids_12
-    assert "q32_kv64_e96_ps2_ph1_acc1" in topology_ids_12
-    assert "q32_kv64_e96_ps2_ph2_acc1" in topology_ids_12
-    assert "q32_kv64_e96_ps4_ph2_acc1" in topology_ids_12
-    assert "q32_kv64_e96_ps2_ph4_acc1" in topology_ids_12
-    assert "q32_kv64_e96_ps4_ph1_acc1" in topology_ids_12
-    assert "q32_kv64_e96_ps8_ph1_acc1" in topology_ids_12
-    assert "q32_kv64_e96_ps6_ph1_acc1" in topology_ids_12_seq384
-    assert "q32_kv64_e96_ps2_ph2_acc1" in topology_ids_12_seq384
-    assert "q32_kv64_e96_ps4_ph2_acc1" in topology_ids_12_seq384
-    assert "q32_kv64_e96_ps2_ph4_acc1" in topology_ids_12_seq384
-    assert "q32_kv64_e128_ps1_ph2_acc1" in topology_ids_16
-    assert "q32_kv64_e128_ps1_ph4_acc1" in topology_ids_16
-    assert "q32_kv64_e128_ps2_ph1_acc1" in topology_ids_16
-    assert "q32_kv64_e128_ps2_ph2_acc1" in topology_ids_16
-    assert "q32_kv64_e128_ps4_ph2_acc1" in topology_ids_16
-    assert "q32_kv64_e128_ps2_ph4_acc1" in topology_ids_16
-    assert "q32_kv64_e128_ps4_ph1_acc1" in topology_ids_16
-    assert "q32_kv64_e128_ps8_ph1_acc1" in topology_ids_16
-    assert "q32_kv64_e128_ps6_ph1_acc1" in topology_ids_16_seq384
-    assert "q32_kv64_e128_ps2_ph2_acc1" in topology_ids_16_seq384
-    assert "q32_kv64_e128_ps4_ph2_acc1" in topology_ids_16_seq384
-    assert "q32_kv64_e128_ps2_ph4_acc1" in topology_ids_16_seq384
+    assert "q32_kv64_e96_ps1_ph4_acc8" in topology_ids_12
+    assert "q32_kv64_e96_ps1_ph6_acc8" in topology_ids_12
+    assert "q32_kv64_e96_ps2_ph1_acc8" in topology_ids_12
+    assert "q32_kv64_e96_ps2_ph2_acc8" in topology_ids_12
+    assert "q32_kv64_e96_ps2_ph4_acc8" in topology_ids_12
+    assert "q32_kv64_e96_ps8_ph1_acc8" in topology_ids_12
+    assert "q32_kv64_e96_ps6_ph1_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps4_ph2_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps2_ph4_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e128_ps1_ph4_acc8" in topology_ids_16
+    assert "q32_kv64_e128_ps2_ph1_acc8" in topology_ids_16
+    assert "q32_kv64_e128_ps2_ph2_acc8" in topology_ids_16
+    assert "q32_kv64_e128_ps2_ph4_acc8" in topology_ids_16
+    assert "q32_kv64_e128_ps8_ph1_acc8" in topology_ids_16
+    assert "q32_kv64_e128_ps6_ph1_acc8" in topology_ids_16_seq384
+    assert "q32_kv64_e128_ps4_ph2_acc8" in topology_ids_16_seq384
+    assert "q32_kv64_e128_ps2_ph4_acc8" in topology_ids_16_seq384
     assert "q32_kv64_e128_ps1_ph8_acc1" not in topology_ids_16
+
+
+def test_supported_block2_topologies_admit_validated_higher_acc_depth_subset():
+    topology_ids_12_seq64 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=64,
+            num_heads=12,
+            head_dim=64,
+        )
+    }
+    topology_ids_12_seq384 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=384,
+            num_heads=12,
+            head_dim=64,
+        )
+    }
+    topology_ids_12_seq512 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=512,
+            num_heads=12,
+            head_dim=64,
+        )
+    }
+    topology_ids_16_seq64 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=64,
+            num_heads=16,
+            head_dim=64,
+        )
+    }
+    topology_ids_16_seq384 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=384,
+            num_heads=16,
+            head_dim=64,
+        )
+    }
+    topology_ids_16_seq2048 = {
+        str(topology["topology_id"])
+        for topology in mha_out_proj_topologies(
+            seq_len=2048,
+            num_heads=16,
+            head_dim=64,
+        )
+    }
+
+    assert "q32_kv64_e96_ps1_ph1_acc8" in topology_ids_12_seq64
+    assert "q32_kv64_e96_ps1_ph2_acc8" in topology_ids_12_seq64
+    assert "q32_kv64_e96_ps1_ph4_acc8" in topology_ids_12_seq64
+    assert "q32_kv64_e96_ps2_ph1_acc8" in topology_ids_12_seq64
+    assert "q32_kv64_e96_ps2_ph2_acc8" in topology_ids_12_seq64
+    assert "q32_kv64_e96_ps1_ph6_acc8" in topology_ids_12_seq64
+    assert "q32_kv64_e96_ps2_ph4_acc8" in topology_ids_12_seq64
+    assert "q32_kv64_e96_ps4_ph1_acc4" not in topology_ids_12_seq64
+    assert "q32_kv64_e96_ps4_ph2_acc4" not in topology_ids_12_seq64
+    assert "q32_kv64_e96_ps6_ph1_acc4" not in topology_ids_12_seq64
+    assert "q32_kv64_e96_ps8_ph1_acc4" not in topology_ids_12_seq64
+    assert "q32_kv64_e96_ps1_ph1_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps1_ph2_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps1_ph4_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps2_ph1_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps2_ph2_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps1_ph6_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps2_ph4_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps4_ph1_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps4_ph2_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps6_ph1_acc8" in topology_ids_12_seq384
+    assert "q32_kv64_e96_ps1_ph1_acc8" in topology_ids_12_seq512
+    assert "q32_kv64_e96_ps1_ph2_acc8" in topology_ids_12_seq512
+    assert "q32_kv64_e96_ps1_ph4_acc8" in topology_ids_12_seq512
+    assert "q32_kv64_e96_ps2_ph1_acc8" in topology_ids_12_seq512
+    assert "q32_kv64_e96_ps2_ph2_acc8" in topology_ids_12_seq512
+    assert "q32_kv64_e96_ps1_ph6_acc8" in topology_ids_12_seq512
+    assert "q32_kv64_e96_ps2_ph4_acc8" in topology_ids_12_seq512
+    assert "q32_kv64_e96_ps4_ph1_acc8" in topology_ids_12_seq512
+    assert "q32_kv64_e96_ps4_ph2_acc8" in topology_ids_12_seq512
+    assert "q32_kv64_e96_ps8_ph1_acc8" in topology_ids_12_seq512
+    assert "q32_kv64_e128_ps1_ph1_acc8" in topology_ids_16_seq64
+    assert "q32_kv64_e128_ps1_ph2_acc8" in topology_ids_16_seq64
+    assert "q32_kv64_e128_ps1_ph4_acc8" in topology_ids_16_seq64
+    assert "q32_kv64_e128_ps2_ph1_acc8" in topology_ids_16_seq64
+    assert "q32_kv64_e128_ps2_ph2_acc8" in topology_ids_16_seq64
+    assert "q32_kv64_e128_ps2_ph4_acc8" in topology_ids_16_seq64
+    assert "q32_kv64_e128_ps4_ph1_acc4" not in topology_ids_16_seq64
+    assert "q32_kv64_e128_ps4_ph2_acc4" not in topology_ids_16_seq64
+    assert "q32_kv64_e128_ps6_ph1_acc4" not in topology_ids_16_seq64
+    assert "q32_kv64_e128_ps8_ph1_acc4" not in topology_ids_16_seq64
+    assert "q32_kv64_e128_ps1_ph1_acc8" in topology_ids_16_seq384
+    assert "q32_kv64_e128_ps1_ph2_acc8" in topology_ids_16_seq384
+    assert "q32_kv64_e128_ps1_ph4_acc8" in topology_ids_16_seq384
+    assert "q32_kv64_e128_ps2_ph1_acc8" in topology_ids_16_seq384
+    assert "q32_kv64_e128_ps2_ph2_acc8" in topology_ids_16_seq384
+    assert "q32_kv64_e128_ps2_ph4_acc8" in topology_ids_16_seq384
+    assert "q32_kv64_e128_ps4_ph1_acc8" in topology_ids_16_seq384
+    assert "q32_kv64_e128_ps4_ph2_acc8" in topology_ids_16_seq384
+    assert "q32_kv64_e128_ps6_ph1_acc8" in topology_ids_16_seq384
+    assert "q32_kv64_e128_ps1_ph1_acc8" in topology_ids_16_seq2048
+    assert "q32_kv64_e128_ps1_ph2_acc8" in topology_ids_16_seq2048
+    assert "q32_kv64_e128_ps1_ph4_acc8" in topology_ids_16_seq2048
+    assert "q32_kv64_e128_ps2_ph1_acc8" in topology_ids_16_seq2048
+    assert "q32_kv64_e128_ps2_ph2_acc8" in topology_ids_16_seq2048
+    assert "q32_kv64_e128_ps2_ph4_acc8" in topology_ids_16_seq2048
+    assert "q32_kv64_e128_ps4_ph1_acc8" in topology_ids_16_seq2048
+    assert "q32_kv64_e128_ps4_ph2_acc8" in topology_ids_16_seq2048
+    assert "q32_kv64_e128_ps8_ph1_acc8" in topology_ids_16_seq2048
+    assert "q32_kv64_e96_ps2_ph1_acc2" not in topology_ids_12_seq512
+    assert "q32_kv64_e128_ps2_ph1_acc2" not in topology_ids_16_seq2048
 
 
 def test_block2_accepts_flat_qkv_without_head_major_reshape(aie_context):
@@ -497,14 +602,14 @@ def test_block2_packed_output_matches_dense_output(aie_context):
         num_heads=num_heads,
         seq_len=seq_len,
         d=head_dim,
-        topology_id="q32_kv64_e96_ps1_ph1_acc1",
+        topology_id="q32_kv64_e96_ps2_ph1_acc1",
         context=aie_context,
     )
     packed = AIEMHAOutProj(
         num_heads=num_heads,
         seq_len=seq_len,
         d=head_dim,
-        topology_id="q32_kv64_e96_ps1_ph1_acc1",
+        topology_id="q32_kv64_e96_ps2_ph1_acc1",
         context=aie_context,
         packed_output_parallel_seq=1,
         packed_output_rows=seq_len,
@@ -539,6 +644,71 @@ def test_block2_sequence_parallel_packed_output_matches_dense_output(aie_context
         d=head_dim,
         heads=num_heads,
         seed=31,
+        debug=DEBUG_MODE,
+    )
+
+    plain = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        topology_id=topology_id,
+        context=aie_context,
+    )
+    packed = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        topology_id=topology_id,
+        context=aie_context,
+        packed_output_parallel_seq=2,
+        packed_output_rows=seq_len,
+    )
+
+    aie_context.compile_all()
+    aie_context.prepare_runtime()
+
+    dense_out = plain.forward(
+        golden_ref["Q"],
+        golden_ref["K"],
+        golden_ref["V"],
+        golden_ref["W_O"],
+    )
+    packed_out = packed.forward_packed(
+        golden_ref["Q"],
+        golden_ref["K"],
+        golden_ref["V"],
+        golden_ref["Q"],
+        golden_ref["W_O"],
+    )
+
+    unpacked_attention = _unpack_block3_attention_output(
+        torch_to_numpy(packed_out),
+        seq_len=seq_len,
+        packed_rows=seq_len,
+        embed_sz=num_heads * head_dim,
+        q_seq_tile=packed.q_seq_tile,
+        emb_tile=packed.emb_tile,
+        parallel_seq=packed.packed_output_parallel_seq,
+    )
+
+    assert np.array_equal(
+        dense_out.detach().cpu().float().numpy(),
+        unpacked_attention.astype(np.float32),
+    )
+
+
+def test_block2_sequence_parallel_packed_output_matches_dense_output_with_acc8(
+    aie_context,
+):
+    seq_len = 64
+    head_dim = 64
+    num_heads = 12
+    topology_id = "q32_kv64_e96_ps2_ph2_acc8"
+    golden_ref = generate_golden_reference(
+        seq_len=seq_len,
+        d=head_dim,
+        heads=num_heads,
+        seed=41,
         debug=DEBUG_MODE,
     )
 
@@ -826,6 +996,32 @@ def test_practical_block2_sort_key_favors_higher_acc_depth():
 @pytest.mark.parametrize(
     "seq_len,num_heads,topology_id",
     (
+        (64, 12, "q32_kv64_e96_ps1_ph1_acc8"),
+        (64, 12, "q32_kv64_e96_ps1_ph2_acc8"),
+        (64, 12, "q32_kv64_e96_ps1_ph4_acc8"),
+        (64, 12, "q32_kv64_e96_ps2_ph1_acc8"),
+        (64, 12, "q32_kv64_e96_ps2_ph2_acc8"),
+        (64, 12, "q32_kv64_e96_ps1_ph6_acc8"),
+        (512, 12, "q32_kv64_e96_ps1_ph6_acc8"),
+        (64, 12, "q32_kv64_e96_ps2_ph4_acc8"),
+        (512, 12, "q32_kv64_e96_ps1_ph1_acc8"),
+        (512, 12, "q32_kv64_e96_ps2_ph2_acc8"),
+        (384, 12, "q32_kv64_e96_ps4_ph1_acc8"),
+        (384, 12, "q32_kv64_e96_ps4_ph2_acc8"),
+        (384, 12, "q32_kv64_e96_ps6_ph1_acc8"),
+        (512, 12, "q32_kv64_e96_ps8_ph1_acc8"),
+        (64, 16, "q32_kv64_e128_ps1_ph1_acc8"),
+        (64, 16, "q32_kv64_e128_ps1_ph2_acc8"),
+        (64, 16, "q32_kv64_e128_ps1_ph4_acc8"),
+        (64, 16, "q32_kv64_e128_ps2_ph1_acc8"),
+        (64, 16, "q32_kv64_e128_ps2_ph2_acc8"),
+        (64, 16, "q32_kv64_e128_ps2_ph4_acc8"),
+        (2048, 16, "q32_kv64_e128_ps1_ph1_acc8"),
+        (2048, 16, "q32_kv64_e128_ps2_ph2_acc8"),
+        (384, 16, "q32_kv64_e128_ps4_ph1_acc8"),
+        (384, 16, "q32_kv64_e128_ps4_ph2_acc8"),
+        (384, 16, "q32_kv64_e128_ps6_ph1_acc8"),
+        (512, 16, "q32_kv64_e128_ps8_ph1_acc8"),
         (64, 1, "q32_kv64_e64_ps2_ph1_acc1"),
         (512, 1, "q32_kv64_e64_ps2_ph1_acc1"),
         (512, 1, "q32_kv64_e64_ps4_ph1_acc1"),
@@ -835,29 +1031,21 @@ def test_practical_block2_sort_key_favors_higher_acc_depth():
         (384, 1, "q32_kv64_e64_ps6_ph1_acc1"),
         (64, 12, "q32_kv64_e96_ps2_ph2_acc1"),
         (64, 12, "q32_kv64_e96_ps2_ph4_acc1"),
-        (512, 12, "q32_kv64_e96_ps2_ph1_acc1"),
-        (512, 12, "q32_kv64_e96_ps2_ph2_acc1"),
         (512, 12, "q32_kv64_e96_ps4_ph2_acc1"),
-        (512, 12, "q32_kv64_e96_ps2_ph4_acc1"),
-        (512, 12, "q32_kv64_e96_ps4_ph1_acc1"),
         (512, 12, "q32_kv64_e96_ps8_ph1_acc1"),
-        (384, 12, "q32_kv64_e96_ps6_ph1_acc1"),
-        (384, 12, "q32_kv64_e96_ps2_ph2_acc1"),
         (384, 12, "q32_kv64_e96_ps4_ph2_acc1"),
         (384, 12, "q32_kv64_e96_ps2_ph4_acc1"),
         (64, 16, "q32_kv64_e128_ps2_ph2_acc1"),
         (64, 16, "q32_kv64_e128_ps2_ph4_acc1"),
-        (512, 16, "q32_kv64_e128_ps2_ph2_acc1"),
         (512, 16, "q32_kv64_e128_ps4_ph2_acc1"),
         (512, 16, "q32_kv64_e128_ps2_ph4_acc1"),
         (512, 16, "q32_kv64_e128_ps8_ph1_acc1"),
         (384, 16, "q32_kv64_e128_ps6_ph1_acc1"),
-        (384, 16, "q32_kv64_e128_ps2_ph2_acc1"),
         (384, 16, "q32_kv64_e128_ps4_ph2_acc1"),
         (384, 16, "q32_kv64_e128_ps2_ph4_acc1"),
     ),
 )
-def test_block2_sequence_parallel_topologies_run_numerically(
+def test_block2_runtime_topologies_run_numerically(
     seq_len, num_heads, topology_id, aie_context
 ):
     head_dim = 64

@@ -96,14 +96,21 @@ Current runtime-supported surface:
     surface instead of only returning the retained family table when `seq_len`
     is provided
   - the retained `parallel_heads` sweep on the established `ps1` path
+  - a validated denser `o_proj_acc_depth` subset on the retained `12x64` and
+    `16x64` families for `head_dim == 64`, `q_seq_tile == 32`, and
+    `kv_seq_tile == 64`; the current runtime-supported catalog now admits the
+    maximum validated `o_proj_acc_depth` for each retained `ps/ph` shape:
+    `acc8` on all retained widened `12x64` / `16x64` `q32/kv64` shapes
   - a validated `parallel_seq` subset on the retained `12x64` and `16x64`
     families, with `parallel_seq in {2, 4, 6, 8}` lowered as real sequence lanes
-    when `q_seq_tile == 32`, `kv_seq_tile == 64`, `o_proj_acc_depth == 1`, and
+    when `q_seq_tile == 32`, `kv_seq_tile == 64`, and
     `parallel_seq * parallel_heads <= 8`; the validated composed subset now
     includes `ps2/ph2`, `ps2/ph4`, and `ps4/ph2` where sequence divisibility
     allows them, `ps6` is currently validated on retained workloads whose
     `seq_len` is divisible by `192`, and `ps8` is currently validated on
-    retained workloads whose `seq_len` is divisible by `256`
+    retained workloads whose `seq_len` is divisible by `256`; within that
+    retained widened surface the runtime selector now prefers the maximum
+    validated `o_proj_acc_depth` for each shape before falling back to `acc1`
   - a narrower validated `parallel_seq` subset on the retained `1x64` family:
     `parallel_heads == 1`, `q_seq_tile == 32`, `kv_seq_tile == 64`,
     `emb_tile == 64`, `o_proj_acc_depth == 1`, with `ps2` validated at
@@ -113,10 +120,13 @@ Current runtime-supported surface:
   - `seq_len=64, heads=1, head_dim=64`: `2` topologies
   - `seq_len=384, heads=1, head_dim=64`: `4` topologies
   - `seq_len=512, heads=1, head_dim=64`: `4` topologies
-  - `seq_len=64, heads=12, head_dim=64`: `7` topologies
-  - `seq_len=512, heads=12, head_dim=64`: `10` topologies
-  - `seq_len=64, heads=16, head_dim=64`: `6` topologies
-  - `seq_len=512, heads=16, head_dim=64`: `9` topologies
+  - `seq_len=64, heads=12, head_dim=64`: `12` topologies
+  - `seq_len=384, heads=12, head_dim=64`: `12` topologies
+  - `seq_len=512, heads=12, head_dim=64`: `12` topologies
+  - `seq_len=64, heads=16, head_dim=64`: `12` topologies
+  - `seq_len=384, heads=16, head_dim=64`: `12` topologies
+  - `seq_len=512, heads=16, head_dim=64`: `12` topologies
+  - `seq_len=2048, heads=16, head_dim=64`: `12` topologies
   - representative generalized `head_dim=64` workloads now also produce
     runtime/practical Block 2 catalogs:
     - `seq_len=64, heads=24`: runtime `12`
@@ -124,48 +134,24 @@ Current runtime-supported surface:
     - `seq_len=64, heads=8`: runtime `12`
     - `seq_len=512, heads=8`: runtime `12`
 - concretely:
-  - `1 x 64, seq_len=64`
-    - `q32_kv64_e64_ps1_ph1_acc1`
-    - `q32_kv64_e64_ps2_ph1_acc1`
-  - `1 x 64, seq_len=512`
-    - `q32_kv64_e64_ps1_ph1_acc1`
-    - `q32_kv64_e64_ps2_ph1_acc1`
-    - `q32_kv64_e64_ps4_ph1_acc1`
-    - `q32_kv64_e64_ps8_ph1_acc1`
-  - `1 x 64, seq_len=384`
-    - `q32_kv64_e64_ps1_ph1_acc1`
-    - `q32_kv64_e64_ps2_ph1_acc1`
-    - `q32_kv64_e64_ps4_ph1_acc1`
-    - `q32_kv64_e64_ps6_ph1_acc1`
-  - `12 x 64, seq_len=64`
-    - `q32_kv64_e96_ps1_ph1_acc1`
-    - `q32_kv64_e96_ps1_ph2_acc1`
-    - `q32_kv64_e96_ps1_ph4_acc1`
-    - `q32_kv64_e96_ps1_ph6_acc1`
-    - `q32_kv64_e96_ps2_ph1_acc1`
-    - `q32_kv64_e96_ps2_ph2_acc1`
-    - `q32_kv64_e96_ps2_ph4_acc1`
-  - `12 x 64, seq_len=512`
-    - the same set plus `q32_kv64_e96_ps4_ph1_acc1`,
-      `q32_kv64_e96_ps4_ph2_acc1`, and `q32_kv64_e96_ps8_ph1_acc1`
-  - `12 x 64, seq_len=384`
-    - the `ps1` retained set plus `q32_kv64_e96_ps2_ph2_acc1`,
-      `q32_kv64_e96_ps2_ph4_acc1`, `q32_kv64_e96_ps4_ph2_acc1`, and
-      `q32_kv64_e96_ps6_ph1_acc1`
-  - `16 x 64, seq_len=64`
-    - `q32_kv64_e128_ps1_ph1_acc1`
-    - `q32_kv64_e128_ps1_ph2_acc1`
-    - `q32_kv64_e128_ps1_ph4_acc1`
-    - `q32_kv64_e128_ps2_ph1_acc1`
-    - `q32_kv64_e128_ps2_ph2_acc1`
-    - `q32_kv64_e128_ps2_ph4_acc1`
-  - `16 x 64, seq_len=512`
-    - the same set plus `q32_kv64_e128_ps4_ph1_acc1`,
-      `q32_kv64_e128_ps4_ph2_acc1`, and `q32_kv64_e128_ps8_ph1_acc1`
-  - `16 x 64, seq_len=384`
-    - the `ps1` retained set plus `q32_kv64_e128_ps2_ph2_acc1`,
-      `q32_kv64_e128_ps2_ph4_acc1`, `q32_kv64_e128_ps4_ph2_acc1`, and
-      `q32_kv64_e128_ps6_ph1_acc1`
+  - `1 x 64`
+    - remains `acc1` only
+    - `ps2` is validated at `seq_len=64`
+    - `ps2/ps4/ps6` are validated at `seq_len=384`
+    - `ps2/ps4/ps8` are validated at `seq_len=512`
+  - `12 x 64`
+    - the capped retained runtime set now ranks the higher-acc shapes first:
+      `acc8` on `ps1/ph{1,2,4}`, `ps2/ph{1,2,4}`, and, when sequence
+      divisibility allows them, `ps4/ph{1,2}`, `ps6/ph1`, and `ps8/ph1`
+    - selected `acc1` fallbacks for those same retained shapes remain in the
+      capped runtime set for comparison/baseline coverage
+  - `16 x 64`
+    - the capped retained runtime set follows the same pattern except there is
+      no `ph6` path: `acc8` on `ps1/ph{1,2,4}`, `ps2/ph{1,2,4}`, and, when
+      sequence divisibility allows them, `ps4/ph{1,2}`, `ps6/ph1`, and
+      `ps8/ph1`
+    - selected `acc1` fallbacks remain in the capped runtime set for
+      comparison/baseline coverage
 
 Verified today:
 
@@ -183,17 +169,19 @@ Verified today:
 Work left:
 
 - broaden the current real `parallel_seq` lowering beyond the validated
-  `q32/kv64/acc1` subset; on retained families that now includes the composed
-  `ps/ph` cases listed above, on the `1x64` family the widened support is still
-  limited to `parallel_heads == 1`, and on generalized families the current
-  generated runtime catalog is still anchored on the `ps1` head-parallel path
+  `q32/kv64` subset; on retained families that now includes the max-validated
+  higher-acc subset listed above, on the `1x64` family the widened support is
+  still limited to `parallel_heads == 1`, and on generalized families the
+  current generated runtime catalog is still anchored on the `ps1`
+  head-parallel path
 - broaden the packed Block 2 output mode beyond the current restricted path
   used for Block 3 handoff; the current packed handoff no longer requires
   `Block 2 parallel_seq == Block 3 parallel_seq`, but it still requires
   matching `(q_seq_tile, emb_tile) == (tile_m, tile_k)` and a Block 3-compatible
   packed row count
 - widen runtime support across more of the practical/theoretical Block 2 space,
-  especially if higher `o_proj_acc_depth` or wider family support is needed
+  especially if higher `o_proj_acc_depth` on the wider `ps/ph` paths or wider
+  family support is needed
 - remove the remaining pytest skips in the practical matrix as those topologies
   become runnable
 

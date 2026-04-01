@@ -193,14 +193,21 @@ path:
   while generalized `head_dim=64` workloads can surface broader generated
   runtime candidates
 - `parallel_heads` on the established retained `ps1` path
+- a validated denser `o_proj_acc_depth` subset on the retained `12x64` and
+  `16x64` families for `head_dim == 64`, `q_seq_tile == 32`, and
+  `kv_seq_tile == 64`; the current runtime-supported catalog now admits the
+  maximum validated `o_proj_acc_depth` for each retained `ps/ph` shape:
+  `acc8` on all retained widened `12x64` / `16x64` `q32/kv64` shapes
 - a seq-len-aware `parallel_seq` subset on the retained `12x64` and `16x64`
   families, with `parallel_seq in {2, 4, 6, 8}` lowered as real sequence lanes
-  when `q_seq_tile == 32`, `kv_seq_tile == 64`, `o_proj_acc_depth == 1`, and
+  when `q_seq_tile == 32`, `kv_seq_tile == 64`, and
   `parallel_seq * parallel_heads <= 8`; the validated composed subset now
   includes `ps2/ph2`, `ps2/ph4`, and `ps4/ph2` where sequence divisibility
   allows them, `ps6` is currently validated on retained workloads whose
   `seq_len` is divisible by `192`, and `ps8` is currently validated on retained
-  workloads whose `seq_len` is divisible by `256`
+  workloads whose `seq_len` is divisible by `256`; within that retained
+  widened surface the runtime selector now prefers the maximum validated
+  `o_proj_acc_depth` for each shape before falling back to `acc1`
 - a narrower `parallel_seq` subset on the retained `1x64` family, currently
   validated with `parallel_heads == 1`, `q_seq_tile == 32`,
   `kv_seq_tile == 64`, `emb_tile == 64`, and `o_proj_acc_depth == 1`; this
@@ -209,7 +216,10 @@ path:
 Representative generalized `head_dim=64` workloads such as `24x64` and `8x64`
 now also resolve non-empty seq-len-aware runtime/practical catalogs through
 that same path, though the honest current runtime gate is still the narrower
-validated `q32/kv64/acc1` subset.
+validated `q32/kv64` subset: higher `o_proj_acc_depth` is currently admitted
+only on the retained `12x64/16x64` families through the max-validated-per-shape
+policy above, while generalized families and the retained `1x64` family remain
+`acc1`.
 For the retained runtime-supported study surface, `emb_tile` is still selected
 per retained workload family, and the current lowered design still does not
 support the `16x64 / parallel_heads=8` retained-shape variant because it
@@ -222,7 +232,8 @@ That design file should expose three distinct topology views:
   and the current staged local-memory working-set limits for a given workload
 - a heuristic-pruned practical exploration surface that favors higher sequence
   and head parallelism, larger Q/KV/output tiles, larger
-  `o_proj_acc_depth`, larger sequence and output chunks, and fuller per-stage
+  `o_proj_acc_depth`, larger `emb_tile * o_proj_acc_depth` output chunks to
+  reduce recomputation of the earlier stages, and fuller per-stage
   local-memory utilization while still retaining the baseline runtime-supported
   study topologies; practical ranking should continue to prefer real lowered
   axes over paper-only gains

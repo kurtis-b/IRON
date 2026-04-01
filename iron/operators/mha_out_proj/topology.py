@@ -556,8 +556,8 @@ def _block2_practical_sort_key(
     )
 
     return (
-        lane_parallelism,
         o_proj_acc_depth,
+        lane_parallelism,
         kv_seq_tile,
         sequence_chunk,
         emb_tile,
@@ -592,6 +592,42 @@ def _block2_runtime_sort_key(
     return _block2_practical_sort_key(candidate, head_dim=head_dim)
 
 
+def _block2_runtime_supported_acc_depth(
+    candidate: dict[str, int | str],
+    *,
+    num_heads: int,
+    head_dim: int,
+) -> int:
+    parallel_seq = int(candidate["parallel_seq"])
+    parallel_heads = int(candidate["parallel_heads"])
+    q_seq_tile = int(candidate["q_seq_tile"])
+    kv_seq_tile = int(candidate["kv_seq_tile"])
+    if head_dim != 64:
+        return 1
+    if num_heads not in (12, 16):
+        return 1
+    if q_seq_tile != 32 or kv_seq_tile != 64:
+        return 1
+    if parallel_seq == 1:
+        if parallel_heads in (1, 2, 4):
+            return 8
+        if num_heads == 12 and parallel_heads == 6:
+            return 8
+        return 1
+    if parallel_seq == 2:
+        if parallel_heads in (1, 2, 4):
+            return 8
+        return 1
+    if parallel_seq == 4:
+        if parallel_heads in (1, 2):
+            return 8
+        return 1
+    if parallel_seq in (6, 8):
+        if parallel_heads == 1:
+            return 8
+    return 1
+
+
 def _block2_runtime_candidate_allowed(
     candidate: dict[str, int | str],
     *,
@@ -615,7 +651,12 @@ def _block2_runtime_candidate_allowed(
         return False
     if kv_seq_tile != 64:
         return False
-    if o_proj_acc_depth != 1:
+    max_supported_acc_depth = _block2_runtime_supported_acc_depth(
+        candidate,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+    if o_proj_acc_depth not in (1, max_supported_acc_depth):
         return False
     if seq_len % (parallel_seq * q_seq_tile) != 0:
         return False
@@ -630,6 +671,8 @@ def _block2_runtime_candidate_allowed(
     if num_heads == 1 and (emb_tile != 64 or parallel_heads != 1):
         return False
     if parallel_seq > 1:
+        if o_proj_acc_depth != 1 and o_proj_acc_depth != max_supported_acc_depth:
+            return False
         if num_heads == 1:
             return True
         return num_heads in (12, 16)
@@ -659,6 +702,15 @@ def _block2_preferred_runtime_ids(
     preferred_ids.update(
         _mha_out_proj_topology_id(candidate)
         for candidate in _block2_promoted_parallel_seq_candidates(
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            retained=retained,
+        )
+    )
+    preferred_ids.update(
+        _mha_out_proj_topology_id(candidate)
+        for candidate in _block2_promoted_acc_depth_candidates(
             seq_len=seq_len,
             num_heads=num_heads,
             head_dim=head_dim,
@@ -750,4 +802,61 @@ def _block2_promoted_parallel_seq_candidates(
                 head_dim=head_dim,
             ):
                 promoted.append(candidate)
+    return promoted
+
+
+def _block2_promoted_acc_depth_candidates(
+    *,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    retained: list[dict[str, int]],
+) -> list[dict[str, int]]:
+    base_candidates = [
+        copy.deepcopy(candidate)
+        for candidate in retained
+        if int(candidate["q_seq_tile"]) == 32
+        and int(candidate["kv_seq_tile"]) == 64
+        and int(candidate["o_proj_acc_depth"]) == 1
+    ]
+    base_candidates.extend(
+        copy.deepcopy(candidate)
+        for candidate in _block2_promoted_parallel_seq_candidates(
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            retained=retained,
+        )
+    )
+    if not base_candidates:
+        return []
+
+    promoted: list[dict[str, int]] = []
+    for base_candidate in base_candidates:
+        max_acc_depth = _block2_runtime_supported_acc_depth(
+            base_candidate,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+        if max_acc_depth <= 1:
+            continue
+        candidate = copy.deepcopy(base_candidate)
+        candidate["o_proj_acc_depth"] = max_acc_depth
+        if (num_heads * head_dim) % (
+            int(candidate["emb_tile"]) * int(candidate["o_proj_acc_depth"])
+        ) != 0:
+            continue
+        if _block2_runtime_supported_acc_depth(
+            candidate,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        ) != int(candidate["o_proj_acc_depth"]):
+            continue
+        if _block2_runtime_candidate_allowed(
+            candidate,
+            seq_len=seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        ):
+            promoted.append(candidate)
     return promoted
