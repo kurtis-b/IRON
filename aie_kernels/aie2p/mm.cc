@@ -1199,10 +1199,11 @@ matmul_vectorized_8x8x8_bf16_bf16(const bfloat16 *__restrict pA, const bfloat16 
 
     ::aie::set_rounding(round_mode);
 
-    // LLVM-AIE currently crashes in the 2x2 bf16 8x8x8 path for k=24,n=32.
-    // Falling back to the 2x1 expansion keeps the runtime-supported shape
-    // available without changing the public Block 1 topology surface.
-    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0) && (k == 24) && (n == 32)) {
+    // The 2x2 bf16 8x8x8 expansion is not stable for k=24 shapes on AIE2P.
+    // Falling back to the 2x1 expansion keeps the supported k=24 surfaces
+    // available for Block 1 and Block 3 without changing their topology
+    // contracts.
+    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0) && (k == 24)) {
         return matmul_vectorized_2x1_mmul<bfloat16,
                                           bfloat16,
                                           (m / r),
@@ -1264,7 +1265,7 @@ static inline void matmul_init_vectorized_8x8x8_bf16_bf16(const bfloat16 *__rest
 
     ::aie::set_rounding(round_mode);
 
-    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0) && (k == 24) && (n == 32)) {
+    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0) && (k == 24)) {
         return matmul_init_vectorized_2x1_mmul<bfloat16,
                                                bfloat16,
                                                (m / r),
@@ -1525,7 +1526,7 @@ static inline void matmul_with_acc_vectorized_8x8x8_bf16_bf16(const bfloat16 *__
 
     ::aie::set_rounding(round_mode);
 
-    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0) && (k == 24) && (n == 32)) {
+    if constexpr ((m % (2 * r) == 0) && (n % (2 * t) == 0) && (k == 24)) {
         return matmul_with_acc_vectorized_2x1_mmul<bfloat16,
                                                    bfloat16,
                                                    (m / r),
