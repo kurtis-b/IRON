@@ -293,3 +293,60 @@ def test_ffn(
             assert (
                 len(errors["C"]) <= max_acceptable_errors
             ), f"Test failed with {len(errors['C'])} errors (max allowable: {max_acceptable_errors})"
+
+
+@pytest.mark.parametrize("m", (8, 16))
+def test_ffn_supports_small_tile_m_with_1x4_expansion(m, aie_context):
+    M = 32
+    K = 96
+    N = 64
+    down_proj_depth = 1
+    num_aie_columns = 2
+    nA_tiles_distributed = 1
+    nB_tiles_distributed = 1
+    gelu_stage = 1
+
+    golden_ref = generate_golden_reference(
+        M=M,
+        K=K,
+        N=N,
+        debug_mode=DEBUG_MODE,
+    )
+
+    operator = AIEFFNAN(
+        M=M,
+        K=K,
+        N=N,
+        tile_m=m,
+        tile_k=K,
+        tile_n=N,
+        down_proj_depth=down_proj_depth,
+        num_aie_columns=num_aie_columns,
+        ln2_weight=golden_ref["weight2"],
+        debug_mode=DEBUG_MODE,
+        context=aie_context,
+        emulate_bf32_mmul_with_bfp32=True,
+        nA_tiles_distributed=nA_tiles_distributed,
+        nB_tiles_distributed=nB_tiles_distributed,
+        stage_only=None,
+        gelu_stage=gelu_stage,
+    )
+
+    input_buffers = {
+        "AR": golden_ref["input_and_residual"].flatten(),
+        "B_Up": golden_ref["input_b_up"].flatten(),
+        "B_Down": golden_ref["input_b_down"].flatten(),
+    }
+    output_buffers = {"C": golden_ref["output"].flatten()}
+
+    errors, _, _ = run_test(
+        operator,
+        input_buffers,
+        output_buffers,
+        rel_tol=4.0e-2,
+        abs_tol=1.5e-1,
+    )
+
+    error_threshold = 0.005
+    max_acceptable_errors = int(M * K * error_threshold)
+    assert len(errors["C"]) <= max_acceptable_errors

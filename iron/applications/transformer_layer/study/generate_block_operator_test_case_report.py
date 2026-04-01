@@ -300,22 +300,6 @@ def collect_block3_cases() -> list[CaseSpec]:
                 )
             )
 
-    cases.append(
-        CaseSpec(
-            block="block3",
-            case_id="block3_forward_packed_64x768x3072_m32_k96_n64_ps2_pi6_d8_g1",
-            source_tests=["test_forward_packed_uses_bound_static_weights"],
-            workload={
-                "seq_len": 64,
-                "hidden_size": 768,
-                "intermediate_size": 3072,
-            },
-            topology_id="m32_k96_n64_ps2_pi6_d8_g1",
-            topology_family="pipelined_addnorm_ffn_addnorm",
-            case_kind="packed_runtime_case",
-        )
-    )
-
     topology = addnorm_ffn_addnorm_topologies(
         seq_len=64,
         hidden_size=1536,
@@ -524,9 +508,7 @@ def _measure_block3(
     context = AIEContext()
     try:
         seed = 7
-        if case.case_kind == "packed_runtime_case":
-            seed = 17
-        elif case.case_kind == "generalized_spot_check":
+        if case.case_kind == "generalized_spot_check":
             seed = 19
         golden = generate_block3_reference(
             seq_len=seq_len,
@@ -551,15 +533,14 @@ def _measure_block3(
         for _ in range(warmup_iters):
             operator.run_runlist()
 
-        packed_input = operator._pack_hidden_residual(
-            torch_to_numpy(golden["hidden_states"]),
-            torch_to_numpy(golden["residual"]),
-        )
         operator.write_buffer("C", np.zeros(operator.buffers["C"], dtype=np.uint8))
-        operator.write_buffer("packed_hidden_residual", packed_input)
+        operator.write_buffer("A", torch_to_numpy(golden["hidden_states"]).reshape(-1))
+        operator.write_buffer("R", torch_to_numpy(golden["residual"]).reshape(-1))
 
         latencies_us: list[float] = []
-        total_bytes = operator.buffers["packed_hidden_residual"] + operator.buffers["C"]
+        total_bytes = (
+            operator.buffers["A"] + operator.buffers["R"] + operator.buffers["C"]
+        )
         bandwidths_gbps: list[float] = []
         for _ in range(timed_iters):
             elapsed = operator.run_runlist()

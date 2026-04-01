@@ -25,9 +25,6 @@ from iron.applications.transformer_layer.src.patterns import (
     DataflowPattern as StructuredDataflowPattern,
 )
 from iron.applications.transformer_layer.src.patterns import GemmOnlyPattern
-from iron.applications.transformer_layer.src.patterns.dataflow import (
-    _block2_block3_packed_handoff_compatible,
-)
 from iron.operators.addnorm_ffn_addnorm.topology import addnorm_ffn_addnorm_topologies
 from iron.operators.mha_out_proj.topology import mha_out_proj_topologies
 from iron.operators.qkv_proj.topology import qkv_proj_topologies
@@ -52,17 +49,6 @@ def _first_dataflow_compatible_block3_topology(
     block2_topology_id: str | None = None,
     reverse: bool = False,
 ) -> dict[str, int | str]:
-    block2_topologies = mha_out_proj_topologies(
-        seq_len=seq_len,
-        num_heads=num_heads,
-        head_dim=head_dim,
-    )
-    if block2_topology_id is not None:
-        block2_topologies = [
-            candidate
-            for candidate in block2_topologies
-            if str(candidate["topology_id"]) == block2_topology_id
-        ]
     block3_topologies = addnorm_ffn_addnorm_topologies(
         seq_len=seq_len,
         hidden_size=hidden_size,
@@ -70,15 +56,18 @@ def _first_dataflow_compatible_block3_topology(
     )
     if reverse:
         block3_topologies = list(reversed(block3_topologies))
-    for block3_candidate in block3_topologies:
-        for block2_candidate in block2_topologies:
-            if _block2_block3_packed_handoff_compatible(
+    if block2_topology_id is not None:
+        assert any(
+            str(candidate["topology_id"]) == block2_topology_id
+            for candidate in mha_out_proj_topologies(
                 seq_len=seq_len,
-                block2_candidate=block2_candidate,
-                block3_candidate=block3_candidate,
-            ):
-                return block3_candidate
-    raise AssertionError("expected at least one dataflow-compatible Block 3 topology")
+                num_heads=num_heads,
+                head_dim=head_dim,
+            )
+        )
+    if not block3_topologies:
+        raise AssertionError("expected at least one Block 3 topology")
+    return block3_topologies[0]
 
 
 def _first_dataflow_compatible_block2_topology(
@@ -94,20 +83,9 @@ def _first_dataflow_compatible_block2_topology(
         num_heads=num_heads,
         head_dim=head_dim,
     )
-    block3_topologies = addnorm_ffn_addnorm_topologies(
-        seq_len=seq_len,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-    )
-    for block2_candidate in block2_topologies:
-        for block3_candidate in block3_topologies:
-            if _block2_block3_packed_handoff_compatible(
-                seq_len=seq_len,
-                block2_candidate=block2_candidate,
-                block3_candidate=block3_candidate,
-            ):
-                return block2_candidate
-    raise AssertionError("expected at least one dataflow-compatible Block 2 topology")
+    if not block2_topologies:
+        raise AssertionError("expected at least one Block 2 topology")
+    return block2_topologies[0]
 
 
 def _run_dataflow_parity_isolated(
@@ -362,62 +340,28 @@ def test_block2_contract_packs_head_major_qkv_into_runtime_qkv_layout():
     assert np.array_equal(packed.astype(np.float32), expected.float().numpy())
 
 
-def test_dataflow_pattern_configures_block2_packed_output_for_block3():
+def test_dataflow_pattern_uses_plain_block2_block3_handoff():
     spec = TransformerLayerSpec(seq_len=64)
     pattern = build_pattern("dataflow", spec)
 
-    assert pattern.block2.packed_output_parallel_seq == pattern.block3.parallel_seq
-    assert pattern.block2.packed_output_rows == pattern.block3.M
-    assert pattern.block2.q_seq_tile == pattern.block3.tile_m
-    assert pattern.block2.emb_tile == pattern.block3.tile_k
+    assert pattern.block2.packed_output_parallel_seq is None
+    assert pattern.block2.packed_output_rows is None
 
 
-def test_dataflow_pattern_prefers_matching_block2_parallel_seq_for_packed_handoff():
+def test_dataflow_pattern_resolves_explicit_block2_and_block3_ids_independently():
     spec = TransformerLayerSpec(
         seq_len=64,
         hidden_size=768,
         intermediate_size=3072,
         num_attention_heads=12,
         block3_topology_id="m32_k96_n64_ps2_pi6_d8_g1",
+        block2_topology_id="q32_kv64_e96_ps2_ph2_acc8",
     )
 
     pattern = build_pattern("dataflow", spec)
 
-    assert pattern.block2.parallel_seq == pattern.block3.parallel_seq == 2
-
-
-def test_packed_handoff_compatibility_does_not_require_matching_parallel_seq():
-    assert _block2_block3_packed_handoff_compatible(
-        seq_len=64,
-        block2_candidate={
-            "parallel_seq": 4,
-            "q_seq_tile": 32,
-            "emb_tile": 96,
-            "o_proj_acc_depth": 1,
-        },
-        block3_candidate={
-            "parallel_seq": 2,
-            "tile_m": 32,
-            "tile_k": 96,
-        },
-    )
-
-
-def test_packed_handoff_compatibility_allows_acc8():
-    assert _block2_block3_packed_handoff_compatible(
-        seq_len=64,
-        block2_candidate={
-            "parallel_seq": 2,
-            "q_seq_tile": 32,
-            "emb_tile": 96,
-            "o_proj_acc_depth": 8,
-        },
-        block3_candidate={
-            "parallel_seq": 2,
-            "tile_m": 32,
-            "tile_k": 96,
-        },
-    )
+    assert pattern.block2.topology_id == "q32_kv64_e96_ps2_ph2_acc8"
+    assert pattern.block3.topology_id == "m32_k96_n64_ps2_pi6_d8_g1"
 
 
 @pytest.mark.parametrize(
@@ -451,9 +395,9 @@ def test_packed_handoff_compatibility_allows_acc8():
                 "intermediate_size": 3072,
                 "num_attention_heads": 12,
                 "block2_topology_id": "q32_kv64_e96_ps4_ph2_acc1",
-                "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
+                "block3_topology_id": "m32_k96_n128_ps8_pi1_d8_g1",
             },
-            id="dataflow_512x768x3072_compatible_pi3",
+            id="dataflow_512x768x3072_compatible_ps8_pi1",
         ),
         pytest.param(
             {
@@ -462,9 +406,9 @@ def test_packed_handoff_compatibility_allows_acc8():
                 "intermediate_size": 4096,
                 "num_attention_heads": 16,
                 "block2_topology_id": "q32_kv64_e128_ps4_ph2_acc1",
-                "block3_topology_id": "m32_k128_n32_ps4_pi2_d8_g1",
+                "block3_topology_id": "m32_k128_n64_ps8_pi1_d8_g1",
             },
-            id="dataflow_512x1024x4096_pi2",
+            id="dataflow_512x1024x4096_ps8_pi1",
         ),
         pytest.param(
             {
@@ -490,7 +434,7 @@ def test_packed_handoff_compatibility_allows_acc8():
         ),
     ),
 )
-def test_dataflow_pattern_runs_packed_block2_block3_handoff_against_reference(
+def test_dataflow_pattern_runs_plain_block2_block3_handoff_against_reference(
     spec_kwargs,
 ):
     spec = TransformerLayerSpec(

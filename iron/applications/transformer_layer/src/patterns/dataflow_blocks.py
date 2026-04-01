@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 
 from iron.common import AIEContext
-from iron.common.utils import numpy_to_torch, torch_to_numpy
 from iron.operators.addnorm_ffn_addnorm.op import AIEAddNormFFNAddNorm
 from iron.operators.mha_out_proj.op import AIEMHAOutProj
 from iron.operators.qkv_proj.op import AIEQKVProj
@@ -201,7 +200,8 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
             context=self.context,
         )
         self._weights: dict[str, torch.Tensor] | None = None
-        self._cached_packed_hidden_residual: torch.Tensor | None = None
+        self._cached_attention_output: torch.Tensor | None = None
+        self._cached_residual: torch.Tensor | None = None
 
     def assign_weights(self, weights: dict[str, torch.Tensor]) -> None:
         require_keys(
@@ -241,12 +241,8 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
         )
         attention_output_padded[: attention_output.shape[0], :] = attention_output
         hidden_states_padded[: hidden_states.shape[0], :] = hidden_states
-        self._cached_packed_hidden_residual = numpy_to_torch(
-            self.block._pack_hidden_residual(
-                torch_to_numpy(attention_output_padded),
-                torch_to_numpy(hidden_states_padded),
-            )
-        )
+        self._cached_attention_output = attention_output_padded
+        self._cached_residual = hidden_states_padded
 
     def forward_with_stage_timings(
         self,
@@ -257,11 +253,14 @@ class Block3AddNormFFNAddNormPattern(_BaseBlockPattern):
             raise RuntimeError(
                 "Dataflow block studies currently require attention_mask=None"
             )
-        if self._cached_packed_hidden_residual is None:
+        if self._cached_attention_output is None or self._cached_residual is None:
             self.prepare_benchmark_inputs(layer_inputs)
         self._prepare_runtime()
         start = time.perf_counter()
-        output = self.block.forward_packed(self._cached_packed_hidden_residual)
+        output = self.block.forward(
+            self._cached_attention_output,
+            self._cached_residual,
+        )
         end = time.perf_counter()
         return output.unsqueeze(0), {"block3_addnorm_ffn_addnorm_sec": end - start}
 

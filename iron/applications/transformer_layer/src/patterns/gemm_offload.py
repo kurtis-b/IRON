@@ -311,8 +311,9 @@ class GemmOnlyPattern(nn.Module):
         npu_gemm_after_attention = time.perf_counter()
         host_postprocess_start = npu_gemm_after_attention
         attention_output = torch.cat(attention_blocks, dim=0)
+        preadd = attention_output + residual
         attention_output = _layer_norm_no_bias(
-            attention_output + residual,
+            preadd,
             self.ln1_weight,
             self.spec.layer_norm_eps,
         )
@@ -329,7 +330,7 @@ class GemmOnlyPattern(nn.Module):
         host_postprocess_resume_start = npu_gemm_end
         ffn_down = torch.cat(output_blocks, dim=0)
         output = _layer_norm_no_bias(
-            ffn_down + attention_output,
+            ffn_down + preadd,
             self.ln2_weight,
             self.spec.layer_norm_eps,
         ).unsqueeze(0)

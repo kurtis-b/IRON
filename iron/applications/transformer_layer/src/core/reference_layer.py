@@ -128,6 +128,7 @@ class ReferenceTransformerLayer(nn.Module):
         )
 
         attention_output = self.out_proj(attn_context)
-        attention_output = self.ln1(attention_output + residual)
+        preadd = attention_output + residual
+        attention_output = self.ln1(preadd)
         ffn_hidden = F.gelu(self.ffn_up(attention_output))
-        return self.ln2(self.ffn_down(ffn_hidden) + attention_output)
+        return self.ln2(self.ffn_down(ffn_hidden) + preadd)

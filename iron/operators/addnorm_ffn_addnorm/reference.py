@@ -34,8 +34,9 @@ def generate_golden_reference(
         torch.randn(intermediate_size, hidden_size, dtype=dtype_torch) * val_range
     )
 
+    preadd = hidden_states + residual
     addnorm1 = torch.nn.functional.layer_norm(
-        hidden_states + residual,
+        preadd,
         normalized_shape=(hidden_size,),
         weight=ln1_weight,
         bias=None,
@@ -44,7 +45,7 @@ def generate_golden_reference(
     gelu = torch.nn.functional.gelu(up_proj)
     down_proj = torch.matmul(gelu, down_weight)
     output = torch.nn.functional.layer_norm(
-        down_proj + addnorm1,
+        down_proj + preadd,
         normalized_shape=(hidden_size,),
         weight=ln2_weight,
         bias=None,

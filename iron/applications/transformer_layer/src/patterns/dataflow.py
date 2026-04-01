@@ -75,8 +75,6 @@ class DataflowPattern(nn.Module):
             topology_id=block2_topology_id,
             static_weights=True,
             context=self.context,
-            packed_output_parallel_seq=self.block3.parallel_seq,
-            packed_output_rows=self.block3.M,
         )
 
     def _prepare_runtime(self) -> None:
@@ -134,11 +132,11 @@ class DataflowPattern(nn.Module):
         block1_end = time.perf_counter()
 
         block2_start = block1_end
-        packed_block3_input = self.block2.forward_packed(q, k, v, hidden_states)
+        attention_output = self.block2.forward(q, k, v)
         block2_end = time.perf_counter()
 
         block3_start = block2_end
-        output = self.block3.forward_packed(packed_block3_input)
+        output = self.block3.forward(attention_output, hidden_states)
         block3_end = time.perf_counter()
 
         return output.unsqueeze(0), {
@@ -192,24 +190,6 @@ class DataflowPattern(nn.Module):
             attention_mask=attention_mask,
         )
         return output
-
-
-def _block2_block3_packed_handoff_compatible(
-    *,
-    seq_len: int,
-    block2_candidate: dict[str, int | str],
-    block3_candidate: dict[str, int | str],
-) -> bool:
-    q_seq_tile = int(block2_candidate["q_seq_tile"])
-    emb_tile = int(block2_candidate["emb_tile"])
-    parallel_seq = int(block3_candidate["parallel_seq"])
-    tile_m = int(block3_candidate["tile_m"])
-    tile_k = int(block3_candidate["tile_k"])
-    if seq_len % q_seq_tile != 0:
-        return False
-    if q_seq_tile != tile_m or emb_tile != tile_k:
-        return False
-    return ((seq_len // q_seq_tile) % parallel_seq) == 0
 
 
 def _resolve_dataflow_topology_ids(
@@ -268,26 +248,22 @@ def _resolve_dataflow_topology_ids(
         raise ValueError(
             f"Unknown Block 3 topology_id={spec.block3_topology_id!r} for dataflow pattern"
         )
-    for block3_candidate in block3_candidates:
-        preferred_block2_candidates = sorted(
+    if spec.block2_topology_id is None:
+        selected_block2 = max(
             block2_candidates,
             key=lambda candidate: (
-                int(candidate["parallel_seq"]) != int(block3_candidate["parallel_seq"]),
-                int(candidate["parallel_heads"]) != 1,
-                -int(candidate["parallel_heads"]),
-                -int(candidate["o_proj_acc_depth"]),
+                int(candidate["parallel_seq"]),
+                int(candidate["parallel_heads"]),
+                int(candidate["o_proj_acc_depth"]),
             ),
         )
-        for block2_candidate in preferred_block2_candidates:
-            if _block2_block3_packed_handoff_compatible(
-                seq_len=spec.seq_len,
-                block2_candidate=block2_candidate,
-                block3_candidate=block3_candidate,
-            ):
-                return (
-                    str(block2_candidate["topology_id"]),
-                    str(block3_candidate["topology_id"]),
-                )
-    raise ValueError(
-        "No compatible Block 2 / Block 3 topology pair exists for the packed dataflow handoff"
+    else:
+        selected_block2 = block2_candidates[0]
+    if spec.block3_topology_id is None:
+        selected_block3 = block3_candidates[0]
+    else:
+        selected_block3 = block3_candidates[0]
+    return (
+        str(selected_block2["topology_id"]),
+        str(selected_block3["topology_id"]),
     )

@@ -29,8 +29,7 @@ work, see `dataflow_status.md`.
   branches such as "mixed parallel" special cases
 - each thesis-local operator directory should mirror the `mha` operator layout:
   `design.py`, `op.py`, `reference.py`, and `test.py`
-- `design.py` should expose the retained execution entrypoint only; optional
-  debug/CLI helpers should live in a separate `design_debug.py`
+- `design.py` should expose the retained execution entrypoint only
 - `reference.py` should expose only `generate_golden_reference()`
 - `test.py` should expose `generate_test_params()` and one test method
 - `op.py` should keep the same operator-method surface as `mha`; any small
@@ -338,21 +337,26 @@ still reflects the current `design.py` implementation:
 - `tile_k >= 16`
 - `tile_n >= 16`
 - `down_proj_depth <= 8`
-- runtime candidates must also satisfy a conservative stage-1 bank-fit gate:
-  - required live stage-1 tiles scale with `hidden_size / tile_k`
-  - each runtime `(tile_m, tile_k)` pair is assigned a conservative bank-slot
-    capacity
-  - candidates that would require more bank memtiles than the current layout
-    is assumed to expose stay practical/theoretical-only
+- replay-based LN2 now consumes forwarded preadd tiles from LN1 rather than a
+  separate `AR_ln2` ingress:
+  - when `hidden_size / tile_k == down_proj_depth` and
+    `down_proj_depth * tile_m * tile_k * 2 <= 32768`, runtime uses a buffered
+    one-replay path
+  - otherwise runtime uses a forwarded two-pass replay path
 - placement must satisfy the current horizontal, vertical, or compact-sequence
   Block 3 layouts
+- `parallel_seq > 2` with `parallel_int_dim > 1` is currently excluded from
+  runtime support because the forwarded-preadd stream overruns memtile BD
+  budget on those layouts
+- `tile_n > 128` is currently excluded from runtime support for the same
+  memtile-BD reason
 - `parallel_seq > 4` currently requires the compact-sequence layout, so the
   promoted `ps8` runtime surface is currently limited to `parallel_int_dim=1`
 
-So the practical Block 3 surface can still explore broader `ps8`/small-tile
-shapes than the current runtime-supported set, but `ps8` is no longer
-practical-only: the compact-sequence runtime path now supports strict-runtime-
-feasible `ps8, pi1` topologies.
+So the practical Block 3 surface can still explore broader `ps4/pi>1`,
+`ps8`, and small-tile shapes than the current runtime-supported set, but `ps8`
+is no longer practical-only: the compact-sequence runtime path now supports
+strict-runtime-feasible `ps8, pi1` topologies.
 Representative generalized workloads such as `1536/6144` and `960/3840` now
 also produce seq-len-aware runtime/practical Block 3 catalogs through that same
 generated-runtime path.
@@ -475,35 +479,35 @@ target. It instead prefers:
 - larger `parallel_seq * tile_m`
 - larger `tile_m`
 - larger `parallel_int_dim * tile_n`
-- fewer required stage-1 bank memtiles
+- buffered one-replay shapes
+- fewer replay `col_group`s
+- larger `down_proj_depth`
 - and only then smaller viable `tile_k`
 Because `ln1_weight` and `ln2_weight` are compile-time constants embedded into
 the generated Block 3 MLIR/xclbin, Block 3 artifact names must include a
 deterministic fingerprint of those two weight tensors so tests and studies do
 not accidentally reuse stale compiled artifacts across different retained
 workloads.
-For grouped Block 3 families where `hidden_size / tile_k` exceeds
-`down_proj_depth`, the standalone runtime now uses a row-tile-local three-phase
-design rather than a banked LN2 design:
-- for one row tile, LN2 first consumes a full-width packed `[A | R]` prepass
-  and caches LN1 row statistics locally
-- next, for each `col_group`, LN1 regenerates the full-width stage-1 stream for
-  FFN while LN2 independently regenerates only the active group and accumulates
-  LN2 row statistics locally from `down + stage1`
-- finally, for each `col_group`, LN1/FFN recompute that group and LN2
-  regenerates only the active group again and emits that group's output slice
+For grouped Block 3 families, the standalone runtime now uses forwarded-preadd
+replay rather than a separate LN2-side packed-`AR` replay:
+- LN1 always computes row statistics from packed `[A | R]`, forwards normalized
+  stage1 tiles to FFN, and forwards pre-LN1-add tiles to LN2
+- if `hidden_size / tile_k == down_proj_depth` and the active combined tiles
+  fit locally, LN2 buffers `preadd + down` once, accumulates LN2 row
+  statistics, and emits from those local combined buffers without a second FFN
+  replay
+- otherwise LN2 consumes forwarded preadd during one grouped stats sweep and
+  one grouped output sweep while FFN replays the active group twice
 Under this contract, `parallel_seq` duplicates the whole
 `AN1 -> Up-proj -> Down-proj -> AN2` pipeline across the array. If one pipeline
 runs over multiple row tiles because `seq_len / (parallel_seq * tile_m) > 1`,
-those row tiles are processed sequentially through the three phases
-rather than through separate LN2 stats banks. LN2 therefore owns both LN1 and
-LN2 cached row statistics locally, and the grouped runtime no longer depends on
-a down-proj-to-LN2 statistics handoff.
+those row tiles are processed sequentially through the buffered one-replay or
+two-pass forwarded replay schedule.
 That design file should also expose three distinct topology views:
 - a seq-len-aware runtime-supported topology list used by operator tests and
   benchmark manifests; for retained workloads that list now keeps the validated
   baseline IDs and also promotes additional generated runtime candidates when
-  they pass the current layout, stability, and stage-1 bank-fit gates
+  they pass the current layout, stability, and forwarded-replay gates
 - a broader theoretical topology enumerator that explores every combination
   allowed by the Block 3 contract, imported FFN tiling equalities,
   `seq_len`-fit, lane-count limit, and GeLU staging for a given workload

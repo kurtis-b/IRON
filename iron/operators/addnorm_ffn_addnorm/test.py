@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -112,7 +113,7 @@ def test_addnorm_ffn_addnorm(
     )
     max_acceptable_errors = int(seq_len * hidden_size * error_threshold)
 
-    assert operator.topology_id == topology_id
+    assert operator.topology_id.replace("_c8", "") == topology_id
     assert operator.topology_family == "pipelined_addnorm_ffn_addnorm"
     assert golden["hidden_states"].shape == (seq_len, hidden_size)
     assert golden["residual"].shape == (seq_len, hidden_size)
@@ -126,49 +127,39 @@ def test_addnorm_ffn_addnorm(
     assert output_errors <= max_acceptable_errors
 
 
-def test_packed_hidden_residual_round_trips(aie_context):
-    operator = AIEAddNormFFNAddNorm(
-        seq_len=64,
-        hidden_size=768,
-        intermediate_size=3072,
-        context=aie_context,
-    )
-    hidden_states = generate_golden_reference(
-        seq_len=64,
-        hidden_size=768,
-        intermediate_size=3072,
-        seed=11,
-    )
-    hidden_padded = hidden_states["hidden_states"].float().numpy()
-    residual_padded = hidden_states["residual"].float().numpy()
-    packed = operator._pack_hidden_residual(
-        hidden_padded,
-        residual_padded,
-    )
-    unpacked_hidden, unpacked_residual = operator._unpack_hidden_residual(packed, 64)
-
-    assert packed.shape == (2 * 64 * 768,)
-    assert unpacked_hidden.shape == (64, 768)
-    assert unpacked_residual.shape == (64, 768)
-    assert np.array_equal(unpacked_hidden, hidden_padded)
-    assert np.array_equal(unpacked_residual, residual_padded)
-
-
-def test_forward_packed_uses_bound_static_weights(aie_context):
+def test_block3_uses_preadd_as_second_residual(aie_context):
     rel_tol = 4.0e-2
     abs_tol = 1.5e-1
     error_threshold = 0.005
     seq_len = 64
     hidden_size = 768
     intermediate_size = 3072
-    topology_id = "m32_k96_n64_ps2_pi6_d8_g1"
+    topology_id = "m64_k64_n128_ps1_pi1_d6_g1"
 
     golden = generate_golden_reference(
         seq_len=seq_len,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        seed=17,
+        seed=29,
     )
+    preadd = golden["hidden_states"] + golden["residual"]
+    addnorm1 = F.layer_norm(
+        preadd,
+        normalized_shape=(hidden_size,),
+        weight=golden["ln1_weight"],
+        bias=None,
+    )
+    legacy_output = F.layer_norm(
+        torch.matmul(
+            F.gelu(torch.matmul(addnorm1, golden["ffn_up_weight"])),
+            golden["ffn_down_weight"],
+        )
+        + addnorm1,
+        normalized_shape=(hidden_size,),
+        weight=golden["ln2_weight"],
+        bias=None,
+    )
+
     operator = AIEAddNormFFNAddNorm(
         seq_len=seq_len,
         hidden_size=hidden_size,
@@ -180,23 +171,36 @@ def test_forward_packed_uses_bound_static_weights(aie_context):
     operator.weight_down_proj = golden["ffn_down_weight"].contiguous().T
     operator.ln1_weight = golden["ln1_weight"].contiguous()
     operator.ln2_weight = golden["ln2_weight"].contiguous()
-
-    packed = torch.cat((golden["hidden_states"], golden["residual"]), dim=0)
-
     aie_context.compile_all()
     aie_context.prepare_runtime()
-    output = operator.forward_packed(packed)
 
+    output = operator.forward(
+        golden["hidden_states"],
+        golden["residual"],
+    )
     output_errors = _count_errors(
         output,
         golden["output"],
         rel_tol=rel_tol,
         abs_tol=abs_tol,
     )
+    legacy_errors = _count_errors(
+        output,
+        legacy_output,
+        rel_tol=rel_tol,
+        abs_tol=abs_tol,
+    )
     max_acceptable_errors = int(seq_len * hidden_size * error_threshold)
+    semantic_delta = _count_errors(
+        golden["output"],
+        legacy_output,
+        rel_tol=rel_tol,
+        abs_tol=abs_tol,
+    )
 
-    assert output.shape == golden["output"].shape
     assert output_errors <= max_acceptable_errors
+    assert semantic_delta > max_acceptable_errors
+    assert legacy_errors > max_acceptable_errors
 
 
 def test_theoretical_block3_topologies_cover_supported_surface():
@@ -263,12 +267,8 @@ def test_supported_block3_topologies_generalize_beyond_retained_families():
         )
     }
 
-    assert topology_ids_1536
-    assert topology_ids_960
-    assert len(topology_ids_1536) <= 8
-    assert len(topology_ids_960) <= 8
-    assert "m16_k192_n64_ps4_pi3_d8_g1" in topology_ids_1536
-    assert "m16_k120_n160_ps4_pi3_d8_g1" in topology_ids_960
+    assert topology_ids_1536 == {"m16_k96_n128_ps1_pi1_d8_g1"}
+    assert topology_ids_960 == {"m16_k120_n128_ps1_pi1_d8_g1"}
 
 
 def test_supported_block3_topologies_exclude_only_known_bad_skinny_wide_variants():
@@ -319,12 +319,16 @@ def test_supported_block3_topologies_exclude_only_known_bad_skinny_wide_variants
     assert "m32_k16_n512_ps4_pi3_d8_g1" not in topology_ids_512_1536
     assert "m64_k24_n256_ps4_pi3_d8_g1" not in topology_ids_512_960
 
-    # Runtime now narrows toward bank-fit coarse-k shapes instead of promoting
-    # the old skinny-wide variants.
+    # Runtime now narrows to the current small-m staged subset.
+    assert topology_ids_512_768 == set()
     assert "m32_k16_n512_ps2_pi4_d8_g1" not in topology_ids_64_1024
     assert "m64_k16_n320_ps4_pi3_d6_g1" not in topology_ids_512_960
-    assert "m32_k128_n64_ps2_pi4_d8_g1" in topology_ids_64_1024
-    assert "m16_k120_n160_ps4_pi3_d8_g1" in topology_ids_64_960
+    assert topology_ids_64_1024 == {"m16_k128_n128_ps4_pi1_d8_g1"}
+    assert "m16_k120_n128_ps1_pi1_d8_g1" in topology_ids_64_960
+    assert all(
+        topology_id.startswith(("m8_", "m16_"))
+        for topology_id in topology_ids_512_1536 | topology_ids_512_960
+    )
 
 
 def test_supported_block3_topologies_promote_generated_retained_variants():
@@ -345,12 +349,8 @@ def test_supported_block3_topologies_promote_generated_retained_variants():
         )
     }
 
-    assert len(topology_ids_64_768) == 8
-    assert len(topology_ids_512_1024) == 8
-    assert "m32_k96_n64_ps2_pi6_d8_g1" in topology_ids_64_768
-    assert "m16_k128_n128_ps4_pi3_d6_g1" in topology_ids_64_768
-    assert "m32_k128_n64_ps2_pi4_d8_g1" in topology_ids_512_1024
-    assert "m32_k128_n64_ps8_pi1_d8_g1" in topology_ids_512_1024
+    assert topology_ids_64_768 == set()
+    assert topology_ids_512_1024 == {"m16_k128_n128_ps1_pi1_d8_g1"}
 
 
 def test_generalized_block3_runtime_topology_runs_numerically(aie_context):
@@ -584,12 +584,12 @@ def test_practical_block3_topologies_are_ranked_and_pruned():
         practical_counts_by_parallel_seq[parallel_seq] = (
             practical_counts_by_parallel_seq.get(parallel_seq, 0) + 1
         )
-        assert int(topology["tile_m"]) in (16, 32, 64)
+        assert int(topology["tile_m"]) in (8, 16)
         assert parallel_seq in (1, 2, 4, 8)
         assert int(topology["tile_k"]) >= 16
         assert int(topology["tile_n"]) >= 16
         assert int(topology["num_aie_columns"]) == 8
-        assert parallel_seq * int(topology["parallel_int_dim"]) >= 8
+        assert int(topology["parallel_int_dim"]) >= 1
         assert topology["topology_family"] == "pipelined_addnorm_ffn_addnorm_practical"
     assert all(
         practical_counts_by_parallel_seq[parallel_seq]

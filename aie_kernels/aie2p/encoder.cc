@@ -586,6 +586,326 @@ void matmul_with_acc_vectorized_2x1_mmul(const T_in *__restrict pA,
     event1();
 }
 
+template <typename T_in,
+          typename T_out,
+          unsigned rowA,
+          unsigned colA,
+          unsigned colB,
+          unsigned r,
+          unsigned s,
+          unsigned t>
+void matmul_vectorized_1x4_mmul(const T_in *__restrict pHalfA1,
+                                const T_in *__restrict pHalfA2,
+                                const T_in *__restrict pB,
+                                T_out *__restrict pC)
+{
+    using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
+    constexpr int szA = MMUL::size_A;
+
+    event0();
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
+        T_out *__restrict pC1 = pC + (z * colB) * MMUL::size_C;
+
+        for (unsigned j = 0; j < colB; j += 4)
+#ifdef OPT_PERF_ENABLED
+            AIE_LOOP_FLATTEN
+#endif
+            {
+                const T_in *__restrict pHA1 = pHalfA1 + (z * colA) * szA;
+                const T_in *__restrict pB1 = pB + (j)*MMUL::size_B;
+                const T_in *__restrict pB2 = pB + (j + 1) * MMUL::size_B;
+                const T_in *__restrict pB3 = pB + (j + 2) * MMUL::size_B;
+                const T_in *__restrict pB4 = pB + (j + 3) * MMUL::size_B;
+                aie::vector<T_in, szA> HA10;
+                aie::vector<T_in, MMUL::size_B> B0;
+                aie::vector<T_in, MMUL::size_B> B1;
+                aie::vector<T_in, MMUL::size_B> B2;
+                aie::vector<T_in, MMUL::size_B> B3;
+
+                aie::vector<T_out, MMUL::size_C> acc_C00 = aie::load_v<MMUL::size_C>(pC1);
+                aie::vector<T_out, MMUL::size_C> acc_C01 = aie::load_v<MMUL::size_C>(pC1 + MMUL::size_C);
+                aie::vector<T_out, MMUL::size_C> acc_C02 = aie::load_v<MMUL::size_C>(pC1 + 2 * MMUL::size_C);
+                aie::vector<T_out, MMUL::size_C> acc_C03 = aie::load_v<MMUL::size_C>(pC1 + 3 * MMUL::size_C);
+
+                MMUL C00(acc_C00);
+                MMUL C01(acc_C01);
+                MMUL C02(acc_C02);
+                MMUL C03(acc_C03);
+
+                for (unsigned i = 0; i < colA; ++i)
+#ifdef OPT_PERF_ENABLED
+                    AIE_LOOP_FLATTEN
+#endif
+                    {
+                        HA10 = aie::load_v<szA>(pHA1);
+                        pHA1 += szA;
+                        B0 = aie::load_v<MMUL::size_B>(pB1);
+                        pB1 += MMUL::size_B * colB;
+                        B1 = aie::load_v<MMUL::size_B>(pB2);
+                        pB2 += MMUL::size_B * colB;
+                        B2 = aie::load_v<MMUL::size_B>(pB3);
+                        pB3 += MMUL::size_B * colB;
+                        B3 = aie::load_v<MMUL::size_B>(pB4);
+                        pB4 += MMUL::size_B * colB;
+
+                        C00.mac(HA10, B0);
+                        C01.mac(HA10, B1);
+                        C02.mac(HA10, B2);
+                        C03.mac(HA10, B3);
+                    }
+
+                aie::store_v(pC1, C00.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C01.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C02.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C03.template to_vector<T_out>());
+            }
+
+        T_out *__restrict pC2 = pC + ((z + rowA) * colB) * MMUL::size_C;
+
+        for (unsigned j = 0; j < colB; j += 4)
+#ifdef OPT_PERF_ENABLED
+            AIE_LOOP_FLATTEN
+#endif
+            {
+                const T_in *__restrict pHA2 = pHalfA2 + (z * colA) * szA;
+                const T_in *__restrict pB1 = pB + (j)*MMUL::size_B;
+                const T_in *__restrict pB2 = pB + (j + 1) * MMUL::size_B;
+                const T_in *__restrict pB3 = pB + (j + 2) * MMUL::size_B;
+                const T_in *__restrict pB4 = pB + (j + 3) * MMUL::size_B;
+                aie::vector<T_in, szA> HA20;
+                aie::vector<T_in, MMUL::size_B> B0;
+                aie::vector<T_in, MMUL::size_B> B1;
+                aie::vector<T_in, MMUL::size_B> B2;
+                aie::vector<T_in, MMUL::size_B> B3;
+
+                aie::vector<T_out, MMUL::size_C> acc_C10 = aie::load_v<MMUL::size_C>(pC2);
+                aie::vector<T_out, MMUL::size_C> acc_C11 = aie::load_v<MMUL::size_C>(pC2 + MMUL::size_C);
+                aie::vector<T_out, MMUL::size_C> acc_C12 = aie::load_v<MMUL::size_C>(pC2 + 2 * MMUL::size_C);
+                aie::vector<T_out, MMUL::size_C> acc_C13 = aie::load_v<MMUL::size_C>(pC2 + 3 * MMUL::size_C);
+
+                MMUL C10(acc_C10);
+                MMUL C11(acc_C11);
+                MMUL C12(acc_C12);
+                MMUL C13(acc_C13);
+
+                for (unsigned i = 0; i < colA; ++i)
+#ifdef OPT_PERF_ENABLED
+                    AIE_LOOP_FLATTEN
+#endif
+                    {
+                        HA20 = aie::load_v<szA>(pHA2);
+                        pHA2 += szA;
+                        B0 = aie::load_v<MMUL::size_B>(pB1);
+                        pB1 += MMUL::size_B * colB;
+                        B1 = aie::load_v<MMUL::size_B>(pB2);
+                        pB2 += MMUL::size_B * colB;
+                        B2 = aie::load_v<MMUL::size_B>(pB3);
+                        pB3 += MMUL::size_B * colB;
+                        B3 = aie::load_v<MMUL::size_B>(pB4);
+                        pB4 += MMUL::size_B * colB;
+
+                        C10.mac(HA20, B0);
+                        C11.mac(HA20, B1);
+                        C12.mac(HA20, B2);
+                        C13.mac(HA20, B3);
+                    }
+
+                aie::store_v(pC2, C10.template to_vector<T_out>());
+                pC2 += MMUL::size_C;
+                aie::store_v(pC2, C11.template to_vector<T_out>());
+                pC2 += MMUL::size_C;
+                aie::store_v(pC2, C12.template to_vector<T_out>());
+                pC2 += MMUL::size_C;
+                aie::store_v(pC2, C13.template to_vector<T_out>());
+            }
+    }
+
+    event1();
+}
+
+template <typename T_in,
+          typename T_out,
+          unsigned rowA,
+          unsigned colA,
+          unsigned colB,
+          unsigned r,
+          unsigned s,
+          unsigned t>
+void matmul_vectorized_1x4_mmul_MLessThanr(const T_in *__restrict pHalfA1,
+                                           const T_in *__restrict pHalfA2,
+                                           const T_in *__restrict pB,
+                                           T_out *__restrict pC)
+{
+    using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
+    constexpr int szA = MMUL::size_A / 2;
+
+    event0();
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
+        T_out *__restrict pC1 = pC + (z * colB) * MMUL::size_C;
+
+        for (unsigned j = 0; j < colB; j += 4)
+#ifdef OPT_PERF_ENABLED
+            AIE_LOOP_FLATTEN
+#endif
+            {
+                const T_in *__restrict pHA1 = pHalfA1 + (z * colA) * szA;
+                const T_in *__restrict pHA2 = pHalfA2 + (z * colA) * szA;
+                const T_in *__restrict pB1 = pB + (j)*MMUL::size_B;
+                const T_in *__restrict pB2 = pB + (j + 1) * MMUL::size_B;
+                const T_in *__restrict pB3 = pB + (j + 2) * MMUL::size_B;
+                const T_in *__restrict pB4 = pB + (j + 3) * MMUL::size_B;
+                aie::vector<T_in, szA> HA10;
+                aie::vector<T_in, szA> HA20;
+                aie::vector<T_in, MMUL::size_B> B0;
+                aie::vector<T_in, MMUL::size_B> B1;
+                aie::vector<T_in, MMUL::size_B> B2;
+                aie::vector<T_in, MMUL::size_B> B3;
+
+                aie::vector<T_out, MMUL::size_C> acc_C00 = aie::load_v<MMUL::size_C>(pC1);
+                aie::vector<T_out, MMUL::size_C> acc_C01 = aie::load_v<MMUL::size_C>(pC1 + MMUL::size_C);
+                aie::vector<T_out, MMUL::size_C> acc_C02 = aie::load_v<MMUL::size_C>(pC1 + 2 * MMUL::size_C);
+                aie::vector<T_out, MMUL::size_C> acc_C03 = aie::load_v<MMUL::size_C>(pC1 + 3 * MMUL::size_C);
+
+                MMUL C00(acc_C00);
+                MMUL C01(acc_C01);
+                MMUL C02(acc_C02);
+                MMUL C03(acc_C03);
+
+                for (unsigned i = 0; i < colA; ++i)
+#ifdef OPT_PERF_ENABLED
+                    AIE_LOOP_FLATTEN
+#endif
+                    {
+                        HA10 = aie::load_v<szA>(pHA1);
+                        pHA1 += szA;
+                        HA20 = aie::load_v<szA>(pHA2);
+                        pHA2 += szA;
+                        auto A0 = ::aie::concat(HA10, HA20);
+                        B0 = aie::load_v<MMUL::size_B>(pB1);
+                        pB1 += MMUL::size_B * colB;
+                        B1 = aie::load_v<MMUL::size_B>(pB2);
+                        pB2 += MMUL::size_B * colB;
+                        B2 = aie::load_v<MMUL::size_B>(pB3);
+                        pB3 += MMUL::size_B * colB;
+                        B3 = aie::load_v<MMUL::size_B>(pB4);
+                        pB4 += MMUL::size_B * colB;
+
+                        C00.mac(A0, B0);
+                        C01.mac(A0, B1);
+                        C02.mac(A0, B2);
+                        C03.mac(A0, B3);
+                    }
+
+                aie::store_v(pC1, C00.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C01.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C02.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C03.template to_vector<T_out>());
+            }
+    }
+
+    event1();
+}
+
+template <typename T_in,
+          typename T_out,
+          unsigned rowA,
+          unsigned colA,
+          unsigned colB,
+          unsigned r,
+          unsigned s,
+          unsigned t>
+void matmul_with_acc_vectorized_1x4_mmul(const T_in *__restrict pA,
+                                         const T_in *__restrict pB,
+                                         T_out *__restrict pAcc,
+                                         T_out *__restrict pC)
+{
+    using MMUL = aie::mmul<r, s, t, T_in, T_in, accauto>;
+
+    event0();
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
+        T_out *__restrict pAcc1 = pAcc + (z * colB) * MMUL::size_C;
+        T_out *__restrict pC1 = pC + (z * colB) * MMUL::size_C;
+
+        for (unsigned j = 0; j < colB; j += 4)
+#ifdef OPT_PERF_ENABLED
+            AIE_LOOP_FLATTEN
+#endif
+            {
+                const T_in *__restrict pA1 = pA + (z * colA) * MMUL::size_A;
+                const T_in *__restrict pB1 = pB + (j)*MMUL::size_B;
+                const T_in *__restrict pB2 = pB + (j + 1) * MMUL::size_B;
+                const T_in *__restrict pB3 = pB + (j + 2) * MMUL::size_B;
+                const T_in *__restrict pB4 = pB + (j + 3) * MMUL::size_B;
+                aie::vector<T_in, MMUL::size_A> A0;
+                aie::vector<T_in, MMUL::size_B> B0;
+                aie::vector<T_in, MMUL::size_B> B1;
+                aie::vector<T_in, MMUL::size_B> B2;
+                aie::vector<T_in, MMUL::size_B> B3;
+
+                aie::vector<T_out, MMUL::size_C> acc_C00 = aie::load_v<MMUL::size_C>(pAcc1);
+                pAcc1 += MMUL::size_C;
+                aie::vector<T_out, MMUL::size_C> acc_C01 = aie::load_v<MMUL::size_C>(pAcc1);
+                pAcc1 += MMUL::size_C;
+                aie::vector<T_out, MMUL::size_C> acc_C02 = aie::load_v<MMUL::size_C>(pAcc1);
+                pAcc1 += MMUL::size_C;
+                aie::vector<T_out, MMUL::size_C> acc_C03 = aie::load_v<MMUL::size_C>(pAcc1);
+                pAcc1 += MMUL::size_C;
+
+                MMUL C00(acc_C00);
+                MMUL C01(acc_C01);
+                MMUL C02(acc_C02);
+                MMUL C03(acc_C03);
+
+                for (unsigned i = 0; i < colA; ++i)
+#ifdef OPT_PERF_ENABLED
+                    AIE_LOOP_FLATTEN
+#endif
+                    {
+                        A0 = aie::load_v<MMUL::size_A>(pA1);
+                        pA1 += MMUL::size_A;
+                        B0 = aie::load_v<MMUL::size_B>(pB1);
+                        pB1 += MMUL::size_B * colB;
+                        B1 = aie::load_v<MMUL::size_B>(pB2);
+                        pB2 += MMUL::size_B * colB;
+                        B2 = aie::load_v<MMUL::size_B>(pB3);
+                        pB3 += MMUL::size_B * colB;
+                        B3 = aie::load_v<MMUL::size_B>(pB4);
+                        pB4 += MMUL::size_B * colB;
+
+                        C00.mac(A0, B0);
+                        C01.mac(A0, B1);
+                        C02.mac(A0, B2);
+                        C03.mac(A0, B3);
+                    }
+
+                aie::store_v(pC1, C00.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C01.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C02.template to_vector<T_out>());
+                pC1 += MMUL::size_C;
+                aie::store_v(pC1, C03.template to_vector<T_out>());
+            }
+    }
+
+    event1();
+}
+
 template <typename T, unsigned rowA, unsigned colA, unsigned r, unsigned s>
 void fused_add_layer_norm_1(const T *restrict input,
                             const T *restrict residual,
@@ -653,10 +973,10 @@ void fused_add_layer_norm_1(const T *restrict input,
                 pC1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
                 aie::store_v(pC1, A1);
 #elif DEBUG_AIE_KERNELS == 1
-                // Residual values
-                aie::store_v(pC1, R0);
+                // This helper has no residual input; mirror the input path.
+                aie::store_v(pC1, A0);
                 pC1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
-                aie::store_v(pC1, R1);
+                aie::store_v(pC1, A1);
 #endif
 #endif
                 pC1 += mmul_c_size; // Move pointer to the start of the next microtile in the same row
@@ -674,6 +994,47 @@ void fused_add_layer_norm_1(const T *restrict input,
 }
 
 #ifdef BUILD_ADDNORM_REPLAY_FASTPATH
+template <typename T, unsigned rowA, unsigned colA, unsigned r, unsigned s>
+void add_1_from_inputs(const T *restrict input, const T *restrict residual, T *restrict output)
+{
+    event0();
+
+    constexpr unsigned mmul_c_size = r * s;
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
+        const T *__restrict pA1 = input + (z * colA) * mmul_c_size;
+        const T *__restrict pR1 = residual + (z * colA) * mmul_c_size;
+        T *__restrict pC1 = output + (z * colA) * mmul_c_size;
+
+        for (unsigned ri = 0; ri < r; ri++) {
+            for (unsigned j = 0; j < colA; j += 2) {
+                aie::vector<T, s> A0 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size;
+                aie::vector<T, s> A1 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size;
+                aie::vector<T, s> R0 = aie::load_v<s>(pR1);
+                pR1 += mmul_c_size;
+                aie::vector<T, s> R1 = aie::load_v<s>(pR1);
+                pR1 += mmul_c_size;
+                aie::store_v(pC1, aie::add(A0, R0));
+                pC1 += mmul_c_size;
+                aie::store_v(pC1, aie::add(A1, R1));
+                pC1 += mmul_c_size;
+            }
+
+            pA1 -= colA * mmul_c_size;
+            pA1 += s;
+            pR1 -= colA * mmul_c_size;
+            pR1 += s;
+            pC1 -= colA * mmul_c_size;
+            pC1 += s;
+        }
+    }
+    event1();
+}
+
 template <typename T, unsigned rowA, unsigned colA, unsigned r, unsigned s>
 void fused_add_layer_norm_1_from_inputs(const T *restrict input,
                                         const T *restrict residual,
@@ -758,6 +1119,103 @@ void fused_add_layer_norm_1_from_inputs(const T *restrict input,
             pR1 += s;
             pC1 -= colA * mmul_c_size;
             pC1 += s;
+        }
+    }
+    event1();
+}
+
+template <typename T, unsigned rowA, unsigned colA, unsigned r, unsigned s>
+void fused_add_layer_norm_2_from_inputs(const T *restrict input,
+                                        const T *restrict residual,
+                                        const T *restrict weight,
+                                        const float *restrict sum,
+                                        const float *restrict sumsq,
+                                        T *restrict output,
+                                        T *restrict merged_output,
+                                        const int32_t cols,
+                                        const int32_t col_idx)
+{
+    event0();
+
+    constexpr float epsilon = 1e-5f;
+    constexpr unsigned mmul_c_size = r * s;
+
+    AIE_PREPARE_FOR_PIPELINING
+    AIE_LOOP_MIN_ITERATION_COUNT(1)
+    for (unsigned z = 0; z < rowA; z += 1) {
+
+        const T *__restrict pA1 = input + (z * colA) * mmul_c_size;
+        const T *__restrict pR1 = residual + (z * colA) * mmul_c_size;
+        T *__restrict pC1 = output + (z * colA) * mmul_c_size;
+        T *__restrict pMerged1 = merged_output + (z * colA) * mmul_c_size;
+
+        const float *__restrict pSum1 = sum + z * r;
+        const float *__restrict pSumSq1 = sumsq + z * r;
+
+        for (unsigned ri = 0; ri < r; ri++) {
+            float mean = aie::div(*pSum1, aie::to_float(cols));
+            float mean_sq = mean * mean;
+            float variance = aie::div(*pSumSq1, aie::to_float(cols)) - mean_sq;
+            if (variance < 0.0f) {
+                variance = 0.0f;
+            }
+            float inv_std = aie::invsqrt(variance + epsilon);
+
+            const T *__restrict pW = weight + (col_idx * colA * s);
+
+            for (unsigned j = 0; j < colA; j += 2) {
+                aie::vector<T, s> A0 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size;
+                aie::vector<T, s> A1 = aie::load_v<s>(pA1);
+                pA1 += mmul_c_size;
+                aie::vector<T, s> R0 = aie::load_v<s>(pR1);
+                pR1 += mmul_c_size;
+                aie::vector<T, s> R1 = aie::load_v<s>(pR1);
+                pR1 += mmul_c_size;
+                aie::vector<T, s> merged0 = aie::add(A0, R0);
+                aie::vector<T, s> merged1 = aie::add(A1, R1);
+                auto merged01 = aie::concat(merged0, merged1);
+                aie::accum<accfloat, 2 * s> a_acc;
+                a_acc.from_vector(merged01);
+                aie::accum<accfloat, 2 * s> diff_acc = aie::sub(a_acc, mean);
+                aie::accum<accfloat, 2 * s> norm_acc = aie::mul(diff_acc.template to_vector<float>(), inv_std);
+                aie::vector<T, 2 * s> weight_v = aie::load_v<2 * s>(pW);
+                pW += 2 * s;
+                aie::vector<T, 2 * s> scaled_acc = aie::mul(norm_acc.template to_vector<T>(), weight_v);
+
+                aie::store_v(pMerged1, merged0);
+                pMerged1 += mmul_c_size;
+                aie::store_v(pMerged1, merged1);
+                pMerged1 += mmul_c_size;
+
+#ifndef DEBUG_AIE_KERNELS
+                aie::store_v(pC1, scaled_acc.template extract<s>(0));
+                pC1 += mmul_c_size;
+                aie::store_v(pC1, scaled_acc.template extract<s>(1));
+#else
+#if DEBUG_AIE_KERNELS == 0
+                aie::store_v(pC1, merged0);
+                pC1 += mmul_c_size;
+                aie::store_v(pC1, merged1);
+#elif DEBUG_AIE_KERNELS == 1
+                aie::store_v(pC1, R0);
+                pC1 += mmul_c_size;
+                aie::store_v(pC1, R1);
+#endif
+#endif
+                pC1 += mmul_c_size;
+            }
+
+            pSum1++;
+            pSumSq1++;
+            pA1 -= colA * mmul_c_size;
+            pA1 += s;
+            pR1 -= colA * mmul_c_size;
+            pR1 += s;
+            pC1 -= colA * mmul_c_size;
+            pC1 += s;
+            pMerged1 -= colA * mmul_c_size;
+            pMerged1 += s;
         }
     }
     event1();
@@ -1363,14 +1821,21 @@ void ffn_matmul_init_bf16_bf16_up_proj(const bfloat16 *A, const bfloat16 *B, bfl
     constexpr int s = 8;
     constexpr int t = 8;
 
-    static_assert(DIM_M % (2 * r) == 0);
-    static_assert(DIM_N % (2 * t) == 0);
+    static_assert(DIM_M % r == 0);
     static_assert(DIM_K % s == 0);
 
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
     zero_vectorized<bfloat16, DIM_M, DIM_N>(C);
-    matmul_vectorized_2x2_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, s, t>(A, B, C);
+    if constexpr (DIM_M < (2 * r)) {
+        static_assert(DIM_N % (4 * t) == 0);
+        constexpr int half_tile_elems = (DIM_M / 2) * DIM_K;
+        matmul_vectorized_1x4_mmul_MLessThanr<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, s, t>(
+            A, A + half_tile_elems, B, C);
+    } else {
+        static_assert(DIM_N % (2 * t) == 0);
+        matmul_vectorized_2x2_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, s, t>(A, B, C);
+    }
 }
 
 void ffn_matmul_bf16_bf16_up_proj(const bfloat16 *A, const bfloat16 *B, bfloat16 *C)
@@ -1382,13 +1847,49 @@ void ffn_matmul_bf16_bf16_up_proj(const bfloat16 *A, const bfloat16 *B, bfloat16
     constexpr int s = 8;
     constexpr int t = 8;
 
-    static_assert(DIM_M % (2 * r) == 0);
-    static_assert(DIM_N % (2 * t) == 0);
+    static_assert(DIM_M % r == 0);
     static_assert(DIM_K % s == 0);
 
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
-    matmul_vectorized_2x2_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, s, t>(A, B, C);
+    if constexpr (DIM_M < (2 * r)) {
+        static_assert(DIM_N % (4 * t) == 0);
+        constexpr int half_tile_elems = (DIM_M / 2) * DIM_K;
+        matmul_vectorized_1x4_mmul_MLessThanr<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, s, t>(
+            A, A + half_tile_elems, B, C);
+    } else {
+        static_assert(DIM_N % (2 * t) == 0);
+        matmul_vectorized_2x2_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, s, t>(A, B, C);
+    }
+}
+
+void ffn_matmul_bf16_bf16_up_proj_half_inps(const bfloat16 *A1, const bfloat16 *A2, const bfloat16 *B, bfloat16 *C)
+{
+#ifndef AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16
+    static_assert(false, "AIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16 must be defined for this kernel");
+#endif
+    constexpr int r = 8;
+    constexpr int s = 8;
+    constexpr int t = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_K % s == 0);
+    static_assert(DIM_N % (4 * t) == 0);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+    if constexpr (DIM_M <= r) {
+        matmul_vectorized_1x4_mmul_MLessThanr<bfloat16, bfloat16, (DIM_M / r), (DIM_K / s), (DIM_N / t), r, s, t>(
+            A1, A2, B, C);
+    } else {
+        matmul_vectorized_1x4_mmul<bfloat16, bfloat16, (DIM_M / (2 * r)), (DIM_K / s), (DIM_N / t), r, s, t>(
+            A1, A2, B, C);
+    }
+}
+
+void matmul_bf16_bf16_up_proj_half_inps(const bfloat16 *A1, const bfloat16 *A2, const bfloat16 *B, bfloat16 *C)
+{
+    ffn_matmul_bf16_bf16_up_proj_half_inps(A1, A2, B, C);
 }
 
 void ffn_matmul_init_bf16_bf16_down_proj(const bfloat16 *A, const bfloat16 *B, bfloat16 *C)
@@ -1400,18 +1901,23 @@ void ffn_matmul_init_bf16_bf16_down_proj(const bfloat16 *A, const bfloat16 *B, b
     constexpr int s = 8;
     constexpr int t = 8;
 
-    static_assert(DIM_M % (2 * r) == 0);
-    static_assert(DIM_K % s == 0);
+    static_assert(DIM_M % r == 0);
     static_assert(DIM_N % t == 0);
 
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
     zero_vectorized<bfloat16, DIM_M, DIM_K>(C);
     if constexpr ((DIM_N % (2 * t) == 0) && (DIM_K == 24)) {
+        static_assert(DIM_M % (2 * r) == 0);
         matmul_init_vectorized_2x1_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, s, t>(A, B, C);
+    } else if constexpr (DIM_M < (2 * r)) {
+        static_assert(DIM_K % (4 * s) == 0);
+        matmul_with_acc_vectorized_1x4_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, t, s>(
+            A, B, C, C);
     } else if constexpr (DIM_N % (2 * t) == 0) {
         matmul_vectorized_2x2_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, s, t>(A, B, C);
     } else {
+        static_assert(DIM_M % (2 * r) == 0);
         matmul_init_vectorized_2x1_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, s, t>(A, B, C);
     }
 }
@@ -1425,19 +1931,24 @@ void ffn_matmul_with_acc_bf16_bf16_down_proj(const bfloat16 *A, const bfloat16 *
     constexpr int s = 8;
     constexpr int t = 8;
 
-    static_assert(DIM_M % (2 * r) == 0);
-    static_assert(DIM_K % s == 0);
+    static_assert(DIM_M % r == 0);
     static_assert(DIM_N % t == 0);
 
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
     if constexpr ((DIM_N % (2 * t) == 0) && (DIM_K == 24)) {
+        static_assert(DIM_M % (2 * r) == 0);
         matmul_with_acc_vectorized_2x1_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, s, t>(
+            A, B, pAcc, C);
+    } else if constexpr (DIM_M < (2 * r)) {
+        static_assert(DIM_K % (4 * s) == 0);
+        matmul_with_acc_vectorized_1x4_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, t, s>(
             A, B, pAcc, C);
     } else if constexpr (DIM_N % (2 * t) == 0) {
         matmul_with_acc_vectorized_2x2_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, s, t>(
             A, B, pAcc, C);
     } else {
+        static_assert(DIM_M % (2 * r) == 0);
         matmul_with_acc_vectorized_2x1_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, s, t>(
             A, B, pAcc, C);
     }
@@ -1524,6 +2035,26 @@ void fused_add_layer_norm_1outs_fp32weights(const bfloat16 *input,
 }
 
 #ifdef BUILD_ADDNORM_REPLAY_FASTPATH
+void add_1outs_from_inputs(const bfloat16 *input, const bfloat16 *residual, bfloat16 *output);
+
+void packed_add_1outs_from_inputs(const bfloat16 *packed_input_and_residual, bfloat16 *output)
+{
+    constexpr int packed_tile_elems = DIM_M * DIM_K;
+    add_1outs_from_inputs(packed_input_and_residual, packed_input_and_residual + packed_tile_elems, output);
+}
+
+void add_1outs_from_inputs(const bfloat16 *input, const bfloat16 *residual, bfloat16 *output)
+{
+    constexpr int r = 8;
+    constexpr int s = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_K % s == 0);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    add_1_from_inputs<bfloat16, (DIM_M / r), (DIM_K / s), r, s>(input, residual, output);
+}
+
 void fused_add_layer_norm_1outs_from_inputs(const bfloat16 *input,
                                             const bfloat16 *residual,
                                             const bfloat16 *weights,
@@ -1590,6 +2121,58 @@ void fused_add_layer_norm_1outs_from_inputs_fp32weights(const bfloat16 *input,
     ::aie::set_rounding(aie::rounding_mode::conv_even);
     fused_add_layer_norm_1_from_inputs_fp32weights<bfloat16, (DIM_M / r), (DIM_K / s), r, s>(
         input, residual, weights, sum, sumsq, output, cols, col_idx);
+}
+
+void fused_add_layer_norm_2outs_from_inputs(const bfloat16 *input,
+                                            const bfloat16 *residual,
+                                            const bfloat16 *weights,
+                                            const float *sum,
+                                            const float *sumsq,
+                                            bfloat16 *output,
+                                            bfloat16 *merged_output,
+                                            const int32_t cols,
+                                            const int32_t col_idx);
+
+void packed_fused_add_layer_norm_2outs_from_inputs(const bfloat16 *packed_input_and_residual,
+                                                   const bfloat16 *weights,
+                                                   const float *sum,
+                                                   const float *sumsq,
+                                                   bfloat16 *output,
+                                                   bfloat16 *merged_output,
+                                                   const int32_t cols,
+                                                   const int32_t col_idx)
+{
+    constexpr int packed_tile_elems = DIM_M * DIM_K;
+    fused_add_layer_norm_2outs_from_inputs(packed_input_and_residual,
+                                           packed_input_and_residual + packed_tile_elems,
+                                           weights,
+                                           sum,
+                                           sumsq,
+                                           output,
+                                           merged_output,
+                                           cols,
+                                           col_idx);
+}
+
+void fused_add_layer_norm_2outs_from_inputs(const bfloat16 *input,
+                                            const bfloat16 *residual,
+                                            const bfloat16 *weights,
+                                            const float *sum,
+                                            const float *sumsq,
+                                            bfloat16 *output,
+                                            bfloat16 *merged_output,
+                                            const int32_t cols,
+                                            const int32_t col_idx)
+{
+    constexpr int r = 8;
+    constexpr int s = 8;
+
+    static_assert(DIM_M % r == 0);
+    static_assert(DIM_K % s == 0);
+
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    fused_add_layer_norm_2_from_inputs<bfloat16, (DIM_M / r), (DIM_K / s), r, s>(
+        input, residual, weights, sum, sumsq, output, merged_output, cols, col_idx);
 }
 #endif
 

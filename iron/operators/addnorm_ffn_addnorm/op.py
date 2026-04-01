@@ -25,6 +25,11 @@ from iron.common.utils import numpy_to_torch, torch_to_numpy
 from iron.operators.addnorm_ffn_addnorm.topology import addnorm_ffn_addnorm_design
 
 
+def _append_addnorm_debug_flag(extra_flags: list[str], debug_mode: int | None):
+    if debug_mode in (0, 1):
+        extra_flags.append(f"-DDEBUG_AIE_KERNELS={debug_mode}")
+
+
 class AIEAddNormFFNAddNorm(AIEOperatorBase):
     """
     Thesis-v2 Block 3 operator.
@@ -41,6 +46,7 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         intermediate_size: int,
         context,
         topology_id: str | None = None,
+        debug_mode: int = -1,
     ) -> None:
         self.seq_len = seq_len
         self.hidden_size = hidden_size
@@ -71,6 +77,7 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         self.weight_down_proj = torch.zeros((self.N, self.K), dtype=torch.bfloat16).T
         self.ln1_weight = torch.ones(hidden_size, dtype=torch.bfloat16)
         self.ln2_weight = torch.ones(hidden_size, dtype=torch.bfloat16)
+        self.debug_mode = debug_mode
 
         self.xclbin_artifact = None
         self.insts_artifact = None
@@ -87,6 +94,8 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
             ln1_weight_np.tobytes() + ln2_weight_np.tobytes()
         ).hexdigest()[:10]
 
+        kernel_revision = "separatearv2"
+
         file_name_total_base = (
             f"{prefix}{self.M}x{self.K}x{self.N}_"
             f"{self.tile_m}x{self.tile_k}x{self.tile_n}_"
@@ -95,6 +104,8 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
             f"{self.parallel_int_dim}_"
             f"None_"
             f"{self.gelu_stage}_"
+            f"{self.debug_mode}_"
+            f"{kernel_revision}_"
             f"{weights_fingerprint}"
         )
 
@@ -107,7 +118,12 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         )
         np.save(ln2_weight_file_name, ln2_weight_np)
 
-        kernel_archive = f"anffn_{self.tile_m}x{self.tile_k}x{self.tile_n}.a"
+        debug_suffix = "" if self.debug_mode < 0 else f"_dbg{self.debug_mode}"
+        kernel_revision = f"_{kernel_revision}"
+        kernel_archive = (
+            f"anffn_{self.tile_m}x{self.tile_k}x{self.tile_n}"
+            f"{kernel_revision}{debug_suffix}.a"
+        )
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_total_base}.mlir",
@@ -133,6 +149,7 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                 "ln2_weight_file": ln2_weight_file_name,
                 "archive": kernel_archive,
                 "n_aie_cols": self.num_aie_columns,
+                "debug_mode": self.debug_mode,
             },
             requires_context=False,
         )
@@ -146,6 +163,7 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
             f"-DDIM_K={self.tile_k}",
             f"-DDIM_N={self.tile_n}",
         ]
+        _append_addnorm_debug_flag(encoder_kernel_flags, self.debug_mode)
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_total_base}.xclbin",
@@ -155,7 +173,8 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"fused_encoder_{self.tile_m}x{self.tile_k}x{self.tile_n}.o",
+                            f"fused_encoder_{self.tile_m}x{self.tile_k}x{self.tile_n}"
+                            f"{kernel_revision}{debug_suffix}.o",
                             depends=[
                                 SourceArtifact.new(
                                     base_dir / "aie_kernels" / "aie2p" / "encoder.cc"
@@ -164,7 +183,8 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                             extra_flags=encoder_kernel_flags,
                         ),
                         KernelObjectArtifact.new(
-                            f"ffn_passThrough_{self.tile_m}x{self.tile_k}x{self.tile_n}.o",
+                            f"ffn_passThrough_{self.tile_m}x{self.tile_k}x{self.tile_n}"
+                            f"{kernel_revision}{debug_suffix}.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[
                                 SourceArtifact.new(
@@ -180,7 +200,8 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                             },
                         ),
                         KernelObjectArtifact.new(
-                            f"ln_passThrough_{self.tile_m}x{self.tile_k}x{self.tile_n}.o",
+                            f"ln_passThrough_{self.tile_m}x{self.tile_k}x{self.tile_n}"
+                            f"{kernel_revision}{debug_suffix}.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[
                                 SourceArtifact.new(
@@ -196,7 +217,8 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                             },
                         ),
                         KernelObjectArtifact.new(
-                            f"ln_passThrough_f32_{self.tile_m}x{self.tile_k}x{self.tile_n}.o",
+                            f"ln_passThrough_f32_{self.tile_m}x{self.tile_k}x{self.tile_n}"
+                            f"{kernel_revision}{debug_suffix}.o",
                             extra_flags=["-DBIT_WIDTH=32"],
                             depends=[
                                 SourceArtifact.new(
@@ -239,20 +261,24 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
 
         static_weights_up_proj = torch_to_numpy(self.weight_up_proj.T)
         static_weights_down_proj = torch_to_numpy(self.weight_down_proj.T)
-
-        self.add_buffer("packed_hidden_residual", 2 * self.M * self.K)
-        self.add_buffer("B_Up", self.K * self.N, static_data=static_weights_up_proj)
-        self.add_buffer(
-            "B_Down",
-            self.K * self.N,
-            static_data=static_weights_down_proj,
+        static_weights = np.concatenate(
+            [
+                static_weights_up_proj.reshape(-1),
+                static_weights_down_proj.reshape(-1),
+            ]
         )
+
+        self.add_buffer("A", self.M * self.K)
+        self.add_buffer("R", self.M * self.K)
+        self.add_buffer("B", 2 * self.K * self.N, static_data=static_weights)
+        self.add_buffer("stage_scratch", self.M * self.K)
         self.add_buffer("C", self.M * self.K)
         self.add_to_runlist(
             "addnorm_ffn_addnorm",
-            "packed_hidden_residual",
-            "B_Up",
-            "B_Down",
+            "A",
+            "R",
+            "B",
+            "stage_scratch",
             "C",
         )
 
@@ -317,225 +343,14 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         )
 
         result_np = self._execute_aie_operation(
-            self._pack_hidden_residual(attention_output_np, residual_np),
+            attention_output_np,
+            residual_np,
             B_Up_np,
             B_Down_np,
         )
 
         result = numpy_to_torch(result_np)
         return result.view(expected_output_shape)
-
-    def forward_packed(
-        self,
-        packed_hidden_residual: torch.Tensor,
-        B_Up: torch.Tensor | None = None,
-        B_Down: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        packed_hidden_residual_np, M = self._canonicalize_packed_hidden_residual(
-            packed_hidden_residual
-        )
-        expected_output_shape = (M, self.K)
-        M, K = expected_output_shape
-        if B_Up is not None and len(B_Up.shape) > 2:
-            B_Up = B_Up.view(-1, B_Up.shape[-1])
-        if B_Down is not None and len(B_Down.shape) > 2:
-            B_Down = B_Down.view(-1, B_Down.shape[-1])
-        B_Up_shape = B_Up.shape if B_Up is not None else self.weight_up_proj.T.shape
-        B_Down_shape = (
-            B_Down.shape if B_Down is not None else self.weight_down_proj.T.shape
-        )
-        K2, N = B_Up_shape
-        N2, K3 = B_Down_shape
-        applicable = (
-            M == self.M
-            and K == self.K
-            and K == K2
-            and K == K3
-            and N == self.N
-            and N == N2
-        )
-        if not applicable:
-            raise AIEOperatorConstraintError(
-                "AIEAddNormFFNAddNorm: incompatible tensor shape(s)"
-            )
-        B_Up_np = torch_to_numpy(B_Up) if B_Up is not None else None
-        B_Down_np = torch_to_numpy(B_Down) if B_Down is not None else None
-        result = numpy_to_torch(
-            self._execute_aie_operation(
-                packed_hidden_residual_np,
-                B_Up_np,
-                B_Down_np,
-            )
-        )
-        return result.view(expected_output_shape)
-
-    def _canonicalize_packed_hidden_residual(
-        self,
-        packed_hidden_residual: torch.Tensor,
-    ) -> tuple[np.ndarray, int]:
-        if packed_hidden_residual.ndim == 1:
-            packed_hidden_residual = packed_hidden_residual.contiguous()
-            if packed_hidden_residual.numel() % (2 * self.K) != 0:
-                raise AIEOperatorConstraintError(
-                    "AIEAddNormFFNAddNorm: invalid flat packed_hidden_residual length"
-                )
-            rows = packed_hidden_residual.numel() // (2 * self.K)
-            if rows != self.M:
-                raise AIEOperatorConstraintError(
-                    "AIEAddNormFFNAddNorm: packed_hidden_residual must exactly match seq_len"
-                )
-            return (
-                torch_to_numpy(packed_hidden_residual),
-                rows,
-            )
-        if packed_hidden_residual.ndim == 3 and packed_hidden_residual.shape[0] == 2:
-            packed_hidden_residual = packed_hidden_residual.contiguous()
-            if packed_hidden_residual.shape[2] != self.K:
-                raise AIEOperatorConstraintError(
-                    "AIEAddNormFFNAddNorm: incompatible packed_hidden_residual hidden size"
-                )
-            if packed_hidden_residual.shape[1] != self.M:
-                raise AIEOperatorConstraintError(
-                    "AIEAddNormFFNAddNorm: packed_hidden_residual rows must exactly match seq_len"
-                )
-            return (
-                self._pack_hidden_residual(
-                    torch_to_numpy(packed_hidden_residual[0]),
-                    torch_to_numpy(packed_hidden_residual[1]),
-                ),
-                packed_hidden_residual.shape[1],
-            )
-        if (
-            packed_hidden_residual.ndim == 2
-            and packed_hidden_residual.shape[0] % 2 == 0
-        ):
-            rows = packed_hidden_residual.shape[0] // 2
-            if rows != self.M:
-                raise AIEOperatorConstraintError(
-                    "AIEAddNormFFNAddNorm: packed_hidden_residual rows must exactly match seq_len"
-                )
-            packed_hidden_residual = packed_hidden_residual.contiguous().view(
-                2, rows, packed_hidden_residual.shape[1]
-            )
-            if packed_hidden_residual.shape[2] != self.K:
-                raise AIEOperatorConstraintError(
-                    "AIEAddNormFFNAddNorm: incompatible packed_hidden_residual hidden size"
-                )
-            return (
-                self._pack_hidden_residual(
-                    torch_to_numpy(packed_hidden_residual[0]),
-                    torch_to_numpy(packed_hidden_residual[1]),
-                ),
-                rows,
-            )
-        raise AIEOperatorConstraintError(
-            "AIEAddNormFFNAddNorm: expected packed_hidden_residual as flat tile-packed "
-            "buffer or legacy shape (2, seq_len, hidden_size)"
-        )
-
-    def _pack_hidden_residual(
-        self,
-        attention_output_np: np.ndarray,
-        residual_np: np.ndarray,
-    ) -> np.ndarray:
-        M, K = attention_output_np.shape
-        if residual_np.shape != (M, K):
-            raise AIEOperatorConstraintError(
-                "AIEAddNormFFNAddNorm: attention_output and residual must have the same shape"
-            )
-        if K != self.K:
-            raise AIEOperatorConstraintError(
-                "AIEAddNormFFNAddNorm: incompatible packed_hidden_residual hidden size"
-            )
-        if M % self.tile_m != 0:
-            raise AIEOperatorConstraintError(
-                "AIEAddNormFFNAddNorm: packed Block 3 handoff requires rows divisible by tile_m"
-            )
-
-        num_row_tiles = M // self.tile_m
-        if num_row_tiles % self.parallel_seq != 0:
-            raise AIEOperatorConstraintError(
-                "AIEAddNormFFNAddNorm: packed Block 3 handoff requires "
-                "(rows / tile_m) divisible by parallel_seq"
-            )
-
-        k_div_tile = K // self.tile_k
-        tile_elems = self.tile_m * self.tile_k
-        packed_hidden_residual_np = np.zeros(
-            (2 * M * K,), dtype=attention_output_np.dtype
-        )
-
-        for row_tile_idx in range(num_row_tiles):
-            row_start = row_tile_idx * self.tile_m
-            for k_tile_idx in range(k_div_tile):
-                col_start = k_tile_idx * self.tile_k
-                tile_index = row_tile_idx * k_div_tile + k_tile_idx
-                tile_offset = tile_index * (2 * tile_elems)
-                packed_hidden_residual_np[tile_offset : tile_offset + tile_elems] = (
-                    attention_output_np[
-                        row_start : row_start + self.tile_m,
-                        col_start : col_start + self.tile_k,
-                    ].reshape(tile_elems)
-                )
-                packed_hidden_residual_np[
-                    tile_offset + tile_elems : tile_offset + (2 * tile_elems)
-                ] = residual_np[
-                    row_start : row_start + self.tile_m,
-                    col_start : col_start + self.tile_k,
-                ].reshape(
-                    tile_elems
-                )
-
-        return packed_hidden_residual_np
-
-    def _unpack_hidden_residual(
-        self,
-        packed_hidden_residual_np: np.ndarray,
-        rows: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if rows % self.tile_m != 0:
-            raise AIEOperatorConstraintError(
-                "AIEAddNormFFNAddNorm: packed Block 3 handoff requires rows divisible by tile_m"
-            )
-
-        num_row_tiles = rows // self.tile_m
-        if num_row_tiles % self.parallel_seq != 0:
-            raise AIEOperatorConstraintError(
-                "AIEAddNormFFNAddNorm: packed Block 3 handoff requires "
-                "(rows / tile_m) divisible by parallel_seq"
-            )
-
-        k_div_tile = self.K // self.tile_k
-        tile_elems = self.tile_m * self.tile_k
-        attention_output_np = np.zeros(
-            (rows, self.K), dtype=packed_hidden_residual_np.dtype
-        )
-        residual_np = np.zeros((rows, self.K), dtype=packed_hidden_residual_np.dtype)
-
-        for row_tile_idx in range(num_row_tiles):
-            row_start = row_tile_idx * self.tile_m
-            for k_tile_idx in range(k_div_tile):
-                col_start = k_tile_idx * self.tile_k
-                tile_index = row_tile_idx * k_div_tile + k_tile_idx
-                tile_offset = tile_index * (2 * tile_elems)
-                attention_output_np[
-                    row_start : row_start + self.tile_m,
-                    col_start : col_start + self.tile_k,
-                ] = packed_hidden_residual_np[
-                    tile_offset : tile_offset + tile_elems
-                ].reshape(
-                    self.tile_m, self.tile_k
-                )
-                residual_np[
-                    row_start : row_start + self.tile_m,
-                    col_start : col_start + self.tile_k,
-                ] = packed_hidden_residual_np[
-                    tile_offset + tile_elems : tile_offset + (2 * tile_elems)
-                ].reshape(
-                    self.tile_m, self.tile_k
-                )
-
-        return attention_output_np, residual_np
 
     def _pad_B(self, B_np: np.ndarray, b_col_maj: bool) -> np.ndarray:
         if b_col_maj:
@@ -555,12 +370,16 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
 
     def _execute_aie_operation(
         self,
-        packed_hidden_residual_np: np.ndarray,
+        attention_output_np: np.ndarray,
+        residual_np: np.ndarray,
         B_Up_np: np.ndarray | None = None,
         B_Down_np: np.ndarray | None = None,
     ) -> np.ndarray:
-        M = packed_hidden_residual_np.size // (2 * self.K)
-        K = self.K
+        M, K = attention_output_np.shape
+        if residual_np.shape != (M, K):
+            raise AIEOperatorConstraintError(
+                "AIEAddNormFFNAddNorm: attention_output and residual must have the same shape"
+            )
         K2, N = B_Up_np.shape if B_Up_np is not None else self.weight_up_proj.T.shape
         N2, K3 = (
             B_Down_np.shape if B_Down_np is not None else self.weight_down_proj.T.shape
@@ -571,13 +390,22 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         assert N == N2 and N == self.N
 
         self.write_buffer(
-            "packed_hidden_residual",
-            packed_hidden_residual_np,
+            "A",
+            attention_output_np.reshape(-1),
         )
-        if B_Up_np is not None:
-            self.write_buffer("B_Up", B_Up_np)
-        if B_Down_np is not None:
-            self.write_buffer("B_Down", B_Down_np)
+        self.write_buffer(
+            "R",
+            residual_np.reshape(-1),
+        )
+        if B_Up_np is not None or B_Down_np is not None:
+            if B_Up_np is None:
+                B_Up_np = torch_to_numpy(self.weight_up_proj.T)
+            if B_Down_np is None:
+                B_Down_np = torch_to_numpy(self.weight_down_proj.T)
+            self.write_buffer(
+                "B",
+                np.concatenate([B_Up_np.reshape(-1), B_Down_np.reshape(-1)]),
+            )
         self.run_runlist()
         result_np = self.read_buffer("C", shape=(M, K), dtype=bfloat16)
 

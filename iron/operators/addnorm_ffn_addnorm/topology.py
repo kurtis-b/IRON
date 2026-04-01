@@ -378,6 +378,36 @@ _BLOCK3_TOPOLOGIES = {
     ],
 }
 
+_BLOCK3_VALIDATED_STAGE_RUNTIME_IDS = {
+    (64, 768, 3072): (
+        "m64_k64_n128_ps1_pi1_d6_g1",
+        "m32_k96_n64_ps1_pi1_d8_g1",
+    ),
+    (512, 768, 3072): (
+        "m64_k64_n128_ps1_pi1_d6_g1",
+        "m32_k96_n64_ps1_pi1_d8_g1",
+    ),
+    (64, 1024, 4096): (
+        "m16_k128_n128_ps4_pi1_d8_g1",
+        "m64_k64_n128_ps1_pi1_d8_g1",
+    ),
+    (512, 1024, 4096): (
+        "m16_k128_n128_ps1_pi1_d8_g1",
+        "m32_k128_n64_ps1_pi1_d8_g1",
+        "m64_k64_n128_ps1_pi1_d8_g1",
+    ),
+    (64, 2048, 8192): (
+        "m16_k128_n128_ps1_pi1_d8_g1",
+        "m64_k64_n64_ps1_pi4_d8_g1",
+    ),
+    (512, 2048, 8192): ("m16_k128_n128_ps1_pi1_d8_g1",),
+    (64, 1536, 6144): ("m16_k96_n128_ps1_pi1_d8_g1",),
+    (64, 960, 3840): (
+        "m16_k120_n128_ps1_pi1_d8_g1",
+        "m32_k120_n64_ps1_pi1_d8_g1",
+    ),
+}
+
 _BLOCK3_PARALLEL_SEQ_CHOICES = (1, 2, 4, 6, 8)
 _BLOCK3_AIE_ROWS_PER_COL = 4
 _BLOCK3_AIE_COLUMNS = 8
@@ -385,7 +415,7 @@ _BLOCK3_COMPUTE_TILE_BYTES = 64 * 1024
 _BLOCK3_STACK_BYTES = 0xD00
 _BLOCK3_BF16_BYTES = 2
 _BLOCK3_F32_BYTES = 4
-_BLOCK3_PRACTICAL_TILE_M_CHOICES = (16, 32, 64)
+_BLOCK3_PRACTICAL_TILE_M_CHOICES = (8, 16)
 _BLOCK3_PRACTICAL_MIN_TILE_K = 16
 _BLOCK3_PRACTICAL_MIN_TILE_N = 16
 _BLOCK3_PRACTICAL_MIN_AIE_COLUMNS = 8
@@ -397,29 +427,11 @@ _BLOCK3_PRACTICAL_MAX_CANDIDATES = (
     * _BLOCK3_PRACTICAL_MAX_CANDIDATES_PER_PS
 )
 _BLOCK3_RUNTIME_NUM_AIE_COLUMNS = 8
-_BLOCK3_RUNTIME_TILE_M_CHOICES = (16, 32, 64)
+_BLOCK3_RUNTIME_TILE_M_CHOICES = (8, 16)
 _BLOCK3_RUNTIME_MIN_TILE_K = 16
 _BLOCK3_RUNTIME_MIN_TILE_N = 16
 _BLOCK3_RUNTIME_MAX_CANDIDATES = 8
 _BLOCK3_RUNTIME_MAX_DOWN_PROJ_DEPTH = 8
-_BLOCK3_BANK_SLOT_CAPACITY_BY_TILE_K = {
-    16: 2,
-    24: 2,
-    32: 4,
-    40: 4,
-    48: 6,
-    64: 8,
-    80: 8,
-    96: 8,
-    120: 8,
-    128: 8,
-    160: 6,
-    192: 8,
-    256: 6,
-    320: 4,
-    384: 4,
-    512: 2,
-}
 
 
 def addnorm_ffn_addnorm_topologies(
@@ -486,6 +498,11 @@ def _block3_runtime_supported_candidates(
     hidden_size: int,
     intermediate_size: int,
 ) -> list[dict[str, int | str]]:
+    validated_ids = _block3_validated_stage_runtime_ids(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
     preferred_ids = _block3_preferred_runtime_ids(
         seq_len=seq_len,
         hidden_size=hidden_size,
@@ -510,9 +527,16 @@ def _block3_runtime_supported_candidates(
         if _block3_runtime_candidate_allowed(
             seq_len=seq_len,
             hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
             candidate=candidate,
         )
     ]
+    if validated_ids:
+        runtime_pool = [
+            candidate
+            for candidate in runtime_pool
+            if _topology_id(candidate) in validated_ids
+        ]
     preferred_candidates = [
         candidate
         for candidate in runtime_pool
@@ -544,16 +568,36 @@ def _block3_preferred_runtime_ids(
     hidden_size: int,
     intermediate_size: int,
 ) -> set[str]:
+    validated_ids = _block3_validated_stage_runtime_ids(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    if validated_ids:
+        return set(validated_ids)
     preferred_ids: set[str] = set()
     for candidate in _BLOCK3_TOPOLOGIES.get((hidden_size, intermediate_size), ()):
         if not _block3_runtime_candidate_allowed(
             seq_len=seq_len,
             hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
             candidate=candidate,
         ):
             continue
         preferred_ids.add(_topology_id(candidate))
     return preferred_ids
+
+
+def _block3_validated_stage_runtime_ids(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> tuple[str, ...]:
+    return _BLOCK3_VALIDATED_STAGE_RUNTIME_IDS.get(
+        (seq_len, hidden_size, intermediate_size),
+        (),
+    )
 
 
 def addnorm_ffn_addnorm_theoretical_topologies(
@@ -802,9 +846,32 @@ def addnorm_ffn_addnorm_design(
                 if str(candidate["topology_id"]) == topology_id
             )
         except StopIteration as exc:
-            raise ValueError(
-                f"Unknown Block 3 topology_id={topology_id!r} for {hidden_size}/{intermediate_size}"
-            ) from exc
+            fallback = next(
+                (
+                    candidate
+                    for candidate in addnorm_ffn_addnorm_theoretical_topologies(
+                        seq_len=seq_len,
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                    )
+                    if (
+                        _topology_id(candidate) == topology_id
+                        or str(candidate["topology_id"]) == topology_id
+                    )
+                    and _block3_runtime_candidate_allowed(
+                        seq_len=seq_len,
+                        hidden_size=hidden_size,
+                        intermediate_size=intermediate_size,
+                        candidate=candidate,
+                    )
+                ),
+                None,
+            )
+            if fallback is None:
+                raise ValueError(
+                    f"Unknown Block 3 topology_id={topology_id!r} for {hidden_size}/{intermediate_size}"
+                ) from exc
+            config = fallback
 
     tile_m = int(config["tile_m"])
     tile_k = int(config["tile_k"])
@@ -983,8 +1050,17 @@ def _block3_runtime_candidate_allowed(
     *,
     seq_len: int,
     hidden_size: int,
+    intermediate_size: int | None = None,
     candidate: dict[str, int | str],
 ) -> bool:
+    if intermediate_size is not None:
+        validated_ids = _block3_validated_stage_runtime_ids(
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+        if validated_ids and _topology_id(candidate) not in validated_ids:
+            return False
     tile_m = int(candidate["tile_m"])
     tile_k = int(candidate["tile_k"])
     tile_n = int(candidate["tile_n"])
@@ -1001,11 +1077,6 @@ def _block3_runtime_candidate_allowed(
         return False
     if _block3_is_known_bad_runtime_candidate(
         seq_len=seq_len,
-        hidden_size=hidden_size,
-        candidate=candidate,
-    ):
-        return False
-    if not _block3_runtime_stage1_bank_feasible(
         hidden_size=hidden_size,
         candidate=candidate,
     ):
@@ -1027,9 +1098,22 @@ def _block3_is_known_bad_runtime_candidate(
 ) -> bool:
     tile_k = int(candidate["tile_k"])
     tile_n = int(candidate["tile_n"])
+    parallel_seq = int(candidate["parallel_seq"])
+    parallel_int_dim = int(candidate["parallel_int_dim"])
 
-    # The broad skinny-wide fence is no longer needed. The remaining failures
-    # are isolated runtime/layout issues that have been reproduced directly:
+    # Forwarded-preadd replay is stable when at most one axis materially fans
+    # out the LN1->LN2 memtile stream. The `ps4/pi{2,3}` families currently
+    # overrun memtile BD budget once that stream is added.
+    if parallel_seq > 2 and parallel_int_dim > 1:
+        return True
+
+    # The forwarded-preadd replay path adds an extra LN1->LN2 memtile stream.
+    # Very wide runtime shapes still overrun the memtile BD budget under that
+    # contract, so keep them in practical/theoretical exploration only.
+    if tile_n > 128:
+        return True
+
+    # Remaining known-bad runtime/layout issues reproduced directly:
     # - `tile_k=24` with very wide `tile_n` still produces runtime NaNs
     # - `512 x 1536` with `tile_k=16, tile_n=512` still fails shim BD lowering
     if tile_k == 24 and tile_n > 128:
@@ -1056,57 +1140,28 @@ def _block3_runtime_placement_feasible(candidate: dict[str, int | str]) -> bool:
     )
 
 
-def _block3_stage1_bank_slot_capacity(*, tile_k: int) -> int:
-    capacity = _BLOCK3_BANK_SLOT_CAPACITY_BY_TILE_K.get(tile_k)
-    if capacity is not None:
-        return capacity
-    if tile_k >= 96:
-        return 8
-    if tile_k >= 64:
-        return 8
-    if tile_k >= 48:
-        return 6
-    if tile_k >= 32:
-        return 4
-    return 2
-
-
-def _block3_available_stage1_bank_memtiles(
-    candidate: dict[str, int | str],
-) -> int:
-    parallel_seq = int(candidate["parallel_seq"])
-    parallel_int_dim = int(candidate["parallel_int_dim"])
-    num_aie_columns = int(candidate["num_aie_columns"])
-
-    if parallel_seq > (num_aie_columns // 2):
-        return 1
-    if parallel_seq < 3:
-        return 1 if parallel_int_dim > 4 else 2
-    return 2
-
-
-def _block3_required_stage1_bank_memtiles(
+def _block3_runtime_n_col_groups(
     *,
     hidden_size: int,
     candidate: dict[str, int | str],
 ) -> int:
     tile_k = int(candidate["tile_k"])
-    k_tiles = hidden_size // tile_k
-    slot_capacity = _block3_stage1_bank_slot_capacity(tile_k=tile_k)
-    return math.ceil(k_tiles / slot_capacity)
+    down_proj_depth = int(candidate["down_proj_depth"])
+    return (hidden_size // tile_k) // down_proj_depth
 
 
-def _block3_runtime_stage1_bank_feasible(
+def _block3_runtime_buffered_replay_eligible(
     *,
     hidden_size: int,
     candidate: dict[str, int | str],
 ) -> bool:
-    required_bank_memtiles = _block3_required_stage1_bank_memtiles(
-        hidden_size=hidden_size,
-        candidate=candidate,
+    tile_m = int(candidate["tile_m"])
+    tile_k = int(candidate["tile_k"])
+    down_proj_depth = int(candidate["down_proj_depth"])
+    return (
+        _block3_runtime_n_col_groups(hidden_size=hidden_size, candidate=candidate) == 1
+        and down_proj_depth * tile_m * tile_k * _BLOCK3_BF16_BYTES <= 32768
     )
-    available_bank_memtiles = _block3_available_stage1_bank_memtiles(candidate)
-    return required_bank_memtiles <= available_bank_memtiles
 
 
 def _block3_practical_placement_feasible(candidate: dict[str, int | str]) -> bool:
@@ -1218,7 +1273,11 @@ def _block3_runtime_sort_key(
     lane_parallelism = parallel_seq * parallel_int_dim
     sequence_chunk = parallel_seq * tile_m
     output_chunk = parallel_int_dim * tile_n
-    required_bank_memtiles = _block3_required_stage1_bank_memtiles(
+    n_col_groups = _block3_runtime_n_col_groups(
+        hidden_size=hidden_size,
+        candidate=candidate,
+    )
+    buffered_replay = _block3_runtime_buffered_replay_eligible(
         hidden_size=hidden_size,
         candidate=candidate,
     )
@@ -1236,10 +1295,11 @@ def _block3_runtime_sort_key(
         tile_m,
         output_chunk,
         tile_n,
-        -required_bank_memtiles,
+        int(buffered_replay),
+        -n_col_groups,
+        down_proj_depth,
         max_compute_tile_bytes,
         -tile_k,
-        -down_proj_depth,
         gelu_stage,
     )
 
@@ -1436,6 +1496,7 @@ def _block3_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ..
     )
     lane_parallelism = parallel_seq * parallel_int_dim
     sequence_chunk = parallel_seq * tile_m
+    grouped_hidden_chunk = down_proj_depth * tile_k
     return (
         core_count,
         lane_parallelism,
@@ -1444,7 +1505,8 @@ def _block3_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ..
         tile_m,
         parallel_int_dim * tile_n,
         tile_n,
+        grouped_hidden_chunk,
+        down_proj_depth,
         -tile_k,
-        -down_proj_depth,
         gelu_stage,
     )
