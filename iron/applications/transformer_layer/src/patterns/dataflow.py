@@ -4,15 +4,22 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import torch
 import torch.nn as nn
 
 from iron.common import AIEContext
 from iron.operators.addnorm_ffn_addnorm.op import AIEAddNormFFNAddNorm
-from iron.operators.addnorm_ffn_addnorm.topology import addnorm_ffn_addnorm_topologies
+from iron.operators.addnorm_ffn_addnorm.topology import (
+    addnorm_ffn_addnorm_design,
+    addnorm_ffn_addnorm_topologies,
+)
 from iron.operators.mha_out_proj.op import AIEMHAOutProj
-from iron.operators.mha_out_proj.topology import mha_out_proj_topologies
+from iron.operators.mha_out_proj.topology import (
+    mha_out_proj_design,
+    mha_out_proj_topologies,
+)
 from iron.operators.qkv_proj.op import AIEQKVProj
 
 from ..core.input_bundle import TransformerLayerInputs
@@ -208,26 +215,51 @@ def _block2_block3_packed_handoff_compatible(
 def _resolve_dataflow_topology_ids(
     spec: TransformerLayerSpec,
 ) -> tuple[str | None, str | None]:
-    block2_candidates = tuple(
-        candidate
-        for candidate in mha_out_proj_topologies(
-            seq_len=spec.seq_len,
-            num_heads=spec.num_attention_heads,
-            head_dim=spec.attention_head_size,
+    block2_candidates: tuple[dict[str, Any], ...]
+    block3_candidates: tuple[dict[str, Any], ...]
+
+    if spec.block2_topology_id is None:
+        block2_candidates = tuple(
+            mha_out_proj_topologies(
+                seq_len=spec.seq_len,
+                num_heads=spec.num_attention_heads,
+                head_dim=spec.attention_head_size,
+            )
         )
-        if spec.block2_topology_id is None
-        or str(candidate["topology_id"]) == spec.block2_topology_id
-    )
-    block3_candidates = tuple(
-        candidate
-        for candidate in addnorm_ffn_addnorm_topologies(
-            seq_len=spec.seq_len,
-            hidden_size=spec.hidden_size,
-            intermediate_size=spec.intermediate_size,
+    else:
+        try:
+            block2_candidates = (
+                mha_out_proj_design(
+                    seq_len=spec.seq_len,
+                    num_heads=spec.num_attention_heads,
+                    head_dim=spec.attention_head_size,
+                    topology_id=spec.block2_topology_id,
+                ),
+            )
+        except ValueError:
+            block2_candidates = ()
+
+    if spec.block3_topology_id is None:
+        block3_candidates = tuple(
+            addnorm_ffn_addnorm_topologies(
+                seq_len=spec.seq_len,
+                hidden_size=spec.hidden_size,
+                intermediate_size=spec.intermediate_size,
+            )
         )
-        if spec.block3_topology_id is None
-        or str(candidate["topology_id"]) == spec.block3_topology_id
-    )
+    else:
+        try:
+            block3_candidates = (
+                addnorm_ffn_addnorm_design(
+                    seq_len=spec.seq_len,
+                    hidden_size=spec.hidden_size,
+                    intermediate_size=spec.intermediate_size,
+                    topology_id=spec.block3_topology_id,
+                ),
+            )
+        except ValueError:
+            block3_candidates = ()
+
     if not block2_candidates:
         raise ValueError(
             f"Unknown Block 2 topology_id={spec.block2_topology_id!r} for dataflow pattern"

@@ -325,7 +325,34 @@ def _block2_runtime_supported_candidates(
     num_heads: int,
     head_dim: int,
 ) -> list[dict[str, int]]:
-    runtime_pool = [
+    runtime_pool = _block2_runtime_design_candidates(
+        seq_len=seq_len,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+    preferred_ids = _block2_preferred_runtime_ids(
+        seq_len=seq_len,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+    return _block2_select_candidates(
+        runtime_pool,
+        sort_key=lambda candidate: _block2_runtime_sort_key(
+            candidate,
+            head_dim=head_dim,
+        ),
+        preferred_ids=preferred_ids,
+        limit=_BLOCK2_RUNTIME_MAX_CANDIDATES,
+    )
+
+
+def _block2_runtime_design_candidates(
+    *,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+) -> list[dict[str, int]]:
+    return [
         {
             "parallel_seq": int(candidate["parallel_seq"]),
             "q_seq_tile": int(candidate["q_seq_tile"]),
@@ -346,26 +373,6 @@ def _block2_runtime_supported_candidates(
             head_dim=head_dim,
         )
     ]
-    preferred_ids = _block2_preferred_runtime_ids(
-        seq_len=seq_len,
-        num_heads=num_heads,
-        head_dim=head_dim,
-    )
-    if preferred_ids:
-        runtime_pool = [
-            candidate
-            for candidate in runtime_pool
-            if _mha_out_proj_topology_id(candidate) in preferred_ids
-        ]
-    return _block2_select_candidates(
-        runtime_pool,
-        sort_key=lambda candidate: _block2_runtime_sort_key(
-            candidate,
-            head_dim=head_dim,
-        ),
-        preferred_ids=preferred_ids,
-        limit=_BLOCK2_RUNTIME_MAX_CANDIDATES,
-    )
 
 
 def mha_out_proj_design(
@@ -384,16 +391,35 @@ def mha_out_proj_design(
     if topology_id is None:
         config = topologies[0]
     else:
-        try:
-            config = next(
+        config = next(
+            (
                 candidate
                 for candidate in topologies
                 if str(candidate["topology_id"]) == topology_id
+            ),
+            None,
+        )
+        if config is None:
+            config = next(
+                (
+                    {
+                        **candidate,
+                        "topology_id": _mha_out_proj_topology_id(candidate),
+                        "topology_family": "fused_mha_out_proj",
+                    }
+                    for candidate in _block2_runtime_design_candidates(
+                        seq_len=seq_len,
+                        num_heads=num_heads,
+                        head_dim=head_dim,
+                    )
+                    if _mha_out_proj_topology_id(candidate) == topology_id
+                ),
+                None,
             )
-        except StopIteration as exc:
+        if config is None:
             raise ValueError(
                 f"Unknown Block 2 topology_id={topology_id!r} for {num_heads}x{head_dim}"
-            ) from exc
+            )
 
     parallel_seq = int(config["parallel_seq"])
     q_seq_tile = int(config["q_seq_tile"])
@@ -602,28 +628,40 @@ def _block2_runtime_supported_acc_depth(
     parallel_heads = int(candidate["parallel_heads"])
     q_seq_tile = int(candidate["q_seq_tile"])
     kv_seq_tile = int(candidate["kv_seq_tile"])
+    emb_tile = int(candidate["emb_tile"])
     if head_dim != 64:
         return 1
     if num_heads not in (12, 16):
+        if num_heads == 8 and q_seq_tile == 32 and kv_seq_tile == 64 and emb_tile == 64:
+            if parallel_seq == 1 and parallel_heads in (1, 2, 4):
+                return 8
+            if parallel_seq == 2 and parallel_heads in (1, 2, 4):
+                return 8
+            if parallel_seq == 4 and parallel_heads in (1, 2):
+                return 8
+            if parallel_seq in (6, 8) and parallel_heads == 1:
+                return 8
         return 1
     if q_seq_tile != 32 or kv_seq_tile != 64:
         return 1
-    if parallel_seq == 1:
-        if parallel_heads in (1, 2, 4):
+    if num_heads == 12 and emb_tile == 96:
+        if parallel_seq == 1 and parallel_heads in (1, 2, 3, 4, 6):
             return 8
-        if num_heads == 12 and parallel_heads == 6:
+        if parallel_seq == 2 and parallel_heads in (1, 2, 3, 4):
             return 8
-        return 1
-    if parallel_seq == 2:
-        if parallel_heads in (1, 2, 4):
+        if parallel_seq == 4 and parallel_heads in (1, 2):
             return 8
-        return 1
-    if parallel_seq == 4:
-        if parallel_heads in (1, 2):
+        if parallel_seq in (6, 8) and parallel_heads == 1:
             return 8
         return 1
-    if parallel_seq in (6, 8):
-        if parallel_heads == 1:
+    if num_heads == 16 and emb_tile == 128:
+        if parallel_seq == 1 and parallel_heads in (1, 2, 4):
+            return 8
+        if parallel_seq == 2 and parallel_heads in (1, 2, 4):
+            return 8
+        if parallel_seq == 4 and parallel_heads in (1, 2):
+            return 8
+        if parallel_seq in (6, 8) and parallel_heads == 1:
             return 8
     return 1
 
@@ -645,11 +683,15 @@ def _block2_runtime_candidate_allowed(
 
     if head_dim != 64:
         return False
+    if num_heads not in (1, 8, 12, 16, 24):
+        return False
     if parallel_seq not in _BLOCK2_RUNTIME_LOWERED_PARALLEL_SEQ_CHOICES:
         return False
     if q_seq_tile != 32:
         return False
     if kv_seq_tile != 64:
+        return False
+    if emb_tile < 64:
         return False
     max_supported_acc_depth = _block2_runtime_supported_acc_depth(
         candidate,
@@ -670,12 +712,23 @@ def _block2_runtime_candidate_allowed(
         return False
     if num_heads == 1 and (emb_tile != 64 or parallel_heads != 1):
         return False
+    if num_heads == 24:
+        return (
+            parallel_seq == 1
+            and parallel_heads == 6
+            and emb_tile == 128
+            and o_proj_acc_depth == 1
+        )
+    if num_heads == 8 and emb_tile != 64:
+        return False
+    if num_heads == 12 and emb_tile != 96:
+        return False
+    if num_heads == 16 and emb_tile != 128:
+        return False
     if parallel_seq > 1:
-        if o_proj_acc_depth != 1 and o_proj_acc_depth != max_supported_acc_depth:
-            return False
         if num_heads == 1:
             return True
-        return num_heads in (12, 16)
+        return num_heads in (8, 12, 16)
     return True
 
 
@@ -689,7 +742,7 @@ def _block2_preferred_runtime_ids(
     if not retained:
         return set()
 
-    preferred_ids = {
+    return {
         _mha_out_proj_topology_id(candidate)
         for candidate in retained
         if _block2_runtime_candidate_allowed(
@@ -699,25 +752,6 @@ def _block2_preferred_runtime_ids(
             head_dim=head_dim,
         )
     }
-    preferred_ids.update(
-        _mha_out_proj_topology_id(candidate)
-        for candidate in _block2_promoted_parallel_seq_candidates(
-            seq_len=seq_len,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            retained=retained,
-        )
-    )
-    preferred_ids.update(
-        _mha_out_proj_topology_id(candidate)
-        for candidate in _block2_promoted_acc_depth_candidates(
-            seq_len=seq_len,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            retained=retained,
-        )
-    )
-    return preferred_ids
 
 
 def _block2_select_candidates(

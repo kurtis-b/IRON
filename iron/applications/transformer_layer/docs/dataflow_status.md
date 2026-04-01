@@ -94,13 +94,25 @@ Current runtime-supported surface:
 - the current local lowering now runtime-supports:
   - a generated/pruned runtime catalog filtered from the broader theoretical
     surface instead of only returning the retained family table when `seq_len`
-    is provided
+    is provided; retained workloads now preserve only the original retained
+    baseline IDs and fill the rest of the capped runtime set from generated
+    legal candidates
   - the retained `parallel_heads` sweep on the established `ps1` path
+  - a cleaner current runtime tile floor:
+    - `head_dim == 64`
+    - `q_seq_tile == 32`
+    - `kv_seq_tile == 64`
+    - `emb_tile >= 64`
   - a validated denser `o_proj_acc_depth` subset on the retained `12x64` and
     `16x64` families for `head_dim == 64`, `q_seq_tile == 32`, and
     `kv_seq_tile == 64`; the current runtime-supported catalog now admits the
     maximum validated `o_proj_acc_depth` for each retained `ps/ph` shape:
     `acc8` on all retained widened `12x64` / `16x64` `q32/kv64` shapes
+  - a validated generated `parallel_heads=3` subset on retained `12x64`,
+    currently admitted on the `q32/kv64/e96` `ps1` and `ps2` paths with `acc8`
+  - a validated generalized `8x64` subset on the `q32/kv64/e64` path:
+    `acc8` is now admitted on `ps1/ph{1,2,4}`, `ps2/ph4`, `ps4/ph2`,
+    `ps6/ph1`, and `ps8/ph1`
   - a validated `parallel_seq` subset on the retained `12x64` and `16x64`
     families, with `parallel_seq in {2, 4, 6, 8}` lowered as real sequence lanes
     when `q_seq_tile == 32`, `kv_seq_tile == 64`, and
@@ -129,8 +141,8 @@ Current runtime-supported surface:
   - `seq_len=2048, heads=16, head_dim=64`: `12` topologies
   - representative generalized `head_dim=64` workloads now also produce
     runtime/practical Block 2 catalogs:
-    - `seq_len=64, heads=24`: runtime `12`
-    - `seq_len=512, heads=24`: runtime `12`
+    - `seq_len=64, heads=24`: runtime `1`
+    - `seq_len=512, heads=24`: runtime `1`
     - `seq_len=64, heads=8`: runtime `12`
     - `seq_len=512, heads=8`: runtime `12`
 - concretely:
@@ -141,7 +153,7 @@ Current runtime-supported surface:
     - `ps2/ps4/ps8` are validated at `seq_len=512`
   - `12 x 64`
     - the capped retained runtime set now ranks the higher-acc shapes first:
-      `acc8` on `ps1/ph{1,2,4}`, `ps2/ph{1,2,4}`, and, when sequence
+      `acc8` on `ps1/ph{1,2,3,4,6}`, `ps2/ph{1,2,3,4}`, and, when sequence
       divisibility allows them, `ps4/ph{1,2}`, `ps6/ph1`, and `ps8/ph1`
     - selected `acc1` fallbacks for those same retained shapes remain in the
       capped runtime set for comparison/baseline coverage
@@ -168,20 +180,24 @@ Verified today:
 
 Work left:
 
-- broaden the current real `parallel_seq` lowering beyond the validated
-  `q32/kv64` subset; on retained families that now includes the max-validated
-  higher-acc subset listed above, on the `1x64` family the widened support is
-  still limited to `parallel_heads == 1`, and on generalized families the
-  current generated runtime catalog is still anchored on the `ps1`
-  head-parallel path
+- Block 2 is now in the same general state as Blocks 1 and 3: generated /
+  pruned runtime selection is tied to the honest current lowering, and the
+  main remaining work is broader expansion rather than runtime-surface cleanup
+- the capped runtime catalog is now an exploration/default-selection surface,
+  not the only admissible runtime-ID surface; explicit Block 2 topology IDs may
+  still reference any runtime-valid candidate admitted by the honest runtime
+  gate even when that ID is outside the capped selected set
 - broaden the packed Block 2 output mode beyond the current restricted path
   used for Block 3 handoff; the current packed handoff no longer requires
   `Block 2 parallel_seq == Block 3 parallel_seq`, but it still requires
   matching `(q_seq_tile, emb_tile) == (tile_m, tile_k)` and a Block 3-compatible
   packed row count
-- widen runtime support across more of the practical/theoretical Block 2 space,
-  especially if higher `o_proj_acc_depth` on the wider `ps/ph` paths or wider
-  family support is needed
+- widen runtime support across more of the practical/theoretical Block 2 space
+  only if broader tile families are wanted; the next expansion targets are
+  wider `q/kv` tiles such as `q64` / `kv128`, higher-acc generalized families
+  beyond the validated `8x64` subset, broadening the currently narrow
+  generalized `24x64` runtime anchor beyond `q32/kv64/e128, ps1/ph6, acc1`,
+  and broader non-retained `parallel_seq` promotion
 - remove the remaining pytest skips in the practical matrix as those topologies
   become runnable
 

@@ -189,15 +189,23 @@ path:
 - when `seq_len` is provided, the runtime-supported Block 2 catalog is now
   generated from the broader theoretical surface and pruned back to a compact
   runtime set instead of being limited to the retained family table; retained
-  workloads still resolve to the preferred validated retained/promoted IDs,
-  while generalized `head_dim=64` workloads can surface broader generated
-  runtime candidates
+  workloads now preserve only the original retained baseline IDs and fill the
+  rest of the capped runtime set from broader generated legal candidates, while
+  generalized `head_dim=64` workloads can surface broader generated runtime
+  candidates through that same path
 - `parallel_heads` on the established retained `ps1` path
+- the current honest runtime gate is now explicit:
+  - `head_dim == 64`
+  - `q_seq_tile == 32`
+  - `kv_seq_tile == 64`
+  - `emb_tile >= 64`
 - a validated denser `o_proj_acc_depth` subset on the retained `12x64` and
   `16x64` families for `head_dim == 64`, `q_seq_tile == 32`, and
   `kv_seq_tile == 64`; the current runtime-supported catalog now admits the
   maximum validated `o_proj_acc_depth` for each retained `ps/ph` shape:
   `acc8` on all retained widened `12x64` / `16x64` `q32/kv64` shapes
+- a validated generated `parallel_heads=3` subset on retained `12x64`,
+  currently admitted on the `q32/kv64/e96` `ps1` and `ps2` paths with `acc8`
 - a seq-len-aware `parallel_seq` subset on the retained `12x64` and `16x64`
   families, with `parallel_seq in {2, 4, 6, 8}` lowered as real sequence lanes
   when `q_seq_tile == 32`, `kv_seq_tile == 64`, and
@@ -208,6 +216,9 @@ path:
   workloads whose `seq_len` is divisible by `256`; within that retained
   widened surface the runtime selector now prefers the maximum validated
   `o_proj_acc_depth` for each shape before falling back to `acc1`
+- the capped runtime catalog is the default study / selection surface, but the
+  design entrypoint accepts any topology ID that is still admitted by the
+  honest runtime gate, even when that ID falls outside the capped selected set
 - a narrower `parallel_seq` subset on the retained `1x64` family, currently
   validated with `parallel_heads == 1`, `q_seq_tile == 32`,
   `kv_seq_tile == 64`, `emb_tile == 64`, and `o_proj_acc_depth == 1`; this
@@ -215,11 +226,18 @@ path:
   `ps2/ps4/ps8` at `seq_len=512`
 Representative generalized `head_dim=64` workloads such as `24x64` and `8x64`
 now also resolve non-empty seq-len-aware runtime/practical catalogs through
-that same path, though the honest current runtime gate is still the narrower
-validated `q32/kv64` subset: higher `o_proj_acc_depth` is currently admitted
-only on the retained `12x64/16x64` families through the max-validated-per-shape
-policy above, while generalized families and the retained `1x64` family remain
-`acc1`.
+that same path. The current validated generalized runtime surface includes a
+real `8x64` `acc8` subset on the `q32/kv64/e64` path:
+- `ps1/ph{1,2,4}`
+- `ps2/ph4`
+- `ps4/ph2`
+- `ps6/ph1`
+- `ps8/ph1`
+The broader generalized `24x64` family currently remains a narrow runtime
+anchor on the honest path:
+- `q32/kv64/e128`
+- `ps1/ph6`
+- `acc1`
 For the retained runtime-supported study surface, `emb_tile` is still selected
 per retained workload family, and the current lowered design still does not
 support the `16x64 / parallel_heads=8` retained-shape variant because it
@@ -237,6 +255,10 @@ That design file should expose three distinct topology views:
   local-memory utilization while still retaining the baseline runtime-supported
   study topologies; practical ranking should continue to prefer real lowered
   axes over paper-only gains
+With the generated/pruned runtime surface, explicit honest runtime gate, and
+validated generalized `8x64` plus generated retained `12x64 ph3` support,
+Block 2 is now in the same general category as Blocks 1 and 3: most remaining
+work is broader tile-family expansion rather than runtime-surface cleanup.
 The checked-in study manifests should continue to pin the baseline retained
 topology IDs for reproducibility even as that broader theoretical exploration
 surface grows.
