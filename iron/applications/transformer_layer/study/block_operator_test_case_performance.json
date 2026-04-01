@@ -1,4 +1,8 @@
 {
+  "_header": [
+    "SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.",
+    "SPDX-License-Identifier: Apache-2.0"
+  ],
   "generated_at_utc": "2026-03-31T22:29:57.237764+00:00",
   "git_commit": "3e3da6345e85822f406a21b2e1e311ee54c40c85",
   "measurement_method": {
