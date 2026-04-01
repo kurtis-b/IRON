@@ -1408,15 +1408,11 @@ void ffn_matmul_init_bf16_bf16_down_proj(const bfloat16 *A, const bfloat16 *B, b
 
     zero_vectorized<bfloat16, DIM_M, DIM_K>(C);
     if constexpr ((DIM_N % (2 * t) == 0) && (DIM_K == 24)) {
-        matmul_init_vectorized_2x1_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, s, t>(A,
-                                                                                                              B,
-                                                                                                              C);
+        matmul_init_vectorized_2x1_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, s, t>(A, B, C);
     } else if constexpr (DIM_N % (2 * t) == 0) {
         matmul_vectorized_2x2_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, s, t>(A, B, C);
     } else {
-        matmul_init_vectorized_2x1_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, s, t>(A,
-                                                                                                              B,
-                                                                                                              C);
+        matmul_init_vectorized_2x1_mmul<bfloat16, bfloat16, (DIM_M / r), (DIM_N / t), (DIM_K / s), r, s, t>(A, B, C);
     }
 }
 
