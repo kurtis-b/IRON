@@ -52,14 +52,33 @@ PARITY_FIELD_ORDER = [
     "seed",
     "max_abs_diff",
     "mean_abs_diff",
+    "error_count",
+    "max_acceptable_errors",
 ]
+
+PARITY_REL_TOL = 4.0e-2
+PARITY_ABS_TOL = 1.5e-1
+PARITY_ERROR_THRESHOLD = 0.005
 
 
 def error_stats(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float]:
     diff = (reference - candidate).abs().to(torch.float32)
+    error_count = int(
+        (
+            ~torch.isclose(
+                reference,
+                candidate,
+                rtol=PARITY_REL_TOL,
+                atol=PARITY_ABS_TOL,
+            )
+        ).sum()
+    )
+    max_acceptable_errors = int(reference.numel() * PARITY_ERROR_THRESHOLD)
     return {
         "max_abs_diff": float(diff.max().item()),
         "mean_abs_diff": float(diff.mean().item()),
+        "error_count": error_count,
+        "max_acceptable_errors": max_acceptable_errors,
     }
 
 

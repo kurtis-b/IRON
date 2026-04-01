@@ -40,7 +40,12 @@ def test_validate_npu_parity_restructure_preserves_legacy_imports_and_helpers():
     reference = torch.tensor([1.0, 2.0], dtype=torch.float32)
     candidate = torch.tensor([1.5, 1.0], dtype=torch.float32)
     stats = error_stats(reference, candidate)
-    assert stats == {"max_abs_diff": 1.0, "mean_abs_diff": 0.75}
+    assert stats == {
+        "max_abs_diff": 1.0,
+        "mean_abs_diff": 0.75,
+        "error_count": 2,
+        "max_acceptable_errors": 0,
+    }
 
     spec = TransformerLayerSpec(seq_len=64)
     rows = run_parity_suite(

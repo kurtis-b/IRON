@@ -41,6 +41,7 @@ from ..bench.npu_inference import (
 from ..core.layer_spec import TransformerLayerSpec
 from ..core.reference_layer import ReferenceTransformerLayer
 from ..patterns.runlist import RunlistPattern
+from .validate_npu_parity import error_stats as parity_error_stats
 from ..utils import make_synthetic_layer_inputs, make_synthetic_layer_weights
 
 
@@ -396,7 +397,6 @@ def parity_operator_runlist_request(request: dict[str, object]) -> dict[str, obj
         pattern.assign_weights(weights)
         candidate_output = pattern(layer_inputs)
         _ensure_finite_output(candidate_output, mode="parity", spec=spec)
-        diff = (reference_output - candidate_output).abs().to(candidate_output.dtype)
         return {
             "study_id": study_id,
             "execution_mode": "runlist",
@@ -409,8 +409,7 @@ def parity_operator_runlist_request(request: dict[str, object]) -> dict[str, obj
             "dtype": spec.dtype,
             "weights_source": spec.weights_source,
             "seed": seed,
-            "max_abs_diff": float(diff.max().item()),
-            "mean_abs_diff": float(diff.float().mean().item()),
+            **parity_error_stats(reference_output, candidate_output),
         }
     finally:
         context = getattr(pattern, "context", None)

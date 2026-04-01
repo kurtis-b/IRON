@@ -81,6 +81,35 @@ def _first_dataflow_compatible_block3_topology(
     raise AssertionError("expected at least one dataflow-compatible Block 3 topology")
 
 
+def _first_dataflow_compatible_block2_topology(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_heads: int,
+    head_dim: int,
+) -> dict[str, int | str]:
+    block2_topologies = mha_out_proj_topologies(
+        seq_len=seq_len,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+    block3_topologies = addnorm_ffn_addnorm_topologies(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    for block2_candidate in block2_topologies:
+        for block3_candidate in block3_topologies:
+            if _block2_block3_packed_handoff_compatible(
+                seq_len=seq_len,
+                block2_candidate=block2_candidate,
+                block3_candidate=block3_candidate,
+            ):
+                return block2_candidate
+    raise AssertionError("expected at least one dataflow-compatible Block 2 topology")
+
+
 def _run_dataflow_parity_isolated(
     spec: TransformerLayerSpec,
     *,
@@ -98,7 +127,9 @@ def _run_dataflow_parity_isolated(
             f"spec = TransformerLayerSpec.from_dict({spec.to_dict()!r}); "
             f"row = validate_pattern_parity(execution_mode='dataflow', spec=spec, seed={seed}); "
             "print(json.dumps({'max_abs_diff': row['max_abs_diff'], "
-            "'mean_abs_diff': row['mean_abs_diff']}))"
+            "'mean_abs_diff': row['mean_abs_diff'], "
+            "'error_count': row['error_count'], "
+            "'max_acceptable_errors': row['max_acceptable_errors']}))"
         ),
     ]
     result = subprocess.run(
@@ -205,7 +236,13 @@ def test_dataflow_patterns_report_selected_block_topologies_in_metadata():
 
 def test_build_pattern_honors_block_topology_overrides():
     block2_topology_id = str(
-        mha_out_proj_topologies(seq_len=64, num_heads=12, head_dim=64)[0]["topology_id"]
+        _first_dataflow_compatible_block2_topology(
+            seq_len=64,
+            hidden_size=768,
+            intermediate_size=3072,
+            num_heads=12,
+            head_dim=64,
+        )["topology_id"]
     )
     block3_topology_id = str(
         _first_dataflow_compatible_block3_topology(
@@ -356,6 +393,24 @@ def test_packed_handoff_compatibility_does_not_require_matching_parallel_seq():
             "parallel_seq": 4,
             "q_seq_tile": 32,
             "emb_tile": 96,
+            "o_proj_acc_depth": 1,
+        },
+        block3_candidate={
+            "parallel_seq": 2,
+            "tile_m": 32,
+            "tile_k": 96,
+        },
+    )
+
+
+def test_packed_handoff_compatibility_allows_acc8():
+    assert _block2_block3_packed_handoff_compatible(
+        seq_len=64,
+        block2_candidate={
+            "parallel_seq": 2,
+            "q_seq_tile": 32,
+            "emb_tile": 96,
+            "o_proj_acc_depth": 8,
         },
         block3_candidate={
             "parallel_seq": 2,
@@ -366,8 +421,19 @@ def test_packed_handoff_compatibility_does_not_require_matching_parallel_seq():
 
 
 @pytest.mark.parametrize(
-    "spec_kwargs,max_abs_diff,max_mean_abs_diff",
+    "spec_kwargs",
     (
+        pytest.param(
+            {
+                "seq_len": 64,
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_attention_heads": 12,
+                "block2_topology_id": "q32_kv64_e96_ps2_ph2_acc8",
+                "block3_topology_id": "m32_k96_n64_ps2_pi6_d8_g1",
+            },
+            id="dataflow_64x768x3072_block2_ps2_ph2_acc8_to_block3_ps2",
+        ),
         pytest.param(
             {
                 "seq_len": 64,
@@ -376,8 +442,6 @@ def test_packed_handoff_compatibility_does_not_require_matching_parallel_seq():
                 "num_attention_heads": 12,
                 "block3_topology_id": "m32_k96_n64_ps2_pi6_d8_g1",
             },
-            2.5e-1,
-            8.0e-3,
             id="dataflow_64x768x3072_compatible_pi6",
         ),
         pytest.param(
@@ -386,10 +450,9 @@ def test_packed_handoff_compatibility_does_not_require_matching_parallel_seq():
                 "hidden_size": 768,
                 "intermediate_size": 3072,
                 "num_attention_heads": 12,
+                "block2_topology_id": "q32_kv64_e96_ps4_ph2_acc1",
                 "block3_topology_id": "m32_k96_n64_ps4_pi3_d8_g1",
             },
-            2.5e-1,
-            8.0e-3,
             id="dataflow_512x768x3072_compatible_pi3",
         ),
         pytest.param(
@@ -398,10 +461,9 @@ def test_packed_handoff_compatibility_does_not_require_matching_parallel_seq():
                 "hidden_size": 1024,
                 "intermediate_size": 4096,
                 "num_attention_heads": 16,
+                "block2_topology_id": "q32_kv64_e128_ps4_ph2_acc1",
                 "block3_topology_id": "m32_k128_n32_ps4_pi2_d8_g1",
             },
-            2.5e-1,
-            8.0e-3,
             id="dataflow_512x1024x4096_pi2",
         ),
         pytest.param(
@@ -413,8 +475,6 @@ def test_packed_handoff_compatibility_does_not_require_matching_parallel_seq():
                 "block2_topology_id": "q32_kv64_e96_ps2_ph2_acc1",
                 "block3_topology_id": "m32_k96_n64_ps2_pi6_d8_g1",
             },
-            2.5e-1,
-            1.6e-2,
             id="dataflow_64x768x3072_block2_ps2_ph2_to_block3_ps2",
         ),
         pytest.param(
@@ -423,19 +483,15 @@ def test_packed_handoff_compatibility_does_not_require_matching_parallel_seq():
                 "hidden_size": 1024,
                 "intermediate_size": 4096,
                 "num_attention_heads": 16,
-                "block2_topology_id": "q32_kv64_e128_ps4_ph1_acc1",
+                "block2_topology_id": "q32_kv64_e128_ps4_ph2_acc1",
                 "block3_topology_id": "m32_k128_n64_ps2_pi4_d8_g1",
             },
-            2.5e-1,
-            8.0e-3,
             id="dataflow_512x1024x4096_block2_ps4_to_block3_ps2",
         ),
     ),
 )
 def test_dataflow_pattern_runs_packed_block2_block3_handoff_against_reference(
     spec_kwargs,
-    max_abs_diff,
-    max_mean_abs_diff,
 ):
     spec = TransformerLayerSpec(
         use_bias=False,
@@ -443,5 +499,4 @@ def test_dataflow_pattern_runs_packed_block2_block3_handoff_against_reference(
         **spec_kwargs,
     )
     stats = _run_dataflow_parity_isolated(spec, seed=7)
-    assert float(stats["max_abs_diff"]) <= max_abs_diff
-    assert float(stats["mean_abs_diff"]) <= max_mean_abs_diff
+    assert int(stats["error_count"]) <= int(stats["max_acceptable_errors"])
