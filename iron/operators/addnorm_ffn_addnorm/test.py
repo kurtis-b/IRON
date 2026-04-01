@@ -319,9 +319,12 @@ def test_supported_block3_topologies_exclude_only_known_bad_skinny_wide_variants
     assert "m32_k16_n512_ps4_pi3_d8_g1" not in topology_ids_512_1536
     assert "m64_k24_n256_ps4_pi3_d8_g1" not in topology_ids_512_960
 
-    # These variants were caught by the old broad fence but now run cleanly.
-    assert "m32_k16_n512_ps2_pi4_d8_g1" in topology_ids_64_1024
-    assert "m64_k16_n320_ps4_pi3_d6_g1" in topology_ids_512_960
+    # Runtime now narrows toward bank-fit coarse-k shapes instead of promoting
+    # the old skinny-wide variants.
+    assert "m32_k16_n512_ps2_pi4_d8_g1" not in topology_ids_64_1024
+    assert "m64_k16_n320_ps4_pi3_d6_g1" not in topology_ids_512_960
+    assert "m32_k128_n64_ps2_pi4_d8_g1" in topology_ids_64_1024
+    assert "m16_k120_n160_ps4_pi3_d8_g1" in topology_ids_64_960
 
 
 def test_supported_block3_topologies_promote_generated_retained_variants():
@@ -347,7 +350,7 @@ def test_supported_block3_topologies_promote_generated_retained_variants():
     assert "m32_k96_n64_ps2_pi6_d8_g1" in topology_ids_64_768
     assert "m16_k128_n128_ps4_pi3_d6_g1" in topology_ids_64_768
     assert "m32_k128_n64_ps2_pi4_d8_g1" in topology_ids_512_1024
-    assert "m64_k64_n128_ps8_pi1_d8_g1" in topology_ids_512_1024
+    assert "m32_k128_n64_ps8_pi1_d8_g1" in topology_ids_512_1024
 
 
 def test_generalized_block3_runtime_topology_runs_numerically(aie_context):

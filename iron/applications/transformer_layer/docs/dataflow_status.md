@@ -230,6 +230,13 @@ Current runtime-supported surface:
   - `tile_m in {16, 32, 64}`
   - `tile_k >= 16`
   - `tile_n >= 16`
+  - runtime candidates must now also satisfy a coarse bank-fit model for the
+    stage-1 activation stream:
+    - the required live stage-1 tile count is `hidden_size / tile_k`
+    - each runtime `(tile_m, tile_k)` shape is assigned a conservative bank
+      slot capacity
+    - the runtime gate rejects shapes that would require more bank memtiles
+      than the current layout is assumed to leave available
   - the old broad skinny-wide fence is gone; only a short explicit list of
     reproduced unstable shapes remains excluded:
     - `tile_k=24` with `tile_n > 128` still produces runtime NaNs
@@ -253,6 +260,12 @@ Current runtime-supported surface:
   - `512 x 1536 x 6144`: runtime `8`, practical `16`
   - `64 x 960 x 3840`: runtime `8`, practical `12`
   - `512 x 960 x 3840`: runtime `8`, practical `16`
+- runtime ranking now biases toward:
+  - larger `parallel_seq * tile_m`
+  - larger `tile_m`
+  - larger `parallel_int_dim * tile_n`
+  - fewer required stage-1 bank memtiles
+  - smaller viable `tile_k` only after those higher-priority terms tie
 - `ps8` is now runtime-supported for strict-runtime-feasible `parallel_int_dim=1`
   compact-sequence Block 3 topologies; broader `ps8` shapes still remain
   practical-only until the runtime layout is generalized further
@@ -307,8 +320,8 @@ Work left:
 - continue promoting additional theoretical/practical Block 3 topologies only
   after the standalone runtime proves them constructible and numerically sound
 - broaden `ps8` runtime support beyond the current compact-sequence `pi1` path
-- continue promoting smaller-`k` runtime candidates now that the hard
-  `tile_k >= 64` policy gate is gone
+- continue promoting smaller-`k` runtime candidates only when they satisfy the
+  stage-1 bank-fit/runtime-stability gate
 - broaden Dataflow-level Block 2 -> Block 3 verification further only as more
   tile-compatible runtime pairs are promoted into the app-visible catalog
 

@@ -402,6 +402,24 @@ _BLOCK3_RUNTIME_MIN_TILE_K = 16
 _BLOCK3_RUNTIME_MIN_TILE_N = 16
 _BLOCK3_RUNTIME_MAX_CANDIDATES = 8
 _BLOCK3_RUNTIME_MAX_DOWN_PROJ_DEPTH = 8
+_BLOCK3_BANK_SLOT_CAPACITY_BY_TILE_K = {
+    16: 2,
+    24: 2,
+    32: 4,
+    40: 4,
+    48: 6,
+    64: 8,
+    80: 8,
+    96: 8,
+    120: 8,
+    128: 8,
+    160: 6,
+    192: 8,
+    256: 6,
+    320: 4,
+    384: 4,
+    512: 2,
+}
 
 
 def addnorm_ffn_addnorm_topologies(
@@ -987,6 +1005,11 @@ def _block3_runtime_candidate_allowed(
         candidate=candidate,
     ):
         return False
+    if not _block3_runtime_stage1_bank_feasible(
+        hidden_size=hidden_size,
+        candidate=candidate,
+    ):
+        return False
     if not _block3_runtime_placement_feasible(candidate):
         return False
     return _block3_runtime_feasible(
@@ -1031,6 +1054,59 @@ def _block3_runtime_placement_feasible(candidate: dict[str, int | str]) -> bool:
         and parallel_seq <= num_aie_columns // 2
         and (2 * parallel_seq) <= num_aie_columns
     )
+
+
+def _block3_stage1_bank_slot_capacity(*, tile_k: int) -> int:
+    capacity = _BLOCK3_BANK_SLOT_CAPACITY_BY_TILE_K.get(tile_k)
+    if capacity is not None:
+        return capacity
+    if tile_k >= 96:
+        return 8
+    if tile_k >= 64:
+        return 8
+    if tile_k >= 48:
+        return 6
+    if tile_k >= 32:
+        return 4
+    return 2
+
+
+def _block3_available_stage1_bank_memtiles(
+    candidate: dict[str, int | str],
+) -> int:
+    parallel_seq = int(candidate["parallel_seq"])
+    parallel_int_dim = int(candidate["parallel_int_dim"])
+    num_aie_columns = int(candidate["num_aie_columns"])
+
+    if parallel_seq > (num_aie_columns // 2):
+        return 1
+    if parallel_seq < 3:
+        return 1 if parallel_int_dim > 4 else 2
+    return 2
+
+
+def _block3_required_stage1_bank_memtiles(
+    *,
+    hidden_size: int,
+    candidate: dict[str, int | str],
+) -> int:
+    tile_k = int(candidate["tile_k"])
+    k_tiles = hidden_size // tile_k
+    slot_capacity = _block3_stage1_bank_slot_capacity(tile_k=tile_k)
+    return math.ceil(k_tiles / slot_capacity)
+
+
+def _block3_runtime_stage1_bank_feasible(
+    *,
+    hidden_size: int,
+    candidate: dict[str, int | str],
+) -> bool:
+    required_bank_memtiles = _block3_required_stage1_bank_memtiles(
+        hidden_size=hidden_size,
+        candidate=candidate,
+    )
+    available_bank_memtiles = _block3_available_stage1_bank_memtiles(candidate)
+    return required_bank_memtiles <= available_bank_memtiles
 
 
 def _block3_practical_placement_feasible(candidate: dict[str, int | str]) -> bool:
@@ -1141,8 +1217,11 @@ def _block3_runtime_sort_key(
     )
     lane_parallelism = parallel_seq * parallel_int_dim
     sequence_chunk = parallel_seq * tile_m
-    grouped_hidden_chunk = down_proj_depth * tile_k
     output_chunk = parallel_int_dim * tile_n
+    required_bank_memtiles = _block3_required_stage1_bank_memtiles(
+        hidden_size=hidden_size,
+        candidate=candidate,
+    )
     max_compute_tile_bytes = _block3_max_compute_tile_bytes_current_pipeline(
         hidden_size=hidden_size,
         tile_m=tile_m,
@@ -1155,11 +1234,12 @@ def _block3_runtime_sort_key(
         lane_parallelism,
         sequence_chunk,
         tile_m,
-        grouped_hidden_chunk,
-        max_compute_tile_bytes,
         output_chunk,
-        tile_k,
         tile_n,
+        -required_bank_memtiles,
+        max_compute_tile_bytes,
+        -tile_k,
+        -down_proj_depth,
         gelu_stage,
     )
 
@@ -1356,16 +1436,15 @@ def _block3_practical_sort_key(candidate: dict[str, int | str]) -> tuple[int, ..
     )
     lane_parallelism = parallel_seq * parallel_int_dim
     sequence_chunk = parallel_seq * tile_m
-    grouped_hidden_chunk = tile_k * down_proj_depth
     return (
         core_count,
         lane_parallelism,
         num_aie_columns,
         sequence_chunk,
-        grouped_hidden_chunk,
         tile_m,
-        tile_k,
+        parallel_int_dim * tile_n,
         tile_n,
+        -tile_k,
         -down_proj_depth,
         gelu_stage,
     )

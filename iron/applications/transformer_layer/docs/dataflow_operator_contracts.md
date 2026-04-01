@@ -338,6 +338,12 @@ still reflects the current `design.py` implementation:
 - `tile_k >= 16`
 - `tile_n >= 16`
 - `down_proj_depth <= 8`
+- runtime candidates must also satisfy a conservative stage-1 bank-fit gate:
+  - required live stage-1 tiles scale with `hidden_size / tile_k`
+  - each runtime `(tile_m, tile_k)` pair is assigned a conservative bank-slot
+    capacity
+  - candidates that would require more bank memtiles than the current layout
+    is assumed to expose stay practical/theoretical-only
 - placement must satisfy the current horizontal, vertical, or compact-sequence
   Block 3 layouts
 - `parallel_seq > 4` currently requires the compact-sequence layout, so the
@@ -464,6 +470,13 @@ now a short explicit list of reproduced bad shapes instead:
 - `tile_k=24` with `tile_n > 128`, which still produces runtime NaNs
 - `512 x 1536 x 6144` with `tile_k=16` and `tile_n=512`, which still fails
   shim BD lowering
+The runtime selector also now de-emphasizes `tile_k` as a primary performance
+target. It instead prefers:
+- larger `parallel_seq * tile_m`
+- larger `tile_m`
+- larger `parallel_int_dim * tile_n`
+- fewer required stage-1 bank memtiles
+- and only then smaller viable `tile_k`
 Because `ln1_weight` and `ln2_weight` are compile-time constants embedded into
 the generated Block 3 MLIR/xclbin, Block 3 artifact names must include a
 deterministic fingerprint of those two weight tensors so tests and studies do
@@ -490,12 +503,12 @@ That design file should also expose three distinct topology views:
 - a seq-len-aware runtime-supported topology list used by operator tests and
   benchmark manifests; for retained workloads that list now keeps the validated
   baseline IDs and also promotes additional generated runtime candidates when
-  they pass the current gate
+  they pass the current layout, stability, and stage-1 bank-fit gates
 - a broader theoretical topology enumerator that explores every combination
   allowed by the Block 3 contract, imported FFN tiling equalities,
   `seq_len`-fit, lane-count limit, and GeLU staging for a given workload
 - a heuristic-pruned practical exploration surface that favors higher sequence
-  and intermediate-dimension parallelism, larger reusable tiles, and fuller
+  and intermediate-dimension parallelism, larger row/output chunks, and fuller
   array-column utilization while still retaining the baseline runtime-supported
   study topologies
 
