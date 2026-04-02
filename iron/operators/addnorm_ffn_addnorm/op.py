@@ -114,10 +114,15 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         )
         np.save(ln2_weight_file_name, ln2_weight_np)
 
-        kernel_archive = (
-            f"addnorm_ffn_addnorm_{self.tile_m}x{self.tile_k}x{self.tile_n}"
-            f"_ps{self.parallel_seq}_pi{self.parallel_int_dim}.a"
+        kernel_suffix = (
+            f"{self.tile_m}x{self.tile_k}x{self.tile_n}"
+            f"_d{self.down_proj_depth}"
+            f"_ps{self.parallel_seq}"
+            f"_pi{self.parallel_int_dim}"
+            f"_g{self.gelu_stage}"
+            f"_s{'full' if self.stage_only is None else self.stage_only}"
         )
+        kernel_archive = f"addnorm_ffn_addnorm_{kernel_suffix}.a"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_total_base}.mlir",
@@ -168,7 +173,7 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"fused_addnorm_ffn_addnorm_{self.tile_m}x{self.tile_k}x{self.tile_n}.o",
+                            f"fused_addnorm_ffn_addnorm_{kernel_suffix}.o",
                             depends=[
                                 SourceArtifact.new(
                                     base_dir
@@ -180,7 +185,7 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                             extra_flags=kernel_flags,
                         ),
                         KernelObjectArtifact.new(
-                            f"ffn_passThrough_{self.tile_m}x{self.tile_k}x{self.tile_n}.o",
+                            f"ffn_passThrough_addnorm_ffn_addnorm_{kernel_suffix}.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[
                                 SourceArtifact.new(
@@ -196,7 +201,7 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                             },
                         ),
                         KernelObjectArtifact.new(
-                            f"ln_passThrough_{self.tile_m}x{self.tile_k}x{self.tile_n}.o",
+                            f"ln_passThrough_addnorm_ffn_addnorm_{kernel_suffix}.o",
                             extra_flags=["-DBIT_WIDTH=16"],
                             depends=[
                                 SourceArtifact.new(
@@ -363,6 +368,9 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
         assert M == self.M
         assert K == K2 and K == K3 and K == self.K
         assert N == N2 and N == self.N
+
+        if self.stage_only is not None:
+            return np.zeros((M, K), dtype=A_np.dtype)
 
         self.write_buffer("A", A_np)
         self.write_buffer("R", R_np)
