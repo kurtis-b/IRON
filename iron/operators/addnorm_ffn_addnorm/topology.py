@@ -53,6 +53,18 @@ _BLOCK3_BASE_CONFIGS = {
             "gelu_stage": 1,
         },
     ),
+    (768, 96): (
+        {
+            "tile_m": 32,
+            "tile_k": 96,
+            "tile_n": 96,
+            "down_proj_depth": 8,
+            "num_aie_columns": 3,
+            "parallel_seq": 1,
+            "parallel_int_dim": 1,
+            "gelu_stage": 1,
+        },
+    ),
 }
 
 

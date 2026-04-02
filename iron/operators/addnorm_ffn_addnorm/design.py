@@ -45,6 +45,19 @@ def choose_phase1_rows(m: int, K: int, dtype_itemsize: int) -> int:
     return 1
 
 
+def choose_partial_accum_mtile(
+    *,
+    a_tile: int,
+    b_tile: int,
+    n_aie_cols: int,
+) -> Tile:
+    weight_col = b_tile + 1
+    for candidate_col in (a_tile, n_aie_cols - 1 - a_tile):
+        if 0 <= candidate_col < n_aie_cols and candidate_col != weight_col:
+            return Tile(candidate_col, 1)
+    return Tile((weight_col + 1) % n_aie_cols, 1)
+
+
 def fused_addnorm_ffn_addnorm(
     dev,
     M,
@@ -249,6 +262,11 @@ def fused_addnorm_ffn_addnorm(
             np.int32,
         ],
     )
+    run_phase1 = stage_only in (0, None)
+    run_up_proj = stage_only in (1, 2, 3, None)
+    run_down_proj = stage_only in (2, 3, None)
+    run_ln2 = stage_only in (3, None)
+    run_phase2 = run_up_proj or run_down_proj or run_ln2
 
     # Phase 1 FIFOs.
     phase1_A_l3l2_fifos = [None] * nA_tiles_distributed
@@ -260,58 +278,59 @@ def fused_addnorm_ffn_addnorm(
     phase1_ln1_l1l2_fifos = [None] * nA_tiles_distributed
     phase1_ln1_l2l3_fifos = [None] * nA_tiles_distributed
 
-    for a_tile in range(nA_tiles_distributed):
-        phase1_A_l3l2_fifos[a_tile] = ObjectFifo(
-            phase1_l1_ty, name=f"phase1_A_L3L2_{a_tile}", depth=fifo_depth
-        )
-        phase1_A_l2l1_fifos[a_tile] = (
-            phase1_A_l3l2_fifos[a_tile]
-            .cons()
-            .forward(
-                obj_type=phase1_l1_ty,
-                name=f"phase1_A_L2L1_{a_tile}",
-                placement=Tile(a_tile, 1),
+    if run_phase1:
+        for a_tile in range(nA_tiles_distributed):
+            phase1_A_l3l2_fifos[a_tile] = ObjectFifo(
+                phase1_l1_ty, name=f"phase1_A_L3L2_{a_tile}", depth=fifo_depth
             )
-        )
+            phase1_A_l2l1_fifos[a_tile] = (
+                phase1_A_l3l2_fifos[a_tile]
+                .cons()
+                .forward(
+                    obj_type=phase1_l1_ty,
+                    name=f"phase1_A_L2L1_{a_tile}",
+                    placement=Tile(a_tile, 1),
+                )
+            )
 
-        phase1_R_l3l2_fifos[a_tile] = ObjectFifo(
-            phase1_l1_ty, name=f"phase1_R_L3L2_{a_tile}", depth=fifo_depth
-        )
-        phase1_R_l2l1_fifos[a_tile] = (
-            phase1_R_l3l2_fifos[a_tile]
-            .cons()
-            .forward(
-                obj_type=phase1_l1_ty,
-                name=f"phase1_R_L2L1_{a_tile}",
-                placement=Tile(n_aie_cols - 1 - a_tile, 1),
+            phase1_R_l3l2_fifos[a_tile] = ObjectFifo(
+                phase1_l1_ty, name=f"phase1_R_L3L2_{a_tile}", depth=fifo_depth
             )
-        )
+            phase1_R_l2l1_fifos[a_tile] = (
+                phase1_R_l3l2_fifos[a_tile]
+                .cons()
+                .forward(
+                    obj_type=phase1_l1_ty,
+                    name=f"phase1_R_L2L1_{a_tile}",
+                    placement=Tile(n_aie_cols - 1 - a_tile, 1),
+                )
+            )
 
-        phase1_preadd_l1l2_fifos[a_tile] = ObjectFifo(
-            phase1_l1_ty, name=f"stage_preadd_L1L2_{a_tile}", depth=fifo_depth
-        )
-        phase1_preadd_l2l3_fifos[a_tile] = (
-            phase1_preadd_l1l2_fifos[a_tile]
-            .cons()
-            .forward(
-                obj_type=phase1_l1_ty,
-                name=f"stage_preadd_L2L3_{a_tile}",
-                placement=Tile(n_aie_cols - 1 - a_tile, 1),
+            phase1_preadd_l1l2_fifos[a_tile] = ObjectFifo(
+                phase1_l1_ty, name=f"stage_preadd_L1L2_{a_tile}", depth=fifo_depth
             )
-        )
+            phase1_preadd_l2l3_fifos[a_tile] = (
+                phase1_preadd_l1l2_fifos[a_tile]
+                .cons()
+                .forward(
+                    obj_type=phase1_l1_ty,
+                    name=f"stage_preadd_L2L3_{a_tile}",
+                    placement=Tile(n_aie_cols - 1 - a_tile, 1),
+                )
+            )
 
-        phase1_ln1_l1l2_fifos[a_tile] = ObjectFifo(
-            phase1_l1_ty, name=f"stage_ln1_L1L2_{a_tile}", depth=fifo_depth
-        )
-        phase1_ln1_l2l3_fifos[a_tile] = (
-            phase1_ln1_l1l2_fifos[a_tile]
-            .cons()
-            .forward(
-                obj_type=phase1_l1_ty,
-                name=f"stage_ln1_L2L3_{a_tile}",
-                placement=Tile(a_tile, 1),
+            phase1_ln1_l1l2_fifos[a_tile] = ObjectFifo(
+                phase1_l1_ty, name=f"stage_ln1_L1L2_{a_tile}", depth=fifo_depth
             )
-        )
+            phase1_ln1_l2l3_fifos[a_tile] = (
+                phase1_ln1_l1l2_fifos[a_tile]
+                .cons()
+                .forward(
+                    obj_type=phase1_l1_ty,
+                    name=f"stage_ln1_L2L3_{a_tile}",
+                    placement=Tile(a_tile, 1),
+                )
+            )
 
     # Phase 2 FIFOs.
     phase2_A_l3l2_fifos = [None] * nA_tiles_distributed
@@ -338,124 +357,139 @@ def fused_addnorm_ffn_addnorm(
     ln2_l1l2_fifos = [None] * nA_tiles_distributed
     ln2_l2l3_fifos = [None] * nA_tiles_distributed
 
-    dims_to_stream_a = [
-        (m // r, r * k),
-        (k // s, s),
-        (r, k),
-        (s, 1),
-    ]
-    for a_tile in range(nA_tiles_distributed):
-        phase2_A_l3l2_fifos[a_tile] = ObjectFifo(
-            A_l2_ty, name=f"A_L3L2_{a_tile}", depth=fifo_depth
-        )
-        phase2_A_l2l1_fifos[a_tile] = (
-            phase2_A_l3l2_fifos[a_tile]
-            .cons()
-            .forward(
-                obj_type=A_l1_ty,
-                name=f"A_L2L1_{a_tile}",
-                dims_to_stream=dims_to_stream_a,
-                placement=Tile(a_tile, 1),
-            )
-        )
-
-        phase2_R_l3l2_fifos[a_tile] = ObjectFifo(
-            A_l1_ty, name=f"R_L3L2_{a_tile}", depth=fifo_depth
-        )
-        phase2_R_l2l1_fifos[a_tile] = (
-            phase2_R_l3l2_fifos[a_tile]
-            .cons()
-            .forward(
-                obj_type=A_l1_ty,
-                name=f"R_L2L1_{a_tile}",
-                dims_to_stream=dims_to_stream_a,
-                placement=Tile(n_aie_cols - 1 - a_tile, 1),
-            )
-        )
-
-    for b_tile in range(nB_tiles_distributed):
-        dims_to_stream_up = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
-        B_up_proj_l3l2_fifos[b_tile] = ObjectFifo(
-            B_l2_ty, name=f"B_up_L3L2_{b_tile}", depth=fifo_depth
-        )
-        B_up_proj_l2l1_fifos[b_tile] = (
-            B_up_proj_l3l2_fifos[b_tile]
-            .cons()
-            .forward(
-                obj_type=B_up_proj_l1_ty,
-                name=f"B_up_L2L1_{b_tile}",
-                dims_to_stream=dims_to_stream_up,
-                placement=Tile(b_tile + 1, 1),
-            )
-        )
-
-        dims_to_stream_down = [(n // s, s * k), (k // t, t), (s, k), (t, 1)]
-        B_down_proj_l3l2_fifos[b_tile] = ObjectFifo(
-            B_l2_ty, name=f"B_down_L3L2_{b_tile}", depth=fifo_depth
-        )
-        B_down_proj_l2l1_fifos[b_tile] = (
-            B_down_proj_l3l2_fifos[b_tile]
-            .cons()
-            .forward(
-                obj_type=B_down_proj_l1_ty,
-                name=f"B_down_L2L1_{b_tile}",
-                dims_to_stream=dims_to_stream_down,
-                placement=Tile(b_tile + 1, 1),
-            )
-        )
-
-    for a_tile in range(nA_tiles_distributed):
-        for b_tile in range(nB_tiles_distributed):
-            C_up_proj_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
-                C_up_proj_l1_ty,
-                name=f"C_up_L1L1_{a_tile}_{b_tile}",
-                depth=fifo_depth,
-            )
-            C_down_proj_part_l1l2_fifos[a_tile][b_tile] = ObjectFifo(
-                A_l1_ty,
-                name=f"C_down_L1L2_{a_tile}_{b_tile}",
-                depth=1,
-            )
-            C_down_proj_part_l2l1_fifos[a_tile][b_tile] = (
-                C_down_proj_part_l1l2_fifos[a_tile][b_tile]
-                .cons(depth=down_proj_depth)
-                .forward(
-                    obj_type=A_l1_ty,
-                    name=f"C_down_L2L1_{b_tile}_{a_tile}",
-                    depth=down_proj_depth,
-                    placement=Tile(b_tile + 1, 1),
+    if run_phase2:
+        dims_to_stream_a = [
+            (m // r, r * k),
+            (k // s, s),
+            (r, k),
+            (s, 1),
+        ]
+        for a_tile in range(nA_tiles_distributed):
+            if run_up_proj:
+                phase2_A_l3l2_fifos[a_tile] = ObjectFifo(
+                    A_l2_ty, name=f"A_L3L2_{a_tile}", depth=fifo_depth
                 )
-            )
+                phase2_A_l2l1_fifos[a_tile] = (
+                    phase2_A_l3l2_fifos[a_tile]
+                    .cons()
+                    .forward(
+                        obj_type=A_l1_ty,
+                        name=f"A_L2L1_{a_tile}",
+                        dims_to_stream=dims_to_stream_a,
+                        placement=Tile(a_tile, 1),
+                    )
+                )
 
-        for b_tile in range(nB_tiles_distributed - 1):
-            C_down_proj_reduce_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
-                A_l1_ty,
-                name=f"C_down_L1L1_{a_tile}_{b_tile}",
-                depth=fifo_depth,
-            )
+            if run_ln2:
+                phase2_R_l3l2_fifos[a_tile] = ObjectFifo(
+                    A_l1_ty, name=f"R_L3L2_{a_tile}", depth=fifo_depth
+                )
+                phase2_R_l2l1_fifos[a_tile] = (
+                    phase2_R_l3l2_fifos[a_tile]
+                    .cons()
+                    .forward(
+                        obj_type=A_l1_ty,
+                        name=f"R_L2L1_{a_tile}",
+                        dims_to_stream=dims_to_stream_a,
+                        placement=Tile(n_aie_cols - 1 - a_tile, 1),
+                    )
+                )
 
-        C_down_proj_out_l1l1_fifos[a_tile] = ObjectFifo(
-            A_l1_ty,
-            name=f"C_out_L1L1_{a_tile}",
-            depth=fifo_depth,
-        )
+        for b_tile in range(nB_tiles_distributed):
+            if run_up_proj:
+                dims_to_stream_up = [(k // s, s * n), (n // t, t), (s, n), (t, 1)]
+                B_up_proj_l3l2_fifos[b_tile] = ObjectFifo(
+                    B_l2_ty, name=f"B_up_L3L2_{b_tile}", depth=fifo_depth
+                )
+                B_up_proj_l2l1_fifos[b_tile] = (
+                    B_up_proj_l3l2_fifos[b_tile]
+                    .cons()
+                    .forward(
+                        obj_type=B_up_proj_l1_ty,
+                        name=f"B_up_L2L1_{b_tile}",
+                        dims_to_stream=dims_to_stream_up,
+                        placement=Tile(b_tile + 1, 1),
+                    )
+                )
 
-        ln2_l1l2_fifos[a_tile] = ObjectFifo(
-            A_l1_ty,
-            name=f"ln2_L1L2_{a_tile}",
-            depth=fifo_depth,
-        )
-        dims_to_stream_out = [(m // r, r * k), (r, s), (k // s, r * s), (s, 1)]
-        ln2_l2l3_fifos[a_tile] = (
-            ln2_l1l2_fifos[a_tile]
-            .cons()
-            .forward(
-                obj_type=A_l1_ty,
-                name=f"ln2_L2L3_{a_tile}",
-                dims_to_stream=dims_to_stream_out,
-                placement=Tile(n_aie_cols - 1 - a_tile, 1),
-            )
-        )
+            if run_down_proj:
+                dims_to_stream_down = [(n // s, s * k), (k // t, t), (s, k), (t, 1)]
+                B_down_proj_l3l2_fifos[b_tile] = ObjectFifo(
+                    B_l2_ty, name=f"B_down_L3L2_{b_tile}", depth=fifo_depth
+                )
+                B_down_proj_l2l1_fifos[b_tile] = (
+                    B_down_proj_l3l2_fifos[b_tile]
+                    .cons(depth=down_proj_depth)
+                    .forward(
+                        obj_type=B_down_proj_l1_ty,
+                        name=f"B_down_L2L1_{b_tile}",
+                        dims_to_stream=dims_to_stream_down,
+                        placement=Tile(b_tile + 1, 1),
+                    )
+                )
+
+        for a_tile in range(nA_tiles_distributed):
+            if run_up_proj:
+                for b_tile in range(nB_tiles_distributed):
+                    C_up_proj_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
+                        C_up_proj_l1_ty,
+                        name=f"C_up_L1L1_{a_tile}_{b_tile}",
+                        depth=fifo_depth,
+                    )
+
+            if run_down_proj:
+                for b_tile in range(nB_tiles_distributed):
+                    partial_accum_mt = choose_partial_accum_mtile(
+                        a_tile=a_tile,
+                        b_tile=b_tile,
+                        n_aie_cols=n_aie_cols,
+                    )
+                    C_down_proj_part_l1l2_fifos[a_tile][b_tile] = ObjectFifo(
+                        A_l1_ty,
+                        name=f"C_down_L1L2_{a_tile}_{b_tile}",
+                        depth=1,
+                    )
+                    C_down_proj_part_l2l1_fifos[a_tile][b_tile] = (
+                        C_down_proj_part_l1l2_fifos[a_tile][b_tile]
+                        .cons(depth=down_proj_depth)
+                        .forward(
+                            obj_type=A_l1_ty,
+                            name=f"C_down_L2L1_{b_tile}_{a_tile}",
+                            depth=down_proj_depth,
+                            placement=partial_accum_mt,
+                        )
+                    )
+
+                for b_tile in range(nB_tiles_distributed - 1):
+                    C_down_proj_reduce_l1l1_fifos[a_tile][b_tile] = ObjectFifo(
+                        A_l1_ty,
+                        name=f"C_down_L1L1_{a_tile}_{b_tile}",
+                        depth=fifo_depth,
+                    )
+
+                C_down_proj_out_l1l1_fifos[a_tile] = ObjectFifo(
+                    A_l1_ty,
+                    name=f"C_out_L1L1_{a_tile}",
+                    depth=fifo_depth,
+                )
+
+            if run_ln2:
+                ln2_l1l2_fifos[a_tile] = ObjectFifo(
+                    A_l1_ty,
+                    name=f"ln2_L1L2_{a_tile}",
+                    depth=fifo_depth,
+                )
+                dims_to_stream_out = [(m // r, r * k), (r, s), (k // s, r * s), (s, 1)]
+                ln2_l2l3_fifos[a_tile] = (
+                    ln2_l1l2_fifos[a_tile]
+                    .cons()
+                    .forward(
+                        obj_type=A_l1_ty,
+                        name=f"ln2_L2L3_{a_tile}",
+                        dims_to_stream=dims_to_stream_out,
+                        placement=Tile(n_aie_cols - 1 - a_tile, 1),
+                    )
+                )
 
     def core_fn_add_norm1(
         in_a,
@@ -524,6 +558,19 @@ def fused_addnorm_ffn_addnorm(
             if gelu:
                 gelu(elem_out, elem_out, m * n)
             out_c.release(1)
+
+    def core_fn_consume_up(in_a):
+        loop = range(1)
+        if nC_tiles_per_core > 1:
+            loop = range_(nC_tiles_per_core)
+        for _ in loop:
+            elem_in_a = in_a.acquire(1)
+            in_a.release(1)
+
+    def core_fn_consume_down(in_a):
+        for _ in range_(2 * down_proj_depth):
+            elem_in_a = in_a.acquire(1)
+            in_a.release(1)
 
     def core_fn_down_proj(
         in_a,
@@ -680,109 +727,138 @@ def fused_addnorm_ffn_addnorm(
     for a_tile in range(nA_tiles_distributed):
         row_base = 2 + a_tile * 2
 
-        workers.append(
-            Worker(
-                core_fn_add_norm1,
-                [
-                    phase1_A_l2l1_fifos[a_tile].cons(),
-                    phase1_R_l2l1_fifos[a_tile].cons(),
-                    Buffer(
-                        type=ln_weights_ty,
-                        initial_value=static_ln1_weights,
-                        name=f"static_ln1_weights_{a_tile}",
-                    ),
-                    Buffer(type=phase1_l1_ty, name=f"ln1_tmp_norm_{a_tile}"),
-                    phase1_preadd_l1l2_fifos[a_tile].prod(),
-                    phase1_ln1_l1l2_fifos[a_tile].prod(),
-                    phase1_add_kernel,
-                    ln1_layer_norm_rows_kernel,
-                    ln1_mul_rows_kernel,
-                    stage_only,
-                ],
-                placement=Tile(0, row_base),
-                stack_size=0xF00,
-            )
-        )
-
-        workers.append(
-            Worker(
-                core_fn_add_norm2,
-                [
-                    C_down_proj_out_l1l1_fifos[a_tile].cons(),
-                    phase2_R_l2l1_fifos[a_tile].cons(),
-                    Buffer(type=sum_l1_ty, name=f"sum_buffer_{a_tile}"),
-                    Buffer(type=sum_l1_ty, name=f"sumsq_buffer_{a_tile}"),
-                    Buffer(
-                        type=ln_weights_ty,
-                        initial_value=static_ln2_weights,
-                        name=f"static_ln2_weights_{a_tile}",
-                    ),
-                    Buffer(type=A_l1_ty, name=f"ln2_combined_buffer_{a_tile}"),
-                    Buffer(type=A_l1_ty, name=f"ln2_norm_buffer_{a_tile}"),
-                    ln2_l1l2_fifos[a_tile].prod(),
-                    ffn_eltwise_add_kernel,
-                    ln2_fused_layer_norm_kernel,
-                    ln2_mul_weights_kernel,
-                    ln2_calc_sum_sumsq_kernel,
-                    ln2_zero_f32_kernel,
-                    stage_only,
-                ],
-                placement=Tile(n_aie_cols - 1, row_base),
-                stack_size=0xF00,
-            )
-        )
-
-        for b_tile in range(nB_tiles_distributed):
+        if run_phase1:
             workers.append(
                 Worker(
-                    core_fn_up_proj,
+                    core_fn_add_norm1,
                     [
-                        phase2_A_l2l1_fifos[a_tile].cons(),
-                        B_up_proj_l2l1_fifos[b_tile].cons(),
-                        C_up_proj_l1l1_fifos[a_tile][b_tile].prod(),
-                        ffn_zero_kernel_up_proj,
-                        ffn_matmul_kernel_up_proj,
-                        ffn_gelu_kernel if gelu_stage == 0 else None,
+                        phase1_A_l2l1_fifos[a_tile].cons(),
+                        phase1_R_l2l1_fifos[a_tile].cons(),
+                        Buffer(
+                            type=ln_weights_ty,
+                            initial_value=static_ln1_weights,
+                            name=f"static_ln1_weights_{a_tile}",
+                        ),
+                        Buffer(type=phase1_l1_ty, name=f"ln1_tmp_norm_{a_tile}"),
+                        phase1_preadd_l1l2_fifos[a_tile].prod(),
+                        phase1_ln1_l1l2_fifos[a_tile].prod(),
+                        phase1_add_kernel,
+                        ln1_layer_norm_rows_kernel,
+                        ln1_mul_rows_kernel,
                         stage_only,
                     ],
-                    placement=Tile(b_tile + 1, row_base + 1),
+                    placement=Tile(0, row_base),
                     stack_size=0xF00,
                 )
             )
+
+        if run_ln2:
             workers.append(
                 Worker(
-                    core_fn_down_proj,
+                    core_fn_add_norm2,
                     [
-                        C_up_proj_l1l1_fifos[a_tile][b_tile].cons(),
-                        B_down_proj_l2l1_fifos[b_tile].cons(),
-                        C_down_proj_part_l2l1_fifos[a_tile][b_tile].cons(depth=1),
-                        C_down_proj_part_l1l2_fifos[a_tile][b_tile].prod(),
-                        (
-                            C_down_proj_out_l1l1_fifos[a_tile].prod(fifo_depth)
-                            if b_tile == nB_tiles_distributed - 1
-                            else C_down_proj_reduce_l1l1_fifos[a_tile][b_tile].prod(
-                                fifo_depth
-                            )
+                        C_down_proj_out_l1l1_fifos[a_tile].cons(),
+                        phase2_R_l2l1_fifos[a_tile].cons(),
+                        Buffer(type=sum_l1_ty, name=f"sum_buffer_{a_tile}"),
+                        Buffer(type=sum_l1_ty, name=f"sumsq_buffer_{a_tile}"),
+                        Buffer(
+                            type=ln_weights_ty,
+                            initial_value=static_ln2_weights,
+                            name=f"static_ln2_weights_{a_tile}",
                         ),
-                        ffn_zero_kernel_down_proj,
-                        ffn_matmul_kernel_down_proj,
+                        Buffer(type=A_l1_ty, name=f"ln2_combined_buffer_{a_tile}"),
+                        Buffer(type=A_l1_ty, name=f"ln2_norm_buffer_{a_tile}"),
+                        ln2_l1l2_fifos[a_tile].prod(),
                         ffn_eltwise_add_kernel,
-                        ffn_mem_copy_kernel,
-                        ffn_gelu_kernel if gelu_stage == 1 else None,
-                        (
-                            None
-                            if b_tile == 0
-                            else C_down_proj_reduce_l1l1_fifos[a_tile][
-                                b_tile - 1
-                            ].cons()
-                        ),
-                        b_tile == nB_tiles_distributed - 1,
+                        ln2_fused_layer_norm_kernel,
+                        ln2_mul_weights_kernel,
+                        ln2_calc_sum_sumsq_kernel,
+                        ln2_zero_f32_kernel,
                         stage_only,
                     ],
-                    placement=Tile(b_tile + 1, row_base),
+                    placement=Tile(n_aie_cols - 1, row_base),
                     stack_size=0xF00,
                 )
             )
+        elif run_down_proj:
+            workers.append(
+                Worker(
+                    core_fn_consume_down,
+                    [
+                        C_down_proj_out_l1l1_fifos[a_tile].cons(),
+                    ],
+                    placement=Tile(n_aie_cols - 1, row_base),
+                    stack_size=0xF00,
+                )
+            )
+
+        if run_up_proj:
+            for b_tile in range(nB_tiles_distributed):
+                workers.append(
+                    Worker(
+                        core_fn_up_proj,
+                        [
+                            phase2_A_l2l1_fifos[a_tile].cons(),
+                            B_up_proj_l2l1_fifos[b_tile].cons(),
+                            C_up_proj_l1l1_fifos[a_tile][b_tile].prod(),
+                            ffn_zero_kernel_up_proj,
+                            ffn_matmul_kernel_up_proj,
+                            ffn_gelu_kernel if gelu_stage == 0 else None,
+                            stage_only,
+                        ],
+                        placement=Tile(b_tile + 1, row_base + 1),
+                        stack_size=0xF00,
+                    )
+                )
+
+        if run_down_proj:
+            for b_tile in range(nB_tiles_distributed):
+                workers.append(
+                    Worker(
+                        core_fn_down_proj,
+                        [
+                            C_up_proj_l1l1_fifos[a_tile][b_tile].cons(),
+                            B_down_proj_l2l1_fifos[b_tile].cons(),
+                            C_down_proj_part_l2l1_fifos[a_tile][b_tile].cons(depth=1),
+                            C_down_proj_part_l1l2_fifos[a_tile][b_tile].prod(),
+                            (
+                                C_down_proj_out_l1l1_fifos[a_tile].prod(fifo_depth)
+                                if b_tile == nB_tiles_distributed - 1
+                                else C_down_proj_reduce_l1l1_fifos[a_tile][b_tile].prod(
+                                    fifo_depth
+                                )
+                            ),
+                            ffn_zero_kernel_down_proj,
+                            ffn_matmul_kernel_down_proj,
+                            ffn_eltwise_add_kernel,
+                            ffn_mem_copy_kernel,
+                            ffn_gelu_kernel if gelu_stage == 1 else None,
+                            (
+                                None
+                                if b_tile == 0
+                                else C_down_proj_reduce_l1l1_fifos[a_tile][
+                                    b_tile - 1
+                                ].cons()
+                            ),
+                            b_tile == nB_tiles_distributed - 1,
+                            stage_only,
+                        ],
+                        placement=Tile(b_tile + 1, row_base),
+                        stack_size=0xF00,
+                    )
+                )
+        elif run_up_proj:
+            for b_tile in range(nB_tiles_distributed):
+                workers.append(
+                    Worker(
+                        core_fn_consume_up,
+                        [
+                            C_up_proj_l1l1_fifos[a_tile][b_tile].cons(),
+                        ],
+                        placement=Tile(b_tile + 1, row_base),
+                        stack_size=0xF00,
+                    )
+                )
 
     stage_preadd_base = 0
     stage_ln1_base = M * K
@@ -809,160 +885,166 @@ def fused_addnorm_ffn_addnorm(
     ):
         rt.start(*workers)
 
-        phase1_tg = rt.task_group()
-        for row_tile in range(ln_iters_per_core):
-            for a_tile in range(nA_tiles_distributed):
-                row_base = (row_tile * nA_tiles_distributed + a_tile) * m
-                for phase1_chunk in range(phase1_chunks_per_tile):
-                    row_offset = (row_base + phase1_chunk * phase1_rows) * K
-                    tap = TensorAccessPattern(
+        if run_phase1:
+            for row_tile in range(ln_iters_per_core):
+                for a_tile in range(nA_tiles_distributed):
+                    row_base = (row_tile * nA_tiles_distributed + a_tile) * m
+                    for phase1_chunk in range(phase1_chunks_per_tile):
+                        phase1_tg = rt.task_group()
+                        row_offset = (row_base + phase1_chunk * phase1_rows) * K
+                        tap = TensorAccessPattern(
+                            (M, K),
+                            row_offset,
+                            [1, 1, phase1_rows, K],
+                            [0, 0, K, 1],
+                        )
+                        logging.debug(
+                            "Phase1 lane %s row_tile=%s chunk=%s tap offset=%s rows=%s",
+                            a_tile,
+                            row_tile,
+                            phase1_chunk,
+                            tap.offset,
+                            phase1_rows,
+                        )
+                        rt.fill(
+                            phase1_A_l3l2_fifos[a_tile].prod(),
+                            A,
+                            tap=tap,
+                            task_group=phase1_tg,
+                            placement=Tile(a_tile, 0),
+                        )
+                        rt.fill(
+                            phase1_R_l3l2_fifos[a_tile].prod(),
+                            R,
+                            tap=tap,
+                            task_group=phase1_tg,
+                            placement=Tile(n_aie_cols - 1 - a_tile, 0),
+                        )
+                        rt.drain(
+                            phase1_preadd_l2l3_fifos[a_tile].cons(),
+                            stage_stacked,
+                            tap=stacked_tap(
+                                tap,
+                                tensor_dims=stacked_stage_dims,
+                                base_offset=stage_preadd_base,
+                            ),
+                            wait=True,
+                            task_group=phase1_tg,
+                            placement=Tile(n_aie_cols - 1 - a_tile, 0),
+                        )
+                        rt.drain(
+                            phase1_ln1_l2l3_fifos[a_tile].cons(),
+                            stage_stacked,
+                            tap=stacked_tap(
+                                tap,
+                                tensor_dims=stacked_stage_dims,
+                                base_offset=stage_ln1_base,
+                            ),
+                            wait=True,
+                            task_group=phase1_tg,
+                            placement=Tile(a_tile, 0),
+                        )
+                        rt.finish_task_group(phase1_tg)
+
+        if run_phase2:
+            phase2_tg = rt.task_group()
+            for row_tile in range(ln_iters_per_core):
+                for a_tile in range(nA_tiles_distributed):
+                    a_offset = (row_tile * nA_tiles_distributed + a_tile) * m * K
+                    a_tap = TensorAccessPattern(
                         (M, K),
-                        row_offset,
-                        [1, 1, phase1_rows, K],
-                        [0, 0, K, 1],
+                        offset=a_offset,
+                        sizes=[nC_up_col_tiles_per_core, K_div_k, m, k],
+                        strides=[0, k, K, 1],
+                    )
+                    c_tap = TensorAccessPattern(
+                        (M, K),
+                        offset=a_offset,
+                        sizes=[1, down_proj_depth, m, k],
+                        strides=[0, k, K, 1],
                     )
                     logging.debug(
-                        "Phase1 lane %s row_tile=%s chunk=%s tap offset=%s rows=%s",
+                        "Phase2 lane %s row_tile=%s A_offset=%s",
                         a_tile,
                         row_tile,
-                        phase1_chunk,
-                        tap.offset,
-                        phase1_rows,
+                        a_offset,
                     )
-                    rt.fill(
-                        phase1_A_l3l2_fifos[a_tile].prod(),
-                        A,
-                        tap=tap,
-                        task_group=phase1_tg,
-                        placement=Tile(a_tile, 0),
-                    )
-                    rt.fill(
-                        phase1_R_l3l2_fifos[a_tile].prod(),
-                        R,
-                        tap=tap,
-                        task_group=phase1_tg,
-                        placement=Tile(n_aie_cols - 1 - a_tile, 0),
-                    )
-                    rt.drain(
-                        phase1_preadd_l2l3_fifos[a_tile].cons(),
-                        stage_stacked,
-                        tap=stacked_tap(
-                            tap,
-                            tensor_dims=stacked_stage_dims,
-                            base_offset=stage_preadd_base,
-                        ),
-                        wait=True,
-                        task_group=phase1_tg,
-                        placement=Tile(n_aie_cols - 1 - a_tile, 0),
-                    )
-                    rt.drain(
-                        phase1_ln1_l2l3_fifos[a_tile].cons(),
-                        stage_stacked,
-                        tap=stacked_tap(
-                            tap,
-                            tensor_dims=stacked_stage_dims,
-                            base_offset=stage_ln1_base,
-                        ),
-                        wait=True,
-                        task_group=phase1_tg,
-                        placement=Tile(a_tile, 0),
-                    )
-        rt.finish_task_group(phase1_tg)
+                    if run_up_proj:
+                        rt.fill(
+                            phase2_A_l3l2_fifos[a_tile].prod(),
+                            stage_stacked,
+                            tap=stacked_tap(
+                                a_tap,
+                                tensor_dims=stacked_stage_dims,
+                                base_offset=stage_ln1_base,
+                            ),
+                            task_group=phase2_tg,
+                            placement=Tile(a_tile, 0),
+                        )
+                    if run_ln2:
+                        rt.fill(
+                            phase2_R_l3l2_fifos[a_tile].prod(),
+                            stage_stacked,
+                            tap=stacked_tap(
+                                TensorAccessPattern(
+                                    (M, K),
+                                    offset=a_offset,
+                                    sizes=[2, down_proj_depth, m, k],
+                                    strides=[0, k, K, 1],
+                                ),
+                                tensor_dims=stacked_stage_dims,
+                                base_offset=stage_preadd_base,
+                            ),
+                            task_group=phase2_tg,
+                            placement=Tile(n_aie_cols - 1 - a_tile, 0),
+                        )
+                        rt.drain(
+                            ln2_l2l3_fifos[a_tile].cons(),
+                            C,
+                            tap=c_tap,
+                            wait=True,
+                            task_group=phase2_tg,
+                            placement=Tile(n_aie_cols - 1 - a_tile, 0),
+                        )
 
-        phase2_tg = rt.task_group()
-        for row_tile in range(ln_iters_per_core):
-            for a_tile in range(nA_tiles_distributed):
-                a_offset = (row_tile * nA_tiles_distributed + a_tile) * m * K
-                a_tap = TensorAccessPattern(
-                    (M, K),
-                    offset=a_offset,
-                    sizes=[nC_up_col_tiles_per_core, K_div_k, m, k],
-                    strides=[0, k, K, 1],
-                )
-                c_tap = TensorAccessPattern(
-                    (M, K),
-                    offset=a_offset,
-                    sizes=[1, down_proj_depth, m, k],
-                    strides=[0, k, K, 1],
-                )
-                logging.debug(
-                    "Phase2 lane %s row_tile=%s A_offset=%s",
-                    a_tile,
-                    row_tile,
-                    a_offset,
-                )
-                rt.fill(
-                    phase2_A_l3l2_fifos[a_tile].prod(),
-                    stage_stacked,
-                    tap=stacked_tap(
-                        a_tap,
-                        tensor_dims=stacked_stage_dims,
-                        base_offset=stage_ln1_base,
-                    ),
-                    task_group=phase2_tg,
-                    placement=Tile(a_tile, 0),
-                )
-                rt.fill(
-                    phase2_R_l3l2_fifos[a_tile].prod(),
-                    stage_stacked,
-                    tap=stacked_tap(
-                        TensorAccessPattern(
-                            (M, K),
-                            offset=a_offset,
-                            sizes=[2, down_proj_depth, m, k],
-                            strides=[0, k, K, 1],
-                        ),
-                        tensor_dims=stacked_stage_dims,
-                        base_offset=stage_preadd_base,
-                    ),
-                    task_group=phase2_tg,
-                    placement=Tile(n_aie_cols - 1 - a_tile, 0),
-                )
-                rt.drain(
-                    ln2_l2l3_fifos[a_tile].cons(),
-                    C,
-                    tap=c_tap,
-                    wait=True,
-                    task_group=phase2_tg,
-                    placement=Tile(n_aie_cols - 1 - a_tile, 0),
-                )
-
-            for b_tile in range(nB_tiles_distributed):
-                b_up_tap = TensorAccessPattern(
-                    (N, K),
-                    offset=b_tile * n,
-                    sizes=[nC_up_col_tiles_per_core, K_div_k, k, n],
-                    strides=[mem_tile_n, k * N, N, 1],
-                )
-                rt.fill(
-                    B_up_proj_l3l2_fifos[b_tile].prod(),
-                    B_stacked,
-                    tap=stacked_tap(
-                        b_up_tap,
-                        tensor_dims=stacked_B_dims,
-                        base_offset=B_up_base,
-                    ),
-                    task_group=phase2_tg,
-                    placement=Tile(b_tile + 1, 0),
-                )
-                b_down_tap = TensorAccessPattern(
-                    (K, N),
-                    offset=b_tile * n * K,
-                    sizes=[nC_up_col_tiles_per_core, down_proj_depth, n, k],
-                    strides=[mem_tile_n * K, k, K, 1],
-                )
-                rt.fill(
-                    B_down_proj_l3l2_fifos[b_tile].prod(),
-                    B_stacked,
-                    tap=stacked_tap(
-                        b_down_tap,
-                        tensor_dims=stacked_B_dims,
-                        base_offset=B_down_base,
-                    ),
-                    task_group=phase2_tg,
-                    placement=Tile(b_tile + 1, 0),
-                )
-        rt.finish_task_group(phase2_tg)
+                for b_tile in range(nB_tiles_distributed):
+                    if run_up_proj:
+                        b_up_tap = TensorAccessPattern(
+                            (N, K),
+                            offset=b_tile * n,
+                            sizes=[nC_up_col_tiles_per_core, K_div_k, k, n],
+                            strides=[mem_tile_n, k * N, N, 1],
+                        )
+                        rt.fill(
+                            B_up_proj_l3l2_fifos[b_tile].prod(),
+                            B_stacked,
+                            tap=stacked_tap(
+                                b_up_tap,
+                                tensor_dims=stacked_B_dims,
+                                base_offset=B_up_base,
+                            ),
+                            task_group=phase2_tg,
+                            placement=Tile(b_tile + 1, 0),
+                        )
+                    if run_down_proj:
+                        b_down_tap = TensorAccessPattern(
+                            (K, N),
+                            offset=b_tile * n * K,
+                            sizes=[nC_up_col_tiles_per_core, down_proj_depth, n, k],
+                            strides=[mem_tile_n * K, k, K, 1],
+                        )
+                        rt.fill(
+                            B_down_proj_l3l2_fifos[b_tile].prod(),
+                            B_stacked,
+                            tap=stacked_tap(
+                                b_down_tap,
+                                tensor_dims=stacked_B_dims,
+                                base_offset=B_down_base,
+                            ),
+                            task_group=phase2_tg,
+                            placement=Tile(b_tile + 1, 0),
+                        )
+            rt.finish_task_group(phase2_tg)
 
     my_program = Program(dev_ty, rt)
     return my_program.resolve_program(SequentialPlacer())
