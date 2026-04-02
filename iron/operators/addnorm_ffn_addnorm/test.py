@@ -75,7 +75,54 @@ _ACTIVE_BRINGUP_CASES = [
         None,
         id="baseline_32x96x96_m32_k96_n96_ps1_pi1_d1_g0_full",
     ),
-    # Repeat the same sequence for g1 after the g0 ladder is green.
+    pytest.param(
+        32,
+        96,
+        96,
+        "m32_k96_n96_ps1_pi1_d1_g1",
+        -1,
+        id="baseline_32x96x96_m32_k96_n96_ps1_pi1_d1_g1_stageonly-1",
+    ),
+    pytest.param(
+        32,
+        96,
+        96,
+        "m32_k96_n96_ps1_pi1_d1_g1",
+        0,
+        id="baseline_32x96x96_m32_k96_n96_ps1_pi1_d1_g1_stageonly0",
+    ),
+    pytest.param(
+        32,
+        96,
+        96,
+        "m32_k96_n96_ps1_pi1_d1_g1",
+        1,
+        id="baseline_32x96x96_m32_k96_n96_ps1_pi1_d1_g1_stageonly1",
+    ),
+    pytest.param(
+        32,
+        96,
+        96,
+        "m32_k96_n96_ps1_pi1_d1_g1",
+        2,
+        id="baseline_32x96x96_m32_k96_n96_ps1_pi1_d1_g1_stageonly2",
+    ),
+    pytest.param(
+        32,
+        96,
+        96,
+        "m32_k96_n96_ps1_pi1_d1_g1",
+        3,
+        id="baseline_32x96x96_m32_k96_n96_ps1_pi1_d1_g1_stageonly3",
+    ),
+    pytest.param(
+        32,
+        96,
+        96,
+        "m32_k96_n96_ps1_pi1_d1_g1",
+        None,
+        id="baseline_32x96x96_m32_k96_n96_ps1_pi1_d1_g1_full",
+    ),
 ]
 
 
