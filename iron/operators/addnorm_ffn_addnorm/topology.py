@@ -21,77 +21,21 @@ def _topology_id(config: dict[str, int]) -> str:
 _BLOCK3_BASE_CONFIGS = {
     (96, 96): (
         {
-            "tile_m": 32,
+            "tile_m": 16,
             "tile_k": 96,
             "tile_n": 96,
             "down_proj_depth": 1,
-            "num_aie_columns": 3,
+            "num_aie_columns": 2,
             "parallel_seq": 1,
             "parallel_int_dim": 1,
             "gelu_stage": 0,
         },
         {
-            "tile_m": 32,
+            "tile_m": 16,
             "tile_k": 96,
             "tile_n": 96,
             "down_proj_depth": 1,
-            "num_aie_columns": 3,
-            "parallel_seq": 1,
-            "parallel_int_dim": 1,
-            "gelu_stage": 1,
-        },
-        {
-            "tile_m": 32,
-            "tile_k": 96,
-            "tile_n": 96,
-            "down_proj_depth": 1,
-            "num_aie_columns": 5,
-            "parallel_seq": 2,
-            "parallel_int_dim": 1,
-            "gelu_stage": 1,
-        },
-    ),
-    (96, 192): (
-        {
-            "tile_m": 32,
-            "tile_k": 96,
-            "tile_n": 96,
-            "down_proj_depth": 1,
-            "num_aie_columns": 3,
-            "parallel_seq": 1,
-            "parallel_int_dim": 1,
-            "gelu_stage": 1,
-        },
-        {
-            "tile_m": 32,
-            "tile_k": 96,
-            "tile_n": 96,
-            "down_proj_depth": 1,
-            "num_aie_columns": 4,
-            "parallel_seq": 1,
-            "parallel_int_dim": 2,
-            "gelu_stage": 1,
-        },
-    ),
-    (192, 96): (
-        {
-            "tile_m": 32,
-            "tile_k": 96,
-            "tile_n": 96,
-            "down_proj_depth": 2,
-            "num_aie_columns": 3,
-            "parallel_seq": 1,
-            "parallel_int_dim": 1,
-            "gelu_stage": 1,
-        },
-    ),
-    (768, 96): (
-        {
-            "tile_m": 32,
-            "tile_k": 96,
-            "tile_n": 96,
-            "down_proj_depth": 8,
-            "num_aie_columns": 3,
+            "num_aie_columns": 2,
             "parallel_seq": 1,
             "parallel_int_dim": 1,
             "gelu_stage": 1,
@@ -122,11 +66,11 @@ def _is_valid_candidate(
     down_proj_depth = int(config["down_proj_depth"])
     num_aie_columns = int(config["num_aie_columns"])
 
-    if parallel_seq < 1 or parallel_seq > 2:
+    if parallel_seq < 1 or parallel_seq > 1:
         return False
     if parallel_int_dim < 1:
         return False
-    if num_aie_columns < parallel_int_dim + 2:
+    if num_aie_columns < max(parallel_int_dim + 1, 2):
         return False
     if hidden_size != tile_k * down_proj_depth:
         return False
