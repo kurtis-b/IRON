@@ -43,60 +43,81 @@ def my_weighted_layer_norm(
         )
     per_tile_elements = weight_length
     rows_to_process = get_rows_to_process(num_elements, weight_length)
-    # Find a tile size multiple that divides num_elements
-    input_tile_size = per_tile_elements * rows_to_process
-    for _ in range(rows_to_process, 0, -1):
-        n = input_tile_size * num_columns
-        if num_elements % n == 0:
-            break
-        input_tile_size -= per_tile_elements
-        rows_to_process -= 1
+    max_worker_lanes_per_column = 2
+    # Find a tile size multiple that divides num_elements and can be evenly
+    # partitioned across the per-column worker lanes.
+    input_tile_size = 0
+    worker_lanes_per_column = 1
+    for candidate_rows_to_process in range(rows_to_process, 0, -1):
+        candidate_tile_size = per_tile_elements * candidate_rows_to_process
+        candidate_n = candidate_tile_size * num_columns
+        if num_elements % candidate_n != 0:
+            continue
+        candidate_worker_lanes = min(
+            max_worker_lanes_per_column, candidate_rows_to_process
+        )
+        while (
+            candidate_worker_lanes > 1
+            and candidate_rows_to_process % candidate_worker_lanes != 0
+        ):
+            candidate_worker_lanes -= 1
+        rows_to_process = candidate_rows_to_process
+        input_tile_size = candidate_tile_size
+        worker_lanes_per_column = candidate_worker_lanes
+        n = candidate_n
+        break
     if input_tile_size == 0:
         raise ValueError(
             f"Couldn't find tile size multiple for number of elements ({num_elements})"
         )
     N_div_n = num_elements // n
     chunk = num_elements // num_columns
+    worker_rows_to_process = rows_to_process // worker_lanes_per_column
+    worker_tile_size = per_tile_elements * worker_rows_to_process
+    split_offsets = [worker_tile_size * i for i in range(worker_lanes_per_column)]
     dtype = bfloat16
     # Define tensor types
     tensor_ty = np.ndarray[(num_elements,), np.dtype[dtype]]
     weights_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
-    tile_ty = np.ndarray[(input_tile_size,), np.dtype[dtype]]
+    column_tile_ty = np.ndarray[(input_tile_size,), np.dtype[dtype]]
+    worker_tile_ty = np.ndarray[(worker_tile_size,), np.dtype[dtype]]
 
     # Set fifodepth based on weight_length
     fifodepth = 1 if weight_length > 4096 else 2
 
     # AIE-array data movement with object fifos
     of_in1s = [
-        ObjectFifo(tile_ty, name=f"in1_{i}", depth=fifodepth)
+        ObjectFifo(column_tile_ty, name=f"in1_L3L2_{i}", depth=fifodepth)
         for i in range(num_columns)
     ]
     of_in2s = [
-        ObjectFifo(tile_ty, name=f"in2_{i}", depth=fifodepth)
-        for i in range(num_columns)
-    ]
-    of_adds = [
-        ObjectFifo(tile_ty, name=f"add_{i}", depth=fifodepth)
+        ObjectFifo(column_tile_ty, name=f"in2_L3L2_{i}", depth=fifodepth)
         for i in range(num_columns)
     ]
     of_outs = [
-        ObjectFifo(tile_ty, name=f"out_{i}", depth=fifodepth)
+        ObjectFifo(column_tile_ty, name=f"out_L2L3_{i}", depth=fifodepth)
         for i in range(num_columns)
     ]
+    of_in1_l2l1s = [[None] * worker_lanes_per_column for _ in range(num_columns)]
+    of_in2_l2l1s = [[None] * worker_lanes_per_column for _ in range(num_columns)]
+    of_adds = [[None] * worker_lanes_per_column for _ in range(num_columns)]
+    of_out_l1l2s = [[None] * worker_lanes_per_column for _ in range(num_columns)]
 
     # AIE Core Function declaration
     eltwise_add_kernel = Kernel(
         "eltwise_add_bf16_vector",
         kernel_archive_path,
-        [tile_ty, tile_ty, tile_ty, np.int32],
+        [worker_tile_ty, worker_tile_ty, worker_tile_ty, np.int32],
     )
     layer_norm_kernel = Kernel(
-        "layer_norm_rows", kernel_archive_path, [tile_ty, tile_ty, np.int32, np.int32]
+        "layer_norm_rows",
+        kernel_archive_path,
+        [worker_tile_ty, worker_tile_ty, np.int32, np.int32],
     )
     eltwise_mul_kernel = Kernel(
         "eltwise_mul_bf16_vector_rows",
         kernel_archive_path,
-        [tile_ty, weights_ty, tile_ty, np.int32, np.int32],
+        [worker_tile_ty, weights_ty, worker_tile_ty, np.int32, np.int32],
     )
 
     # Define a task that will run on a compute tile
@@ -106,7 +127,12 @@ def my_weighted_layer_norm(
             elem_in1 = of_in1.acquire(1)
             elem_in2 = of_in2.acquire(1)
             elem_out = of_add.acquire(1)
-            add(elem_in1, elem_in2, elem_out, per_tile_elements * rows_to_process)
+            add(
+                elem_in1,
+                elem_in2,
+                elem_out,
+                per_tile_elements * worker_rows_to_process,
+            )
             of_in1.release(1)
             of_in2.release(1)
             of_add.release(1)
@@ -116,45 +142,94 @@ def my_weighted_layer_norm(
         for _ in range_(N_div_n):
             elem_in = of_add.acquire(1)
             elem_out = of_out.acquire(1)
-            layer_norm(elem_in, elem_out, per_tile_elements, rows_to_process)
+            layer_norm(elem_in, elem_out, per_tile_elements, worker_rows_to_process)
             # Reuse the normalized output tile so the weighted layer norm stage
             # multiplies normalized values instead of the raw add result.
-            eltwise_mul(elem_out, weights, elem_out, per_tile_elements, rows_to_process)
+            eltwise_mul(
+                elem_out,
+                weights,
+                elem_out,
+                per_tile_elements,
+                worker_rows_to_process,
+            )
             of_add.release(1)
             of_out.release(1)
 
-    # Create workers to run the task on compute tiles,
-    # one core for layer norm and another pipelined to do eltwise mul
+    # Split each column-wide tile through the memtile into per-lane subtiles,
+    # then join the lane outputs back before draining to host memory.
     my_workers = []
     for i in range(num_columns):
-        weights_buffer = Buffer(
-            type=weights_ty,
-            initial_value=static_weights,
-            name=f"weights_buffer_{i}",
-        )
-        my_workers.append(
-            Worker(
-                core_body_stg1,
-                [
-                    of_in1s[i].cons(),
-                    of_in2s[i].cons(),
-                    of_adds[i].prod(),
-                    eltwise_add_kernel,
+        of_in1_l2l1s[i] = (
+            of_in1s[i]
+            .cons()
+            .split(
+                split_offsets,
+                obj_types=[worker_tile_ty] * worker_lanes_per_column,
+                names=[
+                    f"in1_L2L1_{i}_{lane}" for lane in range(worker_lanes_per_column)
                 ],
+                depths=[fifodepth] * worker_lanes_per_column,
+                placement=Tile(i, 1),
             )
         )
-        my_workers.append(
-            Worker(
-                core_body_stg2,
-                [
-                    of_adds[i].cons(),
-                    weights_buffer,
-                    of_outs[i].prod(),
-                    layer_norm_kernel,
-                    eltwise_mul_kernel,
+        of_in2_l2l1s[i] = (
+            of_in2s[i]
+            .cons()
+            .split(
+                split_offsets,
+                obj_types=[worker_tile_ty] * worker_lanes_per_column,
+                names=[
+                    f"in2_L2L1_{i}_{lane}" for lane in range(worker_lanes_per_column)
                 ],
+                depths=[fifodepth] * worker_lanes_per_column,
+                placement=Tile(i, 1),
             )
         )
+        of_out_l1l2s[i] = (
+            of_outs[i]
+            .prod()
+            .join(
+                split_offsets,
+                obj_types=[worker_tile_ty] * worker_lanes_per_column,
+                names=[
+                    f"out_L1L2_{i}_{lane}" for lane in range(worker_lanes_per_column)
+                ],
+                depths=[fifodepth] * worker_lanes_per_column,
+                placement=Tile(i, 1),
+            )
+        )
+        for lane in range(worker_lanes_per_column):
+            of_adds[i][lane] = ObjectFifo(
+                worker_tile_ty, name=f"add_{i}_{lane}", depth=fifodepth
+            )
+            weights_buffer = Buffer(
+                type=weights_ty,
+                initial_value=static_weights,
+                name=f"weights_buffer_{i}_{lane}",
+            )
+            my_workers.append(
+                Worker(
+                    core_body_stg1,
+                    [
+                        of_in1_l2l1s[i][lane].cons(),
+                        of_in2_l2l1s[i][lane].cons(),
+                        of_adds[i][lane].prod(),
+                        eltwise_add_kernel,
+                    ],
+                )
+            )
+            my_workers.append(
+                Worker(
+                    core_body_stg2,
+                    [
+                        of_adds[i][lane].cons(),
+                        weights_buffer,
+                        of_out_l1l2s[i][lane].prod(),
+                        layer_norm_kernel,
+                        eltwise_mul_kernel,
+                    ],
+                )
+            )
 
     # Create a TensorAccessPattern for each core
     # to describe the data movement
