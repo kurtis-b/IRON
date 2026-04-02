@@ -164,6 +164,10 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
             "eltwise_mul_bf16_vector_rows": "block3_ln1_eltwise_mul_bf16_vector_rows",
             "eltwise_mul_bf16_broadcasted_scalar": "block3_ln1_eltwise_mul_bf16_broadcasted_scalar",
         }
+        ln1_add_rename_symbols = {
+            "eltwise_add_bf16_scalar": "block3_ln1_eltwise_add_bf16_scalar",
+            "eltwise_add_bf16_vector": "block3_ln1_eltwise_add_bf16_vector",
+        }
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_total_base}.xclbin",
@@ -198,6 +202,15 @@ class AIEAddNormFFNAddNorm(AIEOperatorBase):
                                 )
                             ],
                             rename_symbols=ln1_mul_rename_symbols,
+                        ),
+                        KernelObjectArtifact.new(
+                            f"block3_ln1_add_{self.tile_m}x{self.tile_k}x{self.tile_n}.o",
+                            depends=[
+                                SourceArtifact.new(
+                                    base_dir / "aie_kernels" / "generic" / "add.cc"
+                                )
+                            ],
+                            rename_symbols=ln1_add_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
                             f"ffn_passThrough_{self.tile_m}x{self.tile_k}x{self.tile_n}.o",

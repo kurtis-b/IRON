@@ -32,6 +32,19 @@ def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def choose_phase1_rows(m: int, K: int, dtype_itemsize: int) -> int:
+    # Phase 1 keeps five live row-major buffers on the core:
+    # A, R, preadd, tmp_norm, ln1_out. Pick the largest row chunk that
+    # divides m evenly while staying within a conservative local-memory budget.
+    local_buffer_budget_bytes = 48 * 1024
+    live_buffers = 5
+    max_rows = max(1, local_buffer_budget_bytes // (live_buffers * K * dtype_itemsize))
+    for rows in range(min(m, max_rows), 0, -1):
+        if m % rows == 0:
+            return rows
+    return 1
+
+
 def fused_addnorm_ffn_addnorm(
     dev,
     M,
@@ -89,12 +102,16 @@ def fused_addnorm_ffn_addnorm(
     ln_iters_per_core = M // (nA_tiles_distributed * m)
     nC_tiles_per_core = nC_up_col_tiles_per_core * ln_iters_per_core
     n_aie_cores_needed = nA_tiles_distributed * (2 + 2 * nB_tiles_distributed)
+    phase1_rows = choose_phase1_rows(m, K, np.dtype(dtype_in).itemsize)
+    phase1_chunks_per_tile = m // phase1_rows
+    phase1_iters_per_core = ln_iters_per_core * phase1_chunks_per_tile
 
     assert M % (nA_tiles_distributed * m) == 0
     assert K % k == 0
     assert N % n == 0
     assert N % mem_tile_n == 0
     assert K == k * down_proj_depth
+    assert m % phase1_rows == 0
 
     mac_dims = microkernel_mac_dim_map[dev][dtype_in_str]
     if dev == "npu2" and dtype_in_str == "bf16":
@@ -129,7 +146,7 @@ def fused_addnorm_ffn_addnorm(
     C_ty = np.ndarray[(M * K,), np.dtype[dtype_out]]
 
     ln_weights_ty = np.ndarray[(K,), np.dtype[dtype_in]]
-    ln_stage_ty = np.ndarray[(m * K,), np.dtype[dtype_in]]
+    phase1_l1_ty = np.ndarray[(phase1_rows, K), np.dtype[dtype_in]]
     A_l2_ty = np.ndarray[(m * k,), np.dtype[dtype_in]]
     A_l1_ty = np.ndarray[(m, k), np.dtype[dtype_in]]
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
@@ -169,6 +186,11 @@ def fused_addnorm_ffn_addnorm(
         "ffn_passThroughLine",
         archive_name,
         [A_l1_ty, A_l1_ty, np.int32],
+    )
+    phase1_add_kernel = Kernel(
+        "block3_ln1_eltwise_add_bf16_vector",
+        archive_name,
+        [phase1_l1_ty, phase1_l1_ty, phase1_l1_ty, np.int32],
     )
     ffn_eltwise_add_kernel = Kernel(
         "ffn_eltwise_add_bf16_vector",
@@ -210,8 +232,8 @@ def fused_addnorm_ffn_addnorm(
         "block3_ln1_layer_norm_rows",
         archive_name,
         [
-            A_l1_ty,
-            A_l1_ty,
+            phase1_l1_ty,
+            phase1_l1_ty,
             np.int32,
             np.int32,
         ],
@@ -220,9 +242,9 @@ def fused_addnorm_ffn_addnorm(
         "block3_ln1_eltwise_mul_bf16_vector_rows",
         archive_name,
         [
-            A_l1_ty,
+            phase1_l1_ty,
             ln_weights_ty,
-            A_l1_ty,
+            phase1_l1_ty,
             np.int32,
             np.int32,
         ],
@@ -240,52 +262,52 @@ def fused_addnorm_ffn_addnorm(
 
     for a_tile in range(nA_tiles_distributed):
         phase1_A_l3l2_fifos[a_tile] = ObjectFifo(
-            A_l1_ty, name=f"phase1_A_L3L2_{a_tile}", depth=fifo_depth
+            phase1_l1_ty, name=f"phase1_A_L3L2_{a_tile}", depth=fifo_depth
         )
         phase1_A_l2l1_fifos[a_tile] = (
             phase1_A_l3l2_fifos[a_tile]
             .cons()
             .forward(
-                obj_type=A_l1_ty,
+                obj_type=phase1_l1_ty,
                 name=f"phase1_A_L2L1_{a_tile}",
                 placement=Tile(a_tile, 1),
             )
         )
 
         phase1_R_l3l2_fifos[a_tile] = ObjectFifo(
-            A_l1_ty, name=f"phase1_R_L3L2_{a_tile}", depth=fifo_depth
+            phase1_l1_ty, name=f"phase1_R_L3L2_{a_tile}", depth=fifo_depth
         )
         phase1_R_l2l1_fifos[a_tile] = (
             phase1_R_l3l2_fifos[a_tile]
             .cons()
             .forward(
-                obj_type=A_l1_ty,
+                obj_type=phase1_l1_ty,
                 name=f"phase1_R_L2L1_{a_tile}",
                 placement=Tile(n_aie_cols - 1 - a_tile, 1),
             )
         )
 
         phase1_preadd_l1l2_fifos[a_tile] = ObjectFifo(
-            A_l1_ty, name=f"stage_preadd_L1L2_{a_tile}", depth=fifo_depth
+            phase1_l1_ty, name=f"stage_preadd_L1L2_{a_tile}", depth=fifo_depth
         )
         phase1_preadd_l2l3_fifos[a_tile] = (
             phase1_preadd_l1l2_fifos[a_tile]
             .cons()
             .forward(
-                obj_type=A_l1_ty,
+                obj_type=phase1_l1_ty,
                 name=f"stage_preadd_L2L3_{a_tile}",
                 placement=Tile(n_aie_cols - 1 - a_tile, 1),
             )
         )
 
         phase1_ln1_l1l2_fifos[a_tile] = ObjectFifo(
-            A_l1_ty, name=f"stage_ln1_L1L2_{a_tile}", depth=fifo_depth
+            phase1_l1_ty, name=f"stage_ln1_L1L2_{a_tile}", depth=fifo_depth
         )
         phase1_ln1_l2l3_fifos[a_tile] = (
             phase1_ln1_l1l2_fifos[a_tile]
             .cons()
             .forward(
-                obj_type=A_l1_ty,
+                obj_type=phase1_l1_ty,
                 name=f"stage_ln1_L2L3_{a_tile}",
                 placement=Tile(a_tile, 1),
             )
@@ -447,7 +469,7 @@ def fused_addnorm_ffn_addnorm(
         mul_rows,
         stage_only,
     ):
-        for _ in range_(ln_iters_per_core):
+        for _ in range_(phase1_iters_per_core):
             elem_a = in_a.acquire(1)
             elem_r = in_r.acquire(1)
             elem_preadd = out_preadd.acquire(1)
@@ -457,20 +479,20 @@ def fused_addnorm_ffn_addnorm(
                     elem_a,
                     elem_r,
                     elem_preadd,
-                    m * k,
+                    phase1_rows * K,
                 )
                 layer_norm_rows(
                     elem_preadd,
                     tmp_ln1_norm,
                     K,
-                    m,
+                    phase1_rows,
                 )
                 mul_rows(
                     tmp_ln1_norm,
                     weights,
                     elem_ln1,
                     K,
-                    m,
+                    phase1_rows,
                 )
             in_a.release(1)
             in_r.release(1)
@@ -610,44 +632,49 @@ def fused_addnorm_ffn_addnorm(
             for _ in range_(down_proj_depth):
                 elem_in1 = of_in1.acquire(1)
                 elem_in2 = of_in2.acquire(1)
+                of_in1.release(1)
+                of_in2.release(1)
+            for _ in range_(down_proj_depth):
+                elem_in1 = of_in1.acquire(1)
+                elem_in2 = of_in2.acquire(1)
                 elem_out1 = of_out1.acquire(1)
                 of_out1.release(1)
                 of_in1.release(1)
                 of_in2.release(1)
             return
 
-        if down_proj_depth != 1:
-            raise RuntimeError(
-                "Baseline staged Block 3 currently supports down_proj_depth == 1 only"
-            )
-
         zero_f32(sum_buf, m)
         zero_f32(sumsq_buf, m)
-        elem_in1_stats = of_in1.acquire(1)
-        elem_in1_discard = of_in1.acquire(1)
-        elem_in2 = of_in2.acquire(1)
-        elem_out1 = of_out1.acquire(1)
+        for _ in range_(down_proj_depth):
+            elem_in1_stats = of_in1.acquire(1)
+            elem_in2_stats = of_in2.acquire(1)
+            add(elem_in1_stats, elem_in2_stats, combined_buf, m * k)
+            calc_sum_sumsq(combined_buf, sum_buf, sumsq_buf)
+            of_in1.release(1)
+            of_in2.release(1)
 
-        add(elem_in1_stats, elem_in2, combined_buf, m * k)
-        calc_sum_sumsq(combined_buf, sum_buf, sumsq_buf)
-        fused_layer_norm(
-            combined_buf,
-            sum_buf,
-            sumsq_buf,
-            norm_buf,
-            K,
-        )
-        mul_weights(
-            norm_buf,
-            weights,
-            elem_out1,
-            0,
-        )
-
-        of_out1.release(1)
-        of_in1.release(1)
-        of_in1.release(1)
-        of_in2.release(1)
+        for col_idx in range_(down_proj_depth):
+            col_i32 = index.casts(T.i32(), col_idx)
+            elem_in1_out = of_in1.acquire(1)
+            elem_in2_out = of_in2.acquire(1)
+            elem_out1 = of_out1.acquire(1)
+            add(elem_in1_out, elem_in2_out, combined_buf, m * k)
+            fused_layer_norm(
+                combined_buf,
+                sum_buf,
+                sumsq_buf,
+                norm_buf,
+                K,
+            )
+            mul_weights(
+                norm_buf,
+                weights,
+                elem_out1,
+                col_i32,
+            )
+            of_out1.release(1)
+            of_in1.release(1)
+            of_in2.release(1)
 
     workers = []
     for a_tile in range(nA_tiles_distributed):
@@ -664,10 +691,10 @@ def fused_addnorm_ffn_addnorm(
                         initial_value=static_ln1_weights,
                         name=f"static_ln1_weights_{a_tile}",
                     ),
-                    Buffer(type=A_l1_ty, name=f"ln1_tmp_norm_{a_tile}"),
+                    Buffer(type=phase1_l1_ty, name=f"ln1_tmp_norm_{a_tile}"),
                     phase1_preadd_l1l2_fifos[a_tile].prod(),
                     phase1_ln1_l1l2_fifos[a_tile].prod(),
-                    ffn_eltwise_add_kernel,
+                    phase1_add_kernel,
                     ln1_layer_norm_rows_kernel,
                     ln1_mul_rows_kernel,
                     stage_only,
@@ -785,52 +812,61 @@ def fused_addnorm_ffn_addnorm(
         phase1_tg = rt.task_group()
         for row_tile in range(ln_iters_per_core):
             for a_tile in range(nA_tiles_distributed):
-                a_offset = (row_tile * nA_tiles_distributed + a_tile) * m * K
-                tap = TensorAccessPattern(
-                    (M, K),
-                    a_offset,
-                    [1, 1, m, k],
-                    [0, 0, K, 1],
-                )
-                logging.debug("Phase1 lane %s tap offset=%s", a_tile, tap.offset)
-                rt.fill(
-                    phase1_A_l3l2_fifos[a_tile].prod(),
-                    A,
-                    tap=tap,
-                    task_group=phase1_tg,
-                    placement=Tile(a_tile, 0),
-                )
-                rt.fill(
-                    phase1_R_l3l2_fifos[a_tile].prod(),
-                    R,
-                    tap=tap,
-                    task_group=phase1_tg,
-                    placement=Tile(n_aie_cols - 1 - a_tile, 0),
-                )
-                rt.drain(
-                    phase1_preadd_l2l3_fifos[a_tile].cons(),
-                    stage_stacked,
-                    tap=stacked_tap(
-                        tap,
-                        tensor_dims=stacked_stage_dims,
-                        base_offset=stage_preadd_base,
-                    ),
-                    wait=True,
-                    task_group=phase1_tg,
-                    placement=Tile(n_aie_cols - 1 - a_tile, 0),
-                )
-                rt.drain(
-                    phase1_ln1_l2l3_fifos[a_tile].cons(),
-                    stage_stacked,
-                    tap=stacked_tap(
-                        tap,
-                        tensor_dims=stacked_stage_dims,
-                        base_offset=stage_ln1_base,
-                    ),
-                    wait=True,
-                    task_group=phase1_tg,
-                    placement=Tile(a_tile, 0),
-                )
+                row_base = (row_tile * nA_tiles_distributed + a_tile) * m
+                for phase1_chunk in range(phase1_chunks_per_tile):
+                    row_offset = (row_base + phase1_chunk * phase1_rows) * K
+                    tap = TensorAccessPattern(
+                        (M, K),
+                        row_offset,
+                        [1, 1, phase1_rows, K],
+                        [0, 0, K, 1],
+                    )
+                    logging.debug(
+                        "Phase1 lane %s row_tile=%s chunk=%s tap offset=%s rows=%s",
+                        a_tile,
+                        row_tile,
+                        phase1_chunk,
+                        tap.offset,
+                        phase1_rows,
+                    )
+                    rt.fill(
+                        phase1_A_l3l2_fifos[a_tile].prod(),
+                        A,
+                        tap=tap,
+                        task_group=phase1_tg,
+                        placement=Tile(a_tile, 0),
+                    )
+                    rt.fill(
+                        phase1_R_l3l2_fifos[a_tile].prod(),
+                        R,
+                        tap=tap,
+                        task_group=phase1_tg,
+                        placement=Tile(n_aie_cols - 1 - a_tile, 0),
+                    )
+                    rt.drain(
+                        phase1_preadd_l2l3_fifos[a_tile].cons(),
+                        stage_stacked,
+                        tap=stacked_tap(
+                            tap,
+                            tensor_dims=stacked_stage_dims,
+                            base_offset=stage_preadd_base,
+                        ),
+                        wait=True,
+                        task_group=phase1_tg,
+                        placement=Tile(n_aie_cols - 1 - a_tile, 0),
+                    )
+                    rt.drain(
+                        phase1_ln1_l2l3_fifos[a_tile].cons(),
+                        stage_stacked,
+                        tap=stacked_tap(
+                            tap,
+                            tensor_dims=stacked_stage_dims,
+                            base_offset=stage_ln1_base,
+                        ),
+                        wait=True,
+                        task_group=phase1_tg,
+                        placement=Tile(a_tile, 0),
+                    )
         rt.finish_task_group(phase1_tg)
 
         phase2_tg = rt.task_group()
@@ -870,7 +906,12 @@ def fused_addnorm_ffn_addnorm(
                     phase2_R_l3l2_fifos[a_tile].prod(),
                     stage_stacked,
                     tap=stacked_tap(
-                        c_tap,
+                        TensorAccessPattern(
+                            (M, K),
+                            offset=a_offset,
+                            sizes=[2, down_proj_depth, m, k],
+                            strides=[0, k, K, 1],
+                        ),
                         tensor_dims=stacked_stage_dims,
                         base_offset=stage_preadd_base,
                     ),
