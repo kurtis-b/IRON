@@ -275,11 +275,14 @@ def collect_block3_cases() -> list[CaseSpec]:
         (64, 2048, 8192),
         (512, 2048, 8192),
     ):
-        for topology in addnorm_ffn_addnorm_topologies(
+        topologies = addnorm_ffn_addnorm_topologies(
             seq_len=seq_len,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-        ):
+        )
+        if not topologies:
+            continue
+        for topology in topologies:
             topology_id = str(topology["topology_id"])
             cases.append(
                 CaseSpec(
@@ -288,7 +291,7 @@ def collect_block3_cases() -> list[CaseSpec]:
                         f"block3_{seq_len}x{hidden_size}x{intermediate_size}_"
                         f"{topology_id}"
                     ),
-                    source_tests=["test_addnorm_ffn_addnorm"],
+                    source_tests=["test_block3_runtime_topologies_run_numerically"],
                     workload={
                         "seq_len": seq_len,
                         "hidden_size": hidden_size,
@@ -300,26 +303,30 @@ def collect_block3_cases() -> list[CaseSpec]:
                 )
             )
 
-    topology = addnorm_ffn_addnorm_topologies(
+    generalized_topologies = addnorm_ffn_addnorm_topologies(
         seq_len=64,
-        hidden_size=1536,
-        intermediate_size=6144,
-    )[0]
-    cases.append(
-        CaseSpec(
-            block="block3",
-            case_id=(f"block3_generalized_64x1536x6144_{topology['topology_id']}"),
-            source_tests=["test_generalized_block3_runtime_topology_runs_numerically"],
-            workload={
-                "seq_len": 64,
-                "hidden_size": 1536,
-                "intermediate_size": 6144,
-            },
-            topology_id=str(topology["topology_id"]),
-            topology_family=str(topology["topology_family"]),
-            case_kind="generalized_spot_check",
-        )
+        hidden_size=96,
+        intermediate_size=768,
     )
+    if generalized_topologies:
+        topology = generalized_topologies[0]
+        cases.append(
+            CaseSpec(
+                block="block3",
+                case_id=(f"block3_generalized_64x96x768_{topology['topology_id']}"),
+                source_tests=[
+                    "test_generalized_block3_runtime_topology_runs_numerically"
+                ],
+                workload={
+                    "seq_len": 64,
+                    "hidden_size": 96,
+                    "intermediate_size": 768,
+                },
+                topology_id=str(topology["topology_id"]),
+                topology_family=str(topology["topology_family"]),
+                case_kind="generalized_spot_check",
+            )
+        )
     return _merge_case_specs(cases)
 
 

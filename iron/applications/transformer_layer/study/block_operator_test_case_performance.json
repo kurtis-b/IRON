@@ -3,8 +3,8 @@
     "SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.",
     "SPDX-License-Identifier: Apache-2.0"
   ],
-  "generated_at_utc": "2026-03-31T22:29:57.237764+00:00",
-  "git_commit": "3e3da6345e85822f406a21b2e1e311ee54c40c85",
+  "generated_at_utc": "2026-04-02T03:30:33.809241+00:00",
+  "git_commit": "1656f836275bba7a6064fed63180c6692cedf7e7",
   "measurement_method": {
     "warmup_iterations": 1,
     "timed_iterations": 5,
@@ -22,7 +22,7 @@
       ]
     },
     "block2": {
-      "case_count": 54,
+      "case_count": 100,
       "failed_case_count": 0,
       "source_tests": [
         "test_generalized_block2_runtime_topology_runs_numerically",
@@ -5981,6 +5981,1754 @@
       "timed_iterations": 5,
       "warmup_iterations": 1,
       "dynamic_io_bytes": 589824
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_64seq_64hdim_q32_kv64_e96_ps2_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps2_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 251.3286075554788,
+        "median": 256.3699963502586,
+        "min": 219.48100766167045,
+        "max": 279.4730244204402,
+        "stddev": 24.864862911203822
+      },
+      "bandwidth_gbps": {
+        "mean": 6.308693975284386,
+        "median": 6.135132903193231,
+        "min": 5.627963569155704,
+        "max": 7.166287492285286,
+        "stddev": 0.6392201315168389
+      },
+      "error_counts": {
+        "O": 23
+      },
+      "max_acceptable_errors": 245,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 1572864
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_64seq_64hdim_q32_kv64_e96_ps2_ph3_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps2_ph3_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 250.7193828932941,
+        "median": 249.90795645862818,
+        "min": 227.62600565329194,
+        "max": 275.99697932600975,
+        "stddev": 17.282507415327615
+      },
+      "bandwidth_gbps": {
+        "mean": 6.2971664212896306,
+        "median": 6.2937732046974055,
+        "min": 5.698844979539145,
+        "max": 6.90986074058561,
+        "stddev": 0.4320517663777554
+      },
+      "error_counts": {
+        "O": 83
+      },
+      "max_acceptable_errors": 245,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 1572864
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_64seq_64hdim_q32_kv64_e96_ps1_ph6_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps1_ph6_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 370.4276052303612,
+        "median": 389.14900505915284,
+        "min": 323.1350565329194,
+        "max": 406.91200410947204,
+        "stddev": 42.33416848106466
+      },
+      "bandwidth_gbps": {
+        "mean": 4.292529771801224,
+        "median": 4.041803986524174,
+        "min": 3.865366428405613,
+        "max": 4.867512726338203,
+        "stddev": 0.5083196783385433
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 245,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 1572864
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_64seq_64hdim_q32_kv64_e96_ps2_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps2_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 255.54479798302054,
+        "median": 250.83997752517462,
+        "min": 236.8540153838694,
+        "max": 281.6380001604557,
+        "stddev": 17.557013411034337
+      },
+      "bandwidth_gbps": {
+        "mean": 6.177583551310244,
+        "median": 6.270388059822503,
+        "min": 5.584700924960065,
+        "max": 6.64064739392684,
+        "stddev": 0.4124357025676638
+      },
+      "error_counts": {
+        "O": 39
+      },
+      "max_acceptable_errors": 245,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 1572864
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_64seq_64hdim_q32_kv64_e96_ps1_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps1_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 312.75758519768715,
+        "median": 312.15400667861104,
+        "min": 305.13195088133216,
+        "max": 326.8619766458869,
+        "stddev": 8.91795767433426
+      },
+      "bandwidth_gbps": {
+        "mean": 5.032231864536035,
+        "median": 5.038743589216193,
+        "min": 4.81201275272222,
+        "max": 5.154701090649459,
+        "stddev": 0.14085570897783806
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 245,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 1572864
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_64seq_64hdim_q32_kv64_e96_ps1_ph3_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps1_ph3_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 339.1872043721378,
+        "median": 335.2880012243986,
+        "min": 329.446978867054,
+        "max": 360.1950011216104,
+        "stddev": 12.197730433957334
+      },
+      "bandwidth_gbps": {
+        "mean": 4.641777033221844,
+        "median": 4.691083469304728,
+        "min": 4.366701356493739,
+        "max": 4.774255345758439,
+        "stddev": 0.1606543911268478
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 245,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 1572864
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_64seq_64hdim_q32_kv64_e96_ps2_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps2_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 359.9724150262773,
+        "median": 356.0470067895949,
+        "min": 348.4830376692116,
+        "max": 382.11600622162223,
+        "stddev": 12.871802607216615
+      },
+      "bandwidth_gbps": {
+        "mean": 4.373711661467855,
+        "median": 4.417574000079939,
+        "min": 4.1161950151016695,
+        "max": 4.513459279165834,
+        "stddev": 0.1507128281005698
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 245,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 1572864
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_64seq_64hdim_q32_kv64_e96_ps1_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps1_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 398.40020472183824,
+        "median": 394.33903293684125,
+        "min": 393.7470028176904,
+        "max": 415.21701496094465,
+        "stddev": 9.404977989702498
+      },
+      "bandwidth_gbps": {
+        "mean": 3.949656703519338,
+        "median": 3.988608452696377,
+        "min": 3.7880528574869303,
+        "max": 3.99460564460031,
+        "stddev": 0.09038300273688936
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 245,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 1572864
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_512seq_64hdim_q32_kv64_e96_ps8_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps8_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 1605.4015955887735,
+        "median": 1581.4429498277605,
+        "min": 1555.033028125763,
+        "max": 1714.140991680324,
+        "stddev": 62.58193153970009
+      },
+      "bandwidth_gbps": {
+        "mean": 2.697404011681236,
+        "median": 2.7350819076155033,
+        "min": 2.5233490249597006,
+        "max": 2.7815332033257536,
+        "stddev": 0.10070386337904018
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 1966,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 4325376
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_512seq_64hdim_q32_kv64_e96_ps4_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps4_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 1723.1721780262887,
+        "median": 1724.4310001842678,
+        "min": 1704.9639718607068,
+        "max": 1752.291980665177,
+        "stddev": 18.95198388203839
+      },
+      "bandwidth_gbps": {
+        "mean": 2.510365586964368,
+        "median": 2.5082917203053077,
+        "min": 2.468410543292032,
+        "max": 2.536931026923411,
+        "stddev": 0.02744776873063008
+      },
+      "error_counts": {
+        "O": 108
+      },
+      "max_acceptable_errors": 1966,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 4325376
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_512seq_64hdim_q32_kv64_e96_ps2_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps2_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 2303.3077945001423,
+        "median": 2267.36901095137,
+        "min": 2000.0580116175115,
+        "max": 2589.48199916631,
+        "stddev": 277.32436568566413
+      },
+      "bandwidth_gbps": {
+        "mean": 1.899819439965063,
+        "median": 1.9076630134347239,
+        "min": 1.6703634168503838,
+        "max": 2.1626252713049703,
+        "stddev": 0.22798518292646217
+      },
+      "error_counts": {
+        "O": 18
+      },
+      "max_acceptable_errors": 1966,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 4325376
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_512seq_64hdim_q32_kv64_e96_ps2_ph3_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps2_ph3_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 2852.1282132714987,
+        "median": 2915.2530478313565,
+        "min": 2701.5720261260867,
+        "max": 2957.981952931732,
+        "stddev": 114.13521599837634
+      },
+      "bandwidth_gbps": {
+        "mean": 1.5185207388767858,
+        "median": 1.4837051635080623,
+        "min": 1.4622726131621624,
+        "max": 1.6010589235343702,
+        "stddev": 0.06177541163544375
+      },
+      "error_counts": {
+        "O": 13
+      },
+      "max_acceptable_errors": 1966,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 4325376
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_512seq_64hdim_q32_kv64_e96_ps1_ph6_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps1_ph6_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 3306.830197107047,
+        "median": 3324.188000988215,
+        "min": 3069.7720358148217,
+        "max": 3599.92595622316,
+        "stddev": 222.21537819460895
+      },
+      "bandwidth_gbps": {
+        "mean": 1.3127210646286573,
+        "median": 1.301182724537286,
+        "min": 1.2015180458150148,
+        "max": 1.4090218913769923,
+        "stddev": 0.08766582119673996
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 1966,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 4325376
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_512seq_64hdim_q32_kv64_e96_ps4_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps4_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 3095.1199936680496,
+        "median": 3092.9860076867044,
+        "min": 3091.3429800421,
+        "max": 3101.972979493439,
+        "stddev": 4.426613239546252
+      },
+      "bandwidth_gbps": {
+        "mean": 1.397484775939635,
+        "median": 1.398446675559008,
+        "min": 1.3943951248428816,
+        "max": 1.3991899403996557,
+        "stddev": 0.001996690157936358
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 1966,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 4325376
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_512seq_64hdim_q32_kv64_e96_ps2_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps2_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 3236.4023965783417,
+        "median": 3243.0169521830976,
+        "min": 3196.0689811967313,
+        "max": 3263.03398469463,
+        "stddev": 25.149699649948502
+      },
+      "bandwidth_gbps": {
+        "mean": 1.3365415049693714,
+        "median": 1.3337506598873285,
+        "min": 1.3255687866839025,
+        "max": 1.3533425046353076,
+        "stddev": 0.010444165918977965
+      },
+      "error_counts": {
+        "O": 108
+      },
+      "max_acceptable_errors": 1966,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 4325376
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_12heads_512seq_64hdim_q32_kv64_e96_ps1_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e96_ps1_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 12,
+        "head_dim": 64,
+        "hidden_size": 768
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 3791.300195734948,
+        "median": 3779.992985073477,
+        "min": 3771.3669589720666,
+        "max": 3816.4309808053076,
+        "stddev": 19.99693794880804
+      },
+      "bandwidth_gbps": {
+        "mean": 1.1408941201732132,
+        "median": 1.1442814886377153,
+        "min": 1.133356274947569,
+        "max": 1.1468987364674097,
+        "stddev": 0.0060072540721552905
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 1966,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 4325376
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_64seq_64hdim_q32_kv64_e128_ps2_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 332.41499913856387,
+        "median": 284.2330140992999,
+        "min": 280.7860146276653,
+        "max": 409.1769806109369,
+        "stddev": 68.45470159154915
+      },
+      "bandwidth_gbps": {
+        "mean": 8.14300507019448,
+        "median": 9.222855438897648,
+        "min": 6.406616511236682,
+        "max": 9.336077523220471,
+        "stddev": 1.559809936154392
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 327,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 2621440
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_64seq_64hdim_q32_kv64_e128_ps2_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 352.57061244919896,
+        "median": 345.6770209595561,
+        "min": 340.91901034116745,
+        "max": 374.0810207091272,
+        "stddev": 14.32350473322092
+      },
+      "bandwidth_gbps": {
+        "mean": 7.444813184820221,
+        "median": 7.583495115536494,
+        "min": 7.007679766887568,
+        "max": 7.68933359678784,
+        "stddev": 0.29524699796220893
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 327,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 2621440
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_64seq_64hdim_q32_kv64_e128_ps1_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 483.5459985770285,
+        "median": 458.5490096360445,
+        "min": 442.8389947861433,
+        "max": 550.2619897015393,
+        "stddev": 46.900855231722886
+      },
+      "bandwidth_gbps": {
+        "mean": 5.4605199245131235,
+        "median": 5.716815312894616,
+        "min": 4.763985245322618,
+        "max": 5.919623228451124,
+        "stddev": 0.5061670573934667
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 327,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 2621440
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_64seq_64hdim_q32_kv64_e128_ps2_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 511.41021540388465,
+        "median": 506.1679985374212,
+        "min": 500.5080020055175,
+        "max": 523.6310535110533,
+        "stddev": 10.212850433104746
+      },
+      "bandwidth_gbps": {
+        "mean": 5.127532501995306,
+        "median": 5.17899197020492,
+        "min": 5.006272990157304,
+        "max": 5.2375586194346235,
+        "stddev": 0.10189802754593051
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 327,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 2621440
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_64seq_64hdim_q32_kv64_e128_ps1_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 566.844386048615,
+        "median": 562.0329757221043,
+        "min": 560.4099715128541,
+        "max": 577.5829777121544,
+        "stddev": 8.178740768880212
+      },
+      "bandwidth_gbps": {
+        "mean": 4.62538588045648,
+        "median": 4.664210310136969,
+        "min": 4.538637912051533,
+        "max": 4.677718337029755,
+        "stddev": 0.06633421973622557
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 327,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 2621440
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_64seq_64hdim_q32_kv64_e128_ps1_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 64,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 915.3393912129104,
+        "median": 905.957946088165,
+        "min": 904.9560176208615,
+        "max": 934.4809805043042,
+        "stddev": 14.02990223139537
+      },
+      "bandwidth_gbps": {
+        "mean": 2.8644339352078,
+        "median": 2.8935559440911285,
+        "min": 2.8052363340614033,
+        "max": 2.8967595650579705,
+        "stddev": 0.04358739544587718
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 327,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 2621440
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_512seq_64hdim_q32_kv64_e128_ps8_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps8_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 2424.0030092187226,
+        "median": 2472.1440277062356,
+        "min": 2183.9429973624647,
+        "max": 2513.0300200544298,
+        "stddev": 135.35221964229257
+      },
+      "bandwidth_gbps": {
+        "mean": 2.602476417800616,
+        "median": 2.5449391012373543,
+        "min": 2.5035339609129434,
+        "max": 2.880778485335082,
+        "stddev": 0.15659989637741656
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 2621,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 6291456
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_512seq_64hdim_q32_kv64_e128_ps4_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps4_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 2438.8449848629534,
+        "median": 2383.2369479350746,
+        "min": 2317.222999408841,
+        "max": 2731.86998674646,
+        "stddev": 166.42802690659502
+      },
+      "bandwidth_gbps": {
+        "mean": 2.588588186457181,
+        "median": 2.639878508702692,
+        "min": 2.3029851458973907,
+        "max": 2.715084392656661,
+        "stddev": 0.16312069297576362
+      },
+      "error_counts": {
+        "O": 1
+      },
+      "max_acceptable_errors": 2621,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 6291456
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_512seq_64hdim_q32_kv64_e128_ps2_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 2902.9455967247486,
+        "median": 2840.8350190147758,
+        "min": 2811.9009803049266,
+        "max": 3188.656992278993,
+        "stddev": 160.46315089674223
+      },
+      "bandwidth_gbps": {
+        "mean": 2.1722178662933507,
+        "median": 2.2146502552555574,
+        "min": 1.973073935275609,
+        "max": 2.2374386737180716,
+        "stddev": 0.11198313577521127
+      },
+      "error_counts": {
+        "O": 1
+      },
+      "max_acceptable_errors": 2621,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 6291456
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_512seq_64hdim_q32_kv64_e128_ps4_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps4_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 4229.195206426084,
+        "median": 4218.898015096784,
+        "min": 4207.385994959623,
+        "max": 4267.389012966305,
+        "stddev": 23.392050851688424
+      },
+      "bandwidth_gbps": {
+        "mean": 1.4876611189721318,
+        "median": 1.4912557680908225,
+        "min": 1.474310399376209,
+        "max": 1.4953360608076032,
+        "stddev": 0.008190510784110734
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 2621,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 6291456
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_512seq_64hdim_q32_kv64_e128_ps2_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 4539.643425960094,
+        "median": 4498.472029808909,
+        "min": 4461.563017684966,
+        "max": 4762.076016049832,
+        "stddev": 125.78903943650357
+      },
+      "bandwidth_gbps": {
+        "mean": 1.386715080311661,
+        "median": 1.3985762183937056,
+        "min": 1.3211582466965315,
+        "max": 1.410146169640911,
+        "stddev": 0.03712720445495468
+      },
+      "error_counts": {
+        "O": 1
+      },
+      "max_acceptable_errors": 2621,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 6291456
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_512seq_64hdim_q32_kv64_e128_ps1_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 5465.250206179917,
+        "median": 5414.489016402513,
+        "min": 5394.971987698227,
+        "max": 5694.174033124,
+        "stddev": 128.55425818703307
+      },
+      "bandwidth_gbps": {
+        "mean": 1.1516688970633278,
+        "median": 1.161966712083232,
+        "min": 1.1048935215891729,
+        "max": 1.166170281207384,
+        "stddev": 0.026279858280502492
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 2621,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 6291456
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_512seq_64hdim_q32_kv64_e128_ps2_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 8424.68321789056,
+        "median": 8326.668001245707,
+        "min": 8289.848046842963,
+        "max": 8610.059041529894,
+        "stddev": 161.52544001651515
+      },
+      "bandwidth_gbps": {
+        "mean": 0.7470066452996478,
+        "median": 0.7555790622441977,
+        "min": 0.7307099718658946,
+        "max": 0.758935020816936,
+        "stddev": 0.014226531133635248
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 2621,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 6291456
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_512seq_64hdim_q32_kv64_e128_ps1_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 8986.163605004549,
+        "median": 8874.443999957293,
+        "min": 8867.040043696761,
+        "max": 9437.909990083426,
+        "stddev": 252.57563915315302
+      },
+      "bandwidth_gbps": {
+        "mean": 0.7005537070977732,
+        "median": 0.7089408643550262,
+        "min": 0.6666153848267827,
+        "max": 0.7095328282037426,
+        "stddev": 0.01897564550442021
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 2621,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 6291456
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_512seq_64hdim_q32_kv64_e128_ps1_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 512,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 16429.345216602087,
+        "median": 16420.10803334415,
+        "min": 16383.670037612319,
+        "max": 16474.51997268945,
+        "stddev": 38.28131820305484
+      },
+      "bandwidth_gbps": {
+        "mean": 0.38294181767565283,
+        "median": 0.38315557895380487,
+        "min": 0.3818900951547983,
+        "max": 0.3840077336492116,
+        "stddev": 0.000892096147383354
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 2621,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 6291456
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_1984seq_64hdim_q32_kv64_e128_ps2_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 1984,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 25687.03080760315,
+        "median": 25594.778009690344,
+        "min": 25444.005033932626,
+        "max": 26204.611000139266,
+        "stddev": 297.75277284974214
+      },
+      "bandwidth_gbps": {
+        "mean": 0.7144471843690983,
+        "median": 0.7169462455604242,
+        "min": 0.7002614921435956,
+        "max": 0.7211946380111138,
+        "stddev": 0.008173193966370744
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10158,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18350080
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_1984seq_64hdim_q32_kv64_e128_ps2_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 1984,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 46848.13761850819,
+        "median": 46849.1290230304,
+        "min": 46454.04900657013,
+        "max": 47469.67303799465,
+        "stddev": 414.69770860934364
+      },
+      "bandwidth_gbps": {
+        "mean": 0.3917172924136329,
+        "median": 0.3916845495885174,
+        "min": 0.3865642804262128,
+        "max": 0.3950157282824732,
+        "stddev": 0.0034532645179677544
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10158,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18350080
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_1984seq_64hdim_q32_kv64_e128_ps1_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 1984,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 50446.37898681685,
+        "median": 50624.81795903295,
+        "min": 50108.07799408212,
+        "max": 50669.29099848494,
+        "stddev": 268.52847300261993
+      },
+      "bandwidth_gbps": {
+        "mean": 0.3637624188687985,
+        "median": 0.3624720194519891,
+        "min": 0.36215387344868677,
+        "max": 0.36621001512305434,
+        "stddev": 0.0019404078148005423
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10158,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18350080
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_1984seq_64hdim_q32_kv64_e128_ps2_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 1984,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 90300.4348045215,
+        "median": 90272.24796591327,
+        "min": 89685.43802620843,
+        "max": 90924.36003265902,
+        "stddev": 453.44468272498756
+      },
+      "bandwidth_gbps": {
+        "mean": 0.20321552341888727,
+        "median": 0.20327487587247164,
+        "min": 0.2018169827470752,
+        "max": 0.20460489912127794,
+        "stddev": 0.0010203234309673992
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10158,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18350080
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_1984seq_64hdim_q32_kv64_e128_ps1_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 1984,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 92312.9036091268,
+        "median": 92435.53300620988,
+        "min": 91674.86801743507,
+        "max": 92599.04001373798,
+        "stddev": 367.59677016299486
+      },
+      "bandwidth_gbps": {
+        "mean": 0.19878384424334355,
+        "median": 0.19851759819210682,
+        "min": 0.1981670652015138,
+        "max": 0.2001647823099141,
+        "stddev": 0.0007952095714890323
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10158,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18350080
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_1984seq_64hdim_q32_kv64_e128_ps1_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 1984,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 179248.26520029455,
+        "median": 179255.92203391716,
+        "min": 179139.21200670302,
+        "max": 179326.44399115816,
+        "stddev": 76.79535670123443
+      },
+      "bandwidth_gbps": {
+        "mean": 0.10237244234670632,
+        "median": 0.1023680545211107,
+        "min": 0.10232779723722603,
+        "max": 0.102434747783268,
+        "stddev": 4.386600501599169e-05
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10158,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18350080
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_2048seq_64hdim_q32_kv64_e128_ps8_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps8_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 2048,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 25123.404199257493,
+        "median": 25138.21399770677,
+        "min": 24748.864001594484,
+        "max": 25493.110006209463,
+        "stddev": 276.0572656968659
+      },
+      "bandwidth_gbps": {
+        "mean": 0.7513389453617421,
+        "median": 0.7508237459400183,
+        "min": 0.7403713393698412,
+        "max": 0.7626357314333292,
+        "stddev": 0.008259655791602599
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10485,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18874368
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_2048seq_64hdim_q32_kv64_e128_ps4_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps4_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 2048,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 25607.55438171327,
+        "median": 25698.634970467538,
+        "min": 25219.367002137005,
+        "max": 26086.1010174267,
+        "stddev": 353.57722778700844
+      },
+      "bandwidth_gbps": {
+        "mean": 0.7371747288340685,
+        "median": 0.7344502158067976,
+        "min": 0.7235411680492637,
+        "max": 0.748407682016787,
+        "stddev": 0.010160800837602459
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10485,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18874368
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_2048seq_64hdim_q32_kv64_e128_ps2_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 2048,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 26870.971207972616,
+        "median": 26956.80601755157,
+        "min": 26535.727025475353,
+        "max": 27238.2739931345,
+        "stddev": 291.1246186641942
+      },
+      "bandwidth_gbps": {
+        "mean": 0.7024733414489152,
+        "median": 0.7001707838722029,
+        "min": 0.6929355363984279,
+        "max": 0.7112813597260725,
+        "stddev": 0.007612621990813246
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10485,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18874368
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_2048seq_64hdim_q32_kv64_e128_ps4_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps4_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 2048,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 48827.88519607857,
+        "median": 48765.56096132845,
+        "min": 48183.92003653571,
+        "max": 49579.79696337134,
+        "stddev": 498.24590006586806
+      },
+      "bandwidth_gbps": {
+        "mean": 0.38658105655511,
+        "median": 0.38704297926496845,
+        "min": 0.38068667392777034,
+        "max": 0.3917150780942773,
+        "stddev": 0.0039326414723019655
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10485,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18874368
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_2048seq_64hdim_q32_kv64_e128_ps2_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 2048,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 49332.4114009738,
+        "median": 49238.57701942325,
+        "min": 49196.788982953876,
+        "max": 49631.65399385616,
+        "stddev": 180.07928100706042
+      },
+      "bandwidth_gbps": {
+        "mean": 0.3825997547531614,
+        "median": 0.38332480633131594,
+        "min": 0.3802889180831337,
+        "max": 0.3836504046339234,
+        "stddev": 0.001391774706435369
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10485,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18874368
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_2048seq_64hdim_q32_kv64_e128_ps1_ph4_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph4_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 2048,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 53463.123203255236,
+        "median": 53397.61497452855,
+        "min": 53046.69600445777,
+        "max": 53827.86103291437,
+        "stddev": 313.6876051226668
+      },
+      "bandwidth_gbps": {
+        "mean": 0.3530449955054271,
+        "median": 0.35346837136833453,
+        "min": 0.3506430989048367,
+        "max": 0.3558066651015154,
+        "stddev": 0.0020725072858792043
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10485,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18874368
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_2048seq_64hdim_q32_kv64_e128_ps2_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps2_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 2048,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 95516.38681441545,
+        "median": 95410.5660202913,
+        "min": 94926.88003228977,
+        "max": 96123.75299911946,
+        "stddev": 472.28825786340246
+      },
+      "bandwidth_gbps": {
+        "mean": 0.19760731782850233,
+        "median": 0.1978226184716892,
+        "min": 0.19635488015301378,
+        "max": 0.19883059459638625,
+        "stddev": 0.0009766534965778815
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10485,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18874368
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_2048seq_64hdim_q32_kv64_e128_ps1_ph2_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph2_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 2048,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 98201.15979528055,
+        "median": 98178.06398496032,
+        "min": 97993.32800321281,
+        "max": 98365.7959732227,
+        "stddev": 151.31672969712693
+      },
+      "bandwidth_gbps": {
+        "mean": 0.1922014353090339,
+        "median": 0.19224628429107465,
+        "min": 0.19187938056372777,
+        "max": 0.19260870494551613,
+        "stddev": 0.00029624688621901436
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10485,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18874368
+    },
+    {
+      "block": "block2",
+      "case_id": "mha_out_proj_16heads_2048seq_64hdim_q32_kv64_e128_ps1_ph1_acc8",
+      "case_kind": "runtime_matrix",
+      "topology_id": "q32_kv64_e128_ps1_ph1_acc8",
+      "topology_family": "fused_mha_out_proj",
+      "workload": {
+        "seq_len": 2048,
+        "num_heads": 16,
+        "head_dim": 64,
+        "hidden_size": 1024
+      },
+      "source_tests": [
+        "test_mha_out_proj"
+      ],
+      "latency_us": {
+        "mean": 190186.9405992329,
+        "median": 190305.1559929736,
+        "min": 189667.6509641111,
+        "max": 190547.36103862524,
+        "stddev": 337.1573740029041
+      },
+      "bandwidth_gbps": {
+        "mean": 0.09924138557026527,
+        "median": 0.09917948834080394,
+        "min": 0.09905342113960863,
+        "max": 0.09951284736252367,
+        "stddev": 0.00017611391344262927
+      },
+      "error_counts": {
+        "O": 0
+      },
+      "max_acceptable_errors": 10485,
+      "status": "passed",
+      "timed_iterations": 5,
+      "warmup_iterations": 1,
+      "dynamic_io_bytes": 18874368
     }
   ]
 }

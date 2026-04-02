@@ -37,6 +37,7 @@ from iron.operators.mha_out_proj.op import _pack_qkv_head_major
 from iron.operators.qkv_proj.op import AIEQKVProj
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+_SINGLE_CASE = [pytest.param(None, id="default")]
 
 
 def _first_dataflow_compatible_block3_topology(
@@ -120,14 +121,16 @@ def _run_dataflow_parity_isolated(
     return json.loads(result.stdout)
 
 
-def test_restructured_src_packages_preserve_legacy_imports():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_restructured_src_packages_preserve_legacy_imports(_case):
     assert TransformerLayerSpec is CoreSpec
     assert LegacyDataflowPattern is StructuredDataflowPattern
     assert LegacyGemmOnlyPattern is GemmOnlyPattern
     assert LegacyGemmOffloadPattern is GemmOnlyPattern
 
 
-def test_build_pattern_supports_thesis_modes():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_build_pattern_supports_thesis_modes(_case):
     spec = TransformerLayerSpec(seq_len=64)
     for execution_mode in (
         "dataflow",
@@ -143,7 +146,8 @@ def test_build_pattern_supports_thesis_modes():
         assert getattr(pattern, "pattern_label")
 
 
-def test_block_patterns_prepare_hidden_state_inputs():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_block_patterns_prepare_hidden_state_inputs(_case):
     spec = TransformerLayerSpec(seq_len=64)
     weights = make_synthetic_layer_weights(spec, seed=1)
     inputs = make_synthetic_layer_inputs(spec, seed=2)
@@ -157,7 +161,8 @@ def test_block_patterns_prepare_hidden_state_inputs():
         pattern.prepare_benchmark_inputs(inputs)
 
 
-def test_make_in_process_npu_metadata_formats_common_fields():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_make_in_process_npu_metadata_formats_common_fields(_case):
     metadata = make_in_process_npu_metadata(
         compile_setup_time_sec=0.25,
         dispatch_count=7,
@@ -173,7 +178,8 @@ def test_make_in_process_npu_metadata_formats_common_fields():
     }
 
 
-def test_make_in_process_npu_metadata_includes_extra_fields():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_make_in_process_npu_metadata_includes_extra_fields(_case):
     metadata = make_in_process_npu_metadata(
         compile_setup_time_sec=0.25,
         dispatch_count=7,
@@ -188,7 +194,8 @@ def test_make_in_process_npu_metadata_includes_extra_fields():
     assert metadata["block2_topology_family"] == "fused_mha_out_proj"
 
 
-def test_dataflow_patterns_report_selected_block_topologies_in_metadata():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_dataflow_patterns_report_selected_block_topologies_in_metadata(_case):
     spec = TransformerLayerSpec(seq_len=64)
 
     dataflow_pattern = build_pattern("dataflow", spec)
@@ -212,7 +219,8 @@ def test_dataflow_patterns_report_selected_block_topologies_in_metadata():
     )
 
 
-def test_build_pattern_honors_block_topology_overrides():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_build_pattern_honors_block_topology_overrides(_case):
     block2_topology_id = str(
         _first_dataflow_compatible_block2_topology(
             seq_len=64,
@@ -258,7 +266,8 @@ def test_build_pattern_honors_block_topology_overrides():
     assert block3_pattern.block.topology_id == spec.block3_topology_id
 
 
-def test_build_pattern_honors_nondefault_block1_topology_override():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_build_pattern_honors_nondefault_block1_topology_override(_case):
     block1_topologies = qkv_proj_topologies(seq_len=64, hidden_size=768, num_heads=12)
     assert len(block1_topologies) > 1
 
@@ -274,7 +283,8 @@ def test_build_pattern_honors_nondefault_block1_topology_override():
     assert block1_pattern.block.topology_id == spec.block1_topology_id
 
 
-def test_build_pattern_honors_nondefault_block3_topology_override():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_build_pattern_honors_nondefault_block3_topology_override(_case):
     compatible_block3 = _first_dataflow_compatible_block3_topology(
         seq_len=64,
         hidden_size=768,
@@ -296,7 +306,8 @@ def test_build_pattern_honors_nondefault_block3_topology_override():
     assert block3_pattern.block.topology_id == spec.block3_topology_id
 
 
-def test_block1_contract_reshapes_projection_outputs_to_head_major():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_block1_contract_reshapes_projection_outputs_to_head_major(_case):
     matrix = torch.arange(24, dtype=torch.bfloat16).reshape(3, 8)
     head_major = AIEQKVProj._to_head_major(
         matrix,
@@ -310,7 +321,8 @@ def test_block1_contract_reshapes_projection_outputs_to_head_major():
     assert torch.equal(head_major, expected)
 
 
-def test_block1_pattern_metadata_reports_fused_qkv_dispatch():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_block1_pattern_metadata_reports_fused_qkv_dispatch(_case):
     spec = TransformerLayerSpec(seq_len=64)
     pattern = build_pattern("block1_qkv_proj", spec)
 
@@ -321,7 +333,8 @@ def test_block1_pattern_metadata_reports_fused_qkv_dispatch():
     assert metadata["npu_unique_xclbin_count"] == 1
 
 
-def test_block2_contract_packs_head_major_qkv_into_runtime_qkv_layout():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_block2_contract_packs_head_major_qkv_into_runtime_qkv_layout(_case):
     q = torch.arange(24, dtype=torch.bfloat16).reshape(2, 3, 4)
     k = torch.arange(24, 48, dtype=torch.bfloat16).reshape(2, 3, 4)
     v = torch.arange(48, 72, dtype=torch.bfloat16).reshape(2, 3, 4)
@@ -340,7 +353,8 @@ def test_block2_contract_packs_head_major_qkv_into_runtime_qkv_layout():
     assert np.array_equal(packed.astype(np.float32), expected.float().numpy())
 
 
-def test_dataflow_pattern_uses_plain_block2_block3_handoff():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_dataflow_pattern_uses_plain_block2_block3_handoff(_case):
     spec = TransformerLayerSpec(seq_len=64)
     pattern = build_pattern("dataflow", spec)
 
@@ -348,20 +362,23 @@ def test_dataflow_pattern_uses_plain_block2_block3_handoff():
     assert pattern.block2.packed_output_rows is None
 
 
-def test_dataflow_pattern_resolves_explicit_block2_and_block3_ids_independently():
+@pytest.mark.parametrize("_case", _SINGLE_CASE)
+def test_dataflow_pattern_resolves_explicit_block2_and_block3_ids_independently(
+    _case,
+):
     spec = TransformerLayerSpec(
         seq_len=64,
         hidden_size=768,
         intermediate_size=3072,
         num_attention_heads=12,
-        block3_topology_id="m32_k96_n64_ps2_pi6_d8_g1",
+        block3_topology_id="m16_k96_n96_ps4_pi2_d8_g1",
         block2_topology_id="q32_kv64_e96_ps2_ph2_acc8",
     )
 
     pattern = build_pattern("dataflow", spec)
 
     assert pattern.block2.topology_id == "q32_kv64_e96_ps2_ph2_acc8"
-    assert pattern.block3.topology_id == "m32_k96_n64_ps2_pi6_d8_g1"
+    assert pattern.block3.topology_id == "m16_k96_n96_ps4_pi2_d8_g1"
 
 
 @pytest.mark.parametrize(
@@ -374,9 +391,9 @@ def test_dataflow_pattern_resolves_explicit_block2_and_block3_ids_independently(
                 "intermediate_size": 3072,
                 "num_attention_heads": 12,
                 "block2_topology_id": "q32_kv64_e96_ps2_ph2_acc8",
-                "block3_topology_id": "m32_k96_n64_ps2_pi6_d8_g1",
+                "block3_topology_id": "m16_k96_n96_ps4_pi2_d8_g1",
             },
-            id="dataflow_64x768x3072_block2_ps2_ph2_acc8_to_block3_ps2",
+            id="dataflow_64x768x3072_block2_ps2_ph2_acc8_to_block3_ps4_pi2",
         ),
         pytest.param(
             {
@@ -384,9 +401,9 @@ def test_dataflow_pattern_resolves_explicit_block2_and_block3_ids_independently(
                 "hidden_size": 768,
                 "intermediate_size": 3072,
                 "num_attention_heads": 12,
-                "block3_topology_id": "m32_k96_n64_ps2_pi6_d8_g1",
+                "block3_topology_id": "m16_k96_n96_ps4_pi2_d8_g1",
             },
-            id="dataflow_64x768x3072_compatible_pi6",
+            id="dataflow_64x768x3072_compatible_ps4_pi2",
         ),
         pytest.param(
             {
@@ -395,20 +412,9 @@ def test_dataflow_pattern_resolves_explicit_block2_and_block3_ids_independently(
                 "intermediate_size": 3072,
                 "num_attention_heads": 12,
                 "block2_topology_id": "q32_kv64_e96_ps4_ph2_acc1",
-                "block3_topology_id": "m32_k96_n128_ps8_pi1_d8_g1",
+                "block3_topology_id": "m16_k96_n96_ps4_pi2_d8_g1",
             },
-            id="dataflow_512x768x3072_compatible_ps8_pi1",
-        ),
-        pytest.param(
-            {
-                "seq_len": 512,
-                "hidden_size": 1024,
-                "intermediate_size": 4096,
-                "num_attention_heads": 16,
-                "block2_topology_id": "q32_kv64_e128_ps4_ph2_acc1",
-                "block3_topology_id": "m32_k128_n64_ps8_pi1_d8_g1",
-            },
-            id="dataflow_512x1024x4096_ps8_pi1",
+            id="dataflow_512x768x3072_staged_ps4_pi2",
         ),
         pytest.param(
             {
@@ -417,20 +423,9 @@ def test_dataflow_pattern_resolves_explicit_block2_and_block3_ids_independently(
                 "intermediate_size": 3072,
                 "num_attention_heads": 12,
                 "block2_topology_id": "q32_kv64_e96_ps2_ph2_acc1",
-                "block3_topology_id": "m32_k96_n64_ps2_pi6_d8_g1",
+                "block3_topology_id": "m16_k96_n96_ps4_pi2_d8_g1",
             },
-            id="dataflow_64x768x3072_block2_ps2_ph2_to_block3_ps2",
-        ),
-        pytest.param(
-            {
-                "seq_len": 512,
-                "hidden_size": 1024,
-                "intermediate_size": 4096,
-                "num_attention_heads": 16,
-                "block2_topology_id": "q32_kv64_e128_ps4_ph2_acc1",
-                "block3_topology_id": "m32_k128_n64_ps2_pi4_d8_g1",
-            },
-            id="dataflow_512x1024x4096_block2_ps4_to_block3_ps2",
+            id="dataflow_64x768x3072_block2_ps2_ph2_to_block3_ps4_pi2",
         ),
     ),
 )

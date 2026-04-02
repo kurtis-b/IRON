@@ -303,26 +303,21 @@ Verified today:
   names because those layer-norm weights are compile-time constants embedded
   into the generated MLIR/xclbin; without that, different test cases with the
   same topology could incorrectly reuse stale compiled artifacts
-- the established `768 / 3072` and `1024 / 4096` families, including their
-  `gelu_stage=0` retained variants, currently pass the numerical operator test
-  matrix
-- the retained `2048 / 8192` family, including both `gelu_stage` variants,
-  now also passes the numerical operator test matrix
-- the older retained/runtime surface passed the full Block 3 numerical matrix in
-  `iron/operators/addnorm_ffn_addnorm/test.py::test_addnorm_ffn_addnorm`
-- after the new runtime-catalog promotion rule, the application-side
-  topology-exploration tests again pass and the expanded Block 3 numerical
-  matrix is being re-validated against the generated runtime catalog
-- the current widened runtime surface, including the new `m16` and `ps8`
-  promotions plus the forwarded-preadd replay refactor, passes:
+- the current copied-`addnorm_ffn` Block 3 surface is centered on
+  `m16_k96_n96` with retained promoted runtime IDs for the working ladder
+- the active Block 3 numerical matrix passes in
+  `iron/operators/addnorm_ffn_addnorm/test.py::test_addnorm_ffn_addnorm_bringup`
+- the current Block 3 topology-contract and runtime matrix coverage passes:
+  - `iron/operators/addnorm_ffn_addnorm/test.py::test_block3_runtime_topologies_run_numerically`
+  - `iron/operators/addnorm_ffn_addnorm/test.py::test_generalized_block3_runtime_topology_runs_numerically`
   - `iron/operators/addnorm_ffn_addnorm/test.py`
   - `iron/applications/transformer_layer/test_patterns.py`
-  - `iron/applications/transformer_layer/test_topology_exploration.py`
 
 Work left:
 
-- continue promoting additional theoretical/practical Block 3 topologies only
-  after the standalone runtime proves them constructible and numerically sound
+- continue promoting additional Block 3 theoretical/practical/runtime
+  topologies only after the standalone runtime proves them constructible and
+  numerically sound
 - broaden `ps8` runtime support beyond the current compact-sequence `pi1` path
 - continue promoting `ps4/pi>1` or wider-`n` runtime candidates only when the
   forwarded-preadd replay path fits within memtile BD limits
