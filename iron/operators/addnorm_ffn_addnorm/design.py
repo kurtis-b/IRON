@@ -121,8 +121,6 @@ def fused_addnorm_ffn_addnorm(
         dev_ty = NPU2()
 
     fifo_depth = 2
-    tb_max_n_rows = 4
-
     A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
     B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
     B_stacked_ty = np.ndarray[(2 * K * N,), np.dtype[dtype_in]]
@@ -836,107 +834,93 @@ def fused_addnorm_ffn_addnorm(
         rt.finish_task_group(phase1_tg)
 
         phase2_tg = rt.task_group()
-        for tb in range(ceildiv(ln_iters_per_core, tb_max_n_rows)):
-            for pingpong in [0, 1]:
-                row_tb_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
-                current_tb_n_rows = min(
-                    tb_max_n_rows // 2, ln_iters_per_core - row_tb_base
+        for row_tile in range(ln_iters_per_core):
+            for a_tile in range(nA_tiles_distributed):
+                a_offset = (row_tile * nA_tiles_distributed + a_tile) * m * K
+                a_tap = TensorAccessPattern(
+                    (M, K),
+                    offset=a_offset,
+                    sizes=[nC_up_col_tiles_per_core, K_div_k, m, k],
+                    strides=[0, k, K, 1],
                 )
-                if current_tb_n_rows <= 0:
-                    break
-                for tile_row in range(current_tb_n_rows):
-                    for a_tile in range(nA_tiles_distributed):
-                        a_offset = (
-                            row_tb_base * m * nA_tiles_distributed * K
-                            + a_tile * current_tb_n_rows * m * K
-                            + tile_row * m * K
-                        )
-                        a_tap = TensorAccessPattern(
-                            (M, K),
-                            offset=a_offset,
-                            sizes=[nC_up_col_tiles_per_core, K_div_k, m, k],
-                            strides=[0, k, K, 1],
-                        )
-                        c_tap = TensorAccessPattern(
-                            (M, K),
-                            offset=a_offset,
-                            sizes=[1, down_proj_depth, m, k],
-                            strides=[0, k, K, 1],
-                        )
-                        logging.debug(
-                            "Phase2 lane %s tile_row=%s A_offset=%s",
-                            a_tile,
-                            tile_row,
-                            a_offset,
-                        )
-                        rt.fill(
-                            phase2_A_l3l2_fifos[a_tile].prod(),
-                            stage_stacked,
-                            tap=stacked_tap(
-                                a_tap,
-                                tensor_dims=stacked_stage_dims,
-                                base_offset=stage_ln1_base,
-                            ),
-                            task_group=phase2_tg,
-                            placement=Tile(a_tile, 0),
-                        )
-                        rt.fill(
-                            phase2_R_l3l2_fifos[a_tile].prod(),
-                            stage_stacked,
-                            tap=stacked_tap(
-                                c_tap,
-                                tensor_dims=stacked_stage_dims,
-                                base_offset=stage_preadd_base,
-                            ),
-                            task_group=phase2_tg,
-                            placement=Tile(n_aie_cols - 1 - a_tile, 0),
-                        )
-                        rt.drain(
-                            ln2_l2l3_fifos[a_tile].cons(),
-                            C,
-                            tap=c_tap,
-                            wait=True,
-                            task_group=phase2_tg,
-                            placement=Tile(n_aie_cols - 1 - a_tile, 0),
-                        )
+                c_tap = TensorAccessPattern(
+                    (M, K),
+                    offset=a_offset,
+                    sizes=[1, down_proj_depth, m, k],
+                    strides=[0, k, K, 1],
+                )
+                logging.debug(
+                    "Phase2 lane %s row_tile=%s A_offset=%s",
+                    a_tile,
+                    row_tile,
+                    a_offset,
+                )
+                rt.fill(
+                    phase2_A_l3l2_fifos[a_tile].prod(),
+                    stage_stacked,
+                    tap=stacked_tap(
+                        a_tap,
+                        tensor_dims=stacked_stage_dims,
+                        base_offset=stage_ln1_base,
+                    ),
+                    task_group=phase2_tg,
+                    placement=Tile(a_tile, 0),
+                )
+                rt.fill(
+                    phase2_R_l3l2_fifos[a_tile].prod(),
+                    stage_stacked,
+                    tap=stacked_tap(
+                        c_tap,
+                        tensor_dims=stacked_stage_dims,
+                        base_offset=stage_preadd_base,
+                    ),
+                    task_group=phase2_tg,
+                    placement=Tile(n_aie_cols - 1 - a_tile, 0),
+                )
+                rt.drain(
+                    ln2_l2l3_fifos[a_tile].cons(),
+                    C,
+                    tap=c_tap,
+                    wait=True,
+                    task_group=phase2_tg,
+                    placement=Tile(n_aie_cols - 1 - a_tile, 0),
+                )
 
-                    for b_tile in range(nB_tiles_distributed):
-                        b_up_tap = TensorAccessPattern(
-                            (N, K),
-                            offset=b_tile * n,
-                            sizes=[nC_up_col_tiles_per_core, K_div_k, k, n],
-                            strides=[mem_tile_n, k * N, N, 1],
-                        )
-                        rt.fill(
-                            B_up_proj_l3l2_fifos[b_tile].prod(),
-                            B_stacked,
-                            tap=stacked_tap(
-                                b_up_tap,
-                                tensor_dims=stacked_B_dims,
-                                base_offset=B_up_base,
-                            ),
-                            task_group=phase2_tg,
-                            placement=Tile(b_tile + 1, 0),
-                        )
-                        b_down_tap = TensorAccessPattern(
-                            (K, N),
-                            offset=b_tile * n * K,
-                            sizes=[nC_up_col_tiles_per_core, down_proj_depth, n, k],
-                            strides=[mem_tile_n * K, k, K, 1],
-                        )
-                        rt.fill(
-                            B_down_proj_l3l2_fifos[b_tile].prod(),
-                            B_stacked,
-                            tap=stacked_tap(
-                                b_down_tap,
-                                tensor_dims=stacked_B_dims,
-                                base_offset=B_down_base,
-                            ),
-                            task_group=phase2_tg,
-                            placement=Tile(b_tile + 1, 0),
-                        )
-                rt.finish_task_group(phase2_tg)
-                phase2_tg = rt.task_group()
+            for b_tile in range(nB_tiles_distributed):
+                b_up_tap = TensorAccessPattern(
+                    (N, K),
+                    offset=b_tile * n,
+                    sizes=[nC_up_col_tiles_per_core, K_div_k, k, n],
+                    strides=[mem_tile_n, k * N, N, 1],
+                )
+                rt.fill(
+                    B_up_proj_l3l2_fifos[b_tile].prod(),
+                    B_stacked,
+                    tap=stacked_tap(
+                        b_up_tap,
+                        tensor_dims=stacked_B_dims,
+                        base_offset=B_up_base,
+                    ),
+                    task_group=phase2_tg,
+                    placement=Tile(b_tile + 1, 0),
+                )
+                b_down_tap = TensorAccessPattern(
+                    (K, N),
+                    offset=b_tile * n * K,
+                    sizes=[nC_up_col_tiles_per_core, down_proj_depth, n, k],
+                    strides=[mem_tile_n * K, k, K, 1],
+                )
+                rt.fill(
+                    B_down_proj_l3l2_fifos[b_tile].prod(),
+                    B_stacked,
+                    tap=stacked_tap(
+                        b_down_tap,
+                        tensor_dims=stacked_B_dims,
+                        base_offset=B_down_base,
+                    ),
+                    task_group=phase2_tg,
+                    placement=Tile(b_tile + 1, 0),
+                )
         rt.finish_task_group(phase2_tg)
 
     my_program = Program(dev_ty, rt)
