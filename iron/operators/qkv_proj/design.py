@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -23,7 +23,6 @@ from aie.iron import (
 from aie.iron.controlflow import range_
 from aie.iron.device import NPU1, NPU1Col1, NPU1Col2, NPU2, Tile
 from aie.iron.placers import SequentialPlacer
-from iron.operators.qkv_proj.topology import qkv_proj_design
 
 microkernel_mac_dim_map = {
     "npu": {
@@ -40,25 +39,64 @@ microkernel_mac_dim_map = {
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="Block 1 QKV Projector Design",
-        description="Resolve retained thesis topology parameters for Block 1",
+        prog="AIE Fused QKV Projection MLIR Design",
+        description="Emits MLIR code for a fused Q/K/V projection design",
     )
+    parser.add_argument("--dev", type=str, choices=["npu", "npu2"], default="npu2")
     parser.add_argument("--seq-len", type=int, required=True)
     parser.add_argument("--hidden-size", type=int, required=True)
-    parser.add_argument("--num-heads", type=int, required=True)
-    parser.add_argument("--topology-id", type=str, default=None)
-    args = parser.parse_args()
-    print(
-        json.dumps(
-            qkv_proj_design(
-                seq_len=args.seq_len,
-                hidden_size=args.hidden_size,
-                num_heads=args.num_heads,
-                topology_id=args.topology_id,
-            ),
-            sort_keys=True,
-        )
+    parser.add_argument("--tile-m", type=int, default=32)
+    parser.add_argument("--tile-k", type=int, default=64)
+    parser.add_argument("--tile-n", type=int, default=16)
+    parser.add_argument("--num-aie-columns", type=int, choices=[1, 2, 4, 8], default=8)
+    parser.add_argument("--parallel-seq", type=int, default=1)
+    parser.add_argument("--parallel-emb", type=int, default=1)
+    parser.add_argument("--dtype-in", type=str, choices=["bf16"], default="bf16")
+    parser.add_argument(
+        "--dtype-out",
+        type=str,
+        choices=["bf16", "f32"],
+        default="bf16",
     )
+    parser.add_argument("--use-scalar", action="store_true")
+    parser.add_argument(
+        "--emulate-bf16-mmul-with-bfp16",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument("--trace-size", type=int, default=0)
+    parser.add_argument("--archive", type=str, default=None)
+    parser.add_argument(
+        "--output-file-path",
+        "-o",
+        type=str,
+        required=True,
+        help="Output file path for the generated MLIR module",
+    )
+    args = parser.parse_args()
+
+    module = fused_qkv_proj(
+        dev=args.dev,
+        seq_len=args.seq_len,
+        hidden_size=args.hidden_size,
+        combined_hidden_size=3 * args.hidden_size,
+        tile_m=args.tile_m,
+        tile_k=args.tile_k,
+        tile_n=args.tile_n,
+        parallel_seq=args.parallel_seq,
+        parallel_emb=args.parallel_emb,
+        dtype_in_str=args.dtype_in,
+        dtype_out_str=args.dtype_out,
+        use_scalar=args.use_scalar,
+        emulate_bf16_mmul_with_bfp16=args.emulate_bf16_mmul_with_bfp16,
+        prio_accuracy=False,
+        trace_size=args.trace_size,
+        archive=args.archive,
+    )
+
+    output_file_path = Path(args.output_file_path)
+    with open(output_file_path, "w") as f:
+        f.write(str(module))
 
 
 def fused_qkv_proj(
@@ -70,7 +108,6 @@ def fused_qkv_proj(
     tile_m: int,
     tile_k: int,
     tile_n: int,
-    num_aie_columns: int,
     parallel_seq: int,
     parallel_emb: int,
     dtype_in_str: str,
@@ -86,12 +123,12 @@ def fused_qkv_proj(
     if parallel_seq not in (1, 2, 4):
         raise AssertionError("Block 1 currently lowers parallel_seq only for {1, 2, 4}")
     n_aie_rows = parallel_seq
-    n_shim_mem_A = min(num_aie_columns, n_aie_rows)
-    n_A_tiles_per_shim = n_aie_rows // num_aie_columns if num_aie_columns < 4 else 1
+    n_shim_mem_A = n_aie_rows
+    n_A_tiles_per_shim = 1
 
     mem_tile_m_A = tile_m * n_A_tiles_per_shim
     mem_tile_m_C = tile_m * n_aie_rows
-    mem_tile_n = tile_n * num_aie_columns
+    mem_tile_n = tile_n * parallel_emb
 
     dtype_in = str_to_dtype(dtype_in_str)
     dtype_out = str_to_dtype(dtype_out_str)
@@ -123,11 +160,6 @@ def fused_qkv_proj(
     else:
         r, s, t = mac_dims
 
-    if dev == "npu" and num_aie_columns > 4:
-        raise AssertionError("Invalid configuration: NPU has 4 columns")
-    if dev == "npu2" and num_aie_columns > 8:
-        raise AssertionError("Invalid configuration: NPU2 has 8 columns")
-
     if seq_len % mem_tile_m_A != 0:
         raise AssertionError("Block 1 input must tile into mem-tile A blocks")
     if hidden_size % tile_k != 0:
@@ -138,15 +170,11 @@ def fused_qkv_proj(
         )
     if parallel_emb < 1:
         raise AssertionError("Block 1 requires parallel_emb >= 1")
-    if num_aie_columns % parallel_emb != 0:
-        raise AssertionError(
-            "Block 1 requires num_aie_columns divisible by parallel_emb"
-        )
     if hidden_size % parallel_emb != 0:
         raise AssertionError("Block 1 requires hidden_size divisible by parallel_emb")
     if hidden_size % mem_tile_n != 0:
         raise AssertionError(
-            "Block 1 currently requires hidden_size divisible by tile_n * num_aie_columns"
+            "Block 1 currently requires hidden_size divisible by tile_n * parallel_emb"
         )
     if seq_len % mem_tile_m_C != 0:
         raise AssertionError("Block 1 output must tile into mem-tile C blocks")
@@ -159,14 +187,7 @@ def fused_qkv_proj(
 
     fifo_depth = 2
     if dev == "npu":
-        if num_aie_columns == 1:
-            dev_ty = NPU1Col1()
-        elif num_aie_columns == 2:
-            dev_ty = NPU1Col2()
-        elif num_aie_columns == 4:
-            dev_ty = NPU1()
-        else:
-            raise AssertionError("Invalid Block 1 NPU column count")
+        dev_ty = NPU1()
     else:
         dev_ty = NPU2()
 
@@ -218,15 +239,15 @@ def fused_qkv_proj(
             [A_l1_ty, B_l1_ty, C_l1_ty],
         )
 
-    tiles = [[(col, row) for col in range(num_aie_columns)] for row in range(0, 6)]
+    tiles = [[(col, row) for col in range(parallel_emb)] for row in range(0, 6)]
     core_tiles = tiles[2:]
 
     A_l3l2_fifos = [None] * n_shim_mem_A
     A_l2l1_fifos = [None] * n_aie_rows
-    B_l3l2_fifos = [None] * num_aie_columns
-    B_l2l1_fifos = [None] * num_aie_columns
-    C_l1l2_fifos = [[None] * num_aie_columns for _ in range(n_aie_rows)]
-    C_l2l3_fifos = [None] * num_aie_columns
+    B_l3l2_fifos = [None] * parallel_emb
+    B_l2l1_fifos = [None] * parallel_emb
+    C_l1l2_fifos = [[None] * parallel_emb for _ in range(n_aie_rows)]
+    C_l2l3_fifos = [None] * parallel_emb
 
     rtps = [
         [
@@ -236,12 +257,12 @@ def fused_qkv_proj(
                 initial_value=np.array([0, 0], dtype=np.int32),
                 use_write_rtp=True,
             )
-            for col in range(num_aie_columns)
+            for col in range(parallel_emb)
         ]
         for row in range(n_aie_rows)
     ]
     worker_barriers = [
-        [WorkerRuntimeBarrier(initial_value=0) for col in range(num_aie_columns)]
+        [WorkerRuntimeBarrier(initial_value=0) for col in range(parallel_emb)]
         for row in range(n_aie_rows)
     ]
 
@@ -266,13 +287,13 @@ def fused_qkv_proj(
                 obj_types=[A_l1_ty] * (stop_row - start_row),
                 names=[f"A_L2L1_{row}" for row in range(start_row, stop_row)],
                 dims_to_stream=dims_to_stream,
-                placement=Tile(2 * i if num_aie_columns == 8 else i, 1),
+                placement=Tile(2 * i if parallel_emb == 8 else i, 1),
             )
         )
         for j in range(stop_row - start_row):
             A_l2l1_fifos[j + start_row] = a_tmp_fifos[j]
 
-    for col in range(num_aie_columns):
+    for col in range(parallel_emb):
         B_l3l2_fifos[col] = ObjectFifo(B_l2_ty, name=f"B_L3L2_{col}", depth=fifo_depth)
         dims_to_stream = [
             (tile_k // s, s * tile_n),
@@ -359,7 +380,7 @@ def fused_qkv_proj(
 
     workers = []
     for row in range(n_aie_rows):
-        for col in range(num_aie_columns):
+        for col in range(parallel_emb):
             tile_col, tile_row = core_tiles[row][col]
             acc_buffer = None
             if use_larger_internal_buffer:
@@ -390,7 +411,7 @@ def fused_qkv_proj(
     n_c_row_tiles_per_core = seq_len // mem_tile_m_C
     tb_max_n_rows = 4
     n_projection_tile_groups = hidden_size // mem_tile_n
-    columns_per_emb_group = num_aie_columns // parallel_emb
+    columns_per_emb_group = parallel_emb // parallel_emb
     emb_group_width = hidden_size // parallel_emb
 
     def make_b_taps(col: int) -> list[TensorAccessPattern]:
@@ -472,7 +493,7 @@ def fused_qkv_proj(
         rt.inline_ops(set_rtps, rtps)
 
         for row in range(n_aie_rows):
-            for col in range(num_aie_columns):
+            for col in range(parallel_emb):
                 rt.set_barrier(worker_barriers[row][col], 1)
 
         for tb in range((n_c_row_tiles_per_core + tb_max_n_rows - 1) // tb_max_n_rows):
@@ -485,7 +506,24 @@ def fused_qkv_proj(
                     break
                 for projection_idx in range(3):
                     tg = rt.task_group()
-                    for col in range(num_aie_columns):
+                    for row in range(n_aie_rows):
+                        for tile_row in range(current_tb_n_rows):
+                            rt.fill(
+                                A_l3l2_fifos[row].prod(),
+                                A,
+                                tap=make_a_tap(
+                                    row_base,
+                                    tile_row,
+                                    row,
+                                    n_projection_tile_groups,
+                                ),
+                                task_group=tg,
+                                placement=Tile(
+                                    2 * row if parallel_emb == 8 else row,
+                                    0,
+                                ),
+                            )
+                    for col in range(parallel_emb):
                         c_taps = make_c_taps(row_base, current_tb_n_rows, col)
                         c_taps = [c_taps[projection_idx]]
                         for C_tile in c_taps:
@@ -499,23 +537,6 @@ def fused_qkv_proj(
                             )
 
                         for tile_row in range(current_tb_n_rows):
-                            if col < n_aie_rows:
-                                rt.fill(
-                                    A_l3l2_fifos[col].prod(),
-                                    A,
-                                    tap=make_a_tap(
-                                        row_base,
-                                        tile_row,
-                                        col,
-                                        n_projection_tile_groups,
-                                    ),
-                                    task_group=tg,
-                                    placement=Tile(
-                                        2 * col if num_aie_columns == 8 else col,
-                                        0,
-                                    ),
-                                )
-
                             b_taps = [make_b_taps(col)[projection_idx]]
                             for B_tile in b_taps:
                                 rt.fill(
@@ -527,7 +548,7 @@ def fused_qkv_proj(
                                 )
                     rt.finish_task_group(tg)
         for row in range(n_aie_rows):
-            for col in range(num_aie_columns):
+            for col in range(parallel_emb):
                 rt.set_barrier(worker_barriers[row][col], 0)
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())

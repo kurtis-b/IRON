@@ -1,11 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from __future__ import annotations
-
 from pathlib import Path
 
-import numpy as np
 import torch
 from ml_dtypes import bfloat16
 
@@ -20,125 +17,63 @@ from iron.common import (
     XclbinArtifact,
 )
 from iron.common.utils import torch_to_numpy
-from iron.operators.qkv_proj.topology import qkv_proj_design
-
-
-class _ProjectionWeightView:
-    def __init__(self, block: "AIEQKVProj", projection_index: int) -> None:
-        self._block = block
-        self._projection_index = projection_index
-
-    @property
-    def weight(self) -> torch.Tensor:
-        return self._block._projection_weight(self._projection_index)
-
-    @weight.setter
-    def weight(self, value: torch.Tensor) -> None:
-        self._block._set_projection_weight(self._projection_index, value)
-
-    @property
-    def insts_artifact(self):
-        return self._block.insts_artifact
-
-    @property
-    def runtime_xclbin_artifact(self):
-        return self._block.runtime_xclbin_artifact
-
-    @property
-    def xclbin_artifact(self):
-        return self._block.xclbin_artifact
 
 
 class AIEQKVProj(AIEOperatorBase):
-    """Block 1 fused Q/K/V projection."""
-
-    @staticmethod
-    def _to_head_major(
-        tensor: torch.Tensor,
-        *,
-        seq_len: int,
-        hidden_size: int,
-        num_heads: int,
-    ) -> torch.Tensor:
-        head_dim = hidden_size // num_heads
-        return tensor.view(seq_len, num_heads, head_dim).permute(1, 0, 2).contiguous()
-
-    @staticmethod
-    def _combined_hidden_size(hidden_size: int) -> int:
-        return hidden_size * 3
+    """AIE-accelerated fused Q/K/V projection."""
 
     def __init__(
         self,
         *,
         seq_len: int,
         hidden_size: int,
-        context,
-        num_heads: int,
-        topology_id: str | None = None,
-    ) -> None:
+        use_static_weight=False,
+        tile_m=32,
+        tile_k=64,
+        tile_n=16,
+        parallel_seq=1,
+        parallel_emb=1,
+        context=None,
+        skip_add_to_list=False,
+    ):
         self.seq_len = seq_len
         self.hidden_size = hidden_size
-        self.num_heads = num_heads
+        self.combined_hidden_size = 3 * hidden_size
+        self.tile_m = tile_m
+        self.tile_k = tile_k
+        self.tile_n = tile_n
+        self.parallel_seq = parallel_seq
+        self.parallel_emb = parallel_emb
 
-        topology = qkv_proj_design(
-            seq_len=seq_len,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            topology_id=topology_id,
-        )
-        self.topology_id = str(topology["topology_id"])
-        self.topology_family = str(topology["topology_family"])
-        self.parallel_seq = int(topology["parallel_seq"])
-        self.parallel_emb = int(topology["parallel_emb"])
-        self.tile_m = int(topology["tile_m"])
-        self.tile_k = int(topology["tile_k"])
-        self.tile_n = int(topology["tile_n"])
-        self.num_aie_columns = int(topology["num_aie_columns"])
+        self.M = seq_len
+        self.K = hidden_size
+        self.N = self.combined_hidden_size
 
-        self.M, self.K, self.N = self._get_padded_dims(
-            seq_len,
-            hidden_size,
-            self._combined_hidden_size(hidden_size),
-        )
-        self.weight = torch.zeros(
-            (self._combined_hidden_size(hidden_size), hidden_size),
-            dtype=torch.bfloat16,
+        self.weight = (
+            None
+            if not use_static_weight
+            else torch.zeros((self.K, self.N), dtype=torch.bfloat16)
         )
 
         self.xclbin_artifact = None
         self.insts_artifact = None
-        self.runtime_xclbin_artifact = None
-        self.runtime_kernel_name = None
 
-        self.q_proj = _ProjectionWeightView(self, 0)
-        self.k_proj = _ProjectionWeightView(self, 1)
-        self.v_proj = _ProjectionWeightView(self, 2)
-
-        AIEOperatorBase.__init__(self, context=context)
-
-    def _get_padded_dims(self, M: int, K: int, N: int) -> tuple[int, int, int]:
-        num_aie_rows = self.parallel_seq
-        min_M = self.tile_m * num_aie_rows
-        min_K = self.tile_k
-        min_N = self.tile_n * self.num_aie_columns
-        M_padded = ((M + min_M - 1) // min_M) * min_M
-        K_padded = ((K + min_K - 1) // min_K) * min_K
-        N_padded = ((N + min_N - 1) // min_N) * min_N
-        return M_padded, K_padded, N_padded
-
-    def _get_artifact_name_base(self, prefix: str, M: int, K: int, N: int) -> str:
-        return (
-            f"{prefix}{M}x{K}x{N}_{self.num_aie_columns}_{self.tile_m}x{self.tile_k}x{self.tile_n}"
-            f"_ps{self.parallel_seq}_pe{self.parallel_emb}"
-            "_0_0_bf16_bf16_sc0_acc0_embf161_round1_batchA1d0_batchB1d0_batchC1d0"
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
         )
 
-    def _build_mlir_artifact(self, prefix: str, M: int, K: int, N: int):
+    def get_artifacts(self, prefix="qkv_proj_"):
         operator_dir = Path(__file__).parent
         base_dir = self.context.base_dir
         device_str = self.context.device_manager.device_str()
 
-        file_name_total_base = self._get_artifact_name_base(prefix, M, K, N)
+        file_name_base = (
+            f"{prefix}{self.M}x{self.K}x{self.N}_"
+            f"{self.tile_m}x{self.tile_k}x{self.tile_n}_"
+            f"ps{self.parallel_seq}_pe{self.parallel_emb}"
+            "_0_0_bf16_bf16_sc0_acc0_embf161_round1_batchA1d0_batchB1d0_batchC1d0"
+        )
+
         kernel_archive = (
             f"qkv_proj_{self.tile_m}x{self.tile_k}x{self.tile_n}_0_0_bf16_bf16"
             "_sc0_acc0_embf161_round1.a"
@@ -153,18 +88,17 @@ class AIEQKVProj(AIEOperatorBase):
         ]
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{file_name_total_base}.mlir",
+            f"{file_name_base}.mlir",
             import_path=operator_dir / "design.py",
             callback_fn="fused_qkv_proj",
             callback_kwargs={
                 "dev": device_str,
-                "seq_len": M,
-                "hidden_size": K,
-                "combined_hidden_size": N,
+                "seq_len": self.M,
+                "hidden_size": self.K,
+                "combined_hidden_size": self.N,
                 "tile_m": self.tile_m,
                 "tile_k": self.tile_k,
                 "tile_n": self.tile_n,
-                "num_aie_columns": self.num_aie_columns,
                 "parallel_seq": self.parallel_seq,
                 "parallel_emb": self.parallel_emb,
                 "dtype_in_str": "bf16",
@@ -179,7 +113,7 @@ class AIEQKVProj(AIEOperatorBase):
         )
 
         xclbin_artifact = XclbinArtifact.new(
-            f"{file_name_total_base}.xclbin",
+            f"{file_name_base}.xclbin",
             depends=[
                 mlir_artifact,
                 KernelArchiveArtifact.new(
@@ -199,7 +133,7 @@ class AIEQKVProj(AIEOperatorBase):
                         ),
                         KernelObjectArtifact.new(
                             "zero_scalar.o",
-                            [
+                            depends=[
                                 SourceArtifact.new(
                                     base_dir / "aie_kernels" / "aie2p" / "zero.cc"
                                 )
@@ -207,7 +141,7 @@ class AIEQKVProj(AIEOperatorBase):
                         ),
                         KernelObjectArtifact.new(
                             "convert_copy.o",
-                            [
+                            depends=[
                                 SourceArtifact.new(
                                     base_dir
                                     / "aie_kernels"
@@ -222,142 +156,69 @@ class AIEQKVProj(AIEOperatorBase):
             extra_flags=["--dynamic-objFifos"],
         )
         insts_artifact = InstsBinArtifact.new(
-            f"{file_name_total_base}.bin",
+            f"{file_name_base}.bin",
             depends=[mlir_artifact],
             extra_flags=["--dynamic-objFifos"],
         )
+
         return xclbin_artifact, insts_artifact
 
-    def get_artifacts(self, prefix: str = "qkv_proj_"):
-        return self._build_mlir_artifact(prefix, self.M, self.K, self.N)
-
     def set_up_artifacts(self):
-        if self.xclbin_artifact is None or self.insts_artifact is None:
-            self.xclbin_artifact, self.insts_artifact = self.get_artifacts()
-        artifacts = [self.xclbin_artifact, self.insts_artifact]
-        if (
-            self.runtime_xclbin_artifact is not None
-            and self.runtime_xclbin_artifact is not self.xclbin_artifact
-        ):
-            artifacts.append(self.runtime_xclbin_artifact)
-        self.add_artifacts(artifacts)
+        xclbin_artifact, insts_artifact = self.get_artifacts()
+        self.xclbin_artifact = xclbin_artifact
+        self.insts_artifact = insts_artifact
+        self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
-        runtime_xclbin_artifact = self.runtime_xclbin_artifact or self.xclbin_artifact
-        runtime_kernel_name = (
-            self.runtime_kernel_name or runtime_xclbin_artifact.kernel_name
-        )
+        static_weight = None
+        if self.weight is not None:
+            static_weight = torch_to_numpy(self.weight)
+
         self.add_kernel(
             "qkv_proj",
-            runtime_xclbin_artifact,
-            runtime_kernel_name,
+            self.xclbin_artifact,
+            self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
         self.add_buffer("A", self.M * self.K)
-        self.add_buffer(
-            "B",
-            self.K * self.N,
-            static_data=torch_to_numpy(self._packed_weight_matrix()),
-        )
-        self.add_buffer("Q", self.M * self.hidden_size)
-        self.add_buffer("K", self.M * self.hidden_size)
-        self.add_buffer("V", self.M * self.hidden_size)
+        self.add_buffer("B", self.K * self.N, static_data=static_weight)
+        self.add_buffer("Q", self.M * self.K)
+        self.add_buffer("K", self.M * self.K)
+        self.add_buffer("V", self.M * self.K)
         self.add_to_runlist("qkv_proj", "A", "B", "Q", "K", "V")
 
-    def _projection_slice(self, projection_index: int) -> slice:
-        start = projection_index * self.hidden_size
-        end = start + self.hidden_size
-        return slice(start, end)
-
-    def _projection_weight(self, projection_index: int) -> torch.Tensor:
-        return self.weight[self._projection_slice(projection_index)]
-
-    def _set_projection_weight(
-        self, projection_index: int, value: torch.Tensor
-    ) -> None:
-        expected_shape = (self.hidden_size, self.hidden_size)
-        if tuple(value.shape) != expected_shape:
-            raise ValueError(
-                f"AIEQKVProj: expected projection weight shape {expected_shape}, got {tuple(value.shape)}"
-            )
-        self.weight[self._projection_slice(projection_index)] = value.contiguous()
-
-    def _pad_hidden_states(self, hidden_states: np.ndarray) -> np.ndarray:
-        seq_len, hidden_size = hidden_states.shape
-        padded = np.zeros((1, self.M, self.K), dtype=hidden_states.dtype)
-        padded[0, :seq_len, :hidden_size] = hidden_states
-        return padded
-
-    def _packed_weight_matrix(self) -> torch.Tensor:
-        return self.weight.T.contiguous()
-
-    def _validate_hidden_states(self, hidden_states: torch.Tensor) -> None:
-        if hidden_states.ndim != 2:
+    def forward(self, hidden_states, B=None):
+        if tuple(hidden_states.shape) != (self.seq_len, self.hidden_size):
             raise AIEOperatorConstraintError(
-                "AIEQKVProj: expected a 2D hidden_states tensor"
+                "AIEQKVProj: expected hidden_states shape "
+                f"{(self.seq_len, self.hidden_size)}"
             )
-        if hidden_states.shape[0] != self.seq_len:
+        if B is None and self.weight is None:
+            raise AIEOperatorConstraintError("AIEQKVProj: missing stacked QKV weight")
+        if B is not None and tuple(B.shape) != (
+            self.hidden_size,
+            self.combined_hidden_size,
+        ):
             raise AIEOperatorConstraintError(
-                "AIEQKVProj: hidden_states sequence length must match the compiled operator"
+                "AIEQKVProj: expected stacked weight shape "
+                f"{(self.hidden_size, self.combined_hidden_size)}"
             )
 
-    def _read_projection_output(self, buffer_name: str, seq_len: int) -> torch.Tensor:
-        return self.read_buffer_as_torch(
-            buffer_name,
-            shape=(self.M, self.hidden_size),
-            dtype=bfloat16,
-        )[:seq_len]
+        return self._execute_aie_operation(hidden_states, B)
 
-    def _execute_flat_qkv(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden_states_np = torch_to_numpy(hidden_states)
-        seq_len, hidden_size = hidden_states_np.shape
-
-        if hidden_size != self.hidden_size:
-            raise AIEOperatorConstraintError(
-                "AIEQKVProj: incompatible hidden dimension"
-            )
-        if seq_len > self.M:
-            raise AIEOperatorConstraintError(
-                "AIEQKVProj: sequence length exceeds compiled runtime shape"
-            )
-
-        self.write_buffer("A", self._pad_hidden_states(hidden_states_np))
+    def _execute_aie_operation(self, hidden_states, B=None):
+        self.write_buffer("A", hidden_states)
+        if B is not None:
+            self.write_buffer("B", B)
         self.run_runlist()
 
-        return (
-            self._read_projection_output("Q", seq_len),
-            self._read_projection_output("K", seq_len),
-            self._read_projection_output("V", seq_len),
+        q = self.read_buffer_as_torch(
+            "Q", shape=(self.seq_len, self.hidden_size), dtype=bfloat16
         )
-
-    def forward_flat(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        self._validate_hidden_states(hidden_states)
-        return self._execute_flat_qkv(hidden_states)
-
-    def forward(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q_matrix, k_matrix, v_matrix = self.forward_flat(hidden_states)
-        q = self._to_head_major(
-            q_matrix,
-            seq_len=self.seq_len,
-            hidden_size=self.hidden_size,
-            num_heads=self.num_heads,
+        k = self.read_buffer_as_torch(
+            "K", shape=(self.seq_len, self.hidden_size), dtype=bfloat16
         )
-        k = self._to_head_major(
-            k_matrix,
-            seq_len=self.seq_len,
-            hidden_size=self.hidden_size,
-            num_heads=self.num_heads,
-        )
-        v = self._to_head_major(
-            v_matrix,
-            seq_len=self.seq_len,
-            hidden_size=self.hidden_size,
-            num_heads=self.num_heads,
+        v = self.read_buffer_as_torch(
+            "V", shape=(self.seq_len, self.hidden_size), dtype=bfloat16
         )
         return q, k, v

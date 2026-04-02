@@ -1,34 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import sys
-import math
-import copy
 import argparse
-from pathlib import Path
 import logging
-from itertools import product
+import sys
+from pathlib import Path
 
 from ml_dtypes import bfloat16
 import numpy as np
 
 from aie.iron import (
+    Buffer,
     Kernel,
     ObjectFifo,
     Program,
     Runtime,
     Worker,
-    Buffer,
-    Buffer,
     WorkerRuntimeBarrier,
 )
-from aie.iron.placers import SequentialPlacer
-from aie.iron.device import NPU1Col1, NPU2, Tile
-from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
-from aie.helpers.dialects.scf import if_, else_
-import aie.dialects.index as index
-from aie.dialects.aiex import *
+from aie.iron.controlflow import range_
+from aie.iron.device import NPU2, Tile
+from aie.iron.placers import SequentialPlacer
 
 base_dir = Path(__file__).parent
 
@@ -53,20 +46,18 @@ microkernel_mac_dim_map = {
 
 def main():
     argparser = argparse.ArgumentParser(
-        prog="AIE Matrix Multiplication MLIR Design (Single Core)",
-        description="Emits MLIR code for a matrix multiplication design of the given input size",
+        prog="AIE MHA Output Projection MLIR Design",
+        description="Emits MLIR code for a fused attention and output projection design",
     )
     argparser.add_argument("--heads", type=int, default=1)
     argparser.add_argument("--seq-len", type=int, default=256)
     argparser.add_argument("-d", type=int, default=64)
     argparser.add_argument("--parallel-seq", type=int, default=1)
-    argparser.add_argument("--q-seq-tile", type=int, default=64)
+    argparser.add_argument("--q-seq-tile", type=int, default=32)
     argparser.add_argument("--kv-seq-tile", type=int, default=64)
-    argparser.add_argument("--emb-tile", type=int, default=96)
+    argparser.add_argument("--emb-tile", type=int, default=64)
     argparser.add_argument("--o-proj-acc-depth", type=int, default=1)
     argparser.add_argument("--parallel-heads", type=int, default=1)
-    argparser.add_argument("--packed-output-parallel-seq", type=int, default=None)
-    argparser.add_argument("--packed-output-rows", type=int, default=None)
     argparser.add_argument("--emulate-bf16-mmul-with-bfp16", type=bool, default=True)
     argparser.add_argument("--trace_size", type=int, default=0)
     argparser.add_argument("--kernel-archive", type=str, default="mha_kernels.a")
@@ -90,8 +81,6 @@ def main():
         emb_tile=args.emb_tile,
         o_proj_acc_depth=args.o_proj_acc_depth,
         parallel_heads=args.parallel_heads,
-        packed_output_parallel_seq=args.packed_output_parallel_seq,
-        packed_output_rows=args.packed_output_rows,
         emulate_bf16_mmul_with_bfp16=args.emulate_bf16_mmul_with_bfp16,
         kernel_archive=args.kernel_archive,
         trace_size=args.trace_size,
@@ -118,12 +107,12 @@ def fused_mha(
     emb_tile: int,
     o_proj_acc_depth: int,
     parallel_heads: int,
-    packed_output_parallel_seq: int | None,
-    packed_output_rows: int | None,
     emulate_bf16_mmul_with_bfp16: bool,
     kernel_archive: str,
     trace_size: int = 0,
 ):
+    del trace_size
+
     embed_sz = heads * d
     sequence_parallel_mode = parallel_seq > 1
     parallel_lanes = (
@@ -138,9 +127,7 @@ def fused_mha(
     of_depth = 2
     o_proj_weight_consumer_depth = 1
     o_proj_partial_depth = 1
-    enable_tracing = True if trace_size > 0 else False
     dtype_str = "bf16"
-    dev = "npu2"
 
     num_q_seq_blocks = seq_len // q_seq_tile
     num_kv_seq_blocks = seq_len // kv_seq_tile
@@ -152,20 +139,8 @@ def fused_mha(
     num_o_col_groups = embed_sz // (emb_tile * o_proj_acc_depth)
 
     # r, s, t are the dimensions required by the microkernel MAC instructions.
-    mac_dims = microkernel_mac_dim_map[dev][dtype_str]
+    mac_dims = microkernel_mac_dim_map["npu2"][dtype_str]
     r, s, t = mac_dims[emulate_bf16_mmul_with_bfp16]
-
-    logging.info(f"Device: {dev}")
-    logging.info(f"Number of heads: {heads}")
-    logging.info(
-        f"MHA Dimensions: seq_len={seq_len}, d={d}, parallel_seq={parallel_seq}, q_seq_tile={q_seq_tile}, kv_seq_tile={kv_seq_tile}, emb_tile={emb_tile}, o_proj_acc_depth={o_proj_acc_depth}, parallel_heads={parallel_heads}"
-    )
-    logging.info(
-        f"num_q_seq_blocks: {num_q_seq_blocks}, num_kv_seq_blocks: {num_kv_seq_blocks}, num_qkv_head_block_per_parallel_head: {num_qkv_head_block_per_parallel_head}, num_o_col_groups: {num_o_col_groups}"
-    )
-    logging.info(f"Data type: {dtype_str}")
-    logging.info(f"Microkernel MAC dimensions: r={r}, s={s}, t={t}")
-    logging.info(f"Enable tracing: {enable_tracing}")
 
     assert heads > 0, "Number of heads must be greater than 0"
     assert parallel_seq > 0, "parallel_seq must be greater than 0"
@@ -214,16 +189,10 @@ def fused_mha(
         (seq_len, embed_sz),
         np.dtype[dtype],
     ]
-    if packed_output_parallel_seq is None:
-        O_ty = np.ndarray[
-            (seq_len, embed_sz),
-            np.dtype[dtype],
-        ]
-    else:
-        O_ty = np.ndarray[
-            (2 * packed_output_rows * embed_sz,),
-            np.dtype[dtype],
-        ]
+    O_ty = np.ndarray[
+        (seq_len, embed_sz),
+        np.dtype[dtype],
+    ]
 
     # Tensors living on the AIE-array
     q_ty = np.ndarray[(q_seq_tile, d), np.dtype[dtype]]
@@ -1179,86 +1148,16 @@ def fused_mha(
             tile._strides[2],
             tile._strides[3],
         ]
-    if packed_output_parallel_seq is None:
-        o_tile_rows = (
-            parallel_seq_join_distribute * q_seq_tile
-            if sequence_parallel_mode
-            else q_seq_tile
-        )
-        O_tiles = TensorTiler2D.group_tiler(
-            (seq_len, embed_sz),
-            (o_tile_rows, emb_tile),
-            (1, embed_sz // emb_tile // num_o_col_groups),
-        )
-    else:
-        if packed_output_rows is None:
-            raise ValueError("packed Block 3 handoff requires packed_output_rows")
-        if packed_output_rows < seq_len or packed_output_rows % q_seq_tile != 0:
-            raise ValueError(
-                "packed Block 3 handoff requires packed_output_rows to be "
-                "q_seq_tile-aligned and cover seq_len"
-            )
-        num_packed_q_seq_blocks = packed_output_rows // q_seq_tile
-        if num_packed_q_seq_blocks % packed_output_parallel_seq != 0:
-            raise ValueError(
-                "packed Block 3 handoff requires "
-                "(packed_output_rows / q_seq_tile) divisible by "
-                "packed_output_parallel_seq"
-            )
-        packed_tile_elems = 2 * q_seq_tile * emb_tile
-        k_tiles_per_q_block = embed_sz // emb_tile
-        if sequence_parallel_mode:
-            outer_group_count = 2 if parallel_lanes > 6 else 1
-            tile_group_stride = k_tiles_per_q_block * packed_tile_elems
-            O_tiles = []
-            for q_group_idx in range(num_q_seq_blocks // parallel_seq):
-                base_q_block = q_group_idx * parallel_seq
-                for outer_group in range(outer_group_count):
-                    outer_a_tile = outer_group * parallel_seq_join_distribute
-                    for col_group in range(num_o_col_groups):
-                        tile_index = (
-                            base_q_block + outer_a_tile
-                        ) * k_tiles_per_q_block + col_group * o_proj_acc_depth
-                        O_tiles.append(
-                            TensorAccessPattern(
-                                (2 * packed_output_rows * embed_sz,),
-                                offset=tile_index * packed_tile_elems,
-                                sizes=[
-                                    o_proj_acc_depth,
-                                    parallel_seq_join_distribute,
-                                    q_seq_tile,
-                                    emb_tile,
-                                ],
-                                strides=[
-                                    packed_tile_elems,
-                                    tile_group_stride,
-                                    emb_tile,
-                                    1,
-                                ],
-                            )
-                        )
-        else:
-            O_tiles = []
-            for q_block_idx in range(num_q_seq_blocks):
-                for col_group in range(num_o_col_groups):
-                    tile_index = (
-                        q_block_idx * k_tiles_per_q_block + col_group * o_proj_acc_depth
-                    )
-                    O_tiles.append(
-                        TensorAccessPattern(
-                            (2 * packed_output_rows * embed_sz,),
-                            offset=tile_index * packed_tile_elems,
-                            sizes=[o_proj_acc_depth, 1, q_seq_tile, emb_tile],
-                            strides=[packed_tile_elems, 0, emb_tile, 1],
-                        )
-                    )
-
-    def print_tap_seq_info(tap_seq, name):
-        for idx, tap in enumerate(tap_seq):
-            logging.info(f"{name} tile {idx}:")
-            logging.info(f"  Offset: {tap.offset}")
-            logging.info(f"  Sizes: {tap.sizes}")
-            logging.info(f"  Strides: {tap.strides}")
+    o_tile_rows = (
+        parallel_seq_join_distribute * q_seq_tile
+        if sequence_parallel_mode
+        else q_seq_tile
+    )
+    O_tiles = TensorTiler2D.group_tiler(
+        (seq_len, embed_sz),
+        (o_tile_rows, emb_tile),
+        (1, embed_sz // emb_tile // num_o_col_groups),
+    )
 
     def legalize_tap(tap: TensorAccessPattern, max_dim_size: int):
 
@@ -1321,12 +1220,6 @@ def fused_mha(
     legalize_tas(V_tiles)
     legalize_tas(WO_tiles)
     legalize_tas(O_tiles)
-
-    print_tap_seq_info(Q_tiles, "Q")
-    print_tap_seq_info(K_tiles, "K")
-    print_tap_seq_info(V_tiles, "V")
-    print_tap_seq_info(WO_tiles, "W_O")
-    print_tap_seq_info(O_tiles, "O")
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
@@ -1465,12 +1358,7 @@ def fused_mha(
 
                 rt.finish_task_group(tg)
 
-    # Create the program from the device type and runtime
-    if dev == "npu":
-        dev_ty = NPU1Col1()
-    else:
-        dev_ty = NPU2()
-    my_program = Program(dev_ty, rt)
+    my_program = Program(NPU2(), rt)
 
     # Place components (assign them resources on the device) and generate an MLIR module
     module = my_program.resolve_program(SequentialPlacer())
