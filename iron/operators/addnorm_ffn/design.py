@@ -1261,21 +1261,6 @@ def my_matmul(
                     logging.debug(
                         f"TB: {tb}, PP: {pingpong}, row_base: {row_base}, current_tb_n_rows: {current_tb_n_rows}, A tile: {a_tile}"
                     )
-                    C_tile = ln_taps[a_tile]
-                    # This line does not change MLIR output at all - it's just for recording data movement
-                    C_taps.append(C_tile)
-
-                    rt.drain(
-                        ln2_l2l3_fifos[a_tile].cons(),
-                        C,
-                        tap=C_tile,
-                        wait=True,
-                        task_group=tg,
-                        placement=Tile((a_tile * nB_tiles_distributed) % n_aie_cols, 0),
-                    )
-                    logging.debug(
-                        f"    Placed C output {a_tile} transfer at ({(a_tile * nB_tiles_distributed) % n_aie_cols}, 0) with offset {C_tile.offset}, sizes {C_tile.sizes}, strides {C_tile.strides}"
-                    )
                     # A input transfer:
                     A_tile = ln_taps[a_tile]
                     rt.fill(
@@ -1387,6 +1372,25 @@ def my_matmul(
                                 )
                                 # These lines do not change MLIR output at all - they are just for recording data movement
                                 B_down_proj_taps.append(B_down_proj_tile)
+                for a_tile in range(nA_tiles_distributed):
+                    logging.debug(
+                        f"TB: {tb}, PP: {pingpong}, row_base: {row_base}, current_tb_n_rows: {current_tb_n_rows}, A tile: {a_tile}"
+                    )
+                    C_tile = ln_taps[a_tile]
+                    # This line does not change MLIR output at all - it's just for recording data movement
+                    C_taps.append(C_tile)
+
+                    rt.drain(
+                        ln2_l2l3_fifos[a_tile].cons(),
+                        C,
+                        tap=C_tile,
+                        wait=True,
+                        task_group=tg,
+                        placement=Tile((a_tile * nB_tiles_distributed) % n_aie_cols, 0),
+                    )
+                    logging.debug(
+                        f"    Placed C output {a_tile} transfer at ({(a_tile * nB_tiles_distributed) % n_aie_cols}, 0) with offset {C_tile.offset}, sizes {C_tile.sizes}, strides {C_tile.strides}"
+                    )
                 if tb > 0 or (tb == 0 and pingpong > 0):
                     rt.finish_task_group(tg)
                     tg = rt.task_group()
