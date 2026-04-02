@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from operators.ffn.op import AIEFFN
 from operators.ffn.reference import generate_golden_reference
-from operators.common.test_utils import run_test
+from iron.common.test_utils import run_test
 
 TEST_BERT = True
 INCLUDE_SIMPLE_TESTS = False
