@@ -336,7 +336,7 @@ def my_matmul(
     C_taps = []
 
     # Define tensor types
-    AR_ty = np.ndarray[(2 * M * K,), np.dtype[dtype_in]]
+    A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
     B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
     C_ty = np.ndarray[(M * K,), np.dtype[dtype_out]]
 
@@ -990,7 +990,7 @@ def my_matmul(
 
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
-    with rt.sequence(AR_ty, B_ty, B_ty, C_ty) as (AR, B_Up, B_Down, C):
+    with rt.sequence(A_ty, A_ty, B_ty, B_ty, C_ty) as (A, R, B_Up, B_Down, C):
         rt.start(*workers)
 
         # Task groups will be used to determine when to sync/await/free DMA runtime ops
@@ -1018,9 +1018,8 @@ def my_matmul(
                         )
                         A_sizes = [nC_up_col_tiles_per_core, K_div_k, m, k]
                         A_strides = [0, k, K, 1]
-                        AR_shape = (2 * M, K)
                         A_tile = TensorAccessPattern(
-                            AR_shape,
+                            (M, K),
                             offset=A_offset,
                             sizes=A_sizes,
                             strides=A_strides,
@@ -1032,7 +1031,7 @@ def my_matmul(
                         )
                         rt.fill(
                             A_l3l2_fifos[a_tile].prod(),
-                            AR,
+                            A,
                             tap=A_tile,
                             task_group=tg,
                             placement=place,
@@ -1072,24 +1071,18 @@ def my_matmul(
                             if nA_tiles_distributed < 3
                             else Tile(a_tile * 2 + 1, 0)
                         )
-                        R_tile = TensorAccessPattern(
-                            AR_shape,
-                            offset=M * K + A_offset,
-                            sizes=C_sizes,
-                            strides=A_strides,
-                        )
                         rt.fill(
                             R_l3l2_fifos[a_tile].prod(),
-                            AR,
-                            tap=R_tile,
+                            R,
+                            tap=C_tile,
                             task_group=tg,
                             placement=place,
                         )
                         logging.debug(
-                            f"    Placed R input {a_tile} transfer at {place} with offset {R_tile.offset}, sizes {R_tile.sizes}, strides {R_tile.strides}"
+                            f"    Placed R input {a_tile} transfer at {place} with offset {C_tile.offset}, sizes {C_tile.sizes}, strides {C_tile.strides}"
                         )
                         # This line does not change MLIR output at all - it's just for recording data movement
-                        R_taps.append(R_tile)
+                        R_taps.append(C_tile)
                         C_taps.append(C_tile)
 
                     for b_tile in range(nB_tiles_distributed):

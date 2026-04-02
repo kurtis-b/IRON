@@ -21,12 +21,6 @@ from iron.common import (
 from iron.common.utils import torch_to_numpy, numpy_to_torch
 
 
-def _append_addnorm_debug_flag(extra_flags: list[str], debug_mode: int | None):
-    if debug_mode in (0, 1):
-        extra_flags.append(f"-DDEBUG_AIE_KERNELS={debug_mode}")
-        return
-
-
 class AIEFFNAN(AIEOperatorBase):
     """
     AIE-accelerated ANFFN block for BERT, which has an add & norm, up-projection and down-projection with a GeLU in between, then another add & norm.
@@ -187,7 +181,8 @@ class AIEFFNAN(AIEOperatorBase):
             f"-DDIM_K={tile_k}",
             f"-DDIM_N={tile_n}",
         ]
-        _append_addnorm_debug_flag(encoder_kernel_flags, self.debug_mode)
+        if self.debug_mode == 0 or self.debug_mode == 1:
+            encoder_kernel_flags.append(f"-DDEBUG_AIE_KERNELS={self.debug_mode}")
 
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_total_base}.xclbin",
@@ -298,11 +293,12 @@ class AIEFFNAN(AIEOperatorBase):
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_buffer("AR", 2 * self.M * self.K)
+        self.add_buffer("A", self.M * self.K)
+        self.add_buffer("R", self.M * self.K)
         self.add_buffer("B_Up", self.K * self.N, static_data=static_weights_up_proj)
         self.add_buffer("B_Down", self.K * self.N, static_data=static_weights_down_proj)
         self.add_buffer("C", self.M * self.K)
-        self.add_to_runlist("anffn", "AR", "B_Up", "B_Down", "C")
+        self.add_to_runlist("anffn", "A", "R", "B_Up", "B_Down", "C")
 
     def forward(self, A, R, B_Up=None, B_Down=None):
         """Forward pass through ANFFN block: R2 = LN(A) + R, C = LN(GeLU(R2 @ B_Up) @ B_Down) + R2"""
@@ -331,7 +327,12 @@ class AIEFFNAN(AIEOperatorBase):
         N2, K3 = B_Down_shape
 
         applicable = (
-            K == K2 and K == K3 and N == N2 and (M > 0) and K <= self.K and N <= self.N
+            K == K2
+            and K == K3
+            and N == N2
+            and (M <= self.M)
+            and K <= self.K
+            and N <= self.N
         )
         if not applicable:
             raise AIEOperatorConstraintError("AIEFFNAN: incompatible tensor shape(s)")
@@ -361,7 +362,7 @@ class AIEFFNAN(AIEOperatorBase):
                 A_part, R_part, B_Up_padded, B_Down_padded
             )
             max_M = min(M_lo + self.M, M)
-            result_padded[M_lo:max_M, :] = result_part[: max_M - M_lo, :]
+            result_padded[M_lo:max_M, :] = result_part[:max_M, :]
 
         # ANFFN produces 2D result, reshape to expected output shape
         result = numpy_to_torch(result_padded[:M, :K])
@@ -426,8 +427,8 @@ class AIEFFNAN(AIEOperatorBase):
         assert K == K2 and K == K3 and K == self.K
         assert N == N2 and N == self.N
 
-        ar_np = np.concatenate((A_np, R_np), axis=0)
-        self.write_buffer("AR", ar_np)
+        self.write_buffer("A", A_np)
+        self.write_buffer("R", R_np)
         if B_Up_np is not None:
             self.write_buffer("B_Up", B_Up_np)
         if B_Down_np is not None:
