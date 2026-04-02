@@ -58,6 +58,58 @@ def choose_partial_accum_mtile(
     return Tile((weight_col + 1) % n_aie_cols, 1)
 
 
+def choose_phase1_a_shim_col(
+    *,
+    a_tile: int,
+    n_aie_cols: int,
+    n_a_tiles: int,
+) -> int:
+    if n_a_tiles == 1:
+        return 0
+    if n_aie_cols >= 5:
+        return 0 if a_tile == 0 else 2
+    return a_tile
+
+
+def choose_phase1_r_shim_col(
+    *,
+    a_tile: int,
+    n_aie_cols: int,
+    n_a_tiles: int,
+) -> int:
+    if n_a_tiles == 1:
+        return n_aie_cols - 1
+    if n_aie_cols >= 5:
+        return n_aie_cols - 1 if a_tile == 0 else n_aie_cols - 2
+    return n_aie_cols - 1 - a_tile
+
+
+def choose_phase2_a_shim_col(
+    *,
+    a_tile: int,
+    n_aie_cols: int,
+    n_a_tiles: int,
+) -> int:
+    if n_a_tiles == 1:
+        return 0
+    if n_aie_cols >= 5:
+        return 0 if a_tile == 0 else n_aie_cols - 2
+    return 0 if a_tile == 0 else n_aie_cols - 1
+
+
+def choose_phase2_r_shim_col(
+    *,
+    a_tile: int,
+    n_aie_cols: int,
+    n_a_tiles: int,
+) -> int:
+    if n_a_tiles == 1:
+        return n_aie_cols - 1
+    if n_aie_cols >= 5:
+        return n_aie_cols - 1 if a_tile == 0 else 2
+    return n_aie_cols - 1 if a_tile == 0 else 0
+
+
 def fused_addnorm_ffn_addnorm(
     dev,
     M,
@@ -911,14 +963,28 @@ def fused_addnorm_ffn_addnorm(
                             A,
                             tap=tap,
                             task_group=phase1_tg,
-                            placement=Tile(a_tile, 0),
+                            placement=Tile(
+                                choose_phase1_a_shim_col(
+                                    a_tile=a_tile,
+                                    n_aie_cols=n_aie_cols,
+                                    n_a_tiles=nA_tiles_distributed,
+                                ),
+                                0,
+                            ),
                         )
                         rt.fill(
                             phase1_R_l3l2_fifos[a_tile].prod(),
                             R,
                             tap=tap,
                             task_group=phase1_tg,
-                            placement=Tile(n_aie_cols - 1 - a_tile, 0),
+                            placement=Tile(
+                                choose_phase1_r_shim_col(
+                                    a_tile=a_tile,
+                                    n_aie_cols=n_aie_cols,
+                                    n_a_tiles=nA_tiles_distributed,
+                                ),
+                                0,
+                            ),
                         )
                         rt.drain(
                             phase1_preadd_l2l3_fifos[a_tile].cons(),
@@ -979,7 +1045,14 @@ def fused_addnorm_ffn_addnorm(
                                 base_offset=stage_ln1_base,
                             ),
                             task_group=phase2_tg,
-                            placement=Tile(a_tile, 0),
+                            placement=Tile(
+                                choose_phase2_a_shim_col(
+                                    a_tile=a_tile,
+                                    n_aie_cols=n_aie_cols,
+                                    n_a_tiles=nA_tiles_distributed,
+                                ),
+                                0,
+                            ),
                         )
                     if run_ln2:
                         rt.fill(
@@ -996,7 +1069,14 @@ def fused_addnorm_ffn_addnorm(
                                 base_offset=stage_preadd_base,
                             ),
                             task_group=phase2_tg,
-                            placement=Tile(n_aie_cols - 1 - a_tile, 0),
+                            placement=Tile(
+                                choose_phase2_r_shim_col(
+                                    a_tile=a_tile,
+                                    n_aie_cols=n_aie_cols,
+                                    n_a_tiles=nA_tiles_distributed,
+                                ),
+                                0,
+                            ),
                         )
                         rt.drain(
                             ln2_l2l3_fifos[a_tile].cons(),
