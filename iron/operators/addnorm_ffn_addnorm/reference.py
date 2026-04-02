@@ -58,5 +58,8 @@ def generate_golden_reference(
         "ffn_down_weight": down_weight,
         "ln1_weight": ln1_weight,
         "ln2_weight": ln2_weight,
+        "preadd": preadd,
+        "ln1_out": addnorm1,
+        "down_proj": down_proj,
         "output": output,
     }
