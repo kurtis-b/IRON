@@ -12,11 +12,11 @@ def generate_golden_reference(rows: int, cols: int, dtype="bf16", seed=42):
     input2_tensor = torch.rand(rows, cols, dtype=torch_dtype_map[dtype]) * val_range
     weights = torch.rand(cols, dtype=torch_dtype_map[dtype]) * val_range
 
-    # Compute addition followed by layer norm
-    intermediate_tensor = torch.nn.functional.layer_norm(
-        input1_tensor, normalized_shape=(cols,), weight=weights, bias=None
+    # Compute addition followed by layer norm.
+    preadd_tensor = input1_tensor + input2_tensor
+    output_tensor = torch.nn.functional.layer_norm(
+        preadd_tensor, normalized_shape=(cols,), weight=weights, bias=None
     )
-    output_tensor = intermediate_tensor + input2_tensor
 
     return {
         "input1": input1_tensor,
