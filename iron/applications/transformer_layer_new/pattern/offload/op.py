@@ -1,11 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import math
+import time
+from types import MethodType
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from iron.common import AIEOperatorBase, AIEOperatorConstraintError
+from iron.common import AIEContext, AIEOperatorConstraintError
 from iron.operators.gemm.op import AIEGEMM
 
 
@@ -60,8 +66,21 @@ def resolve_offload_operator_config(
     return resolved
 
 
-class AIETransformerOffload(AIEOperatorBase):
-    """Transformer layer with GEMM stages offloaded to AIE and non-GEMM stages on host."""
+def _layer_norm_no_bias(
+    hidden_states: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return F.layer_norm(
+        hidden_states,
+        (hidden_states.shape[-1],),
+        weight=weight,
+        bias=None,
+    )
+
+
+class AIETransformerOffload(nn.Module):
+    """Transformer layer with all GEMM stages offloaded to AIE and non-GEMM stages on host."""
+
+    pattern_label = "offload"
 
     def __init__(
         self,
@@ -75,6 +94,8 @@ class AIETransformerOffload(AIEOperatorBase):
         operator_config=None,
         context=None,
     ):
+        super().__init__()
+
         self.seq_len = seq_len
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -90,6 +111,7 @@ class AIETransformerOffload(AIEOperatorBase):
         self.ffn_down_weight = None
         self.ln1_weight = ln1_weight
         self.ln2_weight = ln2_weight
+
         self.operator_config = resolve_offload_operator_config(
             seq_len,
             hidden_size,
@@ -98,74 +120,80 @@ class AIETransformerOffload(AIEOperatorBase):
             num_aie_columns=num_aie_columns,
             operator_config=operator_config,
         )
-        shared_gemm_config = dict(self.operator_config["shared_gemm"])
+
+        self.context = context if context is not None else AIEContext(use_runlist=False)
+        self.context.use_runlist = False
+        self.attn_context = AIEContext(use_runlist=False)
+        self.attn_context.use_runlist = False
+        self.attn_context.build_dir = self.context.build_dir
+        self.post_context = AIEContext(use_runlist=False)
+        self.post_context.use_runlist = False
+        self.post_context.build_dir = self.context.build_dir
 
         self.shared_xclbin_artifact = None
-        self.shared_kernel_name = "encoder_offload_gemm"
-        self._runtime_prepared = False
-        self.context = AIEContext(use_runlist=False)
-        self._runtime_ready = False
+        self.compile_setup_time_sec = None
+        self._artifacts_ready = False
 
-        # The wrapper owns a set of GEMM operators but should not register itself
-        # as a separately compiled/runtime-managed AIE operator.
-        AIEOperatorBase.__init__(self, context=context, skip_add_to_list=True)
-
-        common_gemm_args = dict(shared_gemm_config)
-        common_gemm_args["context"] = self.context
+        hidden_gemm_args = dict(self.operator_config["shared_gemm"])
+        hidden_gemm_args["context"] = self.context
+        attn_gemm_args = dict(self.operator_config["shared_gemm"])
+        attn_gemm_args["context"] = self.attn_context
+        post_gemm_args = dict(self.operator_config["shared_gemm"])
+        post_gemm_args["context"] = self.post_context
 
         self.q_proj = AIEGEMM(
             M=self.seq_len,
             K=self.hidden_size,
             N=self.hidden_size,
             use_static_weight=True,
-            **common_gemm_args,
+            **hidden_gemm_args,
         )
         self.k_proj = AIEGEMM(
             M=self.seq_len,
             K=self.hidden_size,
             N=self.hidden_size,
             use_static_weight=True,
-            **common_gemm_args,
+            **hidden_gemm_args,
         )
         self.v_proj = AIEGEMM(
             M=self.seq_len,
             K=self.hidden_size,
             N=self.hidden_size,
             use_static_weight=True,
-            **common_gemm_args,
+            **hidden_gemm_args,
         )
         self.attn_scores_gemm = AIEGEMM(
             M=self.seq_len,
             K=self.head_dim,
             N=self.seq_len,
-            **common_gemm_args,
+            **attn_gemm_args,
         )
         self.attn_output_gemm = AIEGEMM(
             M=self.seq_len,
             K=self.seq_len,
             N=self.head_dim,
-            **common_gemm_args,
+            **attn_gemm_args,
         )
         self.o_proj = AIEGEMM(
             M=self.seq_len,
             K=self.hidden_size,
             N=self.hidden_size,
             use_static_weight=True,
-            **common_gemm_args,
+            **post_gemm_args,
         )
         self.ffn_up_proj = AIEGEMM(
             M=self.seq_len,
             K=self.hidden_size,
             N=self.intermediate_size,
             use_static_weight=True,
-            **common_gemm_args,
+            **post_gemm_args,
         )
         self.ffn_down_proj = AIEGEMM(
             M=self.seq_len,
             K=self.intermediate_size,
             N=self.hidden_size,
             use_static_weight=True,
-            **common_gemm_args,
+            **post_gemm_args,
         )
 
         self.gemm_ops = [
@@ -178,47 +206,58 @@ class AIETransformerOffload(AIEOperatorBase):
             ("ffn_up", self.ffn_up_proj),
             ("ffn_down", self.ffn_down_proj),
         ]
-        self._bind_shared_gemm_artifacts()
 
-    def set_up_artifacts(self):
+    def _all_contexts(self):
+        return (self.context, self.attn_context, self.post_context)
+
+    def _artifact_case_prefix(self) -> str:
+        return (
+            "encoder_offload_case_"
+            f"{self.seq_len}x{self.hidden_size}x"
+            f"{self.intermediate_size}x{self.num_heads}_"
+        )
+
+    def _shared_runtime_dims(self) -> tuple[int, int, int]:
+        config = self.operator_config["shared_gemm"]
+        tile_m = int(config["tile_m"])
+        tile_k = int(config["tile_k"])
+        tile_n = int(config["tile_n"])
+        num_cols = int(config["num_aie_columns"])
+        return tile_m * 4, tile_k, tile_n * num_cols
+
+    def _bind_shared_gemm_artifacts(self) -> None:
+        case_prefix = self._artifact_case_prefix()
         if self.shared_xclbin_artifact is None:
-            shared_gemm_kwargs = dict(self.operator_config["shared_gemm"])
-            shared_gemm_kwargs.update(
-                {
-                    "M": self.seq_len,
-                    "K": self.hidden_size,
-                    "N": self.hidden_size,
-                    "context": self.context,
-                    "skip_add_to_list": True,
-                }
-            )
+            runtime_M, runtime_K, runtime_N = self._shared_runtime_dims()
             shared_builder = AIEGEMM(
-                **shared_gemm_kwargs,
+                M=runtime_M,
+                K=runtime_K,
+                N=runtime_N,
+                context=self.context,
+                skip_add_to_list=True,
+                **self.operator_config["shared_gemm"],
             )
-            self.shared_xclbin_artifact = shared_builder.get_runtime_xclbin_artifact(
-                prefix="encoder_offload_runtime_"
+            shared_xclbin, _ = shared_builder.get_artifacts(
+                prefix=f"{case_prefix}runtime_"
             )
-            self.shared_xclbin_artifact.kernel_name = self.shared_kernel_name
+            self.shared_xclbin_artifact = shared_xclbin
 
-        for name, gemm_op in self.gemm_ops:
-            if (
-                gemm_op.runtime_xclbin_artifact is self.shared_xclbin_artifact
-                and gemm_op.insts_artifact is not None
+        for workload_name, gemm_op in self.gemm_ops:
+            prefix = f"{case_prefix}{workload_name}_"
+
+            def _set_up_shared_artifacts(
+                op, *, _prefix=prefix, _shared=self.shared_xclbin_artifact
             ):
-                continue
-            insts_artifact = gemm_op.get_insts_artifact(
-                prefix=f"encoder_offload_{name}_",
-                xclbin_input=self.shared_xclbin_artifact,
-                kernel_name=self.shared_kernel_name,
-            )
-            gemm_op.bind_artifacts(
-                self.shared_xclbin_artifact,
-                insts_artifact,
-                runtime_xclbin_artifact=self.shared_xclbin_artifact,
-                runtime_kernel_name=self.shared_kernel_name,
-            )
+                if op.xclbin_artifact is _shared and op.insts_artifact is not None:
+                    return
+                _, insts_artifact = op.get_artifacts(prefix=_prefix)
+                op.xclbin_artifact = _shared
+                op.insts_artifact = insts_artifact
+                op.add_artifacts([_shared, insts_artifact])
 
-    def set_up_runtime(self):
+            gemm_op.set_up_artifacts = MethodType(_set_up_shared_artifacts, gemm_op)
+
+    def _validate_required_weights(self) -> None:
         required_weights = {
             "q_weight": self.q_weight,
             "k_weight": self.k_weight,
@@ -235,6 +274,13 @@ class AIETransformerOffload(AIEOperatorBase):
                 "AIETransformerOffload: missing required weights " + ", ".join(missing)
             )
 
+    def prepare_runtime(self):
+        if self._artifacts_ready:
+            return
+
+        self._validate_required_weights()
+        self._bind_shared_gemm_artifacts()
+
         self.q_proj.weight = self.q_weight.T.contiguous()
         self.k_proj.weight = self.k_weight.T.contiguous()
         self.v_proj.weight = self.v_weight.T.contiguous()
@@ -242,14 +288,31 @@ class AIETransformerOffload(AIEOperatorBase):
         self.ffn_up_proj.weight = self.ffn_up_weight.T.contiguous()
         self.ffn_down_proj.weight = self.ffn_down_weight.T.contiguous()
 
-    def prepare_runtime(self):
-        if self._runtime_prepared:
-            return
-        self.set_up_artifacts()
-        self.set_up_runtime()
-        self.context.compile_all()
-        self.context.prepare_runtime()
-        self._runtime_prepared = True
+        compile_started = time.perf_counter()
+        for context in self._all_contexts():
+            context.compile_all()
+        self.compile_setup_time_sec = time.perf_counter() - compile_started
+        self._artifacts_ready = True
+
+    @staticmethod
+    def _clear_runtime_descriptors(context):
+        for op in context.operators:
+            op.kernels = {}
+            op.buffers = {}
+            op.buffer_static_data = {}
+            op.buffer_aliases = {}
+            op.runlist = []
+            op.buffer_bos = {}
+            op.xrt_kernels = {}
+            op.xrt_runlist = None
+
+    def _run_stage(self, context, stage_fn):
+        context.prepare_runtime()
+        try:
+            return stage_fn()
+        finally:
+            context.reset_runtime()
+            self._clear_runtime_descriptors(context)
 
     def forward(self, x, attention_mask=None):
         if attention_mask is not None:
@@ -261,50 +324,46 @@ class AIETransformerOffload(AIEOperatorBase):
                 f"{(self.seq_len, self.hidden_size)}"
             )
 
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        self.prepare_runtime()
+
+        def run_qkv():
+            return self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        q, k, v = self._run_stage(self.context, run_qkv)
 
         q_heads = q.view(self.seq_len, self.num_heads, self.head_dim)
         k_heads = k.view(self.seq_len, self.num_heads, self.head_dim)
         v_heads = v.view(self.seq_len, self.num_heads, self.head_dim)
 
-        scale = math.sqrt(self.head_dim)
-        attn_head_outputs = []
-        for head in range(self.num_heads):
-            q_head = q_heads[:, head, :]
-            k_head_t = k_heads[:, head, :].transpose(0, 1).contiguous()
-            v_head = v_heads[:, head, :]
+        scale = self.head_dim**-0.5
 
-            attn_scores = self.attn_scores_gemm(q_head, k_head_t)
-            attn_probs = torch.nn.functional.softmax(attn_scores / scale, dim=-1)
-            attn_head_outputs.append(self.attn_output_gemm(attn_probs, v_head))
+        def run_attention():
+            attention_heads = []
+            for head in range(self.num_heads):
+                q_head = q_heads[:, head, :]
+                k_head_t = k_heads[:, head, :].transpose(0, 1).contiguous()
+                v_head = v_heads[:, head, :]
+
+                attn_scores = self.attn_scores_gemm(q_head, k_head_t)
+                attn_probs = torch.softmax(
+                    attn_scores.to(torch.float32) * scale, dim=-1
+                ).to(q.dtype)
+                attention_heads.append(self.attn_output_gemm(attn_probs, v_head))
+            return attention_heads
+
+        attention_heads = self._run_stage(self.attn_context, run_attention)
 
         attn_output = (
-            torch.stack(attn_head_outputs, dim=1)
+            torch.stack(attention_heads, dim=1)
             .contiguous()
             .view(self.seq_len, self.hidden_size)
         )
-        attn_output = self.o_proj(attn_output)
 
-        ln1_bias = torch.zeros_like(self.ln1_weight)
-        hidden_states = torch.nn.functional.layer_norm(
-            attn_output + x,
-            (self.hidden_size,),
-            self.ln1_weight,
-            ln1_bias,
-        )
+        def run_post():
+            projected = self.o_proj(attn_output)
+            hidden_states = _layer_norm_no_bias(projected + x, self.ln1_weight)
+            ffn_up = self.ffn_up_proj(hidden_states)
+            ffn_down = self.ffn_down_proj(F.gelu(ffn_up))
+            return _layer_norm_no_bias(ffn_down + hidden_states, self.ln2_weight)
 
-        intermediate = self.ffn_up_proj(hidden_states)
-        intermediate = torch.nn.functional.gelu(intermediate)
-        ffn_output = self.ffn_down_proj(intermediate)
-
-        ln2_bias = torch.zeros_like(self.ln2_weight)
-        output = torch.nn.functional.layer_norm(
-            ffn_output + hidden_states,
-            (self.hidden_size,),
-            self.ln2_weight,
-            ln2_bias,
-        )
-
-        return output
+        return self._run_stage(self.post_context, run_post)

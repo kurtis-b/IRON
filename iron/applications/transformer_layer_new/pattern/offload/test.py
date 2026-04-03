@@ -137,5 +137,12 @@ def test_offload_runtime_lifecycle_uses_non_runlist_context_and_registers_only_c
     )
 
     assert operator.context.use_runlist is False
+    assert operator.attn_context.use_runlist is False
+    assert operator.post_context.use_runlist is False
     assert operator not in operator.context.operators
-    assert len(operator.context.operators) == len(operator.gemm_ops)
+    total_registered = (
+        len(operator.context.operators)
+        + len(operator.attn_context.operators)
+        + len(operator.post_context.operators)
+    )
+    assert total_registered == len(operator.gemm_ops)
