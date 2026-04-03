@@ -1,0 +1,182 @@
+{
+  "baseline_768": {
+    "all": {
+      "shared_gemm": [
+        {
+          "candidate_id": "shared_64x64x16_cols4",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "prio_accuracy": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        },
+        {
+          "candidate_id": "shared_64x64x8_cols8",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 8,
+            "num_aie_columns": 8,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        }
+      ]
+    },
+    "64": {
+      "shared_gemm": [
+        {
+          "candidate_id": "shared_16x64x16_cols4",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "prio_accuracy": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        },
+        {
+          "candidate_id": "shared_16x64x8_cols8",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 8,
+            "num_aie_columns": 8,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "prio_accuracy": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        }
+      ]
+    },
+    "128": {
+      "shared_gemm": [
+        {
+          "candidate_id": "shared_32x64x16_cols4",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        },
+        {
+          "candidate_id": "shared_32x64x8_cols8",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 8,
+            "num_aie_columns": 8,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "prio_accuracy": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        }
+      ]
+    }
+  },
+  "baseline_1024": {
+    "all": {
+      "shared_gemm": [
+        {
+          "candidate_id": "shared_64x64x16_cols4",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "prio_accuracy": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        },
+        {
+          "candidate_id": "shared_64x64x8_cols8",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 8,
+            "num_aie_columns": 8,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        }
+      ]
+    },
+    "64": {
+      "shared_gemm": [
+        {
+          "candidate_id": "shared_16x64x16_cols4",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "prio_accuracy": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        },
+        {
+          "candidate_id": "shared_16x64x8_cols8",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 8,
+            "num_aie_columns": 8,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "prio_accuracy": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        }
+      ]
+    },
+    "128": {
+      "shared_gemm": [
+        {
+          "candidate_id": "shared_32x64x16_cols4",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        },
+        {
+          "candidate_id": "shared_32x64x8_cols8",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 8,
+            "num_aie_columns": 8,
+            "b_col_maj": false,
+            "c_col_maj": false,
+            "prio_accuracy": false,
+            "emulate_bf16_mmul_with_bfp16": true
+          }
+        }
+      ]
+    }
+  }
+}

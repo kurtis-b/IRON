@@ -23,6 +23,94 @@ from iron.operators.ffn.op import AIEFFN
 from iron.common.utils import torch_to_numpy
 
 
+def default_dataflow_operator_config(
+    seq_len,
+    hidden_size,
+    intermediate_size,
+    num_heads,
+    *,
+    num_aie_columns=8,
+):
+    head_dim = hidden_size // num_heads
+    return {
+        "qkv_proj": {
+            "seq_len": seq_len,
+            "hidden_size": hidden_size,
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 16,
+            "parallel_seq": 1,
+            "parallel_emb": num_aie_columns,
+        },
+        "mha_out_proj": {
+            "num_heads": num_heads,
+            "seq_len": seq_len,
+            "d": head_dim,
+            "parallel_seq": 1,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": head_dim,
+            "parallel_heads": 1,
+            "o_proj_acc_depth": 1,
+        },
+        "add_norm1": {
+            "size": seq_len * hidden_size,
+            "num_aie_columns": num_aie_columns,
+            "tile_size": hidden_size,
+        },
+        "ffn": {
+            "M": seq_len,
+            "K": hidden_size,
+            "N": intermediate_size,
+            "tile_m": 64,
+            "tile_k": 48,
+            "tile_n": 96,
+            "down_proj_depth": 8,
+            "num_aie_columns": num_aie_columns,
+            "b_col_maj": False,
+            "c_col_maj": False,
+            "emulate_bf16_mmul_with_bfp16": True,
+            "n_a_tiles_distributed": 4,
+            "n_b_tiles_distributed": 4,
+            "stage_only": None,
+            "gelu_stage": 1,
+        },
+        "add_norm2": {
+            "size": seq_len * hidden_size,
+            "num_aie_columns": num_aie_columns,
+            "tile_size": hidden_size,
+        },
+    }
+
+
+def resolve_dataflow_operator_config(
+    seq_len,
+    hidden_size,
+    intermediate_size,
+    num_heads,
+    *,
+    num_aie_columns=8,
+    operator_config=None,
+):
+    resolved = {
+        name: dict(config)
+        for name, config in default_dataflow_operator_config(
+            seq_len,
+            hidden_size,
+            intermediate_size,
+            num_heads,
+            num_aie_columns=num_aie_columns,
+        ).items()
+    }
+    if operator_config is None:
+        return resolved
+    for name, overrides in operator_config.items():
+        if name not in resolved:
+            raise ValueError(f"Unsupported dataflow operator config: {name}")
+        resolved[name].update(overrides)
+    return resolved
+
+
 class AIETransformerDataflow(AIEOperatorBase):
     """
     AIE-accelerated Transformer Layer using a runlist dataflow implementations.
@@ -53,6 +141,7 @@ class AIETransformerDataflow(AIEOperatorBase):
         num_aie_columns=8,
         ln1_weight=None,
         ln2_weight=None,
+        operator_config=None,
         context=None,
     ):
         self.seq_len = seq_len
@@ -73,6 +162,14 @@ class AIETransformerDataflow(AIEOperatorBase):
         self.ffn_up_weight = None
         self.ffn_down_weight = None
         self.ln2_weight = ln2_weight
+        self.operator_config = resolve_dataflow_operator_config(
+            seq_len,
+            hidden_size,
+            intermediate_size,
+            num_heads,
+            num_aie_columns=num_aie_columns,
+            operator_config=operator_config,
+        )
 
         # Artifacts created by set_up_artifacts() - one per layer
         self.combined_xclbin = None
@@ -106,17 +203,14 @@ class AIETransformerDataflow(AIEOperatorBase):
 
         prefix_base = f"encoder_dataflow_"
         # Q/K/V/O projection kernel
-        qkvo_proj = AIEQKVProj(
-            seq_len=self.seq_len,
-            hidden_size=self.hidden_size,
-            tile_m=32,
-            tile_k=64,
-            tile_n=16,
-            parallel_seq=1,
-            parallel_emb=self.num_aie_columns,
-            context=self.context,
-            skip_add_to_list=True,
+        qkvo_proj_kwargs = dict(self.operator_config["qkv_proj"])
+        qkvo_proj_kwargs.update(
+            {
+                "context": self.context,
+                "skip_add_to_list": True,
+            }
         )
+        qkvo_proj = AIEQKVProj(**qkvo_proj_kwargs)
         self.qkvo_proj_xclbin, self.qkvo_proj_insts = qkvo_proj.get_artifacts(
             prefix=f"{prefix_base}qkvo_proj_"
         )
@@ -128,19 +222,14 @@ class AIETransformerDataflow(AIEOperatorBase):
         artifacts.append(self.qkvo_proj_insts)
         kernel_id += 1
 
-        mha_out_proj = AIEMHAOutProj(
-            num_heads=self.num_heads,
-            seq_len=self.seq_len,
-            d=self.head_dim,
-            parallel_seq=1,
-            q_seq_tile=32,
-            kv_seq_tile=64,
-            emb_tile=self.head_dim,
-            parallel_heads=1,
-            o_proj_acc_depth=1,
-            context=self.context,
-            skip_add_to_list=True,
+        mha_out_proj_kwargs = dict(self.operator_config["mha_out_proj"])
+        mha_out_proj_kwargs.update(
+            {
+                "context": self.context,
+                "skip_add_to_list": True,
+            }
         )
+        mha_out_proj = AIEMHAOutProj(**mha_out_proj_kwargs)
         mha_out_proj.set_up_artifacts()
         self.mha_out_proj_xclbin = mha_out_proj.xclbin_artifact
         self.mha_out_proj_insts = mha_out_proj.insts_artifact
@@ -156,13 +245,16 @@ class AIETransformerDataflow(AIEOperatorBase):
         next_dep = self.mha_out_proj_xclbin
 
         # Pipelined add & norm kernel
+        add_norm1_kwargs = dict(self.operator_config["add_norm1"])
+        add_norm1_kwargs.update(
+            {
+                "weights": self.ln1_weight,
+                "context": self.context,
+                "skip_add_to_list": True,
+            }
+        )
         self.add_norm1_xclbin, self.add_norm1_insts = AIEAddAndNorm(
-            size=self.seq_len * self.hidden_size,
-            num_aie_columns=self.num_aie_columns,
-            tile_size=self.hidden_size,
-            weights=self.ln1_weight,
-            context=self.context,
-            skip_add_to_list=True,
+            **add_norm1_kwargs
         ).get_artifacts(prefix=f"{prefix_base}add_norm1_")
         self.add_norm1_xclbin.xclbin_input = next_dep
         self.add_norm1_xclbin.extra_flags += [
@@ -178,27 +270,15 @@ class AIETransformerDataflow(AIEOperatorBase):
         next_dep = self.add_norm1_xclbin
         kernel_id += 1
 
-        aie_ffn_config = {
-            "b_col_maj": False,
-            "c_col_maj": False,
-            "emulate_bf16_mmul_with_bfp16": True,
-            "n_a_tiles_distributed": 4,
-            "n_b_tiles_distributed": 4,
-            "stage_only": None,
-            "gelu_stage": 1,
-        }
+        ffn_kwargs = dict(self.operator_config["ffn"])
+        ffn_kwargs.update(
+            {
+                "context": self.context,
+                "skip_add_to_list": True,
+            }
+        )
         self.ffn_xclbin, self.ffn_insts = AIEFFN(
-            M=self.seq_len,
-            K=self.hidden_size,
-            N=self.intermediate_size,
-            tile_m=64,
-            tile_k=48,
-            tile_n=96,
-            down_proj_depth=8,
-            num_aie_columns=self.num_aie_columns,
-            **aie_ffn_config,
-            context=self.context,
-            skip_add_to_list=True,
+            **ffn_kwargs,
         ).get_artifacts(prefix=f"{prefix_base}ffn_")
         self.ffn_xclbin.xclbin_input = next_dep
         self.ffn_xclbin.extra_flags += [
@@ -212,13 +292,16 @@ class AIETransformerDataflow(AIEOperatorBase):
         kernel_id += 1
 
         # Second Pipelined add & norm kernel
+        add_norm2_kwargs = dict(self.operator_config["add_norm2"])
+        add_norm2_kwargs.update(
+            {
+                "weights": self.ln2_weight,
+                "context": self.context,
+                "skip_add_to_list": True,
+            }
+        )
         self.add_norm2_xclbin, self.add_norm2_insts = AIEAddAndNorm(
-            size=self.seq_len * self.hidden_size,
-            num_aie_columns=self.num_aie_columns,
-            tile_size=self.hidden_size,
-            weights=self.ln2_weight,
-            context=self.context,
-            skip_add_to_list=True,
+            **add_norm2_kwargs
         ).get_artifacts(prefix=f"{prefix_base}add_norm2_")
         self.add_norm2_xclbin.xclbin_input = next_dep
         self.add_norm2_xclbin.extra_flags += [

@@ -26,6 +26,161 @@ from iron.operators.transpose.op import AIETranspose
 from iron.common.utils import torch_to_numpy
 
 
+def default_runlist_operator_config(
+    seq_len,
+    hidden_size,
+    intermediate_size,
+    num_heads,
+    *,
+    num_aie_columns=8,
+):
+    head_dim = hidden_size // num_heads
+    eltwise_mul_tile_size = (seq_len * seq_len * num_heads) // (num_aie_columns * 2)
+    eltwise_add_tile_size = (seq_len * hidden_size) // (num_aie_columns * 2)
+    gelu_tile_size = (seq_len * intermediate_size) // (num_aie_columns * 2)
+    return {
+        "qkvo_proj": {
+            "M": seq_len,
+            "K": hidden_size,
+            "N": hidden_size,
+            "tile_m": 64,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": num_aie_columns,
+            "prio_accuracy": False,
+            "emulate_bf16_mmul_with_bfp16": True,
+        },
+        "k_transpose": {
+            "M": seq_len,
+            "N": hidden_size,
+            "num_aie_columns": num_aie_columns,
+            "num_channels": 2,
+            "m": 64,
+            "n": 96,
+            "s": 8,
+        },
+        "attn_scores": {
+            "M": seq_len,
+            "K": head_dim,
+            "N": seq_len,
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": num_aie_columns,
+            "batch_A": (num_heads, 1),
+            "batch_B": (num_heads, 1),
+            "batch_C": (num_heads, 0),
+            "prio_accuracy": False,
+            "emulate_bf16_mmul_with_bfp16": True,
+        },
+        "attn_scale": {
+            "size": seq_len * seq_len * num_heads,
+            "num_aie_columns": num_aie_columns,
+            "num_channels": 2,
+            "tile_size": min(
+                math.gcd(4096, eltwise_mul_tile_size), eltwise_mul_tile_size
+            ),
+            "scalar_broadcast": math.sqrt(1.0 / head_dim),
+        },
+        "attn_softmax": {
+            "rows": seq_len * num_heads,
+            "cols": seq_len,
+            "num_aie_columns": num_aie_columns,
+            "num_channels": 2,
+        },
+        "attn_output": {
+            "M": seq_len,
+            "K": seq_len,
+            "N": head_dim,
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4,
+            "batch_A": (num_heads, 0),
+            "batch_B": (num_heads, 1),
+            "batch_C": (num_heads, 1),
+            "prio_accuracy": False,
+            "emulate_bf16_mmul_with_bfp16": True,
+        },
+        "ln1": {
+            "size": seq_len * hidden_size,
+            "tile_size": hidden_size,
+            "num_aie_columns": num_aie_columns,
+            "num_channels": 2,
+        },
+        "add": {
+            "size": seq_len * hidden_size,
+            "num_aie_columns": num_aie_columns,
+            "num_channels": 2,
+            "tile_size": min(
+                math.gcd(4096, eltwise_add_tile_size), eltwise_add_tile_size
+            ),
+        },
+        "up_proj": {
+            "M": seq_len,
+            "K": hidden_size,
+            "N": intermediate_size,
+            "tile_m": 64,
+            "tile_k": 48,
+            "tile_n": 96,
+            "num_aie_columns": num_aie_columns,
+            "prio_accuracy": False,
+            "emulate_bf16_mmul_with_bfp16": True,
+        },
+        "gelu": {
+            "size": seq_len * intermediate_size,
+            "num_aie_columns": num_aie_columns,
+            "num_channels": 2,
+            "tile_size": min(math.gcd(4096, gelu_tile_size), gelu_tile_size),
+        },
+        "down_proj": {
+            "M": seq_len,
+            "K": intermediate_size,
+            "N": hidden_size,
+            "tile_m": 64,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": num_aie_columns,
+            "prio_accuracy": False,
+            "emulate_bf16_mmul_with_bfp16": True,
+        },
+        "ln2": {
+            "size": seq_len * hidden_size,
+            "tile_size": hidden_size,
+            "num_aie_columns": num_aie_columns,
+            "num_channels": 2,
+        },
+    }
+
+
+def resolve_runlist_operator_config(
+    seq_len,
+    hidden_size,
+    intermediate_size,
+    num_heads,
+    *,
+    num_aie_columns=8,
+    operator_config=None,
+):
+    resolved = {
+        name: dict(config)
+        for name, config in default_runlist_operator_config(
+            seq_len,
+            hidden_size,
+            intermediate_size,
+            num_heads,
+            num_aie_columns=num_aie_columns,
+        ).items()
+    }
+    if operator_config is None:
+        return resolved
+    for name, overrides in operator_config.items():
+        if name not in resolved:
+            raise ValueError(f"Unsupported runlist operator config: {name}")
+        resolved[name].update(overrides)
+    return resolved
+
+
 class AIETransformerRunlist(AIEOperatorBase):
     """
     AIE-accelerated Transformer Layer using runlist-based of separate nodes.
@@ -56,6 +211,7 @@ class AIETransformerRunlist(AIEOperatorBase):
         num_aie_columns=8,
         ln1_weight=None,
         ln2_weight=None,
+        operator_config=None,
         context=None,
     ):
         self.seq_len = seq_len
@@ -76,6 +232,14 @@ class AIETransformerRunlist(AIEOperatorBase):
         self.ffn_up_weight = None
         self.ffn_down_weight = None
         self.ln2_weight = ln2_weight
+        self.operator_config = resolve_runlist_operator_config(
+            seq_len,
+            hidden_size,
+            intermediate_size,
+            num_heads,
+            num_aie_columns=num_aie_columns,
+            operator_config=operator_config,
+        )
 
         # Artifacts created by set_up_artifacts() - one per layer
         self.combined_xclbin = None
@@ -120,31 +284,11 @@ class AIETransformerRunlist(AIEOperatorBase):
 
         kernel_id = 0x801
 
-        eltwise_mul_tile_size = (self.seq_len * self.seq_len * self.num_heads) // (
-            self.num_aie_columns * 2
-        )
-        eltwise_add_tile_size = (self.seq_len * self.hidden_size) // (
-            self.num_aie_columns * 2
-        )
-        gelu_tile_size = (self.seq_len * self.intermediate_size) // (
-            self.num_aie_columns * 2
-        )
-
         prefix_base = f"encoder_runlist_"
         # Q/K/V/O projection kernel
-        qkvo_proj = AIEGEMM(  # L1 utilization = 54 KB with double buffering
-            M=self.seq_len,
-            K=self.hidden_size,
-            N=self.hidden_size,
-            tile_m=64,
-            tile_k=96,
-            tile_n=48,  # N=768 processed across 8 columns with n=48
-            num_aie_columns=self.num_aie_columns,
-            prio_accuracy=False,
-            emulate_bf16_mmul_with_bfp16=True,
-            context=self.context,
-            skip_add_to_list=True,
-        )
+        qkvo_proj_kwargs = dict(self.operator_config["qkvo_proj"])
+        qkvo_proj_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        qkvo_proj = AIEGEMM(**qkvo_proj_kwargs)
         self.qkvo_proj_xclbin, self.qkvo_proj_insts = qkvo_proj.get_artifacts(
             prefix=f"{prefix_base}qkvo_proj_"
         )
@@ -157,17 +301,9 @@ class AIETransformerRunlist(AIEOperatorBase):
         kernel_id += 1
 
         # K Transpose kernel (transpose K matrix)
-        k_transpose = AIETranspose(
-            M=self.seq_len,
-            N=self.hidden_size,
-            num_aie_columns=self.num_aie_columns,
-            num_channels=2,
-            m=64,
-            n=96,
-            s=8,
-            context=self.context,
-            skip_add_to_list=True,
-        )
+        k_transpose_kwargs = dict(self.operator_config["k_transpose"])
+        k_transpose_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        k_transpose = AIETranspose(**k_transpose_kwargs)
         self.k_transpose_xclbin, self.k_transpose_insts = k_transpose.get_artifacts(
             prefix=f"{prefix_base}k_transpose_"
         )
@@ -182,21 +318,10 @@ class AIETransformerRunlist(AIEOperatorBase):
         kernel_id += 1
 
         # Attention score calculations (GEMM for Q*K^T, batched across heads)
+        attn_scores_kwargs = dict(self.operator_config["attn_scores"])
+        attn_scores_kwargs.update({"context": self.context, "skip_add_to_list": True})
         self.attn_scores_xclbin, self.attn_scores_insts = AIEGEMM(
-            M=self.seq_len,
-            K=self.head_dim,
-            N=self.seq_len,
-            tile_m=64,
-            tile_k=64,
-            tile_n=64,
-            num_aie_columns=self.num_aie_columns,
-            batch_A=(self.num_heads, 1),  # Batch across heads, batch dim first
-            batch_B=(self.num_heads, 1),  # Batch across heads, batch dim first
-            batch_C=(self.num_heads, 0),  # Batch across heads, batch dim first
-            prio_accuracy=False,
-            emulate_bf16_mmul_with_bfp16=True,
-            context=self.context,
-            skip_add_to_list=True,
+            **attn_scores_kwargs
         ).get_artifacts(prefix=f"{prefix_base}attn_scores_")
         self.attn_scores_xclbin.xclbin_input = self.k_transpose_xclbin
         self.attn_scores_xclbin.extra_flags += [
@@ -211,14 +336,10 @@ class AIETransformerRunlist(AIEOperatorBase):
         kernel_id += 1
 
         # Attention score scaling (Multiplication per attention score)
+        attn_scale_kwargs = dict(self.operator_config["attn_scale"])
+        attn_scale_kwargs.update({"context": self.context, "skip_add_to_list": True})
         self.attn_scale_xclbin, self.attn_scale_insts = AIEElementwiseMul(
-            size=self.seq_len * self.seq_len * self.num_heads,
-            num_aie_columns=self.num_aie_columns,
-            num_channels=2,
-            tile_size=min(math.gcd(4096, eltwise_mul_tile_size), eltwise_mul_tile_size),
-            scalar_broadcast=math.sqrt(1.0 / self.head_dim),
-            context=self.context,
-            skip_add_to_list=True,
+            **attn_scale_kwargs
         ).get_artifacts(prefix=f"{prefix_base}attn_scale_")
         self.attn_scale_xclbin.xclbin_input = self.attn_scores_xclbin
         self.attn_scale_xclbin.extra_flags += [
@@ -231,13 +352,10 @@ class AIETransformerRunlist(AIEOperatorBase):
         kernel_id += 1
 
         # Attention weight calculations (Softmax per attention score)
+        attn_softmax_kwargs = dict(self.operator_config["attn_softmax"])
+        attn_softmax_kwargs.update({"context": self.context, "skip_add_to_list": True})
         self.attn_softmax_xclbin, self.attn_softmax_insts = AIESoftmax(
-            rows=self.seq_len * self.num_heads,
-            cols=self.seq_len,
-            num_aie_columns=self.num_aie_columns,
-            num_channels=2,
-            context=self.context,
-            skip_add_to_list=True,
+            **attn_softmax_kwargs
         ).get_artifacts(prefix=f"{prefix_base}attn_softmax_")
         self.attn_softmax_xclbin.xclbin_input = self.attn_scale_xclbin
         self.attn_softmax_xclbin.extra_flags += [
@@ -250,21 +368,10 @@ class AIETransformerRunlist(AIEOperatorBase):
         kernel_id += 1
 
         # Output head calculations (GEMM per attention weights/V heads, batched across heads)
+        attn_output_kwargs = dict(self.operator_config["attn_output"])
+        attn_output_kwargs.update({"context": self.context, "skip_add_to_list": True})
         self.attn_output_xclbin, self.attn_output_insts = AIEGEMM(
-            M=self.seq_len,
-            K=self.seq_len,
-            N=self.head_dim,
-            tile_m=64,
-            tile_k=64,
-            tile_n=16,
-            num_aie_columns=4,
-            batch_A=(self.num_heads, 0),  # Batch across heads, batch dim first
-            batch_B=(self.num_heads, 1),  # Batch across heads, batch dim first
-            batch_C=(self.num_heads, 1),  # Batch across heads, batch dim first
-            prio_accuracy=False,
-            emulate_bf16_mmul_with_bfp16=True,
-            context=self.context,
-            skip_add_to_list=True,
+            **attn_output_kwargs
         ).get_artifacts(prefix=f"{prefix_base}attn_output_")
         self.attn_output_xclbin.xclbin_input = self.attn_softmax_xclbin
         self.attn_output_xclbin.extra_flags += [
@@ -280,15 +387,17 @@ class AIETransformerRunlist(AIEOperatorBase):
         next_dep = self.attn_output_xclbin
 
         # Layer normalization kernel
-        self.ln1_xclbin, self.ln1_insts = AIELayerNorm(
-            size=self.seq_len * self.hidden_size,
-            tile_size=self.hidden_size,
-            num_aie_columns=self.num_aie_columns,
-            num_channels=2,
-            weights=self.ln1_weight,
-            context=self.context,
-            skip_add_to_list=True,
-        ).get_artifacts(prefix=f"{prefix_base}ln1_")
+        ln1_kwargs = dict(self.operator_config["ln1"])
+        ln1_kwargs.update(
+            {
+                "weights": self.ln1_weight,
+                "context": self.context,
+                "skip_add_to_list": True,
+            }
+        )
+        self.ln1_xclbin, self.ln1_insts = AIELayerNorm(**ln1_kwargs).get_artifacts(
+            prefix=f"{prefix_base}ln1_"
+        )
         self.ln1_xclbin.xclbin_input = next_dep
         self.ln1_xclbin.extra_flags += [
             "--xclbin-instance-name=encoder_ln1",
@@ -300,14 +409,11 @@ class AIETransformerRunlist(AIEOperatorBase):
         kernel_id += 1
 
         # Residual connection kernel (Eltwise add)
-        self.add_xclbin, self.add_insts = AIEElementwiseAdd(
-            size=self.seq_len * self.hidden_size,
-            num_aie_columns=self.num_aie_columns,
-            num_channels=2,
-            tile_size=min(math.gcd(4096, eltwise_add_tile_size), eltwise_add_tile_size),
-            context=self.context,
-            skip_add_to_list=True,
-        ).get_artifacts(prefix=f"{prefix_base}add_")
+        add_kwargs = dict(self.operator_config["add"])
+        add_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        self.add_xclbin, self.add_insts = AIEElementwiseAdd(**add_kwargs).get_artifacts(
+            prefix=f"{prefix_base}add_"
+        )
         self.add_xclbin.xclbin_input = self.ln1_xclbin
         self.add_xclbin.extra_flags += [
             "--xclbin-instance-name=encoder_add",
@@ -319,21 +425,11 @@ class AIETransformerRunlist(AIEOperatorBase):
         next_dep = self.add_xclbin
         kernel_id += 1
         # Up projection (GEMM with Up projection weight)
-        self.up_proj_xclbin, self.up_proj_insts = (
-            AIEGEMM(  # L1 utilization = 54 KB with double buffering
-                M=self.seq_len,
-                K=self.hidden_size,
-                N=self.intermediate_size,
-                tile_m=64,
-                tile_k=48,
-                tile_n=96,
-                num_aie_columns=self.num_aie_columns,
-                prio_accuracy=False,
-                emulate_bf16_mmul_with_bfp16=True,
-                context=self.context,
-                skip_add_to_list=True,
-            ).get_artifacts(prefix=f"{prefix_base}up_proj_")
-        )
+        up_proj_kwargs = dict(self.operator_config["up_proj"])
+        up_proj_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        self.up_proj_xclbin, self.up_proj_insts = AIEGEMM(
+            **up_proj_kwargs
+        ).get_artifacts(prefix=f"{prefix_base}up_proj_")
         self.up_proj_xclbin.xclbin_input = next_dep
         self.up_proj_xclbin.extra_flags += [
             "--xclbin-instance-name=encoder_up_proj",
@@ -345,14 +441,11 @@ class AIETransformerRunlist(AIEOperatorBase):
         kernel_id += 1
 
         # Activation function (GeLU)
-        self.gelu_xclbin, self.gelu_insts = AIEGELU(
-            size=self.seq_len * self.intermediate_size,
-            num_aie_columns=self.num_aie_columns,
-            num_channels=2,
-            tile_size=min(math.gcd(4096, gelu_tile_size), gelu_tile_size),
-            context=self.context,
-            skip_add_to_list=True,
-        ).get_artifacts(prefix=f"{prefix_base}gelu_")
+        gelu_kwargs = dict(self.operator_config["gelu"])
+        gelu_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        self.gelu_xclbin, self.gelu_insts = AIEGELU(**gelu_kwargs).get_artifacts(
+            prefix=f"{prefix_base}gelu_"
+        )
         self.gelu_xclbin.xclbin_input = self.up_proj_xclbin
         self.gelu_xclbin.extra_flags += [
             "--xclbin-instance-name=encoder_gelu",
@@ -364,21 +457,11 @@ class AIETransformerRunlist(AIEOperatorBase):
         kernel_id += 1
 
         # Down projection (GEMM with Down projection weight)
-        self.down_proj_xclbin, self.down_proj_insts = (
-            AIEGEMM(  # L1 utilization = 54 KB with double buffering
-                M=self.seq_len,
-                K=self.intermediate_size,
-                N=self.hidden_size,
-                tile_m=64,
-                tile_k=96,
-                tile_n=48,  # N=768 processed across 8 columns with n=48
-                num_aie_columns=self.num_aie_columns,
-                prio_accuracy=False,
-                emulate_bf16_mmul_with_bfp16=True,
-                context=self.context,
-                skip_add_to_list=True,
-            ).get_artifacts(prefix=f"{prefix_base}down_proj_")
-        )
+        down_proj_kwargs = dict(self.operator_config["down_proj"])
+        down_proj_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        self.down_proj_xclbin, self.down_proj_insts = AIEGEMM(
+            **down_proj_kwargs
+        ).get_artifacts(prefix=f"{prefix_base}down_proj_")
         self.down_proj_xclbin.xclbin_input = self.gelu_xclbin
         self.down_proj_xclbin.extra_flags += [
             "--xclbin-instance-name=encoder_down_proj",
@@ -390,15 +473,17 @@ class AIETransformerRunlist(AIEOperatorBase):
         next_dep = self.down_proj_xclbin
         kernel_id += 1
         # Second Layer normalization kernel
-        self.ln2_xclbin, self.ln2_insts = AIELayerNorm(
-            size=self.seq_len * self.hidden_size,
-            tile_size=self.hidden_size,
-            num_aie_columns=self.num_aie_columns,
-            num_channels=2,
-            weights=self.ln2_weight,
-            context=self.context,
-            skip_add_to_list=True,
-        ).get_artifacts(prefix=f"{prefix_base}ln2_")
+        ln2_kwargs = dict(self.operator_config["ln2"])
+        ln2_kwargs.update(
+            {
+                "weights": self.ln2_weight,
+                "context": self.context,
+                "skip_add_to_list": True,
+            }
+        )
+        self.ln2_xclbin, self.ln2_insts = AIELayerNorm(**ln2_kwargs).get_artifacts(
+            prefix=f"{prefix_base}ln2_"
+        )
         self.ln2_xclbin.xclbin_input = next_dep
         self.ln2_xclbin.extra_flags += [
             "--xclbin-instance-name=encoder_ln2",

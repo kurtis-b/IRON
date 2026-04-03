@@ -1,0 +1,1189 @@
+{
+  "baseline_768": {
+    "all": {
+      "qkvo_proj": [
+        {
+          "candidate_id": "qkvo_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "qkvo_square",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "k_transpose": [
+        {
+          "candidate_id": "transpose_main",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "m": 64,
+            "n": 64,
+            "s": 8
+          }
+        }
+      ],
+      "attn_scores": [
+        {
+          "candidate_id": "scores_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "attn_scale": [
+        {
+          "candidate_id": "scale_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_softmax": [
+        {
+          "candidate_id": "softmax_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_output": [
+        {
+          "candidate_id": "output_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4
+          }
+        }
+      ],
+      "add": [
+        {
+          "candidate_id": "add_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "ln1": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "up_proj": [
+        {
+          "candidate_id": "up_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 48,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "up_alt",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "gelu": [
+        {
+          "candidate_id": "gelu_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "down_proj": [
+        {
+          "candidate_id": "down_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "down_alt",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 48,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "ln2": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ]
+    },
+    "64": {
+      "qkvo_proj": [
+        {
+          "candidate_id": "qkvo_16x96x96_cols8",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 96,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "qkvo_16x64x96_cols8",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "qkvo_16x128x64_cols6",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 128,
+            "tile_n": 64,
+            "num_aie_columns": 6
+          }
+        },
+        {
+          "candidate_id": "qkvo_32x96x96_cols8",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 96,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "qkvo_16x64x64_cols8",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "k_transpose": [
+        {
+          "candidate_id": "transpose_seq64_main",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "m": 32,
+            "n": 32,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_seq64_alt",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 1,
+            "m": 32,
+            "n": 32,
+            "s": 8
+          }
+        }
+      ],
+      "attn_scores": [
+        {
+          "candidate_id": "scores_default",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4
+          }
+        }
+      ],
+      "attn_scale": [
+        {
+          "candidate_id": "scale_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_softmax": [
+        {
+          "candidate_id": "softmax_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_output": [
+        {
+          "candidate_id": "output_default",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4
+          }
+        }
+      ],
+      "add": [
+        {
+          "candidate_id": "add_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "ln1": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "up_proj": [
+        {
+          "candidate_id": "up_default",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 48,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "up_alt",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "gelu": [
+        {
+          "candidate_id": "gelu_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "down_proj": [
+        {
+          "candidate_id": "down_default",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "down_alt",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 48,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "ln2": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ]
+    },
+    "128": {
+      "qkvo_proj": [
+        {
+          "candidate_id": "qkvo_default",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "qkvo_square",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "k_transpose": [
+        {
+          "candidate_id": "transpose_main",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "m": 32,
+            "n": 32,
+            "s": 8
+          }
+        }
+      ],
+      "attn_scores": [
+        {
+          "candidate_id": "scores_default",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "attn_scale": [
+        {
+          "candidate_id": "scale_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_softmax": [
+        {
+          "candidate_id": "softmax_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_output": [
+        {
+          "candidate_id": "output_default",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4
+          }
+        }
+      ],
+      "add": [
+        {
+          "candidate_id": "add_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "ln1": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "up_proj": [
+        {
+          "candidate_id": "up_default",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 48,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "up_alt",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "gelu": [
+        {
+          "candidate_id": "gelu_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "down_proj": [
+        {
+          "candidate_id": "down_default",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "down_alt",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 48,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "ln2": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ]
+    },
+    "256": {
+      "qkvo_proj": [
+        {
+          "candidate_id": "qkvo_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "qkvo_square",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "k_transpose": [
+        {
+          "candidate_id": "transpose_main",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "m": 64,
+            "n": 64,
+            "s": 8
+          }
+        }
+      ],
+      "attn_scores": [
+        {
+          "candidate_id": "scores_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 32,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "attn_scale": [
+        {
+          "candidate_id": "scale_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_softmax": [
+        {
+          "candidate_id": "softmax_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_output": [
+        {
+          "candidate_id": "output_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4
+          }
+        }
+      ],
+      "add": [
+        {
+          "candidate_id": "add_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "ln1": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "up_proj": [
+        {
+          "candidate_id": "up_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 48,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "up_alt",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "gelu": [
+        {
+          "candidate_id": "gelu_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "down_proj": [
+        {
+          "candidate_id": "down_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 96,
+            "tile_n": 48,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "down_alt",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 48,
+            "tile_n": 96,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "ln2": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ]
+    }
+  },
+  "baseline_1024": {
+    "all": {
+      "qkvo_proj": [
+        {
+          "candidate_id": "qkvo_64x64",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "k_transpose": [
+        {
+          "candidate_id": "transpose_main",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "m": 64,
+            "n": 64,
+            "s": 8
+          }
+        }
+      ],
+      "attn_scores": [
+        {
+          "candidate_id": "scores_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "attn_scale": [
+        {
+          "candidate_id": "scale_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_softmax": [
+        {
+          "candidate_id": "softmax_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_output": [
+        {
+          "candidate_id": "output_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4
+          }
+        }
+      ],
+      "add": [
+        {
+          "candidate_id": "add_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "ln1": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "up_proj": [
+        {
+          "candidate_id": "up_64x64",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "gelu": [
+        {
+          "candidate_id": "gelu_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "down_proj": [
+        {
+          "candidate_id": "down_64x64",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "ln2": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ]
+    },
+    "64": {
+      "qkvo_proj": [
+        {
+          "candidate_id": "qkvo_16x64x128_cols8",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 128,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "qkvo_16x128x64_cols8",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 128,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "qkvo_16x64x64_cols8",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "qkvo_32x64x64_cols8",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "qkvo_16x128x128_cols8",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 128,
+            "tile_n": 128,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "k_transpose": [
+        {
+          "candidate_id": "transpose_seq64_main",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "m": 32,
+            "n": 32,
+            "s": 8
+          }
+        }
+      ],
+      "attn_scores": [
+        {
+          "candidate_id": "scores_default",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4
+          }
+        }
+      ],
+      "attn_scale": [
+        {
+          "candidate_id": "scale_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_softmax": [
+        {
+          "candidate_id": "softmax_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_output": [
+        {
+          "candidate_id": "output_default",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4
+          }
+        }
+      ],
+      "add": [
+        {
+          "candidate_id": "add_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "ln1": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "up_proj": [
+        {
+          "candidate_id": "up_128x64",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 128,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "up_64x128",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 128,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "gelu": [
+        {
+          "candidate_id": "gelu_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "down_proj": [
+        {
+          "candidate_id": "down_128x64",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 128,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        },
+        {
+          "candidate_id": "down_64x128",
+          "config": {
+            "tile_m": 16,
+            "tile_k": 64,
+            "tile_n": 128,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "ln2": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ]
+    },
+    "128": {
+      "qkvo_proj": [
+        {
+          "candidate_id": "qkvo_64x64",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "k_transpose": [
+        {
+          "candidate_id": "transpose_main",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "m": 32,
+            "n": 32,
+            "s": 8
+          }
+        }
+      ],
+      "attn_scores": [
+        {
+          "candidate_id": "scores_default",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "attn_scale": [
+        {
+          "candidate_id": "scale_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_softmax": [
+        {
+          "candidate_id": "softmax_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_output": [
+        {
+          "candidate_id": "output_default",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4
+          }
+        }
+      ],
+      "add": [
+        {
+          "candidate_id": "add_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "ln1": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "up_proj": [
+        {
+          "candidate_id": "up_64x64",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "gelu": [
+        {
+          "candidate_id": "gelu_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "down_proj": [
+        {
+          "candidate_id": "down_64x64",
+          "config": {
+            "tile_m": 32,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "ln2": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ]
+    },
+    "256": {
+      "qkvo_proj": [
+        {
+          "candidate_id": "qkvo_64x64",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "k_transpose": [
+        {
+          "candidate_id": "transpose_main",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "m": 64,
+            "n": 64,
+            "s": 8
+          }
+        }
+      ],
+      "attn_scores": [
+        {
+          "candidate_id": "scores_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 32,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "attn_scale": [
+        {
+          "candidate_id": "scale_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_softmax": [
+        {
+          "candidate_id": "softmax_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "attn_output": [
+        {
+          "candidate_id": "output_default",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": 4
+          }
+        }
+      ],
+      "add": [
+        {
+          "candidate_id": "add_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "ln1": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "up_proj": [
+        {
+          "candidate_id": "up_64x64",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "gelu": [
+        {
+          "candidate_id": "gelu_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ],
+      "down_proj": [
+        {
+          "candidate_id": "down_64x64",
+          "config": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "num_aie_columns": 8
+          }
+        }
+      ],
+      "ln2": [
+        {
+          "candidate_id": "ln_default",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2
+          }
+        }
+      ]
+    }
+  }
+}

@@ -5,12 +5,13 @@ SPDX-License-Identifier: Apache-2.0
 
 # Study Conventions
 
-This note defines the current shared rules for the first
-`transformer_layer_new` study implementation pass.
+This note defines the current shared rules for the implemented
+`transformer_layer_new` studies.
 
-The current implementation scope is the block study only.
-Broader shared-study conventions for `end_to_end`, `reconfiguration_overhead`,
-and `igpu` are deferred until those study runners land.
+The implemented scope now includes:
+
+- `block`
+- `end_to_end`
 
 ## Retained Cases
 
@@ -33,6 +34,12 @@ Full sequence ladder:
 The shared block-study case table lives in:
 
 - `study/block/cases.py`
+
+The end-to-end study uses checked-in default candidate files:
+
+- `study/end_to_end/dataflow_candidates.json`
+- `study/end_to_end/runlist_candidates.json`
+- `study/end_to_end/offload_candidates.json`
 
 ## Shared Block Entry Point
 
@@ -59,9 +66,10 @@ sequence length.
 
 ## Stable Naming
 
-Stable study ID:
+Stable study IDs:
 
 - `block`
+- `end_to_end`
 
 Stable family IDs:
 
@@ -81,22 +89,57 @@ the full transformer layer.
 
 ## Synthetic Data Policy
 
-The first block-study pass uses each operator's existing reference generator
-directly.
+The block study uses each operator's existing reference generator directly.
 
 - `qkv_proj` uses `iron/operators/qkv_proj/reference.py`
 - `mha_out_proj` uses `iron/operators/mha_out_proj/reference.py`
 - `addnorm` uses `iron/operators/addnorm/reference.py`
 - `ffn` uses `iron/operators/ffn/reference.py`
 
-The block runner does not introduce a new app-level synthetic data contract in
-this pass.
+The end-to-end study uses the shared app-level generator in:
+
+- `pattern/reference.py`
+
+This shared generator supports two modes:
+
+- full golden-reference generation for small sequence lengths
+- synthetic input/weight generation without materializing the full attention
+  output for the long retained ladder
+
+The end-to-end runner uses golden-reference validation through `seq_len=512`
+and finite-output validation above that threshold.
+
+## End-to-End Tuning Flow
+
+The end-to-end study tunes internal operators before the final full-pattern run.
+
+For each `(family, seq_len, execution_mode)` point:
+
+- load the default JSON candidate table from the mode-local candidate file
+- benchmark each internal operator's candidates in isolation
+- select the fastest passing candidate for that operator
+- assemble the selected operator configs into the full pattern
+- run the final end-to-end benchmark once with that resolved config set
+
+There is no CLI override for the candidate files in this first pass.
+
+The current tuning units are:
+
+- `dataflow`:
+  `qkv_proj`, `mha_out_proj`, `add_norm1`, `ffn`, `add_norm2`
+- `runlist`:
+  `qkvo_proj`, `k_transpose`, `attn_scores`, `attn_scale`, `attn_softmax`,
+  `attn_output`, `add`, `ln1`, `up_proj`, `gelu`, `down_proj`, `ln2`
+- `offload`:
+  `shared_gemm`
 
 ## Result CSV Contract
 
-The current canonical CSV is:
+Current canonical CSVs:
 
 - `results/block/results.csv`
+- `results/end_to_end/tuning.csv`
+- `results/end_to_end/results.csv`
 
 Required row groups:
 
@@ -114,3 +157,33 @@ Required row groups:
 
 The CSV keeps one row per candidate and marks the minimum-latency successful
 candidate per `(family_id, seq_len, block_kind)` as best.
+
+The end-to-end CSV keeps one row per `(study_case_id, seq_len, execution_mode)`
+and marks the minimum-latency successful row per `(study_case_id, seq_len)` as
+best.
+
+The end-to-end tuning CSV keeps one row per
+`(study_case_id, seq_len, execution_mode, internal_operator, candidate_id)` and
+marks the fastest passing candidate per internal operator with
+`is_operator_best=True`.
+
+Required end-to-end row groups:
+
+- identity:
+  `study_id`, `study_case_id`, `study_case_label`, `backend`,
+  `execution_mode`, `pattern_label`, `seq_len`
+- workload:
+  `hidden_size`, `intermediate_size`, `num_attention_heads`,
+  `attention_head_size`, `batch_size`, `dtype`, `use_bias`, `weights_source`
+- timing:
+  `warmup_runs`, `runs_per_sample`, `measured_inference_count`,
+  `timed_total_sec`, `avg_latency_ms`, `compile_setup_time_ms`
+- throughput and power:
+  `tokens_per_sec`, `power_backend`, `avg_power_w`,
+  `tokens_per_sec_per_watt`
+- runtime metadata:
+  `npu_dispatch_count`, `npu_unique_instruction_binary_count`,
+  `npu_unique_xclbin_count`, `process_model`
+- result:
+  `validation_error_count`, `run_status`, `failure_message`,
+  `selected_candidate_ids_json`, `selected_config_json`, `is_best`

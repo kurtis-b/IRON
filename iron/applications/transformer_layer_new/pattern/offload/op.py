@@ -9,6 +9,57 @@ from iron.common import AIEOperatorBase, AIEOperatorConstraintError
 from iron.operators.gemm.op import AIEGEMM
 
 
+def default_offload_operator_config(
+    seq_len,
+    hidden_size,
+    intermediate_size,
+    num_heads,
+    *,
+    num_aie_columns=8,
+):
+    del seq_len, hidden_size, intermediate_size, num_heads
+    return {
+        "shared_gemm": {
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 16,
+            "num_aie_columns": num_aie_columns,
+            "b_col_maj": False,
+            "c_col_maj": False,
+            "prio_accuracy": False,
+            "emulate_bf16_mmul_with_bfp16": True,
+        }
+    }
+
+
+def resolve_offload_operator_config(
+    seq_len,
+    hidden_size,
+    intermediate_size,
+    num_heads,
+    *,
+    num_aie_columns=8,
+    operator_config=None,
+):
+    resolved = {
+        name: dict(config)
+        for name, config in default_offload_operator_config(
+            seq_len,
+            hidden_size,
+            intermediate_size,
+            num_heads,
+            num_aie_columns=num_aie_columns,
+        ).items()
+    }
+    if operator_config is None:
+        return resolved
+    for name, overrides in operator_config.items():
+        if name not in resolved:
+            raise ValueError(f"Unsupported offload operator config: {name}")
+        resolved[name].update(overrides)
+    return resolved
+
+
 class AIETransformerOffload(AIEOperatorBase):
     """Transformer layer with GEMM stages offloaded to AIE and non-GEMM stages on host."""
 
@@ -21,6 +72,7 @@ class AIETransformerOffload(AIEOperatorBase):
         num_aie_columns=8,
         ln1_weight=None,
         ln2_weight=None,
+        operator_config=None,
         context=None,
     ):
         self.seq_len = seq_len
@@ -38,23 +90,28 @@ class AIETransformerOffload(AIEOperatorBase):
         self.ffn_down_weight = None
         self.ln1_weight = ln1_weight
         self.ln2_weight = ln2_weight
+        self.operator_config = resolve_offload_operator_config(
+            seq_len,
+            hidden_size,
+            intermediate_size,
+            num_heads,
+            num_aie_columns=num_aie_columns,
+            operator_config=operator_config,
+        )
+        shared_gemm_config = dict(self.operator_config["shared_gemm"])
 
         self.shared_xclbin_artifact = None
         self.shared_kernel_name = "encoder_offload_gemm"
+        self._runtime_prepared = False
+        self.context = AIEContext(use_runlist=False)
+        self._runtime_ready = False
 
-        AIEOperatorBase.__init__(self, context=context)
+        # The wrapper owns a set of GEMM operators but should not register itself
+        # as a separately compiled/runtime-managed AIE operator.
+        AIEOperatorBase.__init__(self, context=context, skip_add_to_list=True)
 
-        common_gemm_args = {
-            "tile_m": 64,
-            "tile_k": 64,
-            "tile_n": 16,
-            "num_aie_columns": self.num_aie_columns,
-            "b_col_maj": False,
-            "c_col_maj": False,
-            "partition_N": 1,
-            "emulate_bf16_mmul_with_bfp16": True,
-            "context": self.context,
-        }
+        common_gemm_args = dict(shared_gemm_config)
+        common_gemm_args["context"] = self.context
 
         self.q_proj = AIEGEMM(
             M=self.seq_len,
@@ -121,23 +178,22 @@ class AIETransformerOffload(AIEOperatorBase):
             ("ffn_up", self.ffn_up_proj),
             ("ffn_down", self.ffn_down_proj),
         ]
+        self._bind_shared_gemm_artifacts()
 
     def set_up_artifacts(self):
         if self.shared_xclbin_artifact is None:
+            shared_gemm_kwargs = dict(self.operator_config["shared_gemm"])
+            shared_gemm_kwargs.update(
+                {
+                    "M": self.seq_len,
+                    "K": self.hidden_size,
+                    "N": self.hidden_size,
+                    "context": self.context,
+                    "skip_add_to_list": True,
+                }
+            )
             shared_builder = AIEGEMM(
-                M=self.seq_len,
-                K=self.hidden_size,
-                N=self.hidden_size,
-                tile_m=64,
-                tile_k=64,
-                tile_n=16,
-                num_aie_columns=self.num_aie_columns,
-                b_col_maj=False,
-                c_col_maj=False,
-                partition_N=1,
-                emulate_bf16_mmul_with_bfp16=True,
-                context=self.context,
-                skip_add_to_list=True,
+                **shared_gemm_kwargs,
             )
             self.shared_xclbin_artifact = shared_builder.get_runtime_xclbin_artifact(
                 prefix="encoder_offload_runtime_"
@@ -185,6 +241,15 @@ class AIETransformerOffload(AIEOperatorBase):
         self.o_proj.weight = self.attn_output_weight.T.contiguous()
         self.ffn_up_proj.weight = self.ffn_up_weight.T.contiguous()
         self.ffn_down_proj.weight = self.ffn_down_weight.T.contiguous()
+
+    def prepare_runtime(self):
+        if self._runtime_prepared:
+            return
+        self.set_up_artifacts()
+        self.set_up_runtime()
+        self.context.compile_all()
+        self.context.prepare_runtime()
+        self._runtime_prepared = True
 
     def forward(self, x, attention_mask=None):
         if attention_mask is not None:

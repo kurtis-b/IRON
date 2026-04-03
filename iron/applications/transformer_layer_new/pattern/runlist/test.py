@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 from iron.applications.transformer_layer_new.pattern.runlist.op import (
     AIETransformerRunlist,
 )
-from iron.applications.transformer_layer_new.pattern.runlist.reference import (
+from iron.applications.transformer_layer_new.pattern.reference import (
     generate_golden_reference,
 )
 from iron.common.test_utils import run_test

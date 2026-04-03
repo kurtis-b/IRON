@@ -19,8 +19,7 @@ The remaining work in this app is the study harness and study documentation.
 ## Current Status
 
 - the block implementations are complete
-- the first implementation pass is the shared block-study entry point under
-  `study/block`
+- the implemented study runners are `study/block` and `study/end_to_end`
 - study infrastructure is being added here instead of extending the older
   `transformer_layer` app
 
@@ -57,13 +56,14 @@ Each study gets its own directory under `study/`.
 Current structure:
 
 - `docs/`
-  shared study rules and current block-study conventions
+  shared study rules and the current block/end-to-end conventions
 - `pattern/`
   existing end-to-end implementations
 - `study/block/`
   shared block entry point, editable case table, tests, and docs
 - `study/end_to_end/`
-  end-to-end study runner and docs
+  workload-based end-to-end study runner, JSON tuning defaults, power helper,
+  tests, and docs
 - `study/reconfiguration_overhead/`
   reconfiguration-overhead study runner and docs
 - `study/igpu/`
@@ -73,30 +73,37 @@ Current structure:
 
 ## Study Outputs
 
-Current canonical result CSV:
+Current canonical result CSVs:
 
 - `results/block/results.csv`
+- `results/end_to_end/results.csv`
+- `results/end_to_end/tuning.csv`
 
 Later planned result CSVs:
 
-- `results/end_to_end/results.csv`
 - `results/reconfiguration_overhead/results.csv`
 - `results/igpu/results.csv`
 
-Current study entrypoint:
+Current study entrypoints:
 
 - `python -m iron.applications.transformer_layer_new.study.block.run`
+- `python -m iron.applications.transformer_layer_new.study.end_to_end.run`
+
+The end-to-end study also uses checked-in default candidate files:
+
+- `study/end_to_end/dataflow_candidates.json`
+- `study/end_to_end/runlist_candidates.json`
+- `study/end_to_end/offload_candidates.json`
 
 Later planned entrypoints:
 
-- `python -m iron.applications.transformer_layer_new.study.end_to_end.run`
 - `python -m iron.applications.transformer_layer_new.study.reconfiguration_overhead.run`
 - `python -m iron.applications.transformer_layer_new.study.igpu.run`
 
 ## Documentation Map
 
 - `docs/study_conventions.md`
-  shared study rules, naming, and current block-study result conventions
+  shared study rules, naming, and current block/end-to-end result conventions
 - `study/block/README.md`
   block-study contract and shared entry point
 - `study/end_to_end/README.md`

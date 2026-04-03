@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 from iron.applications.transformer_layer_new.pattern.offload.op import (
     AIETransformerOffload,
 )
-from iron.applications.transformer_layer_new.pattern.offload.reference import (
+from iron.applications.transformer_layer_new.pattern.reference import (
     generate_golden_reference,
 )
 
@@ -83,8 +83,7 @@ def test_transformer_layer(
     operator.ffn_up_weight = golden_ref["weights"]["ffn_up_weight"]
     operator.ffn_down_weight = golden_ref["weights"]["ffn_down_weight"]
 
-    operator.context.compile_all()
-    operator.context.prepare_runtime()
+    operator.prepare_runtime()
 
     operator.forward(golden_ref["input"])
 
@@ -121,3 +120,22 @@ def test_transformer_layer(
     assert (
         output_errors <= max_acceptable_errors
     ), f"Test failed with {output_errors} errors (max allowable: {max_acceptable_errors})"
+
+
+def test_offload_runtime_lifecycle_uses_non_runlist_context_and_registers_only_children(
+    aie_context,
+):
+    golden_ref = generate_golden_reference(64, 768, 3072, 12)
+    operator = AIETransformerOffload(
+        seq_len=64,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_heads=12,
+        ln1_weight=golden_ref["weights"]["ln1_weight"],
+        ln2_weight=golden_ref["weights"]["ln2_weight"],
+        context=aie_context,
+    )
+
+    assert operator.context.use_runlist is False
+    assert operator not in operator.context.operators
+    assert len(operator.context.operators) == len(operator.gemm_ops)
