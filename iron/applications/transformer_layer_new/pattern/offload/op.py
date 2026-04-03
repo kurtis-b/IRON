@@ -359,11 +359,11 @@ class AIETransformerOffload(nn.Module):
             .view(self.seq_len, self.hidden_size)
         )
 
-        def run_post():
-            projected = self.o_proj(attn_output)
-            hidden_states = _layer_norm_no_bias(projected + x, self.ln1_weight)
-            ffn_up = self.ffn_up_proj(hidden_states)
-            ffn_down = self.ffn_down_proj(F.gelu(ffn_up))
-            return _layer_norm_no_bias(ffn_down + hidden_states, self.ln2_weight)
-
-        return self._run_stage(self.post_context, run_post)
+        projected = self._run_stage(self.post_context, lambda: self.o_proj(attn_output))
+        hidden_states = _layer_norm_no_bias(projected + x, self.ln1_weight)
+        ffn_up = self._run_stage(self.post_context, lambda: self.ffn_up_proj(hidden_states))
+        ffn_down = self._run_stage(
+            self.post_context,
+            lambda: self.ffn_down_proj(F.gelu(ffn_up)),
+        )
+        return _layer_norm_no_bias(ffn_down + hidden_states, self.ln2_weight)
