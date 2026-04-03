@@ -428,13 +428,18 @@ def _tokens_per_sec_per_watt(
 
 
 def _cleanup_operator_runtime(operator) -> None:
-    context = getattr(operator, "context", None)
-    if context is None or not hasattr(context, "reset_runtime"):
-        return
-    try:
-        context.reset_runtime()
-    except Exception:
-        return
+    seen_contexts = set()
+    for attr_name in ("context", "attn_context", "post_context"):
+        context = getattr(operator, attr_name, None)
+        if context is None or not hasattr(context, "reset_runtime"):
+            continue
+        if id(context) in seen_contexts:
+            continue
+        seen_contexts.add(id(context))
+        try:
+            context.reset_runtime()
+        except Exception:
+            continue
 
 
 def _partitioned_static_weight_tensor(

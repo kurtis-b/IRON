@@ -19,25 +19,15 @@ from iron.applications.transformer_layer_new.pattern.reference import (
 
 
 def generate_test_params(extensive=False):
+    del extensive
     params = [
         # seq_len,embedding_dim,ffn_dim,num_heads
         (512, 768, 3072, 12),
-        (512, 768, 3072, 12),
-        (512, 768, 3072, 12),
-        (512, 768, 3072, 12),
-        (512, 768, 3072, 12),
-        (512, 768, 3072, 12),
-        (512, 768, 3072, 12),
     ]
-    extensive_params = []
-
-    if extensive:
-        params = extensive_params
-
-    names = []
-    for seq_len, embedding_dim, ffn_dim, num_heads in params:
-        names.append(f"transformer_{seq_len}x{embedding_dim}x{ffn_dim}x{num_heads}")
-
+    names = [
+        f"transformer_{seq_len}x{embedding_dim}x{ffn_dim}x{num_heads}"
+        for seq_len, embedding_dim, ffn_dim, num_heads in params
+    ]
     return params, names
 
 

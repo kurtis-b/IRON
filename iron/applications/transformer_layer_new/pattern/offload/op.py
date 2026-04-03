@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import math
-import time
 from types import MethodType
 
 import torch
@@ -100,7 +98,6 @@ class AIETransformerOffload(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_heads = num_heads
-        self.num_aie_columns = num_aie_columns
         self.head_dim = hidden_size // num_heads
 
         self.q_weight = None
@@ -131,7 +128,6 @@ class AIETransformerOffload(nn.Module):
         self.post_context.build_dir = self.context.build_dir
 
         self.shared_xclbin_artifact = None
-        self.compile_setup_time_sec = None
         self._artifacts_ready = False
 
         hidden_gemm_args = dict(self.operator_config["shared_gemm"])
@@ -288,10 +284,8 @@ class AIETransformerOffload(nn.Module):
         self.ffn_up_proj.weight = self.ffn_up_weight.T.contiguous()
         self.ffn_down_proj.weight = self.ffn_down_weight.T.contiguous()
 
-        compile_started = time.perf_counter()
         for context in self._all_contexts():
             context.compile_all()
-        self.compile_setup_time_sec = time.perf_counter() - compile_started
         self._artifacts_ready = True
 
     @staticmethod
@@ -361,7 +355,9 @@ class AIETransformerOffload(nn.Module):
 
         projected = self._run_stage(self.post_context, lambda: self.o_proj(attn_output))
         hidden_states = _layer_norm_no_bias(projected + x, self.ln1_weight)
-        ffn_up = self._run_stage(self.post_context, lambda: self.ffn_up_proj(hidden_states))
+        ffn_up = self._run_stage(
+            self.post_context, lambda: self.ffn_up_proj(hidden_states)
+        )
         ffn_down = self._run_stage(
             self.post_context,
             lambda: self.ffn_down_proj(F.gelu(ffn_up)),

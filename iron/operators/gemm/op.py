@@ -69,8 +69,6 @@ class AIEGEMM(AIEOperatorBase):
         self.M = M_padded
         self.K = K_padded
         self.N = N_padded
-        self.b_col_maj = self.gemm_args.get("b_col_maj", False)
-        self.c_col_maj = self.gemm_args.get("c_col_maj", False)
 
         # Artifacts created by set_up_artifacts()
         self.xclbin_artifact = None
@@ -164,14 +162,10 @@ class AIEGEMM(AIEOperatorBase):
             requires_context=False,
         )
 
-        # FIXME: We should be able to reuse the same xclbin for same tile
-        # sizes, only swapping out the instruction sequence for different
-        # problem sizes. However, there seem to be cases where this does
-        # not work and the GEMM appears to be misconfigured for the wrong
-        # size (resulting in a timeout when trying to run it). Perhaps
-        # XRT is caching something, or something is wrong with the run-
-        # time parameter (synchronization)? For now, create separate
-        # xclbins for each problem size.
+        # Base GEMM keeps per-problem-size xclbins because reusing a single
+        # xclbin across different problem sizes has produced misconfigured
+        # runtime behavior in this path. Higher-level wrappers may still bind
+        # one shared xclbin intentionally for their own staged execution.
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_total_base}.xclbin",
             depends=[

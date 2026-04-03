@@ -118,7 +118,8 @@ def test_candidate_table_merges_family_defaults_with_seq_overrides(tmp_path):
     assert table["runlist"]["qkvo_proj"][0]["candidate_id"] == "default"
 
 
-def test_split_candidate_files_define_explicit_overrides_through_512():
+def test_split_candidate_files_define_low_sequence_overrides_and_fallbacks():
+    payloads = load_default_candidate_payloads()
     for execution_mode in EXECUTION_MODES:
         payload = load_candidate_payload(
             execution_mode,
@@ -126,8 +127,16 @@ def test_split_candidate_files_define_explicit_overrides_through_512():
         )
         for family_id in FAMILY_IDS:
             assert "all" in payload[family_id]
-            for seq_key in ("64", "128", "256", "512"):
+            for seq_key in ("64", "128"):
                 assert seq_key in payload[family_id]
+            if execution_mode != "offload":
+                assert "256" in payload[family_id]
+            assert candidate_table_for_case(family_id, 256, payloads=payloads)[
+                execution_mode
+            ]
+            assert candidate_table_for_case(family_id, 512, payloads=payloads)[
+                execution_mode
+            ]
 
 
 def _expected_dataflow_config_rows(
@@ -208,11 +217,26 @@ def test_dataflow_candidate_file_matches_block_study_configs():
         "dataflow",
         default_candidates_path("dataflow"),
     )
+    payloads = {
+        "dataflow": payload,
+        "runlist": load_candidate_payload(
+            "runlist",
+            default_candidates_path("runlist"),
+        ),
+        "offload": load_candidate_payload(
+            "offload",
+            default_candidates_path("offload"),
+        ),
+    }
 
     for family_id in FAMILY_IDS:
         family_cases = BLOCK_CASES[family_id]
         for seq_len in (64, 128, 256, 512):
-            seq_payload = payload[family_id][str(seq_len)]
+            seq_payload = candidate_table_for_case(
+                family_id,
+                seq_len,
+                payloads=payloads,
+            )["dataflow"]
             block_case = family_cases[seq_len]
             for operator_name in MODE_OPERATORS["dataflow"]:
                 actual = [
