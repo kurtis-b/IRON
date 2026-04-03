@@ -521,8 +521,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="all",
         help="Select one block kind or benchmark all block kinds.",
     )
-    parser.add_argument("--warmup-iters", type=int, default=10)
-    parser.add_argument("--timed-iters", type=int, default=100)
+    parser.add_argument("--warmup-iters", type=int, default=None)
+    parser.add_argument("--timed-iters", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, default=default_output_path())
     return parser.parse_args(argv)
@@ -543,13 +543,34 @@ def selected_seq_len(seq_len_argument: str) -> int | None:
     return seq_len
 
 
+def iteration_schedule(
+    seq_len: int,
+    *,
+    warmup_iters: int | None,
+    timed_iters: int | None,
+) -> tuple[int, int]:
+    if seq_len <= 128:
+        default_warmup_iters, default_timed_iters = 10, 100
+    elif seq_len <= 512:
+        default_warmup_iters, default_timed_iters = 5, 50
+    elif seq_len <= 2048:
+        default_warmup_iters, default_timed_iters = 3, 20
+    else:
+        default_warmup_iters, default_timed_iters = 1, 10
+
+    return (
+        default_warmup_iters if warmup_iters is None else warmup_iters,
+        default_timed_iters if timed_iters is None else timed_iters,
+    )
+
+
 def build_rows(
     *,
     family_argument: str,
     seq_len_argument: str,
     block_argument: str,
-    warmup_iters: int,
-    timed_iters: int,
+    warmup_iters: int | None,
+    timed_iters: int | None,
     seed: int,
 ) -> list[dict[str, object]]:
     family_id = None if family_argument == "all" else family_argument
@@ -558,21 +579,28 @@ def build_rows(
 
     rows: list[dict[str, object]] = []
     for case in iter_cases(family_id=family_id, seq_len=seq_len):
+        case_warmup_iters, case_timed_iters = iteration_schedule(
+            case.seq_len,
+            warmup_iters=warmup_iters,
+            timed_iters=timed_iters,
+        )
         for block_kind in block_kinds:
             for candidate_index, candidate in enumerate(case.candidates(block_kind)):
                 LOGGER.info(
-                    "Benchmarking family=%s seq_len=%s block=%s candidate=%s",
+                    "Benchmarking family=%s seq_len=%s block=%s candidate=%s warmup_iters=%s timed_iters=%s",
                     case.family_id,
                     case.seq_len,
                     block_kind,
                     candidate_index,
+                    case_warmup_iters,
+                    case_timed_iters,
                 )
                 result = benchmark_candidate(
                     block_kind,
                     case.workload,
                     candidate,
-                    warmup_iters=warmup_iters,
-                    timed_iters=timed_iters,
+                    warmup_iters=case_warmup_iters,
+                    timed_iters=case_timed_iters,
                     seed=seed,
                 )
                 rows.append(
@@ -587,8 +615,8 @@ def build_rows(
                         "num_heads": case.workload.num_heads,
                         "hidden_size": case.workload.hidden_size,
                         "ffn_dim": case.workload.ffn_dim,
-                        "warmup_iters": warmup_iters,
-                        "timed_iters": timed_iters,
+                        "warmup_iters": case_warmup_iters,
+                        "timed_iters": case_timed_iters,
                         **config_row(block_kind, candidate),
                         **result,
                     }

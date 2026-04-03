@@ -137,11 +137,12 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
             ],
             mha_out_proj=[
                 (1, 32, 64, 96, 6, 8),
+                (2, 32, 64, 96, 4, 8),
             ],
             ffn=[
-                (8, False, False, 16, 96, 96, 8, 1, 8, None, 1),
-                (8, False, False, 16, 96, 96, 8, 1, 4, None, 1),
-                (8, False, False, 16, 96, 48, 8, 1, 6, None, 1),
+                (8, False, False, 16, 96, 96, 8, 2, 4, None, 1),
+                (8, False, False, 16, 96, 48, 8, 2, 4, None, 1),
+                (8, False, False, 16, 96, 64, 8, 1, 4, None, 1),
             ],
         ),
         128: make_case(
@@ -159,7 +160,7 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (2, 32, 64, 96, 4, 8),
             ],
             ffn=[
-                (8, False, False, 64, 96, 32, 8, 2, 6, None, 1),
+                (8, False, False, 32, 96, 48, 8, 2, 4, None, 1),
                 (8, False, False, 16, 96, 96, 8, 8, 2, None, 1),
                 (8, False, False, 32, 96, 48, 8, 4, 4, None, 1),
             ],
@@ -181,7 +182,8 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
             ],
             ffn=[
                 (8, False, False, 32, 96, 96, 8, 8, 2, None, 1),
-                (8, False, False, 64, 96, 48, 8, 4, 4, None, 1),
+                (8, False, False, 32, 96, 64, 8, 2, 4, None, 1),
+                (8, False, False, 16, 96, 64, 8, 4, 4, None, 1),
             ],
         ),
         512: make_case(
@@ -200,8 +202,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (2, 32, 64, 96, 4, 8),
             ],
             ffn=[
-                (8, False, False, 64, 96, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 96, 48, 8, 4, 4, None, 1),
+                (8, False, False, 16, 96, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 96, 64, 8, 2, 4, None, 1),
+                (8, False, False, 32, 96, 48, 8, 4, 4, None, 1),
             ],
         ),
         1024: make_case(
@@ -220,8 +223,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (2, 32, 64, 96, 4, 8),
             ],
             ffn=[
-                (8, False, False, 64, 96, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 96, 48, 8, 4, 4, None, 1),
+                (8, False, False, 16, 96, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 96, 64, 8, 2, 4, None, 1),
+                (8, False, False, 32, 96, 48, 8, 4, 4, None, 1),
             ],
         ),
         2048: make_case(
@@ -240,8 +244,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (2, 32, 64, 96, 4, 8),
             ],
             ffn=[
-                (8, False, False, 64, 96, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 96, 48, 8, 4, 4, None, 1),
+                (8, False, False, 16, 96, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 96, 64, 8, 2, 4, None, 1),
+                (8, False, False, 32, 96, 48, 8, 4, 4, None, 1),
             ],
         ),
         4096: make_case(
@@ -260,8 +265,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (2, 32, 64, 96, 4, 8),
             ],
             ffn=[
-                (8, False, False, 64, 96, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 96, 48, 8, 4, 4, None, 1),
+                (8, False, False, 16, 96, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 96, 64, 8, 2, 4, None, 1),
+                (8, False, False, 32, 96, 48, 8, 4, 4, None, 1),
             ],
         ),
         8192: make_case(
@@ -280,8 +286,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (2, 32, 64, 96, 4, 8),
             ],
             ffn=[
-                (8, False, False, 64, 96, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 96, 48, 8, 4, 4, None, 1),
+                (8, False, False, 16, 96, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 96, 64, 8, 2, 4, None, 1),
+                (8, False, False, 32, 96, 48, 8, 4, 4, None, 1),
             ],
         ),
         16384: make_case(
@@ -300,8 +307,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (2, 32, 64, 96, 4, 8),
             ],
             ffn=[
-                (8, False, False, 64, 96, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 96, 48, 8, 4, 4, None, 1),
+                (8, False, False, 16, 96, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 96, 64, 8, 2, 4, None, 1),
+                (8, False, False, 32, 96, 48, 8, 4, 4, None, 1),
             ],
         ),
     },
@@ -317,15 +325,17 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (16, 128, 64, 4, 8),
             ],
             mha_out_proj=[
-                (1, 32, 64, 128, 6, 8),
+                (1, 32, 64, 128, 4, 8),
+                (2, 32, 64, 128, 4, 8),
             ],
             addnorm=[
                 (8, 1024),
             ],
             ffn=[
-                (8, False, False, 16, 128, 96, 8, 1, 8, None, 1),
-                (8, False, False, 16, 128, 96, 8, 1, 4, None, 1),
-                (8, False, False, 16, 128, 48, 8, 1, 6, None, 1),
+                (8, False, False, 16, 128, 64, 8, 4, 4, None, 1),
+                (8, False, False, 16, 64, 128, 8, 4, 4, None, 1),
+                (8, False, False, 16, 128, 64, 8, 2, 4, None, 1),
+                (8, False, False, 16, 64, 128, 8, 2, 4, None, 1),
             ],
         ),
         128: make_case(
@@ -345,9 +355,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (8, 1024),
             ],
             ffn=[
-                (8, False, False, 64, 128, 32, 8, 2, 6, None, 1),
-                (8, False, False, 16, 128, 96, 8, 8, 2, None, 1),
-                (8, False, False, 32, 128, 48, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 4, 4, None, 1),
+                (8, False, False, 16, 128, 64, 8, 8, 2, None, 1),
+                (8, False, False, 16, 128, 64, 8, 4, 4, None, 1),
             ],
         ),
         256: make_case(
@@ -368,8 +378,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (8, 1024),
             ],
             ffn=[
-                (8, False, False, 32, 128, 96, 8, 8, 2, None, 1),
-                (8, False, False, 64, 128, 48, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 8, 2, None, 1),
+                (8, False, False, 16, 128, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 2, 4, None, 1),
             ],
         ),
         512: make_case(
@@ -390,8 +401,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (8, 1024),
             ],
             ffn=[
-                (8, False, False, 64, 128, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 128, 48, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 8, 2, None, 1),
+                (8, False, False, 16, 128, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 2, 4, None, 1),
             ],
         ),
         1024: make_case(
@@ -412,8 +424,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (8, 1024),
             ],
             ffn=[
-                (8, False, False, 64, 128, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 128, 48, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 8, 2, None, 1),
+                (8, False, False, 16, 128, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 2, 4, None, 1),
             ],
         ),
         2048: make_case(
@@ -434,8 +447,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (8, 1024),
             ],
             ffn=[
-                (8, False, False, 64, 128, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 128, 48, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 8, 2, None, 1),
+                (8, False, False, 16, 128, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 2, 4, None, 1),
             ],
         ),
         4096: make_case(
@@ -456,8 +470,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (8, 1024),
             ],
             ffn=[
-                (8, False, False, 64, 128, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 128, 48, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 8, 2, None, 1),
+                (8, False, False, 16, 128, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 2, 4, None, 1),
             ],
         ),
         8192: make_case(
@@ -478,8 +493,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (8, 1024),
             ],
             ffn=[
-                (8, False, False, 64, 128, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 128, 48, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 8, 2, None, 1),
+                (8, False, False, 16, 128, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 2, 4, None, 1),
             ],
         ),
         16384: make_case(
@@ -500,8 +516,9 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
                 (8, 1024),
             ],
             ffn=[
-                (8, False, False, 64, 128, 48, 8, 8, 2, None, 1),
-                (8, False, False, 64, 128, 48, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 8, 2, None, 1),
+                (8, False, False, 16, 128, 64, 8, 4, 4, None, 1),
+                (8, False, False, 32, 128, 64, 8, 2, 4, None, 1),
             ],
         ),
     },
