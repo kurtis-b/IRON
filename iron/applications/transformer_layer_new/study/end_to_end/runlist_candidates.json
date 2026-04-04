@@ -1,4 +1,8 @@
 {
+  "_header": [
+    "# SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.",
+    "# SPDX-License-Identifier: Apache-2.0"
+  ],
   "baseline_768": {
     "all": {
       "qkvo_proj": [
