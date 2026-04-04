@@ -50,6 +50,12 @@ class AIEGEMM(AIEOperatorBase):
         self.batch_A = batch_A
         self.batch_B = batch_B
         self.batch_C = batch_C
+        self.input_a_buffer_shape = gemm_kwargs.pop("input_a_buffer_shape", None)
+        self.input_b_buffer_shape = gemm_kwargs.pop("input_b_buffer_shape", None)
+        self.output_c_buffer_shape = gemm_kwargs.pop("output_c_buffer_shape", None)
+        self.input_a_offset = gemm_kwargs.pop("input_a_offset", 0)
+        self.input_b_offset = gemm_kwargs.pop("input_b_offset", 0)
+        self.output_c_offset = gemm_kwargs.pop("output_c_offset", 0)
         self.gemm_args = gemm_kwargs
 
         self.b_col_maj = gemm_kwargs.get("b_col_maj", False)
@@ -76,6 +82,17 @@ class AIEGEMM(AIEOperatorBase):
         if self._uses_batched_layout() and use_static_weight and batch_B[0] > 1:
             raise AIEOperatorConstraintError(
                 "Static weights are only supported for batch_B=(1, 0) in batched GEMM"
+            )
+        if not self._uses_batched_layout() and (
+            self.input_a_buffer_shape is not None
+            or self.input_b_buffer_shape is not None
+            or self.output_c_buffer_shape is not None
+            or self.input_a_offset != 0
+            or self.input_b_offset != 0
+            or self.output_c_offset != 0
+        ):
+            raise AIEOperatorConstraintError(
+                "Buffer window overrides are only supported for batched GEMM"
             )
 
         if self._uses_batched_layout():
@@ -115,6 +132,33 @@ class AIEGEMM(AIEOperatorBase):
     def _uses_batched_layout(self):
         return self.batch_C[0] > 1
 
+    @staticmethod
+    def _buffer_shape_element_count(shape):
+        return int(np.prod(shape))
+
+    def _buffer_window_name_suffix(self):
+        if not self._uses_batched_layout():
+            return ""
+
+        parts = []
+        for label, shape in (
+            ("bufA", self.input_a_buffer_shape),
+            ("bufB", self.input_b_buffer_shape),
+            ("bufC", self.output_c_buffer_shape),
+        ):
+            if shape is not None:
+                parts.append(f"{label}{shape[0]}x{shape[1]}")
+        for label, offset in (
+            ("offA", self.input_a_offset),
+            ("offB", self.input_b_offset),
+            ("offC", self.output_c_offset),
+        ):
+            if offset:
+                parts.append(f"{label}{offset}")
+        if not parts:
+            return ""
+        return "_" + "_".join(parts)
+
     def _get_runtime_dims(self):
         num_aie_rows = 4
         min_M = self.tile_m * num_aie_rows
@@ -146,6 +190,7 @@ class AIEGEMM(AIEOperatorBase):
                 f"_batchB{self.batch_B[0]}d{self.batch_B[1]}"
                 f"_batchC{self.batch_C[0]}d{self.batch_C[1]}"
             )
+            file_name_total_base += self._buffer_window_name_suffix()
         else:
             file_name_total_base += "_ctiles1"
         if (
@@ -244,6 +289,12 @@ class AIEGEMM(AIEOperatorBase):
                     "batch_A": self.batch_A,
                     "batch_B": self.batch_B,
                     "batch_C": self.batch_C,
+                    "input_a_buffer_shape": self.input_a_buffer_shape,
+                    "input_b_buffer_shape": self.input_b_buffer_shape,
+                    "output_c_buffer_shape": self.output_c_buffer_shape,
+                    "input_a_offset": self.input_a_offset,
+                    "input_b_offset": self.input_b_offset,
+                    "output_c_offset": self.output_c_offset,
                 },
                 requires_context=False,
             )
@@ -389,12 +440,27 @@ class AIEGEMM(AIEOperatorBase):
         )
 
         if self._uses_batched_layout():
-            self.add_buffer("A", self.M * self.K * self.batch_A[0])
+            a_count = (
+                self._buffer_shape_element_count(self.input_a_buffer_shape)
+                if self.input_a_buffer_shape is not None
+                else self.M * self.K * self.batch_A[0]
+            )
+            self.add_buffer("A", a_count)
             if static_weights is None:
-                self.add_buffer("B", self.K * self.N * self.batch_B[0])
+                b_count = (
+                    self._buffer_shape_element_count(self.input_b_buffer_shape)
+                    if self.input_b_buffer_shape is not None
+                    else self.K * self.N * self.batch_B[0]
+                )
+                self.add_buffer("B", b_count)
             else:
                 self.add_buffer("B", self.K * self.N, static_data=static_weights)
-            self.add_buffer("C", self.M * self.N * self.batch_C[0])
+            c_count = (
+                self._buffer_shape_element_count(self.output_c_buffer_shape)
+                if self.output_c_buffer_shape is not None
+                else self.M * self.N * self.batch_C[0]
+            )
+            self.add_buffer("C", c_count)
             self.add_to_runlist("gemm", "A", "B", "C")
             return
 

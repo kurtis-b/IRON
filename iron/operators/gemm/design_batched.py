@@ -88,6 +88,14 @@ def get_shape_with_batch(dim_0, dim_1, batch_size, batch_stride_dim, col_maj):
             return (dim_1, dim_0 * batch_size)
 
 
+def resolve_buffer_shape(default_shape, override_shape):
+    if override_shape is None:
+        return default_shape
+    if len(override_shape) != 2:
+        raise ValueError(f"Expected 2D buffer shape override, got {override_shape!r}")
+    return tuple(int(dim) for dim in override_shape)
+
+
 def main():
     argparser = argparse.ArgumentParser(
         prog="AIE Matrix Multiplication MLIR Design (Whole Array)",
@@ -217,6 +225,12 @@ def my_matmul(
     batch_A=None,
     batch_B=None,
     batch_C=None,
+    input_a_buffer_shape=None,
+    input_b_buffer_shape=None,
+    output_c_buffer_shape=None,
+    input_a_offset=0,
+    input_b_offset=0,
+    output_c_offset=0,
 ):
     batch_A_size, batch_A_stride_dim = batch_A
     batch_B_size, batch_B_stride_dim = batch_B
@@ -230,6 +244,9 @@ def my_matmul(
     batched_C_shape = get_shape_with_batch(
         N, M, batch_C_size, batch_C_stride_dim, col_maj=c_col_maj
     )
+    batched_A_shape = resolve_buffer_shape(batched_A_shape, input_a_buffer_shape)
+    batched_B_shape = resolve_buffer_shape(batched_B_shape, input_b_buffer_shape)
+    batched_C_shape = resolve_buffer_shape(batched_C_shape, output_c_buffer_shape)
     n_aie_rows = 4
 
     dtype_in = str_to_dtype(dtype_in_str)
@@ -685,7 +702,7 @@ def my_matmul(
                             ]
                         C_tile = TensorAccessPattern(
                             batched_C_shape,
-                            offset=C_offset + C_batch_offset,
+                            offset=C_offset + C_batch_offset + output_c_offset,
                             sizes=C_sizes,
                             strides=C_strides,
                         )
@@ -749,7 +766,7 @@ def my_matmul(
                             if col < n_aie_rows:
                                 A_tile = TensorAccessPattern(
                                     batched_A_shape,
-                                    offset=A_offset + A_batch_offset,
+                                    offset=A_offset + A_batch_offset + input_a_offset,
                                     sizes=A_sizes,
                                     strides=A_strides,
                                 )
@@ -816,7 +833,7 @@ def my_matmul(
                                 ]
                             B_tile = TensorAccessPattern(
                                 batched_B_shape,
-                                offset=B_col_offset + B_batch_offset,
+                                offset=B_col_offset + B_batch_offset + input_b_offset,
                                 sizes=B_sizes,
                                 strides=B_strides,
                             )

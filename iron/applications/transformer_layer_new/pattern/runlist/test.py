@@ -54,7 +54,7 @@ all_params = [
 ]
 
 
-def test_runlist_long_seq_uses_attention_fallback(aie_context):
+def test_runlist_long_seq_uses_blocked_attention(aie_context):
     operator = AIETransformerRunlist(
         seq_len=16384,
         hidden_size=768,
@@ -63,11 +63,63 @@ def test_runlist_long_seq_uses_attention_fallback(aie_context):
         context=aie_context,
     )
 
-    assert operator.use_long_seq_fallback is True
+    operator.set_up_artifacts()
+    operator.set_up_runtime()
+
+    expected_block_count = 16384 // 256
+    expected_attn_scratch_elems = 256 * 16384 * 12
+
+    assert operator.use_blocked_attention is True
+    assert operator.use_long_seq_fallback is False
     assert operator.query_block_size == 256
-    assert operator.attn_scores_partition_n == 4
-    assert operator.long_attn_scores_gemm is not None
-    assert operator.long_attn_output_gemm is not None
+    assert operator.query_block_count == expected_block_count
+    assert operator.operator_config["attn_scores"]["M"] == 256
+    assert operator.operator_config["attn_output"]["M"] == 256
+    assert operator.operator_config["attn_scale"]["size"] == expected_attn_scratch_elems
+    assert operator.operator_config["attn_softmax"]["rows"] == 256 * 12
+    assert operator.buffers["attn_scores_output"] == expected_attn_scratch_elems * 2
+    assert operator.buffers["attn_scaled_output"] == expected_attn_scratch_elems * 2
+    assert operator.buffers["attn_weights_output"] == expected_attn_scratch_elems * 2
+    assert (
+        len(
+            [
+                kernel_name
+                for kernel_name in operator.kernels
+                if kernel_name.startswith("encoder_attn_scores_block_")
+            ]
+        )
+        == expected_block_count
+    )
+    assert (
+        len(
+            [
+                kernel_name
+                for kernel_name in operator.kernels
+                if kernel_name.startswith("encoder_attn_output_block_")
+            ]
+        )
+        == expected_block_count
+    )
+    assert (
+        len(
+            [
+                entry
+                for entry in operator.runlist
+                if entry[0].startswith("encoder_attn_scores_block_")
+            ]
+        )
+        == expected_block_count
+    )
+    assert (
+        len(
+            [
+                entry
+                for entry in operator.runlist
+                if entry[0].startswith("encoder_attn_output_block_")
+            ]
+        )
+        == expected_block_count
+    )
 
 
 @pytest.mark.metrics(
