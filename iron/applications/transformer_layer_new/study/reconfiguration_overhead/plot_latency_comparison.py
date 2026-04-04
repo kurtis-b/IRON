@@ -50,8 +50,8 @@ MODE_LABELS = {
 }
 
 MODE_COLORS = {
-    "offload_gemm_sequence": "#1f7a8c",
-    "runlist_gemm_sequence": "#d17a22",
+    "offload_gemm_sequence": "#81b29a",
+    "runlist_gemm_sequence": "#e07a5f",
 }
 
 
@@ -115,9 +115,10 @@ def render_plot(
         rc={
             "axes.spines.top": False,
             "axes.spines.right": False,
+            "axes.titleweight": "bold",
             "figure.facecolor": "#f7f5f2",
             "axes.facecolor": "#fcfbf8",
-            "grid.color": "#ddd6cb",
+            "grid.color": "#ded8cf",
         },
     )
     plt.rcParams["svg.fonttype"] = "none"
@@ -125,9 +126,8 @@ def render_plot(
     fig, axes = plt.subplots(
         1,
         len(family_order),
-        figsize=(15.5, 6.6),
+        figsize=(20, 8),
         sharey=True,
-        constrained_layout=True,
     )
     if len(family_order) == 1:
         axes = [axes]
@@ -154,18 +154,16 @@ def render_plot(
             offload_values,
             width=bar_width,
             color=MODE_COLORS["offload_gemm_sequence"],
-            edgecolor="#2b2b2b",
-            linewidth=1.0,
-            zorder=3,
+            edgecolor="white",
+            linewidth=0.7,
         )
         ax.bar(
             runlist_x,
             runlist_values,
             width=bar_width,
             color=MODE_COLORS["runlist_gemm_sequence"],
-            edgecolor="#2b2b2b",
-            linewidth=1.0,
-            zorder=3,
+            edgecolor="white",
+            linewidth=0.7,
         )
 
         for x_mid, offload_latency, runlist_latency in zip(
@@ -179,37 +177,42 @@ def render_plot(
                 f"{ratio:.2f}x",
                 ha="center",
                 va="bottom",
-                fontsize=10.5,
+                fontsize=9,
                 fontweight="bold",
-                color="#3b3b3b",
+                color="#4a4a4a",
             )
 
         ax.set_xticks(x_positions)
-        ax.set_xticklabels([str(seq_len) for seq_len in seq_lens], fontsize=11)
-        ax.set_xlabel("Context Length (tokens)", fontsize=13)
-        ax.set_title(FAMILY_LABELS.get(family, family), fontsize=14, pad=16)
+        ax.set_xticklabels([str(seq_len) for seq_len in seq_lens], fontsize=12)
+        ax.set_xlabel("Context Length (tokens)", fontsize=15)
+        ax.set_title(
+            FAMILY_LABELS.get(family, family),
+            loc="left",
+            fontsize=18,
+            pad=12,
+        )
         ax.set_yscale("log")
         ax.grid(True, axis="y", which="major", linewidth=0.9, alpha=0.85)
-        ax.grid(False, axis="x")
-        ax.set_axisbelow(True)
+        ax.grid(True, axis="y", which="minor", linewidth=0.4, alpha=0.35)
+        ax.tick_params(axis="both", labelsize=12)
 
-    axes[0].set_ylabel("Latency (ms, log scale)", fontsize=13)
+    axes[0].set_ylabel("Latency (ms, log scale)", fontsize=15)
     fig.suptitle(
         "Reconfiguration Overhead: Runlist vs Offload",
-        fontsize=20,
+        fontsize=24,
         fontweight="bold",
-        y=1.02,
+        y=0.98,
     )
 
     legend_handles = [
         Patch(
             facecolor=MODE_COLORS["offload_gemm_sequence"],
-            edgecolor="#2b2b2b",
+            edgecolor="none",
             label=_mode_legend_label("offload_gemm_sequence", data),
         ),
         Patch(
             facecolor=MODE_COLORS["runlist_gemm_sequence"],
-            edgecolor="#2b2b2b",
+            edgecolor="none",
             label=_mode_legend_label("runlist_gemm_sequence", data),
         ),
     ]
@@ -218,9 +221,10 @@ def render_plot(
         loc="lower center",
         ncol=2,
         frameon=False,
-        bbox_to_anchor=(0.5, -0.03),
-        fontsize=12,
+        bbox_to_anchor=(0.5, 0.01),
+        fontsize=13,
     )
+    fig.tight_layout(rect=[0, 0.08, 1, 0.93])
 
     output_svg_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_svg_path, bbox_inches="tight")
