@@ -124,7 +124,7 @@ For the ROCm iGPU study on Ubuntu 24.04 / Python 3.12 Ryzen APU systems:
 
 1. install the normal repo requirements first
 2. then install the iGPU ROCm overlay:
-   `pip install -r iron/applications/transformer_layer_new/study/igpu/requirements_rocm.txt`
+   `pip install -r iron/applications/transformer_layer_new/requirements.txt`
 
 That overlay is local to `transformer_layer_new` and avoids changing the
 repo-wide Python environment defaults for unrelated studies.

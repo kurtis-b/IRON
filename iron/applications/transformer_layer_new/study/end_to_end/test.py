@@ -82,11 +82,20 @@ def test_power_sweep_iter_selected_cases_respects_family_and_max_seq_len():
     assert tuple(case.seq_len for case in cases) == (64, 128, 256)
 
 
-def test_power_sweep_default_paths_live_in_study_directory():
+def test_power_sweep_default_paths_live_in_results_directory():
     assert default_power_sweep_output_path(256).name == "results_upto256_power.csv"
+    assert default_power_sweep_output_path(256).parent.name == "end_to_end"
+    assert default_power_sweep_output_path(256).parent.parent.name == "results"
     assert (
         default_power_sweep_tuning_output_path(256).name == "tuning_upto256_power.csv"
     )
+    assert default_power_sweep_tuning_output_path(256).parent.name == "end_to_end"
+    assert default_power_sweep_tuning_output_path(256).parent.parent.name == "results"
+
+
+def test_power_sweep_full_ladder_defaults_to_all_power_filenames():
+    assert default_power_sweep_output_path(16384).name == "results_all_power.csv"
+    assert default_power_sweep_tuning_output_path(16384).name == "tuning_all_power.csv"
 
 
 def test_power_sampling_defaults_to_conservative_100ms_floor():

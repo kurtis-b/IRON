@@ -160,10 +160,15 @@ Power sampling uses a conservative default cadence for `turbostat`:
 - requested interval: `0.1 s`
 - minimum interval floor: `0.1 s`
 
-It writes merged outputs directly into this study directory:
+It writes merged outputs into the app-level results directory:
 
-- `results_upto<max_seq_len>_power.csv`
-- `tuning_upto<max_seq_len>_power.csv`
+- `results/end_to_end/results_upto<max_seq_len>_power.csv`
+- `results/end_to_end/tuning_upto<max_seq_len>_power.csv`
+
+For a full ladder sweep through `16384`, the default filenames are:
+
+- `results/end_to_end/results_all_power.csv`
+- `results/end_to_end/tuning_all_power.csv`
 
 Environment:
 

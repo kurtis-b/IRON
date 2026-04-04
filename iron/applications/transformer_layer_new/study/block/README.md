@@ -96,3 +96,15 @@ Canonical output:
 
 The CSV keeps one row per candidate and marks the minimum-latency successful
 candidate per `(family_id, seq_len, block_kind)` as `is_best=True`.
+
+Visualization helper:
+
+- `python -m iron.applications.transformer_layer_new.study.block.plot_best_latency`
+- `python -m iron.applications.transformer_layer_new.study.block.plot_best_latency --variant slides`
+
+That command renders:
+
+- `results/block/best_latency_by_block.png`
+- `results/block/best_latency_by_block.svg`
+- `results/block/best_latency_by_block_slides.png`
+- `results/block/best_latency_by_block_slides.svg`

@@ -47,11 +47,17 @@ def iter_selected_cases(
 
 
 def default_output_path(max_seq_len: int) -> Path:
-    return Path(__file__).resolve().parent / f"results_upto{max_seq_len}_power.csv"
+    results_dir = Path(__file__).resolve().parents[2] / "results" / "end_to_end"
+    if int(max_seq_len) == max(SEQUENCE_LADDER):
+        return results_dir / "results_all_power.csv"
+    return results_dir / f"results_upto{max_seq_len}_power.csv"
 
 
 def default_tuning_output_path(max_seq_len: int) -> Path:
-    return Path(__file__).resolve().parent / f"tuning_upto{max_seq_len}_power.csv"
+    results_dir = Path(__file__).resolve().parents[2] / "results" / "end_to_end"
+    if int(max_seq_len) == max(SEQUENCE_LADDER):
+        return results_dir / "tuning_all_power.csv"
+    return results_dir / f"tuning_upto{max_seq_len}_power.csv"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
