@@ -54,6 +54,22 @@ all_params = [
 ]
 
 
+def test_runlist_long_seq_uses_attention_fallback(aie_context):
+    operator = AIETransformerRunlist(
+        seq_len=16384,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_heads=12,
+        context=aie_context,
+    )
+
+    assert operator.use_long_seq_fallback is True
+    assert operator.query_block_size == 256
+    assert operator.attn_scores_partition_n == 4
+    assert operator.long_attn_scores_gemm is not None
+    assert operator.long_attn_output_gemm is not None
+
+
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",

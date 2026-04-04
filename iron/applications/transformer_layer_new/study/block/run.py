@@ -6,10 +6,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import logging
+import multiprocessing
+import sys
 from collections import defaultdict
 from pathlib import Path
 
+from iron.common.aie_device_manager import AIEDeviceManager
 from iron.common import AIEContext
 from iron.common.test_utils import run_test
 from iron.operators.addnorm.op import AIEAddAndNorm
@@ -103,6 +107,42 @@ CSV_FIELDNAMES = (
 
 def default_output_path() -> Path:
     return Path(__file__).resolve().parents[2] / "results" / "block" / "results.csv"
+
+
+def _case_descriptor(family_id: str, workload: BlockWorkload) -> str:
+    return (
+        f"{family_id} seq_len={workload.seq_len} hidden={workload.hidden_size} "
+        f"ffn={workload.ffn_dim} heads={workload.num_heads}"
+    )
+
+
+def _should_use_aggressive_cleanup(seq_len: int) -> bool:
+    return seq_len >= 8192
+
+
+def _aggressive_cleanup(seq_len: int) -> None:
+    if not _should_use_aggressive_cleanup(seq_len):
+        return
+
+    gc.collect()
+    try:
+        AIEDeviceManager().reset()
+    except Exception:
+        LOGGER.exception(
+            "Failed to reset AIE device manager during long-sequence block cleanup"
+        )
+    gc.collect()
+
+
+def _preferred_subprocess_start_method() -> str:
+    start_methods = multiprocessing.get_all_start_methods()
+    main_module = sys.modules.get("__main__")
+    main_file = getattr(main_module, "__file__", None)
+    if main_file not in (None, "<stdin>") and "spawn" in start_methods:
+        return "spawn"
+    if "fork" in start_methods:
+        return "fork"
+    return start_methods[0]
 
 
 def operator_kwargs(
@@ -445,6 +485,35 @@ def benchmark_candidate(
     timed_iters: int,
     seed: int,
 ) -> dict[str, object]:
+    if _should_use_aggressive_cleanup(workload.seq_len):
+        return _benchmark_candidate_isolated_subprocess(
+            block_kind,
+            workload,
+            candidate,
+            warmup_iters=warmup_iters,
+            timed_iters=timed_iters,
+            seed=seed,
+        )
+
+    return _benchmark_candidate_in_process(
+        block_kind,
+        workload,
+        candidate,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        seed=seed,
+    )
+
+
+def _benchmark_candidate_in_process(
+    block_kind: BlockKind,
+    workload: BlockWorkload,
+    candidate: tuple[object, ...],
+    *,
+    warmup_iters: int,
+    timed_iters: int,
+    seed: int,
+) -> dict[str, object]:
     benchmarkers = {
         "qkv_proj": _benchmark_qkv_proj,
         "mha_out_proj": _benchmark_mha_out_proj,
@@ -467,6 +536,80 @@ def benchmark_candidate(
             "run_status": "failed_exception",
             "error_message": str(exc),
         }
+    finally:
+        _aggressive_cleanup(workload.seq_len)
+
+
+def _subprocess_benchmark_entry(
+    result_queue,
+    block_kind: BlockKind,
+    workload: BlockWorkload,
+    candidate: tuple[object, ...],
+    warmup_iters: int,
+    timed_iters: int,
+    seed: int,
+) -> None:
+    result = _benchmark_candidate_in_process(
+        block_kind,
+        workload,
+        candidate,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        seed=seed,
+    )
+    result_queue.put(result)
+
+
+def _benchmark_candidate_isolated_subprocess(
+    block_kind: BlockKind,
+    workload: BlockWorkload,
+    candidate: tuple[object, ...],
+    *,
+    warmup_iters: int,
+    timed_iters: int,
+    seed: int,
+) -> dict[str, object]:
+    ctx = multiprocessing.get_context(_preferred_subprocess_start_method())
+    result_queue = ctx.Queue()
+    process = ctx.Process(
+        target=_subprocess_benchmark_entry,
+        args=(
+            result_queue,
+            block_kind,
+            workload,
+            candidate,
+            warmup_iters,
+            timed_iters,
+            seed,
+        ),
+    )
+    process.start()
+    process.join()
+
+    result: dict[str, object] | None = None
+    if not result_queue.empty():
+        result = result_queue.get()
+    result_queue.close()
+    result_queue.join_thread()
+
+    if process.exitcode == 0 and result is not None:
+        _aggressive_cleanup(workload.seq_len)
+        return result
+
+    failure_message = (
+        f"isolated benchmark subprocess failed with exit code {process.exitcode}"
+    )
+    if result is not None and result.get("run_status") == "failed_exception":
+        failure_message = str(result.get("error_message", failure_message))
+
+    _aggressive_cleanup(workload.seq_len)
+    return {
+        "avg_latency_ms": "",
+        "bandwidth_gbps": "",
+        "validation_error_count": "",
+        "run_status": "failed_exception",
+        "error_message": failure_message,
+    }
 
 
 def mark_best_rows(rows: list[dict[str, object]]) -> None:
@@ -577,48 +720,71 @@ def build_rows(
 
     rows: list[dict[str, object]] = []
     for case in iter_cases(family_id=family_id, seq_len=seq_len):
-        case_warmup_iters, case_timed_iters = iteration_schedule(
-            case.seq_len,
-            warmup_iters=warmup_iters,
-            timed_iters=timed_iters,
+        rows.extend(
+            build_case_rows(
+                case,
+                block_kinds=block_kinds,
+                warmup_iters=warmup_iters,
+                timed_iters=timed_iters,
+                seed=seed,
+            )
         )
-        for block_kind in block_kinds:
-            for candidate_index, candidate in enumerate(case.candidates(block_kind)):
-                LOGGER.info(
-                    "Benchmarking family=%s seq_len=%s block=%s candidate=%s warmup_iters=%s timed_iters=%s",
-                    case.family_id,
-                    case.seq_len,
-                    block_kind,
-                    candidate_index,
-                    case_warmup_iters,
-                    case_timed_iters,
-                )
-                result = benchmark_candidate(
-                    block_kind,
-                    case.workload,
-                    candidate,
-                    warmup_iters=case_warmup_iters,
-                    timed_iters=case_timed_iters,
-                    seed=seed,
-                )
-                rows.append(
-                    {
-                        "study_id": "block",
-                        "family_id": case.family_id,
-                        "family_label": case.family_label,
-                        "seq_len": case.seq_len,
-                        "block_kind": block_kind,
-                        "candidate_index": candidate_index,
-                        "head_dim": case.workload.head_dim,
-                        "num_heads": case.workload.num_heads,
-                        "hidden_size": case.workload.hidden_size,
-                        "ffn_dim": case.workload.ffn_dim,
-                        "warmup_iters": case_warmup_iters,
-                        "timed_iters": case_timed_iters,
-                        **config_row(block_kind, candidate),
-                        **result,
-                    }
-                )
+
+    mark_best_rows(rows)
+    return rows
+
+
+def build_case_rows(
+    case,
+    *,
+    block_kinds: tuple[BlockKind, ...],
+    warmup_iters: int | None,
+    timed_iters: int | None,
+    seed: int,
+) -> list[dict[str, object]]:
+    case_warmup_iters, case_timed_iters = iteration_schedule(
+        case.seq_len,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+    )
+    rows: list[dict[str, object]] = []
+    for block_kind in block_kinds:
+        for candidate_index, candidate in enumerate(case.candidates(block_kind)):
+            LOGGER.info(
+                "Benchmarking family=%s seq_len=%s block=%s candidate=%s warmup_iters=%s timed_iters=%s",
+                case.family_id,
+                case.seq_len,
+                block_kind,
+                candidate_index,
+                case_warmup_iters,
+                case_timed_iters,
+            )
+            result = benchmark_candidate(
+                block_kind,
+                case.workload,
+                candidate,
+                warmup_iters=case_warmup_iters,
+                timed_iters=case_timed_iters,
+                seed=seed,
+            )
+            rows.append(
+                {
+                    "study_id": "block",
+                    "family_id": case.family_id,
+                    "family_label": case.family_label,
+                    "seq_len": case.seq_len,
+                    "block_kind": block_kind,
+                    "candidate_index": candidate_index,
+                    "head_dim": case.workload.head_dim,
+                    "num_heads": case.workload.num_heads,
+                    "hidden_size": case.workload.hidden_size,
+                    "ffn_dim": case.workload.ffn_dim,
+                    "warmup_iters": case_warmup_iters,
+                    "timed_iters": case_timed_iters,
+                    **config_row(block_kind, candidate),
+                    **result,
+                }
+            )
 
     mark_best_rows(rows)
     return rows
@@ -629,14 +795,36 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
     args = parse_args(argv)
-    rows = build_rows(
-        family_argument=args.family,
-        seq_len_argument=args.seq_len,
-        block_argument=args.block,
-        warmup_iters=args.warmup_iters,
-        timed_iters=args.timed_iters,
-        seed=args.seed,
+    family_id = None if args.family == "all" else args.family
+    seq_len = selected_seq_len(args.seq_len)
+    block_kinds = selected_block_kinds(args.block)
+    cases = tuple(iter_cases(family_id=family_id, seq_len=seq_len))
+    rows: list[dict[str, object]] = []
+
+    LOGGER.info(
+        "Starting block study with %d case(s), block=%s", len(cases), args.block
     )
+    for case_index, case in enumerate(cases, start=1):
+        LOGGER.info(
+            "Case %d/%d: %s",
+            case_index,
+            len(cases),
+            _case_descriptor(case.family_id, case.workload),
+        )
+        case_rows = build_case_rows(
+            case,
+            block_kinds=block_kinds,
+            warmup_iters=args.warmup_iters,
+            timed_iters=args.timed_iters,
+            seed=args.seed,
+        )
+        rows.extend(case_rows)
+        mark_best_rows(rows)
+        write_rows(args.output, rows)
+        LOGGER.info("Checkpointed %d block-study rows", len(rows))
+        _aggressive_cleanup(case.seq_len)
+
+    mark_best_rows(rows)
     write_rows(args.output, rows)
     LOGGER.info("Wrote %s rows to %s", len(rows), args.output)
     return 0

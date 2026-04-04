@@ -6,6 +6,25 @@ import math
 import torch
 
 
+def _chunked_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    scale: float,
+    query_block_size: int,
+) -> torch.Tensor:
+    blocks: list[torch.Tensor] = []
+    k_t = k.transpose(-1, -2)
+    for start in range(0, q.shape[1], query_block_size):
+        end = min(start + query_block_size, q.shape[1])
+        q_block = q[:, start:end, :]
+        scores = torch.matmul(q_block, k_t) * scale
+        probs = torch.softmax(scores, dim=-1)
+        blocks.append(torch.matmul(probs, v))
+    return torch.cat(blocks, dim=1)
+
+
 def generate_golden_reference(heads=1, seq_len=256, d=64, seed=42):
     torch.manual_seed(seed)
     val_range = 4
@@ -20,14 +39,24 @@ def generate_golden_reference(heads=1, seq_len=256, d=64, seed=42):
     k = input_k.view(seq_len, heads, d).transpose(0, 1).contiguous()
     v = input_v.view(seq_len, heads, d).transpose(0, 1).contiguous()
 
-    attention = torch.nn.functional.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        dropout_p=0.0,
-        is_causal=False,
-        scale=1 / math.sqrt(d),
-    )
+    scale = 1 / math.sqrt(d)
+    if seq_len >= 16384:
+        attention = _chunked_attention(
+            q.to(torch.float32),
+            k.to(torch.float32),
+            v.to(torch.float32),
+            scale=scale,
+            query_block_size=256,
+        ).to(torch.bfloat16)
+    else:
+        attention = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+        )
     attention = attention.transpose(0, 1).contiguous().view(seq_len, embed_sz)
     output = torch.matmul(attention, input_w_o)
 

@@ -21,6 +21,13 @@ from .run import (
 LOGGER = logging.getLogger(__name__)
 
 
+def _case_descriptor(case: EndToEndCase) -> str:
+    return (
+        f"{case.study_case_id} seq_len={case.seq_len} hidden={case.hidden_size} "
+        f"inter={case.intermediate_size} heads={case.num_attention_heads}"
+    )
+
+
 def selected_sequence_ladder(max_seq_len: int) -> tuple[int, ...]:
     return tuple(seq_len for seq_len in SEQUENCE_LADDER if seq_len <= max_seq_len)
 
@@ -88,23 +95,6 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
 
-    tuning_rows: list[dict[str, object]] = []
-    final_rows: list[dict[str, object]] = []
-
-    for case in iter_selected_cases(args.family, max_seq_len=int(args.max_seq_len)):
-        case_tuning_rows, case_final_rows = build_rows(
-            case,
-            mode_filter=args.mode,
-            warmup_runs=args.warmup_iters,
-            runs_per_sample=args.timed_iters,
-            seed=args.seed,
-            power_backend=args.power_backend,
-        )
-        tuning_rows.extend(case_tuning_rows)
-        final_rows.extend(case_final_rows)
-
-    mark_best_rows(final_rows)
-
     output_path = (
         default_output_path(int(args.max_seq_len))
         if args.output is None
@@ -115,7 +105,44 @@ def main(argv: list[str] | None = None) -> int:
         if args.tuning_output is None
         else args.tuning_output.expanduser()
     )
+    cases = iter_selected_cases(args.family, max_seq_len=int(args.max_seq_len))
 
+    LOGGER.info(
+        "Starting powered end-to-end sweep with %d case(s), mode=%s, power_backend=%s",
+        len(cases),
+        args.mode,
+        args.power_backend,
+    )
+
+    tuning_rows: list[dict[str, object]] = []
+    final_rows: list[dict[str, object]] = []
+
+    for case_index, case in enumerate(cases, start=1):
+        LOGGER.info("Case %d/%d: %s", case_index, len(cases), _case_descriptor(case))
+        case_tuning_rows, case_final_rows = build_rows(
+            case,
+            mode_filter=args.mode,
+            warmup_runs=args.warmup_iters,
+            runs_per_sample=args.timed_iters,
+            seed=args.seed,
+            power_backend=args.power_backend,
+        )
+        tuning_rows.extend(case_tuning_rows)
+        final_rows.extend(case_final_rows)
+        mark_best_rows(final_rows)
+        write_rows(output_path, fieldnames=RESULTS_CSV_FIELDNAMES, rows=final_rows)
+        write_rows(
+            tuning_output_path,
+            fieldnames=TUNING_CSV_FIELDNAMES,
+            rows=tuning_rows,
+        )
+        LOGGER.info(
+            "Checkpointed %d end-to-end rows and %d tuning rows",
+            len(final_rows),
+            len(tuning_rows),
+        )
+
+    mark_best_rows(final_rows)
     write_rows(output_path, fieldnames=RESULTS_CSV_FIELDNAMES, rows=final_rows)
     write_rows(
         tuning_output_path,

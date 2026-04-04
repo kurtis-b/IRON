@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import gc
 from itertools import count
+import multiprocessing
 from pathlib import Path
+import sys
 import time
 
 import torch
@@ -102,6 +105,7 @@ REFERENCE_VALIDATION_MAX_SEQ_LEN = 512
 DEFAULT_POWER_SAMPLE_INTERVAL_SEC = 0.1
 DEFAULT_QUIESCENT_BASELINE_DURATION_SEC = 0.5
 _CONTEXT_COUNTER = count()
+_LONG_SEQ_CANDIDATE_SUBPROCESS_MIN_SEQ_LEN = 8192
 
 
 def _new_benchmark_context(scope: str) -> AIEContext:
@@ -117,6 +121,17 @@ def _new_benchmark_context(scope: str) -> AIEContext:
         / f"{next(_CONTEXT_COUNTER):04d}_{sanitized_scope}"
     )
     return context
+
+
+def _preferred_subprocess_start_method() -> str:
+    start_methods = multiprocessing.get_all_start_methods()
+    main_module = sys.modules.get("__main__")
+    main_file = getattr(main_module, "__file__", None)
+    if main_file not in (None, "<stdin>") and "spawn" in start_methods:
+        return "spawn"
+    if "fork" in start_methods:
+        return "fork"
+    return start_methods[0]
 
 
 def resolve_mode_operator_config(
@@ -232,6 +247,49 @@ def _metadata_for_operator(
             ),
             "npu_unique_xclbin_count": len(
                 {key for key in xclbin_keys if key is not None}
+            ),
+            "process_model": "in_process",
+        }
+
+    if execution_mode == "runlist" and getattr(
+        operator, "use_long_seq_fallback", False
+    ):
+        query_block_size = int(getattr(operator, "query_block_size", workload.seq_len))
+        block_count = (workload.seq_len + query_block_size - 1) // query_block_size
+        attention_dispatches = 2 * workload.num_attention_heads * block_count
+        extra_ops = (
+            getattr(operator, "long_attn_scores_gemm", None),
+            getattr(operator, "long_attn_output_gemm", None),
+        )
+        extra_insts = {
+            _artifact_key(getattr(op, "insts_artifact", None))
+            for op in extra_ops
+            if op is not None
+        }
+        extra_xclbins = {
+            _artifact_key(getattr(op, "xclbin_artifact", None))
+            for op in extra_ops
+            if op is not None
+        }
+        base_insts = {
+            _artifact_key(value)
+            for name, value in vars(operator).items()
+            if name.endswith("_insts") and value is not None
+        }
+        base_xclbins = {
+            _artifact_key(value)
+            for name, value in vars(operator).items()
+            if name.endswith("_xclbin") and value is not None
+        }
+        return {
+            "compile_setup_time_ms": compile_setup_time_ms,
+            "npu_dispatch_count": len(getattr(operator, "runlist", ()))
+            + attention_dispatches,
+            "npu_unique_instruction_binary_count": len(
+                {key for key in (base_insts | extra_insts) if key is not None}
+            ),
+            "npu_unique_xclbin_count": len(
+                {key for key in (base_xclbins | extra_xclbins) if key is not None}
             ),
             "process_model": "in_process",
         }
@@ -1311,6 +1369,38 @@ def benchmark_operator_candidate(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
+    if workload.seq_len >= _LONG_SEQ_CANDIDATE_SUBPROCESS_MIN_SEQ_LEN:
+        return _benchmark_operator_candidate_isolated_subprocess(
+            execution_mode,
+            operator_name,
+            workload,
+            candidate_config,
+            warmup_runs=warmup_runs,
+            runs_per_sample=runs_per_sample,
+            seed=seed,
+        )
+
+    return _benchmark_operator_candidate_in_process(
+        execution_mode,
+        operator_name,
+        workload,
+        candidate_config,
+        warmup_runs=warmup_runs,
+        runs_per_sample=runs_per_sample,
+        seed=seed,
+    )
+
+
+def _benchmark_operator_candidate_in_process(
+    execution_mode: ExecutionMode,
+    operator_name: str,
+    workload: EndToEndWorkload,
+    candidate_config: dict[str, object],
+    *,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+) -> dict[str, object]:
     benchmarkers = {
         ("dataflow", "qkv_proj"): _benchmark_qkv_proj,
         ("dataflow", "mha_out_proj"): _benchmark_mha_out_proj,
@@ -1372,6 +1462,84 @@ def benchmark_operator_candidate(
             "run_status": "failed_exception",
             "failure_message": f"{type(exc).__name__}: {exc}",
         }
+
+
+def _benchmark_operator_candidate_subprocess_entry(
+    result_queue,
+    execution_mode: ExecutionMode,
+    operator_name: str,
+    workload: EndToEndWorkload,
+    candidate_config: dict[str, object],
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+) -> None:
+    result_queue.put(
+        _benchmark_operator_candidate_in_process(
+            execution_mode,
+            operator_name,
+            workload,
+            candidate_config,
+            warmup_runs=warmup_runs,
+            runs_per_sample=runs_per_sample,
+            seed=seed,
+        )
+    )
+
+
+def _benchmark_operator_candidate_isolated_subprocess(
+    execution_mode: ExecutionMode,
+    operator_name: str,
+    workload: EndToEndWorkload,
+    candidate_config: dict[str, object],
+    *,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+) -> dict[str, object]:
+    ctx = multiprocessing.get_context(_preferred_subprocess_start_method())
+    result_queue = ctx.Queue()
+    process = ctx.Process(
+        target=_benchmark_operator_candidate_subprocess_entry,
+        args=(
+            result_queue,
+            execution_mode,
+            operator_name,
+            workload,
+            candidate_config,
+            warmup_runs,
+            runs_per_sample,
+            seed,
+        ),
+    )
+    process.start()
+    process.join()
+
+    result: dict[str, object] | None = None
+    if not result_queue.empty():
+        result = result_queue.get()
+    result_queue.close()
+    result_queue.join_thread()
+
+    gc.collect()
+
+    if process.exitcode == 0 and result is not None:
+        return result
+
+    failure_message = (
+        "isolated candidate benchmark subprocess failed "
+        f"with exit code {process.exitcode}"
+    )
+    if result is not None and result.get("run_status") == "failed_exception":
+        failure_message = str(result.get("failure_message", failure_message))
+
+    return {
+        "avg_latency_ms": "",
+        "bandwidth_gbps": "",
+        "validation_error_count": "",
+        "run_status": "failed_exception",
+        "failure_message": failure_message,
+    }
 
 
 def _benchmark_gemm_from_runlist(

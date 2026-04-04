@@ -156,13 +156,19 @@ def _validate_candidates_payload(
     if not isinstance(payload, dict):
         raise ValueError(f"{source} must contain a JSON object at the top level")
 
+    family_items = {
+        family_id: family_payload
+        for family_id, family_payload in payload.items()
+        if not str(family_id).startswith("_")
+    }
+
     for family_id in FAMILY_IDS:
-        if family_id not in payload:
+        if family_id not in family_items:
             raise ValueError(f"{source} is missing family '{family_id}'")
 
     valid_seq_keys = {"all", *(str(value) for value in SEQUENCE_LADDER)}
     valid_operators = MODE_OPERATORS[execution_mode]
-    for family_id, family_payload in payload.items():
+    for family_id, family_payload in family_items.items():
         if family_id not in FAMILY_IDS:
             raise ValueError(f"{source} has unsupported family '{family_id}'")
         if not isinstance(family_payload, dict):

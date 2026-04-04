@@ -282,8 +282,6 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
             ],
             mha_out_proj=[
                 (8, 32, 64, 96, 1, 8),
-                (4, 32, 64, 96, 2, 8),
-                (2, 32, 64, 96, 4, 8),
             ],
             ffn=[
                 (8, False, False, 16, 96, 64, 8, 4, 4, None, 1),
@@ -303,8 +301,6 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
             ],
             mha_out_proj=[
                 (8, 32, 64, 96, 1, 8),
-                (4, 32, 64, 96, 2, 8),
-                (2, 32, 64, 96, 4, 8),
             ],
             ffn=[
                 (8, False, False, 16, 96, 64, 8, 4, 4, None, 1),
@@ -486,8 +482,6 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
             ],
             mha_out_proj=[
                 (8, 32, 64, 128, 1, 8),
-                (4, 32, 64, 128, 2, 8),
-                (2, 32, 64, 128, 4, 8),
             ],
             addnorm=[
                 (8, 1024),
@@ -509,8 +503,6 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
             ],
             mha_out_proj=[
                 (8, 32, 64, 128, 1, 8),
-                (4, 32, 64, 128, 2, 8),
-                (2, 32, 64, 128, 4, 8),
             ],
             addnorm=[
                 (8, 1024),

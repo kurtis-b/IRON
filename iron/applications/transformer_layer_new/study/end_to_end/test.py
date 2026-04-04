@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import csv
 import json
+from pathlib import Path
 
 from iron.applications.transformer_layer_new.pattern.reference import (
     derive_offload_inputs,
@@ -33,6 +34,7 @@ from iron.applications.transformer_layer_new.study.end_to_end.modes import (
     _tokens_per_sec,
     _tokens_per_sec_per_watt,
     _validate_output,
+    benchmark_operator_candidate,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.run import (
     build_rows,
@@ -1103,3 +1105,212 @@ def test_power_sweep_main_writes_merged_results_and_tuning_csv(monkeypatch, tmp_
     assert len(tuning_rows) == 2
     assert {row["seq_len"] for row in result_rows} == {"64", "128"}
     assert all(row["is_best"] == "True" for row in result_rows)
+
+
+def test_power_sweep_main_checkpoints_after_each_case(monkeypatch, tmp_path):
+    cases = (get_case("baseline_768", 64), get_case("baseline_768", 128))
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run_power_sweep.iter_selected_cases",
+        lambda family_filter, max_seq_len: cases,
+    )
+
+    def fake_build_rows(
+        case,
+        *,
+        mode_filter,
+        warmup_runs,
+        runs_per_sample,
+        seed,
+        power_backend,
+    ):
+        del mode_filter, warmup_runs, runs_per_sample, seed, power_backend
+        return (
+            [
+                {
+                    "study_id": "end_to_end_tuning",
+                    "study_case_id": case.study_case_id,
+                    "study_case_label": case.study_case_label,
+                    "execution_mode": "offload",
+                    "internal_operator": "shared_gemm",
+                    "candidate_id": f"picked_{case.seq_len}",
+                    "seq_len": case.seq_len,
+                    "hidden_size": case.hidden_size,
+                    "intermediate_size": case.intermediate_size,
+                    "num_attention_heads": case.num_attention_heads,
+                    "attention_head_size": case.attention_head_size,
+                    "warmup_runs": 1,
+                    "runs_per_sample": 1,
+                    "avg_latency_ms": 1.0,
+                    "bandwidth_gbps": 1.0,
+                    "validation_error_count": 0,
+                    "run_status": "passed",
+                    "failure_message": "",
+                    "operator_config_json": "{}",
+                    "is_operator_best": True,
+                }
+            ],
+            [
+                {
+                    "study_id": "end_to_end",
+                    "study_case_id": case.study_case_id,
+                    "study_case_label": case.study_case_label,
+                    "backend": "npu",
+                    "execution_mode": "offload",
+                    "pattern_label": "offload",
+                    "seq_len": case.seq_len,
+                    "hidden_size": case.hidden_size,
+                    "intermediate_size": case.intermediate_size,
+                    "num_attention_heads": case.num_attention_heads,
+                    "attention_head_size": case.attention_head_size,
+                    "batch_size": 1,
+                    "dtype": "bf16",
+                    "use_bias": False,
+                    "weights_source": "synthetic",
+                    "warmup_runs": 1,
+                    "runs_per_sample": 1,
+                    "measured_inference_count": 1,
+                    "timed_total_sec": 0.1,
+                    "avg_latency_ms": float(case.seq_len),
+                    "compile_setup_time_ms": 10.0,
+                    "host_qkv_precompute_ms": 0.0,
+                    "tokens_per_sec": 1.0,
+                    "power_backend": "turbostat_pkgwatt",
+                    "avg_power_w": 2.0,
+                    "tokens_per_sec_per_watt": 0.5,
+                    "npu_dispatch_count": 30,
+                    "npu_unique_instruction_binary_count": 8,
+                    "npu_unique_xclbin_count": 1,
+                    "process_model": "in_process",
+                    "validation_error_count": 0,
+                    "run_status": "passed",
+                    "failure_message": "",
+                    "selected_candidate_ids_json": '{"shared_gemm": "picked"}',
+                    "selected_config_json": '{"shared_gemm": {"tile_m": 16}}',
+                }
+            ],
+        )
+
+    write_events: list[tuple[str, int]] = []
+
+    def fake_write_rows(path, *, fieldnames, rows):
+        del fieldnames
+        write_events.append((Path(path).name, len(rows)))
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run_power_sweep.build_rows",
+        fake_build_rows,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run_power_sweep.write_rows",
+        fake_write_rows,
+    )
+
+    exit_code = power_sweep_main(
+        [
+            "--family",
+            "baseline_768",
+            "--max-seq-len",
+            "256",
+            "--mode",
+            "all",
+            "--output",
+            str(tmp_path / "results_upto256_power.csv"),
+            "--tuning-output",
+            str(tmp_path / "tuning_upto256_power.csv"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert write_events == [
+        ("results_upto256_power.csv", 1),
+        ("tuning_upto256_power.csv", 1),
+        ("results_upto256_power.csv", 2),
+        ("tuning_upto256_power.csv", 2),
+        ("results_upto256_power.csv", 2),
+        ("tuning_upto256_power.csv", 2),
+    ]
+
+
+def test_benchmark_operator_candidate_uses_subprocess_for_long_sequences(monkeypatch):
+    calls: list[tuple[str, str, int]] = []
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.modes._benchmark_operator_candidate_isolated_subprocess",
+        lambda execution_mode, operator_name, workload, candidate_config, *, warmup_runs, runs_per_sample, seed: (
+            calls.append((execution_mode, operator_name, workload.seq_len))
+            or {
+                "avg_latency_ms": 1.0,
+                "bandwidth_gbps": 1.0,
+                "validation_error_count": 0,
+                "run_status": "passed",
+                "failure_message": "",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.modes._benchmark_operator_candidate_in_process",
+        lambda *args, **kwargs: {
+            "avg_latency_ms": 2.0,
+            "bandwidth_gbps": 2.0,
+            "validation_error_count": 1,
+            "run_status": "passed",
+            "failure_message": "",
+        },
+    )
+
+    workload = get_case("baseline_768", 8192).workload
+    result = benchmark_operator_candidate(
+        "offload",
+        "shared_gemm",
+        workload,
+        {"tile_m": 64},
+        warmup_runs=1,
+        runs_per_sample=2,
+        seed=42,
+    )
+
+    assert result["run_status"] == "passed"
+    assert calls == [("offload", "shared_gemm", 8192)]
+
+
+def test_benchmark_operator_candidate_uses_in_process_for_short_sequences(monkeypatch):
+    calls: list[tuple[str, str, int]] = []
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.modes._benchmark_operator_candidate_in_process",
+        lambda execution_mode, operator_name, workload, candidate_config, *, warmup_runs, runs_per_sample, seed: (
+            calls.append((execution_mode, operator_name, workload.seq_len))
+            or {
+                "avg_latency_ms": 1.0,
+                "bandwidth_gbps": 1.0,
+                "validation_error_count": 0,
+                "run_status": "passed",
+                "failure_message": "",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.modes._benchmark_operator_candidate_isolated_subprocess",
+        lambda *args, **kwargs: {
+            "avg_latency_ms": 2.0,
+            "bandwidth_gbps": 2.0,
+            "validation_error_count": 1,
+            "run_status": "passed",
+            "failure_message": "",
+        },
+    )
+
+    workload = get_case("baseline_768", 4096).workload
+    result = benchmark_operator_candidate(
+        "offload",
+        "shared_gemm",
+        workload,
+        {"tile_m": 64},
+        warmup_runs=1,
+        runs_per_sample=5,
+        seed=42,
+    )
+
+    assert result["run_status"] == "passed"
+    assert calls == [("offload", "shared_gemm", 4096)]

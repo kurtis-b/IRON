@@ -16,6 +16,7 @@ from iron.applications.transformer_layer_new.study.block.cases import (
 from iron.applications.transformer_layer_new.study.block.run import (
     BLOCK_CONFIG_COLUMNS,
     _threshold_validation_result,
+    benchmark_candidate,
     iteration_schedule,
     main,
     mark_best_rows,
@@ -133,6 +134,13 @@ def test_iteration_schedule_matches_end_to_end_defaults():
     assert iteration_schedule(16384, warmup_iters=None, timed_iters=None) == (1, 2)
 
 
+def test_long_sequence_mha_out_proj_cases_keep_only_stable_candidate():
+    for family_id in FAMILY_IDS:
+        for seq_len in (8192, 16384):
+            case = get_case(family_id, seq_len)
+            assert len(case.mha_out_proj) == 1
+
+
 def test_main_writes_csv_for_selected_case(monkeypatch, tmp_path):
     def fake_benchmark_candidate(
         block_kind,
@@ -206,3 +214,177 @@ def test_main_writes_csv_for_selected_case(monkeypatch, tmp_path):
         for column in block_columns
     }
     assert config_columns.issubset(rows[0].keys())
+
+
+def test_main_checkpoints_after_each_case(monkeypatch, tmp_path):
+    def fake_benchmark_candidate(
+        block_kind,
+        workload,
+        candidate,
+        *,
+        warmup_iters,
+        timed_iters,
+        seed,
+    ):
+        return {
+            "avg_latency_ms": 1.0,
+            "bandwidth_gbps": 10.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "error_message": "",
+        }
+
+    checkpoint_row_counts: list[int] = []
+
+    def fake_write_rows(output_path, rows):
+        checkpoint_row_counts.append(len(rows))
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run.benchmark_candidate",
+        fake_benchmark_candidate,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run.write_rows",
+        fake_write_rows,
+    )
+
+    exit_code = main(
+        [
+            "--family",
+            "all",
+            "--seq-len",
+            "64",
+            "--block",
+            "qkv_proj",
+            "--warmup-iters",
+            "1",
+            "--timed-iters",
+            "2",
+            "--output",
+            str(tmp_path / "ignored.csv"),
+        ]
+    )
+
+    assert exit_code == 0
+
+    baseline_768_rows = len(get_case("baseline_768", 64).candidates("qkv_proj"))
+    baseline_1024_rows = len(get_case("baseline_1024", 64).candidates("qkv_proj"))
+    assert checkpoint_row_counts == [
+        baseline_768_rows,
+        baseline_768_rows + baseline_1024_rows,
+        baseline_768_rows + baseline_1024_rows,
+    ]
+
+
+def test_benchmark_candidate_runs_aggressive_cleanup_for_long_sequences(monkeypatch):
+    cleanup_seq_lens: list[int] = []
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run._benchmark_candidate_isolated_subprocess",
+        lambda block_kind, workload, candidate, *, warmup_iters, timed_iters, seed: {
+            "avg_latency_ms": 1.0,
+            "bandwidth_gbps": 10.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "error_message": "",
+        },
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run._aggressive_cleanup",
+        lambda seq_len: cleanup_seq_lens.append(seq_len),
+    )
+
+    case = get_case("baseline_1024", 8192)
+    result = benchmark_candidate(
+        "qkv_proj",
+        case.workload,
+        case.qkv_proj[0],
+        warmup_iters=1,
+        timed_iters=2,
+        seed=42,
+    )
+
+    assert result["run_status"] == "passed"
+    assert cleanup_seq_lens == []
+
+
+def test_benchmark_candidate_uses_subprocess_for_long_sequences(monkeypatch):
+    calls: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run._benchmark_candidate_isolated_subprocess",
+        lambda block_kind, workload, candidate, *, warmup_iters, timed_iters, seed: (
+            calls.append((block_kind, workload.seq_len))
+            or {
+                "avg_latency_ms": 1.0,
+                "bandwidth_gbps": 10.0,
+                "validation_error_count": 0,
+                "run_status": "passed",
+                "error_message": "",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run._benchmark_candidate_in_process",
+        lambda *args, **kwargs: {
+            "avg_latency_ms": 2.0,
+            "bandwidth_gbps": 9.0,
+            "validation_error_count": 1,
+            "run_status": "passed",
+            "error_message": "",
+        },
+    )
+
+    case = get_case("baseline_1024", 16384)
+    result = benchmark_candidate(
+        "qkv_proj",
+        case.workload,
+        case.qkv_proj[0],
+        warmup_iters=1,
+        timed_iters=2,
+        seed=42,
+    )
+
+    assert result["run_status"] == "passed"
+    assert calls == [("qkv_proj", 16384)]
+
+
+def test_benchmark_candidate_uses_in_process_for_short_sequences(monkeypatch):
+    calls: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run._benchmark_candidate_in_process",
+        lambda block_kind, workload, candidate, *, warmup_iters, timed_iters, seed: (
+            calls.append((block_kind, workload.seq_len))
+            or {
+                "avg_latency_ms": 1.0,
+                "bandwidth_gbps": 10.0,
+                "validation_error_count": 0,
+                "run_status": "passed",
+                "error_message": "",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run._benchmark_candidate_isolated_subprocess",
+        lambda *args, **kwargs: {
+            "avg_latency_ms": 2.0,
+            "bandwidth_gbps": 9.0,
+            "validation_error_count": 1,
+            "run_status": "passed",
+            "error_message": "",
+        },
+    )
+
+    case = get_case("baseline_768", 64)
+    result = benchmark_candidate(
+        "qkv_proj",
+        case.workload,
+        case.qkv_proj[0],
+        warmup_iters=1,
+        timed_iters=1,
+        seed=42,
+    )
+
+    assert result["run_status"] == "passed"
+    assert calls == [("qkv_proj", 64)]

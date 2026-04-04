@@ -153,6 +153,20 @@ def default_runlist_operator_config(
     }
 
 
+def _use_long_seq_fallback(seq_len: int) -> bool:
+    return seq_len >= 16384
+
+
+def _resolve_long_seq_query_block_size(seq_len: int) -> int:
+    return 256 if _use_long_seq_fallback(seq_len) else seq_len
+
+
+def _resolve_long_seq_attn_scores_partition_n(seq_len: int) -> int:
+    if not _use_long_seq_fallback(seq_len):
+        return 1
+    return max(1, seq_len // 4096)
+
+
 def resolve_runlist_operator_config(
     seq_len,
     hidden_size,
@@ -222,6 +236,11 @@ class AIETransformerRunlist(AIEOperatorBase):
 
         # Derived dimensions
         self.head_dim = hidden_size // num_heads
+        self.use_long_seq_fallback = _use_long_seq_fallback(seq_len)
+        self.query_block_size = _resolve_long_seq_query_block_size(seq_len)
+        self.attn_scores_partition_n = _resolve_long_seq_attn_scores_partition_n(
+            seq_len
+        )
 
         # Weights to be set by user (separate Q/K/V weights)
         self.q_weight = None
@@ -275,7 +294,36 @@ class AIETransformerRunlist(AIEOperatorBase):
         self.down_proj_xclbin = None
         self.down_proj_insts = None
 
+        self.long_attn_scores_gemm = None
+        self.long_attn_output_gemm = None
+
         AIEOperatorBase.__init__(self, context=context)
+        if self.use_long_seq_fallback:
+            self.long_attn_scores_gemm = AIEGEMM(
+                M=self.query_block_size,
+                K=self.head_dim,
+                N=self.seq_len,
+                tile_m=64,
+                tile_k=64,
+                tile_n=16,
+                partition_N=self.attn_scores_partition_n,
+                num_aie_columns=4,
+                prio_accuracy=False,
+                emulate_bf16_mmul_with_bfp16=True,
+                context=self.context,
+            )
+            self.long_attn_output_gemm = AIEGEMM(
+                M=self.query_block_size,
+                K=self.seq_len,
+                N=self.head_dim,
+                tile_m=64,
+                tile_k=64,
+                tile_n=16,
+                num_aie_columns=4,
+                prio_accuracy=False,
+                emulate_bf16_mmul_with_bfp16=True,
+                context=self.context,
+            )
 
     def set_up_artifacts(self):
         """Set up artifacts for the encoder layer components using 13 individual layers."""
@@ -317,74 +365,85 @@ class AIETransformerRunlist(AIEOperatorBase):
         artifacts.append(self.k_transpose_insts)
         kernel_id += 1
 
-        # Attention score calculations (GEMM for Q*K^T, batched across heads)
-        attn_scores_kwargs = dict(self.operator_config["attn_scores"])
-        attn_scores_kwargs.update({"context": self.context, "skip_add_to_list": True})
-        self.attn_scores_xclbin, self.attn_scores_insts = AIEGEMM(
-            **attn_scores_kwargs
-        ).get_artifacts(prefix=f"{prefix_base}attn_scores_")
-        self.attn_scores_xclbin.xclbin_input = self.k_transpose_xclbin
-        self.attn_scores_xclbin.extra_flags += [
-            "--xclbin-instance-name=encoder_attn_scores",
-            f"--xclbin-kernel-id={hex(kernel_id)}",
-        ]
-        self.attn_scores_xclbin.kernel_name = "encoder_attn_scores"
-        self.attn_scores_xclbin.depends += [
-            self.k_transpose_xclbin,
-        ]
-        artifacts.append(self.attn_scores_insts)
-        kernel_id += 1
+        if self.use_long_seq_fallback:
+            next_dep = self.qkvo_proj_xclbin
+        else:
+            # Attention score calculations (GEMM for Q*K^T, batched across heads)
+            attn_scores_kwargs = dict(self.operator_config["attn_scores"])
+            attn_scores_kwargs.update(
+                {"context": self.context, "skip_add_to_list": True}
+            )
+            self.attn_scores_xclbin, self.attn_scores_insts = AIEGEMM(
+                **attn_scores_kwargs
+            ).get_artifacts(prefix=f"{prefix_base}attn_scores_")
+            self.attn_scores_xclbin.xclbin_input = self.k_transpose_xclbin
+            self.attn_scores_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_attn_scores",
+                f"--xclbin-kernel-id={hex(kernel_id)}",
+            ]
+            self.attn_scores_xclbin.kernel_name = "encoder_attn_scores"
+            self.attn_scores_xclbin.depends += [
+                self.k_transpose_xclbin,
+            ]
+            artifacts.append(self.attn_scores_insts)
+            kernel_id += 1
 
-        # Attention score scaling (Multiplication per attention score)
-        attn_scale_kwargs = dict(self.operator_config["attn_scale"])
-        attn_scale_kwargs.update({"context": self.context, "skip_add_to_list": True})
-        self.attn_scale_xclbin, self.attn_scale_insts = AIEElementwiseMul(
-            **attn_scale_kwargs
-        ).get_artifacts(prefix=f"{prefix_base}attn_scale_")
-        self.attn_scale_xclbin.xclbin_input = self.attn_scores_xclbin
-        self.attn_scale_xclbin.extra_flags += [
-            "--xclbin-instance-name=encoder_attn_scale",
-            f"--xclbin-kernel-id={hex(kernel_id)}",
-        ]
-        self.attn_scale_xclbin.kernel_name = "encoder_attn_scale"
-        self.attn_scale_xclbin.depends += [self.attn_scores_xclbin]
-        artifacts.append(self.attn_scale_insts)
-        kernel_id += 1
+            # Attention score scaling (Multiplication per attention score)
+            attn_scale_kwargs = dict(self.operator_config["attn_scale"])
+            attn_scale_kwargs.update(
+                {"context": self.context, "skip_add_to_list": True}
+            )
+            self.attn_scale_xclbin, self.attn_scale_insts = AIEElementwiseMul(
+                **attn_scale_kwargs
+            ).get_artifacts(prefix=f"{prefix_base}attn_scale_")
+            self.attn_scale_xclbin.xclbin_input = self.attn_scores_xclbin
+            self.attn_scale_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_attn_scale",
+                f"--xclbin-kernel-id={hex(kernel_id)}",
+            ]
+            self.attn_scale_xclbin.kernel_name = "encoder_attn_scale"
+            self.attn_scale_xclbin.depends += [self.attn_scores_xclbin]
+            artifacts.append(self.attn_scale_insts)
+            kernel_id += 1
 
-        # Attention weight calculations (Softmax per attention score)
-        attn_softmax_kwargs = dict(self.operator_config["attn_softmax"])
-        attn_softmax_kwargs.update({"context": self.context, "skip_add_to_list": True})
-        self.attn_softmax_xclbin, self.attn_softmax_insts = AIESoftmax(
-            **attn_softmax_kwargs
-        ).get_artifacts(prefix=f"{prefix_base}attn_softmax_")
-        self.attn_softmax_xclbin.xclbin_input = self.attn_scale_xclbin
-        self.attn_softmax_xclbin.extra_flags += [
-            "--xclbin-instance-name=encoder_attn_softmax",
-            f"--xclbin-kernel-id={hex(kernel_id)}",
-        ]
-        self.attn_softmax_xclbin.kernel_name = "encoder_attn_softmax"
-        self.attn_softmax_xclbin.depends += [self.attn_scale_xclbin]
-        artifacts.append(self.attn_softmax_insts)
-        kernel_id += 1
+            # Attention weight calculations (Softmax per attention score)
+            attn_softmax_kwargs = dict(self.operator_config["attn_softmax"])
+            attn_softmax_kwargs.update(
+                {"context": self.context, "skip_add_to_list": True}
+            )
+            self.attn_softmax_xclbin, self.attn_softmax_insts = AIESoftmax(
+                **attn_softmax_kwargs
+            ).get_artifacts(prefix=f"{prefix_base}attn_softmax_")
+            self.attn_softmax_xclbin.xclbin_input = self.attn_scale_xclbin
+            self.attn_softmax_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_attn_softmax",
+                f"--xclbin-kernel-id={hex(kernel_id)}",
+            ]
+            self.attn_softmax_xclbin.kernel_name = "encoder_attn_softmax"
+            self.attn_softmax_xclbin.depends += [self.attn_scale_xclbin]
+            artifacts.append(self.attn_softmax_insts)
+            kernel_id += 1
 
-        # Output head calculations (GEMM per attention weights/V heads, batched across heads)
-        attn_output_kwargs = dict(self.operator_config["attn_output"])
-        attn_output_kwargs.update({"context": self.context, "skip_add_to_list": True})
-        self.attn_output_xclbin, self.attn_output_insts = AIEGEMM(
-            **attn_output_kwargs
-        ).get_artifacts(prefix=f"{prefix_base}attn_output_")
-        self.attn_output_xclbin.xclbin_input = self.attn_softmax_xclbin
-        self.attn_output_xclbin.extra_flags += [
-            "--xclbin-instance-name=encoder_attn_output",
-            f"--xclbin-kernel-id={hex(kernel_id)}",
-        ]
-        self.attn_output_xclbin.kernel_name = "encoder_attn_output"
-        self.attn_output_xclbin.depends += [
-            self.attn_softmax_xclbin,
-        ]
-        artifacts.append(self.attn_output_insts)
-        kernel_id += 1
-        next_dep = self.attn_output_xclbin
+            # Output head calculations (GEMM per attention weights/V heads, batched across heads)
+            attn_output_kwargs = dict(self.operator_config["attn_output"])
+            attn_output_kwargs.update(
+                {"context": self.context, "skip_add_to_list": True}
+            )
+            self.attn_output_xclbin, self.attn_output_insts = AIEGEMM(
+                **attn_output_kwargs
+            ).get_artifacts(prefix=f"{prefix_base}attn_output_")
+            self.attn_output_xclbin.xclbin_input = self.attn_softmax_xclbin
+            self.attn_output_xclbin.extra_flags += [
+                "--xclbin-instance-name=encoder_attn_output",
+                f"--xclbin-kernel-id={hex(kernel_id)}",
+            ]
+            self.attn_output_xclbin.kernel_name = "encoder_attn_output"
+            self.attn_output_xclbin.depends += [
+                self.attn_softmax_xclbin,
+            ]
+            artifacts.append(self.attn_output_insts)
+            kernel_id += 1
+            next_dep = self.attn_output_xclbin
 
         # Layer normalization kernel
         ln1_kwargs = dict(self.operator_config["ln1"])
@@ -560,16 +619,17 @@ class AIETransformerRunlist(AIEOperatorBase):
         self.add_buffer("q_output", act_size)  # After layer 1a
         self.add_buffer("k_output", act_size)  # After layer 1b
         self.add_buffer("v_output", act_size)  # After layer 1c
-        self.add_buffer("k_transposed", act_size)  # After K transpose
-        self.add_buffer(
-            "attn_scores_output", self.seq_len * self.seq_len * self.num_heads
-        )  # After layer 2
-        self.add_buffer(
-            "attn_scaled_output", self.seq_len * self.seq_len * self.num_heads
-        )  # After layer 3
-        self.add_buffer(
-            "attn_weights_output", self.seq_len * self.seq_len * self.num_heads
-        )  # After layer 4
+        if not self.use_long_seq_fallback:
+            self.add_buffer("k_transposed", act_size)  # After K transpose
+            self.add_buffer(
+                "attn_scores_output", self.seq_len * self.seq_len * self.num_heads
+            )  # After layer 2
+            self.add_buffer(
+                "attn_scaled_output", self.seq_len * self.seq_len * self.num_heads
+            )  # After layer 3
+            self.add_buffer(
+                "attn_weights_output", self.seq_len * self.seq_len * self.num_heads
+            )  # After layer 4
         self.add_buffer("attn_heads_output", act_size)  # After layer 5
         self.add_buffer("output_proj_output", act_size)  # After layer 6
         self.add_buffer("add1_output", act_size)  # After residual add 1
@@ -596,36 +656,37 @@ class AIETransformerRunlist(AIEOperatorBase):
             self.qkvo_proj_xclbin.kernel_name,
             self.qkvo_proj_insts,
         )
-        self.add_kernel(
-            "encoder_k_transpose",
-            self.combined_xclbin,
-            self.k_transpose_xclbin.kernel_name,
-            self.k_transpose_insts,
-        )
-        self.add_kernel(
-            "encoder_attn_scores",
-            self.combined_xclbin,
-            self.attn_scores_xclbin.kernel_name,
-            self.attn_scores_insts,
-        )
-        self.add_kernel(
-            "encoder_attn_scale",
-            self.combined_xclbin,
-            self.attn_scale_xclbin.kernel_name,
-            self.attn_scale_insts,
-        )
-        self.add_kernel(
-            "encoder_attn_softmax",
-            self.combined_xclbin,
-            self.attn_softmax_xclbin.kernel_name,
-            self.attn_softmax_insts,
-        )
-        self.add_kernel(
-            "encoder_attn_output",
-            self.combined_xclbin,
-            self.attn_output_xclbin.kernel_name,
-            self.attn_output_insts,
-        )
+        if not self.use_long_seq_fallback:
+            self.add_kernel(
+                "encoder_k_transpose",
+                self.combined_xclbin,
+                self.k_transpose_xclbin.kernel_name,
+                self.k_transpose_insts,
+            )
+            self.add_kernel(
+                "encoder_attn_scores",
+                self.combined_xclbin,
+                self.attn_scores_xclbin.kernel_name,
+                self.attn_scores_insts,
+            )
+            self.add_kernel(
+                "encoder_attn_scale",
+                self.combined_xclbin,
+                self.attn_scale_xclbin.kernel_name,
+                self.attn_scale_insts,
+            )
+            self.add_kernel(
+                "encoder_attn_softmax",
+                self.combined_xclbin,
+                self.attn_softmax_xclbin.kernel_name,
+                self.attn_softmax_insts,
+            )
+            self.add_kernel(
+                "encoder_attn_output",
+                self.combined_xclbin,
+                self.attn_output_xclbin.kernel_name,
+                self.attn_output_insts,
+            )
         self.add_kernel(
             "encoder_ln1",
             self.combined_xclbin,
@@ -673,34 +734,37 @@ class AIETransformerRunlist(AIEOperatorBase):
         self.add_to_runlist("encoder_qkvo_proj", "input", "k_weight", "k_output")
         # V projection
         self.add_to_runlist("encoder_qkvo_proj", "input", "v_weight", "v_output")
-        # Transpose K matrix
-        self.add_to_runlist("encoder_k_transpose", "k_output", "k_transposed")
-        # Attention score calculations
-        self.add_to_runlist(
-            "encoder_attn_scores", "q_output", "k_transposed", "attn_scores_output"
-        )
-        # Attention score scaling
-        self.add_to_runlist(
-            "encoder_attn_scale",
-            "attn_scores_output",
-            "attn_scaled_output",
-        )
-        # Attention weight calculations (Softmax)
-        self.add_to_runlist(
-            "encoder_attn_softmax", "attn_scaled_output", "attn_weights_output"
-        )
-        # Output head calculations
-        self.add_to_runlist(
-            "encoder_attn_output",
-            "attn_weights_output",
-            "v_output",
-            "attn_heads_output",
-        )
-        next_output = "attn_heads_output"
+        if not self.use_long_seq_fallback:
+            # Transpose K matrix
+            self.add_to_runlist("encoder_k_transpose", "k_output", "k_transposed")
+            # Attention score calculations
+            self.add_to_runlist(
+                "encoder_attn_scores",
+                "q_output",
+                "k_transposed",
+                "attn_scores_output",
+            )
+            # Attention score scaling
+            self.add_to_runlist(
+                "encoder_attn_scale",
+                "attn_scores_output",
+                "attn_scaled_output",
+            )
+            # Attention weight calculations (Softmax)
+            self.add_to_runlist(
+                "encoder_attn_softmax", "attn_scaled_output", "attn_weights_output"
+            )
+            # Output head calculations
+            self.add_to_runlist(
+                "encoder_attn_output",
+                "attn_weights_output",
+                "v_output",
+                "attn_heads_output",
+            )
         # Output projection
         self.add_to_runlist(
             "encoder_qkvo_proj",
-            next_output,
+            "attn_heads_output",
             "attn_output_weight",
             "output_proj_output",
         )
@@ -750,11 +814,98 @@ class AIETransformerRunlist(AIEOperatorBase):
         assert x_flat.shape[0] == expected_size
 
         self.write_buffer("input", x_flat)
-        self.run_runlist()
-        result = self.read_buffer_as_torch(
+        if not self.use_long_seq_fallback:
+            self.run_runlist()
+            result = self.read_buffer_as_torch(
+                "output",
+                (self.seq_len, self.hidden_size),
+                dtype=bfloat16,
+            ).view(x.shape)
+            return result
+
+        return self._forward_long_seq_fallback(x)
+
+    def _forward_long_seq_fallback(self, x):
+        self.run_kernel_once("encoder_qkvo_proj", "input", "q_weight", "q_output")
+        self.run_kernel_once("encoder_qkvo_proj", "input", "k_weight", "k_output")
+        self.run_kernel_once("encoder_qkvo_proj", "input", "v_weight", "v_output")
+
+        q_output = self.read_buffer_as_torch(
+            "q_output", (self.seq_len, self.hidden_size), dtype=bfloat16
+        )
+        k_output = self.read_buffer_as_torch(
+            "k_output", (self.seq_len, self.hidden_size), dtype=bfloat16
+        )
+        v_output = self.read_buffer_as_torch(
+            "v_output", (self.seq_len, self.hidden_size), dtype=bfloat16
+        )
+
+        q_heads = (
+            q_output.view(self.seq_len, self.num_heads, self.head_dim)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+        k_heads = (
+            k_output.view(self.seq_len, self.num_heads, self.head_dim)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+        v_heads = (
+            v_output.view(self.seq_len, self.num_heads, self.head_dim)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+
+        attn_heads_output = torch.empty(
+            (self.seq_len, self.hidden_size), dtype=torch.bfloat16
+        )
+        scale = math.sqrt(1.0 / self.head_dim)
+        for q_start in range(0, self.seq_len, self.query_block_size):
+            q_end = min(q_start + self.query_block_size, self.seq_len)
+            block_len = q_end - q_start
+            block_output = torch.empty(
+                (self.num_heads, block_len, self.head_dim), dtype=torch.bfloat16
+            )
+            for head in range(self.num_heads):
+                q_block = q_heads[head, q_start:q_end, :].contiguous()
+                k_head_t = k_heads[head].transpose(0, 1).contiguous()
+                attn_scores = self.long_attn_scores_gemm(q_block, k_head_t)
+                attn_probs = torch.softmax(attn_scores.float() * scale, dim=-1).to(
+                    torch.bfloat16
+                )
+                block_output[head] = self.long_attn_output_gemm(
+                    attn_probs, v_heads[head].contiguous()
+                )
+            attn_heads_output[q_start:q_end] = (
+                block_output.permute(1, 0, 2)
+                .contiguous()
+                .view(block_len, self.hidden_size)
+            )
+
+        self.write_buffer("attn_heads_output", attn_heads_output.view(-1))
+        self.run_kernel_once(
+            "encoder_qkvo_proj",
+            "attn_heads_output",
+            "attn_output_weight",
+            "output_proj_output",
+        )
+        self.run_kernel_once(
+            "encoder_add", "input", "output_proj_output", "add1_output"
+        )
+        self.run_kernel_once("encoder_ln1", "add1_output", "ln1_output")
+        self.run_kernel_once(
+            "encoder_up_proj", "ln1_output", "ffn_up_weight", "up_proj_output"
+        )
+        self.run_kernel_once("encoder_gelu", "up_proj_output", "gelu_output")
+        self.run_kernel_once(
+            "encoder_down_proj", "gelu_output", "ffn_down_weight", "down_proj_output"
+        )
+        self.run_kernel_once(
+            "encoder_add", "ln1_output", "down_proj_output", "add2_output"
+        )
+        self.run_kernel_once("encoder_ln2", "add2_output", "output")
+        return self.read_buffer_as_torch(
             "output",
             (self.seq_len, self.hidden_size),
             dtype=bfloat16,
         ).view(x.shape)
-
-        return result
