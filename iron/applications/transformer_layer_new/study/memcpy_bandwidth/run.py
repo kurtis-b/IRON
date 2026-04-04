@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import argparse
 import csv
-import html
 import logging
 from pathlib import Path
+
+import seaborn as sns
+from matplotlib import pyplot as plt
 
 from .cases import (
     NUM_CHANNELS,
@@ -56,21 +58,13 @@ def default_output_path() -> Path:
 
 
 def default_bandwidth_plot_path(output_path: Path) -> Path:
-    return output_path.with_name("peak_bandwidth_by_size.svg")
-
-
-def default_latency_plot_path(output_path: Path) -> Path:
-    return output_path.with_name("latency_by_size.svg")
+    return output_path.with_name("bandwidth_by_shim_tiles.svg")
 
 
 def _resolve_plot_path(path: Path) -> Path:
     if path.suffix.lower() != PLOT_SUFFIX:
         raise ValueError(f"Plot output must use the {PLOT_SUFFIX} suffix: {path}")
     return path
-
-
-def _svg_escape(value: object) -> str:
-    return html.escape(str(value), quote=True)
 
 
 def _format_metric_value(value: float) -> str:
@@ -82,33 +76,6 @@ def _format_metric_value(value: float) -> str:
     if magnitude >= 10.0:
         return f"{value:,.2f}"
     return f"{value:,.3f}"
-
-
-def _value_to_y_position(
-    value: float,
-    *,
-    plot_top: float,
-    plot_height: float,
-    y_min: float,
-    y_max: float,
-) -> float:
-    denominator = y_max - y_min
-    normalized = 0.5 if denominator <= 0 else (value - y_min) / denominator
-    return plot_top + plot_height - (normalized * plot_height)
-
-
-def _format_size_label(size_bytes: int) -> str:
-    if size_bytes >= 1024:
-        kib = size_bytes / 1024.0
-        if float(int(kib)) == kib:
-            return f"{int(kib)} KiB"
-        return f"{kib:.1f} KiB"
-    return f"{size_bytes} B"
-
-
-def _winner_config_label(row: dict[str, object]) -> str:
-    mode_label = "bypass" if bool(row.get("bypass")) else "kernel"
-    return f"{int(row['num_cores'])}c / {int(row['num_channels'])}ch / {mode_label}"
 
 
 def _new_benchmark_context(case: MemcpyBandwidthCase):
@@ -303,150 +270,109 @@ def write_peak_metric_plot(
         [
             row
             for row in rows
-            if row.get("is_size_peak")
-            and row.get("run_status") == "passed"
+            if row.get("run_status") == "passed"
             and row.get(metric_key) is not None
+            and bool(row.get("bypass"))
         ],
-        key=lambda row: int(row["size_elements"]),
+        key=lambda row: int(row["num_cores"]) // int(row["num_channels"]),
+    )
+    plt.rcParams["svg.fonttype"] = "none"
+    sns.set_theme(
+        style="whitegrid",
+        context="talk",
+        rc={
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.titleweight": "bold",
+            "figure.facecolor": "#f7f5f2",
+            "axes.facecolor": "#fcfbf8",
+            "grid.color": "#ded8cf",
+        },
     )
 
-    width = 1060
-    height = 430
-    plot_left = 90
-    plot_right = 1030
-    plot_top = 70
-    plot_bottom = 270
-    plot_width = plot_right - plot_left
-    plot_height = plot_bottom - plot_top
-    svg_lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        (
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
-            f'height="{height}" viewBox="0 0 {width} {height}">'
-        ),
-        "<style>",
-        "text { font-family: sans-serif; fill: #1f2933; }",
-        ".title { font-size: 22px; font-weight: 700; }",
-        ".axis { stroke: #334155; stroke-width: 1.5; }",
-        ".grid { stroke: #cbd5e1; stroke-width: 1; }",
-        ".tick { font-size: 12px; fill: #475569; }",
-        ".value { font-size: 12px; font-weight: 600; }",
-        ".bar { opacity: 0.95; }",
-        "</style>",
-        f'<rect width="{width}" height="{height}" fill="white" />',
-        (
-            f'<text class="title" x="{width / 2.0}" y="34" text-anchor="middle">'
-            f"{_svg_escape(title)}</text>"
-        ),
-    ]
+    fig, ax = plt.subplots(figsize=(11.5, 7.2), constrained_layout=True)
 
     if not plot_rows:
-        svg_lines.append(
-            '<text class="tick" x="530" y="210" text-anchor="middle">'
-            "No successful results"
-            "</text>"
+        ax.text(
+            0.5,
+            0.5,
+            "No successful results",
+            ha="center",
+            va="center",
+            fontsize=14,
+            transform=ax.transAxes,
         )
-        svg_lines.append("</svg>")
+        ax.axis("off")
+        fig.suptitle(title, fontsize=22, fontweight="bold", y=0.97)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text("\n".join(svg_lines), encoding="utf-8")
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
         return
 
-    values = [float(row[metric_key]) for row in plot_rows]
-    y_min = 0.0
-    y_max = max(values)
-    if y_max <= y_min:
-        y_max = y_min + 1.0
-    y_max *= 1.08
-
-    svg_lines.append(
-        f'<text class="tick" x="28" y="{plot_top + (plot_height / 2.0)}" '
-        f'transform="rotate(-90 28 {plot_top + (plot_height / 2.0)})">'
-        f"{_svg_escape(y_axis_label)}</text>"
+    shim_tile_counts = sorted(
+        {int(row["num_cores"]) // int(row["num_channels"]) for row in plot_rows}
     )
-    svg_lines.append(
-        f'<line class="axis" x1="{plot_left}" y1="{plot_top}" '
-        f'x2="{plot_left}" y2="{plot_bottom}" />'
+    x_positions = list(range(len(shim_tile_counts)))
+    grouped_rows = {
+        int(row["num_cores"]) // int(row["num_channels"]): row for row in plot_rows
+    }
+    values = [
+        float(grouped_rows[shim_tile_count][metric_key])
+        for shim_tile_count in shim_tile_counts
+    ]
+    ax.bar(
+        x_positions,
+        values,
+        width=0.62,
+        color=bar_color,
+        edgecolor="#2b2b2b",
+        linewidth=1.0,
+        zorder=2,
     )
-    svg_lines.append(
-        f'<line class="axis" x1="{plot_left}" y1="{plot_bottom}" '
-        f'x2="{plot_right}" y2="{plot_bottom}" />'
-    )
-    for tick_index in range(5):
-        ratio = tick_index / 4.0
-        y_position = plot_bottom - (ratio * plot_height)
-        tick_value = y_min + ((y_max - y_min) * ratio)
-        svg_lines.append(
-            f'<line class="grid" x1="{plot_left}" y1="{y_position}" '
-            f'x2="{plot_right}" y2="{y_position}" />'
-        )
-        svg_lines.append(
-            f'<text class="tick" x="{plot_left - 10}" y="{y_position + 4}" '
-            f'text-anchor="end">{_svg_escape(_format_metric_value(tick_value))}</text>'
-        )
-
-    slot_width = plot_width / float(len(plot_rows))
-    bar_width = min(72.0, slot_width * 0.55)
-    for row_index, row in enumerate(plot_rows):
-        slot_left = plot_left + (row_index * slot_width)
-        slot_center = slot_left + (slot_width / 2.0)
-        bar_left = slot_center - (bar_width / 2.0)
-        value = float(row[metric_key])
-        bar_top = _value_to_y_position(
-            value,
-            plot_top=plot_top,
-            plot_height=plot_height,
-            y_min=y_min,
-            y_max=y_max,
-        )
-        bar_height = max(0.0, plot_bottom - bar_top)
-        svg_lines.append(
-            f'<rect class="bar" x="{bar_left:.2f}" y="{bar_top:.2f}" '
-            f'width="{bar_width:.2f}" height="{bar_height:.2f}" '
-            f'fill="{bar_color}" />'
-        )
-        svg_lines.append(
-            f'<text class="value" x="{slot_center:.2f}" y="{bar_top - 8:.2f}" '
-            f'text-anchor="middle">{_svg_escape(_format_metric_value(value))}</text>'
-        )
-        svg_lines.append(
-            f'<text class="tick" x="{slot_center:.2f}" y="{plot_bottom + 18}" '
-            f'text-anchor="middle">{_svg_escape(_format_size_label(int(row["size_bytes"])))}</text>'
-        )
-        svg_lines.append(
-            f'<text class="tick" x="{slot_center:.2f}" y="{plot_bottom + 34}" '
-            f'text-anchor="middle">{_svg_escape(_winner_config_label(row))}</text>'
+    value_offset = max(values) * 0.04 if max(values) > 0 else 0.1
+    for bar_x, value in zip(x_positions, values, strict=True):
+        ax.text(
+            bar_x,
+            value + value_offset,
+            _format_metric_value(value),
+            ha="center",
+            va="bottom",
+            fontsize=11,
+            fontweight="bold",
+            color="#2b2b2b",
         )
 
-    svg_lines.append(
-        f'<text class="tick" x="{plot_left + (plot_width / 2.0)}" y="{height - 26}" '
-        'text-anchor="middle">Winning configuration per size</text>'
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(
+        [str(shim_tile_count) for shim_tile_count in shim_tile_counts], fontsize=11
     )
-    svg_lines.append("</svg>")
+    ax.set_xlabel("Shim Tile Count", fontsize=14)
+    ax.set_ylabel(y_axis_label, fontsize=14)
+    ax.set_title(title, fontsize=22, fontweight="bold", pad=18)
+    ax.grid(True, which="major", axis="y", linewidth=0.8, alpha=0.8)
+    ax.grid(False, axis="x")
+    ax.margins(x=0.04)
+    max_value = max(float(row[metric_key]) for row in plot_rows)
+    ax.set_ylim(0.0, max_value * 1.24 if max_value > 0 else 1.0)
+    ax.tick_params(axis="y", labelsize=12)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(svg_lines), encoding="utf-8")
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
 
 
 def write_plots(
     rows: list[dict[str, object]],
     *,
     bandwidth_plot_path: Path,
-    latency_plot_path: Path,
 ) -> None:
     write_peak_metric_plot(
         bandwidth_plot_path,
         rows,
         metric_key="bandwidth_gbps",
-        title="Peak NPU memcpy Bandwidth by Size",
-        y_axis_label="Bandwidth (GB/s)",
+        title="Bandwidth by Shim Tile Count",
+        y_axis_label="Effective Bandwidth (GB/s)",
         bar_color="#0072b2",
-    )
-    write_peak_metric_plot(
-        latency_plot_path,
-        rows,
-        metric_key="latency_us",
-        title="Peak-Config memcpy Latency by Size",
-        y_axis_label="Latency (us)",
-        bar_color="#d55e00",
     )
 
 
@@ -472,13 +398,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--bypass",
         choices=("all", "false", "true"),
-        default="all",
+        default="true",
     )
-    parser.add_argument("--warmup-iters", type=int, default=1)
-    parser.add_argument("--timed-iters", type=int, default=10)
+    parser.add_argument("--warmup-iters", type=int, default=10)
+    parser.add_argument("--timed-iters", type=int, default=500)
     parser.add_argument("--output", type=Path, default=default_output_path())
     parser.add_argument("--bandwidth-plot", type=Path, default=None)
-    parser.add_argument("--latency-plot", type=Path, default=None)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
     if args.warmup_iters < 0:
@@ -499,11 +424,6 @@ def main(argv: list[str] | None = None) -> int:
         default_bandwidth_plot_path(output_path)
         if args.bandwidth_plot is None
         else _resolve_plot_path(args.bandwidth_plot.expanduser())
-    )
-    latency_plot_path = (
-        default_latency_plot_path(output_path)
-        if args.latency_plot is None
-        else _resolve_plot_path(args.latency_plot.expanduser())
     )
 
     rows = build_rows(
@@ -528,14 +448,9 @@ def main(argv: list[str] | None = None) -> int:
     write_plots(
         rows,
         bandwidth_plot_path=bandwidth_plot_path,
-        latency_plot_path=latency_plot_path,
     )
     LOGGER.info("Wrote %d memcpy bandwidth rows to %s", len(rows), output_path)
-    LOGGER.info(
-        "Wrote memcpy bandwidth plots to %s and %s",
-        bandwidth_plot_path,
-        latency_plot_path,
-    )
+    LOGGER.info("Wrote memcpy bandwidth plot to %s", bandwidth_plot_path)
     return 0
 
 

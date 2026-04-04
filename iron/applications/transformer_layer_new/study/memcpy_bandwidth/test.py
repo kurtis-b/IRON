@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import csv
+import pytest
 
 from iron.applications.transformer_layer_new.study.memcpy_bandwidth.cases import (
     iter_cases,
@@ -60,23 +61,49 @@ def _result(
     }
 
 
-def test_iter_cases_applies_validity_rules_and_tile_cap():
+def test_iter_cases_uses_fixed_size_and_shim_tile_scaled_cores():
     invalid_cases = iter_cases(
-        size_filter="65536",
-        num_cores_filter="4",
-        num_channels_filter="all",
+        size_filter="8388608",
+        num_cores_filter="1",
+        num_channels_filter="2",
         bypass_filter="all",
     )
     assert invalid_cases == ()
 
     valid_cases = iter_cases(
-        size_filter="131072",
-        num_cores_filter="16",
+        size_filter="8388608",
+        num_cores_filter="8",
         num_channels_filter="2",
         bypass_filter="all",
     )
     assert len(valid_cases) == 2
-    assert {case.tile_size for case in valid_cases} == {8192}
+    assert {case.num_channels for case in valid_cases} == {2}
+    assert {case.tile_size for case in valid_cases} == {4096}
+
+    max_core_cases = iter_cases(
+        size_filter="8388608",
+        num_cores_filter="16",
+        num_channels_filter="2",
+        bypass_filter="all",
+    )
+    assert len(max_core_cases) == 2
+    assert {case.tile_size for case in max_core_cases} == {4096}
+
+    invalid_one_channel_cases = iter_cases(
+        size_filter="8388608",
+        num_cores_filter="16",
+        num_channels_filter="1",
+        bypass_filter="all",
+    )
+    assert invalid_one_channel_cases == ()
+
+    invalid_core_cases = iter_cases(
+        size_filter="8388608",
+        num_cores_filter="6",
+        num_channels_filter="2",
+        bypass_filter="all",
+    )
+    assert invalid_core_cases == ()
 
 
 def test_mark_peak_rows_flags_size_peaks_and_overall_peak():
@@ -149,8 +176,8 @@ def test_write_peak_metric_plot_writes_svg_labels(tmp_path):
         {
             **_result(
                 size_elements=1024,
-                num_cores=1,
-                num_channels=1,
+                num_cores=2,
+                num_channels=2,
                 bypass=False,
                 tile_size=1024,
                 latency_us=10.0,
@@ -162,7 +189,7 @@ def test_write_peak_metric_plot_writes_svg_labels(tmp_path):
             **_result(
                 size_elements=2048,
                 num_cores=2,
-                num_channels=1,
+                num_channels=2,
                 bypass=True,
                 tile_size=1024,
                 latency_us=8.0,
@@ -176,21 +203,22 @@ def test_write_peak_metric_plot_writes_svg_labels(tmp_path):
         output_path,
         rows,
         metric_key="bandwidth_gbps",
-        title="Peak NPU memcpy Bandwidth by Size",
-        y_axis_label="Bandwidth (GB/s)",
+        title="Bandwidth by Shim Tile Count",
+        y_axis_label="Effective Bandwidth (GB/s)",
         bar_color="#0072b2",
     )
 
     svg = output_path.read_text(encoding="utf-8")
-    assert "Peak NPU memcpy Bandwidth by Size" in svg
-    assert "2 KiB" in svg
-    assert "1c / 1ch / kernel" in svg
-    assert "2c / 1ch / bypass" in svg
+    assert "Bandwidth by Shim Tile Count" in svg
+    assert "Shim Tile Count" in svg
+    assert "Effective Bandwidth (GB/s)" in svg
+    assert "1" in svg
+    assert "2" in svg
 
 
 def test_main_writes_csv_and_plots_from_monkeypatched_benchmarks(monkeypatch, tmp_path):
     def fake_benchmark_case(case, *, warmup_iters, timed_iters):
-        assert warmup_iters == 1
+        assert warmup_iters == 10
         assert timed_iters == 4
         return {
             "latency_us": float(case.size_elements) / float(case.num_cores * 100.0),
@@ -206,17 +234,16 @@ def test_main_writes_csv_and_plots_from_monkeypatched_benchmarks(monkeypatch, tm
     )
 
     output_path = tmp_path / "results.csv"
-    bandwidth_plot_path = tmp_path / "peak_bandwidth_by_size.svg"
-    latency_plot_path = tmp_path / "latency_by_size.svg"
+    bandwidth_plot_path = tmp_path / "bandwidth_by_shim_tiles.svg"
 
     exit_code = main(
         [
             "--size",
-            "1024",
+            "8388608",
             "--num-cores",
-            "1",
+            "8",
             "--num-channels",
-            "1",
+            "2",
             "--bypass",
             "all",
             "--timed-iters",
@@ -225,8 +252,6 @@ def test_main_writes_csv_and_plots_from_monkeypatched_benchmarks(monkeypatch, tm
             str(output_path),
             "--bandwidth-plot",
             str(bandwidth_plot_path),
-            "--latency-plot",
-            str(latency_plot_path),
         ]
     )
 
@@ -235,9 +260,45 @@ def test_main_writes_csv_and_plots_from_monkeypatched_benchmarks(monkeypatch, tm
     assert len(rows) == 2
     assert rows[0]["run_status"] == "passed"
     assert rows[0]["is_overall_peak"] == "False"
-    assert rows[1]["is_overall_peak"] == "True"
+    assert rows[-1]["is_overall_peak"] == "True"
     assert bandwidth_plot_path.exists()
-    assert latency_plot_path.exists()
+
+
+def test_main_defaults_to_bypass_only(monkeypatch, tmp_path):
+    def fake_benchmark_case(case, *, warmup_iters, timed_iters):
+        assert warmup_iters == 10
+        assert timed_iters == 500
+        return {
+            "latency_us": float(case.size_elements) / float(case.num_cores * 100.0),
+            "bandwidth_gbps": float(case.num_cores) + (0.5 if case.bypass else 0.0),
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memcpy_bandwidth.run.benchmark_case",
+        fake_benchmark_case,
+    )
+
+    output_path = tmp_path / "results.csv"
+    exit_code = main(
+        [
+            "--size",
+            "8388608",
+            "--num-cores",
+            "8",
+            "--num-channels",
+            "2",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    rows = _read_csv_rows(output_path)
+    assert len(rows) == 1
+    assert {row["bypass"] for row in rows} == {"True"}
 
 
 def test_main_emits_failed_exception_rows_without_aborting(monkeypatch, tmp_path):
@@ -262,11 +323,11 @@ def test_main_emits_failed_exception_rows_without_aborting(monkeypatch, tmp_path
     exit_code = main(
         [
             "--size",
-            "1024",
+            "8388608",
             "--num-cores",
-            "1",
+            "8",
             "--num-channels",
-            "1",
+            "2",
             "--bypass",
             "all",
             "--output",
@@ -282,7 +343,7 @@ def test_main_emits_failed_exception_rows_without_aborting(monkeypatch, tmp_path
     assert rows[1]["failure_message"] == "boom"
 
 
-def test_main_writes_empty_csv_when_no_cases_match(monkeypatch, tmp_path):
+def test_main_rejects_out_of_surface_cli_choices(monkeypatch, tmp_path):
     def fail_if_called(*args, **kwargs):
         raise AssertionError("benchmark_case should not run when no cases match")
 
@@ -292,20 +353,18 @@ def test_main_writes_empty_csv_when_no_cases_match(monkeypatch, tmp_path):
     )
 
     output_path = tmp_path / "results.csv"
-    exit_code = main(
-        [
-            "--size",
-            "131072",
-            "--num-cores",
-            "1",
-            "--num-channels",
-            "1",
-            "--bypass",
-            "all",
-            "--output",
-            str(output_path),
-        ]
-    )
-
-    assert exit_code == 0
-    assert _read_csv_rows(output_path) == []
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--size",
+                "8388608",
+                "--num-cores",
+                "1",
+                "--num-channels",
+                "2",
+                "--bypass",
+                "all",
+                "--output",
+                str(output_path),
+            ]
+        )

@@ -16,34 +16,31 @@ This study is NPU-only and does not compare against the transformer patterns.
 
 ## Sweep Surface
 
-Default transfer-size ladder:
+Fixed transfer size:
 
-- `1024`
-- `2048`
-- `4096`
-- `8192`
-- `16384`
-- `32768`
-- `65536`
-- `131072`
+- `8388608` elements
+- `16777216` bytes input
+- `33554432` total moved bytes
 
 Default sweep dimensions:
 
-- `num_cores=1..16`
-- `num_channels in {1, 2}`
-- `bypass in {False, True}`
+- `2` channels with `num_cores in {2, 4, 8, 16}`
+- default run compares only `bypass=True`
 
-The case generator applies the same validity rules as the existing
-`iron/operators/mem_copy/test.py` surface:
+This keeps the processed data size fixed while comparing a small, interpretable
+set of core/channel configurations. With `2` channels fixed, the sweep maps
+directly to shim-tile usage:
 
-- `num_cores <= 8 * num_channels`
-- `num_cores >= num_channels`
-- `size_elements % num_cores == 0`
-- `tile_size = size_elements // num_cores`
-- `tile_size <= 8192`
+- `2` cores -> `1` shim tile used
+- `4` cores -> `2` shim tiles used
+- `8` cores -> `4` shim tiles used
+- `16` cores -> `8` shim tiles used
 
-If capping `tile_size` to `8192` would change the requested total size, that
-case is skipped.
+Each case uses a fixed `4096` element tile size. The transfer size is chosen so
+that every tested configuration partitions into an exact number of full tiles.
+
+If needed, kernel-mode rows can still be generated explicitly with
+`--bypass all` or `--bypass false`.
 
 ## Output Contract
 
@@ -53,8 +50,10 @@ Canonical raw output is:
 
 Canonical plots are:
 
-- `results/memcpy_bandwidth/peak_bandwidth_by_size.svg`
-- `results/memcpy_bandwidth/latency_by_size.svg`
+- `results/memcpy_bandwidth/bandwidth_by_shim_tiles.svg`
+
+The plot is rendered as a single bar chart over shim-tile count, using
+bypass-mode rows by default.
 
 The CSV keeps one row per memcpy benchmark case and includes:
 
@@ -89,6 +88,11 @@ so the measured bandwidth matches the operator test convention:
 - validate the copied output
 - compute effective bandwidth from total input-plus-output bytes
 
+Default iteration schedule:
+
+- `10` warmup iterations
+- `500` timed iterations
+
 ## Owned Files
 
 This study owns:
@@ -96,4 +100,3 @@ This study owns:
 - `cases.py`
 - `run.py`
 - `test.py`
-

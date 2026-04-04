@@ -7,21 +7,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 STUDY_ID = "memcpy_bandwidth"
-SIZE_LADDER: tuple[int, ...] = (
-    1024,
-    2048,
-    4096,
-    8192,
-    16384,
-    32768,
-    65536,
-    131072,
+SIZE_LADDER: tuple[int, ...] = (8388608,)
+NUM_CHANNELS: tuple[int, ...] = (2,)
+TWO_CHANNEL_CORES: tuple[int, ...] = (2, 4, 8, 16)
+CORE_CHANNEL_SURFACE: tuple[tuple[int, int], ...] = tuple(
+    (core_count, 2) for core_count in TWO_CHANNEL_CORES
 )
-NUM_CORES: tuple[int, ...] = tuple(range(1, 17))
-NUM_CHANNELS: tuple[int, ...] = (1, 2)
+NUM_CORES: tuple[int, ...] = tuple(
+    sorted({core_count for core_count, _ in CORE_CHANNEL_SURFACE})
+)
 BYPASS_VALUES: tuple[bool, ...] = (False, True)
 ELEMENT_BYTES = 2
-MAX_TILE_SIZE = 8192
+FIXED_TILE_SIZE = 4096
 
 
 @dataclass(frozen=True)
@@ -55,19 +52,13 @@ def _resolve_tile_size(
     num_cores: int,
     num_channels: int,
 ) -> int | None:
-    if num_cores < num_channels:
+    if (num_cores, num_channels) not in CORE_CHANNEL_SURFACE:
         return None
-    if num_cores > (8 * num_channels):
+    if size_elements % FIXED_TILE_SIZE != 0:
         return None
-    if size_elements % num_cores != 0:
+    if size_elements % (FIXED_TILE_SIZE * num_cores) != 0:
         return None
-
-    tile_size = size_elements // num_cores
-    if tile_size > MAX_TILE_SIZE:
-        tile_size = MAX_TILE_SIZE
-    if tile_size * num_cores != size_elements:
-        return None
-    return tile_size
+    return FIXED_TILE_SIZE
 
 
 def iter_cases(
@@ -77,6 +68,13 @@ def iter_cases(
     num_channels_filter: str = "all",
     bypass_filter: str = "all",
 ) -> tuple[MemcpyBandwidthCase, ...]:
+    if size_filter != "all" and int(size_filter) not in SIZE_LADDER:
+        return ()
+    if num_cores_filter != "all" and int(num_cores_filter) not in NUM_CORES:
+        return ()
+    if num_channels_filter != "all" and int(num_channels_filter) not in NUM_CHANNELS:
+        return ()
+
     size_values = SIZE_LADDER if size_filter == "all" else (int(size_filter),)
     core_values = NUM_CORES if num_cores_filter == "all" else (int(num_cores_filter),)
     channel_values = (
@@ -115,8 +113,8 @@ def iter_cases(
             cases,
             key=lambda case: (
                 case.size_elements,
-                case.num_channels,
                 case.num_cores,
+                case.num_channels,
                 int(case.bypass),
             ),
         )
@@ -125,11 +123,13 @@ def iter_cases(
 
 __all__ = [
     "BYPASS_VALUES",
-    "MAX_TILE_SIZE",
+    "CORE_CHANNEL_SURFACE",
+    "FIXED_TILE_SIZE",
     "MemcpyBandwidthCase",
     "NUM_CHANNELS",
     "NUM_CORES",
     "SIZE_LADDER",
     "STUDY_ID",
+    "TWO_CHANNEL_CORES",
     "iter_cases",
 ]
