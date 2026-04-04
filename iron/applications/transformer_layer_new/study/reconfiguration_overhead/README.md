@@ -9,8 +9,8 @@ Status: `planned`
 
 ## Goal
 
-Isolate the GEMM-only subgraph and compare the shared-runtime reuse path against
-the multi-xclbin reconfiguration path.
+Compare the current shared-xclbin `offload` path against the multi-xclbin
+runlist sequence path for the GEMM-dominated portions of the transformer layer.
 
 Compared execution modes:
 
@@ -36,7 +36,7 @@ Total planned surface:
 
 ## Timed Surface
 
-The timed surface is limited to:
+The timed surface is limited to the NPU GEMM stages:
 
 - `q_proj`
 - `k_proj`
@@ -52,6 +52,9 @@ This study intentionally excludes:
 - softmax
 - GeLU
 - add/norm
+
+This matches the current offload/runtime comparison focus, even though the
+end-to-end offload pattern now also performs `q/k/v` on NPU.
 
 ## Artifact Contract
 

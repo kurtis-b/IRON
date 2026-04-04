@@ -189,3 +189,19 @@ def test_offload_supports_seq_len_16384_via_query_blocking():
     assert operator.q_proj.M == 256
     assert operator.k_proj.M == 256
     assert operator.v_proj.M == 256
+
+
+def test_offload_supports_seq_len_8192_via_query_blocking():
+    operator = AIETransformerOffload(
+        seq_len=8192,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_heads=12,
+    )
+
+    assert operator.query_block_size == 256
+    assert operator.uses_query_blocking is True
+    assert operator.attn_scores.partition_N == 2
+    assert operator.q_proj.M == 256
+    assert operator.k_proj.M == 256
+    assert operator.v_proj.M == 256

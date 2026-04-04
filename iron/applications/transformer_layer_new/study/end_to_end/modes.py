@@ -99,7 +99,7 @@ FINAL_REL_TOL = 0.1
 FINAL_ABS_TOL = 0.5
 FINAL_ERROR_THRESHOLD = 0.05
 REFERENCE_VALIDATION_MAX_SEQ_LEN = 512
-DEFAULT_POWER_SAMPLE_INTERVAL_SEC = 0.05
+DEFAULT_POWER_SAMPLE_INTERVAL_SEC = 0.1
 DEFAULT_QUIESCENT_BASELINE_DURATION_SEC = 0.5
 _CONTEXT_COUNTER = count()
 
@@ -1110,7 +1110,7 @@ def _benchmark_offload_shared_gemm(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    if workload.seq_len > 8192:
+    if workload.seq_len >= 8192:
         return _benchmark_offload_long_seq_candidate(
             workload,
             candidate_config,

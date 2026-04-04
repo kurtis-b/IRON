@@ -5,8 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Transformer Layer New
 
-`transformer_layer_new` is the smaller thesis-local study app for the
-Transformer Layer design-pattern work.
+`transformer_layer_new` is the thesis-local study app for the Transformer Layer
+design-pattern work.
 
 It starts from the existing pattern implementations in:
 
@@ -14,14 +14,20 @@ It starts from the existing pattern implementations in:
 - `pattern/runlist`
 - `pattern/offload`
 
+Current offload semantics:
+
+- one shared xclbin across the offloaded GEMMs
+- `q_proj`, `k_proj`, `v_proj`, `attn_scores`, `attn_output`, `out_proj`,
+  `ffn_up`, and `ffn_down` on NPU
+- host softmax, GeLU, and residual add/layer norm
+
 The remaining work in this app is the study harness and study documentation.
 
 ## Current Status
 
 - the block implementations are complete
 - the implemented study runners are `study/block` and `study/end_to_end`
-- study infrastructure is being added here instead of extending the older
-  `transformer_layer` app
+- study infrastructure lives here
 
 Implementation order:
 

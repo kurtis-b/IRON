@@ -53,7 +53,7 @@ def resolve_power_sample_interval_sec(
     requested_interval_sec: float,
     estimated_timed_window_sec: float | None,
     min_sample_count: int = 6,
-    min_interval_sec: float = 0.02,
+    min_interval_sec: float = 0.1,
 ) -> float:
     interval = float(requested_interval_sec)
     if estimated_timed_window_sec is None or estimated_timed_window_sec <= 0:
@@ -107,7 +107,7 @@ class TurbostatPackagePowerMonitor:
     def __init__(
         self,
         *,
-        sample_interval_sec: float = 0.05,
+        sample_interval_sec: float = 0.1,
         quiescent_baseline_duration_sec: float = 0.5,
         estimated_timed_window_sec: float | None = None,
     ):
@@ -233,7 +233,7 @@ class TurbostatPackagePowerMonitor:
 def create_power_monitor(
     *,
     power_backend: str,
-    sample_interval_sec: float = 0.05,
+    sample_interval_sec: float = 0.1,
     quiescent_baseline_duration_sec: float = 0.5,
     estimated_timed_window_sec: float | None = None,
 ):

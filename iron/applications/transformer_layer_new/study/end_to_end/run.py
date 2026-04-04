@@ -91,6 +91,26 @@ RESULTS_CSV_FIELDNAMES = (
 )
 
 
+def _case_descriptor(case: EndToEndCase) -> str:
+    return (
+        f"{case.study_case_id} seq_len={case.seq_len} "
+        f"hidden={case.hidden_size} inter={case.intermediate_size} "
+        f"heads={case.num_attention_heads}"
+    )
+
+
+def _result_summary(result: dict[str, object]) -> str:
+    status = str(result.get("run_status", ""))
+    avg_latency_ms = result.get("avg_latency_ms")
+    if status == "passed" and avg_latency_ms not in ("", None):
+        return (
+            f"passed avg_latency_ms={float(avg_latency_ms):.4f} "
+            f"validation_error_count={int(result.get('validation_error_count', 0))}"
+        )
+    failure_message = str(result.get("failure_message", ""))
+    return f"{status}: {failure_message}" if failure_message else status
+
+
 def default_output_path() -> Path:
     return (
         Path(__file__).resolve().parents[2] / "results" / "end_to_end" / "results.csv"
@@ -102,13 +122,11 @@ def default_tuning_output_path() -> Path:
 
 
 def iteration_schedule(seq_len: int) -> tuple[int, int]:
-    if seq_len <= 128:
-        return (10, 100)
-    if seq_len <= 512:
-        return (5, 50)
     if seq_len <= 2048:
-        return (3, 20)
-    return (1, 10)
+        return (1, 10)
+    if seq_len <= 4096:
+        return (1, 5)
+    return (1, 2)
 
 
 def json_dumps(value: object) -> str:
@@ -158,6 +176,57 @@ def _failed_final_result(
     }
 
 
+def _skip_isolated_long_seq_runlist_benchmark(
+    case: EndToEndCase,
+    *,
+    execution_mode: str,
+    operator_name: str,
+    candidates: list[dict[str, object]],
+) -> bool:
+    return (
+        execution_mode == "runlist"
+        and case.seq_len >= 8192
+        and len(candidates) == 1
+        and operator_name not in {"qkvo_proj", "k_transpose"}
+    )
+
+
+def _long_seq_runlist_selected_default_row(
+    *,
+    case: EndToEndCase,
+    operator_name: str,
+    candidate_id: str,
+    resolved_config: dict[str, object],
+    warmup_runs: int,
+    runs_per_sample: int,
+) -> dict[str, object]:
+    return {
+        "study_id": "end_to_end_tuning",
+        "study_case_id": case.study_case_id,
+        "study_case_label": case.study_case_label,
+        "execution_mode": "runlist",
+        "internal_operator": operator_name,
+        "candidate_id": candidate_id,
+        "seq_len": case.seq_len,
+        "hidden_size": case.hidden_size,
+        "intermediate_size": case.intermediate_size,
+        "num_attention_heads": case.num_attention_heads,
+        "attention_head_size": case.attention_head_size,
+        "warmup_runs": warmup_runs,
+        "runs_per_sample": runs_per_sample,
+        "avg_latency_ms": "",
+        "bandwidth_gbps": "",
+        "validation_error_count": "",
+        "run_status": "skipped_long_seq_default",
+        "failure_message": (
+            "Selected without isolated benchmark during long-sequence runlist tuning"
+        ),
+        "operator_config_json": json_dumps(resolved_config),
+        "is_operator_best": True,
+        "_resolved_config": resolved_config,
+    }
+
+
 def tune_mode(
     case: EndToEndCase,
     *,
@@ -165,15 +234,75 @@ def tune_mode(
     warmup_runs: int,
     runs_per_sample: int,
     seed: int,
+    validate_long_seq_runlist: bool = True,
 ) -> tuple[list[dict[str, object]], dict[str, str], dict[str, dict[str, object]], str]:
     candidates_by_mode = candidate_table_for_case(case.study_case_id, case.seq_len)
     tuning_rows: list[dict[str, object]] = []
     selected_candidate_ids: dict[str, str] = {}
     selected_config: dict[str, dict[str, object]] = {}
+    operator_names = MODE_OPERATORS[execution_mode]
 
-    for operator_name in MODE_OPERATORS[execution_mode]:
+    LOGGER.info(
+        "Tuning %s for %s (%d operator groups, warmup=%d, timed=%d)",
+        execution_mode,
+        _case_descriptor(case),
+        len(operator_names),
+        warmup_runs,
+        runs_per_sample,
+    )
+
+    for operator_index, operator_name in enumerate(operator_names, start=1):
         operator_rows: list[dict[str, object]] = []
-        for candidate in candidates_by_mode[execution_mode][operator_name]:
+        candidates = candidates_by_mode[execution_mode][operator_name]
+        if _skip_isolated_long_seq_runlist_benchmark(
+            case,
+            execution_mode=execution_mode,
+            operator_name=operator_name,
+            candidates=candidates,
+        ):
+            candidate = candidates[0]
+            resolved_config = resolve_mode_operator_config(
+                execution_mode,
+                case.workload,
+                {operator_name: dict(candidate["config"])},
+            )[operator_name]
+            selected_candidate_ids[operator_name] = candidate["candidate_id"]
+            selected_config[operator_name] = dict(resolved_config)
+            tuning_rows.append(
+                _long_seq_runlist_selected_default_row(
+                    case=case,
+                    operator_name=operator_name,
+                    candidate_id=candidate["candidate_id"],
+                    resolved_config=resolved_config,
+                    warmup_runs=warmup_runs,
+                    runs_per_sample=runs_per_sample,
+                )
+            )
+            LOGGER.info(
+                "[%s] Selected singleton %s candidate %s without isolated benchmarking "
+                "for long-sequence tuning",
+                execution_mode,
+                operator_name,
+                candidate["candidate_id"],
+            )
+            continue
+        LOGGER.info(
+            "[%s] Operator %d/%d: %s (%d candidates)",
+            execution_mode,
+            operator_index,
+            len(operator_names),
+            operator_name,
+            len(candidates),
+        )
+        for candidate_index, candidate in enumerate(candidates, start=1):
+            LOGGER.info(
+                "[%s] Candidate %d/%d for %s: %s",
+                execution_mode,
+                candidate_index,
+                len(candidates),
+                operator_name,
+                candidate["candidate_id"],
+            )
             resolved_config = resolve_mode_operator_config(
                 execution_mode,
                 case.workload,
@@ -209,6 +338,13 @@ def tune_mode(
                     **result,
                 }
             )
+            LOGGER.info(
+                "[%s] %s candidate %s -> %s",
+                execution_mode,
+                operator_name,
+                candidate["candidate_id"],
+                _result_summary(result),
+            )
 
         best_row = None
         successful_rows = [
@@ -223,14 +359,62 @@ def tune_mode(
             best_row["is_operator_best"] = True
             selected_candidate_ids[operator_name] = str(best_row["candidate_id"])
             selected_config[operator_name] = dict(best_row["_resolved_config"])
+            LOGGER.info(
+                "[%s] Selected %s candidate %s (avg_latency_ms=%.4f)",
+                execution_mode,
+                operator_name,
+                best_row["candidate_id"],
+                float(best_row["avg_latency_ms"]),
+            )
 
         tuning_rows.extend(operator_rows)
         if best_row is None:
+            LOGGER.warning(
+                "[%s] No passing candidate for %s in %s",
+                execution_mode,
+                operator_name,
+                _case_descriptor(case),
+            )
             return (
                 tuning_rows,
                 selected_candidate_ids,
                 selected_config,
                 f"tuning_failed: no passing candidate for {operator_name}",
+            )
+
+    if (
+        validate_long_seq_runlist
+        and execution_mode == "runlist"
+        and case.seq_len >= 8192
+    ):
+        LOGGER.info(
+            "[%s] Running long-sequence mode smoke for %s with selected operators %s",
+            execution_mode,
+            _case_descriptor(case),
+            json_dumps(selected_candidate_ids),
+        )
+        smoke_result = benchmark_mode(
+            execution_mode,
+            case.workload,
+            warmup_runs=warmup_runs,
+            runs_per_sample=runs_per_sample,
+            seed=seed,
+            power_backend="none",
+            operator_config=selected_config,
+        )
+        LOGGER.info(
+            "[%s] Long-sequence mode smoke for %s -> %s",
+            execution_mode,
+            _case_descriptor(case),
+            _result_summary(smoke_result),
+        )
+        if smoke_result["run_status"] != "passed":
+            return (
+                tuning_rows,
+                selected_candidate_ids,
+                selected_config,
+                "tuning_failed: long-sequence runlist mode smoke failed: "
+                + str(smoke_result["failure_message"]),
             )
 
     return tuning_rows, selected_candidate_ids, selected_config, ""
@@ -256,6 +440,11 @@ def build_rows(
     final_rows: list[dict[str, object]] = []
 
     for execution_mode in selected_modes:
+        LOGGER.info(
+            "Starting %s finalization for %s",
+            execution_mode,
+            _case_descriptor(case),
+        )
         mode_tuning_rows, selected_candidate_ids, selected_config, tuning_failure = (
             tune_mode(
                 case,
@@ -263,6 +452,7 @@ def build_rows(
                 warmup_runs=resolved_warmup_runs,
                 runs_per_sample=resolved_runs_per_sample,
                 seed=seed,
+                validate_long_seq_runlist=False,
             )
         )
         tuning_rows.extend(mode_tuning_rows)
@@ -272,7 +462,19 @@ def build_rows(
                 power_backend=power_backend,
                 failure_message=tuning_failure,
             )
+            LOGGER.warning(
+                "Skipping final %s benchmark for %s: %s",
+                execution_mode,
+                _case_descriptor(case),
+                tuning_failure,
+            )
         else:
+            LOGGER.info(
+                "Running final %s benchmark for %s with selected operators %s",
+                execution_mode,
+                _case_descriptor(case),
+                json_dumps(selected_candidate_ids),
+            )
             result = benchmark_mode(
                 execution_mode,
                 case.workload,
@@ -281,6 +483,12 @@ def build_rows(
                 seed=seed,
                 power_backend=power_backend,
                 operator_config=selected_config,
+            )
+            LOGGER.info(
+                "Completed final %s benchmark for %s -> %s",
+                execution_mode,
+                _case_descriptor(case),
+                _result_summary(result),
             )
 
         final_rows.append(
@@ -366,9 +574,21 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
 
+    output_path = args.output.expanduser()
+    tuning_output_path = args.tuning_output.expanduser()
+    cases = tuple(iter_cases(args.family, args.seq_len))
+
+    LOGGER.info(
+        "Starting end-to-end study with %d case(s), mode=%s, power_backend=%s",
+        len(cases),
+        args.mode,
+        args.power_backend,
+    )
+
     tuning_rows: list[dict[str, object]] = []
     final_rows: list[dict[str, object]] = []
-    for case in iter_cases(args.family, args.seq_len):
+    for case_index, case in enumerate(cases, start=1):
+        LOGGER.info("Case %d/%d: %s", case_index, len(cases), _case_descriptor(case))
         case_tuning_rows, case_final_rows = build_rows(
             case,
             mode_filter=args.mode,
@@ -379,10 +599,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         tuning_rows.extend(case_tuning_rows)
         final_rows.extend(case_final_rows)
+        mark_best_rows(final_rows)
+        write_rows(output_path, fieldnames=RESULTS_CSV_FIELDNAMES, rows=final_rows)
+        write_rows(
+            tuning_output_path,
+            fieldnames=TUNING_CSV_FIELDNAMES,
+            rows=tuning_rows,
+        )
+        LOGGER.info(
+            "Checkpointed %d end-to-end rows and %d tuning rows",
+            len(final_rows),
+            len(tuning_rows),
+        )
 
     mark_best_rows(final_rows)
-    output_path = args.output.expanduser()
-    tuning_output_path = args.tuning_output.expanduser()
     write_rows(output_path, fieldnames=RESULTS_CSV_FIELDNAMES, rows=final_rows)
     write_rows(
         tuning_output_path,

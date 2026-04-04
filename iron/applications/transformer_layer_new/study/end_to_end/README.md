@@ -18,6 +18,13 @@ Compared execution modes:
 - `runlist`
 - `offload`
 
+Current offload semantics:
+
+- the study still starts from hidden states at the benchmark boundary
+- offload performs `q/k/v` projections on NPU inside the pattern
+- offload keeps one shared xclbin across all offloaded GEMMs
+- host-side work remains softmax, GeLU, and residual add/layer norm
+
 ## Case Matrix
 
 Families:
@@ -60,6 +67,13 @@ Flow per `(family, seq_len, mode)`:
 - assemble the selected operator configs
 - run the final end-to-end benchmark once with the selected config set
 
+For `offload`, the current tuning unit remains one shared runtime GEMM config:
+
+- `shared_gemm`
+
+That shared config is applied across the offloaded `q/k/v`, attention, output,
+and FFN GEMMs.
+
 The candidate file is loaded by default. There is no CLI override for it in
 this first pass.
 
@@ -95,6 +109,13 @@ Required metrics in each row include:
 - `avg_power_w`
 - `tokens_per_sec_per_watt`
 
+Compatibility/runtime metrics:
+
+- `host_qkv_precompute_ms`
+  retained in the schema for study continuity; currently `0.0` for offload
+  because the offload pattern now starts from hidden states and computes
+  `q/k/v` on NPU
+
 `tokens_per_sec` is computed as `seq_len / avg_latency_sec`.
 
 Power measurement is best-effort:
@@ -117,6 +138,32 @@ Validation policy:
 Entry point:
 
 - `python -m iron.applications.transformer_layer_new.study.end_to_end.run`
+
+Convenience wrapper for powered ladder prefixes:
+
+- `python -m iron.applications.transformer_layer_new.study.end_to_end.run_power_sweep`
+
+Example:
+
+- `python -m iron.applications.transformer_layer_new.study.end_to_end.run_power_sweep --max-seq-len 256`
+
+The power-sweep helper defaults to:
+
+- `--family all`
+- `--mode all`
+- `--power-backend turbostat_pkgwatt`
+- `--warmup-iters 1`
+- `--timed-iters 1`
+
+Power sampling uses a conservative default cadence for `turbostat`:
+
+- requested interval: `0.1 s`
+- minimum interval floor: `0.1 s`
+
+It writes merged outputs directly into this study directory:
+
+- `results_upto<max_seq_len>_power.csv`
+- `tuning_upto<max_seq_len>_power.csv`
 
 Environment:
 

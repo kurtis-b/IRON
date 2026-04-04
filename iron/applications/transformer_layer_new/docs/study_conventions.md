@@ -133,6 +133,20 @@ The current tuning units are:
 - `offload`:
   `shared_gemm`
 
+The current `offload` pattern starts from hidden states and performs:
+
+- `q_proj`
+- `k_proj`
+- `v_proj`
+- `attn_scores`
+- `attn_output`
+- `out_proj`
+- `ffn_up`
+- `ffn_down`
+
+on NPU under one shared xclbin. Host work remains softmax, GeLU, and the two
+residual add/layer norm steps.
+
 ## Result CSV Contract
 
 Current canonical CSVs:
@@ -177,7 +191,8 @@ Required end-to-end row groups:
   `attention_head_size`, `batch_size`, `dtype`, `use_bias`, `weights_source`
 - timing:
   `warmup_runs`, `runs_per_sample`, `measured_inference_count`,
-  `timed_total_sec`, `avg_latency_ms`, `compile_setup_time_ms`
+  `timed_total_sec`, `avg_latency_ms`, `compile_setup_time_ms`,
+  `host_qkv_precompute_ms`
 - throughput and power:
   `tokens_per_sec`, `power_backend`, `avg_power_w`,
   `tokens_per_sec_per_watt`

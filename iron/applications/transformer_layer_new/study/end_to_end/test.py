@@ -42,6 +42,16 @@ from iron.applications.transformer_layer_new.study.end_to_end.run import (
     mark_best_rows,
     tune_mode,
 )
+from iron.applications.transformer_layer_new.study.end_to_end.power import (
+    resolve_power_sample_interval_sec,
+)
+from iron.applications.transformer_layer_new.study.end_to_end.run_power_sweep import (
+    default_output_path as default_power_sweep_output_path,
+    default_tuning_output_path as default_power_sweep_tuning_output_path,
+    iter_selected_cases,
+    main as power_sweep_main,
+    selected_sequence_ladder,
+)
 
 
 def test_case_table_covers_retained_surface():
@@ -56,6 +66,35 @@ def test_case_table_covers_retained_surface():
             assert case.attention_head_size == (
                 case.hidden_size // case.num_attention_heads
             )
+
+
+def test_power_sweep_selects_ladder_prefix():
+    assert selected_sequence_ladder(64) == (64,)
+    assert selected_sequence_ladder(256) == (64, 128, 256)
+    assert selected_sequence_ladder(16384) == SEQUENCE_LADDER
+
+
+def test_power_sweep_iter_selected_cases_respects_family_and_max_seq_len():
+    cases = iter_selected_cases("baseline_768", max_seq_len=256)
+    assert tuple(case.study_case_id for case in cases) == ("baseline_768",) * 3
+    assert tuple(case.seq_len for case in cases) == (64, 128, 256)
+
+
+def test_power_sweep_default_paths_live_in_study_directory():
+    assert default_power_sweep_output_path(256).name == "results_upto256_power.csv"
+    assert (
+        default_power_sweep_tuning_output_path(256).name == "tuning_upto256_power.csv"
+    )
+
+
+def test_power_sampling_defaults_to_conservative_100ms_floor():
+    assert (
+        resolve_power_sample_interval_sec(
+            requested_interval_sec=0.1,
+            estimated_timed_window_sec=0.03,
+        )
+        == 0.1
+    )
 
 
 def test_default_candidate_file_covers_all_modes_and_operators():
@@ -261,6 +300,14 @@ def test_dataflow_candidate_file_matches_block_study_configs():
                     candidate["config"] for candidate in seq_payload[operator_name]
                 ]
                 expected = _expected_dataflow_config_rows(block_case, operator_name)
+                if (
+                    family_id == "baseline_768"
+                    and seq_len == 64
+                    and operator_name == "qkv_proj"
+                ):
+                    # Keep the smaller qkv surface for the powered end-to-end study,
+                    # where the more aggressive qkv_3 candidate was unstable.
+                    expected = expected[:-1]
                 assert actual == expected
 
         all_payload = payload[family_id]["all"]
@@ -271,14 +318,16 @@ def test_dataflow_candidate_file_matches_block_study_configs():
             assert actual == expected
 
 
-def test_iteration_schedule_matches_block_study():
-    assert iteration_schedule(64) == (10, 100)
-    assert iteration_schedule(128) == (10, 100)
-    assert iteration_schedule(256) == (5, 50)
-    assert iteration_schedule(512) == (5, 50)
-    assert iteration_schedule(1024) == (3, 20)
-    assert iteration_schedule(2048) == (3, 20)
-    assert iteration_schedule(4096) == (1, 10)
+def test_iteration_schedule_matches_end_to_end_defaults():
+    assert iteration_schedule(64) == (1, 10)
+    assert iteration_schedule(128) == (1, 10)
+    assert iteration_schedule(256) == (1, 10)
+    assert iteration_schedule(512) == (1, 10)
+    assert iteration_schedule(1024) == (1, 10)
+    assert iteration_schedule(2048) == (1, 10)
+    assert iteration_schedule(4096) == (1, 5)
+    assert iteration_schedule(8192) == (1, 2)
+    assert iteration_schedule(16384) == (1, 2)
 
 
 def test_generate_golden_reference_can_skip_large_output():
@@ -547,6 +596,178 @@ def test_tune_mode_selects_fastest_passing_candidate(monkeypatch):
     ] == "fast"
 
 
+def test_tune_mode_runlist_long_seq_skips_singleton_defaults_and_smokes(monkeypatch):
+    case = get_case("baseline_768", 8192)
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.candidate_table_for_case",
+        lambda family_id, seq_len: {
+            "dataflow": {
+                operator: [{"candidate_id": "only", "config": {}}]
+                for operator in MODE_OPERATORS["dataflow"]
+            },
+            "runlist": {
+                "qkvo_proj": [
+                    {"candidate_id": "slow", "config": {"tile_m": 64}},
+                    {"candidate_id": "fast", "config": {"tile_m": 32}},
+                ],
+                "k_transpose": [{"candidate_id": "transpose", "config": {"m": 64}}],
+                **{
+                    operator: [{"candidate_id": "only", "config": {}}]
+                    for operator in MODE_OPERATORS["runlist"]
+                    if operator not in {"qkvo_proj", "k_transpose"}
+                },
+            },
+            "offload": {"shared_gemm": [{"candidate_id": "only", "config": {}}]},
+        },
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.resolve_mode_operator_config",
+        lambda execution_mode, workload, config: {
+            next(iter(config)): {"resolved": next(iter(config.values()))}
+        },
+    )
+
+    benchmarked = []
+
+    def fake_benchmark_operator_candidate(
+        execution_mode,
+        operator_name,
+        workload,
+        candidate_config,
+        *,
+        warmup_runs,
+        runs_per_sample,
+        seed,
+    ):
+        benchmarked.append(operator_name)
+        latency = 2.0 if candidate_config.get("tile_m") == 64 else 1.0
+        return {
+            "avg_latency_ms": latency,
+            "bandwidth_gbps": 1.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    smoke_calls = []
+
+    def fake_benchmark_mode(
+        execution_mode,
+        workload,
+        *,
+        warmup_runs,
+        runs_per_sample,
+        seed,
+        power_backend,
+        operator_config,
+    ):
+        smoke_calls.append((execution_mode, workload.seq_len, operator_config))
+        return {
+            "timed_total_sec": 0.5,
+            "measured_inference_count": runs_per_sample,
+            "avg_latency_ms": 5.0,
+            "compile_setup_time_ms": 100.0,
+            "host_qkv_precompute_ms": None,
+            "tokens_per_sec": 1.0,
+            "power_backend": power_backend,
+            "avg_power_w": None,
+            "tokens_per_sec_per_watt": None,
+            "npu_dispatch_count": 0,
+            "npu_unique_instruction_binary_count": 0,
+            "npu_unique_xclbin_count": 0,
+            "process_model": "in_process",
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.benchmark_operator_candidate",
+        fake_benchmark_operator_candidate,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.benchmark_mode",
+        fake_benchmark_mode,
+    )
+
+    tuning_rows, selected_candidate_ids, selected_config, tuning_failure = tune_mode(
+        case,
+        execution_mode="runlist",
+        warmup_runs=1,
+        runs_per_sample=1,
+        seed=42,
+    )
+
+    assert tuning_failure == ""
+    assert benchmarked == ["qkvo_proj", "qkvo_proj", "k_transpose"]
+    assert selected_candidate_ids["qkvo_proj"] == "fast"
+    assert selected_candidate_ids["attn_scores"] == "only"
+    skipped = [
+        row
+        for row in tuning_rows
+        if row["internal_operator"] == "attn_scores"
+        and row["run_status"] == "skipped_long_seq_default"
+    ]
+    assert len(skipped) == 1
+    assert smoke_calls == [("runlist", 8192, selected_config)]
+
+
+def test_tune_mode_runlist_long_seq_smoke_failure_returns_tuning_failure(monkeypatch):
+    case = get_case("baseline_768", 8192)
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.candidate_table_for_case",
+        lambda family_id, seq_len: {
+            "dataflow": {
+                operator: [{"candidate_id": "only", "config": {}}]
+                for operator in MODE_OPERATORS["dataflow"]
+            },
+            "runlist": {
+                operator: [{"candidate_id": "only", "config": {}}]
+                for operator in MODE_OPERATORS["runlist"]
+            },
+            "offload": {"shared_gemm": [{"candidate_id": "only", "config": {}}]},
+        },
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.resolve_mode_operator_config",
+        lambda execution_mode, workload, config: {
+            next(iter(config)): {"resolved": next(iter(config.values()))}
+        },
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.benchmark_operator_candidate",
+        lambda *args, **kwargs: {
+            "avg_latency_ms": 1.0,
+            "bandwidth_gbps": 1.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        },
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.benchmark_mode",
+        lambda *args, **kwargs: {
+            "run_status": "failed_exception",
+            "failure_message": "timeout",
+        },
+    )
+
+    _, _, _, tuning_failure = tune_mode(
+        case,
+        execution_mode="runlist",
+        warmup_runs=1,
+        runs_per_sample=1,
+        seed=42,
+    )
+
+    assert (
+        tuning_failure
+        == "tuning_failed: long-sequence runlist mode smoke failed: timeout"
+    )
+
+
 def test_build_rows_returns_tuning_and_final_rows(monkeypatch):
     case = get_case("baseline_768", 128)
 
@@ -557,6 +778,7 @@ def test_build_rows_returns_tuning_and_final_rows(monkeypatch):
         warmup_runs,
         runs_per_sample,
         seed,
+        validate_long_seq_runlist,
     ):
         return (
             [
@@ -637,8 +859,8 @@ def test_build_rows_returns_tuning_and_final_rows(monkeypatch):
 
     assert len(tuning_rows) == len(EXECUTION_MODES)
     assert len(final_rows) == len(EXECUTION_MODES)
-    assert all(row["warmup_runs"] == 10 for row in final_rows)
-    assert all(row["runs_per_sample"] == 100 for row in final_rows)
+    assert all(row["warmup_runs"] == 1 for row in final_rows)
+    assert all(row["runs_per_sample"] == 10 for row in final_rows)
     assert all(
         row["selected_candidate_ids_json"] == '{"qkv_proj": "picked"}'
         for row in final_rows
@@ -762,3 +984,122 @@ def test_main_writes_results_and_tuning_csv(monkeypatch, tmp_path):
     assert len(tuning_rows) == 1
     assert result_rows[0]["is_best"] == "True"
     assert tuning_rows[0]["is_operator_best"] == "True"
+
+
+def test_power_sweep_main_writes_merged_results_and_tuning_csv(monkeypatch, tmp_path):
+    cases = (get_case("baseline_768", 64), get_case("baseline_768", 128))
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run_power_sweep.iter_selected_cases",
+        lambda family_filter, max_seq_len: cases,
+    )
+
+    def fake_build_rows(
+        case,
+        *,
+        mode_filter,
+        warmup_runs,
+        runs_per_sample,
+        seed,
+        power_backend,
+    ):
+        del mode_filter, warmup_runs, runs_per_sample, seed, power_backend
+        return (
+            [
+                {
+                    "study_id": "end_to_end_tuning",
+                    "study_case_id": case.study_case_id,
+                    "study_case_label": case.study_case_label,
+                    "execution_mode": "offload",
+                    "internal_operator": "shared_gemm",
+                    "candidate_id": f"picked_{case.seq_len}",
+                    "seq_len": case.seq_len,
+                    "hidden_size": case.hidden_size,
+                    "intermediate_size": case.intermediate_size,
+                    "num_attention_heads": case.num_attention_heads,
+                    "attention_head_size": case.attention_head_size,
+                    "warmup_runs": 1,
+                    "runs_per_sample": 1,
+                    "avg_latency_ms": 1.0,
+                    "bandwidth_gbps": 1.0,
+                    "validation_error_count": 0,
+                    "run_status": "passed",
+                    "failure_message": "",
+                    "operator_config_json": "{}",
+                    "is_operator_best": True,
+                }
+            ],
+            [
+                {
+                    "study_id": "end_to_end",
+                    "study_case_id": case.study_case_id,
+                    "study_case_label": case.study_case_label,
+                    "backend": "npu",
+                    "execution_mode": "offload",
+                    "pattern_label": "offload",
+                    "seq_len": case.seq_len,
+                    "hidden_size": case.hidden_size,
+                    "intermediate_size": case.intermediate_size,
+                    "num_attention_heads": case.num_attention_heads,
+                    "attention_head_size": case.attention_head_size,
+                    "batch_size": 1,
+                    "dtype": "bf16",
+                    "use_bias": False,
+                    "weights_source": "synthetic",
+                    "warmup_runs": 1,
+                    "runs_per_sample": 1,
+                    "measured_inference_count": 1,
+                    "timed_total_sec": 0.1,
+                    "avg_latency_ms": float(case.seq_len),
+                    "compile_setup_time_ms": 10.0,
+                    "host_qkv_precompute_ms": 0.0,
+                    "tokens_per_sec": 1.0,
+                    "power_backend": "turbostat_pkgwatt",
+                    "avg_power_w": 2.0,
+                    "tokens_per_sec_per_watt": 0.5,
+                    "npu_dispatch_count": 30,
+                    "npu_unique_instruction_binary_count": 8,
+                    "npu_unique_xclbin_count": 1,
+                    "process_model": "in_process",
+                    "validation_error_count": 0,
+                    "run_status": "passed",
+                    "failure_message": "",
+                    "selected_candidate_ids_json": '{"shared_gemm": "picked"}',
+                    "selected_config_json": '{"shared_gemm": {"tile_m": 16}}',
+                }
+            ],
+        )
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run_power_sweep.build_rows",
+        fake_build_rows,
+    )
+
+    output_path = tmp_path / "results_upto256_power.csv"
+    tuning_output_path = tmp_path / "tuning_upto256_power.csv"
+
+    exit_code = power_sweep_main(
+        [
+            "--family",
+            "baseline_768",
+            "--max-seq-len",
+            "256",
+            "--mode",
+            "all",
+            "--output",
+            str(output_path),
+            "--tuning-output",
+            str(tuning_output_path),
+        ]
+    )
+    assert exit_code == 0
+
+    with output_path.open(newline="", encoding="utf-8") as handle:
+        result_rows = list(csv.DictReader(handle))
+    with tuning_output_path.open(newline="", encoding="utf-8") as handle:
+        tuning_rows = list(csv.DictReader(handle))
+
+    assert len(result_rows) == 2
+    assert len(tuning_rows) == 2
+    assert {row["seq_len"] for row in result_rows} == {"64", "128"}
+    assert all(row["is_best"] == "True" for row in result_rows)

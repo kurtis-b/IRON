@@ -155,16 +155,7 @@ def derive_offload_inputs(
     }
 
 
-def derive_gemm_only_inputs(
-    reference: dict[str, torch.Tensor | dict[str, torch.Tensor] | None],
-    *,
-    num_heads: int,
-) -> dict[str, torch.Tensor]:
-    return derive_offload_inputs(reference, num_heads=num_heads)
-
-
 __all__ = [
     "derive_offload_inputs",
-    "derive_gemm_only_inputs",
     "generate_golden_reference",
 ]

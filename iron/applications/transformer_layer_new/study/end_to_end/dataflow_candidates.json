@@ -158,16 +158,6 @@
             "parallel_seq": 4,
             "parallel_emb": 6
           }
-        },
-        {
-          "candidate_id": "qkv_3",
-          "config": {
-            "tile_m": 32,
-            "tile_k": 96,
-            "tile_n": 96,
-            "parallel_seq": 2,
-            "parallel_emb": 8
-          }
         }
       ],
       "mha_out_proj": [
