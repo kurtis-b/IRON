@@ -26,7 +26,8 @@ The remaining work in this app is the study harness and study documentation.
 ## Current Status
 
 - the block implementations are complete
-- the implemented study runners are `study/block`, `study/end_to_end`, and `study/igpu`
+- the implemented study runners are `study/block`, `study/end_to_end`,
+  `study/reconfiguration_overhead`, and `study/igpu`
 - study infrastructure is being added here instead of extending the older
   `transformer_layer` app
 
@@ -54,7 +55,7 @@ Full sequence ladder:
 
 Reconfiguration-overhead subset:
 
-- `64, 512, 16384`
+- `256, 2048, 16384`
 
 ## Study Layout
 
@@ -85,6 +86,7 @@ Current canonical result CSVs:
 - `results/block/results.csv`
 - `results/end_to_end/results.csv`
 - `results/end_to_end/tuning.csv`
+- `results/reconfiguration_overhead/results.csv`
 - `results/igpu/results.csv`
 
 Current canonical plot outputs:
@@ -92,14 +94,11 @@ Current canonical plot outputs:
 - `results/igpu/tps_comparison.svg`
 - `results/igpu/tps_per_watt_comparison.svg`
 
-Later planned result CSVs:
-
-- `results/reconfiguration_overhead/results.csv`
-
 Current study entrypoints:
 
 - `python -m iron.applications.transformer_layer_new.study.block.run`
 - `python -m iron.applications.transformer_layer_new.study.end_to_end.run`
+- `python -m iron.applications.transformer_layer_new.study.reconfiguration_overhead.run`
 - `python -m iron.applications.transformer_layer_new.study.igpu.run`
 
 The end-to-end study also uses checked-in default candidate files:
@@ -107,10 +106,6 @@ The end-to-end study also uses checked-in default candidate files:
 - `study/end_to_end/dataflow_candidates.json`
 - `study/end_to_end/runlist_candidates.json`
 - `study/end_to_end/offload_candidates.json`
-
-Later planned entrypoints:
-
-- `python -m iron.applications.transformer_layer_new.study.reconfiguration_overhead.run`
 
 ## iGPU Environment
 

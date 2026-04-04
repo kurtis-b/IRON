@@ -12,6 +12,7 @@ The implemented scope now includes:
 
 - `block`
 - `end_to_end`
+- `reconfiguration_overhead`
 - `igpu`
 
 ## Retained Cases
@@ -71,6 +72,8 @@ Stable study IDs:
 
 - `block`
 - `end_to_end`
+- `reconfiguration_overhead`
+- `igpu`
 
 Stable family IDs:
 
@@ -155,6 +158,7 @@ Current canonical CSVs:
 - `results/block/results.csv`
 - `results/end_to_end/tuning.csv`
 - `results/end_to_end/results.csv`
+- `results/reconfiguration_overhead/results.csv`
 - `results/igpu/results.csv`
 
 Current canonical iGPU plots:
@@ -196,6 +200,26 @@ The end-to-end tuning CSV keeps one row per
 `(study_case_id, seq_len, execution_mode, internal_operator, candidate_id)` and
 marks the fastest passing candidate per internal operator with
 `is_operator_best=True`.
+
+The reconfiguration-overhead CSV keeps one row per
+`(study_case_id, seq_len, execution_mode)` point.
+It reads the selected `runlist` and `offload` configs from
+`results/end_to_end/results.csv`, skips missing/empty config rows, and
+benchmarks a blocked GEMM-only NPU sequence for:
+
+- `offload_gemm_sequence`
+- `runlist_gemm_sequence`
+
+Its required metrics are latency and power:
+
+- `avg_latency_ms`
+- `avg_power_w`
+
+It also preserves the reconfiguration metadata:
+
+- `npu_dispatch_count`
+- `npu_unique_instruction_binary_count`
+- `npu_unique_xclbin_count`
 
 Required end-to-end row groups:
 
