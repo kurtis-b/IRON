@@ -14,6 +14,7 @@ The implemented scope now includes:
 - `end_to_end`
 - `reconfiguration_overhead`
 - `igpu`
+- `memcpy_bandwidth`
 
 ## Retained Cases
 
@@ -74,6 +75,7 @@ Stable study IDs:
 - `end_to_end`
 - `reconfiguration_overhead`
 - `igpu`
+- `memcpy_bandwidth`
 
 Stable family IDs:
 
@@ -160,11 +162,14 @@ Current canonical CSVs:
 - `results/end_to_end/results.csv`
 - `results/reconfiguration_overhead/results.csv`
 - `results/igpu/results.csv`
+- `results/memcpy_bandwidth/results.csv`
 
 Current canonical iGPU plots:
 
 - `results/igpu/tps_comparison.svg`
 - `results/igpu/tps_per_watt_comparison.svg`
+- `results/memcpy_bandwidth/peak_bandwidth_by_size.svg`
+- `results/memcpy_bandwidth/latency_by_size.svg`
 
 Required row groups:
 
@@ -220,6 +225,28 @@ It also preserves the reconfiguration metadata:
 - `npu_dispatch_count`
 - `npu_unique_instruction_binary_count`
 - `npu_unique_xclbin_count`
+
+The memcpy-bandwidth CSV keeps one row per memcpy benchmark case and is not
+family-based.
+It measures the existing `AIEMemCopy` operator across transfer size,
+`num_cores`, `num_channels`, and `bypass`.
+
+Its required metrics are:
+
+- `latency_us`
+- `bandwidth_gbps`
+
+It also preserves the case-identifying config and best-row markers:
+
+- `size_elements`
+- `size_bytes`
+- `total_moved_bytes`
+- `num_cores`
+- `num_channels`
+- `bypass`
+- `tile_size`
+- `is_size_peak`
+- `is_overall_peak`
 
 Required end-to-end row groups:
 

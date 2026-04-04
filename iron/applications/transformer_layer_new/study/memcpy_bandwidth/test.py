@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import csv
+
+from iron.applications.transformer_layer_new.study.memcpy_bandwidth.cases import (
+    iter_cases,
+)
+from iron.applications.transformer_layer_new.study.memcpy_bandwidth.run import (
+    CSV_FIELDNAMES,
+    main,
+    mark_peak_rows,
+    write_peak_metric_plot,
+    write_rows,
+)
+
+
+def _read_csv_rows(path):
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _result(
+    *,
+    size_elements: int,
+    num_cores: int,
+    num_channels: int,
+    bypass: bool,
+    tile_size: int,
+    latency_us: float | None,
+    bandwidth_gbps: float | None,
+    run_status: str = "passed",
+    failure_message: str = "",
+) -> dict[str, object]:
+    return {
+        "study_id": "memcpy_bandwidth",
+        "case_id": (
+            f"memcpy_{size_elements}_cores{num_cores}_ch{num_channels}_"
+            f"{'bypass' if bypass else 'kernel'}"
+        ),
+        "size_elements": size_elements,
+        "size_bytes": size_elements * 2,
+        "total_moved_bytes": size_elements * 4,
+        "num_cores": num_cores,
+        "num_channels": num_channels,
+        "bypass": bypass,
+        "tile_size": tile_size,
+        "warmup_iters": 1,
+        "timed_iters": 10,
+        "latency_us": latency_us,
+        "bandwidth_gbps": bandwidth_gbps,
+        "validation_error_count": 0,
+        "run_status": run_status,
+        "failure_message": failure_message,
+        "is_size_peak": False,
+        "is_overall_peak": False,
+    }
+
+
+def test_iter_cases_applies_validity_rules_and_tile_cap():
+    invalid_cases = iter_cases(
+        size_filter="65536",
+        num_cores_filter="4",
+        num_channels_filter="all",
+        bypass_filter="all",
+    )
+    assert invalid_cases == ()
+
+    valid_cases = iter_cases(
+        size_filter="131072",
+        num_cores_filter="16",
+        num_channels_filter="2",
+        bypass_filter="all",
+    )
+    assert len(valid_cases) == 2
+    assert {case.tile_size for case in valid_cases} == {8192}
+
+
+def test_mark_peak_rows_flags_size_peaks_and_overall_peak():
+    rows = [
+        _result(
+            size_elements=1024,
+            num_cores=1,
+            num_channels=1,
+            bypass=False,
+            tile_size=1024,
+            latency_us=9.0,
+            bandwidth_gbps=1.0,
+        ),
+        _result(
+            size_elements=1024,
+            num_cores=2,
+            num_channels=1,
+            bypass=False,
+            tile_size=512,
+            latency_us=6.0,
+            bandwidth_gbps=1.5,
+        ),
+        _result(
+            size_elements=2048,
+            num_cores=2,
+            num_channels=1,
+            bypass=True,
+            tile_size=1024,
+            latency_us=5.0,
+            bandwidth_gbps=3.0,
+        ),
+    ]
+
+    mark_peak_rows(rows)
+
+    assert rows[0]["is_size_peak"] is False
+    assert rows[1]["is_size_peak"] is True
+    assert rows[1]["is_overall_peak"] is False
+    assert rows[2]["is_size_peak"] is True
+    assert rows[2]["is_overall_peak"] is True
+
+
+def test_write_rows_writes_required_columns(tmp_path):
+    output_path = tmp_path / "results.csv"
+    write_rows(
+        output_path,
+        [
+            _result(
+                size_elements=1024,
+                num_cores=1,
+                num_channels=1,
+                bypass=False,
+                tile_size=1024,
+                latency_us=10.0,
+                bandwidth_gbps=0.5,
+            )
+        ],
+    )
+
+    rows = _read_csv_rows(output_path)
+    assert len(rows) == 1
+    assert tuple(rows[0].keys()) == CSV_FIELDNAMES
+    assert rows[0]["size_elements"] == "1024"
+    assert rows[0]["bandwidth_gbps"] == "0.5"
+
+
+def test_write_peak_metric_plot_writes_svg_labels(tmp_path):
+    output_path = tmp_path / "peak_bandwidth_by_size.svg"
+    rows = [
+        {
+            **_result(
+                size_elements=1024,
+                num_cores=1,
+                num_channels=1,
+                bypass=False,
+                tile_size=1024,
+                latency_us=10.0,
+                bandwidth_gbps=0.5,
+            ),
+            "is_size_peak": True,
+        },
+        {
+            **_result(
+                size_elements=2048,
+                num_cores=2,
+                num_channels=1,
+                bypass=True,
+                tile_size=1024,
+                latency_us=8.0,
+                bandwidth_gbps=1.0,
+            ),
+            "is_size_peak": True,
+        },
+    ]
+
+    write_peak_metric_plot(
+        output_path,
+        rows,
+        metric_key="bandwidth_gbps",
+        title="Peak NPU memcpy Bandwidth by Size",
+        y_axis_label="Bandwidth (GB/s)",
+        bar_color="#0072b2",
+    )
+
+    svg = output_path.read_text(encoding="utf-8")
+    assert "Peak NPU memcpy Bandwidth by Size" in svg
+    assert "2 KiB" in svg
+    assert "1c / 1ch / kernel" in svg
+    assert "2c / 1ch / bypass" in svg
+
+
+def test_main_writes_csv_and_plots_from_monkeypatched_benchmarks(monkeypatch, tmp_path):
+    def fake_benchmark_case(case, *, warmup_iters, timed_iters):
+        assert warmup_iters == 1
+        assert timed_iters == 4
+        return {
+            "latency_us": float(case.size_elements) / float(case.num_cores * 100.0),
+            "bandwidth_gbps": float(case.num_cores) + (0.5 if case.bypass else 0.0),
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memcpy_bandwidth.run.benchmark_case",
+        fake_benchmark_case,
+    )
+
+    output_path = tmp_path / "results.csv"
+    bandwidth_plot_path = tmp_path / "peak_bandwidth_by_size.svg"
+    latency_plot_path = tmp_path / "latency_by_size.svg"
+
+    exit_code = main(
+        [
+            "--size",
+            "1024",
+            "--num-cores",
+            "1",
+            "--num-channels",
+            "1",
+            "--bypass",
+            "all",
+            "--timed-iters",
+            "4",
+            "--output",
+            str(output_path),
+            "--bandwidth-plot",
+            str(bandwidth_plot_path),
+            "--latency-plot",
+            str(latency_plot_path),
+        ]
+    )
+
+    assert exit_code == 0
+    rows = _read_csv_rows(output_path)
+    assert len(rows) == 2
+    assert rows[0]["run_status"] == "passed"
+    assert rows[0]["is_overall_peak"] == "False"
+    assert rows[1]["is_overall_peak"] == "True"
+    assert bandwidth_plot_path.exists()
+    assert latency_plot_path.exists()
+
+
+def test_main_emits_failed_exception_rows_without_aborting(monkeypatch, tmp_path):
+    def fake_benchmark_case(case, *, warmup_iters, timed_iters):
+        del warmup_iters, timed_iters
+        if case.bypass:
+            raise RuntimeError("boom")
+        return {
+            "latency_us": 5.0,
+            "bandwidth_gbps": 2.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memcpy_bandwidth.run.benchmark_case",
+        fake_benchmark_case,
+    )
+
+    output_path = tmp_path / "results.csv"
+    exit_code = main(
+        [
+            "--size",
+            "1024",
+            "--num-cores",
+            "1",
+            "--num-channels",
+            "1",
+            "--bypass",
+            "all",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    rows = _read_csv_rows(output_path)
+    assert len(rows) == 2
+    assert [row["run_status"] for row in rows] == ["passed", "failed_exception"]
+    assert rows[0]["is_size_peak"] == "True"
+    assert rows[1]["failure_message"] == "boom"
+
+
+def test_main_writes_empty_csv_when_no_cases_match(monkeypatch, tmp_path):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("benchmark_case should not run when no cases match")
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memcpy_bandwidth.run.benchmark_case",
+        fail_if_called,
+    )
+
+    output_path = tmp_path / "results.csv"
+    exit_code = main(
+        [
+            "--size",
+            "131072",
+            "--num-cores",
+            "1",
+            "--num-channels",
+            "1",
+            "--bypass",
+            "all",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert _read_csv_rows(output_path) == []
