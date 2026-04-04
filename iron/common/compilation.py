@@ -125,11 +125,38 @@ class XclbinArtifact(CompilationArtifact):
         self.extra_flags = extra_flags if extra_flags is not None else []
         self.xclbin_input = xclbin_input
 
+    def is_available(self):
+        if not super().is_available():
+            return False
+        if self.xclbin_input is None:
+            return True
+        if not self.xclbin_input.is_available():
+            return False
+        return not self.xclbin_input.is_newer_than(os.path.getmtime(str(self.path)))
+
 
 class InstsBinArtifact(CompilationArtifact):
-    def __init__(self, path, depends, extra_flags=None):
+    def __init__(
+        self,
+        path,
+        depends,
+        extra_flags=None,
+        xclbin_input=None,
+        kernel_name=None,
+    ):
         super().__init__(path, depends)
         self.extra_flags = extra_flags if extra_flags is not None else []
+        self.xclbin_input = xclbin_input
+        self.kernel_name = kernel_name
+
+    def is_available(self):
+        if not super().is_available():
+            return False
+        if self.xclbin_input is None:
+            return True
+        if not self.xclbin_input.is_available():
+            return False
+        return not self.xclbin_input.is_newer_than(os.path.getmtime(str(self.path)))
 
 
 class KernelObjectArtifact(CompilationArtifact):
@@ -383,6 +410,14 @@ class AieccCompilationRule(CompilationRule):
                 ]  # FIXME: this does not handle the case of multiple insts.bins with different flags from the same MLIR
                 if not do_compile_xclbin:
                     compile_cmd += ["--no-compile"]
+                if first_insts_bin.xclbin_input is not None:
+                    compile_cmd += [
+                        "--xclbin-input=" + str(first_insts_bin.xclbin_input.path)
+                    ]
+                    if first_insts_bin.kernel_name is not None:
+                        compile_cmd += [
+                            "--xclbin-kernel-name=" + first_insts_bin.kernel_name
+                        ]
                 compile_cmd += first_insts_bin.extra_flags + [
                     "--aie-generate-npu",
                     "--npu-insts-name=" + str(first_insts_bin.path),

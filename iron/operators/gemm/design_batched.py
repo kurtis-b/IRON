@@ -37,6 +37,57 @@ microkernel_mac_dim_map = {
 }
 
 
+# Parse batch configuration tuples
+def parse_batch_tuple(batch_str):
+    """Parse a batch configuration string like '(1,0,0)' into a tuple of ints."""
+    if batch_str is None:
+        return None
+    try:
+        # Remove parentheses and split by comma
+        batch_str = batch_str.strip()
+        if batch_str.startswith("("):
+            batch_str = batch_str[1:]
+        if batch_str.endswith(")"):
+            batch_str = batch_str[:-1]
+        parts = [int(x.strip()) for x in batch_str.split(",")]
+        if len(parts) != 3:
+            raise ValueError(
+                "Batch tuple must have exactly 3 elements: (batch_size, batch_stride_dim)"
+            )
+        return tuple(parts)
+    except Exception as e:
+        raise ValueError(
+            f"Invalid batch tuple format: {batch_str}. Expected format: '(batch_size,batch_stride_dim)'. Error: {e}"
+        )
+
+
+def get_batch_offset(dim_0, dim_1, batch_idx, batch_stride_dim, col_maj):
+    """dim_0 and dim_1 are the hardware dimensions"""
+    if col_maj:  # (dim_0, dim_1)
+        if batch_stride_dim == 0:  # stride across row dim for batch
+            return batch_idx * dim_0 * dim_1
+        else:  # stride across col dim for batch
+            return batch_idx * dim_1
+    else:  # (dim_1, dim_0)
+        if batch_stride_dim == 0:  # stride across row dim for batch
+            return batch_idx * dim_1 * dim_0
+        else:  # stride across col dim for batch
+            return batch_idx * dim_0
+
+
+def get_shape_with_batch(dim_0, dim_1, batch_size, batch_stride_dim, col_maj):
+    if col_maj:  # (dim_0, dim_1)
+        if batch_stride_dim == 0:  # batch size applied to row dim
+            return (dim_0 * batch_size, dim_1)
+        else:  # batch size applied to col dim
+            return (dim_0, dim_1 * batch_size)
+    else:  # (dim_1, dim_0)
+        if batch_stride_dim == 0:  # batch size applied to row dim
+            return (dim_1 * batch_size, dim_0)
+        else:  # batch size applied to col dim
+            return (dim_1, dim_0 * batch_size)
+
+
 def main():
     argparser = argparse.ArgumentParser(
         prog="AIE Matrix Multiplication MLIR Design (Whole Array)",
@@ -58,7 +109,6 @@ def main():
         "--emulate-bf16-mmul-with-bfp16", action="store_true", default=False
     )
     argparser.add_argument("--prio-accuracy", action="store_true", default=False)
-    argparser.add_argument("--separate-c-tiles", type=int, choices=[0, 1], default=0)
     argparser.add_argument(
         "--archive",
         type=str,
@@ -85,6 +135,27 @@ def main():
         type=str,
         help="Output file path for the generated MLIR module",
     )
+    argparser.add_argument(
+        "--batch-A",
+        type=str,
+        default=None,
+        help="Batch configuration for matrix A as tuple: (batch_size, batch_stride_dim). "
+        "Example: '(2,0)' for batch_size=2, batch_stride_dim=0",
+    )
+    argparser.add_argument(
+        "--batch-B",
+        type=str,
+        default=None,
+        help="Batch configuration for matrix B as tuple: (batch_size, batch_stride_dim). "
+        "Example: '(2,0)' for batch_size=2, batch_stride_dim=0",
+    )
+    argparser.add_argument(
+        "--batch-C",
+        type=str,
+        default=None,
+        help="Batch configuration for matrix C as tuple: (batch_size, batch_stride_dim). "
+        "Example: '(2,0)' for batch_size=2, batch_stride_dim=0",
+    )
 
     args = argparser.parse_args()
     maybe_module = my_matmul(
@@ -103,10 +174,12 @@ def main():
         args.scalar,
         args.emulate_bf16_mmul_with_bfp16,
         args.prio_accuracy,
-        args.separate_c_tiles,
         args.trace_size,
         args.archive,
         args.generate_taps,
+        parse_batch_tuple(args.batch_A),
+        parse_batch_tuple(args.batch_B),
+        parse_batch_tuple(args.batch_C),
     )
 
     if args.generate_taps:
@@ -138,11 +211,25 @@ def my_matmul(
     use_scalar,
     emulate_bf16_mmul_with_bfp16,
     prio_accuracy,
-    separate_c_tiles,
     trace_size,
     archive=None,
     generate_taps=False,
+    batch_A=None,
+    batch_B=None,
+    batch_C=None,
 ):
+    batch_A_size, batch_A_stride_dim = batch_A
+    batch_B_size, batch_B_stride_dim = batch_B
+    batch_C_size, batch_C_stride_dim = batch_C
+    batched_A_shape = get_shape_with_batch(
+        K, M, batch_A_size, batch_A_stride_dim, col_maj=False
+    )
+    batched_B_shape = get_shape_with_batch(
+        N, K, batch_B_size, batch_B_stride_dim, col_maj=b_col_maj
+    )
+    batched_C_shape = get_shape_with_batch(
+        N, M, batch_C_size, batch_C_stride_dim, col_maj=c_col_maj
+    )
     n_aie_rows = 4
 
     dtype_in = str_to_dtype(dtype_in_str)
@@ -261,9 +348,9 @@ def my_matmul(
     C_taps = []
 
     # Define tensor types
-    A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
-    B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
-    C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
+    A_ty = np.ndarray[batched_A_shape, np.dtype[dtype_in]]
+    B_ty = np.ndarray[batched_B_shape, np.dtype[dtype_in]]
+    C_ty = np.ndarray[batched_C_shape, np.dtype[dtype_out]]
     A_l2_ty = np.ndarray[(mem_tile_m_A * k,), np.dtype[dtype_in]]
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
     C_l2_ty = np.ndarray[(mem_tile_m_C * n,), np.dtype[dtype_out]]
@@ -441,9 +528,6 @@ def my_matmul(
         barrier,
         elem_out_internal,
     ):
-        # Persist across dispatches so a shared xclbin can swap instruction
-        # binaries between workloads. The runtime sequence writes fresh RTPs,
-        # flips the barrier to 1, and resets it to 0 when the dispatch ends.
         for _ in range_(sys.maxsize):
             barrier.wait_for_value(1)
             rtp_K_div_k = my_rtp[0]
@@ -512,37 +596,6 @@ def my_matmul(
     # tb = transfer block; block of transfers before sync call
     tb_max_n_rows = 4 if not c_col_maj else 2
 
-    # Define tensor access patterns (tiling) for A, B, and C
-    A_tiles = TensorTiler2D.group_tiler(
-        (M, K),  # Size of A matrix
-        (mem_tile_m_A, k),  # Size of A (smallest) tile
-        (1, K_div_k),  # Size of "group" of tiles
-        # Repeat data so can distribute across whole column
-        pattern_repeat=n_c_col_tiles_per_core,
-        prune_step=False,
-    )
-    if b_col_maj:
-        B_tiles = TensorTiler2D.step_tiler(
-            (N, K),  # Size of B matrix
-            (n, k),  # Size of B tile
-            # Number of tiles per transfer in each dimension (whole col, partial row)
-            tile_group_repeats=(n_c_col_tiles_per_core, K_div_k),
-            # Contiguous tile group in col, but send every n_aie_cols-th tile in the row
-            tile_group_steps=(n_aie_cols, 1),
-            prune_step=False,
-        )
-    else:
-        B_tiles = TensorTiler2D.step_tiler(
-            (K, N),  # Size of B matrix
-            (k, n),  # Size of B tile
-            # Number of tiles per transfer in each dimension (whole col, partial row)
-            tile_group_repeats=(K_div_k, n_c_col_tiles_per_core),
-            # Contiguous tile group in col, but send every n_aie_cols-th tile in the row
-            tile_group_steps=(1, n_aie_cols),
-            tile_group_col_major=True,  # Send all tiles in column before moving on to next column
-            prune_step=False,
-        )
-
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
     with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
@@ -553,7 +606,12 @@ def my_matmul(
             for row, rtps_row in enumerate(args):
                 for col, rtp_row_col in enumerate(rtps_row):
                     rtp_row_col[0] = K_div_k
-                    rtp_row_col[1] = n_c_row_tiles_per_core * n_c_col_tiles_per_core
+                    # A single runtime-sequence dispatch streams every batch_C slice
+                    # before lowering the worker barrier again, so workers must stay
+                    # active for the full batched tile count, not just one batch.
+                    rtp_row_col[1] = (
+                        batch_C_size * n_c_row_tiles_per_core * n_c_col_tiles_per_core
+                    )
 
         rt.inline_ops(set_rtps, rtps)
 
@@ -564,19 +622,19 @@ def my_matmul(
                 rt.set_barrier(workerBarriers[row][col], 1)
 
         # Task groups will be used to determine when to sync/await/free DMA runtime ops
-        tg = rt.task_group()
-        for tb in range(ceildiv(n_c_row_tiles_per_core, tb_max_n_rows)):
-            for pingpong in [0, 1]:
-                row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
-                current_tb_n_rows = min(
-                    [tb_max_n_rows // 2, n_c_row_tiles_per_core - row_base]
-                )
-                if current_tb_n_rows <= 0:
-                    # For small input sizes, we may not even need a "pong" iteration
-                    break
-                for col in range(n_aie_cols):
-                    if not separate_c_tiles:
-                        # C Output Transfer for smaller N dimensions:
+        for batch_idx in range(batch_C_size):
+            tg = rt.task_group()
+            for tb in range(ceildiv(n_c_row_tiles_per_core, tb_max_n_rows)):
+                for pingpong in [0, 1]:
+                    row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
+                    current_tb_n_rows = min(
+                        [tb_max_n_rows // 2, n_c_row_tiles_per_core - row_base]
+                    )
+                    if current_tb_n_rows <= 0:
+                        # For small input sizes, we may not even need a "pong" iteration
+                        break
+                    for col in range(n_aie_cols):
+                        # C Output Transfer:
                         # The smallest transfer unit is a (m*n_aie_rows)-x-(n)-sized sub-tile of the matrix.
                         # Transfer one such tile for every (n_aie_cols)-th column, evenly spaced,
                         # then repeat that (current_tb_n_rows) times for the next contiguous blocks of rows.
@@ -595,8 +653,11 @@ def my_matmul(
                         #     |                |
                         #     |                |
                         #      ----------------
+                        C_batch_offset = get_batch_offset(
+                            N, M, batch_idx, batch_C_stride_dim, col_maj=c_col_maj
+                        )
                         if not c_col_maj:
-                            C_row_offset = row_base * mem_tile_m_C * N
+                            C_row_offset = row_base * mem_tile_m_C * batched_C_shape[-1]
                             C_col_offset = col * n
                             C_offset = C_col_offset + C_row_offset
                             C_sizes = [
@@ -605,16 +666,26 @@ def my_matmul(
                                 mem_tile_m_C,
                                 n,
                             ]
-                            C_strides = [mem_tile_m_C * N, mem_tile_n, N, 1]
+                            C_strides = [
+                                mem_tile_m_C * batched_C_shape[-1],
+                                mem_tile_n,
+                                batched_C_shape[-1],
+                                1,
+                            ]
                         else:
                             C_row_offset = row_base * mem_tile_m_C
-                            C_col_offset = col * n * M
+                            C_col_offset = col * n * batched_C_shape[-1]
                             C_offset = C_col_offset + C_row_offset
                             C_sizes = [N // mem_tile_n, n_aie_rows, n, m]
-                            C_strides = [M * mem_tile_n, m, M, 1]
+                            C_strides = [
+                                batched_C_shape[-1] * mem_tile_n,
+                                m,
+                                batched_C_shape[-1],
+                                1,
+                            ]
                         C_tile = TensorAccessPattern(
-                            (N, M) if c_col_maj else (M, N),
-                            offset=C_offset,
+                            batched_C_shape,
+                            offset=C_offset + C_batch_offset,
                             sizes=C_sizes,
                             strides=C_strides,
                         )
@@ -630,134 +701,139 @@ def my_matmul(
                             task_group=tg,
                             placement=Tile(col, 0),
                         )
+                        for tile_row in range(current_tb_n_rows):
+                            # A input transfer:
+                            #
+                            # The smallest transfer unit is a (m*n_A_tiles_per_shim)-sized sub-tile of the input matrix.
+                            # Transfer one such tile for every column, contiguously.
+                            # Repeat this transfer with identical tiles a total of (N//n//n_aie_cols) times.
+                            # Each shim transfers the tiles for separate rows. For example, shim 0 may transfer the
+                            # tiles marked 0 below, and shim 1 may transfer the tiles marked 1.
+                            #             K
+                            #      ----------------
+                            #     |0000000000000000|    (repeated N//n//n_aie_cols times)
+                            #     |0000000000000000|
+                            #     |1111111111111111|
+                            # M   |1111111111111111|
+                            #     |                |
+                            #     |                |
+                            #     |                |
+                            #     |                |
+                            #      ----------------
+                            A_batch_offset = get_batch_offset(
+                                K,
+                                M,
+                                batch_idx % batch_A_size,
+                                batch_A_stride_dim,
+                                col_maj=False,
+                            )
+                            A_block_offset = (
+                                (row_base + tile_row)
+                                * n_aie_rows
+                                * m
+                                * batched_A_shape[-1]
+                            )  # base address for this transfer block for all BDs
+                            A_row_offset = (
+                                col * n_A_tiles_per_shim * m * batched_A_shape[-1]
+                            )  # base address for the shim in this column
+                            A_offset = A_block_offset + A_row_offset
+                            A_sizes = [
+                                N // n // n_aie_cols,
+                                K // k,
+                                m * n_A_tiles_per_shim,
+                                k,
+                            ]
+                            A_strides = [0, k, batched_A_shape[-1], 1]
 
-                    for tile_row in range(current_tb_n_rows):
-                        if separate_c_tiles:
-                            # C Output Transfer for larger N dimensions:
-                            # The smallest transfer unit is an (m)-x-(n)-sized sub-tile of the matrix.
-                            # Transfer one such tile for every (n_aie_cols)-th column, evenly spaced.
-                            # Each shim will start at a different column offset, transferring interleaved
-                            # columns. For example, shim 0 may transfer the blocks marked 0 below, and shim 1
-                            # may transfer the blocks marked 1.
+                            # always equal to n_aie_rows since we have n_aie_rows row tiles for matrix A
+                            if col < n_aie_rows:
+                                A_tile = TensorAccessPattern(
+                                    batched_A_shape,
+                                    offset=A_offset + A_batch_offset,
+                                    sizes=A_sizes,
+                                    strides=A_strides,
+                                )
+                                rt.fill(
+                                    A_l3l2_fifos[col].prod(),
+                                    A,
+                                    tap=A_tile,
+                                    task_group=tg,
+                                    placement=Tile(
+                                        2 * col if n_aie_cols == 8 else col, 0
+                                    ),  # alternate columns in full 4x8 NPU2 case
+                                )
+                                # This line does not change MLIR output at all - it's just for recording data movement
+                                A_taps.append(A_tile)
+                            # Use the calculated sizes/strides/offsets to record the data movement
+                            # caused by the above call to npu_dma_memcpy_nd.
+                            # This line does not change MLIR output at all.
+
+                            # B input transfer:
+                            # Transfer the first a (n)-wide block of columns of B,
+                            # Then transfer the (n_aie_columns)-th such block, and so on.
+                            # Each shim will start at a different column offset.
+                            # For example, shim 0 may transfer the tiles marked 0 below,
+                            # and shim 1 may transfer the tiles marked 1.
                             #
                             #             N
                             #      ----------------
                             #     |0011    0011    |
-                            #     |                |
-                            #     |                |
-                            # M   |                |
-                            #     |                |
-                            #     |                |
-                            #     |                |
-                            #     |                |
+                            #     |0011    0011    |
+                            #     |0011    0011    |
+                            # K   |0011    0011    |
+                            #     |0011    0011    |
+                            #     |0011    0011    |
+                            #     |0011    0011    |
+                            #     |0011    0011    |
                             #      ----------------
-                            C_col_offset = col * n if not c_col_maj else col * n * M
-                            if not c_col_maj:
-                                C_block_offset = (
-                                    (row_base + tile_row) * n_aie_rows * m * N
-                                )  # base address for this transfer block for all BDs
-                                C_offset = C_col_offset + C_block_offset
-                                C_sizes = [
-                                    1,
-                                    n_c_col_tiles_per_core,
-                                    mem_tile_m_C,
-                                    n,
-                                ]
-                                C_strides = [0, mem_tile_n, N, 1]
-                            else:
-                                C_block_offset = (
-                                    (row_base + tile_row) * n_aie_rows * m
-                                )  # base address for this transfer block for all BDs
-                                C_offset = C_col_offset + C_block_offset
-                                C_sizes = [n_c_col_tiles_per_core, 1, n, m]
-                                C_strides = [M * mem_tile_n, 0, M, 1]
-                            C_tile = TensorAccessPattern(
-                                (N, M) if c_col_maj else (M, N),
-                                offset=C_offset,
-                                sizes=C_sizes,
-                                strides=C_strides,
+                            B_batch_offset = get_batch_offset(
+                                N,
+                                K,
+                                batch_idx % batch_B_size,
+                                batch_B_stride_dim,
+                                col_maj=b_col_maj,
                             )
-                            rt.drain(
-                                C_l2l3_fifos[col].cons(),
-                                C,
-                                tap=C_tile,
-                                wait=True,
+                            B_col_offset = (
+                                col * n
+                                if not b_col_maj
+                                else col * n * batched_B_shape[-1]
+                            )
+                            if not b_col_maj:
+                                B_sizes = [N // n // n_aie_cols, K // k, k, n]
+                                B_strides = [
+                                    n * n_aie_cols,
+                                    k * batched_B_shape[-1],
+                                    batched_B_shape[-1],
+                                    1,
+                                ]
+                            else:
+                                B_sizes = [N // n // n_aie_cols, K // k, n, k]
+                                B_strides = [
+                                    n * n_aie_cols * batched_B_shape[-1],
+                                    k,
+                                    batched_B_shape[-1],
+                                    1,
+                                ]
+                            B_tile = TensorAccessPattern(
+                                batched_B_shape,
+                                offset=B_col_offset + B_batch_offset,
+                                sizes=B_sizes,
+                                strides=B_strides,
+                            )
+                            rt.fill(
+                                B_l3l2_fifos[col].prod(),
+                                B,
+                                tap=B_tile,
                                 task_group=tg,
                                 placement=Tile(col, 0),
                             )
+
                             # This line does not change MLIR output at all - it's just for recording data movement
-                            C_taps.append(C_tile)
-
-                        # A input transfer:
-                        #
-                        # The smallest transfer unit is a (m*n_A_tiles_per_shim)-sized sub-tile of the input matrix.
-                        # Transfer one such tile for every column, contiguously.
-                        # Repeat this transfer with identical tiles a total of (N//n//n_aie_cols) times.
-                        # Each shim transfers the tiles for separate rows. For example, shim 0 may transfer the
-                        # tiles marked 0 below, and shim 1 may transfer the tiles marked 1.
-                        #             K
-                        #      ----------------
-                        #     |0000000000000000|    (repeated N//n//n_aie_cols times)
-                        #     |0000000000000000|
-                        #     |1111111111111111|
-                        # M   |1111111111111111|
-                        #     |                |
-                        #     |                |
-                        #     |                |
-                        #     |                |
-                        #      ----------------
-                        tile_offset = (
-                            (row_base + tile_row) * n_shim_mem_A + col
-                        ) % len(A_tiles)
-
-                        # always equal to n_aie_rows since we have n_aie_rows row tiles for matrix A
-                        if col < n_aie_rows:
-                            rt.fill(
-                                A_l3l2_fifos[col].prod(),
-                                A,
-                                tap=A_tiles[tile_offset],
-                                task_group=tg,
-                                placement=Tile(
-                                    2 * col if n_aie_cols == 8 else col, 0
-                                ),  # alternate columns in full 4x8 NPU2 case
-                            )
-                        # Use the calculated sizes/strides/offsets to record the data movement
-                        # caused by the above call to npu_dma_memcpy_nd.
-                        # This line does not change MLIR output at all.
-
-                        # B input transfer:
-                        # Transfer the first a (n)-wide block of columns of B,
-                        # Then transfer the (n_aie_columns)-th such block, and so on.
-                        # Each shim will start at a different column offset.
-                        # For example, shim 0 may transfer the tiles marked 0 below,
-                        # and shim 1 may transfer the tiles marked 1.
-                        #
-                        #             N
-                        #      ----------------
-                        #     |0011    0011    |
-                        #     |0011    0011    |
-                        #     |0011    0011    |
-                        # K   |0011    0011    |
-                        #     |0011    0011    |
-                        #     |0011    0011    |
-                        #     |0011    0011    |
-                        #     |0011    0011    |
-                        #      ----------------
-                        rt.fill(
-                            B_l3l2_fifos[col].prod(),
-                            B,
-                            tap=B_tiles[col],
-                            task_group=tg,
-                            placement=Tile(col, 0),
-                        )
-
-                        # These lines do not change MLIR output at all - they are just for recording data movement
-                        A_taps.append(A_tiles[tile_offset])
-                        B_taps.append(B_tiles[col])
-                if tb > 0 or (tb == 0 and pingpong > 0):
-                    rt.finish_task_group(tg)
-                    tg = rt.task_group()
-        rt.finish_task_group(tg)
+                            B_taps.append(B_tile)
+                    if tb > 0 or (tb == 0 and pingpong > 0):
+                        rt.finish_task_group(tg)
+                        tg = rt.task_group()
+            rt.finish_task_group(tg)
         for row in range(n_aie_rows):
             for col in range(n_aie_cols):
                 rt.set_barrier(workerBarriers[row][col], 0)

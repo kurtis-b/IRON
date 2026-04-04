@@ -245,7 +245,7 @@ class AIEContext:
 
         self._runtime_prepared = True
 
-    def reset_runtime(self):
+    def reset_runtime(self, *, reset_device=True):
         """Drop prepared XRT runtime state so it can be reloaded."""
         if not self._runtime_prepared:
             return
@@ -255,11 +255,12 @@ class AIEContext:
             op.xrt_kernels = {}
             op.xrt_runlist = None
 
-        # Drop Python references to XRT objects before the host runtime's
-        # atexit cleanup runs. Calling CachedXRTRuntime.cleanup() here causes
-        # a second cleanup pass later and can double-free when multiple staged
-        # xclbins have been loaded in one process.
-        gc.collect()
-        self.device_manager.reset()
+        if reset_device:
+            # Drop Python references to XRT objects before the host runtime's
+            # atexit cleanup runs. Calling CachedXRTRuntime.cleanup() here causes
+            # a second cleanup pass later and can double-free when multiple staged
+            # xclbins have been loaded in one process.
+            gc.collect()
+            self.device_manager.reset()
 
         self._runtime_prepared = False

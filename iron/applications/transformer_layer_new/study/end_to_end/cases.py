@@ -12,7 +12,11 @@ from typing import Any, Literal
 
 ExecutionMode = Literal["dataflow", "runlist", "offload"]
 
-EXECUTION_MODES: tuple[ExecutionMode, ...] = ("dataflow", "runlist", "offload")
+EXECUTION_MODES: tuple[ExecutionMode, ...] = (
+    "dataflow",
+    "runlist",
+    "offload",
+)
 FAMILY_IDS: tuple[str, ...] = ("baseline_768", "baseline_1024")
 SEQUENCE_LADDER: tuple[int, ...] = (
     64,

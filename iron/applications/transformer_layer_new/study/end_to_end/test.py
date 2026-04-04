@@ -8,6 +8,7 @@ import csv
 import json
 
 from iron.applications.transformer_layer_new.pattern.reference import (
+    derive_offload_inputs,
     generate_golden_reference,
 )
 from iron.applications.transformer_layer_new.study.block.cases import BLOCK_CASES
@@ -26,6 +27,7 @@ from iron.applications.transformer_layer_new.study.end_to_end.cases import (
 )
 from iron.applications.transformer_layer_new.study.end_to_end.modes import (
     FINAL_ERROR_THRESHOLD,
+    _benchmark_offload_shared_gemm,
     _elementwise_mul_buffers,
     _metadata_for_operator,
     _tokens_per_sec,
@@ -127,9 +129,13 @@ def test_split_candidate_files_define_low_sequence_overrides_and_fallbacks():
         )
         for family_id in FAMILY_IDS:
             assert "all" in payload[family_id]
-            for seq_key in ("64", "128"):
-                assert seq_key in payload[family_id]
-            if execution_mode != "offload":
+            if execution_mode in {"dataflow", "runlist", "offload"}:
+                for seq_key in ("64", "128"):
+                    assert seq_key in payload[family_id]
+            if execution_mode == "offload":
+                for seq_key in ("256", "512"):
+                    assert seq_key in payload[family_id]
+            if execution_mode in {"dataflow", "runlist"}:
                 assert "256" in payload[family_id]
             assert candidate_table_for_case(family_id, 256, payloads=payloads)[
                 execution_mode
@@ -137,6 +143,18 @@ def test_split_candidate_files_define_low_sequence_overrides_and_fallbacks():
             assert candidate_table_for_case(family_id, 512, payloads=payloads)[
                 execution_mode
             ]
+            assert candidate_table_for_case(family_id, 16384, payloads=payloads)[
+                execution_mode
+            ]
+
+
+def test_derive_offload_inputs_matches_reference_shapes():
+    reference = generate_golden_reference(64, 768, 3072, 12)
+    inputs = derive_offload_inputs(reference, num_heads=12)
+    assert tuple(inputs["q"].shape) == (12, 64, 64)
+    assert tuple(inputs["k"].shape) == (12, 64, 64)
+    assert tuple(inputs["v"].shape) == (12, 64, 64)
+    assert tuple(inputs["residual"].shape) == (64, 768)
 
 
 def _expected_dataflow_config_rows(
@@ -359,7 +377,7 @@ def test_metadata_helpers_count_runtime_artifacts():
         compile_setup_time_ms=1.5,
     )
     assert (
-        offload_metadata["npu_dispatch_count"] == 6 + 2 * workload.num_attention_heads
+        offload_metadata["npu_dispatch_count"] == (2 * workload.num_attention_heads) + 6
     )
     assert offload_metadata["npu_unique_instruction_binary_count"] == 2
     assert offload_metadata["npu_unique_xclbin_count"] == 1
@@ -383,6 +401,47 @@ def test_elementwise_mul_buffers_support_scalar_broadcast():
     assert set(input_buffers) == {"input1"}
     assert output_buffers["output"].shape == input_buffers["input1"].shape
     assert output_buffers["output"].equal(input_buffers["input1"] * 0.5)
+
+
+def test_offload_long_sequence_tuning_uses_pattern_path(monkeypatch):
+    case = get_case("baseline_768", 16384)
+
+    called = {}
+
+    def fake_long_seq(
+        workload, candidate_config, *, warmup_runs, runs_per_sample, seed
+    ):
+        called["workload"] = workload
+        called["candidate_config"] = candidate_config
+        called["warmup_runs"] = warmup_runs
+        called["runs_per_sample"] = runs_per_sample
+        called["seed"] = seed
+        return {
+            "avg_latency_ms": 1.0,
+            "bandwidth_gbps": "",
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.modes._benchmark_offload_long_seq_candidate",
+        fake_long_seq,
+    )
+
+    result = _benchmark_offload_shared_gemm(
+        case.workload,
+        {"tile_m": 64, "tile_k": 64, "tile_n": 16, "num_aie_columns": 4},
+        warmup_runs=1,
+        runs_per_sample=1,
+        seed=42,
+    )
+
+    assert result["run_status"] == "passed"
+    assert called["workload"] == case.workload
+    assert called["warmup_runs"] == 1
+    assert called["runs_per_sample"] == 1
+    assert called["seed"] == 42
 
 
 def test_mark_best_rows_marks_fastest_successful_mode():
@@ -544,6 +603,7 @@ def test_build_rows_returns_tuning_and_final_rows(monkeypatch):
             "measured_inference_count": runs_per_sample,
             "avg_latency_ms": 5.0 if execution_mode == "dataflow" else 6.0,
             "compile_setup_time_ms": 100.0,
+            "host_qkv_precompute_ms": None,
             "tokens_per_sec": 25600.0,
             "power_backend": "none",
             "avg_power_w": None,
@@ -650,6 +710,7 @@ def test_main_writes_results_and_tuning_csv(monkeypatch, tmp_path):
                     "timed_total_sec": 0.1,
                     "avg_latency_ms": 1.0,
                     "compile_setup_time_ms": 10.0,
+                    "host_qkv_precompute_ms": None,
                     "tokens_per_sec": 64000.0,
                     "power_backend": "none",
                     "avg_power_w": None,
