@@ -15,6 +15,7 @@ from .cases import (
     FAMILY_IDS,
     SEQUENCE_LADDER,
     ReconfigurationWorkload,
+    iter_cases,
 )
 from .modes import benchmark_mode, resolve_mode_operator_config
 from .power import SUPPORTED_POWER_BACKENDS
@@ -142,11 +143,23 @@ def build_rows(
     power_sample_interval_sec: float,
     reference_input: Path,
 ) -> list[dict[str, object]]:
-    selections = select_reference_rows(
+    raw_selections = select_reference_rows(
         load_reference_rows(reference_input),
         family_filter=family_filter,
         seq_len_filter=seq_len_filter,
         mode_filter=mode_filter,
+    )
+    allowed_cases = {
+        (case.study_case_id, case.seq_len)
+        for case in iter_cases(
+            family_filter=family_filter,
+            seq_len_filter=seq_len_filter,
+        )
+    }
+    selections = tuple(
+        selection
+        for selection in raw_selections
+        if (selection.study_case_id, selection.seq_len) in allowed_cases
     )
     rows: list[dict[str, object]] = []
     for selection in selections:

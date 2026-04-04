@@ -142,3 +142,8 @@ This study owns:
 Canonical output:
 
 - `results/reconfiguration_overhead/results.csv`
+
+Canonical visualization:
+
+- `results/reconfiguration_overhead/runlist_vs_offload_reconfiguration_overhead.svg`
+- `results/reconfiguration_overhead/runlist_vs_offload_reconfiguration_overhead.png`

@@ -34,9 +34,11 @@ class ReferenceSelection:
 
 
 def default_reference_results_path() -> Path:
-    return (
-        Path(__file__).resolve().parents[2] / "results" / "end_to_end" / "results.csv"
-    )
+    results_dir = Path(__file__).resolve().parents[2] / "results" / "end_to_end"
+    canonical_path = results_dir / "results.csv"
+    if canonical_path.exists():
+        return canonical_path
+    return results_dir / "results_all_power.csv"
 
 
 def load_reference_rows(path: str | Path) -> list[dict[str, str]]:

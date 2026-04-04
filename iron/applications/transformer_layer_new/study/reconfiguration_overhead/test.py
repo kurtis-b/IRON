@@ -15,6 +15,9 @@ from iron.applications.transformer_layer_new.study.reconfiguration_overhead.powe
     parse_turbostat_pkgwatt_samples,
     resolve_requested_power_backend,
 )
+from iron.applications.transformer_layer_new.study.reconfiguration_overhead.plot_latency_comparison import (
+    render_plot,
+)
 from iron.applications.transformer_layer_new.study.reconfiguration_overhead.run import (
     main,
 )
@@ -189,6 +192,56 @@ def _read_csv_rows(path):
         return list(csv.DictReader(handle))
 
 
+def _reconfig_result_row(
+    *,
+    family: str,
+    seq_len: int,
+    execution_mode: str,
+    avg_latency_ms: float,
+    npu_unique_xclbin_count: int,
+) -> dict[str, str]:
+    return {
+        "study_id": "reconfiguration_overhead",
+        "study_case_id": family,
+        "study_case_label": family,
+        "backend": "npu",
+        "execution_mode": execution_mode,
+        "pattern_label": execution_mode,
+        "source_end_to_end_execution_mode": (
+            "offload" if execution_mode == "offload_gemm_sequence" else "runlist"
+        ),
+        "seq_len": str(seq_len),
+        "hidden_size": "768" if family == "baseline_768" else "1024",
+        "intermediate_size": "3072" if family == "baseline_768" else "4096",
+        "num_attention_heads": "12" if family == "baseline_768" else "16",
+        "attention_head_size": "64",
+        "batch_size": "1",
+        "dtype": "bf16",
+        "use_bias": "False",
+        "weights_source": "synthetic",
+        "warmup_runs": "1",
+        "runs_per_sample": "2",
+        "measured_inference_count": "2",
+        "timed_total_sec": "0.1",
+        "avg_latency_ms": str(avg_latency_ms),
+        "compile_setup_time_ms": "0.0",
+        "power_backend": "none",
+        "avg_power_w": "0.0",
+        "max_power_w": "0.0",
+        "energy_j": "0.0",
+        "power_sample_count": "0",
+        "npu_dispatch_count": "0",
+        "npu_unique_instruction_binary_count": "0",
+        "npu_unique_xclbin_count": str(npu_unique_xclbin_count),
+        "process_model": "in_process",
+        "validation_error_count": "0",
+        "run_status": "passed",
+        "failure_message": "",
+        "selected_candidate_ids_json": "{}",
+        "selected_config_json": "{}",
+    }
+
+
 def test_select_reference_rows_filters_modes_and_extracts_gemm_configs():
     rows = [
         _reference_row("offload"),
@@ -212,6 +265,50 @@ def test_select_reference_rows_filters_modes_and_extracts_gemm_configs():
         "up_proj",
         "down_proj",
     )
+
+
+def test_render_plot_writes_outputs(tmp_path):
+    rows = [
+        _reconfig_result_row(
+            family="baseline_768",
+            seq_len=256,
+            execution_mode="offload_gemm_sequence",
+            avg_latency_ms=8.0,
+            npu_unique_xclbin_count=1,
+        ),
+        _reconfig_result_row(
+            family="baseline_768",
+            seq_len=256,
+            execution_mode="runlist_gemm_sequence",
+            avg_latency_ms=16.0,
+            npu_unique_xclbin_count=5,
+        ),
+        _reconfig_result_row(
+            family="baseline_1024",
+            seq_len=256,
+            execution_mode="offload_gemm_sequence",
+            avg_latency_ms=12.0,
+            npu_unique_xclbin_count=1,
+        ),
+        _reconfig_result_row(
+            family="baseline_1024",
+            seq_len=256,
+            execution_mode="runlist_gemm_sequence",
+            avg_latency_ms=18.0,
+            npu_unique_xclbin_count=5,
+        ),
+    ]
+
+    svg_path = tmp_path / "reconfig.svg"
+    png_path = tmp_path / "reconfig.png"
+    render_plot(rows, output_svg_path=svg_path, output_png_path=png_path)
+
+    assert svg_path.exists()
+    assert png_path.exists()
+    svg = svg_path.read_text(encoding="utf-8")
+    assert "Reconfiguration Overhead: Runlist vs Offload" in svg
+    assert "Offload (1 xclbin)" in svg
+    assert "Runlist (5 xclbins)" in svg
 
 
 def test_select_reference_rows_chooses_fastest_duplicate():
@@ -406,6 +503,82 @@ def test_main_writes_long_form_rows_from_available_reference_rows(
     resolved_config = json.loads(runlist_row["selected_config_json"])
     assert resolved_config["q_proj"]["M"] == 256
     assert resolved_config["attn_scores"]["N"] == 256
+
+
+def test_main_filters_reference_rows_to_intended_sequence_ladder(monkeypatch, tmp_path):
+    reference_input = tmp_path / "end_to_end.csv"
+    rows = [
+        _reference_row("offload", seq_len="64"),
+        _reference_row("runlist", seq_len="64"),
+        _reference_row("offload", seq_len="256"),
+        _reference_row("runlist", seq_len="256"),
+        _reference_row("offload", seq_len="2048"),
+        _reference_row("runlist", seq_len="2048"),
+        _reference_row("offload", seq_len="16384"),
+        _reference_row("runlist", seq_len="16384"),
+    ]
+    with reference_input.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    def fake_benchmark_mode(
+        execution_mode,
+        workload,
+        *,
+        warmup_runs,
+        runs_per_sample,
+        seed,
+        power_backend,
+        operator_config,
+        power_sample_interval_sec,
+    ):
+        del execution_mode, warmup_runs, runs_per_sample, seed, power_backend
+        del operator_config, power_sample_interval_sec
+        return {
+            "measured_inference_count": 1,
+            "timed_total_sec": 0.1,
+            "avg_latency_ms": float(workload.seq_len),
+            "compile_setup_time_ms": 1.0,
+            "power_backend": "none",
+            "avg_power_w": None,
+            "max_power_w": None,
+            "energy_j": None,
+            "power_sample_count": None,
+            "npu_dispatch_count": 8,
+            "npu_unique_instruction_binary_count": 5,
+            "npu_unique_xclbin_count": 5,
+            "process_model": "in_process",
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.reconfiguration_overhead.run.benchmark_mode",
+        fake_benchmark_mode,
+    )
+
+    output_path = tmp_path / "results.csv"
+    exit_code = main(
+        [
+            "--reference-input",
+            str(reference_input),
+            "--output",
+            str(output_path),
+            "--power-backend",
+            "none",
+            "--warmup-iters",
+            "1",
+            "--timed-iters",
+            "1",
+        ]
+    )
+
+    assert exit_code == 0
+    output_rows = _read_csv_rows(output_path)
+    assert len(output_rows) == 6
+    assert {row["seq_len"] for row in output_rows} == {"256", "2048", "16384"}
 
 
 def test_parse_turbostat_pkgwatt_samples_reads_values():
