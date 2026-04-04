@@ -549,14 +549,12 @@ def iteration_schedule(
     warmup_iters: int | None,
     timed_iters: int | None,
 ) -> tuple[int, int]:
-    if seq_len <= 128:
-        default_warmup_iters, default_timed_iters = 10, 100
-    elif seq_len <= 512:
-        default_warmup_iters, default_timed_iters = 5, 50
-    elif seq_len <= 2048:
-        default_warmup_iters, default_timed_iters = 3, 20
-    else:
+    if seq_len <= 2048:
         default_warmup_iters, default_timed_iters = 1, 10
+    elif seq_len <= 4096:
+        default_warmup_iters, default_timed_iters = 1, 5
+    else:
+        default_warmup_iters, default_timed_iters = 1, 2
 
     return (
         default_warmup_iters if warmup_iters is None else warmup_iters,

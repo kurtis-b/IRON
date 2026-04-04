@@ -16,6 +16,7 @@ from iron.applications.transformer_layer_new.study.block.cases import (
 from iron.applications.transformer_layer_new.study.block.run import (
     BLOCK_CONFIG_COLUMNS,
     _threshold_validation_result,
+    iteration_schedule,
     main,
     mark_best_rows,
     operator_kwargs,
@@ -118,6 +119,18 @@ def test_threshold_validation_result_uses_max_acceptable_errors():
     assert failing["validation_error_count"] == 11
     assert failing["run_status"] == "failed_validation"
     assert "max_acceptable_errors=10" in failing["error_message"]
+
+
+def test_iteration_schedule_matches_end_to_end_defaults():
+    assert iteration_schedule(64, warmup_iters=None, timed_iters=None) == (1, 10)
+    assert iteration_schedule(128, warmup_iters=None, timed_iters=None) == (1, 10)
+    assert iteration_schedule(256, warmup_iters=None, timed_iters=None) == (1, 10)
+    assert iteration_schedule(512, warmup_iters=None, timed_iters=None) == (1, 10)
+    assert iteration_schedule(1024, warmup_iters=None, timed_iters=None) == (1, 10)
+    assert iteration_schedule(2048, warmup_iters=None, timed_iters=None) == (1, 10)
+    assert iteration_schedule(4096, warmup_iters=None, timed_iters=None) == (1, 5)
+    assert iteration_schedule(8192, warmup_iters=None, timed_iters=None) == (1, 2)
+    assert iteration_schedule(16384, warmup_iters=None, timed_iters=None) == (1, 2)
 
 
 def test_main_writes_csv_for_selected_case(monkeypatch, tmp_path):

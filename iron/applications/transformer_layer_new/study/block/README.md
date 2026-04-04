@@ -82,6 +82,12 @@ Selection flags:
 - `--timed-iters`
 - `--output`
 
+Default iteration schedule:
+
+- `seq_len <= 2048`: `1` warmup, `10` timed
+- `seq_len == 4096`: `1` warmup, `5` timed
+- `seq_len >= 8192`: `1` warmup, `2` timed
+
 ## Outputs
 
 Canonical output:
