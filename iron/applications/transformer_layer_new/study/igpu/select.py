@@ -35,7 +35,10 @@ class ReferenceGroup:
 
 def default_reference_results_path() -> Path:
     return (
-        Path(__file__).resolve().parents[2] / "results" / "end_to_end" / "results.csv"
+        Path(__file__).resolve().parents[2]
+        / "results"
+        / "end_to_end"
+        / "results_all_power.csv"
     )
 
 

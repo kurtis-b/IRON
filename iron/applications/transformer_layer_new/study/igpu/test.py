@@ -400,9 +400,13 @@ def test_main_writes_clean_csv_and_svg_plots(monkeypatch, tmp_path):
     tps_svg = tps_plot_path.read_text(encoding="utf-8")
     tps_per_watt_svg = tps_per_watt_plot_path.read_text(encoding="utf-8")
     assert "TPS Comparison" in tps_svg
-    assert 'class="bar"' in tps_svg
+    assert "Baseline 768" in tps_svg
+    assert "Dataflow" in tps_svg
+    assert "Runlist" in tps_svg
+    assert "Offload" in tps_svg
+    assert "iGPU" in tps_svg
     assert "TPS/W Comparison" in tps_per_watt_svg
-    assert 'class="bar"' in tps_per_watt_svg
+    assert "Tokens / sec / W" in tps_per_watt_svg
 
 
 def test_parse_rocm_smi_average_power_w_reads_package_power():

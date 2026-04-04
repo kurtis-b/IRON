@@ -26,7 +26,7 @@ Reference NPU execution modes:
 
 This study depends on:
 
-- `results/end_to_end/results.csv`
+- `results/end_to_end/results_all_power.csv`
 
 It does not re-run NPU patterns.
 Its execution surface is derived from the completed NPU rows present in the

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import html
 import json
 import logging
 from contextlib import nullcontext
@@ -16,6 +15,12 @@ import subprocess
 import threading
 import time
 
+import matplotlib
+
+matplotlib.use("Agg")
+import seaborn as sns
+from matplotlib import pyplot as plt
+from matplotlib.patches import Patch
 import torch
 import torch.nn.functional as F
 
@@ -42,11 +47,13 @@ RESULTS_CSV_FIELDNAMES = (
     *COMPARISON_COLUMNS,
 )
 PLOT_SERIES = (
-    ("igpu", "iGPU", "#d55e00"),
-    ("dataflow", "dataflow", "#0072b2"),
-    ("runlist", "runlist", "#009e73"),
-    ("offload", "offload", "#c44e52"),
+    ("igpu", "iGPU", "#3d405b"),
+    ("dataflow", "Dataflow", "#1f6f8b"),
+    ("runlist", "Runlist", "#e07a5f"),
+    ("offload", "Offload", "#81b29a"),
 )
+PLOT_FAMILY_ORDER = ("baseline_768", "baseline_1024")
+PLOT_SEQ_ORDER = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 SUPPORTED_PLOT_SUFFIX = ".svg"
 TORCH_DTYPES: dict[str, torch.dtype] = {
     "bf16": torch.bfloat16,
@@ -647,10 +654,6 @@ def _comparison_row(
     return row
 
 
-def _svg_escape(value: object) -> str:
-    return html.escape(str(value), quote=True)
-
-
 def _resolve_plot_path(path: Path) -> Path:
     if path.suffix.lower() != SUPPORTED_PLOT_SUFFIX:
         raise ValueError(
@@ -659,28 +662,163 @@ def _resolve_plot_path(path: Path) -> Path:
     return path
 
 
-def _format_metric_value(value: float) -> str:
-    magnitude = abs(value)
-    if magnitude >= 1000.0:
-        return f"{value:,.0f}"
-    if magnitude >= 100.0:
-        return f"{value:,.1f}"
-    if magnitude >= 10.0:
-        return f"{value:,.2f}"
-    return f"{value:,.3f}"
+def _format_study_case_label(study_case_id: str) -> str:
+    return " ".join(part.capitalize() for part in study_case_id.split("_"))
 
 
-def _value_to_y_position(
-    value: float,
+def _ordered_study_case_ids(metric_rows: list[dict[str, object]]) -> list[str]:
+    present = {
+        str(row.get("study_case_id") or "")
+        for row in metric_rows
+        if str(row.get("study_case_id") or "")
+    }
+    ordered = [family_id for family_id in PLOT_FAMILY_ORDER if family_id in present]
+    extras = sorted(present - set(PLOT_FAMILY_ORDER))
+    return ordered + extras
+
+
+def _ordered_seq_lens(metric_rows: list[dict[str, object]]) -> list[int]:
+    present = {
+        int(row.get("seq_len") or 0)
+        for row in metric_rows
+        if row.get("seq_len") not in (None, "", "None")
+    }
+    ordered = [seq_len for seq_len in PLOT_SEQ_ORDER if seq_len in present]
+    extras = sorted(present - set(PLOT_SEQ_ORDER))
+    return ordered + extras
+
+
+def render_metric_plot(
+    rows: list[dict[str, object]],
     *,
-    plot_top: float,
-    plot_height: float,
-    y_min: float,
-    y_max: float,
-) -> float:
-    denominator = y_max - y_min
-    normalized = 0.5 if denominator <= 0 else (value - y_min) / denominator
-    return plot_top + plot_height - (normalized * plot_height)
+    metric: str,
+    title: str,
+    y_axis_label: str,
+) -> plt.Figure:
+    metric_rows = [row for row in rows if str(row.get("metric") or "") == metric]
+    plt.rcParams["svg.fonttype"] = "none"
+    sns.set_theme(
+        style="whitegrid",
+        context="talk",
+        rc={
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.titleweight": "bold",
+            "figure.facecolor": "#f7f5f2",
+            "axes.facecolor": "#fcfbf8",
+            "grid.color": "#ded8cf",
+        },
+    )
+
+    if not metric_rows:
+        fig, ax = plt.subplots(figsize=(12, 5.5))
+        ax.set_axis_off()
+        fig.text(
+            0.5,
+            0.57,
+            title,
+            ha="center",
+            va="center",
+            fontsize=24,
+            fontweight="bold",
+        )
+        fig.text(
+            0.5,
+            0.42,
+            "No data available",
+            ha="center",
+            va="center",
+            fontsize=18,
+        )
+        fig.patch.set_facecolor("#f7f5f2")
+        return fig
+
+    study_case_ids = _ordered_study_case_ids(metric_rows)
+    seq_lens = _ordered_seq_lens(metric_rows)
+    subplot_count = max(1, len(study_case_ids))
+    fig, axes = plt.subplots(
+        1,
+        subplot_count,
+        figsize=(10 * subplot_count, 8),
+        sharey=True,
+    )
+    if subplot_count == 1:
+        axes = [axes]
+
+    for ax, study_case_id in zip(axes, study_case_ids, strict=True):
+        family_rows = [
+            row
+            for row in metric_rows
+            if str(row.get("study_case_id") or "") == study_case_id
+        ]
+        series_values = {
+            series_name: {
+                int(row.get("seq_len") or 0): _optional_float(row.get(series_name))
+                for row in family_rows
+            }
+            for series_name, _, _ in PLOT_SERIES
+        }
+
+        x_positions = list(range(len(seq_lens)))
+        group_width = 0.82
+        bar_width = group_width / float(len(PLOT_SERIES))
+
+        for series_index, (series_name, _, color) in enumerate(PLOT_SERIES):
+            x_values: list[float] = []
+            y_values: list[float] = []
+            for seq_index, seq_len in enumerate(seq_lens):
+                value = series_values[series_name].get(seq_len)
+                if value is None:
+                    continue
+                x_values.append(
+                    seq_index - (group_width / 2.0) + (series_index * bar_width)
+                )
+                y_values.append(value)
+            if not x_values:
+                continue
+            ax.bar(
+                x_values,
+                y_values,
+                width=bar_width * 0.94,
+                color=color,
+                edgecolor="white",
+                linewidth=0.7,
+                align="edge",
+            )
+
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels([str(seq_len) for seq_len in seq_lens], rotation=0)
+        ax.set_xlabel("Context Length (tokens)", fontsize=15)
+        ax.set_ylabel(y_axis_label, fontsize=15)
+        ax.set_title(
+            _format_study_case_label(study_case_id),
+            loc="left",
+            fontsize=18,
+            pad=12,
+        )
+        ax.grid(True, which="major", axis="y", linewidth=0.8, alpha=0.8)
+        ax.tick_params(axis="both", labelsize=12)
+
+    legend_handles = [
+        Patch(facecolor=color, edgecolor="none", label=label)
+        for _, label, color in PLOT_SERIES
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=len(PLOT_SERIES),
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.01),
+        fontsize=13,
+    )
+    fig.suptitle(
+        title,
+        fontsize=24,
+        fontweight="bold",
+        y=0.98,
+    )
+    fig.tight_layout(rect=[0, 0.08, 1, 0.93])
+    return fig
 
 
 def write_metric_plot(
@@ -691,189 +829,15 @@ def write_metric_plot(
     title: str,
     y_axis_label: str,
 ) -> None:
-    metric_rows = [row for row in rows if str(row.get("metric") or "") == metric]
-    study_ids = sorted(
-        {
-            str(row.get("study_case_id") or "")
-            for row in metric_rows
-            if str(row.get("study_case_id") or "")
-        }
-    )
-    width = 1080
-    title_height = 36
-    legend_height = 34
-    subplot_height = 250
-    plot_left = 90
-    plot_right = 1040
-    plot_width = plot_right - plot_left
-    plot_height = 170
-    plot_title_offset = 28
-    top_padding = 18
-    subplot_count = max(1, len(study_ids))
-    height = (
-        top_padding
-        + title_height
-        + legend_height
-        + (subplot_count * subplot_height)
-        + 18
-    )
-
-    svg_lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        (
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
-            f'height="{height}" viewBox="0 0 {width} {height}">'
-        ),
-        "<style>",
-        "text { font-family: sans-serif; fill: #1f2933; }",
-        ".title { font-size: 22px; font-weight: 700; }",
-        ".subtitle { font-size: 14px; font-weight: 600; }",
-        ".axis { stroke: #334155; stroke-width: 1.5; }",
-        ".grid { stroke: #cbd5e1; stroke-width: 1; }",
-        ".tick { font-size: 12px; fill: #475569; }",
-        ".legend { font-size: 13px; font-weight: 600; }",
-        ".bar { opacity: 0.95; }",
-        "</style>",
-        f'<rect width="{width}" height="{height}" fill="white" />',
-        (
-            f'<text class="title" x="{width / 2.0}" y="{top_padding + 22}" '
-            f'text-anchor="middle">{_svg_escape(title)}</text>'
-        ),
-    ]
-
-    legend_y = top_padding + title_height + 4
-    legend_x = 120
-    for _, label, color in PLOT_SERIES:
-        svg_lines.append(
-            f'<rect x="{legend_x}" y="{legend_y - 9}" width="22" height="14" '
-            f'fill="{color}" class="bar" />'
-        )
-        svg_lines.append(
-            f'<text class="legend" x="{legend_x + 34}" y="{legend_y + 5}">'
-            f"{_svg_escape(label)}</text>"
-        )
-        legend_x += 150
-
-    if not metric_rows:
-        svg_lines.append(
-            (
-                f'<text class="subtitle" x="{width / 2.0}" '
-                f'y="{top_padding + title_height + legend_height + 80}" '
-                'text-anchor="middle">No data available</text>'
-            )
-        )
-        svg_lines.append("</svg>")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text("\n".join(svg_lines), encoding="utf-8")
-        return
-
-    all_values = [
-        _optional_float(row.get(series_name))
-        for row in metric_rows
-        for series_name, _, _ in PLOT_SERIES
-    ]
-    plotted_values = [value for value in all_values if value is not None]
-    y_min = 0.0
-    y_max = 1.0 if not plotted_values else max(plotted_values)
-    if y_max <= y_min:
-        y_max = y_min + 1.0
-    y_max *= 1.08
-
-    for study_index, study_case_id in enumerate(study_ids):
-        study_rows = sorted(
-            [
-                row
-                for row in metric_rows
-                if str(row.get("study_case_id") or "") == study_case_id
-            ],
-            key=lambda row: int(row.get("seq_len") or 0),
-        )
-        section_top = (
-            top_padding + title_height + legend_height + (study_index * subplot_height)
-        )
-        plot_top = section_top + plot_title_offset
-        plot_bottom = plot_top + plot_height
-        svg_lines.append(
-            f'<text class="subtitle" x="{plot_left}" y="{section_top + 18}">'
-            f"{_svg_escape(study_case_id)}</text>"
-        )
-        svg_lines.append(
-            f'<text class="tick" x="24" y="{plot_top + (plot_height / 2.0)}" '
-            f'transform="rotate(-90 24 {plot_top + (plot_height / 2.0)})">'
-            f"{_svg_escape(y_axis_label)}</text>"
-        )
-        svg_lines.append(
-            f'<line class="axis" x1="{plot_left}" y1="{plot_top}" '
-            f'x2="{plot_left}" y2="{plot_bottom}" />'
-        )
-        svg_lines.append(
-            f'<line class="axis" x1="{plot_left}" y1="{plot_bottom}" '
-            f'x2="{plot_right}" y2="{plot_bottom}" />'
-        )
-
-        for tick_index in range(5):
-            ratio = tick_index / 4.0
-            y_position = plot_bottom - (ratio * plot_height)
-            tick_value = y_min + ((y_max - y_min) * ratio)
-            svg_lines.append(
-                f'<line class="grid" x1="{plot_left}" y1="{y_position}" '
-                f'x2="{plot_right}" y2="{y_position}" />'
-            )
-            svg_lines.append(
-                f'<text class="tick" x="{plot_left - 10}" y="{y_position + 4}" '
-                f'text-anchor="end">{_svg_escape(_format_metric_value(tick_value))}</text>'
-            )
-
-        seq_lens = [int(row.get("seq_len") or 0) for row in study_rows]
-        group_slot_width = plot_width / float(max(1, len(seq_lens)))
-        cluster_width = min(group_slot_width * 0.82, 104.0)
-        bar_gap = 4.0
-        cluster_gap_total = bar_gap * float(len(PLOT_SERIES) - 1)
-        bar_width = max(
-            8.0,
-            (cluster_width - cluster_gap_total) / float(len(PLOT_SERIES)),
-        )
-        cluster_total_width = (bar_width * float(len(PLOT_SERIES))) + cluster_gap_total
-
-        for row_index, (study_row, seq_len) in enumerate(zip(study_rows, seq_lens)):
-            slot_left = plot_left + (row_index * group_slot_width)
-            slot_center = slot_left + (group_slot_width / 2.0)
-            cluster_left = slot_center - (cluster_total_width / 2.0)
-            svg_lines.append(
-                f'<line class="grid" x1="{slot_center}" y1="{plot_top}" '
-                f'x2="{slot_center}" y2="{plot_bottom}" />'
-            )
-            svg_lines.append(
-                f'<text class="tick" x="{slot_center}" y="{plot_bottom + 18}" '
-                f'text-anchor="middle">{_svg_escape(seq_len)}</text>'
-            )
-            for series_index, (series_name, _, color) in enumerate(PLOT_SERIES):
-                value = _optional_float(study_row.get(series_name))
-                if value is None:
-                    continue
-                bar_left = cluster_left + (series_index * (bar_width + bar_gap))
-                bar_top = _value_to_y_position(
-                    value,
-                    plot_top=plot_top,
-                    plot_height=plot_height,
-                    y_min=y_min,
-                    y_max=y_max,
-                )
-                bar_height = max(0.0, plot_bottom - bar_top)
-                svg_lines.append(
-                    f'<rect class="bar" x="{bar_left:.2f}" y="{bar_top:.2f}" '
-                    f'width="{bar_width:.2f}" height="{bar_height:.2f}" '
-                    f'fill="{color}" />'
-                )
-
-        svg_lines.append(
-            f'<text class="tick" x="{plot_left + (plot_width / 2.0)}" '
-            f'y="{plot_bottom + 40}" text-anchor="middle">Sequence Length</text>'
-        )
-
-    svg_lines.append("</svg>")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(svg_lines), encoding="utf-8")
+    fig = render_metric_plot(
+        rows,
+        metric=metric,
+        title=title,
+        y_axis_label=y_axis_label,
+    )
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
 
 
 def write_plots(
