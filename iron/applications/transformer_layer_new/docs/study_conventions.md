@@ -12,6 +12,7 @@ The implemented scope now includes:
 
 - `block`
 - `end_to_end`
+- `igpu`
 
 ## Retained Cases
 
@@ -154,6 +155,12 @@ Current canonical CSVs:
 - `results/block/results.csv`
 - `results/end_to_end/tuning.csv`
 - `results/end_to_end/results.csv`
+- `results/igpu/results.csv`
+
+Current canonical iGPU plots:
+
+- `results/igpu/tps_comparison.svg`
+- `results/igpu/tps_per_watt_comparison.svg`
 
 Required row groups:
 
@@ -175,6 +182,15 @@ candidate per `(family_id, seq_len, block_kind)` as best.
 The end-to-end CSV keeps one row per `(study_case_id, seq_len, execution_mode)`
 and marks the minimum-latency successful row per `(study_case_id, seq_len)` as
 best.
+
+The iGPU CSV keeps one comparison row per
+`(study_case_id, seq_len, metric)` point.
+The metric values are `tps` and `tps_per_watt`.
+Its columns are `igpu`, `dataflow`, `runlist`, and `offload`.
+It reuses the retained `end_to_end` NPU rows for `dataflow`, `runlist`, and
+`offload`, benchmarks the iGPU once per available `(study_case_id, seq_len)`
+group, and aggregates all retained NPU rows per execution mode into the clean
+comparison table.
 
 The end-to-end tuning CSV keeps one row per
 `(study_case_id, seq_len, execution_mode, internal_operator, candidate_id)` and

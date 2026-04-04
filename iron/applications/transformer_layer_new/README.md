@@ -26,8 +26,9 @@ The remaining work in this app is the study harness and study documentation.
 ## Current Status
 
 - the block implementations are complete
-- the implemented study runners are `study/block` and `study/end_to_end`
-- study infrastructure lives here
+- the implemented study runners are `study/block`, `study/end_to_end`, and `study/igpu`
+- study infrastructure is being added here instead of extending the older
+  `transformer_layer` app
 
 Implementation order:
 
@@ -84,16 +85,22 @@ Current canonical result CSVs:
 - `results/block/results.csv`
 - `results/end_to_end/results.csv`
 - `results/end_to_end/tuning.csv`
+- `results/igpu/results.csv`
+
+Current canonical plot outputs:
+
+- `results/igpu/tps_comparison.svg`
+- `results/igpu/tps_per_watt_comparison.svg`
 
 Later planned result CSVs:
 
 - `results/reconfiguration_overhead/results.csv`
-- `results/igpu/results.csv`
 
 Current study entrypoints:
 
 - `python -m iron.applications.transformer_layer_new.study.block.run`
 - `python -m iron.applications.transformer_layer_new.study.end_to_end.run`
+- `python -m iron.applications.transformer_layer_new.study.igpu.run`
 
 The end-to-end study also uses checked-in default candidate files:
 
@@ -104,7 +111,20 @@ The end-to-end study also uses checked-in default candidate files:
 Later planned entrypoints:
 
 - `python -m iron.applications.transformer_layer_new.study.reconfiguration_overhead.run`
-- `python -m iron.applications.transformer_layer_new.study.igpu.run`
+
+## iGPU Environment
+
+The repo-root [requirements.txt](/home/agi-demo/iron/requirements.txt) stays
+generic for the wider codebase.
+
+For the ROCm iGPU study on Ubuntu 24.04 / Python 3.12 Ryzen APU systems:
+
+1. install the normal repo requirements first
+2. then install the iGPU ROCm overlay:
+   `pip install -r iron/applications/transformer_layer_new/study/igpu/requirements_rocm.txt`
+
+That overlay is local to `transformer_layer_new` and avoids changing the
+repo-wide Python environment defaults for unrelated studies.
 
 ## Documentation Map
 
