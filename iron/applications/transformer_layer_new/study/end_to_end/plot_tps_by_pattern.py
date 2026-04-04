@@ -47,8 +47,8 @@ def default_output_dir() -> Path:
 
 def variant_stem(variant: str) -> str:
     return {
-        "standard": "tokens_per_second_by_pattern",
-        "slides": "tokens_per_second_by_pattern_slides",
+        "standard": "effective_gflops_per_second_by_pattern",
+        "slides": "effective_gflops_per_second_by_pattern_slides",
     }[variant]
 
 
@@ -65,7 +65,7 @@ def load_plot_rows(results_csv: Path) -> pd.DataFrame:
     df = pd.read_csv(results_csv)
     df = df[df["run_status"] == "passed"].copy()
     df["seq_len"] = df["seq_len"].astype(int)
-    df["tokens_per_sec"] = df["tokens_per_sec"].astype(float)
+    df["effective_gflops_per_sec"] = df["effective_gflops_per_sec"].astype(float)
     df = df[df["execution_mode"].isin(MODE_ORDER)].copy()
     df["execution_mode"] = pd.Categorical(
         df["execution_mode"], MODE_ORDER, ordered=True
@@ -93,7 +93,9 @@ def load_plot_rows(results_csv: Path) -> pd.DataFrame:
             f"{family_id}:{mode}:{seq_len}"
             for family_id, mode, seq_len in sorted(missing)
         )
-        raise ValueError(f"Missing end-to-end TPS rows for: {missing_summary}")
+        raise ValueError(
+            f"Missing end-to-end effective GFLOP/s rows for: {missing_summary}"
+        )
 
     return df
 
@@ -140,7 +142,7 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
             mode_df = family_df[family_df["execution_mode"] == mode].copy()
             ax.plot(
                 mode_df["seq_len"],
-                mode_df["tokens_per_sec"],
+                mode_df["effective_gflops_per_sec"],
                 label=MODE_LABELS[mode],
                 color=MODE_COLORS[mode],
                 marker=MODE_MARKERS[mode],
@@ -152,7 +154,7 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
         ax.set_xticks(SEQ_ORDER)
         ax.set_xticklabels([str(seq_len) for seq_len in SEQ_ORDER], rotation=0)
         ax.set_xlabel("Context Length (tokens)", fontsize=axis_label_size)
-        ax.set_ylabel("Throughput (tokens/s)", fontsize=axis_label_size)
+        ax.set_ylabel("Effective Throughput (GFLOP/s)", fontsize=axis_label_size)
         ax.set_title(
             family_label(family_df),
             loc="left",
@@ -184,7 +186,7 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
         fontsize=legend_font_size,
     )
     fig.suptitle(
-        "Throughput Comparison of Dataflow, Runlist, and Offload Patterns",
+        "Effective Throughput Comparison of Dataflow, Runlist, and Offload Patterns",
         fontsize=suptitle_size,
         fontweight="bold",
         y=title_y,
@@ -195,7 +197,7 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Render a TPS comparison across execution patterns."
+        description="Render an effective GFLOP/s comparison across execution patterns."
     )
     parser.add_argument(
         "--results",

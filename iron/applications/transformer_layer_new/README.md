@@ -96,8 +96,8 @@ Current canonical result CSVs:
 
 Current canonical plot outputs:
 
-- `results/igpu/tps_comparison.svg`
-- `results/igpu/tps_per_watt_comparison.svg`
+- `results/igpu/effective_gflops_comparison.svg`
+- `results/igpu/effective_gflops_per_watt_comparison.svg`
 - `results/memcpy_bandwidth/peak_bandwidth_by_size.svg`
 - `results/memcpy_bandwidth/latency_by_size.svg`
 

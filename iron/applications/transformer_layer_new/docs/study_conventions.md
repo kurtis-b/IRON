@@ -166,8 +166,8 @@ Current canonical CSVs:
 
 Current canonical iGPU plots:
 
-- `results/igpu/tps_comparison.svg`
-- `results/igpu/tps_per_watt_comparison.svg`
+- `results/igpu/effective_gflops_comparison.svg`
+- `results/igpu/effective_gflops_per_watt_comparison.svg`
 - `results/memcpy_bandwidth/peak_bandwidth_by_size.svg`
 - `results/memcpy_bandwidth/latency_by_size.svg`
 
@@ -194,7 +194,8 @@ best.
 
 The iGPU CSV keeps one comparison row per
 `(study_case_id, seq_len, metric)` point.
-The metric values are `tps` and `tps_per_watt`.
+The metric values are `effective_gflops_per_sec` and
+`effective_gflops_per_sec_per_watt`.
 Its columns are `igpu`, `dataflow`, `runlist`, and `offload`.
 It reuses the retained `end_to_end` NPU rows for `dataflow`, `runlist`, and
 `offload`, benchmarks the iGPU once per available `(study_case_id, seq_len)`
@@ -261,8 +262,8 @@ Required end-to-end row groups:
   `timed_total_sec`, `avg_latency_ms`, `compile_setup_time_ms`,
   `host_qkv_precompute_ms`
 - throughput and power:
-  `tokens_per_sec`, `power_backend`, `avg_power_w`,
-  `tokens_per_sec_per_watt`
+  `effective_gflops_per_sec`, `power_backend`, `avg_power_w`,
+  `effective_gflops_per_sec_per_watt`
 - runtime metadata:
   `npu_dispatch_count`, `npu_unique_instruction_binary_count`,
   `npu_unique_xclbin_count`, `process_model`

@@ -105,9 +105,9 @@ selected isolated winner with `is_operator_best=True`.
 Required metrics in each row include:
 
 - `avg_latency_ms`
-- `tokens_per_sec`
+- `effective_gflops_per_sec`
 - `avg_power_w`
-- `tokens_per_sec_per_watt`
+- `effective_gflops_per_sec_per_watt`
 
 Compatibility/runtime metrics:
 
@@ -116,7 +116,17 @@ Compatibility/runtime metrics:
   because the offload pattern now starts from hidden states and computes
   `q/k/v` on NPU
 
-`tokens_per_sec` is computed as `seq_len / avg_latency_sec`.
+`effective_gflops_per_sec` is computed from the dominant dense transformer-layer
+matmuls per forward pass:
+
+- `q/k/v` projections
+- attention-score and attention-output GEMMs
+- output projection
+- FFN up/down GEMMs
+
+The study reports `effective_gflops_per_sec = flop_count / avg_latency_sec / 1e9`.
+Small elementwise ops such as softmax, GeLU, residual adds, and layer norms are
+excluded from the effective FLOP count.
 
 Power measurement is best-effort:
 

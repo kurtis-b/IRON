@@ -106,8 +106,8 @@ The canonical CSV is a compact comparison table with rows keyed by:
 
 The metric rows are:
 
-- `tps`
-- `tps_per_watt`
+- `effective_gflops_per_sec`
+- `effective_gflops_per_sec_per_watt`
 
 The comparison columns are:
 
@@ -136,7 +136,9 @@ This study owns:
 Canonical output:
 
 - `results/igpu/results.csv`
-- `results/igpu/tps_comparison.svg`
-  grouped bar chart for TPS across `igpu`, `dataflow`, `runlist`, and `offload`
-- `results/igpu/tps_per_watt_comparison.svg`
-  grouped bar chart for TPS/W across `igpu`, `dataflow`, `runlist`, and `offload`
+- `results/igpu/effective_gflops_comparison.svg`
+  grouped bar chart for effective GFLOP/s across `igpu`, `dataflow`, `runlist`,
+  and `offload`
+- `results/igpu/effective_gflops_per_watt_comparison.svg`
+  grouped bar chart for effective GFLOP/s/W across `igpu`, `dataflow`,
+  `runlist`, and `offload`

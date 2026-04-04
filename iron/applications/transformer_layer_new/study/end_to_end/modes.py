@@ -77,7 +77,12 @@ from iron.applications.transformer_layer_new.pattern.runlist.op import (
     resolve_runlist_operator_config,
 )
 
-from .cases import EndToEndWorkload, ExecutionMode
+from .cases import (
+    EndToEndWorkload,
+    ExecutionMode,
+    effective_gflops_per_sec,
+    effective_gflops_per_sec_per_watt,
+)
 from .power import (
     create_power_monitor,
     empty_power_stats,
@@ -104,6 +109,7 @@ FINAL_ERROR_THRESHOLD = 0.05
 REFERENCE_VALIDATION_MAX_SEQ_LEN = 512
 DEFAULT_POWER_SAMPLE_INTERVAL_SEC = 0.1
 DEFAULT_QUIESCENT_BASELINE_DURATION_SEC = 0.5
+DEFAULT_MIN_POWER_MEASUREMENT_DURATION_SEC = 1.0
 _CONTEXT_COUNTER = count()
 _LONG_SEQ_CANDIDATE_SUBPROCESS_MIN_SEQ_LEN = 8192
 
@@ -440,7 +446,7 @@ def _measure_power(
     power_probe_runs = resolve_power_probe_runs(
         avg_iteration_sec=avg_iteration_sec,
         baseline_runs=runs_per_sample,
-        min_measurement_duration_sec=0.25,
+        min_measurement_duration_sec=DEFAULT_MIN_POWER_MEASUREMENT_DURATION_SEC,
     )
     estimated_window_sec = (
         None if avg_iteration_sec is None else avg_iteration_sec * power_probe_runs
@@ -473,20 +479,6 @@ def _measure_power(
             stats["power_backend"] = "none"
             return stats
         raise
-
-
-def _tokens_per_sec(seq_len: int, avg_latency_ms: float | None) -> float | None:
-    if avg_latency_ms is None or avg_latency_ms <= 0:
-        return None
-    return float(seq_len) / (avg_latency_ms / 1000.0)
-
-
-def _tokens_per_sec_per_watt(
-    tokens_per_sec: float | None, avg_power_w: float | None
-) -> float | None:
-    if tokens_per_sec is None or avg_power_w is None or avg_power_w <= 0:
-        return None
-    return tokens_per_sec / avg_power_w
 
 
 def _cleanup_operator_runtime(operator) -> None:
@@ -1581,10 +1573,10 @@ def benchmark_mode(
         "measured_inference_count": 0,
         "avg_latency_ms": None,
         "compile_setup_time_ms": None,
-        "tokens_per_sec": None,
+        "effective_gflops_per_sec": None,
         "power_backend": "none" if power_backend == "auto" else power_backend,
         "avg_power_w": None,
-        "tokens_per_sec_per_watt": None,
+        "effective_gflops_per_sec_per_watt": None,
         "host_qkv_precompute_ms": None,
         "npu_dispatch_count": None,
         "npu_unique_instruction_binary_count": None,
@@ -1664,9 +1656,12 @@ def benchmark_mode(
 
         summary = _summarize_latencies(latencies_sec)
         result.update(summary)
-        result["tokens_per_sec"] = _tokens_per_sec(
-            workload.seq_len,
-            summary["avg_latency_ms"],
+        result["effective_gflops_per_sec"] = effective_gflops_per_sec(
+            seq_len=workload.seq_len,
+            hidden_size=workload.hidden_size,
+            intermediate_size=workload.intermediate_size,
+            num_attention_heads=workload.num_attention_heads,
+            avg_latency_ms=summary["avg_latency_ms"],
         )
 
         power_stats = _measure_power(
@@ -1680,8 +1675,8 @@ def benchmark_mode(
             "power_backend", result["power_backend"]
         )
         result["avg_power_w"] = power_stats.get("avg_power_w")
-        result["tokens_per_sec_per_watt"] = _tokens_per_sec_per_watt(
-            result["tokens_per_sec"],
+        result["effective_gflops_per_sec_per_watt"] = effective_gflops_per_sec_per_watt(
+            result["effective_gflops_per_sec"],
             result["avg_power_w"],
         )
 

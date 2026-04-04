@@ -24,6 +24,11 @@ from matplotlib.patches import Patch
 import torch
 import torch.nn.functional as F
 
+from iron.applications.transformer_layer_new.study.end_to_end.cases import (
+    effective_gflops_per_sec,
+    effective_gflops_per_sec_per_watt,
+)
+
 from .select import (
     REFERENCE_EXECUTION_MODES,
     ReferenceGroup,
@@ -54,6 +59,10 @@ PLOT_SERIES = (
 )
 PLOT_FAMILY_ORDER = ("baseline_768", "baseline_1024")
 PLOT_SEQ_ORDER = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+PLOT_FAMILY_LABELS = {
+    "baseline_768": "Head Dim = 64 / Num Heads = 12 / FFN Dim = 3072",
+    "baseline_1024": "Head Dim = 64 / Num Heads = 16 / FFN Dim = 4096",
+}
 SUPPORTED_PLOT_SUFFIX = ".svg"
 TORCH_DTYPES: dict[str, torch.dtype] = {
     "bf16": torch.bfloat16,
@@ -67,12 +76,12 @@ def default_output_path() -> Path:
     return Path(__file__).resolve().parents[2] / "results" / "igpu" / "results.csv"
 
 
-def default_tps_plot_path(output_path: Path) -> Path:
-    return output_path.with_name("tps_comparison.svg")
+def default_effective_gflops_plot_path(output_path: Path) -> Path:
+    return output_path.with_name("effective_gflops_comparison.svg")
 
 
-def default_tps_per_watt_plot_path(output_path: Path) -> Path:
-    return output_path.with_name("tps_per_watt_comparison.svg")
+def default_effective_gflops_per_watt_plot_path(output_path: Path) -> Path:
+    return output_path.with_name("effective_gflops_per_watt_comparison.svg")
 
 
 def generate_synthetic_reference(
@@ -423,21 +432,6 @@ def _validate_output(
     }
 
 
-def _tokens_per_sec(seq_len: int, avg_latency_ms: float | None) -> float | None:
-    if avg_latency_ms is None or avg_latency_ms <= 0:
-        return None
-    return float(seq_len) / (avg_latency_ms / 1000.0)
-
-
-def _tokens_per_sec_per_watt(
-    tokens_per_sec: float | None,
-    avg_power_w: float | None,
-) -> float | None:
-    if tokens_per_sec is None or avg_power_w is None or avg_power_w <= 0:
-        return None
-    return tokens_per_sec / avg_power_w
-
-
 def _forward_reference(
     hidden_states: torch.Tensor,
     weights: dict[str, torch.Tensor],
@@ -580,19 +574,23 @@ def benchmark_igpu_group(
             )
 
     validation = _validate_output(group, last_output, runtime_reference_output)
-    tokens_per_sec = _tokens_per_sec(
-        group.seq_len, _optional_float(summary["avg_latency_ms"])
+    effective_gflops = effective_gflops_per_sec(
+        seq_len=group.seq_len,
+        hidden_size=group.hidden_size,
+        intermediate_size=group.intermediate_size,
+        num_attention_heads=group.num_attention_heads,
+        avg_latency_ms=_optional_float(summary["avg_latency_ms"]),
     )
     return {
         **summary,
-        "tokens_per_sec": tokens_per_sec,
+        "effective_gflops_per_sec": effective_gflops,
         "power_backend": power_stats.get("power_backend"),
         "avg_power_w": power_stats.get("avg_power_w"),
         "max_power_w": power_stats.get("max_power_w"),
         "energy_j": power_stats.get("energy_j"),
         "power_sample_count": power_stats.get("power_sample_count"),
-        "tokens_per_sec_per_watt": _tokens_per_sec_per_watt(
-            tokens_per_sec,
+        "effective_gflops_per_sec_per_watt": effective_gflops_per_sec_per_watt(
+            effective_gflops,
             _optional_float(power_stats.get("avg_power_w")),
         ),
         "process_model": "in_process",
@@ -663,7 +661,10 @@ def _resolve_plot_path(path: Path) -> Path:
 
 
 def _format_study_case_label(study_case_id: str) -> str:
-    return " ".join(part.capitalize() for part in study_case_id.split("_"))
+    return PLOT_FAMILY_LABELS.get(
+        study_case_id,
+        " ".join(part.capitalize() for part in study_case_id.split("_")),
+    )
 
 
 def _ordered_study_case_ids(metric_rows: list[dict[str, object]]) -> list[str]:
@@ -711,7 +712,7 @@ def render_metric_plot(
     )
 
     if not metric_rows:
-        fig, ax = plt.subplots(figsize=(12, 5.5))
+        fig, ax = plt.subplots(figsize=(20, 8))
         ax.set_axis_off()
         fig.text(
             0.5,
@@ -739,7 +740,7 @@ def render_metric_plot(
     fig, axes = plt.subplots(
         1,
         subplot_count,
-        figsize=(10 * subplot_count, 8),
+        figsize=(20, 8),
         sharey=True,
     )
     if subplot_count == 1:
@@ -843,22 +844,22 @@ def write_metric_plot(
 def write_plots(
     rows: list[dict[str, object]],
     *,
-    tps_plot_path: Path,
-    tps_per_watt_plot_path: Path,
+    effective_gflops_plot_path: Path,
+    effective_gflops_per_watt_plot_path: Path,
 ) -> None:
     write_metric_plot(
-        _resolve_plot_path(tps_plot_path),
+        _resolve_plot_path(effective_gflops_plot_path),
         rows,
-        metric="tps",
-        title="TPS Comparison",
-        y_axis_label="Tokens / sec",
+        metric="effective_gflops_per_sec",
+        title="Effective Throughput Comparison",
+        y_axis_label="GFLOP / sec",
     )
     write_metric_plot(
-        _resolve_plot_path(tps_per_watt_plot_path),
+        _resolve_plot_path(effective_gflops_per_watt_plot_path),
         rows,
-        metric="tps_per_watt",
-        title="TPS/W Comparison",
-        y_axis_label="Tokens / sec / W",
+        metric="effective_gflops_per_sec_per_watt",
+        title="Effective Throughput/W Comparison",
+        y_axis_label="GFLOP / sec / W",
     )
 
 
@@ -908,26 +909,32 @@ def build_rows_for_group(
                 or benchmark_result["run_status"],
             )
 
-    reference_tps = _reference_metric_means(group, "tokens_per_sec")
-    reference_tps_per_watt = _reference_metric_means(
+    reference_effective_gflops = _reference_metric_means(
         group,
-        "tokens_per_sec_per_watt",
+        "effective_gflops_per_sec",
+    )
+    reference_effective_gflops_per_watt = _reference_metric_means(
+        group,
+        "effective_gflops_per_sec_per_watt",
     )
     return [
         _comparison_row(
             group=group,
-            metric="tps",
-            igpu_value=_igpu_metric_value(benchmark_result, "tokens_per_sec"),
-            reference_values=reference_tps,
+            metric="effective_gflops_per_sec",
+            igpu_value=_igpu_metric_value(
+                benchmark_result,
+                "effective_gflops_per_sec",
+            ),
+            reference_values=reference_effective_gflops,
         ),
         _comparison_row(
             group=group,
-            metric="tps_per_watt",
+            metric="effective_gflops_per_sec_per_watt",
             igpu_value=_igpu_metric_value(
                 benchmark_result,
-                "tokens_per_sec_per_watt",
+                "effective_gflops_per_sec_per_watt",
             ),
-            reference_values=reference_tps_per_watt,
+            reference_values=reference_effective_gflops_per_watt,
         ),
     ]
 
@@ -965,8 +972,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=default_reference_results_path(),
     )
     parser.add_argument("--output", type=Path, default=default_output_path())
-    parser.add_argument("--tps-plot", type=Path, default=None)
-    parser.add_argument("--tps-per-watt-plot", type=Path, default=None)
+    parser.add_argument(
+        "--effective-gflops-plot",
+        "--tps-plot",
+        dest="effective_gflops_plot",
+        type=Path,
+        default=None,
+    )
+    parser.add_argument(
+        "--effective-gflops-per-watt-plot",
+        "--tps-per-watt-plot",
+        dest="effective_gflops_per_watt_plot",
+        type=Path,
+        default=None,
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -979,15 +998,15 @@ def main(argv: list[str] | None = None) -> int:
 
     reference_input = args.reference_input.expanduser()
     output_path = args.output.expanduser()
-    tps_plot_path = (
-        default_tps_plot_path(output_path)
-        if args.tps_plot is None
-        else _resolve_plot_path(args.tps_plot.expanduser())
+    effective_gflops_plot_path = (
+        default_effective_gflops_plot_path(output_path)
+        if args.effective_gflops_plot is None
+        else _resolve_plot_path(args.effective_gflops_plot.expanduser())
     )
-    tps_per_watt_plot_path = (
-        default_tps_per_watt_plot_path(output_path)
-        if args.tps_per_watt_plot is None
-        else _resolve_plot_path(args.tps_per_watt_plot.expanduser())
+    effective_gflops_per_watt_plot_path = (
+        default_effective_gflops_per_watt_plot_path(output_path)
+        if args.effective_gflops_per_watt_plot is None
+        else _resolve_plot_path(args.effective_gflops_per_watt_plot.expanduser())
     )
 
     if not reference_input.exists():
@@ -998,8 +1017,8 @@ def main(argv: list[str] | None = None) -> int:
         write_rows(output_path, [])
         write_plots(
             [],
-            tps_plot_path=tps_plot_path,
-            tps_per_watt_plot_path=tps_per_watt_plot_path,
+            effective_gflops_plot_path=effective_gflops_plot_path,
+            effective_gflops_per_watt_plot_path=(effective_gflops_per_watt_plot_path),
         )
         return 0
 
@@ -1020,8 +1039,8 @@ def main(argv: list[str] | None = None) -> int:
         write_rows(output_path, [])
         write_plots(
             [],
-            tps_plot_path=tps_plot_path,
-            tps_per_watt_plot_path=tps_per_watt_plot_path,
+            effective_gflops_plot_path=effective_gflops_plot_path,
+            effective_gflops_per_watt_plot_path=(effective_gflops_per_watt_plot_path),
         )
         return 0
 
@@ -1042,14 +1061,14 @@ def main(argv: list[str] | None = None) -> int:
     write_rows(output_path, rows)
     write_plots(
         rows,
-        tps_plot_path=tps_plot_path,
-        tps_per_watt_plot_path=tps_per_watt_plot_path,
+        effective_gflops_plot_path=effective_gflops_plot_path,
+        effective_gflops_per_watt_plot_path=effective_gflops_per_watt_plot_path,
     )
     LOGGER.info("Wrote %d iGPU comparison rows to %s", len(rows), output_path)
     LOGGER.info(
         "Wrote comparison plots to %s and %s",
-        tps_plot_path,
-        tps_per_watt_plot_path,
+        effective_gflops_plot_path,
+        effective_gflops_per_watt_plot_path,
     )
     return 0
 

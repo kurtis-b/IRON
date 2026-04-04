@@ -23,8 +23,8 @@ def _reference_row(
     execution_mode: str,
     *,
     avg_latency_ms: str = "5.0",
-    tokens_per_sec: str = "12800.0",
-    tokens_per_sec_per_watt: str = "1066.7",
+    effective_gflops_per_sec: str = "12800.0",
+    effective_gflops_per_sec_per_watt: str = "1066.7",
     run_status: str = "passed",
     backend: str = "npu",
     study_case_id: str = "baseline_768",
@@ -51,10 +51,10 @@ def _reference_row(
         "measured_inference_count": "100",
         "timed_total_sec": "0.5",
         "avg_latency_ms": avg_latency_ms,
-        "tokens_per_sec": tokens_per_sec,
+        "effective_gflops_per_sec": effective_gflops_per_sec,
         "power_backend": "turbostat_pkgwatt",
         "avg_power_w": "12.0",
-        "tokens_per_sec_per_watt": tokens_per_sec_per_watt,
+        "effective_gflops_per_sec_per_watt": effective_gflops_per_sec_per_watt,
         "process_model": "in_process",
         "validation_error_count": "0",
         "run_status": run_status,
@@ -151,23 +151,23 @@ def test_build_rows_for_group_aggregates_all_reference_rows(monkeypatch):
         [
             _reference_row(
                 "dataflow",
-                tokens_per_sec="100.0",
-                tokens_per_sec_per_watt="10.0",
+                effective_gflops_per_sec="100.0",
+                effective_gflops_per_sec_per_watt="10.0",
             ),
             _reference_row(
                 "dataflow",
-                tokens_per_sec="300.0",
-                tokens_per_sec_per_watt="30.0",
+                effective_gflops_per_sec="300.0",
+                effective_gflops_per_sec_per_watt="30.0",
             ),
             _reference_row(
                 "runlist",
-                tokens_per_sec="200.0",
-                tokens_per_sec_per_watt="20.0",
+                effective_gflops_per_sec="200.0",
+                effective_gflops_per_sec_per_watt="20.0",
             ),
             _reference_row(
                 "offload",
-                tokens_per_sec="400.0",
-                tokens_per_sec_per_watt="40.0",
+                effective_gflops_per_sec="400.0",
+                effective_gflops_per_sec_per_watt="40.0",
             ),
         ]
     )[0]
@@ -183,8 +183,8 @@ def test_build_rows_for_group_aggregates_all_reference_rows(monkeypatch):
         power_sample_interval_sec,
     ):
         return {
-            "tokens_per_sec": 800.0,
-            "tokens_per_sec_per_watt": 80.0,
+            "effective_gflops_per_sec": 800.0,
+            "effective_gflops_per_sec_per_watt": 80.0,
             "run_status": "passed",
             "failure_message": "",
         }
@@ -208,7 +208,7 @@ def test_build_rows_for_group_aggregates_all_reference_rows(monkeypatch):
         {
             "study_case_id": "baseline_768",
             "seq_len": 64,
-            "metric": "tps",
+            "metric": "effective_gflops_per_sec",
             "igpu": 800.0,
             "dataflow": 200.0,
             "runlist": 200.0,
@@ -217,7 +217,7 @@ def test_build_rows_for_group_aggregates_all_reference_rows(monkeypatch):
         {
             "study_case_id": "baseline_768",
             "seq_len": 64,
-            "metric": "tps_per_watt",
+            "metric": "effective_gflops_per_sec_per_watt",
             "igpu": 80.0,
             "dataflow": 20.0,
             "runlist": 20.0,
@@ -254,7 +254,10 @@ def test_build_rows_for_group_blanks_igpu_values_on_gpu_failure(monkeypatch):
     )
 
     assert len(rows) == 2
-    assert {row["metric"] for row in rows} == {"tps", "tps_per_watt"}
+    assert {row["metric"] for row in rows} == {
+        "effective_gflops_per_sec",
+        "effective_gflops_per_sec_per_watt",
+    }
     assert all(row["igpu"] is None for row in rows)
     assert rows[0]["dataflow"] == 12800.0
     assert rows[1]["offload"] == 1066.7
@@ -271,8 +274,8 @@ def test_main_skips_when_reference_case_data_is_missing(tmp_path):
     )
 
     output_path = tmp_path / "igpu.csv"
-    tps_plot_path = tmp_path / "tps.svg"
-    tps_per_watt_plot_path = tmp_path / "tps_per_watt.svg"
+    effective_gflops_plot_path = tmp_path / "effective_gflops.svg"
+    effective_gflops_per_watt_plot_path = tmp_path / "effective_gflops_per_watt.svg"
     exit_code = main(
         [
             "--reference-input",
@@ -283,10 +286,10 @@ def test_main_skips_when_reference_case_data_is_missing(tmp_path):
             "64",
             "--output",
             str(output_path),
-            "--tps-plot",
-            str(tps_plot_path),
-            "--tps-per-watt-plot",
-            str(tps_per_watt_plot_path),
+            "--effective-gflops-plot",
+            str(effective_gflops_plot_path),
+            "--effective-gflops-per-watt-plot",
+            str(effective_gflops_per_watt_plot_path),
             "--power-backend",
             "none",
         ]
@@ -294,9 +297,9 @@ def test_main_skips_when_reference_case_data_is_missing(tmp_path):
 
     assert exit_code == 0
     assert _read_csv_rows(output_path) == []
-    assert "<svg" in tps_plot_path.read_text(encoding="utf-8")
-    assert "No data available" in tps_plot_path.read_text(encoding="utf-8")
-    assert "<svg" in tps_per_watt_plot_path.read_text(encoding="utf-8")
+    assert "<svg" in effective_gflops_plot_path.read_text(encoding="utf-8")
+    assert "No data available" in effective_gflops_plot_path.read_text(encoding="utf-8")
+    assert "<svg" in effective_gflops_per_watt_plot_path.read_text(encoding="utf-8")
 
 
 def test_main_writes_clean_csv_and_svg_plots(monkeypatch, tmp_path):
@@ -308,22 +311,22 @@ def test_main_writes_clean_csv_and_svg_plots(monkeypatch, tmp_path):
         writer.writerow(
             _reference_row(
                 "dataflow",
-                tokens_per_sec="100.0",
-                tokens_per_sec_per_watt="10.0",
+                effective_gflops_per_sec="100.0",
+                effective_gflops_per_sec_per_watt="10.0",
             )
         )
         writer.writerow(
             _reference_row(
                 "runlist",
-                tokens_per_sec="200.0",
-                tokens_per_sec_per_watt="20.0",
+                effective_gflops_per_sec="200.0",
+                effective_gflops_per_sec_per_watt="20.0",
             )
         )
         writer.writerow(
             _reference_row(
                 "offload",
-                tokens_per_sec="300.0",
-                tokens_per_sec_per_watt="30.0",
+                effective_gflops_per_sec="300.0",
+                effective_gflops_per_sec_per_watt="30.0",
             )
         )
 
@@ -338,8 +341,8 @@ def test_main_writes_clean_csv_and_svg_plots(monkeypatch, tmp_path):
         power_sample_interval_sec,
     ):
         return {
-            "tokens_per_sec": 32000.0,
-            "tokens_per_sec_per_watt": 1600.0,
+            "effective_gflops_per_sec": 32000.0,
+            "effective_gflops_per_sec_per_watt": 1600.0,
             "run_status": "passed",
             "failure_message": "",
         }
@@ -350,8 +353,8 @@ def test_main_writes_clean_csv_and_svg_plots(monkeypatch, tmp_path):
     )
 
     output_path = tmp_path / "igpu.csv"
-    tps_plot_path = tmp_path / "tps.svg"
-    tps_per_watt_plot_path = tmp_path / "tps_per_watt.svg"
+    effective_gflops_plot_path = tmp_path / "effective_gflops.svg"
+    effective_gflops_per_watt_plot_path = tmp_path / "effective_gflops_per_watt.svg"
     exit_code = main(
         [
             "--reference-input",
@@ -366,10 +369,10 @@ def test_main_writes_clean_csv_and_svg_plots(monkeypatch, tmp_path):
             "2",
             "--output",
             str(output_path),
-            "--tps-plot",
-            str(tps_plot_path),
-            "--tps-per-watt-plot",
-            str(tps_per_watt_plot_path),
+            "--effective-gflops-plot",
+            str(effective_gflops_plot_path),
+            "--effective-gflops-per-watt-plot",
+            str(effective_gflops_per_watt_plot_path),
             "--power-backend",
             "none",
         ]
@@ -381,7 +384,7 @@ def test_main_writes_clean_csv_and_svg_plots(monkeypatch, tmp_path):
         {
             "study_case_id": "baseline_768",
             "seq_len": "64",
-            "metric": "tps",
+            "metric": "effective_gflops_per_sec",
             "igpu": "32000.0",
             "dataflow": "100.0",
             "runlist": "200.0",
@@ -390,23 +393,25 @@ def test_main_writes_clean_csv_and_svg_plots(monkeypatch, tmp_path):
         {
             "study_case_id": "baseline_768",
             "seq_len": "64",
-            "metric": "tps_per_watt",
+            "metric": "effective_gflops_per_sec_per_watt",
             "igpu": "1600.0",
             "dataflow": "10.0",
             "runlist": "20.0",
             "offload": "30.0",
         },
     ]
-    tps_svg = tps_plot_path.read_text(encoding="utf-8")
-    tps_per_watt_svg = tps_per_watt_plot_path.read_text(encoding="utf-8")
-    assert "TPS Comparison" in tps_svg
-    assert "Baseline 768" in tps_svg
-    assert "Dataflow" in tps_svg
-    assert "Runlist" in tps_svg
-    assert "Offload" in tps_svg
-    assert "iGPU" in tps_svg
-    assert "TPS/W Comparison" in tps_per_watt_svg
-    assert "Tokens / sec / W" in tps_per_watt_svg
+    effective_gflops_svg = effective_gflops_plot_path.read_text(encoding="utf-8")
+    effective_gflops_per_watt_svg = effective_gflops_per_watt_plot_path.read_text(
+        encoding="utf-8"
+    )
+    assert "Effective Throughput Comparison" in effective_gflops_svg
+    assert "Head Dim = 64 / Num Heads = 12 / FFN Dim = 3072" in effective_gflops_svg
+    assert "Dataflow" in effective_gflops_svg
+    assert "Runlist" in effective_gflops_svg
+    assert "Offload" in effective_gflops_svg
+    assert "iGPU" in effective_gflops_svg
+    assert "Effective Throughput/W Comparison" in effective_gflops_per_watt_svg
+    assert "GFLOP / sec / W" in effective_gflops_per_watt_svg
 
 
 def test_parse_rocm_smi_average_power_w_reads_package_power():

@@ -76,6 +76,15 @@ class EndToEndWorkload:
     def attention_head_size(self) -> int:
         return self.hidden_size // self.num_attention_heads
 
+    @property
+    def effective_dense_layer_flop_count(self) -> int:
+        return effective_dense_layer_flop_count(
+            seq_len=self.seq_len,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            num_attention_heads=self.num_attention_heads,
+        )
+
 
 @dataclass(frozen=True)
 class EndToEndCase:
@@ -108,6 +117,64 @@ class EndToEndCase:
     @property
     def attention_head_size(self) -> int:
         return self.workload.attention_head_size
+
+
+def effective_dense_layer_flop_count(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_attention_heads: int,
+) -> int:
+    if hidden_size % num_attention_heads != 0:
+        raise ValueError(
+            "hidden_size must be divisible by num_attention_heads to derive "
+            "the effective dense-layer FLOP count"
+        )
+
+    qkv_projection_flops = 6 * seq_len * hidden_size * hidden_size
+    attention_gemm_flops = 4 * seq_len * seq_len * hidden_size
+    output_projection_flops = 2 * seq_len * hidden_size * hidden_size
+    ffn_gemm_flops = 4 * seq_len * hidden_size * intermediate_size
+    return (
+        qkv_projection_flops
+        + attention_gemm_flops
+        + output_projection_flops
+        + ffn_gemm_flops
+    )
+
+
+def effective_gflops_per_sec(
+    *,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_attention_heads: int,
+    avg_latency_ms: float | None,
+) -> float | None:
+    if avg_latency_ms is None or avg_latency_ms <= 0:
+        return None
+    flop_count = effective_dense_layer_flop_count(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_attention_heads=num_attention_heads,
+    )
+    latency_sec = avg_latency_ms / 1000.0
+    return flop_count / latency_sec / 1.0e9
+
+
+def effective_gflops_per_sec_per_watt(
+    effective_gflops_per_sec_value: float | None,
+    avg_power_w: float | None,
+) -> float | None:
+    if (
+        effective_gflops_per_sec_value is None
+        or avg_power_w is None
+        or avg_power_w <= 0
+    ):
+        return None
+    return effective_gflops_per_sec_value / avg_power_w
 
 
 def get_case(study_case_id: str, seq_len: int) -> EndToEndCase:

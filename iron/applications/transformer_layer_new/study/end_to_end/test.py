@@ -21,18 +21,20 @@ from iron.applications.transformer_layer_new.study.end_to_end.cases import (
     SEQUENCE_LADDER,
     candidate_table_for_case,
     default_candidates_path,
+    effective_dense_layer_flop_count,
+    effective_gflops_per_sec,
+    effective_gflops_per_sec_per_watt,
     get_case,
     iter_cases,
     load_candidate_payload,
     load_default_candidate_payloads,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.modes import (
+    DEFAULT_MIN_POWER_MEASUREMENT_DURATION_SEC,
     FINAL_ERROR_THRESHOLD,
     _benchmark_offload_shared_gemm,
     _elementwise_mul_buffers,
     _metadata_for_operator,
-    _tokens_per_sec,
-    _tokens_per_sec_per_watt,
     _validate_output,
     benchmark_operator_candidate,
 )
@@ -46,6 +48,7 @@ from iron.applications.transformer_layer_new.study.end_to_end.run import (
 )
 from iron.applications.transformer_layer_new.study.end_to_end.power import (
     resolve_power_sample_interval_sec,
+    resolve_power_probe_runs,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.run_power_sweep import (
     default_output_path as default_power_sweep_output_path,
@@ -105,6 +108,17 @@ def test_power_sampling_defaults_to_conservative_100ms_floor():
             estimated_timed_window_sec=0.03,
         )
         == 0.1
+    )
+
+
+def test_power_probe_runs_target_full_second_window_for_short_cases():
+    assert (
+        resolve_power_probe_runs(
+            avg_iteration_sec=0.042,
+            baseline_runs=10,
+            min_measurement_duration_sec=DEFAULT_MIN_POWER_MEASUREMENT_DURATION_SEC,
+        )
+        == 24
     )
 
 
@@ -443,11 +457,26 @@ def test_metadata_helpers_count_runtime_artifacts():
     assert offload_metadata["npu_unique_xclbin_count"] == 1
 
 
-def test_throughput_helpers():
-    tokens_per_sec = _tokens_per_sec(512, 2.0)
-    assert tokens_per_sec == 256000.0
-    assert _tokens_per_sec_per_watt(tokens_per_sec, 50.0) == 5120.0
-    assert _tokens_per_sec_per_watt(tokens_per_sec, None) is None
+def test_effective_gflops_helpers():
+    assert (
+        effective_dense_layer_flop_count(
+            seq_len=512,
+            hidden_size=768,
+            intermediate_size=3072,
+            num_attention_heads=12,
+        )
+        == 8_053_063_680
+    )
+    effective_gflops = effective_gflops_per_sec(
+        seq_len=512,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_attention_heads=12,
+        avg_latency_ms=2.0,
+    )
+    assert effective_gflops == 4026.53184
+    assert effective_gflops_per_sec_per_watt(effective_gflops, 50.0) == 80.5306368
+    assert effective_gflops_per_sec_per_watt(effective_gflops, None) is None
 
 
 def test_elementwise_mul_buffers_support_scalar_broadcast():
@@ -680,10 +709,10 @@ def test_tune_mode_runlist_long_seq_skips_singleton_defaults_and_smokes(monkeypa
             "avg_latency_ms": 5.0,
             "compile_setup_time_ms": 100.0,
             "host_qkv_precompute_ms": None,
-            "tokens_per_sec": 1.0,
+            "effective_gflops_per_sec": 1.0,
             "power_backend": power_backend,
             "avg_power_w": None,
-            "tokens_per_sec_per_watt": None,
+            "effective_gflops_per_sec_per_watt": None,
             "npu_dispatch_count": 0,
             "npu_unique_instruction_binary_count": 0,
             "npu_unique_xclbin_count": 0,
@@ -837,10 +866,10 @@ def test_build_rows_returns_tuning_and_final_rows(monkeypatch):
             "avg_latency_ms": 5.0 if execution_mode == "dataflow" else 6.0,
             "compile_setup_time_ms": 100.0,
             "host_qkv_precompute_ms": None,
-            "tokens_per_sec": 25600.0,
+            "effective_gflops_per_sec": 25600.0,
             "power_backend": "none",
             "avg_power_w": None,
-            "tokens_per_sec_per_watt": None,
+            "effective_gflops_per_sec_per_watt": None,
             "npu_dispatch_count": 3,
             "npu_unique_instruction_binary_count": 2,
             "npu_unique_xclbin_count": 2,
@@ -944,10 +973,10 @@ def test_main_writes_results_and_tuning_csv(monkeypatch, tmp_path):
                     "avg_latency_ms": 1.0,
                     "compile_setup_time_ms": 10.0,
                     "host_qkv_precompute_ms": None,
-                    "tokens_per_sec": 64000.0,
+                    "effective_gflops_per_sec": 64000.0,
                     "power_backend": "none",
                     "avg_power_w": None,
-                    "tokens_per_sec_per_watt": None,
+                    "effective_gflops_per_sec_per_watt": None,
                     "npu_dispatch_count": 3,
                     "npu_unique_instruction_binary_count": 2,
                     "npu_unique_xclbin_count": 2,
@@ -1064,10 +1093,10 @@ def test_power_sweep_main_writes_merged_results_and_tuning_csv(monkeypatch, tmp_
                     "avg_latency_ms": float(case.seq_len),
                     "compile_setup_time_ms": 10.0,
                     "host_qkv_precompute_ms": 0.0,
-                    "tokens_per_sec": 1.0,
+                    "effective_gflops_per_sec": 1.0,
                     "power_backend": "turbostat_pkgwatt",
                     "avg_power_w": 2.0,
-                    "tokens_per_sec_per_watt": 0.5,
+                    "effective_gflops_per_sec_per_watt": 0.5,
                     "npu_dispatch_count": 30,
                     "npu_unique_instruction_binary_count": 8,
                     "npu_unique_xclbin_count": 1,
@@ -1183,10 +1212,10 @@ def test_power_sweep_main_checkpoints_after_each_case(monkeypatch, tmp_path):
                     "avg_latency_ms": float(case.seq_len),
                     "compile_setup_time_ms": 10.0,
                     "host_qkv_precompute_ms": 0.0,
-                    "tokens_per_sec": 1.0,
+                    "effective_gflops_per_sec": 1.0,
                     "power_backend": "turbostat_pkgwatt",
                     "avg_power_w": 2.0,
-                    "tokens_per_sec_per_watt": 0.5,
+                    "effective_gflops_per_sec_per_watt": 0.5,
                     "npu_dispatch_count": 30,
                     "npu_unique_instruction_binary_count": 8,
                     "npu_unique_xclbin_count": 1,
