@@ -97,8 +97,12 @@ Its comparison columns are:
 ## Supporting Studies
 
 The memory-tile staging CSV keeps one row per
-`(family_id, seq_len, block_kind, staging_depth)` and is the source input for
-the staging-ablation summary in `study/end_to_end`.
+`(family_id, seq_len, block_kind, staging_depth)`.
+
+The end-to-end staging-ablation CSV keeps one row per
+`(study_case_id, seq_len, block_kind, staging_depth)` for real `dataflow`
+reruns. It sweeps the selected `dataflow` config at different staging depths
+and can reuse the memory-tile staging depth ladder when that CSV is present.
 
 The iGPU study remains separate from `study/end_to_end` by design. It consumes
 completed end-to-end NPU rows instead of re-running NPU patterns.

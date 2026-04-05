@@ -54,6 +54,11 @@ Canonical CSV outputs:
 The end-to-end helper studies default to `results_all_power.csv` when it is
 present and fall back to `results.csv` otherwise.
 
+`study/end_to_end/run_staging_ablation.py` is an end-to-end `dataflow`
+benchmark sweep, not a metadata-only summary. It reruns the selected `dataflow`
+config at different `mha_out_proj` and `ffn` staging depths, and can mirror the
+depth ladder from `results/memory_tile_staging/results.csv`.
+
 Current paper-facing figure scripts live in:
 
 - `study/end_to_end/plot_tps_by_pattern.py`

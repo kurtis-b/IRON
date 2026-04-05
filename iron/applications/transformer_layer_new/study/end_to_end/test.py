@@ -125,6 +125,16 @@ def test_iteration_schedule_uses_100_timed_iterations_through_256():
     assert iteration_schedule(8192) == (1, 2)
 
 
+def test_new_benchmark_context_reuses_stable_build_scope():
+    first = modes._new_benchmark_context("mode dataflow 768 64")
+    second = modes._new_benchmark_context("mode dataflow 768 64")
+    different = modes._new_benchmark_context("mode runlist 768 64")
+
+    assert first.build_dir == second.build_dir
+    assert first.build_dir.name == "mode_dataflow_768_64"
+    assert different.build_dir != first.build_dir
+
+
 def test_select_result_rows_parses_selected_config_and_filters_modes():
     rows = [
         _result_row("dataflow", seq_len="64"),
@@ -272,12 +282,36 @@ def test_latency_variation_rows_capture_sample_statistics(monkeypatch, tmp_path)
 
 
 def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
-    end_to_end_results = tmp_path / "end_to_end.csv"
+    results_input = tmp_path / "end_to_end.csv"
     staging_results = tmp_path / "staging.csv"
-    _write_csv(
-        end_to_end_results,
-        [_result_row("dataflow", seq_len="64", avg_latency_ms="8.0")],
+    result_row = _result_row("dataflow", seq_len="64", avg_latency_ms="8.0")
+    result_row["selected_candidate_ids_json"] = json.dumps(
+        {"mha_out_proj": "mha_0", "ffn": "ffn_0"},
+        sort_keys=True,
     )
+    result_row["selected_config_json"] = json.dumps(
+        {
+            "qkv_proj": {"parallel_seq": 4},
+            "mha_out_proj": {
+                "parallel_seq": 2,
+                "q_seq_tile": 32,
+                "kv_seq_tile": 64,
+                "emb_tile": 96,
+                "parallel_heads": 4,
+                "o_proj_acc_depth": 2,
+            },
+            "add_norm1": {"tile_size": 768},
+            "ffn": {
+                "tile_m": 16,
+                "tile_k": 96,
+                "tile_n": 96,
+                "down_proj_depth": 4,
+            },
+            "add_norm2": {"tile_size": 768},
+        },
+        sort_keys=True,
+    )
+    _write_csv(results_input, [result_row])
     _write_csv(
         staging_results,
         [
@@ -285,36 +319,70 @@ def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
                 "family_id": "baseline_768",
                 "seq_len": "64",
                 "block_kind": "ffn",
-                "source_staging_depth": "1",
                 "staging_depth": "1",
                 "avg_latency_ms": "4.0",
                 "run_status": "passed",
-                "is_best_depth": "False",
-                "speedup_vs_depth1": "1.0",
             },
             {
                 "family_id": "baseline_768",
                 "seq_len": "64",
                 "block_kind": "ffn",
-                "source_staging_depth": "1",
                 "staging_depth": "2",
+                "avg_latency_ms": "3.0",
+                "run_status": "passed",
+            },
+            {
+                "family_id": "baseline_768",
+                "seq_len": "64",
+                "block_kind": "ffn",
+                "staging_depth": "4",
                 "avg_latency_ms": "2.0",
                 "run_status": "passed",
-                "is_best_depth": "True",
-                "speedup_vs_depth1": "2.0",
             },
         ],
     )
 
+    def fake_benchmark(
+        execution_mode,
+        workload,
+        *,
+        warmup_runs,
+        runs_per_sample,
+        seed,
+        power_backend,
+        operator_config,
+        **_kwargs,
+    ):
+        assert execution_mode == "dataflow"
+        assert power_backend == "none"
+        depth = int(operator_config["ffn"]["down_proj_depth"])
+        return {
+            "avg_latency_ms": float(16 // depth),
+            "compile_setup_time_ms": 1.0,
+            "effective_gflops_per_sec": 100.0 + depth,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
     rows = build_staging_rows(
-        end_to_end_results=end_to_end_results,
+        results_input=results_input,
         staging_results=staging_results,
         family_filter="all",
+        seq_len_filter="all",
+        block_filter="ffn",
+        warmup_runs=None,
+        runs_per_sample=None,
+        seed=42,
+        benchmark_fn=fake_benchmark,
     )
 
-    assert len(rows) == 1
-    assert rows[0]["speedup_vs_source_depth"] == 2.0
-    assert rows[0]["dataflow_end_to_end_latency_ms"] == 8.0
+    assert len(rows) == 3
+    assert [row["staging_depth"] for row in rows] == [1, 2, 4]
+    assert all(row["source_staging_depth"] == 4 for row in rows)
+    assert rows[0]["speedup_vs_depth1"] == 1.0
+    assert rows[-1]["speedup_vs_source_depth"] == 1.0
+    assert rows[-1]["is_best_depth"] is True
 
 
 def test_fairness_rows_report_two_modes_and_new_schedule(tmp_path):

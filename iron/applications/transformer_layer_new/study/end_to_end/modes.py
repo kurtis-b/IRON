@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import gc
-from itertools import count
 import multiprocessing
 from pathlib import Path
 import sys
@@ -105,7 +104,6 @@ REFERENCE_VALIDATION_MAX_SEQ_LEN = 512
 DEFAULT_POWER_SAMPLE_INTERVAL_SEC = 0.1
 DEFAULT_QUIESCENT_BASELINE_DURATION_SEC = 0.5
 DEFAULT_MIN_POWER_MEASUREMENT_DURATION_SEC = 1.0
-_CONTEXT_COUNTER = count()
 _LONG_SEQ_CANDIDATE_SUBPROCESS_MIN_SEQ_LEN = 8192
 
 
@@ -116,10 +114,7 @@ def _new_benchmark_context(scope: str) -> AIEContext:
         for character in scope
     )
     context.build_dir = (
-        Path.cwd()
-        / "build"
-        / "transformer_layer_new_end_to_end"
-        / f"{next(_CONTEXT_COUNTER):04d}_{sanitized_scope}"
+        Path.cwd() / "build" / "transformer_layer_new_end_to_end" / sanitized_scope
     )
     return context
 

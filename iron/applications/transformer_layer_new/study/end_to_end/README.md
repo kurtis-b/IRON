@@ -72,6 +72,14 @@ and is the reference input for the separate `igpu` study.
 The helper entrypoints default to `results_all_power.csv` when it is present and
 fall back to `results.csv` otherwise.
 
+The staging-ablation helper is a real end-to-end `dataflow` rerun:
+
+- it loads the selected `dataflow` config for each `(family, seq_len)`
+- it sweeps `mha_out_proj.o_proj_acc_depth` and `ffn.down_proj_depth`
+- it benchmarks whole-pattern latency at each staging depth with `power_backend=none`
+- when `results/memory_tile_staging/results.csv` is present, it reuses that
+  depth ladder so the end-to-end ablation mirrors the block-only study
+
 Validation policy:
 
 - main runner:

@@ -15,6 +15,7 @@ from iron.applications.transformer_layer_new.study.igpu.run_fairness_repeatabili
 )
 from iron.applications.transformer_layer_new.study.igpu.select import (
     REFERENCE_EXECUTION_MODES,
+    default_reference_results_path,
     group_reference_rows,
 )
 
@@ -84,6 +85,10 @@ def test_group_reference_rows_keeps_only_two_passing_npu_patterns():
     assert (
         tuple(row["execution_mode"] for row in group.rows) == REFERENCE_EXECUTION_MODES
     )
+
+
+def test_default_reference_results_path_prefers_powered_results():
+    assert default_reference_results_path().name == "results_all_power.csv"
 
 
 def test_resolve_sampling_uses_100_timed_iterations_for_short_sequences():
