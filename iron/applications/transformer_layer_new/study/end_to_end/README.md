@@ -67,6 +67,12 @@ Flow per `(family, seq_len, mode)`:
 - assemble the selected operator configs
 - run the final end-to-end benchmark once with the selected config set
 
+Singleton-candidate handling:
+
+- `runlist` and `offload` skip isolated tuning when only one candidate remains
+- `dataflow` still benchmarks singleton operators in isolation so the selected
+  block-latency comparison plot can continue to use measured singleton rows
+
 For `offload`, the current tuning unit remains one shared runtime GEMM config:
 
 - `shared_gemm`

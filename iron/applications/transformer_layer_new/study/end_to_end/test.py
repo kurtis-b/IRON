@@ -212,6 +212,42 @@ def test_split_candidate_files_define_low_sequence_overrides_and_fallbacks():
             ]
 
 
+def test_default_candidate_files_exclude_failed_canonical_candidates():
+    tuning_csv = (
+        Path(__file__).resolve().parents[2]
+        / "results"
+        / "end_to_end"
+        / "tuning_all_power.csv"
+    )
+    with tuning_csv.open(newline="", encoding="utf-8") as handle:
+        failed_candidates = {
+            (
+                row["study_case_id"],
+                row["seq_len"],
+                row["execution_mode"],
+                row["internal_operator"],
+                row["candidate_id"],
+            )
+            for row in csv.DictReader(handle)
+            if row["run_status"].startswith("failed")
+        }
+
+    payloads = load_default_candidate_payloads()
+    for family_id in FAMILY_IDS:
+        for seq_len in SEQUENCE_LADDER:
+            table = candidate_table_for_case(family_id, seq_len, payloads=payloads)
+            for execution_mode in EXECUTION_MODES:
+                for operator_name in MODE_OPERATORS[execution_mode]:
+                    for candidate in table[execution_mode][operator_name]:
+                        assert (
+                            family_id,
+                            str(seq_len),
+                            execution_mode,
+                            operator_name,
+                            candidate["candidate_id"],
+                        ) not in failed_candidates
+
+
 def test_derive_offload_inputs_matches_reference_shapes():
     reference = generate_golden_reference(64, 768, 3072, 12)
     inputs = derive_offload_inputs(reference, num_heads=12)
@@ -740,16 +776,17 @@ def test_tune_mode_runlist_long_seq_skips_singleton_defaults_and_smokes(monkeypa
     )
 
     assert tuning_failure == ""
-    assert benchmarked == ["qkvo_proj", "qkvo_proj", "k_transpose"]
+    assert benchmarked == ["qkvo_proj", "qkvo_proj"]
     assert selected_candidate_ids["qkvo_proj"] == "fast"
+    assert selected_candidate_ids["k_transpose"] == "transpose"
     assert selected_candidate_ids["attn_scores"] == "only"
     skipped = [
         row
         for row in tuning_rows
-        if row["internal_operator"] == "attn_scores"
+        if row["internal_operator"] in {"k_transpose", "attn_scores"}
         and row["run_status"] == "skipped_long_seq_default"
     ]
-    assert len(skipped) == 1
+    assert len(skipped) == 2
     assert smoke_calls == [("runlist", 8192, selected_config)]
 
 
@@ -806,6 +843,125 @@ def test_tune_mode_runlist_long_seq_smoke_failure_returns_tuning_failure(monkeyp
         tuning_failure
         == "tuning_failed: long-sequence runlist mode smoke failed: timeout"
     )
+
+
+def test_tune_mode_runlist_short_seq_skips_singleton_defaults(monkeypatch):
+    case = get_case("baseline_768", 64)
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.candidate_table_for_case",
+        lambda family_id, seq_len: {
+            "dataflow": {
+                operator: [{"candidate_id": "only", "config": {}}]
+                for operator in MODE_OPERATORS["dataflow"]
+            },
+            "runlist": {
+                operator: [{"candidate_id": "only", "config": {}}]
+                for operator in MODE_OPERATORS["runlist"]
+            },
+            "offload": {"shared_gemm": [{"candidate_id": "only", "config": {}}]},
+        },
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.resolve_mode_operator_config",
+        lambda execution_mode, workload, config: {
+            next(iter(config)): {"resolved": next(iter(config.values()))}
+        },
+    )
+
+    benchmarked = []
+
+    def fake_benchmark_operator_candidate(*args, **kwargs):
+        benchmarked.append("called")
+        return {
+            "avg_latency_ms": 1.0,
+            "bandwidth_gbps": 1.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.benchmark_operator_candidate",
+        fake_benchmark_operator_candidate,
+    )
+
+    tuning_rows, selected_candidate_ids, selected_config, tuning_failure = tune_mode(
+        case,
+        execution_mode="runlist",
+        warmup_runs=1,
+        runs_per_sample=1,
+        seed=42,
+    )
+
+    assert tuning_failure == ""
+    assert benchmarked == []
+    assert set(selected_candidate_ids) == set(MODE_OPERATORS["runlist"])
+    assert set(selected_config) == set(MODE_OPERATORS["runlist"])
+    assert all(row["run_status"] == "skipped_singleton_default" for row in tuning_rows)
+
+
+def test_tune_mode_dataflow_singletons_are_still_benchmarked(monkeypatch):
+    case = get_case("baseline_768", 64)
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.candidate_table_for_case",
+        lambda family_id, seq_len: {
+            "dataflow": {
+                operator: [{"candidate_id": "only", "config": {}}]
+                for operator in MODE_OPERATORS["dataflow"]
+            },
+            "runlist": {
+                operator: [{"candidate_id": "only", "config": {}}]
+                for operator in MODE_OPERATORS["runlist"]
+            },
+            "offload": {"shared_gemm": [{"candidate_id": "only", "config": {}}]},
+        },
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.resolve_mode_operator_config",
+        lambda execution_mode, workload, config: {
+            next(iter(config)): {"resolved": next(iter(config.values()))}
+        },
+    )
+
+    benchmarked = []
+
+    def fake_benchmark_operator_candidate(
+        execution_mode,
+        operator_name,
+        workload,
+        candidate_config,
+        *,
+        warmup_runs,
+        runs_per_sample,
+        seed,
+    ):
+        benchmarked.append(operator_name)
+        return {
+            "avg_latency_ms": 1.0,
+            "bandwidth_gbps": 1.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.benchmark_operator_candidate",
+        fake_benchmark_operator_candidate,
+    )
+
+    tuning_rows, _, _, tuning_failure = tune_mode(
+        case,
+        execution_mode="dataflow",
+        warmup_runs=1,
+        runs_per_sample=1,
+        seed=42,
+    )
+
+    assert tuning_failure == ""
+    assert benchmarked == list(MODE_OPERATORS["dataflow"])
+    assert all(row["run_status"] == "passed" for row in tuning_rows)
 
 
 def test_build_rows_returns_tuning_and_final_rows(monkeypatch):

@@ -176,35 +176,33 @@ def _failed_final_result(
     }
 
 
-def _skip_isolated_long_seq_runlist_benchmark(
+def _skip_isolated_singleton_benchmark(
     case: EndToEndCase,
     *,
     execution_mode: str,
     operator_name: str,
     candidates: list[dict[str, object]],
 ) -> bool:
-    return (
-        execution_mode == "runlist"
-        and case.seq_len >= 8192
-        and len(candidates) == 1
-        and operator_name not in {"qkvo_proj", "k_transpose"}
-    )
+    return execution_mode != "dataflow" and len(candidates) == 1
 
 
-def _long_seq_runlist_selected_default_row(
+def _selected_default_row(
     *,
     case: EndToEndCase,
+    execution_mode: str,
     operator_name: str,
     candidate_id: str,
     resolved_config: dict[str, object],
     warmup_runs: int,
     runs_per_sample: int,
+    run_status: str,
+    failure_message: str,
 ) -> dict[str, object]:
     return {
         "study_id": "end_to_end_tuning",
         "study_case_id": case.study_case_id,
         "study_case_label": case.study_case_label,
-        "execution_mode": "runlist",
+        "execution_mode": execution_mode,
         "internal_operator": operator_name,
         "candidate_id": candidate_id,
         "seq_len": case.seq_len,
@@ -217,10 +215,8 @@ def _long_seq_runlist_selected_default_row(
         "avg_latency_ms": "",
         "bandwidth_gbps": "",
         "validation_error_count": "",
-        "run_status": "skipped_long_seq_default",
-        "failure_message": (
-            "Selected without isolated benchmark during long-sequence runlist tuning"
-        ),
+        "run_status": run_status,
+        "failure_message": failure_message,
         "operator_config_json": json_dumps(resolved_config),
         "is_operator_best": True,
         "_resolved_config": resolved_config,
@@ -254,7 +250,7 @@ def tune_mode(
     for operator_index, operator_name in enumerate(operator_names, start=1):
         operator_rows: list[dict[str, object]] = []
         candidates = candidates_by_mode[execution_mode][operator_name]
-        if _skip_isolated_long_seq_runlist_benchmark(
+        if _skip_isolated_singleton_benchmark(
             case,
             execution_mode=execution_mode,
             operator_name=operator_name,
@@ -268,19 +264,32 @@ def tune_mode(
             )[operator_name]
             selected_candidate_ids[operator_name] = candidate["candidate_id"]
             selected_config[operator_name] = dict(resolved_config)
+            run_status = "skipped_singleton_default"
+            failure_message = (
+                "Selected without isolated benchmark because only one candidate "
+                "remained"
+            )
+            if execution_mode == "runlist" and case.seq_len >= 8192:
+                run_status = "skipped_long_seq_default"
+                failure_message = (
+                    "Selected without isolated benchmark during long-sequence "
+                    "runlist tuning because only one candidate remained"
+                )
             tuning_rows.append(
-                _long_seq_runlist_selected_default_row(
+                _selected_default_row(
                     case=case,
+                    execution_mode=execution_mode,
                     operator_name=operator_name,
                     candidate_id=candidate["candidate_id"],
                     resolved_config=resolved_config,
                     warmup_runs=warmup_runs,
                     runs_per_sample=runs_per_sample,
+                    run_status=run_status,
+                    failure_message=failure_message,
                 )
             )
             LOGGER.info(
-                "[%s] Selected singleton %s candidate %s without isolated benchmarking "
-                "for long-sequence tuning",
+                "[%s] Selected singleton %s candidate %s without isolated benchmarking",
                 execution_mode,
                 operator_name,
                 candidate["candidate_id"],

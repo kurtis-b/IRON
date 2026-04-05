@@ -499,6 +499,36 @@
           }
         }
       ]
+    },
+    "8192": {
+      "mha_out_proj": [
+        {
+          "candidate_id": "mha_0",
+          "config": {
+            "parallel_seq": 8,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 96,
+            "parallel_heads": 1,
+            "o_proj_acc_depth": 8
+          }
+        }
+      ]
+    },
+    "16384": {
+      "mha_out_proj": [
+        {
+          "candidate_id": "mha_0",
+          "config": {
+            "parallel_seq": 8,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 96,
+            "parallel_heads": 1,
+            "o_proj_acc_depth": 8
+          }
+        }
+      ]
     }
   },
   "baseline_1024": {
@@ -970,6 +1000,36 @@
           "config": {
             "num_aie_columns": 8,
             "tile_size": 1024
+          }
+        }
+      ]
+    },
+    "8192": {
+      "mha_out_proj": [
+        {
+          "candidate_id": "mha_0",
+          "config": {
+            "parallel_seq": 8,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 128,
+            "parallel_heads": 1,
+            "o_proj_acc_depth": 8
+          }
+        }
+      ]
+    },
+    "16384": {
+      "mha_out_proj": [
+        {
+          "candidate_id": "mha_0",
+          "config": {
+            "parallel_seq": 8,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 128,
+            "parallel_heads": 1,
+            "o_proj_acc_depth": 8
           }
         }
       ]
