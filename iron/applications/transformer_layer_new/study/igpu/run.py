@@ -55,7 +55,6 @@ PLOT_SERIES = (
     ("igpu", "iGPU", "#3d405b"),
     ("dataflow", "Dataflow", "#1f6f8b"),
     ("runlist", "Runlist", "#e07a5f"),
-    ("offload", "Offload", "#81b29a"),
 )
 PLOT_FAMILY_ORDER = ("baseline_768", "baseline_1024")
 PLOT_SEQ_ORDER = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
@@ -316,21 +315,13 @@ def _device_index(device: torch.device) -> int:
 
 
 def iteration_schedule(seq_len: int) -> tuple[int, int]:
-    if seq_len <= 128:
-        return (10, 48)
-    if seq_len <= 512:
-        return (8, 36)
+    if seq_len <= 256:
+        return (1, 100)
     if seq_len <= 2048:
-        return (5, 24)
+        return (1, 10)
     if seq_len <= 4096:
-        return (4, 14)
-    return (3, 8)
-
-
-def _positive_or_none(value: int | None) -> int | None:
-    if value is None or value <= 0:
-        return None
-    return int(value)
+        return (1, 5)
+    return (1, 2)
 
 
 def resolve_sampling(
@@ -340,16 +331,8 @@ def resolve_sampling(
     runs_per_sample: int | None,
 ) -> tuple[int, int]:
     scheduled_warmup_runs, scheduled_runs_per_sample = iteration_schedule(group.seq_len)
-    resolved_warmup_runs = (
-        _positive_or_none(group.warmup_runs)
-        if _positive_or_none(group.warmup_runs) is not None
-        else scheduled_warmup_runs
-    )
-    resolved_runs_per_sample = (
-        _positive_or_none(group.runs_per_sample)
-        if _positive_or_none(group.runs_per_sample) is not None
-        else scheduled_runs_per_sample
-    )
+    resolved_warmup_runs = scheduled_warmup_runs
+    resolved_runs_per_sample = scheduled_runs_per_sample
     if warmup_runs is not None:
         resolved_warmup_runs = warmup_runs
     if runs_per_sample is not None:

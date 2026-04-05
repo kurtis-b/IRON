@@ -10,12 +10,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
-ExecutionMode = Literal["dataflow", "runlist", "offload"]
+ExecutionMode = Literal["dataflow", "runlist"]
 
 EXECUTION_MODES: tuple[ExecutionMode, ...] = (
     "dataflow",
     "runlist",
-    "offload",
 )
 FAMILY_IDS: tuple[str, ...] = ("baseline_768", "baseline_1024")
 SEQUENCE_LADDER: tuple[int, ...] = (
@@ -57,7 +56,6 @@ MODE_OPERATORS: dict[ExecutionMode, tuple[str, ...]] = {
         "down_proj",
         "ln2",
     ),
-    "offload": ("shared_gemm",),
 }
 
 CandidateRecord = dict[str, Any]

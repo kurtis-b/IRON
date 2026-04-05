@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import csv
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .cases import EXECUTION_MODES, FAMILY_IDS, SEQUENCE_LADDER
+
+_MODE_ORDER = {
+    execution_mode: index for index, execution_mode in enumerate(EXECUTION_MODES)
+}
+
+
+@dataclass(frozen=True)
+class SelectedEndToEndRow:
+    study_case_id: str
+    study_case_label: str
+    execution_mode: str
+    seq_len: int
+    hidden_size: int
+    intermediate_size: int
+    num_attention_heads: int
+    attention_head_size: int
+    warmup_runs: int | None
+    runs_per_sample: int | None
+    selected_candidate_ids: dict[str, str]
+    selected_config: dict[str, dict[str, object]]
+    row: dict[str, str]
+
+
+def default_results_path() -> Path:
+    return (
+        Path(__file__).resolve().parents[2] / "results" / "end_to_end" / "results.csv"
+    )
+
+
+def load_result_rows(path: str | Path) -> list[dict[str, str]]:
+    with Path(path).open("r", newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _optional_int(value: object) -> int | None:
+    if value in (None, "", "None"):
+        return None
+    return int(float(str(value)))
+
+
+def _eligible_row(row: dict[str, str]) -> bool:
+    if row.get("backend") != "npu":
+        return False
+    if row.get("run_status") != "passed":
+        return False
+    if row.get("execution_mode") not in EXECUTION_MODES:
+        return False
+    if _optional_int(row.get("seq_len")) is None:
+        return False
+    selected_config_json = str(row.get("selected_config_json") or "").strip()
+    if not selected_config_json:
+        return False
+    return True
+
+
+def _matches_filters(
+    row: dict[str, str],
+    *,
+    family_filter: str,
+    seq_len_filter: str,
+    mode_filter: str,
+) -> bool:
+    if family_filter != "all" and row.get("study_case_id") != family_filter:
+        return False
+    if seq_len_filter != "all" and _optional_int(row.get("seq_len")) != int(
+        seq_len_filter
+    ):
+        return False
+    if mode_filter != "all" and row.get("execution_mode") != mode_filter:
+        return False
+    return True
+
+
+def _sorted_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    family_order = {family_id: index for index, family_id in enumerate(FAMILY_IDS)}
+    seq_order = {seq_len: index for index, seq_len in enumerate(SEQUENCE_LADDER)}
+    return sorted(
+        rows,
+        key=lambda row: (
+            family_order.get(str(row.get("study_case_id") or ""), len(FAMILY_IDS)),
+            _MODE_ORDER.get(str(row.get("execution_mode") or ""), len(EXECUTION_MODES)),
+            seq_order.get(_optional_int(row.get("seq_len")), len(SEQUENCE_LADDER)),
+        ),
+    )
+
+
+def _load_json_dict(value: str) -> dict[str, Any]:
+    loaded = json.loads(value)
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Expected a JSON object, received {type(loaded).__name__}")
+    return loaded
+
+
+def select_result_rows(
+    rows: list[dict[str, str]],
+    *,
+    family_filter: str = "all",
+    seq_len_filter: str = "all",
+    mode_filter: str = "all",
+) -> tuple[SelectedEndToEndRow, ...]:
+    selected: list[SelectedEndToEndRow] = []
+    for row in _sorted_rows(rows):
+        if not _eligible_row(row):
+            continue
+        if not _matches_filters(
+            row,
+            family_filter=family_filter,
+            seq_len_filter=seq_len_filter,
+            mode_filter=mode_filter,
+        ):
+            continue
+
+        selected.append(
+            SelectedEndToEndRow(
+                study_case_id=str(row.get("study_case_id") or ""),
+                study_case_label=str(row.get("study_case_label") or ""),
+                execution_mode=str(row.get("execution_mode") or ""),
+                seq_len=int(_optional_int(row.get("seq_len")) or 0),
+                hidden_size=int(_optional_int(row.get("hidden_size")) or 0),
+                intermediate_size=int(_optional_int(row.get("intermediate_size")) or 0),
+                num_attention_heads=int(
+                    _optional_int(row.get("num_attention_heads")) or 0
+                ),
+                attention_head_size=int(
+                    _optional_int(row.get("attention_head_size")) or 0
+                ),
+                warmup_runs=_optional_int(row.get("warmup_runs")),
+                runs_per_sample=_optional_int(row.get("runs_per_sample")),
+                selected_candidate_ids={
+                    str(key): str(value)
+                    for key, value in _load_json_dict(
+                        str(row.get("selected_candidate_ids_json") or "{}")
+                    ).items()
+                },
+                selected_config={
+                    str(key): dict(value)
+                    for key, value in _load_json_dict(
+                        str(row.get("selected_config_json") or "{}")
+                    ).items()
+                    if isinstance(value, dict)
+                },
+                row=dict(row),
+            )
+        )
+    return tuple(selected)
+
+
+__all__ = [
+    "SelectedEndToEndRow",
+    "default_results_path",
+    "load_result_rows",
+    "select_result_rows",
+]

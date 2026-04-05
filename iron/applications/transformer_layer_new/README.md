@@ -5,124 +5,73 @@ SPDX-License-Identifier: Apache-2.0
 
 # Transformer Layer New
 
-`transformer_layer_new` is the thesis-local study app for the Transformer Layer
-design-pattern work.
+`transformer_layer_new` is the study app for the transformer-layer execution
+granularity paper work.
 
-It starts from the existing pattern implementations in:
+It keeps two NPU pattern implementations:
 
 - `pattern/dataflow`
 - `pattern/runlist`
-- `pattern/offload`
 
-Current offload semantics:
+The current paper-facing studies are:
 
-- one shared xclbin across the offloaded GEMMs
-- `q_proj`, `k_proj`, `v_proj`, `attn_scores`, `attn_output`, `out_proj`,
-  `ffn_up`, and `ffn_down` on NPU
-- host softmax, GeLU, and residual add/layer norm
+- `study/block`
+- `study/end_to_end`
+- `study/memory_tile_staging`
+- `study/igpu`
+- `study/memcpy_bandwidth`
 
-The remaining work in this app is the study harness and study documentation.
+## Retained Surface
 
-## Current Status
+Families:
 
-- the block implementations are complete
-- the implemented study runners are `study/block`, `study/end_to_end`,
-  `study/reconfiguration_overhead`, `study/memory_tile_staging`,
-  `study/igpu`, and `study/memcpy_bandwidth`
-- study infrastructure is being added here instead of extending the older
-  `transformer_layer` app
+- `baseline_768`
+- `baseline_1024`
 
-Implementation order:
-
-1. `block`
-2. `end_to_end`
-3. `reconfiguration_overhead`
-4. `memory_tile_staging`
-5. `igpu`
-6. `memcpy_bandwidth`
-
-## Current Retained Surface
-
-Current implementation families:
-
-- `768 / 3072 / 12`
-- `1024 / 4096 / 16`
-
-Deferred family:
-
-- `2048 / 8192 / 32`
-
-Full sequence ladder:
+Sequence ladder:
 
 - `64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384`
 
-Reconfiguration-overhead subset:
-
-- `256, 2048, 16384`
-
-## Study Layout
-
-Each study gets its own directory under `study/`.
-
-Current structure:
-
-- `docs/`
-  shared study rules and the current block/end-to-end conventions
-- `pattern/`
-  existing end-to-end implementations
-- `study/block/`
-  shared block entry point, editable case table, tests, and docs
-- `study/end_to_end/`
-  workload-based end-to-end study runner, JSON tuning defaults, power helper,
-  tests, and docs
-- `study/reconfiguration_overhead/`
-  reconfiguration-overhead study runner and docs
-- `study/memory_tile_staging/`
-  memory-tile staging depth sweep runner and docs
-- `study/igpu/`
-  iGPU comparison runner and docs
-- `study/memcpy_bandwidth/`
-  memcpy bandwidth runner and docs
-- `results/`
-  canonical result locations per study
+The short-sequence end-to-end policy uses `100` timed iterations for `64`,
+`128`, and `256`.
 
 ## Study Outputs
 
-Current canonical result CSVs:
+Canonical CSV outputs:
 
 - `results/block/results.csv`
 - `results/end_to_end/results.csv`
 - `results/end_to_end/tuning.csv`
-- `results/reconfiguration_overhead/results.csv`
+- `results/end_to_end/correctness_spot_checks.csv`
+- `results/end_to_end/latency_variation.csv`
+- `results/end_to_end/staging_ablation.csv`
+- `results/end_to_end/fairness_repeatability.csv`
 - `results/memory_tile_staging/results.csv`
 - `results/igpu/results.csv`
+- `results/igpu/fairness_repeatability.csv`
 - `results/memcpy_bandwidth/results.csv`
 
-Current canonical plot outputs:
+Current paper-facing figure scripts live in:
 
-- `results/memory_tile_staging/mha_out_proj_latency_by_staging_depth.svg`
-- `results/memory_tile_staging/mha_out_proj_speedup_by_staging_depth.svg`
-- `results/memory_tile_staging/ffn_latency_by_staging_depth.svg`
-- `results/memory_tile_staging/ffn_speedup_by_staging_depth.svg`
-- `results/igpu/effective_gflops_comparison.svg`
-- `results/igpu/effective_gflops_per_watt_comparison.svg`
-- `results/memcpy_bandwidth/peak_bandwidth_by_size.svg`
-- `results/memcpy_bandwidth/latency_by_size.svg`
+- `study/end_to_end/plot_tps_by_pattern.py`
+- `study/end_to_end/run_latency_variation.py`
+- `study/end_to_end/run_staging_ablation.py`
+- `study/memory_tile_staging/plot_staging_depth.py`
+- `study/igpu/run.py`
 
-Current study entrypoints:
+## Entry Points
 
 - `python -m iron.applications.transformer_layer_new.study.block.run`
 - `python -m iron.applications.transformer_layer_new.study.end_to_end.run`
-- `python -m iron.applications.transformer_layer_new.study.reconfiguration_overhead.run`
+- `python -m iron.applications.transformer_layer_new.study.end_to_end.run_power_sweep`
+- `python -m iron.applications.transformer_layer_new.study.end_to_end.run_correctness_spot_checks`
+- `python -m iron.applications.transformer_layer_new.study.end_to_end.run_latency_variation`
+- `python -m iron.applications.transformer_layer_new.study.end_to_end.run_staging_ablation`
+- `python -m iron.applications.transformer_layer_new.study.end_to_end.run_fairness_repeatability`
 - `python -m iron.applications.transformer_layer_new.study.memory_tile_staging.run`
 - `python -m iron.applications.transformer_layer_new.study.igpu.run`
+- `python -m iron.applications.transformer_layer_new.study.igpu.run_fairness_repeatability`
 - `python -m iron.applications.transformer_layer_new.study.memcpy_bandwidth.run`
-
-The end-to-end study also uses checked-in default candidate files:
-
-- `study/end_to_end/dataflow_candidates.json`
-- `study/end_to_end/runlist_candidates.json`
-- `study/end_to_end/offload_candidates.json`
 
 ## iGPU Environment
 
@@ -135,22 +84,11 @@ For the ROCm iGPU study on Ubuntu 24.04 / Python 3.12 Ryzen APU systems:
 2. then install the iGPU ROCm overlay:
    `pip install -r iron/applications/transformer_layer_new/requirements.txt`
 
-That overlay is local to `transformer_layer_new` and avoids changing the
-repo-wide Python environment defaults for unrelated studies.
-
 ## Documentation Map
 
 - `docs/study_conventions.md`
-  shared study rules, naming, and current block/end-to-end result conventions
 - `study/block/README.md`
-  block-study contract and shared entry point
 - `study/end_to_end/README.md`
-  end-to-end study contract
-- `study/reconfiguration_overhead/README.md`
-  reconfiguration-overhead study contract
 - `study/memory_tile_staging/README.md`
-  memory-tile staging study contract
 - `study/igpu/README.md`
-  iGPU study contract
 - `study/memcpy_bandwidth/README.md`
-  memcpy bandwidth study contract

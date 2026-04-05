@@ -122,6 +122,8 @@ def default_tuning_output_path() -> Path:
 
 
 def iteration_schedule(seq_len: int) -> tuple[int, int]:
+    if seq_len <= 256:
+        return (1, 100)
     if seq_len <= 2048:
         return (1, 10)
     if seq_len <= 4096:

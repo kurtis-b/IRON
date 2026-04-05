@@ -64,12 +64,7 @@ from iron.applications.transformer_layer_new.pattern.dataflow.op import (
     AIETransformerDataflow,
     resolve_dataflow_operator_config,
 )
-from iron.applications.transformer_layer_new.pattern.offload.op import (
-    AIETransformerOffload,
-    resolve_offload_operator_config,
-)
 from iron.applications.transformer_layer_new.pattern.reference import (
-    derive_offload_inputs,
     generate_golden_reference,
 )
 from iron.applications.transformer_layer_new.pattern.runlist.op import (
@@ -161,14 +156,6 @@ def resolve_mode_operator_config(
             workload.num_attention_heads,
             operator_config=operator_config,
         )
-    if execution_mode == "offload":
-        return resolve_offload_operator_config(
-            workload.seq_len,
-            workload.hidden_size,
-            workload.intermediate_size,
-            workload.num_attention_heads,
-            operator_config=operator_config,
-        )
     raise ValueError(f"Unsupported execution mode: {execution_mode}")
 
 
@@ -194,8 +181,6 @@ def _build_operator(
         operator = AIETransformerDataflow(**common_kwargs)
     elif execution_mode == "runlist":
         operator = AIETransformerRunlist(**common_kwargs)
-    elif execution_mode == "offload":
-        operator = AIETransformerOffload(**common_kwargs)
     else:
         raise ValueError(f"Unsupported execution mode: {execution_mode}")
 
@@ -231,32 +216,6 @@ def _metadata_for_operator(
     *,
     compile_setup_time_ms: float | None,
 ) -> dict[str, object]:
-    if execution_mode == "offload":
-        inst_keys = {
-            _artifact_key(gemm_op.insts_artifact)
-            for _, gemm_op in operator.gemm_ops
-            if getattr(gemm_op, "insts_artifact", None) is not None
-        }
-        xclbin_keys = (
-            {_artifact_key(operator.shared_xclbin_artifact)}
-            if operator.shared_xclbin_artifact is not None
-            else set()
-        )
-        query_block_size = int(getattr(operator, "query_block_size", workload.seq_len))
-        block_count = (workload.seq_len + query_block_size - 1) // query_block_size
-        return {
-            "compile_setup_time_ms": compile_setup_time_ms,
-            "npu_dispatch_count": ((2 * workload.num_attention_heads) + 6)
-            * block_count,
-            "npu_unique_instruction_binary_count": len(
-                {key for key in inst_keys if key is not None}
-            ),
-            "npu_unique_xclbin_count": len(
-                {key for key in xclbin_keys if key is not None}
-            ),
-            "process_model": "in_process",
-        }
-
     if execution_mode == "runlist" and getattr(
         operator, "use_long_seq_fallback", False
     ):
@@ -1152,205 +1111,6 @@ def _benchmark_gelu(
         context.reset_runtime()
 
 
-def _benchmark_offload_shared_gemm(
-    workload: EndToEndWorkload,
-    candidate_config: dict[str, object],
-    *,
-    warmup_runs: int,
-    runs_per_sample: int,
-    seed: int,
-) -> dict[str, object]:
-    if workload.seq_len >= 8192:
-        return _benchmark_offload_long_seq_candidate(
-            workload,
-            candidate_config,
-            warmup_runs=warmup_runs,
-            runs_per_sample=runs_per_sample,
-            seed=seed,
-        )
-
-    resolved = resolve_offload_operator_config(
-        workload.seq_len,
-        workload.hidden_size,
-        workload.intermediate_size,
-        workload.num_attention_heads,
-        operator_config={"shared_gemm": candidate_config},
-    )["shared_gemm"]
-    query_block_size = AIETransformerOffload._resolve_query_block_size(workload.seq_len)
-    attn_scores_partition_n = AIETransformerOffload._resolve_attn_scores_partition_n(
-        workload.seq_len
-    )
-    block_count = (workload.seq_len + query_block_size - 1) // query_block_size
-
-    role_results = []
-    role_specs = (
-        (
-            "q_proj",
-            {
-                "M": query_block_size,
-                "K": workload.hidden_size,
-                "N": workload.hidden_size,
-            },
-            3 * block_count,
-            True,
-        ),
-        (
-            "attn_scores",
-            {
-                "M": query_block_size,
-                "K": workload.attention_head_size,
-                "N": workload.seq_len,
-                "partition_N": attn_scores_partition_n,
-            },
-            workload.num_attention_heads * block_count,
-            False,
-        ),
-        (
-            "attn_output",
-            {
-                "M": query_block_size,
-                "K": workload.seq_len,
-                "N": workload.attention_head_size,
-            },
-            workload.num_attention_heads * block_count,
-            False,
-        ),
-        (
-            "out_proj",
-            {
-                "M": query_block_size,
-                "K": workload.hidden_size,
-                "N": workload.hidden_size,
-            },
-            block_count,
-            True,
-        ),
-        (
-            "ffn_up",
-            {
-                "M": query_block_size,
-                "K": workload.hidden_size,
-                "N": workload.intermediate_size,
-            },
-            block_count,
-            True,
-        ),
-        (
-            "ffn_down",
-            {
-                "M": query_block_size,
-                "K": workload.intermediate_size,
-                "N": workload.hidden_size,
-            },
-            block_count,
-            True,
-        ),
-    )
-
-    weighted_latency_ms = 0.0
-    total_validation_error_count = 0
-    for role_name, shape_kwargs, weight, use_static_weight in role_specs:
-        role_result = _benchmark_gemm(
-            {
-                **resolved,
-                **shape_kwargs,
-            },
-            warmup_runs=warmup_runs,
-            runs_per_sample=runs_per_sample,
-            seed=seed,
-            use_static_weight=use_static_weight,
-        )
-        if role_result["run_status"] != "passed":
-            return {
-                "avg_latency_ms": "",
-                "bandwidth_gbps": "",
-                "validation_error_count": role_result["validation_error_count"],
-                "run_status": role_result["run_status"],
-                "failure_message": f"{role_name}: {role_result['failure_message']}",
-            }
-        role_results.append(role_result)
-        weighted_latency_ms += float(role_result["avg_latency_ms"]) * weight
-        total_validation_error_count += int(role_result["validation_error_count"])
-
-    avg_bandwidth = (
-        sum(float(result["bandwidth_gbps"]) for result in role_results)
-        / len(role_results)
-        if role_results
-        else ""
-    )
-    return {
-        "avg_latency_ms": weighted_latency_ms,
-        "bandwidth_gbps": avg_bandwidth,
-        "validation_error_count": total_validation_error_count,
-        "run_status": "passed",
-        "failure_message": "",
-    }
-
-
-def _benchmark_offload_long_seq_candidate(
-    workload: EndToEndWorkload,
-    candidate_config: dict[str, object],
-    *,
-    warmup_runs: int,
-    runs_per_sample: int,
-    seed: int,
-) -> dict[str, object]:
-    context = _new_benchmark_context("offload_long_seq_candidate")
-    operator = None
-    try:
-        reference = generate_golden_reference(
-            workload.seq_len,
-            workload.hidden_size,
-            workload.intermediate_size,
-            workload.num_attention_heads,
-            seed=seed,
-            include_output=False,
-            include_attention_mask=False,
-        )
-        operator = _build_operator(
-            "offload",
-            workload,
-            reference["weights"],
-            context=context,
-            operator_config={"shared_gemm": candidate_config},
-        )
-        operator.prepare_runtime()
-
-        for _ in range(warmup_runs):
-            operator.forward(reference["input"])
-
-        latencies_sec: list[float] = []
-        output = None
-        for _ in range(runs_per_sample):
-            started = time.perf_counter()
-            output = operator.forward(reference["input"])
-            latencies_sec.append(time.perf_counter() - started)
-
-        if output is None:
-            return {
-                "avg_latency_ms": "",
-                "bandwidth_gbps": "",
-                "validation_error_count": "",
-                "run_status": "failed_exception",
-                "failure_message": "No output produced by offload long-sequence benchmark",
-            }
-
-        summary = _summarize_latencies(latencies_sec)
-        validation = _validate_output(workload, output, None)
-        return {
-            "avg_latency_ms": summary["avg_latency_ms"],
-            "bandwidth_gbps": "",
-            "validation_error_count": validation["validation_error_count"],
-            "run_status": validation["run_status"],
-            "failure_message": validation["failure_message"],
-        }
-    finally:
-        if operator is not None:
-            _cleanup_operator_runtime(operator)
-        else:
-            context.reset_runtime()
-
-
 def benchmark_operator_candidate(
     execution_mode: ExecutionMode,
     operator_name: str,
@@ -1435,7 +1195,6 @@ def _benchmark_operator_candidate_in_process(
         ("runlist", "ln2"): lambda *args, **kwargs: _benchmark_layer_norm(
             *args, operator_name="ln2", **kwargs
         ),
-        ("offload", "shared_gemm"): _benchmark_offload_shared_gemm,
     }
 
     try:
@@ -1567,6 +1326,8 @@ def benchmark_mode(
     seed: int,
     power_backend: str,
     operator_config: dict[str, dict[str, object]] | None = None,
+    include_reference_output: bool | None = None,
+    capture_latencies: bool = False,
 ) -> dict[str, object]:
     result = {
         "timed_total_sec": 0.0,
@@ -1587,13 +1348,18 @@ def benchmark_mode(
         "failure_message": "",
     }
 
+    include_output = (
+        workload.seq_len <= REFERENCE_VALIDATION_MAX_SEQ_LEN
+        if include_reference_output is None
+        else bool(include_reference_output)
+    )
     reference = generate_golden_reference(
         workload.seq_len,
         workload.hidden_size,
         workload.intermediate_size,
         workload.num_attention_heads,
         seed=seed,
-        include_output=workload.seq_len <= REFERENCE_VALIDATION_MAX_SEQ_LEN,
+        include_output=include_output,
         include_attention_mask=False,
     )
     context = _new_benchmark_context(
@@ -1609,11 +1375,8 @@ def benchmark_mode(
             operator_config=operator_config,
         )
         compile_started = time.perf_counter()
-        if execution_mode == "offload":
-            operator.prepare_runtime()
-        else:
-            operator.context.compile_all()
-            operator.context.prepare_runtime()
+        operator.context.compile_all()
+        operator.context.prepare_runtime()
         compile_setup_time_ms = (time.perf_counter() - compile_started) * 1000.0
         result["compile_setup_time_ms"] = compile_setup_time_ms
         result.update(
@@ -1625,37 +1388,25 @@ def benchmark_mode(
             )
         )
 
-        if execution_mode == "offload":
-            result["host_qkv_precompute_ms"] = 0.0
-
-            def forward_once():
-                operator.prepare_runtime()
-                return operator.forward(reference["input"])
-
-        else:
-
-            def forward_once():
-                return operator.forward(reference["input"])
+        def forward_once():
+            return operator.forward(reference["input"])
 
         for _ in range(warmup_runs):
             forward_once()
 
         latencies_sec: list[float] = []
         output = None
-        if execution_mode == "offload":
-            for _ in range(runs_per_sample):
-                operator.prepare_runtime()
-                started = time.perf_counter()
-                output = operator.forward(reference["input"])
-                latencies_sec.append(time.perf_counter() - started)
-        else:
-            for _ in range(runs_per_sample):
-                started = time.perf_counter()
-                output = forward_once()
-                latencies_sec.append(time.perf_counter() - started)
+        for _ in range(runs_per_sample):
+            started = time.perf_counter()
+            output = forward_once()
+            latencies_sec.append(time.perf_counter() - started)
 
         summary = _summarize_latencies(latencies_sec)
         result.update(summary)
+        if capture_latencies:
+            result["latency_samples_ms"] = [
+                latency * 1000.0 for latency in latencies_sec
+            ]
         result["effective_gflops_per_sec"] = effective_gflops_per_sec(
             seq_len=workload.seq_len,
             hidden_size=workload.hidden_size,

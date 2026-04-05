@@ -118,44 +118,6 @@ def generate_golden_reference(
     }
 
 
-def derive_offload_inputs(
-    reference: dict[str, torch.Tensor | dict[str, torch.Tensor] | None],
-    *,
-    num_heads: int,
-) -> dict[str, torch.Tensor]:
-    input_tensor = reference["input"]
-    weights = reference["weights"]
-    if not isinstance(input_tensor, torch.Tensor):
-        raise ValueError("reference['input'] must be a tensor")
-    if not isinstance(weights, dict):
-        raise ValueError("reference['weights'] must be a tensor mapping")
-
-    hidden_size = int(input_tensor.shape[-1])
-    if hidden_size % num_heads != 0:
-        raise ValueError(
-            f"hidden_size={hidden_size} must be divisible by num_heads={num_heads}"
-        )
-    head_dim = hidden_size // num_heads
-
-    q = torch.matmul(input_tensor, weights["q_weight"])
-    k = torch.matmul(input_tensor, weights["k_weight"])
-    v = torch.matmul(input_tensor, weights["v_weight"])
-
-    return {
-        "q": q.view(input_tensor.shape[0], num_heads, head_dim)
-        .transpose(0, 1)
-        .contiguous(),
-        "k": k.view(input_tensor.shape[0], num_heads, head_dim)
-        .transpose(0, 1)
-        .contiguous(),
-        "v": v.view(input_tensor.shape[0], num_heads, head_dim)
-        .transpose(0, 1)
-        .contiguous(),
-        "residual": input_tensor.contiguous(),
-    }
-
-
 __all__ = [
-    "derive_offload_inputs",
     "generate_golden_reference",
 ]

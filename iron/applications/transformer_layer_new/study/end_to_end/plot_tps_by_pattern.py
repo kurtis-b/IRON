@@ -13,22 +13,19 @@ from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
 
 FAMILY_ORDER = ["baseline_768", "baseline_1024"]
-MODE_ORDER = ["dataflow", "runlist", "offload"]
+MODE_ORDER = ["dataflow", "runlist"]
 SEQ_ORDER = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 MODE_LABELS = {
     "dataflow": "Dataflow",
     "runlist": "Runlist",
-    "offload": "Offload",
 }
 MODE_COLORS = {
     "dataflow": "#1f6f8b",
     "runlist": "#e07a5f",
-    "offload": "#81b29a",
 }
 MODE_MARKERS = {
     "dataflow": "o",
     "runlist": "s",
-    "offload": "D",
 }
 
 
@@ -186,7 +183,7 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
         fontsize=legend_font_size,
     )
     fig.suptitle(
-        "Effective Throughput Comparison of Dataflow, Runlist, and Offload Patterns",
+        "Effective Throughput Comparison of Dataflow and Runlist Patterns",
         fontsize=suptitle_size,
         fontweight="bold",
         y=title_y,

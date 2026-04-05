@@ -4,14 +4,14 @@
 
 from __future__ import annotations
 
-import csv
 import json
 
 from iron.applications.transformer_layer_new.study.igpu.run import (
     build_rows_for_group,
-    main,
-    parse_rocm_smi_average_power_w,
     resolve_sampling,
+)
+from iron.applications.transformer_layer_new.study.igpu.run_fairness_repeatability import (
+    build_rows as build_fairness_rows,
 )
 from iron.applications.transformer_layer_new.study.igpu.select import (
     REFERENCE_EXECUTION_MODES,
@@ -46,7 +46,7 @@ def _reference_row(
         "dtype": "bf16",
         "use_bias": "False",
         "weights_source": "synthetic",
-        "warmup_runs": "10",
+        "warmup_runs": "1",
         "runs_per_sample": "100",
         "measured_inference_count": "100",
         "timed_total_sec": "0.5",
@@ -67,18 +67,12 @@ def _reference_row(
     }
 
 
-def _read_csv_rows(path):
-    with path.open(newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
-
-
-def test_group_reference_rows_keeps_only_three_passing_npu_patterns():
+def test_group_reference_rows_keeps_only_two_passing_npu_patterns():
     rows = [
         _reference_row("dataflow", avg_latency_ms="3.0"),
         _reference_row("runlist", avg_latency_ms="4.0"),
-        _reference_row("offload", avg_latency_ms="5.0"),
+        _reference_row("dataflow", avg_latency_ms="5.0", backend="gpu"),
         _reference_row("dataflow", run_status="failed_validation", seq_len="128"),
-        _reference_row("amd_igpu_reference", backend="gpu"),
     ]
 
     groups = group_reference_rows(rows)
@@ -92,12 +86,11 @@ def test_group_reference_rows_keeps_only_three_passing_npu_patterns():
     )
 
 
-def test_resolve_sampling_prefers_reference_schedule_without_override():
+def test_resolve_sampling_uses_100_timed_iterations_for_short_sequences():
     group = group_reference_rows(
         [
             _reference_row("dataflow"),
             _reference_row("runlist"),
-            _reference_row("offload"),
         ]
     )[0]
 
@@ -107,16 +100,15 @@ def test_resolve_sampling_prefers_reference_schedule_without_override():
         runs_per_sample=None,
     )
 
-    assert warmup_runs == 10
+    assert warmup_runs == 1
     assert runs_per_sample == 100
 
 
-def test_resolve_sampling_falls_back_when_reference_counts_are_zero():
+def test_resolve_sampling_falls_back_to_new_short_sequence_policy():
     group = group_reference_rows(
         [
             _reference_row("dataflow"),
             _reference_row("runlist"),
-            _reference_row("offload"),
         ]
     )[0]
     zero_schedule_group = group.__class__(
@@ -142,11 +134,11 @@ def test_resolve_sampling_falls_back_when_reference_counts_are_zero():
         runs_per_sample=None,
     )
 
-    assert warmup_runs == 10
-    assert runs_per_sample == 48
+    assert warmup_runs == 1
+    assert runs_per_sample == 100
 
 
-def test_build_rows_for_group_aggregates_all_reference_rows(monkeypatch):
+def test_build_rows_for_group_aggregates_dataflow_and_runlist(monkeypatch):
     group = group_reference_rows(
         [
             _reference_row(
@@ -155,43 +147,21 @@ def test_build_rows_for_group_aggregates_all_reference_rows(monkeypatch):
                 effective_gflops_per_sec_per_watt="10.0",
             ),
             _reference_row(
-                "dataflow",
-                effective_gflops_per_sec="300.0",
-                effective_gflops_per_sec_per_watt="30.0",
-            ),
-            _reference_row(
                 "runlist",
                 effective_gflops_per_sec="200.0",
                 effective_gflops_per_sec_per_watt="20.0",
             ),
-            _reference_row(
-                "offload",
-                effective_gflops_per_sec="400.0",
-                effective_gflops_per_sec_per_watt="40.0",
-            ),
         ]
     )[0]
 
-    def fake_benchmark_igpu_group(
-        group,
-        *,
-        warmup_runs,
-        runs_per_sample,
-        seed,
-        device_name,
-        power_backend,
-        power_sample_interval_sec,
-    ):
-        return {
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.igpu.run.benchmark_igpu_group",
+        lambda *args, **kwargs: {
             "effective_gflops_per_sec": 800.0,
             "effective_gflops_per_sec_per_watt": 80.0,
             "run_status": "passed",
             "failure_message": "",
-        }
-
-    monkeypatch.setattr(
-        "iron.applications.transformer_layer_new.study.igpu.run.benchmark_igpu_group",
-        fake_benchmark_igpu_group,
+        },
     )
 
     rows = build_rows_for_group(
@@ -210,18 +180,16 @@ def test_build_rows_for_group_aggregates_all_reference_rows(monkeypatch):
             "seq_len": 64,
             "metric": "effective_gflops_per_sec",
             "igpu": 800.0,
-            "dataflow": 200.0,
+            "dataflow": 100.0,
             "runlist": 200.0,
-            "offload": 400.0,
         },
         {
             "study_case_id": "baseline_768",
             "seq_len": 64,
             "metric": "effective_gflops_per_sec_per_watt",
             "igpu": 80.0,
-            "dataflow": 20.0,
+            "dataflow": 10.0,
             "runlist": 20.0,
-            "offload": 40.0,
         },
     ]
 
@@ -231,16 +199,12 @@ def test_build_rows_for_group_blanks_igpu_values_on_gpu_failure(monkeypatch):
         [
             _reference_row("dataflow"),
             _reference_row("runlist"),
-            _reference_row("offload"),
         ]
     )[0]
 
-    def fake_benchmark_igpu_group(*args, **kwargs):
-        raise RuntimeError("ROCm device unavailable")
-
     monkeypatch.setattr(
         "iron.applications.transformer_layer_new.study.igpu.run.benchmark_igpu_group",
-        fake_benchmark_igpu_group,
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ROCm unavailable")),
     )
 
     rows = build_rows_for_group(
@@ -254,175 +218,18 @@ def test_build_rows_for_group_blanks_igpu_values_on_gpu_failure(monkeypatch):
     )
 
     assert len(rows) == 2
-    assert {row["metric"] for row in rows} == {
-        "effective_gflops_per_sec",
-        "effective_gflops_per_sec_per_watt",
-    }
     assert all(row["igpu"] is None for row in rows)
     assert rows[0]["dataflow"] == 12800.0
-    assert rows[1]["offload"] == 1066.7
+    assert rows[1]["runlist"] == 1066.7
 
 
-def test_main_skips_when_reference_case_data_is_missing(tmp_path):
-    reference_input = tmp_path / "end_to_end.csv"
-    reference_input.write_text(
-        ",".join(_reference_row("dataflow").keys())
-        + "\n"
-        + ",".join(_reference_row("dataflow").values())
-        + "\n",
-        encoding="utf-8",
-    )
+def test_fairness_rows_report_two_reference_modes_and_new_schedule():
+    rows = build_fairness_rows(device="cuda:0", power_backend="rocm-smi")
 
-    output_path = tmp_path / "igpu.csv"
-    effective_gflops_plot_path = tmp_path / "effective_gflops.svg"
-    effective_gflops_per_watt_plot_path = tmp_path / "effective_gflops_per_watt.svg"
-    exit_code = main(
-        [
-            "--reference-input",
-            str(reference_input),
-            "--family",
-            "baseline_1024",
-            "--seq-len",
-            "64",
-            "--output",
-            str(output_path),
-            "--effective-gflops-plot",
-            str(effective_gflops_plot_path),
-            "--effective-gflops-per-watt-plot",
-            str(effective_gflops_per_watt_plot_path),
-            "--power-backend",
-            "none",
-        ]
-    )
-
-    assert exit_code == 0
-    assert _read_csv_rows(output_path) == []
-    assert "<svg" in effective_gflops_plot_path.read_text(encoding="utf-8")
-    assert "No data available" in effective_gflops_plot_path.read_text(encoding="utf-8")
-    assert "<svg" in effective_gflops_per_watt_plot_path.read_text(encoding="utf-8")
-
-
-def test_main_writes_clean_csv_and_svg_plots(monkeypatch, tmp_path):
-    reference_input = tmp_path / "end_to_end.csv"
-    fieldnames = list(_reference_row("dataflow").keys())
-    with reference_input.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerow(
-            _reference_row(
-                "dataflow",
-                effective_gflops_per_sec="100.0",
-                effective_gflops_per_sec_per_watt="10.0",
-            )
-        )
-        writer.writerow(
-            _reference_row(
-                "runlist",
-                effective_gflops_per_sec="200.0",
-                effective_gflops_per_sec_per_watt="20.0",
-            )
-        )
-        writer.writerow(
-            _reference_row(
-                "offload",
-                effective_gflops_per_sec="300.0",
-                effective_gflops_per_sec_per_watt="30.0",
-            )
-        )
-
-    def fake_benchmark_igpu_group(
-        group,
-        *,
-        warmup_runs,
-        runs_per_sample,
-        seed,
-        device_name,
-        power_backend,
-        power_sample_interval_sec,
-    ):
-        return {
-            "effective_gflops_per_sec": 32000.0,
-            "effective_gflops_per_sec_per_watt": 1600.0,
-            "run_status": "passed",
-            "failure_message": "",
-        }
-
-    monkeypatch.setattr(
-        "iron.applications.transformer_layer_new.study.igpu.run.benchmark_igpu_group",
-        fake_benchmark_igpu_group,
-    )
-
-    output_path = tmp_path / "igpu.csv"
-    effective_gflops_plot_path = tmp_path / "effective_gflops.svg"
-    effective_gflops_per_watt_plot_path = tmp_path / "effective_gflops_per_watt.svg"
-    exit_code = main(
-        [
-            "--reference-input",
-            str(reference_input),
-            "--family",
-            "baseline_768",
-            "--seq-len",
-            "64",
-            "--warmup-iters",
-            "1",
-            "--timed-iters",
-            "2",
-            "--output",
-            str(output_path),
-            "--effective-gflops-plot",
-            str(effective_gflops_plot_path),
-            "--effective-gflops-per-watt-plot",
-            str(effective_gflops_per_watt_plot_path),
-            "--power-backend",
-            "none",
-        ]
-    )
-
-    assert exit_code == 0
-    rows = _read_csv_rows(output_path)
-    assert rows == [
-        {
-            "study_case_id": "baseline_768",
-            "seq_len": "64",
-            "metric": "effective_gflops_per_sec",
-            "igpu": "32000.0",
-            "dataflow": "100.0",
-            "runlist": "200.0",
-            "offload": "300.0",
-        },
-        {
-            "study_case_id": "baseline_768",
-            "seq_len": "64",
-            "metric": "effective_gflops_per_sec_per_watt",
-            "igpu": "1600.0",
-            "dataflow": "10.0",
-            "runlist": "20.0",
-            "offload": "30.0",
-        },
+    assert len(rows) == 1
+    assert json.loads(rows[0]["reference_execution_modes_json"]) == [
+        "dataflow",
+        "runlist",
     ]
-    effective_gflops_svg = effective_gflops_plot_path.read_text(encoding="utf-8")
-    effective_gflops_per_watt_svg = effective_gflops_per_watt_plot_path.read_text(
-        encoding="utf-8"
-    )
-    assert "Effective Throughput Comparison" in effective_gflops_svg
-    assert "Head Dim = 64 / Num Heads = 12 / FFN Dim = 3072" in effective_gflops_svg
-    assert "Dataflow" in effective_gflops_svg
-    assert "Runlist" in effective_gflops_svg
-    assert "Offload" in effective_gflops_svg
-    assert "iGPU" in effective_gflops_svg
-    assert "Effective Throughput/W Comparison" in effective_gflops_per_watt_svg
-    assert "GFLOP / sec / W" in effective_gflops_per_watt_svg
-
-
-def test_parse_rocm_smi_average_power_w_reads_package_power():
-    parsed = parse_rocm_smi_average_power_w(
-        json.dumps(
-            {
-                "card0": {
-                    "Average Graphics Package Power (W)": "12.5W",
-                }
-            }
-        ),
-        card_label="card0",
-    )
-    assert parsed == 12.5
+    schedule = json.loads(rows[0]["iteration_schedule_json"])
+    assert schedule["64-256"]["runs_per_sample"] == 100

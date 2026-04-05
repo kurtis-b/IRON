@@ -8,7 +8,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
-REFERENCE_EXECUTION_MODES: tuple[str, ...] = ("dataflow", "runlist", "offload")
+REFERENCE_EXECUTION_MODES: tuple[str, ...] = ("dataflow", "runlist")
 _REFERENCE_MODE_ORDER = {
     execution_mode: index
     for index, execution_mode in enumerate(REFERENCE_EXECUTION_MODES)
@@ -35,10 +35,7 @@ class ReferenceGroup:
 
 def default_reference_results_path() -> Path:
     return (
-        Path(__file__).resolve().parents[2]
-        / "results"
-        / "end_to_end"
-        / "results_all_power.csv"
+        Path(__file__).resolve().parents[2] / "results" / "end_to_end" / "results.csv"
     )
 
 
