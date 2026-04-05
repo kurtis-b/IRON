@@ -6,10 +6,16 @@ import sys
 import pytest
 from pathlib import Path
 import logging
+from aie.helpers.taplib import TensorAccessPattern
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from iron.operators.gemm.op import AIEGEMM
+from iron.operators.gemm.design_batched import (
+    DMA_BD_MAX_STRIDE,
+    _expand_dma_tap_for_stride_limit,
+    my_matmul as batched_gemm_design,
+)
 from iron.operators.gemm.reference import generate_golden_reference
 from iron.common.test_utils import run_test
 
@@ -230,3 +236,68 @@ def test_gemm(
         assert (
             len(errors["C"]) <= max_acceptable_errors
         ), f"Test failed with {len(errors['C'])} errors (max allowable: {max_acceptable_errors})"
+
+
+def test_expand_dma_tap_for_stride_limit_collapses_unit_dims_without_splitting():
+    tap = TensorAccessPattern(
+        (64, 196608),
+        offset=0,
+        sizes=[32, 1, 64, 64],
+        strides=[512, 12582912, 196608, 1],
+    )
+
+    planned_taps, was_split = _expand_dma_tap_for_stride_limit(tap)
+
+    assert was_split is False
+    assert len(planned_taps) == 1
+    assert list(planned_taps[0].sizes) == [32, 64, 64]
+    assert list(planned_taps[0].strides) == [512, 196608, 1]
+    assert max(planned_taps[0].strides) <= DMA_BD_MAX_STRIDE
+
+
+def test_expand_dma_tap_for_stride_limit_splits_even_oversized_dims():
+    tap = TensorAccessPattern(
+        (49152, 16384),
+        offset=0,
+        sizes=[2, 32, 256, 64],
+        strides=[4194304, 512, 16384, 1],
+    )
+
+    planned_taps, was_split = _expand_dma_tap_for_stride_limit(tap)
+
+    assert was_split is True
+    assert len(planned_taps) == 2
+    assert [planned_taps[0].offset, planned_taps[1].offset] == [0, 4194304]
+    for planned_tap in planned_taps:
+        assert max(planned_tap.strides) <= DMA_BD_MAX_STRIDE
+
+
+def test_batched_gemm_design_avoids_oversized_dma_strides_for_large_attn_scores():
+    module = batched_gemm_design(
+        dev="npu2",
+        M=4096,
+        K=64,
+        N=16384,
+        m=64,
+        k=64,
+        n=64,
+        n_aie_cols=8,
+        dtype_in_str="bf16",
+        dtype_out_str="bf16",
+        b_col_maj=0,
+        c_col_maj=0,
+        use_scalar=False,
+        emulate_bf16_mmul_with_bfp16=True,
+        prio_accuracy=False,
+        trace_size=0,
+        archive=None,
+        generate_taps=False,
+        batch_A=(12, 1),
+        batch_B=(12, 1),
+        batch_C=(12, 0),
+        input_a_buffer_shape=(16384, 768),
+    )
+
+    module_text = str(module)
+    assert "stride = 12582912" not in module_text
+    assert "stride = 4194304" not in module_text

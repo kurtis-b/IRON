@@ -161,6 +161,8 @@ def _use_blocked_attention(seq_len: int) -> bool:
 
 
 def _resolve_query_block_size(seq_len: int) -> int:
+    if seq_len == 16384:
+        return 4096
     return 256 if _use_blocked_attention(seq_len) else seq_len
 
 

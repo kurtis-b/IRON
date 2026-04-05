@@ -37,6 +37,9 @@ microkernel_mac_dim_map = {
 }
 
 
+DMA_BD_MAX_STRIDE = 1_048_576
+
+
 # Parse batch configuration tuples
 def parse_batch_tuple(batch_str):
     """Parse a batch configuration string like '(1,0,0)' into a tuple of ints."""
@@ -94,6 +97,122 @@ def resolve_buffer_shape(default_shape, override_shape):
     if len(override_shape) != 2:
         raise ValueError(f"Expected 2D buffer shape override, got {override_shape!r}")
     return tuple(int(dim) for dim in override_shape)
+
+
+def _normalize_dma_tap(
+    tap: TensorAccessPattern, *, max_stride: int
+) -> TensorAccessPattern:
+    """Drop only size-1 dimensions whose stride would otherwise violate the HW limit."""
+    keep_dims = [
+        i
+        for i, (size, stride) in enumerate(zip(tap.sizes, tap.strides))
+        if size != 1 or stride <= max_stride
+    ]
+    if not keep_dims:
+        keep_dims = [len(tap.sizes) - 1]
+    if len(keep_dims) == len(tap.sizes):
+        return tap
+    return TensorAccessPattern(
+        tap.tensor_dims,
+        offset=int(tap.offset),
+        sizes=[tap.sizes[i] for i in keep_dims],
+        strides=[tap.strides[i] for i in keep_dims],
+    )
+
+
+def _expand_dma_tap_for_stride_limit(
+    tap: TensorAccessPattern,
+    *,
+    max_stride: int = DMA_BD_MAX_STRIDE,
+) -> tuple[list[TensorAccessPattern], bool]:
+    """Rewrite a transfer into safe sub-transfers when a BD stride exceeds the HW limit."""
+    pending = [_normalize_dma_tap(tap, max_stride=max_stride)]
+    split_any = False
+
+    while True:
+        rewritten: list[TensorAccessPattern] = []
+        changed = False
+        for current in pending:
+            oversized_dim = next(
+                (i for i, stride in enumerate(current.strides) if stride > max_stride),
+                None,
+            )
+            if oversized_dim is None:
+                rewritten.append(current)
+                continue
+
+            split_size = current.sizes[oversized_dim]
+            if split_size == 1:
+                raise ValueError(
+                    "Cannot legalize DMA tap with oversized stride on a size-1 "
+                    f"dimension: sizes={current.sizes}, strides={current.strides}"
+                )
+            if split_size % 2 != 0:
+                raise ValueError(
+                    "Cannot evenly split DMA tap to satisfy stride limit "
+                    f"{max_stride}: sizes={current.sizes}, strides={current.strides}"
+                )
+
+            changed = True
+            split_any = True
+            half = split_size // 2
+            for part in range(2):
+                split_sizes = list(current.sizes)
+                split_sizes[oversized_dim] = half
+                split_offset = (
+                    int(current.offset) + part * half * current.strides[oversized_dim]
+                )
+                rewritten.append(
+                    _normalize_dma_tap(
+                        TensorAccessPattern(
+                            current.tensor_dims,
+                            offset=split_offset,
+                            sizes=split_sizes,
+                            strides=current.strides,
+                        ),
+                        max_stride=max_stride,
+                    )
+                )
+
+        pending = rewritten
+        if not changed:
+            return pending, split_any
+
+
+def _emit_dma_transfer(
+    rt: Runtime,
+    *,
+    fifo_handle,
+    runtime_buffer,
+    tap: TensorAccessPattern,
+    task_group,
+    placement: Tile,
+    recorded_taps: list[TensorAccessPattern],
+    is_fill: bool,
+    wait: bool = False,
+) -> None:
+    planned_taps, was_split = _expand_dma_tap_for_stride_limit(tap)
+    task_wait = wait or was_split
+    for planned_tap in planned_taps:
+        if is_fill:
+            rt.fill(
+                fifo_handle,
+                runtime_buffer,
+                tap=planned_tap,
+                task_group=task_group,
+                wait=task_wait,
+                placement=placement,
+            )
+        else:
+            rt.drain(
+                fifo_handle,
+                runtime_buffer,
+                tap=planned_tap,
+                task_group=task_group,
+                wait=task_wait,
+                placement=placement,
+            )
+        recorded_taps.append(planned_tap)
 
 
 def main():
@@ -707,16 +826,16 @@ def my_matmul(
                             strides=C_strides,
                         )
 
-                        # This line does not change MLIR output at all - it's just for recording data movement
-                        C_taps.append(C_tile)
-
-                        rt.drain(
-                            C_l2l3_fifos[col].cons(),
-                            C,
+                        _emit_dma_transfer(
+                            rt,
+                            fifo_handle=C_l2l3_fifos[col].cons(),
+                            runtime_buffer=C,
                             tap=C_tile,
-                            wait=True,
                             task_group=tg,
                             placement=Tile(col, 0),
+                            recorded_taps=C_taps,
+                            is_fill=False,
+                            wait=True,
                         )
                         for tile_row in range(current_tb_n_rows):
                             # A input transfer:
@@ -770,17 +889,18 @@ def my_matmul(
                                     sizes=A_sizes,
                                     strides=A_strides,
                                 )
-                                rt.fill(
-                                    A_l3l2_fifos[col].prod(),
-                                    A,
+                                _emit_dma_transfer(
+                                    rt,
+                                    fifo_handle=A_l3l2_fifos[col].prod(),
+                                    runtime_buffer=A,
                                     tap=A_tile,
                                     task_group=tg,
                                     placement=Tile(
                                         2 * col if n_aie_cols == 8 else col, 0
                                     ),  # alternate columns in full 4x8 NPU2 case
+                                    recorded_taps=A_taps,
+                                    is_fill=True,
                                 )
-                                # This line does not change MLIR output at all - it's just for recording data movement
-                                A_taps.append(A_tile)
                             # Use the calculated sizes/strides/offsets to record the data movement
                             # caused by the above call to npu_dma_memcpy_nd.
                             # This line does not change MLIR output at all.
@@ -837,16 +957,16 @@ def my_matmul(
                                 sizes=B_sizes,
                                 strides=B_strides,
                             )
-                            rt.fill(
-                                B_l3l2_fifos[col].prod(),
-                                B,
+                            _emit_dma_transfer(
+                                rt,
+                                fifo_handle=B_l3l2_fifos[col].prod(),
+                                runtime_buffer=B,
                                 tap=B_tile,
                                 task_group=tg,
                                 placement=Tile(col, 0),
+                                recorded_taps=B_taps,
+                                is_fill=True,
                             )
-
-                            # This line does not change MLIR output at all - it's just for recording data movement
-                            B_taps.append(B_tile)
                     if tb > 0 or (tb == 0 and pingpong > 0):
                         rt.finish_task_group(tg)
                         tg = rt.task_group()
