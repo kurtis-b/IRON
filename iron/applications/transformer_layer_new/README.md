@@ -27,8 +27,8 @@ The remaining work in this app is the study harness and study documentation.
 
 - the block implementations are complete
 - the implemented study runners are `study/block`, `study/end_to_end`,
-  `study/reconfiguration_overhead`, `study/igpu`, and
-  `study/memcpy_bandwidth`
+  `study/reconfiguration_overhead`, `study/memory_tile_staging`,
+  `study/igpu`, and `study/memcpy_bandwidth`
 - study infrastructure is being added here instead of extending the older
   `transformer_layer` app
 
@@ -37,8 +37,9 @@ Implementation order:
 1. `block`
 2. `end_to_end`
 3. `reconfiguration_overhead`
-4. `igpu`
-5. `memcpy_bandwidth`
+4. `memory_tile_staging`
+5. `igpu`
+6. `memcpy_bandwidth`
 
 ## Current Retained Surface
 
@@ -76,6 +77,8 @@ Current structure:
   tests, and docs
 - `study/reconfiguration_overhead/`
   reconfiguration-overhead study runner and docs
+- `study/memory_tile_staging/`
+  memory-tile staging depth sweep runner and docs
 - `study/igpu/`
   iGPU comparison runner and docs
 - `study/memcpy_bandwidth/`
@@ -91,11 +94,16 @@ Current canonical result CSVs:
 - `results/end_to_end/results.csv`
 - `results/end_to_end/tuning.csv`
 - `results/reconfiguration_overhead/results.csv`
+- `results/memory_tile_staging/results.csv`
 - `results/igpu/results.csv`
 - `results/memcpy_bandwidth/results.csv`
 
 Current canonical plot outputs:
 
+- `results/memory_tile_staging/mha_out_proj_latency_by_staging_depth.svg`
+- `results/memory_tile_staging/mha_out_proj_speedup_by_staging_depth.svg`
+- `results/memory_tile_staging/ffn_latency_by_staging_depth.svg`
+- `results/memory_tile_staging/ffn_speedup_by_staging_depth.svg`
 - `results/igpu/effective_gflops_comparison.svg`
 - `results/igpu/effective_gflops_per_watt_comparison.svg`
 - `results/memcpy_bandwidth/peak_bandwidth_by_size.svg`
@@ -106,6 +114,7 @@ Current study entrypoints:
 - `python -m iron.applications.transformer_layer_new.study.block.run`
 - `python -m iron.applications.transformer_layer_new.study.end_to_end.run`
 - `python -m iron.applications.transformer_layer_new.study.reconfiguration_overhead.run`
+- `python -m iron.applications.transformer_layer_new.study.memory_tile_staging.run`
 - `python -m iron.applications.transformer_layer_new.study.igpu.run`
 - `python -m iron.applications.transformer_layer_new.study.memcpy_bandwidth.run`
 
@@ -139,6 +148,8 @@ repo-wide Python environment defaults for unrelated studies.
   end-to-end study contract
 - `study/reconfiguration_overhead/README.md`
   reconfiguration-overhead study contract
+- `study/memory_tile_staging/README.md`
+  memory-tile staging study contract
 - `study/igpu/README.md`
   iGPU study contract
 - `study/memcpy_bandwidth/README.md`

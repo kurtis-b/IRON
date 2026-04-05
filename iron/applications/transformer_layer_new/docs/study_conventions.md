@@ -13,6 +13,7 @@ The implemented scope now includes:
 - `block`
 - `end_to_end`
 - `reconfiguration_overhead`
+- `memory_tile_staging`
 - `igpu`
 - `memcpy_bandwidth`
 
@@ -74,6 +75,7 @@ Stable study IDs:
 - `block`
 - `end_to_end`
 - `reconfiguration_overhead`
+- `memory_tile_staging`
 - `igpu`
 - `memcpy_bandwidth`
 
@@ -161,11 +163,16 @@ Current canonical CSVs:
 - `results/end_to_end/tuning.csv`
 - `results/end_to_end/results.csv`
 - `results/reconfiguration_overhead/results.csv`
+- `results/memory_tile_staging/results.csv`
 - `results/igpu/results.csv`
 - `results/memcpy_bandwidth/results.csv`
 
-Current canonical iGPU plots:
+Current canonical study plots:
 
+- `results/memory_tile_staging/mha_out_proj_latency_by_staging_depth.svg`
+- `results/memory_tile_staging/mha_out_proj_speedup_by_staging_depth.svg`
+- `results/memory_tile_staging/ffn_latency_by_staging_depth.svg`
+- `results/memory_tile_staging/ffn_speedup_by_staging_depth.svg`
 - `results/igpu/effective_gflops_comparison.svg`
 - `results/igpu/effective_gflops_per_watt_comparison.svg`
 - `results/memcpy_bandwidth/peak_bandwidth_by_size.svg`
@@ -226,6 +233,27 @@ It also preserves the reconfiguration metadata:
 - `npu_dispatch_count`
 - `npu_unique_instruction_binary_count`
 - `npu_unique_xclbin_count`
+
+The memory-tile staging CSV keeps one row per
+`(family_id, seq_len, block_kind, staging_depth)` point.
+It reads the selected passing best rows for `mha_out_proj` and `ffn` from
+`results/block/results.csv`, freezes every non-depth config field, and sweeps
+all supported divisible staging depths for:
+
+- `mha_out_proj_o_proj_acc_depth`
+- `ffn_down_proj_depth`
+
+Its required metrics are:
+
+- `avg_latency_ms`
+- `bandwidth_gbps`
+- `speedup_vs_depth1`
+
+It also preserves the source-selection metadata and staged best-row marker:
+
+- `source_candidate_index`
+- `source_staging_depth`
+- `is_best_depth`
 
 The memcpy-bandwidth CSV keeps one row per memcpy benchmark case and is not
 family-based.
