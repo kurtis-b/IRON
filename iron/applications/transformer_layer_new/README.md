@@ -18,6 +18,7 @@ The current paper-facing studies are:
 - `study/block`
 - `study/end_to_end`
 - `study/memory_tile_staging`
+- `study/resource_usage`
 - `study/igpu`
 - `study/memcpy_bandwidth`
 
@@ -47,6 +48,8 @@ Canonical CSV outputs:
 - `results/end_to_end/staging_ablation.csv`
 - `results/end_to_end/fairness_repeatability.csv`
 - `results/memory_tile_staging/results.csv`
+- `results/resource_usage/dataflow_block_best_configs.csv`
+- `results/resource_usage/runlist_selected_ops.csv`
 - `results/igpu/results.csv`
 - `results/igpu/fairness_repeatability.csv`
 - `results/memcpy_bandwidth/results.csv`
@@ -65,6 +68,7 @@ Current paper-facing figure scripts live in:
 - `study/end_to_end/run_latency_variation.py`
 - `study/end_to_end/run_staging_ablation.py`
 - `study/memory_tile_staging/plot_staging_depth.py`
+- `study/resource_usage/run.py`
 - `study/igpu/run.py`
 
 ## Entry Points
@@ -77,6 +81,7 @@ Current paper-facing figure scripts live in:
 - `python -m iron.applications.transformer_layer_new.study.end_to_end.run_staging_ablation`
 - `python -m iron.applications.transformer_layer_new.study.end_to_end.run_fairness_repeatability`
 - `python -m iron.applications.transformer_layer_new.study.memory_tile_staging.run`
+- `python -m iron.applications.transformer_layer_new.study.resource_usage.run`
 - `python -m iron.applications.transformer_layer_new.study.igpu.run`
 - `python -m iron.applications.transformer_layer_new.study.igpu.run_fairness_repeatability`
 - `python -m iron.applications.transformer_layer_new.study.memcpy_bandwidth.run`
@@ -98,5 +103,6 @@ For the ROCm iGPU study on Ubuntu 24.04 / Python 3.12 Ryzen APU systems:
 - `study/block/README.md`
 - `study/end_to_end/README.md`
 - `study/memory_tile_staging/README.md`
+- `study/resource_usage/README.md`
 - `study/igpu/README.md`
 - `study/memcpy_bandwidth/README.md`

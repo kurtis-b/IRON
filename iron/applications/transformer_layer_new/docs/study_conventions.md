@@ -13,6 +13,7 @@ This note defines the current shared rules for the implemented
 - `block`
 - `end_to_end`
 - `memory_tile_staging`
+- `resource_usage`
 - `igpu`
 - `memcpy_bandwidth`
 
@@ -77,6 +78,8 @@ Canonical CSV outputs:
 - `results/end_to_end/staging_ablation.csv`
 - `results/end_to_end/fairness_repeatability.csv`
 - `results/memory_tile_staging/results.csv`
+- `results/resource_usage/dataflow_block_best_configs.csv`
+- `results/resource_usage/runlist_selected_ops.csv`
 - `results/igpu/results.csv`
 - `results/igpu/fairness_repeatability.csv`
 - `results/memcpy_bandwidth/results.csv`
@@ -98,6 +101,10 @@ Its comparison columns are:
 
 The memory-tile staging CSV keeps one row per
 `(family_id, seq_len, block_kind, staging_depth)`.
+
+The resource-usage exports are compile-artifact summaries. They reuse the
+existing `build/transformer_layer_new_end_to_end` tree, do not recompile, and
+record missing-artifact notes when the expected physical MLIR is absent.
 
 The end-to-end staging-ablation CSV keeps one row per
 `(study_case_id, seq_len, block_kind, staging_depth)` for real `dataflow`
