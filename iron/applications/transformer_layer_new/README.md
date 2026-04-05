@@ -40,8 +40,8 @@ The short-sequence end-to-end policy uses `100` timed iterations for `64`,
 Canonical CSV outputs:
 
 - `results/block/results.csv`
-- `results/end_to_end/results.csv`
-- `results/end_to_end/tuning.csv`
+- `results/end_to_end/results_all_power.csv`
+- `results/end_to_end/tuning_all_power.csv`
 - `results/end_to_end/correctness_spot_checks.csv`
 - `results/end_to_end/latency_variation.csv`
 - `results/end_to_end/staging_ablation.csv`
@@ -50,6 +50,9 @@ Canonical CSV outputs:
 - `results/igpu/results.csv`
 - `results/igpu/fairness_repeatability.csv`
 - `results/memcpy_bandwidth/results.csv`
+
+The end-to-end helper studies default to `results_all_power.csv` when it is
+present and fall back to `results.csv` otherwise.
 
 Current paper-facing figure scripts live in:
 

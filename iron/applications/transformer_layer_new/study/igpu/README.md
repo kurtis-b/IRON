@@ -22,7 +22,6 @@ Compared columns:
 
 This study depends on completed end-to-end NPU outputs:
 
-- `results/end_to_end/results.csv`
 - `results/end_to_end/results_all_power.csv`
 
 It does not re-run NPU patterns. It benchmarks the iGPU once per available

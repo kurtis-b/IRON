@@ -35,9 +35,15 @@ class SelectedEndToEndRow:
 
 
 def default_results_path() -> Path:
-    return (
-        Path(__file__).resolve().parents[2] / "results" / "end_to_end" / "results.csv"
+    results_dir = Path(__file__).resolve().parents[2] / "results" / "end_to_end"
+    preferred_paths = (
+        results_dir / "results_all_power.csv",
+        results_dir / "results.csv",
     )
+    for path in preferred_paths:
+        if path.exists():
+            return path
+    return preferred_paths[0]
 
 
 def load_result_rows(path: str | Path) -> list[dict[str, str]]:

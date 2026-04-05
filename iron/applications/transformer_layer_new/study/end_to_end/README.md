@@ -59,8 +59,8 @@ Singleton-candidate handling:
 
 Canonical outputs:
 
-- `results/end_to_end/tuning.csv`
-- `results/end_to_end/results.csv`
+- `results/end_to_end/tuning_all_power.csv`
+- `results/end_to_end/results_all_power.csv`
 - `results/end_to_end/correctness_spot_checks.csv`
 - `results/end_to_end/latency_variation.csv`
 - `results/end_to_end/staging_ablation.csv`
@@ -68,6 +68,9 @@ Canonical outputs:
 
 The main result CSV keeps one row per `(study_case_id, seq_len, execution_mode)`
 and is the reference input for the separate `igpu` study.
+
+The helper entrypoints default to `results_all_power.csv` when it is present and
+fall back to `results.csv` otherwise.
 
 Validation policy:
 

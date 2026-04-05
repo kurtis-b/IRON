@@ -70,8 +70,8 @@ The short-sequence iteration policy is:
 Canonical CSV outputs:
 
 - `results/block/results.csv`
-- `results/end_to_end/results.csv`
-- `results/end_to_end/tuning.csv`
+- `results/end_to_end/results_all_power.csv`
+- `results/end_to_end/tuning_all_power.csv`
 - `results/end_to_end/correctness_spot_checks.csv`
 - `results/end_to_end/latency_variation.csv`
 - `results/end_to_end/staging_ablation.csv`

@@ -128,8 +128,8 @@ def build_rows(results_input: Path) -> list[dict[str, object]]:
                     "timed-iteration schedule unless explicitly overridden."
                 ),
                 "selected_candidate_source": (
-                    "results/end_to_end/results.csv selected_candidate_ids_json and "
-                    "selected_config_json"
+                    "selected end-to-end results input CSV "
+                    "selected_candidate_ids_json and selected_config_json"
                 ),
             }
         )
