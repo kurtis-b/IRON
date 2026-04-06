@@ -35,19 +35,22 @@ def _reference_row(
     run_status: str = "passed",
     is_best: str = "True",
 ) -> dict[str, str]:
+    family_info = {
+        "tinybert_512": ("512 / 2048 / 8", "8", "512", "2048"),
+        "baseline_768": ("768 / 3072 / 12", "12", "768", "3072"),
+        "baseline_1024": ("1024 / 4096 / 16", "16", "1024", "4096"),
+    }[family_id]
     row = {
         "study_id": "block",
         "family_id": family_id,
-        "family_label": (
-            "768 / 3072 / 12" if family_id == "baseline_768" else "1024 / 4096 / 16"
-        ),
+        "family_label": family_info[0],
         "seq_len": seq_len,
         "block_kind": block_kind,
         "candidate_index": candidate_index,
         "head_dim": "64",
-        "num_heads": "12" if family_id == "baseline_768" else "16",
-        "hidden_size": "768" if family_id == "baseline_768" else "1024",
-        "ffn_dim": "3072" if family_id == "baseline_768" else "4096",
+        "num_heads": family_info[1],
+        "hidden_size": family_info[2],
+        "ffn_dim": family_info[3],
         "avg_latency_ms": avg_latency_ms,
         "bandwidth_gbps": "10.0",
         "warmup_iters": "1",
@@ -67,7 +70,11 @@ def _reference_row(
                 "mha_out_proj_parallel_seq": "8",
                 "mha_out_proj_q_seq_tile": "32",
                 "mha_out_proj_kv_seq_tile": "64",
-                "mha_out_proj_emb_tile": "96" if family_id == "baseline_768" else "128",
+                "mha_out_proj_emb_tile": (
+                    "64"
+                    if family_id == "tinybert_512"
+                    else ("96" if family_id == "baseline_768" else "128")
+                ),
                 "mha_out_proj_parallel_heads": "1",
                 "mha_out_proj_o_proj_acc_depth": "8",
             }
@@ -79,9 +86,13 @@ def _reference_row(
                 "ffn_b_col_maj": "False",
                 "ffn_c_col_maj": "False",
                 "ffn_tile_m": "64",
-                "ffn_tile_k": "64" if family_id == "baseline_768" else "128",
+                "ffn_tile_k": "64" if family_id != "baseline_1024" else "128",
                 "ffn_tile_n": "64",
-                "ffn_down_proj_depth": "6" if family_id == "baseline_768" else "8",
+                "ffn_down_proj_depth": (
+                    "8"
+                    if family_id == "tinybert_512"
+                    else ("6" if family_id == "baseline_768" else "8")
+                ),
                 "ffn_n_a_tiles_distributed": "8",
                 "ffn_n_b_tiles_distributed": "2",
                 "ffn_stage_only": "",
@@ -482,10 +493,7 @@ def test_render_plot_filters_sequence_lengths_to_256_through_8192(tmp_path):
     labels = [text.get_text() for text in legend.get_texts()]
     assert labels == ["256", "8192"]
     panel_titles = [ax.get_title(loc="left") for ax in fig.axes]
-    assert panel_titles == [
-        "Head Dim = 64 / Num Heads = 12",
-        "Head Dim = 64 / Num Heads = 16",
-    ]
+    assert panel_titles == ["Head Dim = 64 / Num Heads = 12"]
     plt.close(fig)
 
 

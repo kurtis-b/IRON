@@ -15,7 +15,7 @@ AddNormCandidate = tuple[int, int]
 FFNCandidate = tuple[int, bool, bool, int, int, int, int, int, int, int | None, int]
 
 BLOCK_KINDS: tuple[BlockKind, ...] = ("qkv_proj", "mha_out_proj", "addnorm", "ffn")
-FAMILY_IDS: tuple[str, ...] = ("baseline_768", "baseline_1024")
+FAMILY_IDS: tuple[str, ...] = ("tinybert_512", "baseline_768", "baseline_1024")
 SEQUENCE_LADDER: tuple[int, ...] = (
     64,
     128,
@@ -104,6 +104,57 @@ def make_case(
     )
 
 
+def _tinybert_512_case(seq_len: int) -> BlockCase:
+    qkv_proj = (
+        [(16, 64, 64, 4, 8), (16, 128, 64, 4, 4)]
+        if seq_len == 64
+        else (
+            [(32, 64, 64, 4, 8), (32, 128, 64, 4, 4)]
+            if seq_len == 128
+            else [(64, 64, 64, 4, 8), (64, 128, 64, 4, 4)]
+        )
+    )
+    mha_out_proj = (
+        [(1, 32, 64, 64, 4, 8), (2, 32, 64, 64, 2, 8)]
+        if seq_len == 64
+        else (
+            [(4, 32, 64, 64, 1, 8), (2, 32, 64, 64, 2, 8)]
+            if seq_len == 128
+            else (
+                [(8, 32, 64, 64, 1, 8)]
+                if seq_len >= 8192
+                else [(8, 32, 64, 64, 1, 8), (4, 32, 64, 64, 2, 8)]
+            )
+        )
+    )
+    if seq_len == 64:
+        ffn = [
+            (8, False, False, 64, 64, 64, 8, 1, 4, None, 1),
+            (8, False, False, 64, 64, 64, 4, 1, 4, None, 1),
+        ]
+    elif seq_len == 128:
+        ffn = [
+            (8, False, False, 64, 64, 64, 8, 2, 4, None, 1),
+            (8, False, False, 64, 64, 64, 4, 2, 4, None, 1),
+        ]
+    else:
+        ffn = [
+            (8, False, False, 64, 64, 64, 8, 4, 4, None, 1),
+            (8, False, False, 64, 64, 64, 4, 4, 4, None, 1),
+        ]
+    return make_case(
+        "tinybert_512",
+        seq_len,
+        64,
+        8,
+        2048,
+        qkv_proj=qkv_proj,
+        mha_out_proj=mha_out_proj,
+        addnorm=[(8, 512)],
+        ffn=ffn,
+    )
+
+
 # Shared workload entry point per case:
 #   seq_len, head_dim, num_heads, ffn_dim
 # Workload -> operator mapping:
@@ -122,6 +173,9 @@ def make_case(
 # that passes `qkv_proj=...`, `mha_out_proj=...`, `addnorm=...`, or `ffn=...`
 # whenever a specific family/sequence point needs different candidates.
 BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
+    "tinybert_512": {
+        seq_len: _tinybert_512_case(seq_len) for seq_len in SEQUENCE_LADDER
+    },
     "baseline_768": {
         64: make_case(
             "baseline_768",

@@ -12,6 +12,8 @@ import pandas as pd
 import seaborn as sns
 from matplotlib import pyplot as plt
 
+from .cases import FAMILY_IDS
+
 BLOCK_ORDER = ["qkv_proj", "mha_out_proj", "addnorm", "ffn"]
 BLOCK_LABELS = {
     "qkv_proj": "QKV Proj",
@@ -19,8 +21,9 @@ BLOCK_LABELS = {
     "addnorm": "Add + Norm",
     "ffn": "FFN",
 }
-FAMILY_ORDER = ["baseline_768", "baseline_1024"]
+FAMILY_ORDER = list(FAMILY_IDS)
 FAMILY_LABELS = {
+    "tinybert_512": "Head Dim = 64 / Num Heads = 8 / FFN Dim = 2048",
     "baseline_768": "Head Dim = 64 / Num Heads = 12 / FFN Dim = 3072",
     "baseline_1024": "Head Dim = 64 / Num Heads = 16 / FFN Dim = 4096",
 }
@@ -64,9 +67,9 @@ def load_best_rows(results_csv: Path) -> pd.DataFrame:
 def plot_best_latency(best: pd.DataFrame, title: str, variant: str = "standard"):
     if variant == "slides":
         context = "poster"
-        figsize = (20, 7.5)
-        nrows, ncols = 1, 2
-        legend_bbox = (0.5, -0.04)
+        figsize = (20, 11)
+        nrows, ncols = (2, 2) if len(FAMILY_ORDER) == 3 else (1, len(FAMILY_ORDER))
+        legend_bbox = None
         title_y = 1.10
         footnote_y = -0.01
         family_title_size = 20
@@ -78,8 +81,8 @@ def plot_best_latency(best: pd.DataFrame, title: str, variant: str = "standard")
         legend_title = None
     else:
         context = "talk"
-        figsize = (16, 10)
-        nrows, ncols = 2, 1
+        figsize = (24, 8)
+        nrows, ncols = 1, max(1, len(FAMILY_ORDER))
         legend_bbox = (0.5, 1.02)
         title_y = 1.06
         footnote_y = 0.005
@@ -104,7 +107,7 @@ def plot_best_latency(best: pd.DataFrame, title: str, variant: str = "standard")
         },
     )
 
-    fig, axes = plt.subplots(
+    fig, axes_obj = plt.subplots(
         nrows=nrows,
         ncols=ncols,
         figsize=figsize,
@@ -112,7 +115,12 @@ def plot_best_latency(best: pd.DataFrame, title: str, variant: str = "standard")
         sharey=True,
         constrained_layout=True,
     )
-    axes = axes if isinstance(axes, (list, tuple)) else axes.flatten()
+    axes = [axes_obj] if not hasattr(axes_obj, "flatten") else list(axes_obj.flatten())
+    legend_ax = None
+    if variant == "slides" and len(FAMILY_ORDER) == 3:
+        legend_ax = axes[-1]
+        legend_ax.set_axis_off()
+        axes = axes[:-1]
 
     for ax, family_id in zip(axes, FAMILY_ORDER, strict=True):
         family_df = best[best["family_id"] == family_id].copy()
@@ -144,17 +152,29 @@ def plot_best_latency(best: pd.DataFrame, title: str, variant: str = "standard")
     if variant == "standard":
         axes[-1].set_xlabel("Context Length (tokens)", fontsize=x_label_size)
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        ncol=4,
-        loc="upper center",
-        bbox_to_anchor=legend_bbox,
-        frameon=False,
-        title=legend_title,
-        title_fontsize=legend_title_size,
-        fontsize=legend_font_size,
-    )
+    if legend_ax is not None:
+        legend_ax.legend(
+            handles,
+            labels,
+            ncol=1,
+            loc="center",
+            frameon=False,
+            title=legend_title,
+            title_fontsize=legend_title_size,
+            fontsize=legend_font_size,
+        )
+    else:
+        fig.legend(
+            handles,
+            labels,
+            ncol=4,
+            loc="upper center",
+            bbox_to_anchor=legend_bbox,
+            frameon=False,
+            title=legend_title,
+            title_fontsize=legend_title_size,
+            fontsize=legend_font_size,
+        )
     fig.suptitle(
         title,
         fontsize=24 if variant == "standard" else 28,

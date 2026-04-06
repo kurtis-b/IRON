@@ -12,7 +12,9 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
 
-FAMILY_ORDER = ["baseline_768", "baseline_1024"]
+from .cases import FAMILY_IDS
+
+FAMILY_ORDER = list(FAMILY_IDS)
 MODE_ORDER = ["dataflow", "runlist"]
 SEQ_ORDER = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 MODE_LABELS = {
@@ -74,26 +76,6 @@ def load_plot_rows(results_csv: Path) -> pd.DataFrame:
         drop=True
     )
 
-    expected_keys = {
-        (family_id, mode, seq_len)
-        for family_id in FAMILY_ORDER
-        for mode in MODE_ORDER
-        for seq_len in SEQ_ORDER
-    }
-    seen_keys = {
-        (str(row.study_case_id), str(row.execution_mode), int(row.seq_len))
-        for row in df.itertuples(index=False)
-    }
-    missing = expected_keys - seen_keys
-    if missing:
-        missing_summary = ", ".join(
-            f"{family_id}:{mode}:{seq_len}"
-            for family_id, mode, seq_len in sorted(missing)
-        )
-        raise ValueError(
-            f"Missing end-to-end effective GFLOP/s rows for: {missing_summary}"
-        )
-
     return df
 
 
@@ -130,9 +112,24 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
         },
     )
 
-    fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=True)
+    family_ids = [
+        family_id
+        for family_id in FAMILY_ORDER
+        if family_id in set(df["study_case_id"].astype(str).tolist())
+    ]
+    if variant == "slides" and len(family_ids) == 3:
+        fig, axes_grid = plt.subplots(2, 2, figsize=(22, 12), sharey=True)
+        axes = [axes_grid[0][0], axes_grid[0][1], axes_grid[1][0]]
+        legend_ax = axes_grid[1][1]
+        legend_ax.set_axis_off()
+    else:
+        fig, axes_obj = plt.subplots(
+            1, max(1, len(family_ids)), figsize=figsize, sharey=True
+        )
+        axes = [axes_obj] if len(family_ids) == 1 else list(axes_obj)
+        legend_ax = None
 
-    for ax, family_id in zip(axes, FAMILY_ORDER, strict=True):
+    for ax, family_id in zip(axes, family_ids, strict=True):
         family_df = df[df["study_case_id"] == family_id].copy()
 
         for mode in MODE_ORDER:
@@ -174,14 +171,22 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
         )
         for mode in MODE_ORDER
     ]
-    fig.legend(
-        handles=legend_handles,
-        loc="lower center",
-        ncol=3,
-        frameon=False,
-        bbox_to_anchor=(0.5, 0.01),
-        fontsize=legend_font_size,
-    )
+    if legend_ax is not None:
+        legend_ax.legend(
+            handles=legend_handles,
+            loc="center",
+            frameon=False,
+            fontsize=legend_font_size,
+        )
+    else:
+        fig.legend(
+            handles=legend_handles,
+            loc="lower center",
+            ncol=3,
+            frameon=False,
+            bbox_to_anchor=(0.5, 0.01),
+            fontsize=legend_font_size,
+        )
     fig.suptitle(
         "Effective Throughput Comparison of Dataflow and Runlist Patterns",
         fontsize=suptitle_size,

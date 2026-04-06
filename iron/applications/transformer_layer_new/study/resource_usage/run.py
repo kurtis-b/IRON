@@ -40,6 +40,7 @@ from iron.applications.transformer_layer_new.study.block.run import (
 )
 from iron.applications.transformer_layer_new.study.end_to_end.cases import (
     EndToEndWorkload,
+    FAMILY_IDS,
     MODE_OPERATORS,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.select import (
@@ -904,9 +905,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         choices=("all", "dataflow_blocks", "runlist_ops"),
         default="all",
     )
-    parser.add_argument(
-        "--family", choices=("all", "baseline_768", "baseline_1024"), default="all"
-    )
+    parser.add_argument("--family", choices=("all", *FAMILY_IDS), default="all")
     parser.add_argument(
         "--seq-len",
         default="all",

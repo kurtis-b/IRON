@@ -8,7 +8,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
-REFERENCE_EXECUTION_MODES: tuple[str, ...] = ("dataflow", "runlist")
+REFERENCE_EXECUTION_MODES: tuple[str, ...] = ("dataflow",)
 _REFERENCE_MODE_ORDER = {
     execution_mode: index
     for index, execution_mode in enumerate(REFERENCE_EXECUTION_MODES)

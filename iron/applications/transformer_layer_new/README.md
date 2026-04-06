@@ -19,13 +19,14 @@ The current paper-facing studies are:
 - `study/end_to_end`
 - `study/memory_tile_staging`
 - `study/resource_usage`
-- `study/igpu`
+- `study/host_comparison`
 - `study/memcpy_bandwidth`
 
 ## Retained Surface
 
 Families:
 
+- `tinybert_512`
 - `baseline_768`
 - `baseline_1024`
 
@@ -50,8 +51,8 @@ Canonical CSV outputs:
 - `results/memory_tile_staging/results.csv`
 - `results/resource_usage/dataflow_block_best_configs.csv`
 - `results/resource_usage/runlist_selected_ops.csv`
-- `results/igpu/results.csv`
-- `results/igpu/fairness_repeatability.csv`
+- `results/host_comparison/results.csv`
+- `results/host_comparison/fairness_repeatability.csv`
 - `results/memcpy_bandwidth/results.csv`
 
 The end-to-end helper studies default to `results_all_power.csv` when it is
@@ -69,7 +70,7 @@ Current paper-facing figure scripts live in:
 - `study/end_to_end/run_staging_ablation.py`
 - `study/memory_tile_staging/plot_staging_depth.py`
 - `study/resource_usage/run.py`
-- `study/igpu/run.py`
+- `study/host_comparison/run.py`
 
 ## Entry Points
 
@@ -82,19 +83,19 @@ Current paper-facing figure scripts live in:
 - `python -m iron.applications.transformer_layer_new.study.end_to_end.run_fairness_repeatability`
 - `python -m iron.applications.transformer_layer_new.study.memory_tile_staging.run`
 - `python -m iron.applications.transformer_layer_new.study.resource_usage.run`
-- `python -m iron.applications.transformer_layer_new.study.igpu.run`
-- `python -m iron.applications.transformer_layer_new.study.igpu.run_fairness_repeatability`
+- `python -m iron.applications.transformer_layer_new.study.host_comparison.run`
+- `python -m iron.applications.transformer_layer_new.study.host_comparison.run_fairness_repeatability`
 - `python -m iron.applications.transformer_layer_new.study.memcpy_bandwidth.run`
 
-## iGPU Environment
+## Host Comparison Environment
 
 The repo-root [requirements.txt](/home/agi-demo/iron/requirements.txt) stays
 generic for the wider codebase.
 
-For the ROCm iGPU study on Ubuntu 24.04 / Python 3.12 Ryzen APU systems:
+For the iGPU host comparison on Ubuntu 24.04 / Python 3.12 Ryzen APU systems:
 
 1. install the normal repo requirements first
-2. then install the iGPU ROCm overlay:
+2. then install the ROCm overlay used by the iGPU path:
    `pip install -r iron/applications/transformer_layer_new/requirements.txt`
 
 ## Documentation Map
@@ -104,5 +105,5 @@ For the ROCm iGPU study on Ubuntu 24.04 / Python 3.12 Ryzen APU systems:
 - `study/end_to_end/README.md`
 - `study/memory_tile_staging/README.md`
 - `study/resource_usage/README.md`
-- `study/igpu/README.md`
+- `study/host_comparison/README.md`
 - `study/memcpy_bandwidth/README.md`

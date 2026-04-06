@@ -1323,6 +1323,7 @@ def benchmark_mode(
     operator_config: dict[str, dict[str, object]] | None = None,
     include_reference_output: bool | None = None,
     capture_latencies: bool = False,
+    scope_suffix: str | None = None,
 ) -> dict[str, object]:
     result = {
         "timed_total_sec": 0.0,
@@ -1357,9 +1358,10 @@ def benchmark_mode(
         include_output=include_output,
         include_attention_mask=False,
     )
-    context = _new_benchmark_context(
-        f"mode_{execution_mode}_{workload.hidden_size}_{workload.seq_len}"
-    )
+    scope = f"mode_{execution_mode}_{workload.hidden_size}_{workload.seq_len}"
+    if scope_suffix:
+        scope = f"{scope}_{scope_suffix}"
+    context = _new_benchmark_context(scope)
     operator = None
     try:
         operator = _build_operator(

@@ -14,13 +14,15 @@ This note defines the current shared rules for the implemented
 - `end_to_end`
 - `memory_tile_staging`
 - `resource_usage`
-- `igpu`
+- `host_comparison`
 - `memcpy_bandwidth`
 
 ## Retained Cases
 
 Current families:
 
+- `tinybert_512`
+  `hidden_size=512`, `intermediate_size=2048`, `num_attention_heads=8`
 - `baseline_768`
   `hidden_size=768`, `intermediate_size=3072`, `num_attention_heads=12`
 - `baseline_1024`
@@ -80,8 +82,8 @@ Canonical CSV outputs:
 - `results/memory_tile_staging/results.csv`
 - `results/resource_usage/dataflow_block_best_configs.csv`
 - `results/resource_usage/runlist_selected_ops.csv`
-- `results/igpu/results.csv`
-- `results/igpu/fairness_repeatability.csv`
+- `results/host_comparison/results.csv`
+- `results/host_comparison/fairness_repeatability.csv`
 - `results/memcpy_bandwidth/results.csv`
 
 The end-to-end CSV keeps one row per `(study_case_id, seq_len, execution_mode)`.
@@ -90,12 +92,11 @@ The end-to-end tuning CSV keeps one row per
 `(study_case_id, seq_len, execution_mode, internal_operator, candidate_id)` and
 marks the fastest passing isolated candidate with `is_operator_best=True`.
 
-The iGPU CSV keeps one comparison row per `(study_case_id, seq_len, metric)`.
+The host-comparison CSV keeps one comparison row per `(study_case_id, seq_len, metric)`.
 Its comparison columns are:
 
 - `igpu`
 - `dataflow`
-- `runlist`
 
 ## Supporting Studies
 
@@ -111,5 +112,5 @@ The end-to-end staging-ablation CSV keeps one row per
 reruns. It sweeps the selected `dataflow` config at different staging depths
 and can reuse the memory-tile staging depth ladder when that CSV is present.
 
-The iGPU study remains separate from `study/end_to_end` by design. It consumes
-completed end-to-end NPU rows instead of re-running NPU patterns.
+The host-comparison study remains separate from `study/end_to_end` by design.
+It consumes completed end-to-end NPU rows instead of re-running NPU patterns.

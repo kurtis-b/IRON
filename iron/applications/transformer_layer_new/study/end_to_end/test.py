@@ -351,10 +351,15 @@ def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
         seed,
         power_backend,
         operator_config,
-        **_kwargs,
+        **kwargs,
     ):
         assert execution_mode == "dataflow"
         assert power_backend == "none"
+        assert kwargs["scope_suffix"] in {
+            "staging_baseline_768_ffn_d1",
+            "staging_baseline_768_ffn_d2",
+            "staging_baseline_768_ffn_d4",
+        }
         depth = int(operator_config["ffn"]["down_proj_depth"])
         return {
             "avg_latency_ms": float(16 // depth),

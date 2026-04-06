@@ -10,7 +10,10 @@ import json
 import logging
 from pathlib import Path
 
-from .run import SUPPORTED_POWER_BACKENDS, iteration_schedule
+from .run import (
+    SUPPORTED_IGPU_POWER_BACKENDS,
+    iteration_schedule,
+)
 from .select import REFERENCE_EXECUTION_MODES
 
 LOGGER = logging.getLogger(__name__)
@@ -32,7 +35,7 @@ def default_output_path() -> Path:
     return (
         Path(__file__).resolve().parents[2]
         / "results"
-        / "igpu"
+        / "host_comparison"
         / "fairness_repeatability.csv"
     )
 
@@ -58,31 +61,33 @@ def _iteration_schedule_summary() -> dict[str, dict[str, int]]:
     }
 
 
-def build_rows(*, device: str, power_backend: str) -> list[dict[str, object]]:
+def build_rows(
+    *,
+    igpu_device: str,
+    igpu_power_backend: str,
+) -> list[dict[str, object]]:
+    reference_modes_json = json.dumps(list(REFERENCE_EXECUTION_MODES), sort_keys=True)
+    iteration_schedule_json = json.dumps(_iteration_schedule_summary(), sort_keys=True)
     return [
         {
-            "study_id": "igpu_fairness_repeatability",
+            "study_id": "host_comparison_fairness_repeatability",
             "backend": "igpu",
-            "reference_execution_modes_json": json.dumps(
-                list(REFERENCE_EXECUTION_MODES),
-                sort_keys=True,
+            "reference_execution_modes_json": reference_modes_json,
+            "iteration_schedule_json": iteration_schedule_json,
+            "device": igpu_device,
+            "power_backend": igpu_power_backend,
+            "supported_power_backends_json": json.dumps(
+                list(SUPPORTED_IGPU_POWER_BACKENDS)
             ),
-            "iteration_schedule_json": json.dumps(
-                _iteration_schedule_summary(),
-                sort_keys=True,
-            ),
-            "device": device,
-            "power_backend": power_backend,
-            "supported_power_backends_json": json.dumps(list(SUPPORTED_POWER_BACKENDS)),
             "validation_policy": (
-                "The iGPU study validates exactly through seq_len=512 and uses "
+                "The host comparison validates exactly through seq_len=512 and uses "
                 "finite-output validation above that threshold."
             ),
             "latency_variation_policy": (
-                "The iGPU study reuses its default iteration schedule unless warmup "
-                "or timed iterations are overridden at the command line."
+                "The host comparison reuses its default iteration schedule unless "
+                "warmup or timed iterations are overridden at the command line."
             ),
-        }
+        },
     ]
 
 
@@ -99,12 +104,12 @@ def write_rows(output_path: Path, rows: list[dict[str, object]]) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Write a fairness/repeatability summary for the separate iGPU study."
+        description="Write a fairness/repeatability summary for the host comparison study."
     )
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--igpu-device", default="cuda:0")
     parser.add_argument(
-        "--power-backend",
-        choices=list(SUPPORTED_POWER_BACKENDS),
+        "--igpu-power-backend",
+        choices=list(SUPPORTED_IGPU_POWER_BACKENDS),
         default="rocm-smi",
     )
     parser.add_argument("--output", type=Path, default=default_output_path())
@@ -117,9 +122,12 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
-    rows = build_rows(device=str(args.device), power_backend=str(args.power_backend))
+    rows = build_rows(
+        igpu_device=str(args.igpu_device),
+        igpu_power_backend=str(args.igpu_power_backend),
+    )
     write_rows(args.output.expanduser(), rows)
-    LOGGER.info("Wrote %d iGPU fairness rows to %s", len(rows), args.output)
+    LOGGER.info("Wrote %d host comparison fairness rows to %s", len(rows), args.output)
     return 0
 
 

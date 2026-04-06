@@ -36,6 +36,7 @@ BLOCK_LABELS = {
     "ffn": "Dataflow Pattern with FFN Staging Ablation",
 }
 FAMILY_LABELS = {
+    "tinybert_512": "Hidden Size = 512 / FFN Dim = 2048 / Heads = 8",
     "baseline_768": "Hidden Size = 768 / FFN Dim = 3072 / Heads = 12",
     "baseline_1024": "Hidden Size = 1024 / FFN Dim = 4096 / Heads = 16",
 }
@@ -362,6 +363,9 @@ def build_rows(
                     seed=seed,
                     power_backend="none",
                     operator_config=operator_config,
+                    scope_suffix=(
+                        f"staging_{selected_row.study_case_id}_{block_kind}_d{staging_depth}"
+                    ),
                 )
                 rows.append(
                     {
@@ -461,18 +465,29 @@ def render_plot(rows: list[dict[str, object]]) -> plt.Figure:
         fig.patch.set_facecolor("#f7f5f2")
         return fig
 
-    fig, axes = plt.subplots(
+    active_family_ids = [
+        family_id
+        for family_id in FAMILY_IDS
+        if any(str(row.get("study_case_id")) == family_id for row in successful_rows)
+    ]
+    fig, axes_obj = plt.subplots(
         len(STAGING_BLOCK_KINDS),
-        len(FAMILY_IDS),
-        figsize=(20, 12),
+        len(active_family_ids),
+        figsize=(7.5 * len(active_family_ids), 12),
         sharex=False,
         sharey="row",
     )
-    if len(STAGING_BLOCK_KINDS) == 1:
-        axes = [axes]
+    if len(STAGING_BLOCK_KINDS) == 1 and len(active_family_ids) == 1:
+        axes = [[axes_obj]]
+    elif len(STAGING_BLOCK_KINDS) == 1:
+        axes = [list(axes_obj)]
+    elif len(active_family_ids) == 1:
+        axes = [[axis] for axis in axes_obj]
+    else:
+        axes = axes_obj
 
     for row_index, block_kind in enumerate(STAGING_BLOCK_KINDS):
-        for col_index, family_id in enumerate(FAMILY_IDS):
+        for col_index, family_id in enumerate(active_family_ids):
             ax = axes[row_index][col_index]
             panel_rows = [
                 row

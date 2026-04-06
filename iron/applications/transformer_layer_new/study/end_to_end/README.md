@@ -19,6 +19,7 @@ hidden-states boundary:
 
 Families:
 
+- `tinybert_512`
 - `baseline_768`
 - `baseline_1024`
 
@@ -67,7 +68,7 @@ Canonical outputs:
 - `results/end_to_end/fairness_repeatability.csv`
 
 The main result CSV keeps one row per `(study_case_id, seq_len, execution_mode)`
-and is the reference input for the separate `igpu` study.
+and is the reference input for the separate `host_comparison` study.
 
 The helper entrypoints default to `results_all_power.csv` when it is present and
 fall back to `results.csv` otherwise.

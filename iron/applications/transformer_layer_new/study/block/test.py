@@ -267,12 +267,14 @@ def test_main_checkpoints_after_each_case(monkeypatch, tmp_path):
 
     assert exit_code == 0
 
+    tinybert_rows = len(get_case("tinybert_512", 64).candidates("qkv_proj"))
     baseline_768_rows = len(get_case("baseline_768", 64).candidates("qkv_proj"))
     baseline_1024_rows = len(get_case("baseline_1024", 64).candidates("qkv_proj"))
     assert checkpoint_row_counts == [
-        baseline_768_rows,
-        baseline_768_rows + baseline_1024_rows,
-        baseline_768_rows + baseline_1024_rows,
+        tinybert_rows,
+        tinybert_rows + baseline_768_rows,
+        tinybert_rows + baseline_768_rows + baseline_1024_rows,
+        tinybert_rows + baseline_768_rows + baseline_1024_rows,
     ]
 
 

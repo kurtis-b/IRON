@@ -221,7 +221,12 @@ def render_plot(rows: list[dict[str, object]]) -> plt.Figure:
             "grid.color": "#ded8cf",
         },
     )
-    fig, axes = plt.subplots(1, len(FAMILY_IDS), figsize=(20, 8), sharey=True)
+    fig, axes = plt.subplots(
+        1,
+        len(FAMILY_IDS),
+        figsize=(8 * len(FAMILY_IDS), 8),
+        sharey=True,
+    )
     if len(FAMILY_IDS) == 1:
         axes = [axes]
 

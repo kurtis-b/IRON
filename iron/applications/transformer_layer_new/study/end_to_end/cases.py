@@ -16,7 +16,7 @@ EXECUTION_MODES: tuple[ExecutionMode, ...] = (
     "dataflow",
     "runlist",
 )
-FAMILY_IDS: tuple[str, ...] = ("baseline_768", "baseline_1024")
+FAMILY_IDS: tuple[str, ...] = ("tinybert_512", "baseline_768", "baseline_1024")
 SEQUENCE_LADDER: tuple[int, ...] = (
     64,
     128,
@@ -30,6 +30,7 @@ SEQUENCE_LADDER: tuple[int, ...] = (
 )
 
 FAMILY_SPECS: dict[str, tuple[int, int, int]] = {
+    "tinybert_512": (512, 2048, 8),
     "baseline_768": (768, 3072, 12),
     "baseline_1024": (1024, 4096, 16),
 }

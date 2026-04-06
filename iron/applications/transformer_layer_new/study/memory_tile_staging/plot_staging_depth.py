@@ -25,10 +25,12 @@ BLOCK_LABELS = {
 }
 FAMILY_LABELS_BY_BLOCK = {
     "mha_out_proj": {
+        "tinybert_512": "Head Dim = 64 / Num Heads = 8",
         "baseline_768": "Head Dim = 64 / Num Heads = 12",
         "baseline_1024": "Head Dim = 64 / Num Heads = 16",
     },
     "ffn": {
+        "tinybert_512": "Head Dim = 64 / Num Heads = 8 / FFN Dim = 2048",
         "baseline_768": "Head Dim = 64 / Num Heads = 12 / FFN Dim = 3072",
         "baseline_1024": "Head Dim = 64 / Num Heads = 16 / FFN Dim = 4096",
     },
@@ -147,9 +149,20 @@ def render_plot(
         fig.patch.set_facecolor("#f7f5f2")
         return fig
 
-    fig, axes = plt.subplots(1, 2, figsize=(20, 8), sharey=True)
+    family_ids = [
+        family_id
+        for family_id in FAMILY_IDS
+        if family_id in set(block_rows["family_id"].astype(str).tolist())
+    ]
+    fig, axes_obj = plt.subplots(
+        1,
+        max(1, len(family_ids)),
+        figsize=(8 * max(1, len(family_ids)), 8),
+        sharey=True,
+    )
+    axes = [axes_obj] if len(family_ids) == 1 else list(axes_obj)
     all_depths = sorted(block_rows["staging_depth"].unique())
-    for ax, family_id in zip(axes, FAMILY_IDS, strict=True):
+    for ax, family_id in zip(axes, family_ids, strict=True):
         family_rows = block_rows[block_rows["family_id"] == family_id].copy()
         for seq_len in PLOT_SEQUENCE_LENGTHS:
             seq_rows = family_rows[family_rows["seq_len"] == seq_len].copy()

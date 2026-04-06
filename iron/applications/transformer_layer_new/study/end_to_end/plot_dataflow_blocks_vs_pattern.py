@@ -12,7 +12,9 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from matplotlib.patches import Patch
 
-FAMILY_ORDER = ["baseline_768", "baseline_1024"]
+from .cases import FAMILY_IDS
+
+FAMILY_ORDER = list(FAMILY_IDS)
 SEQ_ORDER = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 BLOCK_ORDER = ["QKV Proj", "MHA Out Proj", "Add + Norm (x2)", "FFN"]
 BLOCK_COLORS = {
@@ -106,38 +108,6 @@ def load_plot_rows(
         .copy()
     )
 
-    expected_keys = {
-        (family_id, seq_len) for family_id in FAMILY_ORDER for seq_len in SEQ_ORDER
-    }
-    seen_pattern_keys = {
-        (str(row.study_case_id), int(row.seq_len))
-        for row in pattern_df.itertuples(index=False)
-    }
-    missing_pattern = expected_keys - seen_pattern_keys
-    if missing_pattern:
-        missing_summary = ", ".join(
-            f"{family_id}:{seq_len}" for family_id, seq_len in sorted(missing_pattern)
-        )
-        raise ValueError(f"Missing dataflow pattern rows for: {missing_summary}")
-
-    required_block_keys = {
-        (family_id, seq_len, block_label)
-        for family_id in FAMILY_ORDER
-        for seq_len in SEQ_ORDER
-        for block_label in BLOCK_ORDER
-    }
-    seen_block_keys = {
-        (str(row.study_case_id), int(row.seq_len), str(row.block_label))
-        for row in block_df.itertuples(index=False)
-    }
-    missing_blocks = required_block_keys - seen_block_keys
-    if missing_blocks:
-        missing_summary = ", ".join(
-            f"{family_id}:{seq_len}:{block_label}"
-            for family_id, seq_len, block_label in sorted(missing_blocks)
-        )
-        raise ValueError(f"Missing selected block rows for: {missing_summary}")
-
     return pattern_df, block_df
 
 
@@ -181,11 +151,26 @@ def render_plot(
         },
     )
 
-    fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=True)
+    family_ids = [
+        family_id
+        for family_id in FAMILY_ORDER
+        if family_id in set(pattern_df["study_case_id"].astype(str).tolist())
+    ]
+    if variant == "slides" and len(family_ids) == 3:
+        fig, axes_grid = plt.subplots(2, 2, figsize=(22, 12), sharey=True)
+        axes = [axes_grid[0][0], axes_grid[0][1], axes_grid[1][0]]
+        legend_ax = axes_grid[1][1]
+        legend_ax.set_axis_off()
+    else:
+        fig, axes_obj = plt.subplots(
+            1, max(1, len(family_ids)), figsize=figsize, sharey=True
+        )
+        axes = [axes_obj] if len(family_ids) == 1 else list(axes_obj)
+        legend_ax = None
     bar_width = 0.34
     x_positions = list(range(len(SEQ_ORDER)))
 
-    for ax, family_id in zip(axes, FAMILY_ORDER, strict=True):
+    for ax, family_id in zip(axes, family_ids, strict=True):
         family_patterns = pattern_df[pattern_df["study_case_id"] == family_id].copy()
         family_blocks = block_df[block_df["study_case_id"] == family_id].copy()
 
@@ -200,7 +185,9 @@ def render_plot(
 
         bottoms = [0.0] * len(SEQ_ORDER)
         for block_label in BLOCK_ORDER:
-            heights = [block_map[(seq_len, block_label)] for seq_len in SEQ_ORDER]
+            heights = [
+                block_map.get((seq_len, block_label), 0.0) for seq_len in SEQ_ORDER
+            ]
             ax.bar(
                 [x - (bar_width / 2) for x in x_positions],
                 heights,
@@ -214,7 +201,7 @@ def render_plot(
                 bottom + height for bottom, height in zip(bottoms, heights, strict=True)
             ]
 
-        pattern_heights = [pattern_map[seq_len] for seq_len in SEQ_ORDER]
+        pattern_heights = [pattern_map.get(seq_len, 0.0) for seq_len in SEQ_ORDER]
         ax.bar(
             [x + (bar_width / 2) for x in x_positions],
             pattern_heights,
@@ -235,6 +222,8 @@ def render_plot(
             pair_maxima,
             strict=True,
         ):
+            if stack_total <= 0 or pattern_total <= 0:
+                continue
             factor = pattern_total / stack_total
             ax.text(
                 x_pos + (bar_width / 2),
@@ -271,14 +260,22 @@ def render_plot(
     legend_handles.append(
         Patch(facecolor=PATTERN_COLOR, edgecolor=PATTERN_EDGE, label="Dataflow Pattern")
     )
-    fig.legend(
-        handles=legend_handles,
-        loc="lower center",
-        ncol=5,
-        frameon=False,
-        bbox_to_anchor=(0.5, 0.01),
-        fontsize=legend_font_size,
-    )
+    if legend_ax is not None:
+        legend_ax.legend(
+            handles=legend_handles,
+            loc="center",
+            frameon=False,
+            fontsize=legend_font_size,
+        )
+    else:
+        fig.legend(
+            handles=legend_handles,
+            loc="lower center",
+            ncol=5,
+            frameon=False,
+            bbox_to_anchor=(0.5, 0.01),
+            fontsize=legend_font_size,
+        )
     fig.suptitle(
         "Aggregate Latency of Blocks Compared to Dataflow Pattern Latency",
         fontsize=suptitle_size,

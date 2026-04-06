@@ -49,6 +49,7 @@ family and per sequence length.
 
 Families:
 
+- `tinybert_512`
 - `baseline_768`
 - `baseline_1024`
 
@@ -58,7 +59,7 @@ Sequence ladder:
 
 Total workload surface:
 
-- `2 families x 9 seq lengths x 4 block kinds`
+- `3 families x 9 seq lengths x 4 block kinds`
 
 Each workload point may expand to one or more candidate tuples per block kind.
 
