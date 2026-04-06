@@ -22,6 +22,8 @@ def generate_test_params(extensive=False):
         params = [
             #   M,     K,     N,    num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n, trace_size, down_proj_depth, n_a_tiles_distributed, n_b_tiles_distributed, stage_only, gelu_stage
             # GeLU fused with up projection
+            # TinyBERT-6L-512
+            (512, 512, 2048, 8, False, False, 64, 64, 64, 0, 8, 8, 2, None, 1),
             # Scaling within 8 columns (total cores utilized vary)
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 8, 2, None, 0),
             (512, 768, 3072, 8, False, False, 64, 48, 96, 0, 8, 4, 4, None, 0),
