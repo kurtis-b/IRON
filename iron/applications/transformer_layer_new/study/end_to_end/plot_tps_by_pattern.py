@@ -12,21 +12,24 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
 
-from .cases import FAMILY_IDS
-
-FAMILY_ORDER = list(FAMILY_IDS)
-MODE_ORDER = ["dataflow", "runlist"]
+FAMILY_ORDER = ["tinybert_512", "baseline_768", "baseline_1024"]
+FAMILY_LABELS = {
+    "tinybert_512": "TinyBERT",
+    "baseline_768": "BERT-Base",
+    "baseline_1024": "BERT-Large",
+}
+MODE_ORDER = ["hybrid", "runlist"]
 SEQ_ORDER = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 MODE_LABELS = {
-    "dataflow": "Dataflow",
+    "hybrid": "Hybrid",
     "runlist": "Runlist",
 }
 MODE_COLORS = {
-    "dataflow": "#1f6f8b",
+    "hybrid": "#1f6f8b",
     "runlist": "#e07a5f",
 }
 MODE_MARKERS = {
-    "dataflow": "o",
+    "hybrid": "o",
     "runlist": "s",
 }
 
@@ -44,20 +47,26 @@ def default_output_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "results" / "end_to_end"
 
 
-def variant_stem(variant: str) -> str:
-    return {
-        "standard": "effective_gflops_per_second_by_pattern",
-        "slides": "effective_gflops_per_second_by_pattern_slides",
-    }[variant]
+def variant_stem(metric: str, variant: str, y_scale: str = "log") -> str:
+    stems = {
+        "throughput": {
+            "standard": "effective_gflops_per_second_by_pattern",
+            "slides": "effective_gflops_per_second_by_pattern_slides",
+        },
+        "latency": {
+            "standard": "latency_by_pattern",
+            "slides": "latency_by_pattern_slides",
+        },
+    }
+    stem = stems[metric][variant]
+    if metric == "latency" and y_scale == "linear":
+        return f"{stem}_linear"
+    return stem
 
 
 def family_label(results_rows: pd.DataFrame) -> str:
     sample = results_rows.iloc[0]
-    return (
-        f"Head Dim = {int(sample['attention_head_size'])} / "
-        f"Num Heads = {int(sample['num_attention_heads'])} / "
-        f"FFN Dim = {int(sample['intermediate_size'])}"
-    )
+    return FAMILY_LABELS[str(sample["study_case_id"])]
 
 
 def load_plot_rows(results_csv: Path) -> pd.DataFrame:
@@ -65,6 +74,7 @@ def load_plot_rows(results_csv: Path) -> pd.DataFrame:
     df = df[df["run_status"] == "passed"].copy()
     df["seq_len"] = df["seq_len"].astype(int)
     df["effective_gflops_per_sec"] = df["effective_gflops_per_sec"].astype(float)
+    df["avg_latency_ms"] = df["avg_latency_ms"].astype(float)
     df = df[df["execution_mode"].isin(MODE_ORDER)].copy()
     df["execution_mode"] = pd.Categorical(
         df["execution_mode"], MODE_ORDER, ordered=True
@@ -79,7 +89,25 @@ def load_plot_rows(results_csv: Path) -> pd.DataFrame:
     return df
 
 
-def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
+def render_plot(
+    df: pd.DataFrame,
+    *,
+    metric: str = "throughput",
+    variant: str = "standard",
+    y_scale: str = "log",
+) -> plt.Figure:
+    metric_column = {
+        "throughput": "effective_gflops_per_sec",
+        "latency": "avg_latency_ms",
+    }[metric]
+    ylabel = {
+        "throughput": "Effective Throughput (GFLOP/s)",
+        "latency": "Latency (ms, log scale)" if y_scale == "log" else "Latency (ms)",
+    }[metric]
+    title = {
+        "throughput": "Effective Throughput Comparison of Hybrid and Runlist Patterns",
+        "latency": "Latency Comparison of Hybrid and Runlist Patterns",
+    }[metric]
     if variant == "slides":
         context = "poster"
         figsize = (22, 8.5)
@@ -88,7 +116,7 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
         tick_label_size = 14
         legend_font_size = 16
         suptitle_size = 30
-        title_y = 0.99
+        title_y = 0.965
     else:
         context = "talk"
         figsize = (20, 8)
@@ -97,7 +125,7 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
         tick_label_size = 12
         legend_font_size = 13
         suptitle_size = 24
-        title_y = 0.98
+        title_y = 0.955
 
     sns.set_theme(
         style="whitegrid",
@@ -117,17 +145,11 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
         for family_id in FAMILY_ORDER
         if family_id in set(df["study_case_id"].astype(str).tolist())
     ]
-    if variant == "slides" and len(family_ids) == 3:
-        fig, axes_grid = plt.subplots(2, 2, figsize=(22, 12), sharey=True)
-        axes = [axes_grid[0][0], axes_grid[0][1], axes_grid[1][0]]
-        legend_ax = axes_grid[1][1]
-        legend_ax.set_axis_off()
-    else:
-        fig, axes_obj = plt.subplots(
-            1, max(1, len(family_ids)), figsize=figsize, sharey=True
-        )
-        axes = [axes_obj] if len(family_ids) == 1 else list(axes_obj)
-        legend_ax = None
+    fig, axes_obj = plt.subplots(
+        1, max(1, len(family_ids)), figsize=figsize, sharey=True
+    )
+    axes = [axes_obj] if len(family_ids) == 1 else list(axes_obj)
+    legend_ax = None
 
     for ax, family_id in zip(axes, family_ids, strict=True):
         family_df = df[df["study_case_id"] == family_id].copy()
@@ -136,7 +158,7 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
             mode_df = family_df[family_df["execution_mode"] == mode].copy()
             ax.plot(
                 mode_df["seq_len"],
-                mode_df["effective_gflops_per_sec"],
+                mode_df[metric_column],
                 label=MODE_LABELS[mode],
                 color=MODE_COLORS[mode],
                 marker=MODE_MARKERS[mode],
@@ -147,17 +169,21 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
         ax.set_xscale("log", base=2)
         ax.set_xticks(SEQ_ORDER)
         ax.set_xticklabels([str(seq_len) for seq_len in SEQ_ORDER], rotation=0)
-        ax.set_xlabel("Context Length (tokens)", fontsize=axis_label_size)
-        ax.set_ylabel("Effective Throughput (GFLOP/s)", fontsize=axis_label_size)
+        if metric == "latency" and y_scale == "log":
+            ax.set_yscale("log")
+        ax.set_xlabel("Sequence Length", fontsize=axis_label_size)
+        ax.set_ylabel(ylabel, fontsize=axis_label_size)
         ax.set_title(
             family_label(family_df),
             loc="left",
             fontsize=family_title_size,
-            pad=12,
+            pad=6,
         )
         ax.grid(True, which="major", axis="both", linewidth=0.8, alpha=0.8)
         ax.grid(True, which="minor", axis="x", linewidth=0.4, alpha=0.25)
         ax.tick_params(axis="both", labelsize=tick_label_size)
+        if ax is not axes[0]:
+            ax.set_ylabel("")
 
     legend_handles = [
         Line2D(
@@ -181,19 +207,19 @@ def render_plot(df: pd.DataFrame, *, variant: str = "standard") -> plt.Figure:
     else:
         fig.legend(
             handles=legend_handles,
-            loc="lower center",
-            ncol=3,
+            loc="center left",
+            ncol=1,
             frameon=False,
-            bbox_to_anchor=(0.5, 0.01),
+            bbox_to_anchor=(0.87, 0.5),
             fontsize=legend_font_size,
         )
     fig.suptitle(
-        "Effective Throughput Comparison of Dataflow and Runlist Patterns",
+        title,
         fontsize=suptitle_size,
         fontweight="bold",
         y=title_y,
     )
-    fig.tight_layout(rect=[0, 0.08, 1, 0.93])
+    fig.tight_layout(rect=[0, 0.03, 0.84, 0.92])
     return fig
 
 
@@ -224,6 +250,18 @@ def parse_args() -> argparse.Namespace:
         default="standard",
         help="Chart layout preset",
     )
+    parser.add_argument(
+        "--metric",
+        choices=["throughput", "latency"],
+        default="throughput",
+        help="Metric to render",
+    )
+    parser.add_argument(
+        "--y-scale",
+        choices=["log", "linear"],
+        default="log",
+        help="Y-axis scaling mode for latency plots",
+    )
     return parser.parse_args()
 
 
@@ -231,8 +269,13 @@ def main() -> None:
     args = parse_args()
     df = load_plot_rows(args.results)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    fig = render_plot(df, variant=args.variant)
-    stem = args.stem or variant_stem(args.variant)
+    fig = render_plot(
+        df,
+        metric=args.metric,
+        variant=args.variant,
+        y_scale=args.y_scale,
+    )
+    stem = args.stem or variant_stem(args.metric, args.variant, args.y_scale)
     png_path = args.output_dir / f"{stem}.png"
     svg_path = args.output_dir / f"{stem}.svg"
     fig.savefig(png_path, dpi=220, bbox_inches="tight")

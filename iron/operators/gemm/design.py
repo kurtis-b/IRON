@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from ml_dtypes import bfloat16
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -120,6 +121,224 @@ def main():
 
 def ceildiv(a, b):
     return (a + b - 1) // b
+
+
+@dataclass(frozen=True)
+class GemmTransferTask:
+    tensor_name: str
+    phase: str
+    transfer_block: int
+    pingpong: int
+    compute_tiles: tuple[tuple[int, int], ...]
+    tap: TensorAccessPattern
+
+
+@dataclass(frozen=True)
+class GemmTransferPlan:
+    a_fills: tuple[GemmTransferTask, ...]
+    b_fills: tuple[GemmTransferTask, ...]
+    c_drains: tuple[GemmTransferTask, ...]
+
+    @property
+    def A_taps(self) -> TensorAccessSequence:
+        return TensorAccessSequence.from_taps(tuple(task.tap for task in self.a_fills))
+
+    @property
+    def B_taps(self) -> TensorAccessSequence:
+        return TensorAccessSequence.from_taps(tuple(task.tap for task in self.b_fills))
+
+    @property
+    def C_taps(self) -> TensorAccessSequence:
+        return TensorAccessSequence.from_taps(tuple(task.tap for task in self.c_drains))
+
+
+def _a_fill_compute_tiles(
+    *,
+    shim_index: int,
+    n_aie_rows: int,
+    n_aie_cols: int,
+    n_A_tiles_per_shim: int,
+) -> tuple[tuple[int, int], ...]:
+    start_row = shim_index * n_A_tiles_per_shim
+    stop_row = min(start_row + n_A_tiles_per_shim, n_aie_rows)
+    return tuple(
+        (row, col) for row in range(start_row, stop_row) for col in range(n_aie_cols)
+    )
+
+
+def _column_compute_tiles(
+    *,
+    column: int,
+    n_aie_rows: int,
+) -> tuple[tuple[int, int], ...]:
+    return tuple((row, column) for row in range(n_aie_rows))
+
+
+def plan_gemm_fill_drain_tasks(
+    *,
+    M: int,
+    K: int,
+    N: int,
+    m: int,
+    k: int,
+    n: int,
+    n_aie_cols: int,
+    b_col_maj: bool,
+    c_col_maj: bool,
+    separate_c_tiles: bool,
+) -> GemmTransferPlan:
+    n_aie_rows = 4
+    n_shim_mem_A = min(n_aie_cols, n_aie_rows)
+    n_A_tiles_per_shim = n_aie_rows // n_aie_cols if n_aie_cols < 4 else 1
+    mem_tile_m_A = m * n_A_tiles_per_shim
+    mem_tile_m_C = m * n_aie_rows
+    mem_tile_n = n * n_aie_cols
+    K_div_k = K // k
+    n_c_col_tiles_per_core = N // mem_tile_n
+    n_c_row_tiles_per_core = M // mem_tile_m_C
+    tb_max_n_rows = 4 if not c_col_maj else 2
+
+    a_fills: list[GemmTransferTask] = []
+    b_fills: list[GemmTransferTask] = []
+    c_drains: list[GemmTransferTask] = []
+
+    A_tiles = TensorTiler2D.group_tiler(
+        (M, K),
+        (mem_tile_m_A, k),
+        (1, K_div_k),
+        pattern_repeat=n_c_col_tiles_per_core,
+        prune_step=False,
+    )
+    if b_col_maj:
+        B_tiles = TensorTiler2D.step_tiler(
+            (N, K),
+            (n, k),
+            tile_group_repeats=(n_c_col_tiles_per_core, K_div_k),
+            tile_group_steps=(n_aie_cols, 1),
+            prune_step=False,
+        )
+    else:
+        B_tiles = TensorTiler2D.step_tiler(
+            (K, N),
+            (k, n),
+            tile_group_repeats=(K_div_k, n_c_col_tiles_per_core),
+            tile_group_steps=(1, n_aie_cols),
+            tile_group_col_major=True,
+            prune_step=False,
+        )
+
+    for tb in range(ceildiv(n_c_row_tiles_per_core, tb_max_n_rows)):
+        for pingpong in [0, 1]:
+            row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
+            current_tb_n_rows = min(
+                [tb_max_n_rows // 2, n_c_row_tiles_per_core - row_base]
+            )
+            if current_tb_n_rows <= 0:
+                break
+            for col in range(n_aie_cols):
+                compute_tiles = _column_compute_tiles(column=col, n_aie_rows=n_aie_rows)
+                if not separate_c_tiles:
+                    if not c_col_maj:
+                        C_row_offset = row_base * mem_tile_m_C * N
+                        C_col_offset = col * n
+                        C_offset = C_col_offset + C_row_offset
+                        C_sizes = [
+                            current_tb_n_rows,
+                            N // mem_tile_n,
+                            mem_tile_m_C,
+                            n,
+                        ]
+                        C_strides = [mem_tile_m_C * N, mem_tile_n, N, 1]
+                    else:
+                        C_row_offset = row_base * mem_tile_m_C
+                        C_col_offset = col * n * M
+                        C_offset = C_col_offset + C_row_offset
+                        C_sizes = [N // mem_tile_n, n_aie_rows, n, m]
+                        C_strides = [M * mem_tile_n, m, M, 1]
+                    c_drains.append(
+                        GemmTransferTask(
+                            tensor_name="C",
+                            phase="drain",
+                            transfer_block=tb,
+                            pingpong=pingpong,
+                            compute_tiles=compute_tiles,
+                            tap=TensorAccessPattern(
+                                (N, M) if c_col_maj else (M, N),
+                                offset=C_offset,
+                                sizes=C_sizes,
+                                strides=C_strides,
+                            ),
+                        )
+                    )
+
+                for tile_row in range(current_tb_n_rows):
+                    if separate_c_tiles:
+                        C_col_offset = col * n if not c_col_maj else col * n * M
+                        if not c_col_maj:
+                            C_block_offset = (row_base + tile_row) * n_aie_rows * m * N
+                            C_offset = C_col_offset + C_block_offset
+                            C_sizes = [1, n_c_col_tiles_per_core, mem_tile_m_C, n]
+                            C_strides = [0, mem_tile_n, N, 1]
+                        else:
+                            C_block_offset = (row_base + tile_row) * n_aie_rows * m
+                            C_offset = C_col_offset + C_block_offset
+                            C_sizes = [n_c_col_tiles_per_core, 1, n, m]
+                            C_strides = [M * mem_tile_n, 0, M, 1]
+                        c_drains.append(
+                            GemmTransferTask(
+                                tensor_name="C",
+                                phase="drain",
+                                transfer_block=tb,
+                                pingpong=pingpong,
+                                compute_tiles=compute_tiles,
+                                tap=TensorAccessPattern(
+                                    (N, M) if c_col_maj else (M, N),
+                                    offset=C_offset,
+                                    sizes=C_sizes,
+                                    strides=C_strides,
+                                ),
+                            )
+                        )
+
+                    tile_offset = ((row_base + tile_row) * n_shim_mem_A + col) % len(
+                        A_tiles
+                    )
+                    a_fills.append(
+                        GemmTransferTask(
+                            tensor_name="A",
+                            phase="fill",
+                            transfer_block=tb,
+                            pingpong=pingpong,
+                            compute_tiles=(
+                                _a_fill_compute_tiles(
+                                    shim_index=col,
+                                    n_aie_rows=n_aie_rows,
+                                    n_aie_cols=n_aie_cols,
+                                    n_A_tiles_per_shim=n_A_tiles_per_shim,
+                                )
+                                if col < n_aie_rows
+                                else ()
+                            ),
+                            tap=A_tiles[tile_offset],
+                        )
+                    )
+
+                    b_fills.append(
+                        GemmTransferTask(
+                            tensor_name="B",
+                            phase="fill",
+                            transfer_block=tb,
+                            pingpong=pingpong,
+                            compute_tiles=compute_tiles,
+                            tap=B_tiles[col],
+                        )
+                    )
+
+    return GemmTransferPlan(
+        a_fills=tuple(a_fills),
+        b_fills=tuple(b_fills),
+        c_drains=tuple(c_drains),
+    )
 
 
 def my_matmul(

@@ -10,6 +10,7 @@ import json
 import logging
 from pathlib import Path
 
+from ..run_lock import default_lock_path, hold_study_lock
 from .run import (
     SUPPORTED_IGPU_POWER_BACKENDS,
     iteration_schedule,
@@ -122,12 +123,19 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
-    rows = build_rows(
-        igpu_device=str(args.igpu_device),
-        igpu_power_backend=str(args.igpu_power_backend),
-    )
-    write_rows(args.output.expanduser(), rows)
-    LOGGER.info("Wrote %d host comparison fairness rows to %s", len(rows), args.output)
+    output_path = args.output.expanduser()
+    with hold_study_lock(
+        default_lock_path(output_path),
+        study_name="host comparison fairness repeatability",
+    ):
+        rows = build_rows(
+            igpu_device=str(args.igpu_device),
+            igpu_power_backend=str(args.igpu_power_backend),
+        )
+        write_rows(output_path, rows)
+        LOGGER.info(
+            "Wrote %d host comparison fairness rows to %s", len(rows), output_path
+        )
     return 0
 
 

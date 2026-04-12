@@ -12,39 +12,41 @@ import pandas as pd
 import seaborn as sns
 from matplotlib import pyplot as plt
 
-from .cases import FAMILY_IDS
-
 BLOCK_ORDER = ["qkv_proj", "mha_out_proj", "addnorm", "ffn"]
 BLOCK_LABELS = {
     "qkv_proj": "QKV Proj",
-    "mha_out_proj": "MHA Out Proj",
+    "mha_out_proj": "MHAO",
     "addnorm": "Add + Norm",
     "ffn": "FFN",
 }
-FAMILY_ORDER = list(FAMILY_IDS)
+FAMILY_ORDER = ["tinybert_512", "baseline_768", "baseline_1024"]
 FAMILY_LABELS = {
-    "tinybert_512": "Head Dim = 64 / Num Heads = 8 / FFN Dim = 2048",
-    "baseline_768": "Head Dim = 64 / Num Heads = 12 / FFN Dim = 3072",
-    "baseline_1024": "Head Dim = 64 / Num Heads = 16 / FFN Dim = 4096",
+    "tinybert_512": "TinyBERT",
+    "baseline_768": "BERT-Base",
+    "baseline_1024": "BERT-Large",
 }
 PALETTE = {
     "QKV Proj": "#1f6f8b",
-    "MHA Out Proj": "#e07a5f",
+    "MHAO": "#e07a5f",
     "Add + Norm": "#3d405b",
     "FFN": "#81b29a",
 }
 
 
-def variant_stem(variant: str) -> str:
-    return {
+def variant_stem(variant: str, y_scale: str = "log") -> str:
+    stem = {
         "standard": "best_latency_by_block",
         "slides": "best_latency_by_block_slides",
     }[variant]
+    if y_scale == "linear":
+        return f"{stem}_linear"
+    return stem
 
 
 def load_best_rows(results_csv: Path) -> pd.DataFrame:
     df = pd.read_csv(results_csv)
     df = df[df["run_status"] == "passed"].copy()
+    df = df[df["block_kind"].isin(BLOCK_ORDER)].copy()
     df["seq_len"] = df["seq_len"].astype(int)
     df["avg_latency_ms"] = df["avg_latency_ms"].astype(float)
 
@@ -64,35 +66,34 @@ def load_best_rows(results_csv: Path) -> pd.DataFrame:
     return best
 
 
-def plot_best_latency(best: pd.DataFrame, title: str, variant: str = "standard"):
+def plot_best_latency(
+    best: pd.DataFrame,
+    title: str,
+    variant: str = "standard",
+    y_scale: str = "log",
+):
     if variant == "slides":
         context = "poster"
-        figsize = (20, 11)
-        nrows, ncols = (2, 2) if len(FAMILY_ORDER) == 3 else (1, len(FAMILY_ORDER))
-        legend_bbox = None
-        title_y = 1.10
-        footnote_y = -0.01
-        family_title_size = 20
+        figsize = (22, 8.5)
+        nrows, ncols = 1, max(1, len(FAMILY_ORDER))
+        legend_bbox = (0.88, 0.5)
+        title_y = 0.99
+        family_title_size = 18
         y_label_size = 18
         x_label_size = 18
         tick_label_size = 14
-        legend_title_size = 18
-        legend_font_size = 16
-        legend_title = None
+        legend_font_size = 14
     else:
         context = "talk"
         figsize = (24, 8)
         nrows, ncols = 1, max(1, len(FAMILY_ORDER))
-        legend_bbox = (0.5, 1.02)
+        legend_bbox = (0.88, 0.5)
         title_y = 1.06
-        footnote_y = 0.005
         family_title_size = 16
         y_label_size = 16
         x_label_size = 16
         tick_label_size = 12
-        legend_title_size = 14
         legend_font_size = 13
-        legend_title = "Block"
 
     sns.set_theme(
         style="whitegrid",
@@ -113,14 +114,8 @@ def plot_best_latency(best: pd.DataFrame, title: str, variant: str = "standard")
         figsize=figsize,
         sharex=variant == "standard",
         sharey=True,
-        constrained_layout=True,
     )
     axes = [axes_obj] if not hasattr(axes_obj, "flatten") else list(axes_obj.flatten())
-    legend_ax = None
-    if variant == "slides" and len(FAMILY_ORDER) == 3:
-        legend_ax = axes[-1]
-        legend_ax.set_axis_off()
-        axes = axes[:-1]
 
     for ax, family_id in zip(axes, FAMILY_ORDER, strict=True):
         family_df = best[best["family_id"] == family_id].copy()
@@ -135,10 +130,14 @@ def plot_best_latency(best: pd.DataFrame, title: str, variant: str = "standard")
             errorbar=None,
             ax=ax,
         )
-        ax.set_yscale("log")
-        ax.set_ylabel("Latency (ms, log scale)", fontsize=y_label_size)
+        if y_scale == "log":
+            ax.set_yscale("log")
+        ax.set_ylabel(
+            "Latency (ms, log scale)" if y_scale == "log" else "Latency (ms)",
+            fontsize=y_label_size,
+        )
         ax.set_xlabel(
-            "" if variant == "standard" else "Context Length (tokens)",
+            "" if variant == "standard" else "Sequence Length",
             fontsize=x_label_size,
         )
         ax.set_title(
@@ -148,49 +147,28 @@ def plot_best_latency(best: pd.DataFrame, title: str, variant: str = "standard")
         ax.grid(True, which="minor", axis="y", linewidth=0.4, alpha=0.4)
         ax.legend_.remove()
         ax.tick_params(axis="both", labelsize=tick_label_size)
+        if ax is not axes[0]:
+            ax.set_ylabel("")
 
     if variant == "standard":
-        axes[-1].set_xlabel("Context Length (tokens)", fontsize=x_label_size)
+        axes[-1].set_xlabel("Sequence Length", fontsize=x_label_size)
     handles, labels = axes[0].get_legend_handles_labels()
-    if legend_ax is not None:
-        legend_ax.legend(
-            handles,
-            labels,
-            ncol=1,
-            loc="center",
-            frameon=False,
-            title=legend_title,
-            title_fontsize=legend_title_size,
-            fontsize=legend_font_size,
-        )
-    else:
-        fig.legend(
-            handles,
-            labels,
-            ncol=4,
-            loc="upper center",
-            bbox_to_anchor=legend_bbox,
-            frameon=False,
-            title=legend_title,
-            title_fontsize=legend_title_size,
-            fontsize=legend_font_size,
-        )
+    fig.legend(
+        handles,
+        labels,
+        ncol=1,
+        loc="center left",
+        bbox_to_anchor=legend_bbox,
+        frameon=False,
+        fontsize=legend_font_size,
+    )
     fig.suptitle(
         title,
         fontsize=24 if variant == "standard" else 28,
         fontweight="bold",
         y=title_y,
     )
-    if variant != "slides":
-        fig.text(
-            0.5,
-            footnote_y,
-            "Each bar shows the fastest passing candidate for that block at that sequence length.",
-            ha="center",
-            va="bottom",
-            fontsize=11,
-            color="#4a4a4a",
-        )
+    fig.tight_layout(rect=[0, 0.03, 0.84, 0.94])
     return fig
 
 
@@ -232,6 +210,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output filename stem, without extension",
     )
+    parser.add_argument(
+        "--y-scale",
+        choices=["log", "linear"],
+        default="log",
+        help="Y-axis scaling mode",
+    )
     return parser.parse_args()
 
 
@@ -240,8 +224,8 @@ def main() -> None:
     best = load_best_rows(args.results)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     title = "Latency Comparison of Blocks for Transformer Layer"
-    fig = plot_best_latency(best, title, variant=args.variant)
-    stem = args.stem or variant_stem(args.variant)
+    fig = plot_best_latency(best, title, variant=args.variant, y_scale=args.y_scale)
+    stem = args.stem or variant_stem(args.variant, args.y_scale)
     png_path = args.output_dir / f"{stem}.png"
     svg_path = args.output_dir / f"{stem}.svg"
     fig.savefig(png_path, dpi=220, bbox_inches="tight")

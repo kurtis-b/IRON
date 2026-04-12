@@ -14,6 +14,7 @@ from iron.applications.transformer_layer_new.study.block.cases import (
     get_case,
 )
 from iron.applications.transformer_layer_new.study.block.run import (
+    CSV_FIELDNAMES,
     BLOCK_CONFIG_COLUMNS,
     _threshold_validation_result,
     benchmark_candidate,
@@ -30,7 +31,11 @@ def test_block_case_table_covers_retained_surface():
     expected_candidate_sizes = {
         "qkv_proj": 5,
         "mha_out_proj": 6,
+        "mha_out_proj_causal": 6,
         "addnorm": 2,
+        "layer_norm": 2,
+        "elementwise_add": 2,
+        "causal_mask": 2,
         "ffn": 11,
     }
 
@@ -42,11 +47,37 @@ def test_block_case_table_covers_retained_surface():
             assert case.seq_len == seq_len
             for block_kind in BLOCK_KINDS:
                 candidates = case.candidates(block_kind)
-                assert candidates
-                assert all(
-                    len(candidate) == expected_candidate_sizes[block_kind]
-                    for candidate in candidates
-                )
+                if candidates:
+                    assert all(
+                        len(candidate) == expected_candidate_sizes[block_kind]
+                        for candidate in candidates
+                    )
+
+
+def test_decoder_only_blocks_are_present_only_for_decoder_like_shapes():
+    tinybert_case = get_case("tinybert_512", 256)
+    assert tinybert_case.candidates("mha_out_proj_causal") == ()
+    assert tinybert_case.candidates("layer_norm") == ()
+    assert tinybert_case.candidates("elementwise_add") == ()
+    assert tinybert_case.candidates("causal_mask") == ()
+
+    bert_case = get_case("baseline_768", 256)
+    assert len(bert_case.candidates("mha_out_proj_causal")) == 1
+    assert len(bert_case.candidates("layer_norm")) == 1
+    assert len(bert_case.candidates("elementwise_add")) == 1
+    assert len(bert_case.candidates("causal_mask")) == 1
+
+    long_seq_case = get_case("baseline_768", 8192)
+    assert len(long_seq_case.candidates("mha_out_proj_causal")) == 1
+    assert len(long_seq_case.candidates("layer_norm")) == 1
+    assert len(long_seq_case.candidates("elementwise_add")) == 1
+    assert long_seq_case.candidates("causal_mask") == ()
+
+
+def test_removed_cases_manifest_prunes_known_bad_tinybert_qkv_candidate():
+    case = get_case("tinybert_512", 256)
+    candidates = case.candidates("qkv_proj")
+    assert candidates == ((64, 64, 64, 4, 8),)
 
 
 def test_operator_kwargs_expand_shared_workload_correctly():
@@ -65,6 +96,12 @@ def test_operator_kwargs_expand_shared_workload_correctly():
     addnorm_kwargs = operator_kwargs(workload, "addnorm", case.addnorm[0])
     assert addnorm_kwargs["size"] == 512 * 768
     assert addnorm_kwargs["tile_size"] == 768
+
+    causal_mha_kwargs = operator_kwargs(
+        workload, "mha_out_proj_causal", case.mha_out_proj_causal[0]
+    )
+    assert causal_mha_kwargs["is_causal"] is True
+    assert causal_mha_kwargs["q_seq_tile"] == causal_mha_kwargs["kv_seq_tile"]
 
     ffn_kwargs = operator_kwargs(workload, "ffn", case.ffn[0])
     assert ffn_kwargs["M"] == 512
@@ -154,7 +191,11 @@ def test_main_writes_csv_for_selected_case(monkeypatch, tmp_path):
         latency_by_block = {
             "qkv_proj": 1.0,
             "mha_out_proj": 2.0,
+            "mha_out_proj_causal": 2.5,
             "addnorm": 3.0,
+            "layer_norm": 3.5,
+            "elementwise_add": 3.75,
+            "causal_mask": 3.9,
             "ffn": 4.0,
         }
         return {
@@ -185,6 +226,7 @@ def test_main_writes_csv_for_selected_case(monkeypatch, tmp_path):
             "2",
             "--output",
             str(output_path),
+            "--no-resume",
         ]
     )
 
@@ -197,16 +239,19 @@ def test_main_writes_csv_for_selected_case(monkeypatch, tmp_path):
     expected_row_count = sum(
         len(case.candidates(block_kind)) for block_kind in BLOCK_KINDS
     )
+    expected_block_kinds = {
+        block_kind for block_kind in BLOCK_KINDS if case.candidates(block_kind)
+    }
 
     assert len(rows) == expected_row_count
-    assert {row["block_kind"] for row in rows} == set(BLOCK_KINDS)
+    assert {row["block_kind"] for row in rows} == expected_block_kinds
     assert all(row["family_id"] == "baseline_768" for row in rows)
     assert all(row["seq_len"] == "64" for row in rows)
     assert all(row["run_status"] == "passed" for row in rows)
 
     best_rows = [row for row in rows if row["is_best"] == "True"]
-    assert len(best_rows) == len(BLOCK_KINDS)
-    assert {row["block_kind"] for row in best_rows} == set(BLOCK_KINDS)
+    assert len(best_rows) == len(expected_block_kinds)
+    assert {row["block_kind"] for row in best_rows} == expected_block_kinds
 
     config_columns = {
         column
@@ -262,6 +307,7 @@ def test_main_checkpoints_after_each_case(monkeypatch, tmp_path):
             "2",
             "--output",
             str(tmp_path / "ignored.csv"),
+            "--no-resume",
         ]
     )
 
@@ -278,8 +324,66 @@ def test_main_checkpoints_after_each_case(monkeypatch, tmp_path):
     ]
 
 
+def test_main_reuses_matching_passed_rows(monkeypatch, tmp_path):
+    output_path = tmp_path / "block_results.csv"
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "study_id": "block",
+                "family_id": "baseline_768",
+                "family_label": "768 / 3072 / 12",
+                "seq_len": 64,
+                "block_kind": "addnorm",
+                "candidate_index": 0,
+                "head_dim": 64,
+                "num_heads": 12,
+                "hidden_size": 768,
+                "ffn_dim": 3072,
+                "avg_latency_ms": 1.0,
+                "bandwidth_gbps": 10.0,
+                "warmup_iters": 1,
+                "timed_iters": 2,
+                "validation_error_count": 0,
+                "run_status": "passed",
+                "is_best": True,
+                "error_message": "",
+                "addnorm_num_aie_columns": 8,
+                "addnorm_tile_size": 768,
+            }
+        )
+
+    def fail_benchmark(*args, **kwargs):
+        raise AssertionError("benchmark_candidate should not be called")
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run.benchmark_candidate",
+        fail_benchmark,
+    )
+
+    exit_code = main(
+        [
+            "--family",
+            "baseline_768",
+            "--seq-len",
+            "64",
+            "--block",
+            "addnorm",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+
+
 def test_benchmark_candidate_runs_aggressive_cleanup_for_long_sequences(monkeypatch):
     cleanup_seq_lens: list[int] = []
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run.require_npu_power_mode_turbo",
+        lambda *, study_name: None,
+    )
 
     monkeypatch.setattr(
         "iron.applications.transformer_layer_new.study.block.run._benchmark_candidate_isolated_subprocess",
@@ -312,6 +416,10 @@ def test_benchmark_candidate_runs_aggressive_cleanup_for_long_sequences(monkeypa
 
 def test_benchmark_candidate_uses_subprocess_for_long_sequences(monkeypatch):
     calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run.require_npu_power_mode_turbo",
+        lambda *, study_name: None,
+    )
 
     monkeypatch.setattr(
         "iron.applications.transformer_layer_new.study.block.run._benchmark_candidate_isolated_subprocess",
@@ -353,6 +461,10 @@ def test_benchmark_candidate_uses_subprocess_for_long_sequences(monkeypatch):
 
 def test_benchmark_candidate_uses_in_process_for_short_sequences(monkeypatch):
     calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.block.run.require_npu_power_mode_turbo",
+        lambda *, study_name: None,
+    )
 
     monkeypatch.setattr(
         "iron.applications.transformer_layer_new.study.block.run._benchmark_candidate_in_process",

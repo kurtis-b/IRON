@@ -73,6 +73,11 @@ Environment setup:
 
 - `source /opt/xilinx/xrt/setup.sh`
 - `source ironenv/bin/activate`
+- `sudo xrt-smi configure --pmode turbo`
+- verify with `xrt-smi examine -r all`
+
+The benchmark helper checks `xrt-smi` before each measured candidate row and
+fails that measurement if the reported NPU power mode is not `turbo`.
 
 Selection flags:
 

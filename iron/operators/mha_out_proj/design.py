@@ -58,6 +58,7 @@ def main():
     argparser.add_argument("--emb-tile", type=int, default=64)
     argparser.add_argument("--o-proj-acc-depth", type=int, default=1)
     argparser.add_argument("--parallel-heads", type=int, default=1)
+    argparser.add_argument("--is-causal", action="store_true")
     argparser.add_argument("--emulate-bf16-mmul-with-bfp16", type=bool, default=True)
     argparser.add_argument("--trace_size", type=int, default=0)
     argparser.add_argument("--kernel-archive", type=str, default="mha_kernels.a")
@@ -81,6 +82,7 @@ def main():
         emb_tile=args.emb_tile,
         o_proj_acc_depth=args.o_proj_acc_depth,
         parallel_heads=args.parallel_heads,
+        is_causal=args.is_causal,
         emulate_bf16_mmul_with_bfp16=args.emulate_bf16_mmul_with_bfp16,
         kernel_archive=args.kernel_archive,
         trace_size=args.trace_size,
@@ -107,11 +109,13 @@ def fused_mha(
     emb_tile: int,
     o_proj_acc_depth: int,
     parallel_heads: int,
+    is_causal: bool,
     emulate_bf16_mmul_with_bfp16: bool,
     kernel_archive: str,
     trace_size: int = 0,
 ):
     del trace_size
+    del is_causal
 
     embed_sz = heads * d
     sequence_parallel_mode = parallel_seq > 1
@@ -132,6 +136,9 @@ def fused_mha(
     num_q_seq_blocks = seq_len // q_seq_tile
     num_kv_seq_blocks = seq_len // kv_seq_tile
     num_qkv_head_block_per_parallel_head = heads // parallel_heads
+    num_runtime_q_groups = (
+        num_q_seq_blocks // parallel_seq if sequence_parallel_mode else num_q_seq_blocks
+    )
     assert embed_sz % (emb_tile * o_proj_acc_depth) == 0, (
         "embed_sz must be divisible by emb_tile * o_proj_acc_depth "
         f"({embed_sz} % ({emb_tile} * {o_proj_acc_depth}) != 0)"
@@ -653,40 +660,41 @@ def fused_mha(
         of_a_out,
         zero,
         matmul_QK,
+        q_block_bias,
         q_block_stride,
-        q_block_rtp,
         barrier,
         idx_buffer,
     ):
-        barrier.wait_for_value(1)
-        current_q_block = q_block_rtp[0]
-
         for _ in range_(sys.maxsize):
+            barrier.wait_for_value(1)
 
             idx_buffer[0] = 0
-            idx_buffer[1] = current_q_block
+            idx_buffer[1] = q_block_bias
 
-            for _ in range_(num_qkv_head_block_per_parallel_head):
+            for _ in range_(num_runtime_q_groups):
+                for _ in range_(num_qkv_head_block_per_parallel_head):
 
-                elem_in_q = of_q.acquire(1)
+                    elem_in_q = of_q.acquire(1)
 
-                for _ in range_(num_kv_seq_blocks):
+                    for _ in range_(num_kv_seq_blocks):
 
-                    elem_in_k = of_k.acquire(1)
-                    elem_a_out = of_a_out.acquire(1)
+                        elem_in_k = of_k.acquire(1)
+                        elem_a_out = of_a_out.acquire(1)
 
-                    zero(elem_a_out)
-                    matmul_QK(elem_in_q, elem_in_k, elem_a_out, idx_buffer)
+                        zero(elem_a_out)
+                        matmul_QK(elem_in_q, elem_in_k, elem_a_out, idx_buffer)
 
-                    of_k.release(1)
-                    of_a_out.release(1)
+                        of_k.release(1)
+                        of_a_out.release(1)
 
-                    idx_buffer[0] += 1
-                idx_buffer[0] = 0
+                        idx_buffer[0] += 1
+                    idx_buffer[0] = 0
 
-                of_q.release(1)
+                    of_q.release(1)
 
-            current_q_block += q_block_stride
+                idx_buffer[1] += q_block_stride
+
+            barrier.release_with_value(0)
 
     def softmax(
         of_in_a,
@@ -695,56 +703,58 @@ def fused_mha(
         partial_softmax,
         init_scale_buffer,
         memcopy_kernel_scale,
+        q_block_bias,
         q_block_stride,
-        q_block_rtp,
         barrier,
         idx_buffer,
         scale_buffer,
     ):
-
         # VJUNG: The index buffer count how many Q and KV block this worker has processed
         # From this info we can infer the position in A and P
 
-        barrier.wait_for_value(1)
-        current_q_block = q_block_rtp[0]
-
         for _ in range_(sys.maxsize):
+            barrier.wait_for_value(1)
 
             # VJUNG: Required otherwise the buffer is maintained when doing warmup!
             idx_buffer[0] = 0
-            idx_buffer[1] = current_q_block
+            idx_buffer[1] = q_block_bias
 
-            for _ in range_(num_qkv_head_block_per_parallel_head):
+            for _ in range_(num_runtime_q_groups):
+                for _ in range_(num_qkv_head_block_per_parallel_head):
 
-                init_scale_buffer(scale_buffer, q_seq_tile)
+                    init_scale_buffer(scale_buffer, q_seq_tile)
 
-                for _ in range_(num_kv_seq_blocks):
+                    for _ in range_(num_kv_seq_blocks):
 
-                    elt_of_out_p = of_out_p.acquire(1)
-                    elt_of_in_a = of_in_a.acquire(1)
-                    elt_of_out_scale = of_out_scale.acquire(1)
+                        elt_of_out_p = of_out_p.acquire(1)
+                        elt_of_in_a = of_in_a.acquire(1)
+                        elt_of_out_scale = of_out_scale.acquire(1)
 
-                    partial_softmax(
-                        elt_of_in_a,
-                        elt_of_out_p,
-                        scale_buffer,
-                        idx_buffer,
-                        inv_scale,
-                        q_seq_tile,
-                        kv_seq_tile,
-                        seq_len,
-                        seq_len,
-                    )
-                    memcopy_kernel_scale(scale_buffer, elt_of_out_scale, 4 * q_seq_tile)
+                        partial_softmax(
+                            elt_of_in_a,
+                            elt_of_out_p,
+                            scale_buffer,
+                            idx_buffer,
+                            inv_scale,
+                            q_seq_tile,
+                            kv_seq_tile,
+                            seq_len,
+                            seq_len,
+                        )
+                        memcopy_kernel_scale(
+                            scale_buffer, elt_of_out_scale, 4 * q_seq_tile
+                        )
 
-                    of_in_a.release(1)
-                    of_out_p.release(1)
-                    of_out_scale.release(1)
+                        of_in_a.release(1)
+                        of_out_p.release(1)
+                        of_out_scale.release(1)
 
-                    idx_buffer[0] += 1
-                idx_buffer[0] = 0
+                        idx_buffer[0] += 1
+                    idx_buffer[0] = 0
 
-            current_q_block += q_block_stride
+                idx_buffer[1] += q_block_stride
+
+            barrier.release_with_value(0)
 
     def batched_matmul_pv(
         of_p,
@@ -754,102 +764,103 @@ def fused_mha(
         zero,
         matmul_PV,
         rescale_O,
+        q_block_bias,
         q_block_stride,
-        q_block_rtp,
         barrier,
         idx_buffer,
     ):
-        barrier.wait_for_value(1)
-        current_q_block = q_block_rtp[0]
-
         for _ in range_(sys.maxsize):
+            barrier.wait_for_value(1)
 
             # VJUNG: Required otherwise the buffer is maintained when doing warmup!
             idx_buffer[0] = 0
-            idx_buffer[1] = current_q_block
+            idx_buffer[1] = q_block_bias
 
-            for _ in range_(num_qkv_head_block_per_parallel_head):
+            for _ in range_(num_runtime_q_groups):
+                for _ in range_(num_qkv_head_block_per_parallel_head):
 
-                elem_o_out = of_o_out.acquire(1)
+                    elem_o_out = of_o_out.acquire(1)
 
-                zero(elem_o_out)
+                    zero(elem_o_out)
 
-                ### First iteration, don't rescale O_{i-1}
-                elem_in_p = of_p.acquire(1)
-                elem_in_v = of_v.acquire(1)
-                elt_of_out_scale = of_scale.acquire(1)
-
-                matmul_PV(
-                    elem_in_p,
-                    elem_in_v,
-                    elem_o_out,
-                    elt_of_out_scale,
-                    q_seq_tile,
-                    0,
-                    idx_buffer,
-                )
-
-                of_p.release(1)
-                of_v.release(1)
-                of_scale.release(1)
-
-                idx_buffer[0] += 1
-                ###
-
-                if num_kv_seq_blocks > 2:
-                    for _ in range_(num_kv_seq_blocks - 2):
-                        elem_in_p = of_p.acquire(1)
-                        elem_in_v = of_v.acquire(1)
-                        elt_of_out_scale2 = of_scale.acquire(1)
-
-                        matmul_PV(
-                            elem_in_p,
-                            elem_in_v,
-                            elem_o_out,
-                            elt_of_out_scale2,
-                            q_seq_tile,
-                            1,
-                            idx_buffer,
-                        )
-
-                        of_p.release(1)
-                        of_v.release(1)
-                        of_scale.release(1)
-
-                        idx_buffer[0] += 1
-
-                ### Last iteration, final rescaling
-                if num_kv_seq_blocks > 1:
+                    ### First iteration, don't rescale O_{i-1}
                     elem_in_p = of_p.acquire(1)
                     elem_in_v = of_v.acquire(1)
-                    elt_of_out_scale3 = of_scale.acquire(1)
+                    elt_of_out_scale = of_scale.acquire(1)
 
                     matmul_PV(
                         elem_in_p,
                         elem_in_v,
                         elem_o_out,
-                        elt_of_out_scale3,
+                        elt_of_out_scale,
                         q_seq_tile,
-                        1,
+                        0,
                         idx_buffer,
                     )
-                    rescale_O(elem_o_out, elt_of_out_scale3, q_seq_tile, idx_buffer)
 
                     of_p.release(1)
                     of_v.release(1)
                     of_scale.release(1)
 
                     idx_buffer[0] += 1
-                # else:
-                else:
-                    rescale_O(elem_o_out, elt_of_out_scale, q_seq_tile, idx_buffer)
-                    idx_buffer[0] += 1
-                ###
+                    ###
 
-                idx_buffer[0] = 0
-                of_o_out.release(1)
+                    if num_kv_seq_blocks > 2:
+                        for _ in range_(num_kv_seq_blocks - 2):
+                            elem_in_p = of_p.acquire(1)
+                            elem_in_v = of_v.acquire(1)
+                            elt_of_out_scale2 = of_scale.acquire(1)
 
-            current_q_block += q_block_stride
+                            matmul_PV(
+                                elem_in_p,
+                                elem_in_v,
+                                elem_o_out,
+                                elt_of_out_scale2,
+                                q_seq_tile,
+                                1,
+                                idx_buffer,
+                            )
+
+                            of_p.release(1)
+                            of_v.release(1)
+                            of_scale.release(1)
+
+                            idx_buffer[0] += 1
+
+                    ### Last iteration, final rescaling
+                    if num_kv_seq_blocks > 1:
+                        elem_in_p = of_p.acquire(1)
+                        elem_in_v = of_v.acquire(1)
+                        elt_of_out_scale3 = of_scale.acquire(1)
+
+                        matmul_PV(
+                            elem_in_p,
+                            elem_in_v,
+                            elem_o_out,
+                            elt_of_out_scale3,
+                            q_seq_tile,
+                            1,
+                            idx_buffer,
+                        )
+                        rescale_O(elem_o_out, elt_of_out_scale3, q_seq_tile, idx_buffer)
+
+                        of_p.release(1)
+                        of_v.release(1)
+                        of_scale.release(1)
+
+                        idx_buffer[0] += 1
+                    # else:
+                    else:
+                        rescale_O(elem_o_out, elt_of_out_scale, q_seq_tile, idx_buffer)
+                        idx_buffer[0] += 1
+                    ###
+
+                    idx_buffer[0] = 0
+                    of_o_out.release(1)
+
+                idx_buffer[1] += q_block_stride
+
+            barrier.release_with_value(0)
 
     def matmul_o_proj(
         of_o_in,
@@ -934,28 +945,16 @@ def fused_mha(
     softmax_workers = []
     matmul_pv_workers = []
     o_proj_workers = []
-    q_block_rtps = [
-        [
-            Buffer(
-                np.ndarray[(1,), np.dtype[np.int32]],
-                name=f"q_block_rtp_{stage}_{lane}",
-                initial_value=None,
-                use_write_rtp=True,
-            )
-            for lane in range(parallel_lanes)
-        ]
-        for stage in range(3)
-    ]
     worker_barriers = [
         [WorkerRuntimeBarrier(initial_value=0) for _ in range(parallel_lanes)]
         for _ in range(3)
     ]
-    q_block_stride = parallel_seq if sequence_parallel_mode else 0
+    q_block_stride = parallel_seq if sequence_parallel_mode else 1
     for i in range(parallel_lanes):
         seq_lane = i // parallel_heads if sequence_parallel_mode else 0
         head_lane = i % parallel_heads if sequence_parallel_mode else i
         idx_buffer_qk = Buffer(
-            initial_value=np.zeros(shape=(2,), dtype=np.int32),
+            initial_value=np.array([0, seq_lane], dtype=np.int32),
             name=f"idx_buffer_qk_{i}",
         )
         matmul_workers.append(
@@ -971,8 +970,8 @@ def fused_mha(
                     memA[i].prod(),
                     zero_kernel,
                     matmul_QK,
+                    seq_lane,
                     q_block_stride,
-                    q_block_rtps[0][i],
                     worker_barriers[0][i],
                     idx_buffer_qk,
                 ],
@@ -982,7 +981,7 @@ def fused_mha(
             )
         )
         idx_buffer_softmax = Buffer(
-            initial_value=np.zeros(shape=(2,), dtype=np.int32),
+            initial_value=np.array([0, seq_lane], dtype=np.int32),
             name=f"idx_buffer_softmax_{i}",
         )
         scale_buffer_softmax = Buffer(
@@ -999,8 +998,8 @@ def fused_mha(
                     partial_softmax_kernel,
                     scale_buffer_init_kernel,
                     memcopy_kernel_scale,
+                    seq_lane,
                     q_block_stride,
-                    q_block_rtps[1][i],
                     worker_barriers[1][i],
                     idx_buffer_softmax,
                     scale_buffer_softmax,
@@ -1011,7 +1010,7 @@ def fused_mha(
             )
         )
         idx_buffer_pv = Buffer(
-            initial_value=np.zeros(shape=(2,), dtype=np.int32),
+            initial_value=np.array([0, seq_lane], dtype=np.int32),
             name=f"idx_buffer_pv_{i}",
         )
         matmul_pv_workers.append(
@@ -1029,8 +1028,8 @@ def fused_mha(
                     zero_kernel_q,
                     matmul_PV,
                     rescale_O,
+                    seq_lane,
                     q_block_stride,
-                    q_block_rtps[2][i],
                     worker_barriers[2][i],
                     idx_buffer_pv,
                 ],
@@ -1224,16 +1223,6 @@ def fused_mha(
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
     with rt.sequence(W_O_ty, Q_ty, K_ty, V_ty, O_ty) as (W_O, Q, K, V, O):
-
-        def set_q_block_rtps():
-            for stage in range(3):
-                for lane in range(parallel_lanes):
-                    q_block_rtps[stage][lane][0] = (
-                        lane // parallel_heads if sequence_parallel_mode else 0
-                    )
-
-        rt.inline_ops(set_q_block_rtps, ())
-
         for stage in range(3):
             for lane in range(parallel_lanes):
                 rt.set_barrier(worker_barriers[stage][lane], 1)
@@ -1244,13 +1233,7 @@ def fused_mha(
             rt.start(matmul_pv_workers[i])
             rt.start(o_proj_workers[i])
 
-        num_runtime_q_groups = (
-            num_q_seq_blocks // parallel_seq
-            if sequence_parallel_mode
-            else num_q_seq_blocks
-        )
         for q_block_idx in range(num_runtime_q_groups):
-
             for col_group in range(num_o_col_groups):
                 # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
                 tg = rt.task_group()

@@ -20,9 +20,21 @@ from iron.operators.addnorm.op import AIEAddAndNorm
 from iron.operators.addnorm.reference import (
     generate_golden_reference as generate_addnorm_reference,
 )
+from iron.operators.causal_mask.op import AIECausalMask
+from iron.operators.causal_mask.reference import (
+    generate_golden_reference as generate_causal_mask_reference,
+)
+from iron.operators.elementwise_add.op import AIEElementwiseAdd
+from iron.operators.elementwise_add.reference import (
+    generate_golden_reference as generate_elementwise_add_reference,
+)
 from iron.operators.ffn.op import AIEFFN
 from iron.operators.ffn.reference import (
     generate_golden_reference as generate_ffn_reference,
+)
+from iron.operators.layer_norm.op import AIELayerNorm
+from iron.operators.layer_norm.reference import (
+    generate_golden_reference as generate_layer_norm_reference,
 )
 from iron.operators.mha_out_proj.op import AIEMHAOutProj
 from iron.operators.mha_out_proj.reference import (
@@ -32,6 +44,14 @@ from iron.operators.qkv_proj.op import AIEQKVProj
 from iron.operators.qkv_proj.reference import (
     generate_golden_reference as generate_qkv_proj_reference,
 )
+from iron.applications.transformer_layer_new.pattern.runlist.op import (
+    resolve_runlist_operator_config,
+)
+from ..npu_runtime_checks import (
+    require_npu_power_mode_turbo,
+    warn_if_npu_power_mode_not_turbo,
+)
+from ..run_lock import default_lock_path, hold_study_lock
 
 from .cases import (
     BLOCK_KINDS,
@@ -46,6 +66,10 @@ LOGGER = logging.getLogger(__name__)
 REL_TOL = 4.0e-2
 ABS_TOL = 1.5e-1
 ERROR_THRESHOLD = 0.005
+EXACT_REL_TOL = 4.0e-2
+EXACT_ABS_TOL = 1e-6
+LAYER_NORM_REL_TOL = 1.0e-1
+LAYER_NORM_ABS_TOL = 1.0e-1
 
 BLOCK_CONFIG_COLUMNS: dict[BlockKind, tuple[str, ...]] = {
     "qkv_proj": (
@@ -63,9 +87,29 @@ BLOCK_CONFIG_COLUMNS: dict[BlockKind, tuple[str, ...]] = {
         "mha_out_proj_parallel_heads",
         "mha_out_proj_o_proj_acc_depth",
     ),
+    "mha_out_proj_causal": (
+        "mha_out_proj_causal_parallel_seq",
+        "mha_out_proj_causal_q_seq_tile",
+        "mha_out_proj_causal_kv_seq_tile",
+        "mha_out_proj_causal_emb_tile",
+        "mha_out_proj_causal_parallel_heads",
+        "mha_out_proj_causal_o_proj_acc_depth",
+    ),
     "addnorm": (
         "addnorm_num_aie_columns",
         "addnorm_tile_size",
+    ),
+    "layer_norm": (
+        "layer_norm_num_aie_columns",
+        "layer_norm_num_channels",
+    ),
+    "elementwise_add": (
+        "elementwise_add_num_aie_columns",
+        "elementwise_add_num_channels",
+    ),
+    "causal_mask": (
+        "causal_mask_num_aie_columns",
+        "causal_mask_num_channels",
     ),
     "ffn": (
         "ffn_num_aie_columns",
@@ -107,6 +151,18 @@ CSV_FIELDNAMES = (
 
 def default_output_path() -> Path:
     return Path(__file__).resolve().parents[2] / "results" / "block" / "results.csv"
+
+
+def default_resume_input_paths(output_path: Path) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    candidate = (
+        Path(__file__).resolve().parents[2] / "results_final" / "block" / "results.csv"
+    )
+    if candidate.exists():
+        paths.append(candidate)
+    if output_path.exists() and output_path not in paths:
+        paths.append(output_path)
+    return tuple(paths)
 
 
 def _case_descriptor(family_id: str, workload: BlockWorkload) -> str:
@@ -183,6 +239,28 @@ def operator_kwargs(
             "o_proj_acc_depth": o_proj_acc_depth,
         }
 
+    if block_kind == "mha_out_proj_causal":
+        (
+            parallel_seq,
+            q_seq_tile,
+            kv_seq_tile,
+            emb_tile,
+            parallel_heads,
+            o_proj_acc_depth,
+        ) = candidate
+        return {
+            "num_heads": workload.num_heads,
+            "seq_len": workload.seq_len,
+            "d": workload.head_dim,
+            "parallel_seq": parallel_seq,
+            "q_seq_tile": q_seq_tile,
+            "kv_seq_tile": kv_seq_tile,
+            "emb_tile": emb_tile,
+            "parallel_heads": parallel_heads,
+            "o_proj_acc_depth": o_proj_acc_depth,
+            "is_causal": True,
+        }
+
     if block_kind == "addnorm":
         num_aie_columns, tile_size = candidate
         return {
@@ -190,6 +268,41 @@ def operator_kwargs(
             "num_aie_columns": num_aie_columns,
             "tile_size": tile_size,
         }
+
+    if block_kind == "layer_norm":
+        num_aie_columns, num_channels = candidate
+        return {
+            "size": workload.seq_len * workload.hidden_size,
+            "num_aie_columns": num_aie_columns,
+            "num_channels": num_channels,
+            "tile_size": workload.hidden_size,
+        }
+
+    if block_kind == "elementwise_add":
+        num_aie_columns, num_channels = candidate
+        return {
+            "size": workload.seq_len * workload.hidden_size,
+            "num_aie_columns": num_aie_columns,
+            "num_channels": num_channels,
+            "tile_size": workload.hidden_size,
+        }
+
+    if block_kind == "causal_mask":
+        num_aie_columns, num_channels = candidate
+        return resolve_runlist_operator_config(
+            workload.seq_len,
+            workload.hidden_size,
+            workload.ffn_dim,
+            workload.num_heads,
+            workload_variant="decoder_gpt2",
+            num_aie_columns=num_aie_columns,
+            operator_config={
+                "causal_mask": {
+                    "num_aie_columns": num_aie_columns,
+                    "num_channels": num_channels,
+                }
+            },
+        )["causal_mask"]
 
     if block_kind == "ffn":
         (
@@ -330,6 +443,25 @@ def _benchmark_mha_out_proj(
     timed_iters: int,
     seed: int,
 ) -> dict[str, object]:
+    return _benchmark_mha_out_proj_variant(
+        workload,
+        candidate,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        seed=seed,
+        is_causal=False,
+    )
+
+
+def _benchmark_mha_out_proj_variant(
+    workload: BlockWorkload,
+    candidate: tuple[object, ...],
+    *,
+    warmup_iters: int,
+    timed_iters: int,
+    seed: int,
+    is_causal: bool,
+) -> dict[str, object]:
     context = AIEContext()
     try:
         reference = generate_mha_out_proj_reference(
@@ -337,10 +469,15 @@ def _benchmark_mha_out_proj(
             seq_len=workload.seq_len,
             d=workload.head_dim,
             seed=seed,
+            is_causal=is_causal,
         )
         operator = AIEMHAOutProj(
             context=context,
-            **operator_kwargs(workload, "mha_out_proj", candidate),
+            **operator_kwargs(
+                workload,
+                "mha_out_proj_causal" if is_causal else "mha_out_proj",
+                candidate,
+            ),
         )
         errors, latency_us, bandwidth_gbps = run_test(
             operator,
@@ -372,6 +509,24 @@ def _benchmark_mha_out_proj(
         }
     finally:
         context.reset_runtime()
+
+
+def _benchmark_mha_out_proj_causal(
+    workload: BlockWorkload,
+    candidate: tuple[object, ...],
+    *,
+    warmup_iters: int,
+    timed_iters: int,
+    seed: int,
+) -> dict[str, object]:
+    return _benchmark_mha_out_proj_variant(
+        workload,
+        candidate,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        seed=seed,
+        is_causal=True,
+    )
 
 
 def _benchmark_addnorm(
@@ -416,6 +571,132 @@ def _benchmark_addnorm(
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
             max_acceptable_errors=int(total_size * ERROR_THRESHOLD),
+        )
+        return {
+            "avg_latency_ms": latency_us / 1000.0,
+            "bandwidth_gbps": bandwidth_gbps,
+            **validation,
+        }
+    finally:
+        context.reset_runtime()
+
+
+def _benchmark_layer_norm(
+    workload: BlockWorkload,
+    candidate: tuple[object, ...],
+    *,
+    warmup_iters: int,
+    timed_iters: int,
+    seed: int,
+) -> dict[str, object]:
+    context = AIEContext()
+    try:
+        kwargs = operator_kwargs(workload, "layer_norm", candidate)
+        total_size = int(kwargs["size"])
+        tile_size = int(kwargs["tile_size"])
+        reference = generate_layer_norm_reference(
+            rows=total_size // tile_size,
+            cols=tile_size,
+            seed=seed,
+        )
+        operator = AIELayerNorm(context=context, **kwargs)
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator,
+            {"input": reference["input"]},
+            {"output": reference["output"]},
+            rel_tol=LAYER_NORM_REL_TOL,
+            abs_tol=LAYER_NORM_ABS_TOL,
+            warmup_iters=warmup_iters,
+            timed_iters=timed_iters,
+        )
+        validation = _threshold_validation_result(
+            {"output": len(errors.get("output", []))},
+            max_acceptable_errors=int(total_size * ERROR_THRESHOLD),
+        )
+        return {
+            "avg_latency_ms": latency_us / 1000.0,
+            "bandwidth_gbps": bandwidth_gbps,
+            **validation,
+        }
+    finally:
+        context.reset_runtime()
+
+
+def _benchmark_elementwise_add(
+    workload: BlockWorkload,
+    candidate: tuple[object, ...],
+    *,
+    warmup_iters: int,
+    timed_iters: int,
+    seed: int,
+) -> dict[str, object]:
+    context = AIEContext()
+    try:
+        kwargs = operator_kwargs(workload, "elementwise_add", candidate)
+        reference = generate_elementwise_add_reference(
+            input_length=int(kwargs["size"]),
+            seed=seed,
+        )
+        operator = AIEElementwiseAdd(context=context, **kwargs)
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator,
+            {"input1": reference["A"], "input2": reference["B"]},
+            {"output": reference["C"]},
+            rel_tol=EXACT_REL_TOL,
+            abs_tol=EXACT_ABS_TOL,
+            warmup_iters=warmup_iters,
+            timed_iters=timed_iters,
+        )
+        validation = _threshold_validation_result(
+            {"output": len(errors.get("output", []))},
+            max_acceptable_errors=int(int(kwargs["size"]) * ERROR_THRESHOLD),
+        )
+        return {
+            "avg_latency_ms": latency_us / 1000.0,
+            "bandwidth_gbps": bandwidth_gbps,
+            **validation,
+        }
+    finally:
+        context.reset_runtime()
+
+
+def _benchmark_causal_mask(
+    workload: BlockWorkload,
+    candidate: tuple[object, ...],
+    *,
+    warmup_iters: int,
+    timed_iters: int,
+    seed: int,
+) -> dict[str, object]:
+    context = AIEContext()
+    try:
+        kwargs = operator_kwargs(workload, "causal_mask", candidate)
+        reference = generate_causal_mask_reference(
+            query_block_size=int(kwargs["query_block_size"]),
+            seq_len=int(kwargs["seq_len"]),
+            num_heads=int(kwargs["num_heads"]),
+            q_start=int(kwargs.get("q_start", 0)),
+            masked_fill_value=float(kwargs["masked_fill_value"]),
+            seed=seed,
+        )
+        operator = AIECausalMask(context=context, **kwargs)
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator,
+            {"input1": reference["input"]},
+            {"output": reference["output"]},
+            rel_tol=EXACT_REL_TOL,
+            abs_tol=EXACT_ABS_TOL,
+            warmup_iters=warmup_iters,
+            timed_iters=timed_iters,
+        )
+        validation = _threshold_validation_result(
+            {"output": len(errors.get("output", []))},
+            max_acceptable_errors=int(
+                int(kwargs["query_block_size"])
+                * int(kwargs["seq_len"])
+                * int(kwargs["num_heads"])
+                * ERROR_THRESHOLD
+            ),
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
@@ -485,6 +766,7 @@ def benchmark_candidate(
     timed_iters: int,
     seed: int,
 ) -> dict[str, object]:
+    require_npu_power_mode_turbo(study_name="block study")
     if _should_use_aggressive_cleanup(workload.seq_len):
         return _benchmark_candidate_isolated_subprocess(
             block_kind,
@@ -517,7 +799,11 @@ def _benchmark_candidate_in_process(
     benchmarkers = {
         "qkv_proj": _benchmark_qkv_proj,
         "mha_out_proj": _benchmark_mha_out_proj,
+        "mha_out_proj_causal": _benchmark_mha_out_proj_causal,
         "addnorm": _benchmark_addnorm,
+        "layer_norm": _benchmark_layer_norm,
+        "elementwise_add": _benchmark_elementwise_add,
+        "causal_mask": _benchmark_causal_mask,
         "ffn": _benchmark_ffn,
     }
     try:
@@ -643,6 +929,87 @@ def write_rows(output_path: Path, rows: list[dict[str, object]]) -> None:
             writer.writerow({field: row.get(field, "") for field in CSV_FIELDNAMES})
 
 
+def _candidate_key(
+    family_id: str,
+    seq_len: int,
+    block_kind: BlockKind,
+    candidate_index: int,
+) -> tuple[str, int, BlockKind, int]:
+    return (family_id, seq_len, block_kind, candidate_index)
+
+
+def _config_signature_from_row(
+    row: dict[str, object],
+    block_kind: BlockKind,
+) -> tuple[str, ...]:
+    return tuple(
+        str(row.get(column, "")) for column in BLOCK_CONFIG_COLUMNS[block_kind]
+    )
+
+
+def _config_signature_from_candidate(
+    block_kind: BlockKind,
+    candidate: tuple[object, ...],
+) -> tuple[str, ...]:
+    return tuple(str(value) for value in candidate)
+
+
+def load_existing_rows_from_paths(
+    paths: tuple[Path, ...],
+) -> dict[tuple[str, int, BlockKind, int], dict[str, object]]:
+    expected_keys = {
+        _candidate_key(case.family_id, case.seq_len, block_kind, candidate_index)
+        for case in iter_cases()
+        for block_kind in BLOCK_KINDS
+        for candidate_index, _candidate in enumerate(case.candidates(block_kind))
+    }
+    existing: dict[tuple[str, int, BlockKind, int], dict[str, object]] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                block_kind = str(row.get("block_kind") or "")
+                if block_kind not in BLOCK_CONFIG_COLUMNS:
+                    continue
+                try:
+                    key = _candidate_key(
+                        str(row.get("family_id") or ""),
+                        int(row.get("seq_len") or 0),
+                        block_kind,  # type: ignore[arg-type]
+                        int(row.get("candidate_index") or 0),
+                    )
+                except ValueError:
+                    continue
+                if key not in expected_keys:
+                    continue
+                existing[key] = dict(row)
+    return existing
+
+
+def reusable_existing_row(
+    existing_rows: dict[tuple[str, int, BlockKind, int], dict[str, object]],
+    *,
+    family_id: str,
+    seq_len: int,
+    block_kind: BlockKind,
+    candidate_index: int,
+    candidate: tuple[object, ...],
+) -> dict[str, object] | None:
+    row = existing_rows.get(
+        _candidate_key(family_id, seq_len, block_kind, candidate_index)
+    )
+    if row is None:
+        return None
+    if row.get("run_status") != "passed":
+        return None
+    if _config_signature_from_row(row, block_kind) != _config_signature_from_candidate(
+        block_kind, candidate
+    ):
+        return None
+    return dict(row)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark shared block-study candidates."
@@ -668,6 +1035,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timed-iters", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, default=default_output_path())
+    parser.add_argument(
+        "--resume-input",
+        type=Path,
+        default=None,
+        help="Reuse matching passed rows from this prior results CSV.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Do not reuse rows from the current output path or results_final snapshot.",
+    )
     return parser.parse_args(argv)
 
 
@@ -713,6 +1091,9 @@ def build_rows(
     warmup_iters: int | None,
     timed_iters: int | None,
     seed: int,
+    existing_rows: (
+        dict[tuple[str, int, BlockKind, int], dict[str, object]] | None
+    ) = None,
 ) -> list[dict[str, object]]:
     family_id = None if family_argument == "all" else family_argument
     seq_len = selected_seq_len(seq_len_argument)
@@ -727,6 +1108,7 @@ def build_rows(
                 warmup_iters=warmup_iters,
                 timed_iters=timed_iters,
                 seed=seed,
+                existing_rows={} if existing_rows is None else existing_rows,
             )
         )
 
@@ -741,6 +1123,7 @@ def build_case_rows(
     warmup_iters: int | None,
     timed_iters: int | None,
     seed: int,
+    existing_rows: dict[tuple[str, int, BlockKind, int], dict[str, object]],
 ) -> list[dict[str, object]]:
     case_warmup_iters, case_timed_iters = iteration_schedule(
         case.seq_len,
@@ -750,6 +1133,24 @@ def build_case_rows(
     rows: list[dict[str, object]] = []
     for block_kind in block_kinds:
         for candidate_index, candidate in enumerate(case.candidates(block_kind)):
+            reused_row = reusable_existing_row(
+                existing_rows,
+                family_id=case.family_id,
+                seq_len=case.seq_len,
+                block_kind=block_kind,
+                candidate_index=candidate_index,
+                candidate=candidate,
+            )
+            if reused_row is not None:
+                LOGGER.info(
+                    "Reusing family=%s seq_len=%s block=%s candidate=%s from existing results",
+                    case.family_id,
+                    case.seq_len,
+                    block_kind,
+                    candidate_index,
+                )
+                rows.append(reused_row)
+                continue
             LOGGER.info(
                 "Benchmarking family=%s seq_len=%s block=%s candidate=%s warmup_iters=%s timed_iters=%s",
                 case.family_id,
@@ -795,38 +1196,70 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
     args = parse_args(argv)
-    family_id = None if args.family == "all" else args.family
-    seq_len = selected_seq_len(args.seq_len)
-    block_kinds = selected_block_kinds(args.block)
-    cases = tuple(iter_cases(family_id=family_id, seq_len=seq_len))
-    rows: list[dict[str, object]] = []
+    warn_if_npu_power_mode_not_turbo(LOGGER, study_name="block study")
+    output_path = args.output.expanduser()
+    with hold_study_lock(
+        default_lock_path(output_path),
+        study_name="block study",
+    ):
+        resume_paths: tuple[Path, ...] = tuple()
+        if not args.no_resume:
+            if args.resume_input is not None:
+                resume_paths = (args.resume_input.expanduser(),)
+            else:
+                resume_paths = default_resume_input_paths(output_path)
+        existing_rows = load_existing_rows_from_paths(resume_paths)
+        if resume_paths and existing_rows:
+            LOGGER.info(
+                "Loaded %d reusable block rows from %s",
+                len(existing_rows),
+                ", ".join(str(path) for path in resume_paths),
+            )
+        family_id = None if args.family == "all" else args.family
+        seq_len = selected_seq_len(args.seq_len)
+        block_kinds = selected_block_kinds(args.block)
+        cases = tuple(iter_cases(family_id=family_id, seq_len=seq_len))
+        row_map: dict[tuple[str, int, BlockKind, int], dict[str, object]] = dict(
+            existing_rows
+        )
+        rows: list[dict[str, object]] = list(row_map.values())
 
-    LOGGER.info(
-        "Starting block study with %d case(s), block=%s", len(cases), args.block
-    )
-    for case_index, case in enumerate(cases, start=1):
         LOGGER.info(
-            "Case %d/%d: %s",
-            case_index,
-            len(cases),
-            _case_descriptor(case.family_id, case.workload),
+            "Starting block study with %d case(s), block=%s", len(cases), args.block
         )
-        case_rows = build_case_rows(
-            case,
-            block_kinds=block_kinds,
-            warmup_iters=args.warmup_iters,
-            timed_iters=args.timed_iters,
-            seed=args.seed,
-        )
-        rows.extend(case_rows)
-        mark_best_rows(rows)
-        write_rows(args.output, rows)
-        LOGGER.info("Checkpointed %d block-study rows", len(rows))
-        _aggressive_cleanup(case.seq_len)
+        for case_index, case in enumerate(cases, start=1):
+            LOGGER.info(
+                "Case %d/%d: %s",
+                case_index,
+                len(cases),
+                _case_descriptor(case.family_id, case.workload),
+            )
+            case_rows = build_case_rows(
+                case,
+                block_kinds=block_kinds,
+                warmup_iters=args.warmup_iters,
+                timed_iters=args.timed_iters,
+                seed=args.seed,
+                existing_rows=existing_rows,
+            )
+            for row in case_rows:
+                row_map[
+                    _candidate_key(
+                        str(row["family_id"]),
+                        int(row["seq_len"]),
+                        str(row["block_kind"]),  # type: ignore[arg-type]
+                        int(row["candidate_index"]),
+                    )
+                ] = row
+            rows = list(row_map.values())
+            mark_best_rows(rows)
+            write_rows(output_path, rows)
+            LOGGER.info("Checkpointed %d block-study rows", len(rows))
+            _aggressive_cleanup(case.seq_len)
 
-    mark_best_rows(rows)
-    write_rows(args.output, rows)
-    LOGGER.info("Wrote %s rows to %s", len(rows), args.output)
+        mark_best_rows(rows)
+        write_rows(output_path, rows)
+        LOGGER.info("Wrote %s rows to %s", len(rows), output_path)
     return 0
 
 

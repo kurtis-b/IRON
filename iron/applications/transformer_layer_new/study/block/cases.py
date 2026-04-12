@@ -4,17 +4,41 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import csv
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from pathlib import Path
 from typing import Literal, Sequence
 
-BlockKind = Literal["qkv_proj", "mha_out_proj", "addnorm", "ffn"]
+BlockKind = Literal[
+    "qkv_proj",
+    "mha_out_proj",
+    "mha_out_proj_causal",
+    "addnorm",
+    "layer_norm",
+    "elementwise_add",
+    "causal_mask",
+    "ffn",
+]
 
 QKVProjCandidate = tuple[int, int, int, int, int]
 MHAOutProjCandidate = tuple[int, int, int, int, int, int]
 AddNormCandidate = tuple[int, int]
+LayerNormCandidate = tuple[int, int]
+ElementwiseAddCandidate = tuple[int, int]
+CausalMaskCandidate = tuple[int, int]
 FFNCandidate = tuple[int, bool, bool, int, int, int, int, int, int, int | None, int]
 
-BLOCK_KINDS: tuple[BlockKind, ...] = ("qkv_proj", "mha_out_proj", "addnorm", "ffn")
+BLOCK_KINDS: tuple[BlockKind, ...] = (
+    "qkv_proj",
+    "mha_out_proj",
+    "mha_out_proj_causal",
+    "addnorm",
+    "layer_norm",
+    "elementwise_add",
+    "causal_mask",
+    "ffn",
+)
 FAMILY_IDS: tuple[str, ...] = ("tinybert_512", "baseline_768", "baseline_1024")
 SEQUENCE_LADDER: tuple[int, ...] = (
     64,
@@ -51,7 +75,11 @@ class BlockCase:
     workload: BlockWorkload
     qkv_proj: tuple[QKVProjCandidate, ...]
     mha_out_proj: tuple[MHAOutProjCandidate, ...]
+    mha_out_proj_causal: tuple[MHAOutProjCandidate, ...]
     addnorm: tuple[AddNormCandidate, ...]
+    layer_norm: tuple[LayerNormCandidate, ...]
+    elementwise_add: tuple[ElementwiseAddCandidate, ...]
+    causal_mask: tuple[CausalMaskCandidate, ...]
     ffn: tuple[FFNCandidate, ...]
 
     @property
@@ -63,7 +91,15 @@ class BlockCase:
         return self.workload.family_label
 
     def candidates(self, block_kind: BlockKind) -> tuple[tuple[object, ...], ...]:
-        return getattr(self, block_kind)
+        removed_indices = _removed_candidate_indices().get(
+            (self.family_id, self.seq_len, block_kind),
+            frozenset(),
+        )
+        return tuple(
+            candidate
+            for index, candidate in enumerate(getattr(self, block_kind))
+            if index not in removed_indices
+        )
 
 
 def _normalize_candidates(
@@ -81,7 +117,11 @@ def make_case(
     *,
     qkv_proj: Sequence[QKVProjCandidate] | None = None,
     mha_out_proj: Sequence[MHAOutProjCandidate] | None = None,
+    mha_out_proj_causal: Sequence[MHAOutProjCandidate] | None = None,
     addnorm: Sequence[AddNormCandidate] | None = None,
+    layer_norm: Sequence[LayerNormCandidate] | None = None,
+    elementwise_add: Sequence[ElementwiseAddCandidate] | None = None,
+    causal_mask: Sequence[CausalMaskCandidate] | None = None,
     ffn: Sequence[FFNCandidate] | None = None,
 ) -> BlockCase:
     workload = BlockWorkload(
@@ -97,11 +137,38 @@ def make_case(
         mha_out_proj=_normalize_candidates(
             mha_out_proj or ((1, 32, 64, workload.head_dim, 1, 1),)
         ),
+        mha_out_proj_causal=_normalize_candidates(mha_out_proj_causal or ()),
         addnorm=_normalize_candidates(addnorm or ((8, workload.hidden_size),)),
+        layer_norm=_normalize_candidates(layer_norm or ()),
+        elementwise_add=_normalize_candidates(elementwise_add or ()),
+        causal_mask=_normalize_candidates(causal_mask or ()),
         ffn=_normalize_candidates(
             ffn or ((8, False, False, 64, 48, 96, 8, 4, 4, None, 1),)
         ),
     )
+
+
+def removed_cases_path() -> Path:
+    return Path(__file__).with_name("removed_cases.csv")
+
+
+@lru_cache(maxsize=1)
+def _removed_candidate_indices() -> dict[tuple[str, int, BlockKind], frozenset[int]]:
+    path = removed_cases_path()
+    if not path.exists():
+        return {}
+
+    removed: dict[tuple[str, int, BlockKind], set[int]] = {}
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            family_id = str(row.get("family_id") or "").strip()
+            seq_len = int(row["seq_len"])
+            block_kind = row["block_kind"]
+            candidate_index = int(row["candidate_index"])
+            key = (family_id, seq_len, block_kind)  # type: ignore[arg-type]
+            removed.setdefault(key, set()).add(candidate_index)
+
+    return {key: frozenset(indices) for key, indices in removed.items()}
 
 
 def _tinybert_512_case(seq_len: int) -> BlockCase:
@@ -569,6 +636,58 @@ BLOCK_CASES: dict[str, dict[int, BlockCase]] = {
         ),
     },
 }
+
+
+def _decoder_only_block_candidates(
+    family_id: str,
+    seq_len: int,
+) -> dict[str, tuple[tuple[object, ...], ...]]:
+    if family_id == "baseline_768":
+        causal_mha = (
+            ((1, 32, 32, 96, 6, 8),)
+            if seq_len == 64
+            else (
+                ((4, 32, 32, 96, 2, 8),) if seq_len == 128 else ((8, 32, 32, 96, 1, 8),)
+            )
+        )
+        return {
+            "mha_out_proj_causal": causal_mha,
+            "layer_norm": ((8, 2),),
+            "elementwise_add": ((8, 2),),
+            "causal_mask": ((8, 2),) if seq_len <= 4096 else tuple(),
+        }
+
+    if family_id == "baseline_1024":
+        causal_mha = (
+            ((1, 32, 32, 128, 4, 8),)
+            if seq_len == 64
+            else (
+                ((4, 32, 32, 128, 2, 8),)
+                if seq_len == 128
+                else ((8, 32, 32, 128, 1, 8),)
+            )
+        )
+        return {
+            "mha_out_proj_causal": causal_mha,
+            "layer_norm": ((8, 2),),
+            "elementwise_add": ((8, 2),),
+            "causal_mask": ((8, 2),) if seq_len <= 4096 else tuple(),
+        }
+
+    return {
+        "mha_out_proj_causal": tuple(),
+        "layer_norm": tuple(),
+        "elementwise_add": tuple(),
+        "causal_mask": tuple(),
+    }
+
+
+for _family_id in FAMILY_IDS:
+    for _seq_len in SEQUENCE_LADDER:
+        BLOCK_CASES[_family_id][_seq_len] = replace(
+            BLOCK_CASES[_family_id][_seq_len],
+            **_decoder_only_block_candidates(_family_id, _seq_len),
+        )
 
 
 def get_case(family_id: str, seq_len: int) -> BlockCase:

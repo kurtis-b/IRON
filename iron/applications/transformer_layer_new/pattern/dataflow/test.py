@@ -8,7 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 from iron.applications.transformer_layer_new.pattern.dataflow.op import (
-    AIETransformerDataflow,
+    AIETransformerHybrid,
 )
 from iron.applications.transformer_layer_new.pattern.reference import (
     generate_golden_reference,
@@ -71,7 +71,7 @@ def test_transformer_layer(
 ):
     golden_ref = generate_golden_reference(seq_len, embedding_dim, ffn_dim, num_heads)
 
-    operator = AIETransformerDataflow(
+    operator = AIETransformerHybrid(
         seq_len=seq_len,
         hidden_size=embedding_dim,
         intermediate_size=ffn_dim,

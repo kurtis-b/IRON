@@ -157,6 +157,7 @@ class AIEOperatorBase(ABC):
         Subclasses are expected to overwrite set_up(); they may register any artifacts that they need to be compiled there.
         """
         context = self.context
+        comp.CompilationArtifact._instances.clear()
         self.set_up_artifacts()
         self._move_artifact_paths()
         work_list = comp.get_work_list(self.artifacts)
@@ -177,7 +178,7 @@ class AIEOperatorBase(ABC):
             logging.info(
                 f"Compiling {len(work_list)} new artifacts for AIE operator {self.__class__.__name__}: {', '.join(str(artifact.path.name) for artifact in work_list)}"
             )
-        comp.compile(compilation_rules, work_list)
+        comp.compile(compilation_rules, self.artifacts)
 
     def add_artifacts(self, artifacts):
         self.artifacts.extend(artifacts)

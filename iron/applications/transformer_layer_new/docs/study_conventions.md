@@ -16,6 +16,7 @@ This note defines the current shared rules for the implemented
 - `resource_usage`
 - `host_comparison`
 - `memcpy_bandwidth`
+- `roofline`
 
 ## Retained Cases
 
@@ -27,6 +28,12 @@ Current families:
   `hidden_size=768`, `intermediate_size=3072`, `num_attention_heads=12`
 - `baseline_1024`
   `hidden_size=1024`, `intermediate_size=4096`, `num_attention_heads=16`
+- `gpt2_small_768`
+  `hidden_size=768`, `intermediate_size=3072`, `num_attention_heads=12`,
+  `workload_variant=decoder_gpt2`
+- `gpt2_medium_1024`
+  `hidden_size=1024`, `intermediate_size=4096`, `num_attention_heads=16`,
+  `workload_variant=decoder_gpt2`
 
 Deferred family:
 
@@ -41,12 +48,12 @@ Sequence ladder:
 
 The retained NPU execution modes are:
 
-- `dataflow`
+- `hybrid`
 - `runlist`
 
 The end-to-end study uses checked-in candidate files:
 
-- `study/end_to_end/dataflow_candidates.json`
+- `study/end_to_end/hybrid_candidates.json`
 - `study/end_to_end/runlist_candidates.json`
 
 The shared synthetic generator lives in:
@@ -81,22 +88,38 @@ Canonical CSV outputs:
 - `results/end_to_end/fairness_repeatability.csv`
 - `results/memory_tile_staging/results.csv`
 - `results/resource_usage/dataflow_block_best_configs.csv`
+- `results/resource_usage/hybrid_selected_ops.csv`
 - `results/resource_usage/runlist_selected_ops.csv`
 - `results/host_comparison/results.csv`
 - `results/host_comparison/fairness_repeatability.csv`
 - `results/memcpy_bandwidth/results.csv`
+- `results/roofline/kernel_points.csv`
+- `results/roofline/implementation_points.csv`
+- `results/roofline/kernel_roofline_*_tiles.svg`
+- `results/roofline/implementation_roofline_*_tiles.svg`
 
-The end-to-end CSV keeps one row per `(study_case_id, seq_len, execution_mode)`.
+The end-to-end CSV keeps one row per
+`(workload_variant, study_case_id, seq_len, execution_mode)`.
 
 The end-to-end tuning CSV keeps one row per
-`(study_case_id, seq_len, execution_mode, internal_operator, candidate_id)` and
-marks the fastest passing isolated candidate with `is_operator_best=True`.
+`(workload_variant, study_case_id, seq_len, execution_mode, internal_operator, candidate_id)`
+and marks the fastest passing isolated candidate with `is_operator_best=True`.
 
 The host-comparison CSV keeps one comparison row per `(study_case_id, seq_len, metric)`.
 Its comparison columns are:
 
 - `igpu`
-- `dataflow`
+- `igpu_rocm_smi`
+- `igpu_turbostat_pkgwatt`
+- `hybrid`
+
+The throughput row uses `igpu` and `hybrid`.
+The per-watt row uses the same iGPU throughput numerator with two power
+backends:
+
+- `igpu_rocm_smi`
+- `igpu_turbostat_pkgwatt`
+- `hybrid`
 
 ## Supporting Studies
 
@@ -107,10 +130,58 @@ The resource-usage exports are compile-artifact summaries. They reuse the
 existing `build/transformer_layer_new_end_to_end` tree, do not recompile, and
 record missing-artifact notes when the expected physical MLIR is absent.
 
+Meaningful full exports therefore require the build tree from the same
+end-to-end run set as the selected results CSVs.
+
 The end-to-end staging-ablation CSV keeps one row per
-`(study_case_id, seq_len, block_kind, staging_depth)` for real `dataflow`
-reruns. It sweeps the selected `dataflow` config at different staging depths
+`(study_case_id, seq_len, block_kind, staging_depth)` for real `hybrid`
+reruns. It sweeps the selected `hybrid` config at different staging depths
 and can reuse the memory-tile staging depth ladder when that CSV is present.
 
 The host-comparison study remains separate from `study/end_to_end` by design.
 It consumes completed end-to-end NPU rows instead of re-running NPU patterns.
+
+The roofline study is a postprocessing study. It combines:
+
+- final end-to-end throughput rows
+- isolated end-to-end tuning rows
+- peak memcpy-bandwidth rows
+
+It does not rerun NPU benchmarks and instead derives arithmetic intensity
+analytically from the selected workload and operator configs.
+
+## Recommended Execution Order
+
+The retained study order is:
+
+1. `block`
+2. `end_to_end`
+3. end-to-end helper studies:
+   `correctness_spot_checks`, `latency_variation`, `staging_ablation`,
+   `fairness_repeatability`
+4. `memory_tile_staging`
+5. `host_comparison`
+6. `resource_usage`
+7. `memcpy_bandwidth`
+8. `roofline`
+
+The important dependency edges are:
+
+- `memory_tile_staging` depends on `block`
+- `host_comparison` depends on `end_to_end`
+- `resource_usage` depends on `end_to_end` results plus the matching build tree
+- `roofline` depends on `end_to_end`, end-to-end tuning, and `memcpy_bandwidth`
+
+## NPU Benchmark Environment
+
+Before running NPU benchmark studies, set the NPU power mode to `turbo`:
+
+- `sudo xrt-smi configure --pmode turbo`
+
+Verify the setting with:
+
+- `xrt-smi examine -r all`
+
+The NPU-running benchmark helpers perform an `xrt-smi` turbo-mode check before
+each measured NPU datapoint. If the reported mode is not `turbo`, the
+benchmark call fails before writing that datapoint.

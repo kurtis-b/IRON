@@ -14,6 +14,102 @@ from aie.helpers.taplib.tap import TensorAccessPattern
 from aie.iron.controlflow import range_
 from aie.helpers.util import np_ndarray_type_get_shape
 
+DMA_BD_MAX_STRIDE = 1_048_576
+DMA_BD_MAX_RANK = 3
+
+
+def _normalize_dma_tap(
+    tap: TensorAccessPattern, *, max_stride: int = DMA_BD_MAX_STRIDE
+) -> TensorAccessPattern:
+    keep_dims = [
+        i for i, (size, stride) in enumerate(zip(tap.sizes, tap.strides)) if size != 1
+    ]
+    if not keep_dims:
+        keep_dims = [len(tap.sizes) - 1]
+    if len(keep_dims) == len(tap.sizes):
+        return tap
+    return TensorAccessPattern(
+        tap.tensor_dims,
+        offset=int(tap.offset),
+        sizes=[tap.sizes[i] for i in keep_dims],
+        strides=[tap.strides[i] for i in keep_dims],
+    )
+
+
+def _expand_dma_tap_for_bd_limits(
+    tap: TensorAccessPattern,
+    *,
+    max_stride: int = DMA_BD_MAX_STRIDE,
+    max_rank: int = DMA_BD_MAX_RANK,
+) -> tuple[list[TensorAccessPattern], bool]:
+    def _is_legal(current: TensorAccessPattern) -> bool:
+        return len(current.sizes) <= max_rank and all(
+            stride <= max_stride for stride in current.strides
+        )
+
+    def _expand_order_preserving(
+        current: TensorAccessPattern,
+    ) -> list[TensorAccessPattern]:
+        current = _normalize_dma_tap(current, max_stride=max_stride)
+        if _is_legal(current):
+            return [current]
+        split_size = current.sizes[0]
+        if split_size == 1:
+            raise ValueError(
+                "Cannot legalize DMA tap while preserving transfer order: "
+                f"sizes={current.sizes}, strides={current.strides}"
+            )
+        expanded: list[TensorAccessPattern] = []
+        for split_index in range(split_size):
+            split_sizes = [1, *current.sizes[1:]]
+            split_offset = int(current.offset) + split_index * current.strides[0]
+            expanded.extend(
+                _expand_order_preserving(
+                    TensorAccessPattern(
+                        current.tensor_dims,
+                        offset=split_offset,
+                        sizes=split_sizes,
+                        strides=current.strides,
+                    )
+                )
+            )
+        return expanded
+
+    normalized = _normalize_dma_tap(tap, max_stride=max_stride)
+    planned_taps = _expand_order_preserving(normalized)
+    return planned_taps, len(planned_taps) > 1
+
+
+def _emit_dma_transfer(
+    rt: Runtime,
+    *,
+    fifo_handle,
+    runtime_buffer,
+    tap: TensorAccessPattern,
+    task_group,
+    is_fill: bool,
+    wait: bool = False,
+) -> None:
+    planned_taps, was_split = _expand_dma_tap_for_bd_limits(tap)
+    task_wait = wait or (was_split and not is_fill)
+    for planned_tap in planned_taps:
+        if is_fill:
+            rt.fill(
+                fifo_handle,
+                runtime_buffer,
+                tap=planned_tap,
+                task_group=task_group,
+                wait=task_wait,
+            )
+        else:
+            rt.drain(
+                fifo_handle,
+                runtime_buffer,
+                tap=planned_tap,
+                task_group=task_group,
+                wait=task_wait,
+            )
+
 
 def shuffle_transpose(dev, M, N, num_columns, num_channels, trace_size, m, n, s):
     num_elements = M * N
@@ -143,21 +239,25 @@ def shuffle_transpose(dev, M, N, num_columns, num_channels, trace_size, m, n, s)
         # Fill the input objectFIFOs with data
         for i in range(num_columns):
             for j in range(num_channels):
-                rt.fill(
-                    of_in1s_L3L2[i * num_channels + j].prod(),
-                    A,
-                    taps_in_L3L2[i * num_channels + j],
+                _emit_dma_transfer(
+                    rt,
+                    fifo_handle=of_in1s_L3L2[i * num_channels + j].prod(),
+                    runtime_buffer=A,
+                    tap=taps_in_L3L2[i * num_channels + j],
                     task_group=tg,
+                    is_fill=True,
                 )
         # Drain the output objectFIFOs with data
         for i in range(num_columns):
             for j in range(num_channels):
-                rt.drain(
-                    of_outs[i * num_channels + j].cons(),
-                    C,
-                    taps_out_L1L3[i * num_channels + j],
-                    wait=True,  # wait for the transfer to complete and data to be available
+                _emit_dma_transfer(
+                    rt,
+                    fifo_handle=of_outs[i * num_channels + j].cons(),
+                    runtime_buffer=C,
+                    tap=taps_out_L1L3[i * num_channels + j],
                     task_group=tg,
+                    is_fill=False,
+                    wait=True,
                 )
         rt.finish_task_group(tg)
 

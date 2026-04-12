@@ -91,6 +91,7 @@ def _write_end_to_end_results(path: Path, rows: list[dict[str, object]]) -> None
         "execution_mode",
         "study_case_id",
         "study_case_label",
+        "workload_variant",
         "seq_len",
         "hidden_size",
         "intermediate_size",
@@ -247,6 +248,7 @@ def test_export_runlist_rows_prefers_mode_scope_artifact(
                 "execution_mode": "runlist",
                 "study_case_id": "baseline_768",
                 "study_case_label": "768 / 3072 / 12",
+                "workload_variant": "encoder_bert",
                 "seq_len": "64",
                 "hidden_size": "768",
                 "intermediate_size": "3072",
@@ -278,7 +280,7 @@ def test_export_runlist_rows_prefers_mode_scope_artifact(
     monkeypatch.setattr(
         resource_usage_run,
         "_runlist_operator_artifact_specs",
-        lambda workload, logical_operator, operator_config: (
+        lambda workload, logical_operator, operator_config, **kwargs: (
             resource_usage_run.ArtifactSpec(
                 "exact", "encoder_runlist_add_exact.mlir.prj"
             ),
@@ -312,6 +314,7 @@ def test_export_runlist_layer_norm_can_match_hashed_artifact(
                 "execution_mode": "runlist",
                 "study_case_id": "baseline_768",
                 "study_case_label": "768 / 3072 / 12",
+                "workload_variant": "encoder_bert",
                 "seq_len": "64",
                 "hidden_size": "768",
                 "intermediate_size": "3072",
@@ -343,7 +346,7 @@ def test_export_runlist_layer_norm_can_match_hashed_artifact(
     monkeypatch.setattr(
         resource_usage_run,
         "_runlist_operator_artifact_specs",
-        lambda workload, logical_operator, operator_config: (
+        lambda workload, logical_operator, operator_config, **kwargs: (
             resource_usage_run.ArtifactSpec(
                 "glob", "encoder_runlist_ln1_8c_2ch_49152_768t_*.mlir.prj"
             ),
@@ -360,3 +363,157 @@ def test_export_runlist_layer_norm_can_match_hashed_artifact(
     assert len(rows) == 1
     assert rows[0]["artifact_missing"] is False
     assert rows[0]["artifact_prj_dir"].endswith("deadbeef1234.mlir.prj")
+
+
+def test_export_hybrid_rows_prefer_mode_scope_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    results_path = tmp_path / "results_all_power.csv"
+    _write_end_to_end_results(
+        results_path,
+        [
+            {
+                "backend": "npu",
+                "run_status": "passed",
+                "execution_mode": "hybrid",
+                "study_case_id": "baseline_768",
+                "study_case_label": "768 / 3072 / 12",
+                "workload_variant": "encoder_bert",
+                "seq_len": "64",
+                "hidden_size": "768",
+                "intermediate_size": "3072",
+                "num_attention_heads": "12",
+                "attention_head_size": "64",
+                "warmup_runs": "1",
+                "runs_per_sample": "10",
+                "selected_candidate_ids_json": json.dumps({"qkv_proj": "qkv_default"}),
+                "selected_config_json": json.dumps(
+                    {
+                        "qkv_proj": {
+                            "tile_m": 16,
+                            "tile_k": 64,
+                            "tile_n": 96,
+                            "parallel_seq": 4,
+                            "parallel_emb": 8,
+                        }
+                    }
+                ),
+            }
+        ],
+    )
+
+    build_root = tmp_path / "build"
+    mode_scope = build_root / "mode_hybrid_768_64"
+    _write_input_physical(
+        mode_scope / "encoder_hybrid_qkvo_proj_exact.mlir.prj",
+        _sample_physical_mlir(),
+    )
+    monkeypatch.setattr(
+        resource_usage_run,
+        "_hybrid_operator_artifact_specs",
+        lambda workload, logical_operator, operator_config, **kwargs: (
+            resource_usage_run.ArtifactSpec(
+                "exact", "encoder_hybrid_qkvo_proj_exact.mlir.prj"
+            ),
+        ),
+    )
+
+    rows = resource_usage_run.export_hybrid_selected_ops(
+        end_to_end_results_input=results_path,
+        family_filter="all",
+        seq_len_filter="all",
+        build_index=resource_usage_run.build_artifact_index(build_root),
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["execution_mode"] == "hybrid"
+    assert rows[0]["artifact_missing"] is False
+    assert rows[0]["logical_operator"] == "qkv_proj"
+    assert rows[0]["artifact_group_dir"] == str(mode_scope)
+
+
+def test_runlist_blocked_attention_specs_use_selected_counterpart_config(
+    monkeypatch,
+) -> None:
+    captured_operator_configs: list[dict[str, dict[str, object]]] = []
+
+    class DummyArtifact:
+        def __init__(self, stem: str):
+            self.path = Path(stem)
+
+    class DummyRunlist:
+        def __init__(
+            self,
+            *,
+            operator_config=None,
+            **kwargs,
+        ):
+            captured_operator_configs.append(operator_config or {})
+            self.attn_scores_xclbin = DummyArtifact("encoder_runlist_attn_scores_exact")
+            self.attn_output_xclbin = DummyArtifact("encoder_runlist_attn_output_exact")
+
+        def set_up_artifacts(self) -> None:
+            return None
+
+    monkeypatch.setattr(resource_usage_run, "AIETransformerRunlist", DummyRunlist)
+
+    workload = resource_usage_run.EndToEndWorkload(
+        workload_variant="encoder_bert",
+        seq_len=16384,
+        hidden_size=512,
+        intermediate_size=2048,
+        num_attention_heads=8,
+    )
+    selected_config = {
+        "k_transpose": {
+            "M": 16384,
+            "N": 512,
+            "m": 64,
+            "n": 64,
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "s": 8,
+        },
+        "attn_scores": {
+            "K": 64,
+            "M": 4096,
+            "N": 16384,
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 64,
+            "batch_A": [8, 1],
+            "batch_B": [8, 1],
+            "batch_C": [8, 0],
+            "num_aie_columns": 8,
+            "prio_accuracy": True,
+            "emulate_bf16_mmul_with_bfp16": True,
+        },
+        "attn_output": {
+            "K": 16384,
+            "M": 4096,
+            "N": 64,
+            "tile_m": 64,
+            "tile_k": 64,
+            "tile_n": 16,
+            "batch_A": [8, 0],
+            "batch_B": [8, 1],
+            "batch_C": [8, 1],
+            "num_aie_columns": 4,
+            "prio_accuracy": True,
+            "emulate_bf16_mmul_with_bfp16": True,
+        },
+    }
+
+    specs = resource_usage_run._runlist_operator_artifact_specs(
+        workload,
+        "attn_scores",
+        selected_config["attn_scores"],
+        workload_variant="encoder_bert",
+        selected_config=selected_config,
+    )
+
+    assert specs[0] == resource_usage_run.ArtifactSpec(
+        "exact", "encoder_runlist_attn_scores_exact.mlir.prj"
+    )
+    assert captured_operator_configs == [selected_config]

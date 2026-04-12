@@ -5,11 +5,18 @@
 from __future__ import annotations
 
 import gc
+import json
 import multiprocessing
+import os
+import pickle
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 import time
+import zlib
 
+import numpy as np
 import torch
 
 from iron.common import AIEContext
@@ -17,6 +24,10 @@ from iron.common.test_utils import run_test
 from iron.operators.addnorm.op import AIEAddAndNorm
 from iron.operators.addnorm.reference import (
     generate_golden_reference as generate_addnorm_reference,
+)
+from iron.operators.causal_mask.op import AIECausalMask
+from iron.operators.causal_mask.reference import (
+    generate_golden_reference as generate_causal_mask_reference,
 )
 from iron.operators.elementwise_add.op import AIEElementwiseAdd
 from iron.operators.elementwise_add.reference import (
@@ -60,8 +71,8 @@ from iron.operators.transpose.reference import (
 )
 
 from iron.applications.transformer_layer_new.pattern.dataflow.op import (
-    AIETransformerDataflow,
-    resolve_dataflow_operator_config,
+    AIETransformerHybrid,
+    resolve_hybrid_operator_config,
 )
 from iron.applications.transformer_layer_new.pattern.reference import (
     generate_golden_reference,
@@ -71,9 +82,12 @@ from iron.applications.transformer_layer_new.pattern.runlist.op import (
     resolve_runlist_operator_config,
 )
 
+from ml_dtypes import bfloat16
+
 from .cases import (
     EndToEndWorkload,
     ExecutionMode,
+    canonical_execution_mode,
     effective_gflops_per_sec,
     effective_gflops_per_sec_per_watt,
 )
@@ -84,6 +98,7 @@ from .power import (
     resolve_power_sample_interval_sec,
     resolve_requested_power_backend,
 )
+from ..npu_runtime_checks import require_npu_power_mode_turbo
 
 GEMM_REL_TOL = 0.1
 GEMM_ABS_TOL = 0.5
@@ -107,6 +122,47 @@ DEFAULT_MIN_POWER_MEASUREMENT_DURATION_SEC = 1.0
 _LONG_SEQ_CANDIDATE_SUBPROCESS_MIN_SEQ_LEN = 8192
 
 
+def _config_scope_key(
+    execution_mode: ExecutionMode,
+    workload: EndToEndWorkload,
+    operator_config: dict[str, dict[str, object]] | None = None,
+) -> str:
+    resolved_config = resolve_mode_operator_config(
+        execution_mode,
+        workload,
+        operator_config=operator_config,
+    )
+    payload = {
+        "execution_mode": execution_mode,
+        "workload_variant": workload.workload_variant,
+        "seq_len": workload.seq_len,
+        "hidden_size": workload.hidden_size,
+        "intermediate_size": workload.intermediate_size,
+        "num_attention_heads": workload.num_attention_heads,
+        "operator_config": resolved_config,
+    }
+    checksum = zlib.crc32(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return f"cfg_{checksum:08x}"
+
+
+def _candidate_scope_key(candidate_config: dict[str, object]) -> str:
+    checksum = zlib.crc32(
+        json.dumps(candidate_config, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+    return f"cfg_{checksum:08x}"
+
+
+def _isolated_candidate_scope(
+    prefix: str,
+    candidate_config: dict[str, object],
+) -> str:
+    return f"{prefix}_{_candidate_scope_key(candidate_config)}"
+
+
 def _new_benchmark_context(scope: str) -> AIEContext:
     context = AIEContext()
     sanitized_scope = "".join(
@@ -117,6 +173,17 @@ def _new_benchmark_context(scope: str) -> AIEContext:
         Path.cwd() / "build" / "transformer_layer_new_end_to_end" / sanitized_scope
     )
     return context
+
+
+def _fresh_benchmark_context_for_build_dir(build_dir: Path) -> AIEContext:
+    context = AIEContext()
+    context.build_dir = build_dir
+    return context
+
+
+def _is_retryable_linker_failure(exc: Exception) -> bool:
+    message = str(exc)
+    return "ld.lld: error:" in message and "symbol not found: core_" in message
 
 
 def _preferred_subprocess_start_method() -> str:
@@ -135,12 +202,14 @@ def resolve_mode_operator_config(
     workload: EndToEndWorkload,
     operator_config: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, dict[str, object]]:
-    if execution_mode == "dataflow":
-        return resolve_dataflow_operator_config(
+    execution_mode = canonical_execution_mode(str(execution_mode))
+    if execution_mode == "hybrid":
+        return resolve_hybrid_operator_config(
             workload.seq_len,
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config=operator_config,
         )
     if execution_mode == "runlist":
@@ -149,6 +218,7 @@ def resolve_mode_operator_config(
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config=operator_config,
         )
     raise ValueError(f"Unsupported execution mode: {execution_mode}")
@@ -162,6 +232,7 @@ def _build_operator(
     context: AIEContext,
     operator_config: dict[str, dict[str, object]] | None = None,
 ):
+    execution_mode = canonical_execution_mode(str(execution_mode))
     common_kwargs = {
         "seq_len": workload.seq_len,
         "hidden_size": workload.hidden_size,
@@ -169,11 +240,12 @@ def _build_operator(
         "num_heads": workload.num_attention_heads,
         "ln1_weight": weights["ln1_weight"],
         "ln2_weight": weights["ln2_weight"],
+        "workload_variant": workload.workload_variant,
         "operator_config": operator_config,
         "context": context,
     }
-    if execution_mode == "dataflow":
-        operator = AIETransformerDataflow(**common_kwargs)
+    if execution_mode == "hybrid":
+        operator = AIETransformerHybrid(**common_kwargs)
     elif execution_mode == "runlist":
         operator = AIETransformerRunlist(**common_kwargs)
     else:
@@ -435,6 +507,63 @@ def _measure_power(
         raise
 
 
+def _reset_pattern_run_buffers(operator) -> None:
+    if not getattr(operator, "enable_benchmark_buffer_reset", True):
+        return
+    if not hasattr(operator, "write_buffer") or not hasattr(operator, "buffers"):
+        return
+    for buffer_name in getattr(operator, "reset_buffer_names", ()):
+        operator.write_buffer(
+            buffer_name,
+            np.zeros(operator.buffers[buffer_name], dtype=np.uint8),
+        )
+
+
+def _reset_pattern_output_buffer(operator) -> None:
+    if not hasattr(operator, "write_buffer") or not hasattr(operator, "buffers"):
+        return
+    if "output" not in operator.buffers:
+        return
+    if (
+        hasattr(operator, "buffer_static_data")
+        and "output" in operator.buffer_static_data
+    ):
+        return
+    operator.write_buffer(
+        "output",
+        np.zeros(operator.buffers["output"], dtype=np.uint8),
+    )
+
+
+def _run_pattern_once(
+    operator,
+    input_tensor: torch.Tensor,
+    *,
+    output_shape: tuple[int, int],
+) -> torch.Tensor:
+    if not (
+        hasattr(operator, "write_buffer")
+        and hasattr(operator, "run_runlist")
+        and hasattr(operator, "read_buffer_as_torch")
+    ):
+        return operator.forward(input_tensor)
+    _reset_pattern_run_buffers(operator)
+    _reset_pattern_output_buffer(operator)
+    operator.write_buffer("input", input_tensor.view(-1))
+    operator.run_runlist()
+    return operator.read_buffer_as_torch("output", output_shape, dtype=bfloat16)
+
+
+def _warm_up_pattern_runtime(operator, warmup_runs: int) -> bool:
+    if warmup_runs <= 0:
+        return True
+    if not hasattr(operator, "run_runlist"):
+        return False
+    for _ in range(warmup_runs):
+        operator.run_runlist()
+    return True
+
+
 def _cleanup_operator_runtime(operator) -> None:
     release_runtime = getattr(operator, "release_runtime", None)
     if callable(release_runtime):
@@ -489,8 +618,15 @@ def _benchmark_gemm(
     runs_per_sample: int,
     seed: int,
     use_static_weight: bool = False,
+    scope_prefix: str = "isolated_gemm",
 ) -> dict[str, object]:
-    context = _new_benchmark_context("isolated_gemm")
+    scope_payload = {
+        "gemm_kwargs": gemm_kwargs,
+        "use_static_weight": use_static_weight,
+    }
+    context = _new_benchmark_context(
+        _isolated_candidate_scope(scope_prefix, scope_payload)
+    )
     try:
         batch_A = tuple(gemm_kwargs.get("batch_A", (1, 0)))
         batch_B = tuple(gemm_kwargs.get("batch_B", (1, 0)))
@@ -600,13 +736,16 @@ def _benchmark_qkv_proj(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    context = _new_benchmark_context("dataflow_qkv_proj")
+    context = _new_benchmark_context(
+        _isolated_candidate_scope("hybrid_qkv_proj", candidate_config)
+    )
     try:
-        kwargs = resolve_dataflow_operator_config(
+        kwargs = resolve_hybrid_operator_config(
             workload.seq_len,
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config={"qkv_proj": candidate_config},
         )["qkv_proj"]
         reference = generate_qkv_proj_reference(
@@ -659,13 +798,16 @@ def _benchmark_mha_out_proj(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    context = _new_benchmark_context("dataflow_mha_out_proj")
+    context = _new_benchmark_context(
+        _isolated_candidate_scope("hybrid_mha_out_proj", candidate_config)
+    )
     try:
-        kwargs = resolve_dataflow_operator_config(
+        kwargs = resolve_hybrid_operator_config(
             workload.seq_len,
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config={"mha_out_proj": candidate_config},
         )["mha_out_proj"]
         reference = generate_mha_out_proj_reference(
@@ -673,6 +815,7 @@ def _benchmark_mha_out_proj(
             seq_len=workload.seq_len,
             d=workload.attention_head_size,
             seed=seed,
+            is_causal=workload.workload_variant == "decoder_gpt2",
         )
         operator = AIEMHAOutProj(context=context, **kwargs)
         errors, latency_us, bandwidth_gbps = run_test(
@@ -716,13 +859,16 @@ def _benchmark_addnorm(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    context = _new_benchmark_context(f"dataflow_{operator_name}")
+    context = _new_benchmark_context(
+        _isolated_candidate_scope(f"hybrid_{operator_name}", candidate_config)
+    )
     try:
-        kwargs = resolve_dataflow_operator_config(
+        kwargs = resolve_hybrid_operator_config(
             workload.seq_len,
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config={operator_name: candidate_config},
         )[operator_name]
         total_size = int(kwargs["size"])
@@ -777,13 +923,16 @@ def _benchmark_ffn(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    context = _new_benchmark_context("dataflow_ffn")
+    context = _new_benchmark_context(
+        _isolated_candidate_scope("hybrid_ffn", candidate_config)
+    )
     try:
-        kwargs = resolve_dataflow_operator_config(
+        kwargs = resolve_hybrid_operator_config(
             workload.seq_len,
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config={"ffn": candidate_config},
         )["ffn"]
         reference = generate_ffn_reference(
@@ -833,13 +982,16 @@ def _benchmark_transpose(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    context = _new_benchmark_context("runlist_k_transpose")
+    context = _new_benchmark_context(
+        _isolated_candidate_scope("runlist_k_transpose", candidate_config)
+    )
     try:
         kwargs = resolve_runlist_operator_config(
             workload.seq_len,
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config={"k_transpose": candidate_config},
         )["k_transpose"]
         reference = generate_transpose_reference(
@@ -877,13 +1029,16 @@ def _benchmark_softmax(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    context = _new_benchmark_context("runlist_attn_softmax")
+    context = _new_benchmark_context(
+        _isolated_candidate_scope("runlist_attn_softmax", candidate_config)
+    )
     try:
         kwargs = resolve_runlist_operator_config(
             workload.seq_len,
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config={"attn_softmax": candidate_config},
         )["attn_softmax"]
         reference = generate_softmax_reference(
@@ -937,13 +1092,16 @@ def _benchmark_elementwise_mul(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    context = _new_benchmark_context("runlist_attn_scale")
+    context = _new_benchmark_context(
+        _isolated_candidate_scope("runlist_attn_scale", candidate_config)
+    )
     try:
         kwargs = resolve_runlist_operator_config(
             workload.seq_len,
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config={"attn_scale": candidate_config},
         )["attn_scale"]
         input_buffers, output_buffers = _elementwise_mul_buffers(kwargs, seed=seed)
@@ -977,13 +1135,62 @@ def _benchmark_elementwise_add(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    context = _new_benchmark_context("runlist_add")
+    context = _new_benchmark_context(
+        _isolated_candidate_scope("runlist_add", candidate_config)
+    )
     try:
         kwargs = resolve_runlist_operator_config(
             workload.seq_len,
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
+            operator_config={"add": candidate_config},
+        )["add"]
+        reference = generate_elementwise_add_reference(
+            input_length=int(kwargs["size"]),
+            seed=seed,
+        )
+        operator = AIEElementwiseAdd(context=context, **kwargs)
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator,
+            {"input1": reference["A"], "input2": reference["B"]},
+            {"output": reference["C"]},
+            rel_tol=EXACT_REL_TOL,
+            abs_tol=EXACT_ABS_TOL,
+            warmup_iters=warmup_runs,
+            timed_iters=runs_per_sample,
+        )
+        validation = _threshold_validation_result(
+            {"output": len(errors.get("output", []))},
+        )
+        return {
+            "avg_latency_ms": latency_us / 1000.0,
+            "bandwidth_gbps": bandwidth_gbps,
+            **validation,
+        }
+    finally:
+        context.reset_runtime()
+
+
+def _benchmark_hybrid_elementwise_add(
+    workload: EndToEndWorkload,
+    candidate_config: dict[str, object],
+    *,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+) -> dict[str, object]:
+    context = _new_benchmark_context(
+        _isolated_candidate_scope("hybrid_add", candidate_config)
+    )
+    try:
+        kwargs = resolve_hybrid_operator_config(
+            workload.seq_len,
+            workload.hidden_size,
+            workload.intermediate_size,
+            workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config={"add": candidate_config},
         )["add"]
         reference = generate_elementwise_add_reference(
@@ -1021,13 +1228,16 @@ def _benchmark_layer_norm(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    context = _new_benchmark_context(f"runlist_{operator_name}")
+    context = _new_benchmark_context(
+        _isolated_candidate_scope(f"runlist_{operator_name}", candidate_config)
+    )
     try:
         kwargs = resolve_runlist_operator_config(
             workload.seq_len,
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config={operator_name: candidate_config},
         )[operator_name]
         total_size = int(kwargs["size"])
@@ -1063,6 +1273,56 @@ def _benchmark_layer_norm(
         context.reset_runtime()
 
 
+def _benchmark_hybrid_layer_norm(
+    workload: EndToEndWorkload,
+    candidate_config: dict[str, object],
+    *,
+    operator_name: str,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+) -> dict[str, object]:
+    context = _new_benchmark_context(
+        _isolated_candidate_scope(f"hybrid_{operator_name}", candidate_config)
+    )
+    try:
+        kwargs = resolve_hybrid_operator_config(
+            workload.seq_len,
+            workload.hidden_size,
+            workload.intermediate_size,
+            workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
+            operator_config={operator_name: candidate_config},
+        )[operator_name]
+        total_size = int(kwargs["size"])
+        tile_size = int(kwargs["tile_size"])
+        reference = generate_layer_norm_reference(
+            rows=total_size // tile_size,
+            cols=tile_size,
+            seed=seed,
+        )
+        operator = AIELayerNorm(context=context, **kwargs)
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator,
+            {"input": reference["input"]},
+            {"output": reference["output"]},
+            rel_tol=LAYER_NORM_REL_TOL,
+            abs_tol=LAYER_NORM_ABS_TOL,
+            warmup_iters=warmup_runs,
+            timed_iters=runs_per_sample,
+        )
+        validation = _threshold_validation_result(
+            {"output": len(errors.get("output", []))},
+        )
+        return {
+            "avg_latency_ms": latency_us / 1000.0,
+            "bandwidth_gbps": bandwidth_gbps,
+            **validation,
+        }
+    finally:
+        context.reset_runtime()
+
+
 def _benchmark_gelu(
     workload: EndToEndWorkload,
     candidate_config: dict[str, object],
@@ -1071,13 +1331,16 @@ def _benchmark_gelu(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    context = _new_benchmark_context("runlist_gelu")
+    context = _new_benchmark_context(
+        _isolated_candidate_scope("runlist_gelu", candidate_config)
+    )
     try:
         kwargs = resolve_runlist_operator_config(
             workload.seq_len,
             workload.hidden_size,
             workload.intermediate_size,
             workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
             operator_config={"gelu": candidate_config},
         )["gelu"]
         reference = generate_gelu_reference(
@@ -1106,6 +1369,56 @@ def _benchmark_gelu(
         context.reset_runtime()
 
 
+def _benchmark_causal_mask(
+    workload: EndToEndWorkload,
+    candidate_config: dict[str, object],
+    *,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+) -> dict[str, object]:
+    context = _new_benchmark_context(
+        _isolated_candidate_scope("runlist_causal_mask", candidate_config)
+    )
+    try:
+        kwargs = resolve_runlist_operator_config(
+            workload.seq_len,
+            workload.hidden_size,
+            workload.intermediate_size,
+            workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
+            operator_config={"causal_mask": candidate_config},
+        )["causal_mask"]
+        reference = generate_causal_mask_reference(
+            query_block_size=int(kwargs["query_block_size"]),
+            seq_len=int(kwargs["seq_len"]),
+            num_heads=int(kwargs["num_heads"]),
+            q_start=int(kwargs.get("q_start", 0)),
+            masked_fill_value=float(kwargs["masked_fill_value"]),
+            seed=seed,
+        )
+        operator = AIECausalMask(context=context, **kwargs)
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator,
+            {"input1": reference["input"]},
+            {"output": reference["output"]},
+            rel_tol=EXACT_REL_TOL,
+            abs_tol=EXACT_ABS_TOL,
+            warmup_iters=warmup_runs,
+            timed_iters=runs_per_sample,
+        )
+        validation = _threshold_validation_result(
+            {"output": len(errors.get("output", []))},
+        )
+        return {
+            "avg_latency_ms": latency_us / 1000.0,
+            "bandwidth_gbps": bandwidth_gbps,
+            **validation,
+        }
+    finally:
+        context.reset_runtime()
+
+
 def benchmark_operator_candidate(
     execution_mode: ExecutionMode,
     operator_name: str,
@@ -1116,17 +1429,8 @@ def benchmark_operator_candidate(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
-    if workload.seq_len >= _LONG_SEQ_CANDIDATE_SUBPROCESS_MIN_SEQ_LEN:
-        return _benchmark_operator_candidate_isolated_subprocess(
-            execution_mode,
-            operator_name,
-            workload,
-            candidate_config,
-            warmup_runs=warmup_runs,
-            runs_per_sample=runs_per_sample,
-            seed=seed,
-        )
-
+    require_npu_power_mode_turbo(study_name="end-to-end tuning")
+    execution_mode = canonical_execution_mode(str(execution_mode))
     return _benchmark_operator_candidate_in_process(
         execution_mode,
         operator_name,
@@ -1148,14 +1452,22 @@ def _benchmark_operator_candidate_in_process(
     runs_per_sample: int,
     seed: int,
 ) -> dict[str, object]:
+    execution_mode = canonical_execution_mode(str(execution_mode))
     benchmarkers = {
-        ("dataflow", "qkv_proj"): _benchmark_qkv_proj,
-        ("dataflow", "mha_out_proj"): _benchmark_mha_out_proj,
-        ("dataflow", "add_norm1"): lambda *args, **kwargs: _benchmark_addnorm(
+        ("hybrid", "ln1"): lambda *args, **kwargs: _benchmark_hybrid_layer_norm(
+            *args, operator_name="ln1", **kwargs
+        ),
+        ("hybrid", "qkv_proj"): _benchmark_qkv_proj,
+        ("hybrid", "mha_out_proj"): _benchmark_mha_out_proj,
+        ("hybrid", "add_norm"): lambda *args, **kwargs: _benchmark_addnorm(
+            *args, operator_name="add_norm", **kwargs
+        ),
+        ("hybrid", "add_norm1"): lambda *args, **kwargs: _benchmark_addnorm(
             *args, operator_name="add_norm1", **kwargs
         ),
-        ("dataflow", "ffn"): _benchmark_ffn,
-        ("dataflow", "add_norm2"): lambda *args, **kwargs: _benchmark_addnorm(
+        ("hybrid", "ffn"): _benchmark_ffn,
+        ("hybrid", "add"): _benchmark_hybrid_elementwise_add,
+        ("hybrid", "add_norm2"): lambda *args, **kwargs: _benchmark_addnorm(
             *args, operator_name="add_norm2", **kwargs
         ),
         ("runlist", "qkvo_proj"): lambda *args, **kwargs: _benchmark_gemm_from_runlist(
@@ -1169,6 +1481,7 @@ def _benchmark_operator_candidate_in_process(
             *args, operator_name="attn_scores", **kwargs
         ),
         ("runlist", "attn_scale"): _benchmark_elementwise_mul,
+        ("runlist", "causal_mask"): _benchmark_causal_mask,
         ("runlist", "attn_softmax"): _benchmark_softmax,
         (
             "runlist",
@@ -1288,6 +1601,120 @@ def _benchmark_operator_candidate_isolated_subprocess(
     }
 
 
+def _benchmark_mode_subprocess_entry(
+    result_path: str,
+    execution_mode: ExecutionMode,
+    workload: EndToEndWorkload,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+    power_backend: str,
+    operator_config: dict[str, dict[str, object]] | None,
+    include_reference_output: bool | None,
+    capture_latencies: bool,
+    scope_key_override: str | None,
+    scope_suffix: str | None,
+) -> None:
+    result = benchmark_mode(
+        execution_mode,
+        workload,
+        warmup_runs=warmup_runs,
+        runs_per_sample=runs_per_sample,
+        seed=seed,
+        power_backend=power_backend,
+        operator_config=operator_config,
+        include_reference_output=include_reference_output,
+        capture_latencies=capture_latencies,
+        scope_key_override=scope_key_override,
+        scope_suffix=scope_suffix,
+    )
+    with open(result_path, "wb") as handle:
+        pickle.dump(result, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def benchmark_mode_subprocess(
+    execution_mode: ExecutionMode,
+    workload: EndToEndWorkload,
+    *,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+    power_backend: str,
+    operator_config: dict[str, dict[str, object]] | None = None,
+    include_reference_output: bool | None = None,
+    capture_latencies: bool = False,
+    scope_key_override: str | None = None,
+    scope_suffix: str | None = None,
+) -> dict[str, object]:
+    ctx = multiprocessing.get_context(_preferred_subprocess_start_method())
+    with tempfile.NamedTemporaryFile(
+        prefix="benchmark_mode_result_",
+        suffix=".pkl",
+        delete=False,
+    ) as temp_result_file:
+        result_path = temp_result_file.name
+    process = ctx.Process(
+        target=_benchmark_mode_subprocess_entry,
+        args=(
+            result_path,
+            execution_mode,
+            workload,
+            warmup_runs,
+            runs_per_sample,
+            seed,
+            power_backend,
+            operator_config,
+            include_reference_output,
+            capture_latencies,
+            scope_key_override,
+            scope_suffix,
+        ),
+    )
+    process.start()
+    process.join()
+
+    result: dict[str, object] | None = None
+    if process.exitcode == 0 and os.path.exists(result_path):
+        try:
+            with open(result_path, "rb") as handle:
+                result = pickle.load(handle)
+        finally:
+            os.unlink(result_path)
+    elif os.path.exists(result_path):
+        os.unlink(result_path)
+
+    gc.collect()
+
+    if process.exitcode == 0 and result is not None:
+        result.setdefault("process_model", "subprocess")
+        return result
+
+    failure_message = (
+        "full benchmark subprocess failed " f"with exit code {process.exitcode}"
+    )
+    if result is not None and result.get("run_status") == "failed_exception":
+        failure_message = str(result.get("failure_message", failure_message))
+
+    return {
+        "timed_total_sec": 0.0,
+        "measured_inference_count": 0,
+        "avg_latency_ms": None,
+        "compile_setup_time_ms": None,
+        "effective_gflops_per_sec": None,
+        "power_backend": "none" if power_backend == "auto" else power_backend,
+        "avg_power_w": None,
+        "effective_gflops_per_sec_per_watt": None,
+        "host_qkv_precompute_ms": None,
+        "npu_dispatch_count": None,
+        "npu_unique_instruction_binary_count": None,
+        "npu_unique_xclbin_count": None,
+        "process_model": "subprocess",
+        "validation_error_count": "",
+        "run_status": "failed_exception",
+        "failure_message": failure_message,
+    }
+
+
 def _benchmark_gemm_from_runlist(
     workload: EndToEndWorkload,
     candidate_config: dict[str, object],
@@ -1302,6 +1729,7 @@ def _benchmark_gemm_from_runlist(
         workload.hidden_size,
         workload.intermediate_size,
         workload.num_attention_heads,
+        workload_variant=workload.workload_variant,
         operator_config={operator_name: candidate_config},
     )[operator_name]
     return _benchmark_gemm(
@@ -1309,6 +1737,7 @@ def _benchmark_gemm_from_runlist(
         warmup_runs=warmup_runs,
         runs_per_sample=runs_per_sample,
         seed=seed,
+        scope_prefix=f"runlist_{operator_name}",
     )
 
 
@@ -1323,8 +1752,11 @@ def benchmark_mode(
     operator_config: dict[str, dict[str, object]] | None = None,
     include_reference_output: bool | None = None,
     capture_latencies: bool = False,
+    scope_key_override: str | None = None,
     scope_suffix: str | None = None,
 ) -> dict[str, object]:
+    require_npu_power_mode_turbo(study_name="end-to-end benchmark")
+    execution_mode = canonical_execution_mode(str(execution_mode))
     result = {
         "timed_total_sec": 0.0,
         "measured_inference_count": 0,
@@ -1355,26 +1787,53 @@ def benchmark_mode(
         workload.intermediate_size,
         workload.num_attention_heads,
         seed=seed,
+        workload_variant=workload.workload_variant,
         include_output=include_output,
         include_attention_mask=False,
     )
-    scope = f"mode_{execution_mode}_{workload.hidden_size}_{workload.seq_len}"
+    scope_key = (
+        scope_key_override
+        if scope_key_override is not None
+        else _config_scope_key(execution_mode, workload, operator_config)
+    )
+    scope = (
+        f"mode_{execution_mode}_{workload.hidden_size}_{workload.seq_len}_{scope_key}"
+    )
     if scope_suffix:
         scope = f"{scope}_{scope_suffix}"
     context = _new_benchmark_context(scope)
     operator = None
+    compile_attempt = 0
     try:
-        operator = _build_operator(
-            execution_mode,
-            workload,
-            reference["weights"],
-            context=context,
-            operator_config=operator_config,
-        )
-        compile_started = time.perf_counter()
-        operator.context.compile_all()
-        operator.context.prepare_runtime()
-        compile_setup_time_ms = (time.perf_counter() - compile_started) * 1000.0
+        while True:
+            operator = _build_operator(
+                execution_mode,
+                workload,
+                reference["weights"],
+                context=context,
+                operator_config=operator_config,
+            )
+            compile_started = time.perf_counter()
+            try:
+                operator.context.compile_all()
+                operator.context.prepare_runtime()
+                compile_setup_time_ms = (time.perf_counter() - compile_started) * 1000.0
+                break
+            except RuntimeError as exc:
+                if compile_attempt == 0 and _is_retryable_linker_failure(exc):
+                    logging.warning(
+                        "Retrying %s %s seq_len=%s from a clean build scope after linker failure in %s",
+                        execution_mode,
+                        workload.workload_variant,
+                        workload.seq_len,
+                        context.build_dir,
+                    )
+                    context.reset_runtime()
+                    shutil.rmtree(context.build_dir, ignore_errors=True)
+                    context = _fresh_benchmark_context_for_build_dir(context.build_dir)
+                    compile_attempt += 1
+                    continue
+                raise
         result["compile_setup_time_ms"] = compile_setup_time_ms
         result.update(
             _metadata_for_operator(
@@ -1385,11 +1844,18 @@ def benchmark_mode(
             )
         )
 
-        def forward_once():
-            return operator.forward(reference["input"])
+        output_shape = (workload.seq_len, workload.hidden_size)
 
-        for _ in range(warmup_runs):
-            forward_once()
+        def forward_once():
+            return _run_pattern_once(
+                operator,
+                reference["input"],
+                output_shape=output_shape,
+            )
+
+        if not _warm_up_pattern_runtime(operator, warmup_runs):
+            for _ in range(warmup_runs):
+                forward_once()
 
         latencies_sec: list[float] = []
         output = None

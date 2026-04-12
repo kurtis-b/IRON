@@ -21,10 +21,15 @@ from iron.operators.gemm.op import AIEGEMM
 from iron.operators.softmax.op import AIESoftmax
 from iron.operators.elementwise_mul.op import AIEElementwiseMul
 from iron.operators.layer_norm.op import AIELayerNorm
+from iron.operators.addnorm.op import AIEAddAndNorm
 from iron.operators.elementwise_add.op import AIEElementwiseAdd
 from iron.operators.gelu.op import AIEGELU
 from iron.operators.transpose.op import AIETranspose
+from iron.operators.causal_mask.op import AIECausalMask, _build_causal_mask
 from iron.common.utils import torch_to_numpy
+
+MAX_ATTENTION_SCRATCH_BUFFER_BYTES = 3 * 1024 * 1024 * 1024
+MIN_BLOCKED_QUERY_BLOCK_SIZE = 256
 
 
 def default_runlist_operator_config(
@@ -33,15 +38,16 @@ def default_runlist_operator_config(
     intermediate_size,
     num_heads,
     *,
+    workload_variant="encoder_bert",
     num_aie_columns=8,
 ):
     head_dim = hidden_size // num_heads
-    query_block_size = _resolve_query_block_size(seq_len)
+    query_block_size = _resolve_query_block_size(seq_len, num_heads)
     attn_scratch_size = query_block_size * seq_len * num_heads
     eltwise_mul_tile_size = attn_scratch_size // (num_aie_columns * 2)
     eltwise_add_tile_size = (seq_len * hidden_size) // (num_aie_columns * 2)
     gelu_tile_size = (seq_len * intermediate_size) // (num_aie_columns * 2)
-    return {
+    config = {
         "qkvo_proj": {
             "M": seq_len,
             "K": hidden_size,
@@ -154,16 +160,64 @@ def default_runlist_operator_config(
             "num_channels": 2,
         },
     }
+    if workload_variant == "decoder_gpt2":
+        config["attn_scores"]["batch_B"] = (num_heads, 0)
+        config["causal_mask"] = {
+            "query_block_size": query_block_size,
+            "seq_len": seq_len,
+            "num_heads": num_heads,
+            "q_start": 0,
+            "masked_fill_value": -10000.0,
+            "num_aie_columns": num_aie_columns,
+            "num_channels": 2,
+            "tile_size": min(
+                math.gcd(4096, eltwise_mul_tile_size), eltwise_mul_tile_size
+            ),
+        }
+        config["add_norm"] = {
+            "size": seq_len * hidden_size,
+            "tile_size": hidden_size,
+            "num_aie_columns": num_aie_columns,
+        }
+        config["attn_output"]["batch_C"] = (num_heads, 1)
+        return config
+    if workload_variant != "encoder_bert":
+        raise ValueError(f"Unsupported runlist workload_variant: {workload_variant}")
+    return config
 
 
 def _use_blocked_attention(seq_len: int) -> bool:
     return seq_len >= 16384
 
 
-def _resolve_query_block_size(seq_len: int) -> int:
-    if seq_len == 16384:
-        return 4096
-    return 256 if _use_blocked_attention(seq_len) else seq_len
+def _descending_divisors(value: int) -> tuple[int, ...]:
+    divisors = set()
+    limit = int(math.isqrt(value))
+    for candidate in range(1, limit + 1):
+        if value % candidate != 0:
+            continue
+        divisors.add(candidate)
+        divisors.add(value // candidate)
+    return tuple(sorted(divisors, reverse=True))
+
+
+def _resolve_query_block_size(seq_len: int, num_heads: int) -> int:
+    if not _use_blocked_attention(seq_len):
+        return seq_len
+
+    max_elements_per_buffer = MAX_ATTENTION_SCRATCH_BUFFER_BYTES // (
+        np.dtype(bfloat16).itemsize * seq_len * num_heads
+    )
+    for candidate in _descending_divisors(seq_len):
+        if candidate < MIN_BLOCKED_QUERY_BLOCK_SIZE:
+            continue
+        if candidate <= max_elements_per_buffer:
+            return candidate
+
+    for candidate in _descending_divisors(seq_len):
+        if candidate >= MIN_BLOCKED_QUERY_BLOCK_SIZE:
+            return candidate
+    return seq_len
 
 
 def resolve_runlist_operator_config(
@@ -172,6 +226,7 @@ def resolve_runlist_operator_config(
     intermediate_size,
     num_heads,
     *,
+    workload_variant="encoder_bert",
     num_aie_columns=8,
     operator_config=None,
 ):
@@ -182,6 +237,7 @@ def resolve_runlist_operator_config(
             hidden_size,
             intermediate_size,
             num_heads,
+            workload_variant=workload_variant,
             num_aie_columns=num_aie_columns,
         ).items()
     }
@@ -224,6 +280,7 @@ class AIETransformerRunlist(AIEOperatorBase):
         num_aie_columns=8,
         ln1_weight=None,
         ln2_weight=None,
+        workload_variant="encoder_bert",
         operator_config=None,
         context=None,
     ):
@@ -232,18 +289,13 @@ class AIETransformerRunlist(AIEOperatorBase):
         self.intermediate_size = intermediate_size
         self.num_heads = num_heads
         self.num_aie_columns = num_aie_columns  # NOTE: This value isn't used for GEMMs to generate the output heads since N=64 there
+        self.workload_variant = workload_variant
 
         # Derived dimensions
         self.head_dim = hidden_size // num_heads
         self.use_blocked_attention = _use_blocked_attention(seq_len)
         self.use_long_seq_fallback = False
-        self.query_block_size = _resolve_query_block_size(seq_len)
-        if self.use_blocked_attention and seq_len % self.query_block_size != 0:
-            raise AIEOperatorConstraintError(
-                "Blocked runlist attention requires seq_len divisible by "
-                f"{self.query_block_size}; got seq_len={seq_len}"
-            )
-        self.query_block_count = seq_len // self.query_block_size
+        self.use_causal_attention = workload_variant == "decoder_gpt2"
 
         # Weights to be set by user (separate Q/K/V weights)
         self.q_weight = None
@@ -259,9 +311,30 @@ class AIETransformerRunlist(AIEOperatorBase):
             hidden_size,
             intermediate_size,
             num_heads,
+            workload_variant=workload_variant,
             num_aie_columns=num_aie_columns,
             operator_config=operator_config,
         )
+        self.query_block_size = (
+            int(self.operator_config["attn_scores"]["M"])
+            if self.use_blocked_attention
+            else seq_len
+        )
+        if self.use_blocked_attention and seq_len % self.query_block_size != 0:
+            raise AIEOperatorConstraintError(
+                "Blocked runlist attention requires seq_len divisible by "
+                f"{self.query_block_size}; got seq_len={seq_len}"
+            )
+        if (
+            self.use_blocked_attention
+            and int(self.operator_config["attn_output"]["M"]) != self.query_block_size
+        ):
+            raise AIEOperatorConstraintError(
+                "Blocked runlist attention requires attn_scores.M and "
+                f"attn_output.M to match; got {self.operator_config['attn_scores']['M']} "
+                f"and {self.operator_config['attn_output']['M']}"
+            )
+        self.query_block_count = seq_len // self.query_block_size
 
         # Artifacts created by set_up_artifacts() - one per layer
         self.combined_xclbin = None
@@ -275,6 +348,8 @@ class AIETransformerRunlist(AIEOperatorBase):
         self.attn_scores_insts = None
         self.attn_scale_xclbin = None
         self.attn_scale_insts = None
+        self.causal_mask_xclbin = None
+        self.causal_mask_insts = None
         self.attn_softmax_xclbin = None
         self.attn_softmax_insts = None
         self.attn_output_xclbin = None
@@ -282,6 +357,8 @@ class AIETransformerRunlist(AIEOperatorBase):
         # Residual connection
         self.add_xclbin = None
         self.add_insts = None
+        self.add_norm_xclbin = None
+        self.add_norm_insts = None
         # Layer normalization
         self.ln1_xclbin = None
         self.ln1_insts = None
@@ -296,6 +373,8 @@ class AIETransformerRunlist(AIEOperatorBase):
         # Down projection
         self.down_proj_xclbin = None
         self.down_proj_insts = None
+        self.reset_buffer_names = ()
+        self.enable_benchmark_buffer_reset = False
 
         AIEOperatorBase.__init__(self, context=context)
 
@@ -310,6 +389,9 @@ class AIETransformerRunlist(AIEOperatorBase):
         return f"block_{block_index:03d}"
 
     def set_up_artifacts(self):
+        if self.use_causal_attention:
+            self._set_up_decoder_artifacts()
+            return
         """Set up artifacts for the encoder layer components using 13 individual layers."""
         artifacts = []
         device_str = self.context.device_manager.device_str()
@@ -580,6 +662,9 @@ class AIETransformerRunlist(AIEOperatorBase):
         logging.info(f"Finished setting up {len(artifacts)} BERT Encoder artifacts.")
 
     def set_up_runtime(self):
+        if self.use_causal_attention:
+            self._set_up_decoder_runtime()
+            return
         """Set up runtime buffers and kernels for all 13 layers."""
         act_size = self.seq_len * self.hidden_size
         attn_scratch_size = self.query_block_size * self.seq_len * self.num_heads
@@ -853,6 +938,604 @@ class AIETransformerRunlist(AIEOperatorBase):
         self.add_to_runlist("encoder_ln2", "add2_output", "output")
 
         logging.info(f"Finished setting up {len(self.runlist)} BERT Encoder runlist.")
+        self.reset_buffer_names = (
+            "q_output",
+            "k_output",
+            "v_output",
+            "k_transposed",
+            "attn_scores_output",
+            "attn_heads_output",
+            "output_proj_output",
+            "up_proj_output",
+            "down_proj_output",
+        )
+
+    def _set_up_decoder_artifacts(self):
+        artifacts = []
+        kernel_id = 0x801
+        prefix_base = "decoder_runlist_"
+
+        ln1_kwargs = dict(self.operator_config["ln1"])
+        ln1_kwargs.update(
+            {
+                "weights": self.ln1_weight,
+                "context": self.context,
+                "skip_add_to_list": True,
+            }
+        )
+        self.ln1_xclbin, self.ln1_insts = AIELayerNorm(**ln1_kwargs).get_artifacts(
+            prefix=f"{prefix_base}ln1_"
+        )
+        self.ln1_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_ln1",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.ln1_xclbin.kernel_name = "decoder_ln1"
+        artifacts.append(self.ln1_insts)
+        kernel_id += 1
+
+        qkvo_proj_kwargs = dict(self.operator_config["qkvo_proj"])
+        qkvo_proj_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        qkvo_proj = AIEGEMM(**qkvo_proj_kwargs)
+        self.qkvo_proj_xclbin, self.qkvo_proj_insts = qkvo_proj.get_artifacts(
+            prefix=f"{prefix_base}qkvo_proj_"
+        )
+        self.qkvo_proj_xclbin.xclbin_input = self.ln1_xclbin
+        self.qkvo_proj_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_qkvo_proj",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.qkvo_proj_xclbin.kernel_name = "decoder_qkvo_proj"
+        self.qkvo_proj_xclbin.depends += [self.ln1_xclbin]
+        artifacts.append(self.qkvo_proj_insts)
+        kernel_id += 1
+
+        k_transpose_kwargs = dict(self.operator_config["k_transpose"])
+        k_transpose_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        k_transpose = AIETranspose(**k_transpose_kwargs)
+        self.k_transpose_xclbin, self.k_transpose_insts = k_transpose.get_artifacts(
+            prefix=f"{prefix_base}k_transpose_"
+        )
+        self.k_transpose_xclbin.xclbin_input = self.qkvo_proj_xclbin
+        self.k_transpose_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_k_transpose",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.k_transpose_xclbin.kernel_name = "decoder_k_transpose"
+        self.k_transpose_xclbin.depends += [self.qkvo_proj_xclbin]
+        artifacts.append(self.k_transpose_insts)
+        kernel_id += 1
+
+        attn_scores_kwargs = dict(self.operator_config["attn_scores"])
+        attn_scores_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        if self.use_blocked_attention:
+            attn_scores_kwargs.update(
+                {"input_a_buffer_shape": (self.seq_len, self.hidden_size)}
+            )
+        attn_scores = AIEGEMM(**attn_scores_kwargs)
+        self.attn_scores_xclbin, self.attn_scores_insts = attn_scores.get_artifacts(
+            prefix=f"{prefix_base}attn_scores_"
+        )
+        self.attn_scores_xclbin.xclbin_input = self.k_transpose_xclbin
+        self.attn_scores_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_attn_scores",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.attn_scores_xclbin.kernel_name = "decoder_attn_scores"
+        self.attn_scores_xclbin.depends += [self.k_transpose_xclbin]
+        if self.use_blocked_attention:
+            setattr(self, "attn_scores_block_000_insts", self.attn_scores_insts)
+            artifacts.append(self.attn_scores_insts)
+            for block_index, q_start in self._iter_query_blocks():
+                if block_index == 0:
+                    continue
+                block_suffix = self._block_suffix(block_index)
+                block_attn_scores = AIEGEMM(
+                    **{
+                        **attn_scores_kwargs,
+                        "input_a_offset": q_start * self.hidden_size,
+                    }
+                )
+                block_insts = block_attn_scores.get_insts_artifact(
+                    prefix=f"{prefix_base}attn_scores_{block_suffix}_",
+                    xclbin_input=self.attn_scores_xclbin,
+                    kernel_name=self.attn_scores_xclbin.kernel_name,
+                )
+                setattr(self, f"attn_scores_{block_suffix}_insts", block_insts)
+                artifacts.append(block_insts)
+        else:
+            artifacts.append(self.attn_scores_insts)
+        kernel_id += 1
+
+        attn_scale_kwargs = dict(self.operator_config["attn_scale"])
+        attn_scale_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        self.attn_scale_xclbin, self.attn_scale_insts = AIEElementwiseMul(
+            **attn_scale_kwargs
+        ).get_artifacts(prefix=f"{prefix_base}attn_scale_")
+        self.attn_scale_xclbin.xclbin_input = self.attn_scores_xclbin
+        self.attn_scale_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_attn_scale",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.attn_scale_xclbin.kernel_name = "decoder_attn_scale"
+        self.attn_scale_xclbin.depends += [self.attn_scores_xclbin]
+        artifacts.append(self.attn_scale_insts)
+        kernel_id += 1
+
+        self.causal_mask_xclbin, self.causal_mask_insts = AIECausalMask(
+            **{
+                **self.operator_config["causal_mask"],
+                "context": self.context,
+                "skip_add_to_list": True,
+            }
+        ).get_artifacts(prefix=f"{prefix_base}causal_mask_")
+        self.causal_mask_xclbin.xclbin_input = self.attn_scale_xclbin
+        self.causal_mask_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_causal_mask",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.causal_mask_xclbin.kernel_name = "decoder_causal_mask"
+        self.causal_mask_xclbin.depends += [self.attn_scale_xclbin]
+        artifacts.append(self.causal_mask_insts)
+        kernel_id += 1
+
+        attn_softmax_kwargs = dict(self.operator_config["attn_softmax"])
+        attn_softmax_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        self.attn_softmax_xclbin, self.attn_softmax_insts = AIESoftmax(
+            **attn_softmax_kwargs
+        ).get_artifacts(prefix=f"{prefix_base}attn_softmax_")
+        self.attn_softmax_xclbin.xclbin_input = self.causal_mask_xclbin
+        self.attn_softmax_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_attn_softmax",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.attn_softmax_xclbin.kernel_name = "decoder_attn_softmax"
+        self.attn_softmax_xclbin.depends += [self.causal_mask_xclbin]
+        artifacts.append(self.attn_softmax_insts)
+        kernel_id += 1
+
+        attn_output_kwargs = dict(self.operator_config["attn_output"])
+        attn_output_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        if self.use_blocked_attention:
+            attn_output_kwargs.update(
+                {"output_c_buffer_shape": (self.seq_len, self.hidden_size)}
+            )
+        attn_output = AIEGEMM(**attn_output_kwargs)
+        self.attn_output_xclbin, self.attn_output_insts = attn_output.get_artifacts(
+            prefix=f"{prefix_base}attn_output_"
+        )
+        self.attn_output_xclbin.xclbin_input = self.attn_softmax_xclbin
+        self.attn_output_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_attn_output",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.attn_output_xclbin.kernel_name = "decoder_attn_output"
+        self.attn_output_xclbin.depends += [self.attn_softmax_xclbin]
+        if self.use_blocked_attention:
+            setattr(self, "attn_output_block_000_insts", self.attn_output_insts)
+            artifacts.append(self.attn_output_insts)
+            for block_index, q_start in self._iter_query_blocks():
+                if block_index == 0:
+                    continue
+                block_suffix = self._block_suffix(block_index)
+                block_attn_output = AIEGEMM(
+                    **{
+                        **attn_output_kwargs,
+                        "output_c_offset": q_start * self.hidden_size,
+                    }
+                )
+                block_insts = block_attn_output.get_insts_artifact(
+                    prefix=f"{prefix_base}attn_output_{block_suffix}_",
+                    xclbin_input=self.attn_output_xclbin,
+                    kernel_name=self.attn_output_xclbin.kernel_name,
+                )
+                setattr(self, f"attn_output_{block_suffix}_insts", block_insts)
+                artifacts.append(block_insts)
+        else:
+            artifacts.append(self.attn_output_insts)
+        kernel_id += 1
+        next_dep = self.attn_output_xclbin
+
+        add_kwargs = dict(self.operator_config["add"])
+        add_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        self.add_xclbin, self.add_insts = AIEElementwiseAdd(**add_kwargs).get_artifacts(
+            prefix=f"{prefix_base}add_"
+        )
+        self.add_xclbin.xclbin_input = next_dep
+        self.add_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_add",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.add_xclbin.kernel_name = "decoder_add"
+        self.add_xclbin.depends += [next_dep]
+        artifacts.append(self.add_insts)
+        next_dep = self.add_xclbin
+        kernel_id += 1
+
+        add_norm_kwargs = dict(
+            self.operator_config.get(
+                "add_norm",
+                {
+                    "size": int(self.operator_config["ln2"]["size"]),
+                    "tile_size": int(self.operator_config["ln2"]["tile_size"]),
+                    "num_aie_columns": int(
+                        self.operator_config["ln2"]["num_aie_columns"]
+                    ),
+                },
+            )
+        )
+        add_norm_kwargs.update(
+            {
+                "weights": self.ln2_weight,
+                "context": self.context,
+                "skip_add_to_list": True,
+            }
+        )
+        self.add_norm_xclbin, self.add_norm_insts = AIEAddAndNorm(
+            **add_norm_kwargs
+        ).get_artifacts(prefix=f"{prefix_base}add_norm_")
+        self.add_norm_xclbin.xclbin_input = next_dep
+        self.add_norm_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_add_norm",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.add_norm_xclbin.kernel_name = "decoder_add_norm"
+        self.add_norm_xclbin.depends += [next_dep]
+        artifacts.append(self.add_norm_insts)
+        next_dep = self.add_norm_xclbin
+        kernel_id += 1
+
+        up_proj_kwargs = dict(self.operator_config["up_proj"])
+        up_proj_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        self.up_proj_xclbin, self.up_proj_insts = AIEGEMM(
+            **up_proj_kwargs
+        ).get_artifacts(prefix=f"{prefix_base}up_proj_")
+        self.up_proj_xclbin.xclbin_input = next_dep
+        self.up_proj_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_up_proj",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.up_proj_xclbin.kernel_name = "decoder_up_proj"
+        self.up_proj_xclbin.depends += [next_dep]
+        artifacts.append(self.up_proj_insts)
+        kernel_id += 1
+
+        gelu_kwargs = dict(self.operator_config["gelu"])
+        gelu_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        self.gelu_xclbin, self.gelu_insts = AIEGELU(**gelu_kwargs).get_artifacts(
+            prefix=f"{prefix_base}gelu_"
+        )
+        self.gelu_xclbin.xclbin_input = self.up_proj_xclbin
+        self.gelu_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_gelu",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.gelu_xclbin.kernel_name = "decoder_gelu"
+        self.gelu_xclbin.depends += [self.up_proj_xclbin]
+        artifacts.append(self.gelu_insts)
+        kernel_id += 1
+
+        down_proj_kwargs = dict(self.operator_config["down_proj"])
+        down_proj_kwargs.update({"context": self.context, "skip_add_to_list": True})
+        self.down_proj_xclbin, self.down_proj_insts = AIEGEMM(
+            **down_proj_kwargs
+        ).get_artifacts(prefix=f"{prefix_base}down_proj_")
+        self.down_proj_xclbin.xclbin_input = self.gelu_xclbin
+        self.down_proj_xclbin.extra_flags += [
+            "--xclbin-instance-name=decoder_down_proj",
+            f"--xclbin-kernel-id={hex(kernel_id)}",
+        ]
+        self.down_proj_xclbin.kernel_name = "decoder_down_proj"
+        self.down_proj_xclbin.depends += [self.gelu_xclbin]
+        artifacts.append(self.down_proj_insts)
+        artifacts.append(self.down_proj_xclbin)
+        self.combined_xclbin = self.down_proj_xclbin
+
+        self.add_artifacts(artifacts)
+        logging.info(
+            "Finished setting up %d decoder runlist artifacts.", len(artifacts)
+        )
+
+    def _set_up_decoder_runtime(self):
+        act_size = self.seq_len * self.hidden_size
+        attn_scratch_size = self.query_block_size * self.seq_len * self.num_heads
+
+        self.add_buffer("input", act_size)
+        self.add_buffer(
+            "q_weight",
+            self.hidden_size * self.hidden_size,
+            static_data=(
+                torch_to_numpy(self.q_weight) if self.q_weight is not None else None
+            ),
+        )
+        self.add_buffer(
+            "k_weight",
+            self.hidden_size * self.hidden_size,
+            static_data=(
+                torch_to_numpy(self.k_weight) if self.k_weight is not None else None
+            ),
+        )
+        self.add_buffer(
+            "v_weight",
+            self.hidden_size * self.hidden_size,
+            static_data=(
+                torch_to_numpy(self.v_weight) if self.v_weight is not None else None
+            ),
+        )
+        self.add_buffer(
+            "attn_output_weight",
+            self.hidden_size * self.hidden_size,
+            static_data=(
+                torch_to_numpy(self.attn_output_weight)
+                if self.attn_output_weight is not None
+                else None
+            ),
+        )
+        self.add_buffer(
+            "ffn_up_weight",
+            self.hidden_size * self.intermediate_size,
+            static_data=(
+                torch_to_numpy(self.ffn_up_weight)
+                if self.ffn_up_weight is not None
+                else None
+            ),
+        )
+        self.add_buffer(
+            "ffn_down_weight",
+            self.intermediate_size * self.hidden_size,
+            static_data=(
+                torch_to_numpy(self.ffn_down_weight)
+                if self.ffn_down_weight is not None
+                else None
+            ),
+        )
+
+        self.add_buffer("ln1_output", act_size)
+        self.add_buffer("q_output", act_size)
+        self.add_buffer("k_output", act_size)
+        self.add_buffer("v_output", act_size)
+        self.add_buffer("k_transposed", act_size)
+        self.add_buffer("attn_scores_output", attn_scratch_size)
+        self.add_buffer("attn_scaled_output", attn_scratch_size)
+        self.add_buffer("attn_masked_output", attn_scratch_size)
+        self.add_buffer("attn_weights_output", attn_scratch_size)
+        self.add_buffer("attn_heads_output", act_size)
+        self.add_buffer("output_proj_output", act_size)
+        self.add_buffer("add1_output", act_size)
+        self.add_buffer("add_norm_output", act_size)
+        self.add_buffer("up_proj_output", self.seq_len * self.intermediate_size)
+        self.add_buffer("gelu_output", self.seq_len * self.intermediate_size)
+        self.add_buffer("down_proj_output", act_size)
+        self.add_buffer("output", act_size)
+        for block_index, q_start in self._iter_query_blocks():
+            block_suffix = self._block_suffix(block_index)
+            self.add_buffer(
+                f"causal_mask_{block_suffix}",
+                attn_scratch_size,
+                static_data=torch_to_numpy(
+                    _build_causal_mask(
+                        query_block_size=self.query_block_size,
+                        seq_len=self.seq_len,
+                        num_heads=self.num_heads,
+                        q_start=q_start,
+                        masked_fill_value=float(
+                            self.operator_config["causal_mask"]["masked_fill_value"]
+                        ),
+                    )
+                ),
+            )
+
+        self.add_kernel(
+            "decoder_ln1",
+            self.combined_xclbin,
+            self.ln1_xclbin.kernel_name,
+            self.ln1_insts,
+        )
+        self.add_kernel(
+            "decoder_qkvo_proj",
+            self.combined_xclbin,
+            self.qkvo_proj_xclbin.kernel_name,
+            self.qkvo_proj_insts,
+        )
+        self.add_kernel(
+            "decoder_k_transpose",
+            self.combined_xclbin,
+            self.k_transpose_xclbin.kernel_name,
+            self.k_transpose_insts,
+        )
+        if self.use_blocked_attention:
+            for block_index, _ in self._iter_query_blocks():
+                block_suffix = self._block_suffix(block_index)
+                self.add_kernel(
+                    f"decoder_attn_scores_{block_suffix}",
+                    self.combined_xclbin,
+                    self.attn_scores_xclbin.kernel_name,
+                    getattr(self, f"attn_scores_{block_suffix}_insts"),
+                )
+        else:
+            self.add_kernel(
+                "decoder_attn_scores",
+                self.combined_xclbin,
+                self.attn_scores_xclbin.kernel_name,
+                self.attn_scores_insts,
+            )
+        self.add_kernel(
+            "decoder_attn_scale",
+            self.combined_xclbin,
+            self.attn_scale_xclbin.kernel_name,
+            self.attn_scale_insts,
+        )
+        self.add_kernel(
+            "decoder_causal_mask",
+            self.combined_xclbin,
+            self.causal_mask_xclbin.kernel_name,
+            self.causal_mask_insts,
+        )
+        self.add_kernel(
+            "decoder_attn_softmax",
+            self.combined_xclbin,
+            self.attn_softmax_xclbin.kernel_name,
+            self.attn_softmax_insts,
+        )
+        if self.use_blocked_attention:
+            for block_index, _ in self._iter_query_blocks():
+                block_suffix = self._block_suffix(block_index)
+                self.add_kernel(
+                    f"decoder_attn_output_{block_suffix}",
+                    self.combined_xclbin,
+                    self.attn_output_xclbin.kernel_name,
+                    getattr(self, f"attn_output_{block_suffix}_insts"),
+                )
+        else:
+            self.add_kernel(
+                "decoder_attn_output",
+                self.combined_xclbin,
+                self.attn_output_xclbin.kernel_name,
+                self.attn_output_insts,
+            )
+        self.add_kernel(
+            "decoder_add",
+            self.combined_xclbin,
+            self.add_xclbin.kernel_name,
+            self.add_insts,
+        )
+        self.add_kernel(
+            "decoder_add_norm",
+            self.combined_xclbin,
+            self.add_norm_xclbin.kernel_name,
+            self.add_norm_insts,
+        )
+        self.add_kernel(
+            "decoder_up_proj",
+            self.combined_xclbin,
+            self.up_proj_xclbin.kernel_name,
+            self.up_proj_insts,
+        )
+        self.add_kernel(
+            "decoder_gelu",
+            self.combined_xclbin,
+            self.gelu_xclbin.kernel_name,
+            self.gelu_insts,
+        )
+        self.add_kernel(
+            "decoder_down_proj",
+            self.combined_xclbin,
+            self.down_proj_xclbin.kernel_name,
+            self.down_proj_insts,
+        )
+
+        self.add_to_runlist("decoder_ln1", "input", "ln1_output")
+        self.add_to_runlist("decoder_qkvo_proj", "ln1_output", "q_weight", "q_output")
+        self.add_to_runlist("decoder_qkvo_proj", "ln1_output", "k_weight", "k_output")
+        self.add_to_runlist("decoder_qkvo_proj", "ln1_output", "v_weight", "v_output")
+        self.add_to_runlist("decoder_k_transpose", "k_output", "k_transposed")
+        if self.use_blocked_attention:
+            for block_index, _ in self._iter_query_blocks():
+                block_suffix = self._block_suffix(block_index)
+                self.add_to_runlist(
+                    f"decoder_attn_scores_{block_suffix}",
+                    "q_output",
+                    "k_transposed",
+                    "attn_scores_output",
+                )
+                self.add_to_runlist(
+                    "decoder_attn_scale",
+                    "attn_scores_output",
+                    "attn_scaled_output",
+                )
+                self.add_to_runlist(
+                    "decoder_causal_mask",
+                    "attn_scaled_output",
+                    f"causal_mask_{block_suffix}",
+                    "attn_masked_output",
+                )
+                self.add_to_runlist(
+                    "decoder_attn_softmax",
+                    "attn_masked_output",
+                    "attn_weights_output",
+                )
+                self.add_to_runlist(
+                    f"decoder_attn_output_{block_suffix}",
+                    "attn_weights_output",
+                    "v_output",
+                    "attn_heads_output",
+                )
+        else:
+            self.add_to_runlist(
+                "decoder_attn_scores",
+                "q_output",
+                "k_transposed",
+                "attn_scores_output",
+            )
+            self.add_to_runlist(
+                "decoder_attn_scale",
+                "attn_scores_output",
+                "attn_scaled_output",
+            )
+            self.add_to_runlist(
+                "decoder_causal_mask",
+                "attn_scaled_output",
+                "causal_mask_block_000",
+                "attn_masked_output",
+            )
+            self.add_to_runlist(
+                "decoder_attn_softmax",
+                "attn_masked_output",
+                "attn_weights_output",
+            )
+            self.add_to_runlist(
+                "decoder_attn_output",
+                "attn_weights_output",
+                "v_output",
+                "attn_heads_output",
+            )
+        self.add_to_runlist(
+            "decoder_qkvo_proj",
+            "attn_heads_output",
+            "attn_output_weight",
+            "output_proj_output",
+        )
+        self.add_to_runlist(
+            "decoder_add",
+            "output_proj_output",
+            "input",
+            "add1_output",
+        )
+        self.add_to_runlist(
+            "decoder_add_norm",
+            "output_proj_output",
+            "input",
+            "add_norm_output",
+        )
+        self.add_to_runlist(
+            "decoder_up_proj", "add_norm_output", "ffn_up_weight", "up_proj_output"
+        )
+        self.add_to_runlist("decoder_gelu", "up_proj_output", "gelu_output")
+        self.add_to_runlist(
+            "decoder_down_proj",
+            "gelu_output",
+            "ffn_down_weight",
+            "down_proj_output",
+        )
+        self.add_to_runlist("decoder_add", "add1_output", "down_proj_output", "output")
+
+        logging.info(
+            "Finished setting up %d decoder runlist entries.", len(self.runlist)
+        )
+        self.reset_buffer_names = (
+            "ln1_output",
+            "q_output",
+            "k_output",
+            "v_output",
+            "k_transposed",
+            "attn_scores_output",
+            "attn_heads_output",
+            "output_proj_output",
+            "add1_output",
+            "add_norm_output",
+            "up_proj_output",
+            "down_proj_output",
+        )
 
     def forward(self, x, attention_mask=None):
         """

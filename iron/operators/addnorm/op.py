@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 from ml_dtypes import bfloat16
-from pathlib import Path
 
 from iron.common import (
     AIEOperatorBase,
@@ -22,6 +24,14 @@ from iron.common.utils import torch_to_numpy
 
 class AIEAddAndNorm(AIEOperatorBase):
     """AIE-accelerated ADD & LAYER NORM operator"""
+
+    @staticmethod
+    def _weight_signature(weights):
+        if isinstance(weights, np.ndarray):
+            weight_np = np.ascontiguousarray(weights)
+        else:
+            weight_np = np.ascontiguousarray(torch_to_numpy(weights))
+        return hashlib.sha1(weight_np.view(np.uint8)).hexdigest()[:12]
 
     def __init__(
         self,
@@ -59,11 +69,11 @@ class AIEAddAndNorm(AIEOperatorBase):
         file_name_base = (
             f"{prefix}{self.num_aie_columns}c_{self.size}_{self.tile_size}t"
         )
+        weight_signature = self._weight_signature(self.weight)
+        file_name_base = f"{file_name_base}_{weight_signature}"
 
         # Save the weight weights to a npy file so that the design.py can load it at compile time
-        weight_file_name = (
-            self.context.build_dir / f"{file_name_base}_weights_{self.tile_size}.npy"
-        )
+        weight_file_name = self.context.build_dir / f"{file_name_base}_weights.npy"
         np.save(weight_file_name, torch_to_numpy(self.weight))
 
         kernel_archive = f"{file_name_base}_layer_norm_archive.a"
@@ -109,17 +119,6 @@ class AIEAddAndNorm(AIEOperatorBase):
                                     / "aie_kernels"
                                     / "generic"
                                     / "mul.cc"
-                                )
-                            ],
-                        ),
-                        KernelObjectArtifact.new(
-                            f"{file_name_base}_add.o",
-                            depends=[
-                                SourceArtifact.new(
-                                    self.context.base_dir
-                                    / "aie_kernels"
-                                    / "generic"
-                                    / "add.cc"
                                 )
                             ],
                         ),
@@ -172,11 +171,10 @@ class AIEAddAndNorm(AIEOperatorBase):
 
         # Always flatten to [batch, orig_size]
         original_shape = x.shape
-        batch = x.shape[0] if x.dim() > 1 else 1
-        x_flat = x.reshape(batch, -1)
-        y_flat = y.reshape(batch, -1)
+        x_flat = x.reshape(-1)
+        y_flat = y.reshape(-1)
 
-        pad_len = self.size - x_flat.shape[1]
+        pad_len = self.size - x_flat.numel()
         if pad_len > 0:
             x_flat = torch.nn.functional.pad(x_flat, (0, pad_len))
             y_flat = torch.nn.functional.pad(y_flat, (0, pad_len))
@@ -186,7 +184,7 @@ class AIEAddAndNorm(AIEOperatorBase):
         # Remove padding if added
         numel = np.prod(original_shape)
         if pad_len > 0:
-            out = out.reshape(-1)[..., :numel]
+            out = out[:numel]
         # Restore original shape
         out = out.reshape(*original_shape)
 

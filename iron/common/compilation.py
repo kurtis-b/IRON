@@ -31,6 +31,7 @@ list must be made available after calling `compile()`.
 
 from abc import ABC, abstractmethod
 from pathlib import Path
+import json
 import os.path
 import zlib
 import logging
@@ -164,6 +165,34 @@ class KernelObjectArtifact(CompilationArtifact):
         super().__init__(path, depends)
         self.extra_flags = extra_flags if extra_flags is not None else []
         self.rename_symbols = rename_symbols if rename_symbols is not None else {}
+
+    def metadata_path(self) -> Path:
+        return Path(f"{self.path}.metadata.json")
+
+    def build_signature(self) -> dict[str, object]:
+        return {
+            "artifact_type": "KernelObjectArtifact",
+            "source_paths": [str(dep.path.absolute()) for dep in self.depends],
+            "extra_flags": list(self.extra_flags),
+            "rename_symbols": [
+                [old_sym, new_sym]
+                for old_sym, new_sym in sorted(self.rename_symbols.items())
+            ],
+        }
+
+    def is_available(self):
+        if not super().is_available():
+            return False
+        metadata_path = self.metadata_path()
+        if not metadata_path.exists():
+            return False
+        if os.path.getmtime(str(metadata_path)) < os.path.getmtime(str(self.path)):
+            return False
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return False
+        return metadata == self.build_signature()
 
 
 class KernelArchiveArtifact(CompilationArtifact):
@@ -527,6 +556,13 @@ class PeanoCompilationRule(CompilationRule):
             if artifact.rename_symbols:
                 self._rename_symbols(artifact)
 
+            if self.dry_run is None:
+                artifact.metadata_path().write_text(
+                    json.dumps(artifact.build_signature(), sort_keys=True, indent=2)
+                    + "\n",
+                    encoding="utf-8",
+                )
+
         return artifacts
 
     def _rename_symbols(self, artifact):
@@ -627,15 +663,23 @@ def apply_rules(rules, artifacts):
 
 
 def compile(rules, artifacts):
-    # While some artifacts remain to be compiled (not all are available)
-    while not all(artifact.is_available() for artifact in artifacts):
-        remaining = [artifact for artifact in artifacts if not artifact.is_available()]
-        success, artifacts = apply_rules(rules, remaining)
+    # Recompute the flattened work list each pass so newly stale ancestors are
+    # rediscovered when a dependency is rebuilt during the same operator compile.
+    root_artifacts = list(artifacts)
+    while True:
+        work_list = get_work_list(root_artifacts)
+        if not work_list:
+            return root_artifacts
+        success, remaining = apply_rules(rules, work_list)
         if not success:
             raise RuntimeError(
-                f"No matching rule to compile target(s): {', '.join(str(artifact.path.name) for artifact in artifacts if not artifact.is_available())}"
+                "No matching rule to compile target(s): "
+                + ", ".join(
+                    str(artifact.path.name)
+                    for artifact in remaining
+                    if not artifact.is_available()
+                )
             )
-    return artifacts
 
 
 def get_work_list(artifacts):

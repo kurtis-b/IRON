@@ -14,6 +14,14 @@ Measure and analyze peak NPU memory bandwidth with the existing
 
 This study is NPU-only and does not compare against the transformer patterns.
 
+Before running it, set the NPU power mode to `turbo`:
+
+- `sudo xrt-smi configure --pmode turbo`
+- verify with `xrt-smi examine -r all`
+
+The benchmark helper checks `xrt-smi` before each measured memcpy row and
+fails that measurement if the reported NPU power mode is not `turbo`.
+
 ## Sweep Surface
 
 Fixed transfer size:

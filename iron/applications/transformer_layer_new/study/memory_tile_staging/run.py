@@ -9,6 +9,8 @@ import csv
 import logging
 from pathlib import Path
 
+from ..npu_runtime_checks import warn_if_npu_power_mode_not_turbo
+from ..run_lock import default_lock_path, hold_study_lock
 from iron.applications.transformer_layer_new.study.block.cases import (
     FAMILY_IDS,
     SEQUENCE_LADDER,
@@ -29,6 +31,10 @@ from .select import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+STAGING_SEQUENCE_LENGTHS = tuple(
+    seq_len for seq_len in SEQUENCE_LADDER if 256 <= seq_len <= 8192
+)
 
 RESULTS_CSV_FIELDNAMES = (
     "study_id",
@@ -67,6 +73,41 @@ def default_output_path() -> Path:
         / "memory_tile_staging"
         / "results.csv"
     )
+
+
+def default_resume_paths(output_path: Path) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    candidate = (
+        Path(__file__).resolve().parents[2]
+        / "results_final"
+        / "memory_tile_staging"
+        / output_path.name
+    )
+    if candidate.exists():
+        paths.append(candidate)
+    if output_path.exists() and output_path not in paths:
+        paths.append(output_path)
+    return tuple(paths)
+
+
+def removed_cases_path() -> Path:
+    return Path(__file__).with_name("removed_cases.csv")
+
+
+def load_removed_case_notes() -> dict[tuple[str, int, str, int], str]:
+    path = removed_cases_path()
+    if not path.exists():
+        return {}
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        return {
+            (
+                str(row.get("family_id") or ""),
+                int(float(str(row.get("seq_len") or 0))),
+                str(row.get("block_kind") or ""),
+                int(float(str(row.get("staging_depth") or 0))),
+            ): str(row.get("reason") or "")
+            for row in csv.DictReader(handle)
+        }
 
 
 def _divisors(value: int) -> tuple[int, ...]:
@@ -175,6 +216,32 @@ def write_rows(output_path: Path, rows: list[dict[str, object]]) -> None:
             )
 
 
+def _row_key(row: dict[str, object]) -> tuple[str, int, str, int]:
+    return (
+        str(row.get("family_id") or ""),
+        int(float(str(row.get("seq_len") or 0))),
+        str(row.get("block_kind") or ""),
+        int(float(str(row.get("staging_depth") or 0))),
+    )
+
+
+def _selection_key(selection: ReferenceSelection) -> tuple[str, int, str]:
+    return (selection.family_id, selection.seq_len, selection.block_kind)
+
+
+def load_existing_rows(
+    paths: tuple[Path, ...],
+) -> dict[tuple[str, int, str, int], dict[str, object]]:
+    rows: dict[tuple[str, int, str, int], dict[str, object]] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                rows[_row_key(row)] = dict(row)
+    return rows
+
+
 def _selection_descriptor(selection: ReferenceSelection) -> str:
     return (
         f"{selection.family_id} seq_len={selection.seq_len} "
@@ -188,6 +255,8 @@ def build_selection_rows(
     warmup_iters: int | None,
     timed_iters: int | None,
     seed: int,
+    existing_rows: dict[tuple[str, int, str, int], dict[str, object]] | None = None,
+    removed_case_notes: dict[tuple[str, int, str, int], str] | None = None,
 ) -> list[dict[str, object]]:
     resolved_warmup_iters, resolved_timed_iters = iteration_schedule(
         selection.seq_len,
@@ -205,7 +274,48 @@ def build_selection_rows(
     rows: list[dict[str, object]] = []
     source_depth = source_staging_depth(selection)
     for staging_depth in depths:
+        removed_reason = ({} if removed_case_notes is None else removed_case_notes).get(
+            (
+                selection.family_id,
+                selection.seq_len,
+                selection.block_kind,
+                int(staging_depth),
+            )
+        )
+        if removed_reason:
+            LOGGER.info(
+                "Skipping removed memory-tile staging case %s staging_depth=%s: %s",
+                _selection_descriptor(selection),
+                staging_depth,
+                removed_reason,
+            )
+            continue
         candidate = candidate_with_staging_depth(selection, staging_depth)
+        expected_config = config_row(selection.block_kind, candidate)
+        existing_row = ({} if existing_rows is None else existing_rows).get(
+            (
+                selection.family_id,
+                selection.seq_len,
+                selection.block_kind,
+                int(staging_depth),
+            )
+        )
+        if (
+            existing_row is not None
+            and str(existing_row.get("run_status") or "") == "passed"
+        ):
+            if all(
+                str(existing_row.get(column, ""))
+                == str(expected_config.get(column, ""))
+                for column in CONFIG_COLUMNS_BY_BLOCK_KIND[selection.block_kind]
+            ):
+                LOGGER.info(
+                    "Reusing %s staging_depth=%s from existing results",
+                    _selection_descriptor(selection),
+                    staging_depth,
+                )
+                rows.append(dict(existing_row))
+                continue
         LOGGER.info(
             "Benchmarking %s staging_depth=%s warmup_iters=%s timed_iters=%s",
             _selection_descriptor(selection),
@@ -237,7 +347,7 @@ def build_selection_rows(
                 "ffn_dim": selection.ffn_dim,
                 "warmup_iters": resolved_warmup_iters,
                 "timed_iters": resolved_timed_iters,
-                **config_row(selection.block_kind, candidate),
+                **expected_config,
                 **result,
             }
         )
@@ -256,6 +366,8 @@ def build_rows(
     timed_iters: int | None,
     seed: int,
     reference_input: Path,
+    existing_rows: dict[tuple[str, int, str, int], dict[str, object]] | None = None,
+    removed_case_notes: dict[tuple[str, int, str, int], str] | None = None,
 ) -> list[dict[str, object]]:
     selections = select_reference_rows(
         load_reference_rows(reference_input),
@@ -263,6 +375,10 @@ def build_rows(
         seq_len_filter=seq_len_filter,
         block_filter=block_filter,
     )
+    allowed_seq_lens = set(STAGING_SEQUENCE_LENGTHS)
+    selections = [
+        selection for selection in selections if selection.seq_len in allowed_seq_lens
+    ]
     rows: list[dict[str, object]] = []
     for selection in selections:
         rows.extend(
@@ -271,6 +387,8 @@ def build_rows(
                 warmup_iters=warmup_iters,
                 timed_iters=timed_iters,
                 seed=seed,
+                existing_rows=existing_rows,
+                removed_case_notes=removed_case_notes,
             )
         )
     mark_best_rows(rows)
@@ -289,7 +407,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--seq-len",
-        choices=[*(str(value) for value in SEQUENCE_LADDER), "all"],
+        choices=[*(str(value) for value in STAGING_SEQUENCE_LENGTHS), "all"],
         default="all",
     )
     parser.add_argument(
@@ -306,6 +424,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=default_reference_results_path(),
     )
     parser.add_argument("--output", type=Path, default=default_output_path())
+    parser.add_argument("--resume-input", type=Path, default=None)
+    parser.add_argument("--no-resume", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -314,30 +434,99 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
     args = parse_args(argv)
+    warn_if_npu_power_mode_not_turbo(
+        LOGGER,
+        study_name="memory-tile staging study",
+    )
     reference_input = args.reference_input.expanduser()
     output_path = args.output.expanduser()
+    with hold_study_lock(
+        default_lock_path(output_path),
+        study_name="transformer_layer_new memory-tile staging study",
+    ):
+        resume_paths: tuple[Path, ...] = tuple()
+        if args.no_resume:
+            resume_paths = tuple()
+        elif args.resume_input is not None:
+            resume_paths = (args.resume_input.expanduser(),)
+        else:
+            resume_paths = default_resume_paths(output_path)
 
-    if not reference_input.exists():
-        LOGGER.warning(
-            "Reference block results not found at %s; writing empty outputs",
-            reference_input,
+        if not reference_input.exists():
+            LOGGER.warning(
+                "Reference block results not found at %s; writing empty outputs",
+                reference_input,
+            )
+            write_rows(output_path, [])
+            write_canonical_plots(output_path, output_path.parent)
+            return 0
+
+        existing_rows = load_existing_rows(resume_paths)
+        if resume_paths and existing_rows:
+            LOGGER.info(
+                "Loaded %d reusable memory-tile staging rows from %s",
+                len(existing_rows),
+                ", ".join(str(path) for path in resume_paths),
+            )
+        removed_case_notes = load_removed_case_notes()
+        if removed_case_notes:
+            LOGGER.info(
+                "Loaded %d removed memory-tile staging cases from %s",
+                len(removed_case_notes),
+                removed_cases_path(),
+            )
+
+        selections = select_reference_rows(
+            load_reference_rows(reference_input),
+            family_filter=str(args.family),
+            seq_len_filter=str(args.seq_len),
+            block_filter=str(args.block),
         )
-        write_rows(output_path, [])
-        write_canonical_plots(output_path, output_path.parent)
-        return 0
+        row_map: dict[tuple[str, int, str, int], dict[str, object]] = dict(
+            existing_rows
+        )
+        active_selection_keys = {_selection_key(selection) for selection in selections}
+        row_map = {
+            key: value
+            for key, value in row_map.items()
+            if key[:3] in active_selection_keys
+        }
 
-    rows = build_rows(
-        family_filter=str(args.family),
-        seq_len_filter=str(args.seq_len),
-        block_filter=str(args.block),
-        warmup_iters=args.warmup_iters,
-        timed_iters=args.timed_iters,
-        seed=args.seed,
-        reference_input=reference_input,
-    )
-    write_rows(output_path, rows)
-    write_canonical_plots(output_path, output_path.parent)
-    LOGGER.info("Wrote %d memory-tile staging rows to %s", len(rows), output_path)
+        total_selections = len(selections)
+        for index, selection in enumerate(selections, start=1):
+            selection_rows = build_selection_rows(
+                selection,
+                warmup_iters=args.warmup_iters,
+                timed_iters=args.timed_iters,
+                seed=args.seed,
+                existing_rows=existing_rows,
+                removed_case_notes=removed_case_notes,
+            )
+            selection_prefix = _selection_key(selection)
+            row_map = {
+                key: value
+                for key, value in row_map.items()
+                if key[:3] != selection_prefix
+            }
+            for row in selection_rows:
+                row_map[_row_key(row)] = row
+            rows = list(row_map.values())
+            annotate_speedup_vs_depth1(rows)
+            mark_best_rows(rows)
+            write_rows(output_path, rows)
+            LOGGER.info(
+                "Checkpointed %d memory-tile staging rows after selection %d/%d",
+                len(rows),
+                index,
+                total_selections,
+            )
+
+        rows = list(row_map.values())
+        annotate_speedup_vs_depth1(rows)
+        mark_best_rows(rows)
+        write_rows(output_path, rows)
+        write_canonical_plots(output_path, output_path.parent)
+        LOGGER.info("Wrote %d memory-tile staging rows to %s", len(rows), output_path)
     return 0
 
 

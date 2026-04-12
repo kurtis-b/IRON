@@ -27,9 +27,13 @@ from iron.operators.gemm.op import AIEGEMM
 from iron.operators.layer_norm.op import AIELayerNorm
 from iron.operators.mha_out_proj.op import AIEMHAOutProj
 from iron.operators.qkv_proj.op import AIEQKVProj
+from iron.operators.causal_mask.op import AIECausalMask
 from iron.operators.softmax.op import AIESoftmax
 from iron.operators.transpose.op import AIETranspose
 
+from iron.applications.transformer_layer_new.pattern.dataflow.op import (
+    resolve_hybrid_operator_config,
+)
 from iron.applications.transformer_layer_new.pattern.runlist.op import (
     AIETransformerRunlist,
 )
@@ -41,7 +45,7 @@ from iron.applications.transformer_layer_new.study.block.run import (
 from iron.applications.transformer_layer_new.study.end_to_end.cases import (
     EndToEndWorkload,
     FAMILY_IDS,
-    MODE_OPERATORS,
+    mode_operators,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.select import (
     load_result_rows,
@@ -56,9 +60,8 @@ from iron.applications.transformer_layer_new.study.resource_usage.analysis impor
 
 LOGGER = logging.getLogger(__name__)
 
-Scope = Literal["all", "dataflow_blocks", "runlist_ops"]
+Scope = Literal["all", "dataflow_blocks", "hybrid_ops", "runlist_ops"]
 
-RUNLIST_OPERATOR_ORDER = MODE_OPERATORS["runlist"]
 APP_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = APP_ROOT.parents[2]
 
@@ -89,20 +92,41 @@ DATAFLOW_BLOCK_FIELDNAMES = (
     "aie_tiles_with_buffers",
     "aie_tile_allocated_bytes",
     "aie_tile_memory_utilization",
+    "aie_tile_memory_utilization_min",
+    "aie_tile_memory_utilization_max",
+    "aie_tile_memory_utilization_mean",
+    "aie_tile_memory_utilization_median",
     "mem_tiles_with_buffers",
     "mem_tile_allocated_bytes",
     "mem_tile_memory_utilization",
+    "mem_tile_memory_utilization_min",
+    "mem_tile_memory_utilization_max",
+    "mem_tile_memory_utilization_mean",
+    "mem_tile_memory_utilization_median",
     "shim_tiles_with_s2mm",
     "shim_s2mm_channels_used",
     "shim_s2mm_channel_utilization",
     "shim_tiles_with_mm2s",
     "shim_mm2s_channels_used",
     "shim_mm2s_channel_utilization",
+    "shim_tiles_with_dma",
+    "shim_dma_channels_used",
+    "shim_dma_channel_utilization",
+    "mem_tiles_with_dma",
+    "mem_dma_channels_used",
+    "mem_dma_channel_utilization",
+    "mem_dma_channel_note",
+    "compute_tiles_with_dma",
+    "compute_dma_channels_used",
+    "compute_dma_channel_utilization",
+    "compute_dma_channel_note",
 )
 
 RUNLIST_FIELDNAMES = (
+    "execution_mode",
     "study_case_id",
     "study_case_label",
+    "workload_variant",
     "family_id",
     "seq_len",
     "hidden_size",
@@ -126,16 +150,37 @@ RUNLIST_FIELDNAMES = (
     "aie_tiles_with_buffers",
     "aie_tile_allocated_bytes",
     "aie_tile_memory_utilization",
+    "aie_tile_memory_utilization_min",
+    "aie_tile_memory_utilization_max",
+    "aie_tile_memory_utilization_mean",
+    "aie_tile_memory_utilization_median",
     "mem_tiles_with_buffers",
     "mem_tile_allocated_bytes",
     "mem_tile_memory_utilization",
+    "mem_tile_memory_utilization_min",
+    "mem_tile_memory_utilization_max",
+    "mem_tile_memory_utilization_mean",
+    "mem_tile_memory_utilization_median",
     "shim_tiles_with_s2mm",
     "shim_s2mm_channels_used",
     "shim_s2mm_channel_utilization",
     "shim_tiles_with_mm2s",
     "shim_mm2s_channels_used",
     "shim_mm2s_channel_utilization",
+    "shim_tiles_with_dma",
+    "shim_dma_channels_used",
+    "shim_dma_channel_utilization",
+    "mem_tiles_with_dma",
+    "mem_dma_channels_used",
+    "mem_dma_channel_utilization",
+    "mem_dma_channel_note",
+    "compute_tiles_with_dma",
+    "compute_dma_channels_used",
+    "compute_dma_channel_utilization",
+    "compute_dma_channel_note",
 )
+
+HYBRID_FIELDNAMES = RUNLIST_FIELDNAMES
 
 _LEADING_PREFIX_RE = re.compile(r"(?P<prefix>\d+)_")
 _LAYER_NORM_HASH_RE = re.compile(r"_[0-9a-f]{12}$")
@@ -167,7 +212,13 @@ class ArtifactMatch:
 
 
 def default_output_dir() -> Path:
-    return APP_ROOT / "results" / "resource_usage"
+    canonical = APP_ROOT / "results" / "resource_usage"
+    if canonical.parent.exists():
+        return canonical
+    final = APP_ROOT / "results_final" / "resource_usage"
+    if final.parent.exists():
+        return final
+    return canonical
 
 
 def default_build_root() -> Path:
@@ -182,6 +233,9 @@ def default_block_results_path(app_root: Path = APP_ROOT) -> Path:
     canonical = app_root / "results" / "block" / "results.csv"
     if canonical.exists():
         return canonical
+    final = app_root / "results_final" / "block" / "results.csv"
+    if final.exists():
+        return final
     for snapshot_root in _snapshot_result_roots(app_root):
         candidate = snapshot_root / "block" / "results.csv"
         if candidate.exists():
@@ -198,6 +252,11 @@ def default_end_to_end_results_path(app_root: Path = APP_ROOT) -> Path:
     for path in preferred:
         if path.exists():
             return path
+    final_dir = app_root / "results_final" / "end_to_end"
+    for name in ("results_all_power.csv", "results.csv"):
+        candidate = final_dir / name
+        if candidate.exists():
+            return candidate
     for snapshot_root in _snapshot_result_roots(app_root):
         snapshot_dir = snapshot_root / "end_to_end"
         for name in ("results_all_power.csv", "results.csv"):
@@ -214,15 +273,40 @@ def _leading_numeric_prefix(path: Path) -> int:
     return int(match.group("prefix"))
 
 
-def _artifact_sort_key(path: Path, *, prefer_isolated: bool) -> tuple[int, int, str]:
+def _artifact_sort_key(
+    path: Path,
+    *,
+    artifact_kind: Literal["isolated", "hybrid_mode", "runlist_mode"],
+) -> tuple[int, int, str]:
     parent_name = path.parent.name
-    if prefer_isolated:
-        if re.match(r"\d+_dataflow_", parent_name):
+    if artifact_kind == "isolated":
+        if re.match(r"\d+_hybrid_", parent_name):
             rank = 0
+        elif re.match(r"\d+_dataflow_", parent_name):
+            rank = 0
+        elif re.match(r"\d+_mode_hybrid_", parent_name):
+            rank = 2
         elif re.match(r"\d+_mode_dataflow_", parent_name):
             rank = 2
+        elif parent_name.startswith("mode_hybrid_"):
+            rank = 1
         elif parent_name.startswith("mode_dataflow_"):
             rank = 1
+        else:
+            rank = 3
+    elif artifact_kind == "hybrid_mode":
+        if parent_name.startswith("mode_hybrid_"):
+            rank = 0
+        elif parent_name.startswith("mode_dataflow_"):
+            rank = 0
+        elif re.match(r"\d+_mode_hybrid_", parent_name):
+            rank = 1
+        elif re.match(r"\d+_mode_dataflow_", parent_name):
+            rank = 1
+        elif re.match(r"\d+_hybrid_", parent_name):
+            rank = 2
+        elif re.match(r"\d+_dataflow_", parent_name):
+            rank = 2
         else:
             rank = 3
     else:
@@ -241,7 +325,16 @@ def build_artifact_index(build_root: str | Path) -> BuildArtifactIndex:
     root = Path(build_root)
     if not root.exists():
         return BuildArtifactIndex(build_root=root, prj_dirs=(), by_name={})
-    prj_dirs = tuple(sorted(path.parent for path in root.rglob("input_physical.mlir")))
+    search_root = root
+    if (
+        root.name == "transformer_layer_new_end_to_end"
+        and root.parent.exists()
+        and root.parent != root
+    ):
+        search_root = root.parent
+    prj_dirs = tuple(
+        sorted(path.parent for path in search_root.rglob("input_physical.mlir"))
+    )
     by_name: dict[str, list[Path]] = {}
     for prj_dir in prj_dirs:
         by_name.setdefault(prj_dir.name, []).append(prj_dir)
@@ -250,6 +343,25 @@ def build_artifact_index(build_root: str | Path) -> BuildArtifactIndex:
         prj_dirs=prj_dirs,
         by_name={name: tuple(paths) for name, paths in by_name.items()},
     )
+
+
+def _artifact_specs_for_names(*names: str) -> tuple[ArtifactSpec, ...]:
+    specs: list[ArtifactSpec] = []
+    seen: set[tuple[str, str]] = set()
+    for name in names:
+        if not name:
+            continue
+        exact = ("exact", name)
+        if exact not in seen:
+            specs.append(ArtifactSpec("exact", name))
+            seen.add(exact)
+        if name.endswith(".mlir.prj"):
+            glob_name = f"{name.removesuffix('.mlir.prj')}_*.mlir.prj"
+            glob = ("glob", glob_name)
+            if glob not in seen:
+                specs.append(ArtifactSpec("glob", glob_name))
+                seen.add(glob)
+    return tuple(specs)
 
 
 def _value_from_csv(value: str) -> object:
@@ -361,14 +473,22 @@ def _dataflow_block_artifact_specs_from_row(
             suffix = stem.removeprefix("qkv_proj_")
             return (
                 ArtifactSpec("exact", f"{stem}.mlir.prj"),
+                ArtifactSpec("exact", f"encoder_hybrid_qkvo_proj_{suffix}.mlir.prj"),
                 ArtifactSpec("exact", f"encoder_dataflow_qkvo_proj_{suffix}.mlir.prj"),
             )
 
         if block_kind == "mha_out_proj":
             operator = AIEMHAOutProj(context=context, skip_add_to_list=True, **kwargs)
             operator.set_up_artifacts()
-            return (
-                ArtifactSpec("exact", f"{operator.xclbin_artifact.path.stem}.mlir.prj"),
+            return _artifact_specs_for_names(
+                f"{operator.xclbin_artifact.path.stem}.mlir.prj",
+            )
+
+        if block_kind == "mha_out_proj_causal":
+            operator = AIEMHAOutProj(context=context, skip_add_to_list=True, **kwargs)
+            operator.set_up_artifacts()
+            return _artifact_specs_for_names(
+                f"{operator.xclbin_artifact.path.stem}.mlir.prj",
             )
 
         if block_kind == "addnorm":
@@ -380,19 +500,56 @@ def _dataflow_block_artifact_specs_from_row(
             )
             xclbin_artifact, _ = operator.get_artifacts()
             suffix = xclbin_artifact.path.stem.removeprefix("weighted_layer_norm_")
-            return (
-                ArtifactSpec("exact", f"{xclbin_artifact.path.stem}.mlir.prj"),
-                ArtifactSpec("exact", f"encoder_dataflow_add_norm1_{suffix}.mlir.prj"),
-                ArtifactSpec("exact", f"encoder_dataflow_add_norm2_{suffix}.mlir.prj"),
+            return _artifact_specs_for_names(
+                f"{xclbin_artifact.path.stem}.mlir.prj",
+                f"encoder_hybrid_add_norm1_{suffix}.mlir.prj",
+                f"encoder_hybrid_add_norm2_{suffix}.mlir.prj",
+                f"encoder_dataflow_add_norm1_{suffix}.mlir.prj",
+                f"encoder_dataflow_add_norm2_{suffix}.mlir.prj",
+            )
+
+        if block_kind == "layer_norm":
+            operator = AIELayerNorm(
+                context=context,
+                skip_add_to_list=True,
+                weights=_zero_vector(workload.hidden_size),
+                **kwargs,
+            )
+            xclbin_artifact, _ = operator.get_artifacts()
+            return _artifact_specs_for_names(
+                f"{xclbin_artifact.path.stem}.mlir.prj",
+            )
+
+        if block_kind == "elementwise_add":
+            operator = AIEElementwiseAdd(
+                context=context,
+                skip_add_to_list=True,
+                **kwargs,
+            )
+            xclbin_artifact, _ = operator.get_artifacts()
+            return _artifact_specs_for_names(
+                f"{xclbin_artifact.path.stem}.mlir.prj",
+            )
+
+        if block_kind == "causal_mask":
+            operator = AIECausalMask(
+                context=context,
+                skip_add_to_list=True,
+                **kwargs,
+            )
+            xclbin_artifact, _ = operator.get_artifacts()
+            return _artifact_specs_for_names(
+                f"{xclbin_artifact.path.stem}.mlir.prj",
             )
 
         if block_kind == "ffn":
             operator = AIEFFN(context=context, skip_add_to_list=True, **kwargs)
             xclbin_artifact, _ = operator.get_artifacts()
             suffix = xclbin_artifact.path.stem.removeprefix("ffn_")
-            return (
-                ArtifactSpec("exact", f"{xclbin_artifact.path.stem}.mlir.prj"),
-                ArtifactSpec("exact", f"encoder_dataflow_ffn_{suffix}.mlir.prj"),
+            return _artifact_specs_for_names(
+                f"{xclbin_artifact.path.stem}.mlir.prj",
+                f"encoder_hybrid_ffn_{suffix}.mlir.prj",
+                f"encoder_dataflow_ffn_{suffix}.mlir.prj",
             )
 
     raise ValueError(f"Unsupported block kind: {block_kind}")
@@ -402,15 +559,29 @@ def _runlist_operator_artifact_specs(
     workload: EndToEndWorkload,
     logical_operator: str,
     operator_config: dict[str, object],
+    *,
+    workload_variant: str,
+    selected_config: dict[str, dict[str, object]] | None = None,
 ) -> tuple[ArtifactSpec, ...]:
+    effective_operator_config = {logical_operator: operator_config}
+    if workload.seq_len >= 16384 and logical_operator in {"attn_scores", "attn_output"}:
+        for dependency in ("attn_scores", "attn_output", "k_transpose"):
+            if selected_config is not None and dependency in selected_config:
+                effective_operator_config[dependency] = dict(
+                    selected_config[dependency]
+                )
     kwargs = resolve_runlist_operator_config(
         workload.seq_len,
         workload.hidden_size,
         workload.intermediate_size,
         workload.num_attention_heads,
-        operator_config={logical_operator: operator_config},
+        workload_variant=workload_variant,
+        operator_config=effective_operator_config,
     )[logical_operator]
-    prefix = f"encoder_runlist_{logical_operator}_"
+    prefix_base = (
+        "decoder_runlist_" if workload_variant == "decoder_gpt2" else "encoder_runlist_"
+    )
+    prefix = f"{prefix_base}{logical_operator}_"
     with tempfile.TemporaryDirectory(prefix="tl_resource_usage_") as tempdir:
         context = _make_temporary_context(tempdir)
 
@@ -434,72 +605,243 @@ def _runlist_operator_artifact_specs(
                     hidden_size=workload.hidden_size,
                     intermediate_size=workload.intermediate_size,
                     num_heads=workload.num_attention_heads,
+                    workload_variant=workload_variant,
                     ln1_weight=weights["ln1_weight"],
                     ln2_weight=weights["ln2_weight"],
-                    operator_config={logical_operator: operator_config},
+                    operator_config=effective_operator_config,
                     context=context,
                 )
                 operator.set_up_artifacts()
                 xclbin_artifact = getattr(operator, f"{logical_operator}_xclbin")
                 exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
-                suffix = exact_name.removeprefix(f"encoder_runlist_{logical_operator}_")
+                suffix = exact_name.removeprefix(f"{prefix_base}{logical_operator}_")
                 return (
                     ArtifactSpec("exact", exact_name),
                     ArtifactSpec(
                         "glob",
-                        f"encoder_runlist_{logical_operator}_block_*_{suffix}",
+                        f"{prefix_base}{logical_operator}_block_*_{suffix}",
                     ),
                 )
             operator = AIEGEMM(context=context, skip_add_to_list=True, **kwargs)
             xclbin_artifact, _ = operator.get_artifacts(prefix=prefix)
             exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
             if logical_operator in {"attn_scores", "attn_output"}:
-                suffix = exact_name.removeprefix(f"encoder_runlist_{logical_operator}_")
-                return (
-                    ArtifactSpec("exact", exact_name),
-                    ArtifactSpec(
-                        "glob",
-                        f"encoder_runlist_{logical_operator}_block_*_{suffix}",
-                    ),
+                suffix = exact_name.removeprefix(f"{prefix_base}{logical_operator}_")
+                return _artifact_specs_for_names(
+                    exact_name,
+                    f"gemm_{suffix}",
+                    f"{prefix_base}{logical_operator}_block_*_{suffix}",
                 )
-            return (ArtifactSpec("exact", exact_name),)
+            generic_name = exact_name
+            if logical_operator == "qkvo_proj":
+                generic_name = exact_name.replace(
+                    f"{prefix_base}{logical_operator}_",
+                    "qkv_proj_",
+                    1,
+                )
+            return _artifact_specs_for_names(exact_name, generic_name)
 
         if logical_operator == "k_transpose":
             operator = AIETranspose(context=context, skip_add_to_list=True, **kwargs)
             xclbin_artifact, _ = operator.get_artifacts(prefix=prefix)
-            return (ArtifactSpec("exact", f"{xclbin_artifact.path.stem}.mlir.prj"),)
+            exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
+            return _artifact_specs_for_names(
+                exact_name,
+                exact_name.replace(
+                    f"{prefix_base}{logical_operator}_", "transpose_", 1
+                ),
+            )
 
         if logical_operator == "attn_scale":
             operator = AIEElementwiseMul(
                 context=context, skip_add_to_list=True, **kwargs
             )
             xclbin_artifact, _ = operator.get_artifacts(prefix=prefix)
-            return (ArtifactSpec("exact", f"{xclbin_artifact.path.stem}.mlir.prj"),)
+            exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
+            return _artifact_specs_for_names(exact_name)
+
+        if logical_operator == "causal_mask":
+            operator = AIECausalMask(
+                context=context,
+                skip_add_to_list=True,
+                **kwargs,
+            )
+            xclbin_artifact, _ = operator.get_artifacts(prefix=prefix)
+            exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
+            generic_name = exact_name.replace(
+                f"{prefix_base}{logical_operator}_",
+                "causal_mask_",
+                1,
+            )
+            return _artifact_specs_for_names(exact_name, generic_name)
 
         if logical_operator == "attn_softmax":
             operator = AIESoftmax(context=context, skip_add_to_list=True, **kwargs)
             xclbin_artifact, _ = operator.get_artifacts(prefix=prefix)
-            return (ArtifactSpec("exact", f"{xclbin_artifact.path.stem}.mlir.prj"),)
+            exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
+            generic_name = exact_name.replace(
+                f"{prefix_base}{logical_operator}_",
+                "softmax_",
+                1,
+            )
+            return _artifact_specs_for_names(exact_name, generic_name)
 
         if logical_operator == "add":
             operator = AIEElementwiseAdd(
                 context=context, skip_add_to_list=True, **kwargs
             )
             xclbin_artifact, _ = operator.get_artifacts(prefix=prefix)
-            return (ArtifactSpec("exact", f"{xclbin_artifact.path.stem}.mlir.prj"),)
+            exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
+            generic_name = exact_name.replace(
+                f"{prefix_base}{logical_operator}_",
+                "add_",
+                1,
+            )
+            return _artifact_specs_for_names(exact_name, generic_name)
 
         if logical_operator in {"ln1", "ln2"}:
             operator = AIELayerNorm(context=context, skip_add_to_list=True, **kwargs)
             xclbin_artifact, _ = operator.get_artifacts(prefix=prefix)
             base_name = _LAYER_NORM_HASH_RE.sub("", xclbin_artifact.path.stem)
-            return (ArtifactSpec("glob", f"{base_name}_*.mlir.prj"),)
+            generic_base_name = base_name.replace(
+                f"{prefix_base}{logical_operator}_",
+                "weighted_layer_norm_",
+                1,
+            )
+            return (
+                ArtifactSpec("glob", f"{base_name}_*.mlir.prj"),
+                ArtifactSpec("glob", f"{generic_base_name}_*.mlir.prj"),
+                ArtifactSpec("exact", f"{generic_base_name}.mlir.prj"),
+            )
 
         if logical_operator == "gelu":
             operator = AIEGELU(context=context, skip_add_to_list=True, **kwargs)
             xclbin_artifact, _ = operator.get_artifacts(prefix=prefix)
-            return (ArtifactSpec("exact", f"{xclbin_artifact.path.stem}.mlir.prj"),)
+            exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
+            generic_name = exact_name.replace(
+                f"{prefix_base}{logical_operator}_",
+                "gelu_",
+                1,
+            )
+            return _artifact_specs_for_names(exact_name, generic_name)
 
     raise ValueError(f"Unsupported runlist logical operator: {logical_operator}")
+
+
+def _hybrid_operator_artifact_specs(
+    workload: EndToEndWorkload,
+    logical_operator: str,
+    operator_config: dict[str, object],
+    *,
+    workload_variant: str,
+) -> tuple[ArtifactSpec, ...]:
+    kwargs = resolve_hybrid_operator_config(
+        workload.seq_len,
+        workload.hidden_size,
+        workload.intermediate_size,
+        workload.num_attention_heads,
+        workload_variant=workload_variant,
+        operator_config={logical_operator: operator_config},
+    )[logical_operator]
+    prefix_base = (
+        "decoder_hybrid_" if workload_variant == "decoder_gpt2" else "encoder_hybrid_"
+    )
+    with tempfile.TemporaryDirectory(prefix="tl_resource_usage_") as tempdir:
+        context = _make_temporary_context(tempdir)
+
+        if logical_operator == "qkv_proj":
+            operator = AIEQKVProj(context=context, skip_add_to_list=True, **kwargs)
+            xclbin_artifact, _ = operator.get_artifacts(
+                prefix=f"{prefix_base}qkvo_proj_"
+            )
+            exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
+            specs = list(
+                _artifact_specs_for_names(
+                    exact_name,
+                    exact_name.replace(f"{prefix_base}qkvo_proj_", "qkv_proj_", 1),
+                )
+            )
+            if workload_variant == "encoder_bert":
+                specs.append(
+                    ArtifactSpec(
+                        "exact",
+                        exact_name.replace("encoder_hybrid_", "encoder_dataflow_"),
+                    )
+                )
+            return tuple(specs)
+
+        if logical_operator == "mha_out_proj":
+            operator = AIEMHAOutProj(context=context, skip_add_to_list=True, **kwargs)
+            operator.set_up_artifacts()
+            return (
+                ArtifactSpec("exact", f"{operator.xclbin_artifact.path.stem}.mlir.prj"),
+            )
+
+        if logical_operator in {"add_norm1", "add_norm2", "add_norm"}:
+            operator = AIEAddAndNorm(
+                context=context,
+                skip_add_to_list=True,
+                weights=_zero_vector(workload.hidden_size),
+                **kwargs,
+            )
+            xclbin_artifact, _ = operator.get_artifacts(
+                prefix=f"{prefix_base}{logical_operator}_"
+            )
+            exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
+            specs = list(_artifact_specs_for_names(exact_name))
+            if workload_variant == "encoder_bert":
+                specs.append(
+                    ArtifactSpec(
+                        "exact",
+                        exact_name.replace("encoder_hybrid_", "encoder_dataflow_"),
+                    )
+                )
+            return tuple(specs)
+
+        if logical_operator == "ffn":
+            operator = AIEFFN(context=context, skip_add_to_list=True, **kwargs)
+            xclbin_artifact, _ = operator.get_artifacts(prefix=f"{prefix_base}ffn_")
+            exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
+            specs = list(
+                _artifact_specs_for_names(
+                    exact_name,
+                    exact_name.replace(f"{prefix_base}ffn_", "ffn_", 1),
+                )
+            )
+            if workload_variant == "encoder_bert":
+                specs.append(
+                    ArtifactSpec(
+                        "exact",
+                        exact_name.replace("encoder_hybrid_", "encoder_dataflow_"),
+                    )
+                )
+            return tuple(specs)
+
+        if logical_operator == "ln1":
+            operator = AIELayerNorm(
+                context=context,
+                skip_add_to_list=True,
+                weights=_zero_vector(workload.hidden_size),
+                **kwargs,
+            )
+            xclbin_artifact, _ = operator.get_artifacts(prefix=f"{prefix_base}ln1_")
+            base_name = _LAYER_NORM_HASH_RE.sub("", xclbin_artifact.path.stem)
+            return (ArtifactSpec("glob", f"{base_name}_*.mlir.prj"),)
+
+        if logical_operator == "add":
+            operator = AIEElementwiseAdd(
+                context=context,
+                skip_add_to_list=True,
+                **kwargs,
+            )
+            xclbin_artifact, _ = operator.get_artifacts(prefix=f"{prefix_base}add_")
+            exact_name = f"{xclbin_artifact.path.stem}.mlir.prj"
+            return _artifact_specs_for_names(
+                exact_name,
+                exact_name.replace(f"{prefix_base}add_", "add_", 1),
+            )
+
+    raise ValueError(f"Unsupported hybrid logical operator: {logical_operator}")
 
 
 def _find_mode_scope_dir(
@@ -512,12 +854,26 @@ def _find_mode_scope_dir(
     stable = build_root / f"mode_{execution_mode}_{hidden_size}_{seq_len}"
     if stable.exists():
         return stable
+    stable_hashed = sorted(
+        build_root.glob(f"mode_{execution_mode}_{hidden_size}_{seq_len}_*"),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    if stable_hashed:
+        return stable_hashed[0]
     prefixed = sorted(
         build_root.glob(f"*_mode_{execution_mode}_{hidden_size}_{seq_len}"),
         key=_leading_numeric_prefix,
         reverse=True,
     )
-    return prefixed[0] if prefixed else None
+    if prefixed:
+        return prefixed[0]
+    prefixed_hashed = sorted(
+        build_root.glob(f"*_mode_{execution_mode}_{hidden_size}_{seq_len}_*"),
+        key=_leading_numeric_prefix,
+        reverse=True,
+    )
+    return prefixed_hashed[0] if prefixed_hashed else None
 
 
 def _glob_paths(root: Path, pattern: str) -> list[Path]:
@@ -535,7 +891,7 @@ def _locate_artifact(
     *,
     specs: tuple[ArtifactSpec, ...],
     preferred_scope_dir: Path | None,
-    prefer_isolated: bool,
+    artifact_kind: Literal["isolated", "hybrid_mode", "runlist_mode"],
 ) -> ArtifactMatch:
     notes: list[str] = []
     if not index.build_root.exists():
@@ -587,7 +943,7 @@ def _locate_artifact(
             continue
         chosen = sorted(
             global_matches,
-            key=lambda path: _artifact_sort_key(path, prefer_isolated=prefer_isolated),
+            key=lambda path: _artifact_sort_key(path, artifact_kind=artifact_kind),
         )[0]
         if preferred_scope_dir is not None and chosen.parent != preferred_scope_dir:
             notes.append(
@@ -639,15 +995,34 @@ def _resource_row(match: ArtifactMatch) -> dict[str, object]:
             "aie_tiles_with_buffers": "",
             "aie_tile_allocated_bytes": "",
             "aie_tile_memory_utilization": "",
+            "aie_tile_memory_utilization_min": "",
+            "aie_tile_memory_utilization_max": "",
+            "aie_tile_memory_utilization_mean": "",
+            "aie_tile_memory_utilization_median": "",
             "mem_tiles_with_buffers": "",
             "mem_tile_allocated_bytes": "",
             "mem_tile_memory_utilization": "",
+            "mem_tile_memory_utilization_min": "",
+            "mem_tile_memory_utilization_max": "",
+            "mem_tile_memory_utilization_mean": "",
+            "mem_tile_memory_utilization_median": "",
             "shim_tiles_with_s2mm": "",
             "shim_s2mm_channels_used": "",
             "shim_s2mm_channel_utilization": "",
             "shim_tiles_with_mm2s": "",
             "shim_mm2s_channels_used": "",
             "shim_mm2s_channel_utilization": "",
+            "shim_tiles_with_dma": "",
+            "shim_dma_channels_used": "",
+            "shim_dma_channel_utilization": "",
+            "mem_tiles_with_dma": "",
+            "mem_dma_channels_used": "",
+            "mem_dma_channel_utilization": "",
+            "mem_dma_channel_note": "",
+            "compute_tiles_with_dma": "",
+            "compute_dma_channels_used": "",
+            "compute_dma_channel_utilization": "",
+            "compute_dma_channel_note": "",
         }
 
     usage = parse_input_physical_mlir(match.artifact_input_physical_mlir)
@@ -736,7 +1111,7 @@ def export_dataflow_block_best_configs(
                 build_index,
                 specs=specs,
                 preferred_scope_dir=None,
-                prefer_isolated=True,
+                artifact_kind="isolated",
             )
             resource_row = _resource_row(match)
             search_mode = specs[0].search_mode
@@ -794,7 +1169,7 @@ def export_dataflow_block_best_configs(
     return export_rows
 
 
-def export_runlist_selected_ops(
+def export_hybrid_selected_ops(
     *,
     end_to_end_results_input: str | Path,
     family_filter: str,
@@ -805,11 +1180,12 @@ def export_runlist_selected_ops(
         load_result_rows(end_to_end_results_input),
         family_filter=family_filter,
         seq_len_filter=seq_len_filter,
-        mode_filter="runlist",
+        mode_filter="hybrid",
     )
     export_rows: list[dict[str, object]] = []
     for selected_row in selected_rows:
         workload = EndToEndWorkload(
+            workload_variant=selected_row.workload_variant,
             seq_len=selected_row.seq_len,
             hidden_size=selected_row.hidden_size,
             intermediate_size=selected_row.intermediate_size,
@@ -817,24 +1193,25 @@ def export_runlist_selected_ops(
         )
         preferred_scope_dir = _find_mode_scope_dir(
             build_index.build_root,
-            execution_mode="runlist",
+            execution_mode="hybrid",
             hidden_size=selected_row.hidden_size,
             seq_len=selected_row.seq_len,
         )
-        for logical_operator in RUNLIST_OPERATOR_ORDER:
+        for logical_operator in mode_operators("hybrid", selected_row.workload_variant):
             if logical_operator not in selected_row.selected_config:
                 continue
             try:
-                specs = _runlist_operator_artifact_specs(
+                specs = _hybrid_operator_artifact_specs(
                     workload,
                     logical_operator,
                     selected_row.selected_config[logical_operator],
+                    workload_variant=selected_row.workload_variant,
                 )
                 match = _locate_artifact(
                     build_index,
                     specs=specs,
                     preferred_scope_dir=preferred_scope_dir,
-                    prefer_isolated=False,
+                    artifact_kind="hybrid_mode",
                 )
                 resource_row = _resource_row(match)
                 search_mode = specs[0].search_mode
@@ -857,8 +1234,104 @@ def export_runlist_selected_ops(
 
             export_rows.append(
                 {
+                    "execution_mode": "hybrid",
                     "study_case_id": selected_row.study_case_id,
                     "study_case_label": selected_row.study_case_label,
+                    "workload_variant": selected_row.workload_variant,
+                    "family_id": selected_row.study_case_id,
+                    "seq_len": selected_row.seq_len,
+                    "hidden_size": selected_row.hidden_size,
+                    "intermediate_size": selected_row.intermediate_size,
+                    "num_attention_heads": selected_row.num_attention_heads,
+                    "attention_head_size": selected_row.attention_head_size,
+                    "logical_operator": logical_operator,
+                    "selected_candidate_id": selected_row.selected_candidate_ids.get(
+                        logical_operator, ""
+                    ),
+                    "operator_config_json": json.dumps(
+                        selected_row.selected_config[logical_operator],
+                        sort_keys=True,
+                    ),
+                    "artifact_search_mode": search_mode,
+                    "artifact_search_name": search_name,
+                    **resource_row,
+                }
+            )
+    return export_rows
+
+
+def export_runlist_selected_ops(
+    *,
+    end_to_end_results_input: str | Path,
+    family_filter: str,
+    seq_len_filter: str,
+    build_index: BuildArtifactIndex,
+) -> list[dict[str, object]]:
+    selected_rows = select_result_rows(
+        load_result_rows(end_to_end_results_input),
+        family_filter=family_filter,
+        seq_len_filter=seq_len_filter,
+        mode_filter="runlist",
+    )
+    export_rows: list[dict[str, object]] = []
+    for selected_row in selected_rows:
+        workload = EndToEndWorkload(
+            workload_variant=selected_row.workload_variant,
+            seq_len=selected_row.seq_len,
+            hidden_size=selected_row.hidden_size,
+            intermediate_size=selected_row.intermediate_size,
+            num_attention_heads=selected_row.num_attention_heads,
+        )
+        preferred_scope_dir = _find_mode_scope_dir(
+            build_index.build_root,
+            execution_mode="runlist",
+            hidden_size=selected_row.hidden_size,
+            seq_len=selected_row.seq_len,
+        )
+        for logical_operator in mode_operators(
+            "runlist", selected_row.workload_variant
+        ):
+            if logical_operator not in selected_row.selected_config:
+                continue
+            try:
+                specs = _runlist_operator_artifact_specs(
+                    workload,
+                    logical_operator,
+                    selected_row.selected_config[logical_operator],
+                    workload_variant=selected_row.workload_variant,
+                    selected_config=selected_row.selected_config,
+                )
+                match = _locate_artifact(
+                    build_index,
+                    specs=specs,
+                    preferred_scope_dir=preferred_scope_dir,
+                    artifact_kind="runlist_mode",
+                )
+                resource_row = _resource_row(match)
+                search_mode = specs[0].search_mode
+                search_name = specs[0].search_name
+            except Exception as exc:
+                resource_row = _resource_row(
+                    ArtifactMatch(
+                        preferred_scope_dir=preferred_scope_dir,
+                        artifact_group_dir=None,
+                        artifact_prj_dir=None,
+                        artifact_input_physical_mlir=None,
+                        artifact_missing=True,
+                        artifact_missing_note="artifact resolution failed",
+                        run_status="failed_exception",
+                        error_message=str(exc),
+                    )
+                )
+                search_mode = ""
+                search_name = ""
+
+            export_rows.append(
+                {
+                    "execution_mode": "runlist",
+                    "study_case_id": selected_row.study_case_id,
+                    "study_case_label": selected_row.study_case_label,
+                    "workload_variant": selected_row.workload_variant,
                     "family_id": selected_row.study_case_id,
                     "seq_len": selected_row.seq_len,
                     "hidden_size": selected_row.hidden_size,
@@ -902,7 +1375,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scope",
-        choices=("all", "dataflow_blocks", "runlist_ops"),
+        choices=("all", "dataflow_blocks", "hybrid_ops", "runlist_ops"),
         default="all",
     )
     parser.add_argument("--family", choices=("all", *FAMILY_IDS), default="all")
@@ -973,6 +1446,17 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.info(
             "Wrote %d dataflow block rows to %s", len(dataflow_rows), dataflow_output
         )
+
+    if args.scope in ("all", "hybrid_ops"):
+        hybrid_rows = export_hybrid_selected_ops(
+            end_to_end_results_input=args.end_to_end_results_input,
+            family_filter=args.family,
+            seq_len_filter=args.seq_len,
+            build_index=build_index,
+        )
+        hybrid_output = args.output_dir / "hybrid_selected_ops.csv"
+        _write_csv(hybrid_output, HYBRID_FIELDNAMES, hybrid_rows)
+        LOGGER.info("Wrote %d hybrid rows to %s", len(hybrid_rows), hybrid_output)
 
     if args.scope in ("all", "runlist_ops"):
         runlist_rows = export_runlist_selected_ops(

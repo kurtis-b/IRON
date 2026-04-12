@@ -19,9 +19,10 @@ from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
 import seaborn as sns
 
-from .cases import FAMILY_IDS, SEQUENCE_LADDER, get_case
-from .modes import benchmark_mode
-from .run import iteration_schedule
+from ..npu_runtime_checks import warn_if_npu_power_mode_not_turbo
+from ..run_lock import default_lock_path, hold_study_lock
+from .cases import FAMILY_IDS, WORKLOAD_VARIANTS, SEQUENCE_LADDER, get_case
+from .modes import benchmark_mode, benchmark_mode_subprocess
 from .select import (
     default_results_path as default_end_to_end_results_path,
     load_result_rows,
@@ -31,20 +32,25 @@ from .select import (
 LOGGER = logging.getLogger(__name__)
 
 STAGING_BLOCK_KINDS: tuple[str, ...] = ("mha_out_proj", "ffn")
+STAGING_ABLATION_SEQUENCE_LENGTHS = tuple(
+    seq_len for seq_len in SEQUENCE_LADDER if 256 <= seq_len <= 8192
+)
 BLOCK_LABELS = {
-    "mha_out_proj": "Dataflow Pattern with MHA + Output Projection Staging Ablation",
-    "ffn": "Dataflow Pattern with FFN Staging Ablation",
+    "mha_out_proj": "Hybrid Pattern with MHA + Output Projection Staging Ablation",
+    "ffn": "Hybrid Pattern with FFN Staging Ablation",
 }
 FAMILY_LABELS = {
-    "tinybert_512": "Hidden Size = 512 / FFN Dim = 2048 / Heads = 8",
-    "baseline_768": "Hidden Size = 768 / FFN Dim = 3072 / Heads = 12",
-    "baseline_1024": "Hidden Size = 1024 / FFN Dim = 4096 / Heads = 16",
+    "tinybert_512": "TinyBERT",
+    "baseline_768": "BERT-Base",
+    "baseline_1024": "BERT-Large",
+    "gpt2_small_768": "GPT-2 Small",
+    "gpt2_medium_1024": "GPT-2 Medium",
 }
 SEQ_COLORS = {
     seq_len: color
     for seq_len, color in zip(
-        SEQUENCE_LADDER,
-        sns.color_palette("crest", n_colors=len(SEQUENCE_LADDER)),
+        STAGING_ABLATION_SEQUENCE_LENGTHS,
+        sns.color_palette("crest", n_colors=len(STAGING_ABLATION_SEQUENCE_LENGTHS)),
         strict=True,
     )
 }
@@ -52,6 +58,7 @@ RESULTS_CSV_FIELDNAMES = (
     "study_id",
     "study_case_id",
     "study_case_label",
+    "workload_variant",
     "execution_mode",
     "seq_len",
     "hidden_size",
@@ -104,6 +111,133 @@ def default_plot_path() -> Path:
     )
 
 
+def removed_cases_path() -> Path:
+    return Path(__file__).with_name("staging_ablation_removed_cases.csv")
+
+
+def load_removed_case_notes() -> dict[tuple[str, int, str, int], str]:
+    path = removed_cases_path()
+    if not path.exists():
+        return {}
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        return {
+            (
+                str(row.get("study_case_id") or ""),
+                int(float(str(row.get("seq_len") or 0))),
+                str(row.get("block_kind") or ""),
+                int(float(str(row.get("staging_depth") or 0))),
+            ): str(row.get("reason") or "")
+            for row in csv.DictReader(handle)
+        }
+
+
+def default_resume_paths(output_path: Path) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    candidate = (
+        Path(__file__).resolve().parents[2]
+        / "results_final"
+        / "end_to_end"
+        / output_path.name
+    )
+    if candidate.exists():
+        paths.append(candidate)
+    if output_path.exists() and output_path not in paths:
+        paths.append(output_path)
+    return tuple(paths)
+
+
+def _row_key(row: dict[str, str]) -> tuple[str, str, int, str, int]:
+    return (
+        str(row.get("study_case_id") or ""),
+        str(row.get("workload_variant") or ""),
+        int(float(str(row.get("seq_len") or 0))),
+        str(row.get("block_kind") or ""),
+        int(float(str(row.get("staging_depth") or 0))),
+    )
+
+
+def load_existing_rows(
+    paths: tuple[Path, ...],
+) -> dict[tuple[str, str, int, str, int], dict[str, object]]:
+    rows: dict[tuple[str, str, int, str, int], dict[str, object]] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if not str(row.get("block_kind") or ""):
+                    continue
+                rows[_row_key(row)] = dict(row)
+    return rows
+
+
+def reusable_existing_row(
+    existing_rows: dict[tuple[str, str, int, str, int], dict[str, object]],
+    *,
+    study_case_id: str,
+    workload_variant: str,
+    seq_len: int,
+    block_kind: str,
+    staging_depth: int,
+    warmup_runs: int,
+    runs_per_sample: int,
+    selected_candidate_ids_json: str,
+    selected_config_json: str,
+) -> dict[str, object] | None:
+    row = existing_rows.get(
+        (study_case_id, workload_variant, seq_len, block_kind, staging_depth)
+    )
+    if row is None:
+        return None
+    if str(row.get("run_status") or "") not in ("passed", "failed_exception"):
+        return None
+    if int(float(str(row.get("warmup_runs") or 0))) != int(warmup_runs):
+        return None
+    if int(float(str(row.get("runs_per_sample") or 0))) != int(runs_per_sample):
+        return None
+    if str(row.get("selected_candidate_ids_json") or "") != selected_candidate_ids_json:
+        return None
+    if str(row.get("selected_config_json") or "") != selected_config_json:
+        return None
+    return dict(row)
+
+
+def source_depth_row_from_selected_result(
+    selected_row,
+    *,
+    block_kind: str,
+    source_depth: int,
+    selected_candidate_ids_json: str,
+    selected_config_json: str,
+) -> dict[str, object]:
+    row = selected_row.row
+    return {
+        "study_id": "end_to_end_staging_ablation",
+        "study_case_id": selected_row.study_case_id,
+        "study_case_label": selected_row.study_case_label,
+        "workload_variant": selected_row.workload_variant,
+        "execution_mode": "hybrid",
+        "seq_len": selected_row.seq_len,
+        "hidden_size": selected_row.hidden_size,
+        "intermediate_size": selected_row.intermediate_size,
+        "num_attention_heads": selected_row.num_attention_heads,
+        "attention_head_size": selected_row.attention_head_size,
+        "block_kind": block_kind,
+        "source_staging_depth": source_depth,
+        "staging_depth": source_depth,
+        "warmup_runs": selected_row.warmup_runs or "",
+        "runs_per_sample": selected_row.runs_per_sample or "",
+        "avg_latency_ms": row.get("avg_latency_ms", ""),
+        "compile_setup_time_ms": row.get("compile_setup_time_ms", ""),
+        "effective_gflops_per_sec": row.get("effective_gflops_per_sec", ""),
+        "validation_error_count": row.get("validation_error_count", ""),
+        "run_status": row.get("run_status", ""),
+        "failure_message": row.get("failure_message", ""),
+        "selected_candidate_ids_json": selected_candidate_ids_json,
+        "selected_config_json": selected_config_json,
+    }
+
+
 def _optional_int(value: object) -> int | None:
     if value in (None, "", "None"):
         return None
@@ -122,24 +256,26 @@ def _resolved_sampling(
     warmup_runs: int | None,
     runs_per_sample: int | None,
 ) -> tuple[int, int]:
-    scheduled_warmup_runs, scheduled_runs_per_sample = iteration_schedule(
+    scheduled_warmup_runs, scheduled_runs_per_sample = ablation_iteration_schedule(
         selected_row.seq_len
     )
-    resolved_warmup_runs = (
-        scheduled_warmup_runs
-        if selected_row.warmup_runs in (None, 0)
-        else int(selected_row.warmup_runs)
-    )
-    resolved_runs_per_sample = (
-        scheduled_runs_per_sample
-        if selected_row.runs_per_sample in (None, 0)
-        else int(selected_row.runs_per_sample)
-    )
+    resolved_warmup_runs = scheduled_warmup_runs
+    resolved_runs_per_sample = scheduled_runs_per_sample
     if warmup_runs is not None:
         resolved_warmup_runs = int(warmup_runs)
     if runs_per_sample is not None:
         resolved_runs_per_sample = int(runs_per_sample)
     return resolved_warmup_runs, resolved_runs_per_sample
+
+
+def ablation_iteration_schedule(seq_len: int) -> tuple[int, int]:
+    if seq_len <= 256:
+        return (1, 10)
+    if seq_len <= 2048:
+        return (1, 5)
+    if seq_len <= 4096:
+        return (1, 3)
+    return (1, 2)
 
 
 def _depth_key(block_kind: str) -> str:
@@ -226,14 +362,14 @@ def _candidate_staging_depths(
         (selected_row.study_case_id, selected_row.seq_len, block_kind),
         tuple(),
     )
-    if override_depths:
-        depth_set = {depth for depth in override_depths if depth in supported_depths}
-        if source_depth is not None and source_depth in supported_depths:
-            depth_set.add(source_depth)
-        if 1 in supported_depths:
-            depth_set.add(1)
-        return tuple(sorted(depth_set))
-    return supported_depths
+    if not override_depths:
+        return tuple()
+    depth_set = {depth for depth in override_depths if depth in supported_depths}
+    if source_depth is not None and source_depth in supported_depths:
+        depth_set.add(source_depth)
+    if 1 in supported_depths:
+        depth_set.add(1)
+    return tuple(sorted(depth_set))
 
 
 def _config_with_staging_depth(
@@ -300,20 +436,31 @@ def build_rows(
     *,
     results_input: Path,
     staging_results: Path,
+    workload_variant_filter: str,
     family_filter: str,
     seq_len_filter: str,
     block_filter: str,
     warmup_runs: int | None,
     runs_per_sample: int | None,
     seed: int,
-    benchmark_fn: Callable[..., dict[str, object]] = benchmark_mode,
+    existing_rows: (
+        dict[tuple[str, str, int, str, int], dict[str, object]] | None
+    ) = None,
+    benchmark_fn: Callable[..., dict[str, object]] | None = None,
+    checkpoint_fn=None,
 ) -> list[dict[str, object]]:
+    if benchmark_fn is None:
+        benchmark_fn = benchmark_mode
+    removed_case_notes = load_removed_case_notes()
     selected_rows = select_result_rows(
         load_result_rows(results_input),
+        workload_variant_filter=workload_variant_filter,
         family_filter=family_filter,
         seq_len_filter=seq_len_filter,
-        mode_filter="dataflow",
+        mode_filter="hybrid",
     )
+    allowed_seq_lens = set(STAGING_ABLATION_SEQUENCE_LENGTHS)
+    selected_rows = [row for row in selected_rows if row.seq_len in allowed_seq_lens]
     staging_depth_overrides = _load_staging_depth_overrides(staging_results)
 
     rows: list[dict[str, object]] = []
@@ -343,11 +490,65 @@ def build_rows(
                 continue
 
             for staging_depth in candidate_depths:
+                if (
+                    selected_row.study_case_id,
+                    selected_row.seq_len,
+                    block_kind,
+                    int(staging_depth),
+                ) in removed_case_notes:
+                    continue
                 operator_config = _config_with_staging_depth(
                     selected_row,
                     block_kind=block_kind,
                     staging_depth=staging_depth,
                 )
+                selected_candidate_ids_json = json.dumps(
+                    selected_row.selected_candidate_ids,
+                    sort_keys=True,
+                )
+                selected_config_json = json.dumps(
+                    operator_config,
+                    sort_keys=True,
+                )
+                if staging_depth == source_depth:
+                    rows.append(
+                        source_depth_row_from_selected_result(
+                            selected_row,
+                            block_kind=block_kind,
+                            source_depth=source_depth,
+                            selected_candidate_ids_json=selected_candidate_ids_json,
+                            selected_config_json=selected_config_json,
+                        )
+                    )
+                    if checkpoint_fn is not None:
+                        annotate_speedups(rows)
+                        mark_best_rows(rows)
+                        checkpoint_fn(rows)
+                    continue
+                reused_row = reusable_existing_row(
+                    {} if existing_rows is None else existing_rows,
+                    study_case_id=selected_row.study_case_id,
+                    workload_variant=selected_row.workload_variant,
+                    seq_len=selected_row.seq_len,
+                    block_kind=block_kind,
+                    staging_depth=staging_depth,
+                    warmup_runs=resolved_warmup_runs,
+                    runs_per_sample=resolved_runs_per_sample,
+                    selected_candidate_ids_json=selected_candidate_ids_json,
+                    selected_config_json=selected_config_json,
+                )
+                if reused_row is not None:
+                    rows.append(
+                        {
+                            field: reused_row.get(field, "")
+                            for field in RESULTS_CSV_FIELDNAMES
+                        }
+                    )
+                    if checkpoint_fn is not None:
+                        annotate_speedups(rows)
+                        mark_best_rows(rows)
+                        checkpoint_fn(rows)
+                    continue
                 LOGGER.info(
                     "Running end-to-end staging ablation for %s seq_len=%s block=%s depth=%s",
                     selected_row.study_case_id,
@@ -356,15 +557,16 @@ def build_rows(
                     staging_depth,
                 )
                 result = benchmark_fn(
-                    "dataflow",
+                    "hybrid",
                     case.workload,
                     warmup_runs=resolved_warmup_runs,
                     runs_per_sample=resolved_runs_per_sample,
                     seed=seed,
                     power_backend="none",
                     operator_config=operator_config,
-                    scope_suffix=(
-                        f"staging_{selected_row.study_case_id}_{block_kind}_d{staging_depth}"
+                    scope_key_override=(
+                        f"staginggrp_{selected_row.workload_variant}_"
+                        f"{selected_row.study_case_id}_{block_kind}"
                     ),
                 )
                 rows.append(
@@ -372,7 +574,8 @@ def build_rows(
                         "study_id": "end_to_end_staging_ablation",
                         "study_case_id": selected_row.study_case_id,
                         "study_case_label": selected_row.study_case_label,
-                        "execution_mode": "dataflow",
+                        "workload_variant": selected_row.workload_variant,
+                        "execution_mode": "hybrid",
                         "seq_len": selected_row.seq_len,
                         "hidden_size": selected_row.hidden_size,
                         "intermediate_size": selected_row.intermediate_size,
@@ -394,16 +597,14 @@ def build_rows(
                         ),
                         "run_status": result.get("run_status", ""),
                         "failure_message": result.get("failure_message", ""),
-                        "selected_candidate_ids_json": json.dumps(
-                            selected_row.selected_candidate_ids,
-                            sort_keys=True,
-                        ),
-                        "selected_config_json": json.dumps(
-                            operator_config,
-                            sort_keys=True,
-                        ),
+                        "selected_candidate_ids_json": selected_candidate_ids_json,
+                        "selected_config_json": selected_config_json,
                     }
                 )
+                if checkpoint_fn is not None:
+                    annotate_speedups(rows)
+                    mark_best_rows(rows)
+                    checkpoint_fn(rows)
 
     annotate_speedups(rows)
     mark_best_rows(rows)
@@ -441,6 +642,7 @@ def render_plot(rows: list[dict[str, object]]) -> plt.Figure:
         for row in rows
         if row.get("run_status") == "passed"
         and row.get("avg_latency_ms") not in ("", None)
+        and int(row.get("seq_len", 0)) in set(STAGING_ABLATION_SEQUENCE_LENGTHS)
     ]
     if not successful_rows:
         fig, ax = plt.subplots(figsize=(20, 8))
@@ -448,7 +650,7 @@ def render_plot(rows: list[dict[str, object]]) -> plt.Figure:
         fig.text(
             0.5,
             0.57,
-            "End-to-End Dataflow Latency by Block Staging Depth",
+            "End-to-End Hybrid Latency by Block Staging Depth",
             ha="center",
             va="center",
             fontsize=24,
@@ -502,7 +704,7 @@ def render_plot(rows: list[dict[str, object]]) -> plt.Figure:
                     if _optional_int(row.get("staging_depth")) is not None
                 }
             )
-            for seq_len in SEQUENCE_LADDER:
+            for seq_len in STAGING_ABLATION_SEQUENCE_LENGTHS:
                 seq_rows = [row for row in panel_rows if int(row["seq_len"]) == seq_len]
                 if not seq_rows:
                     continue
@@ -541,7 +743,7 @@ def render_plot(rows: list[dict[str, object]]) -> plt.Figure:
             markersize=7,
             label=str(seq_len),
         )
-        for seq_len in SEQUENCE_LADDER
+        for seq_len in STAGING_ABLATION_SEQUENCE_LENGTHS
         if any(int(row["seq_len"]) == seq_len for row in successful_rows)
     ]
     fig.legend(
@@ -555,7 +757,7 @@ def render_plot(rows: list[dict[str, object]]) -> plt.Figure:
         title_fontsize=13,
     )
     fig.suptitle(
-        "End-to-End Dataflow Latency by Block Staging Depth",
+        "End-to-End Hybrid Latency by Block Staging Depth",
         fontsize=24,
         fontweight="bold",
         y=0.98,
@@ -573,7 +775,7 @@ def write_plot(output_path: Path, rows: list[dict[str, object]]) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run end-to-end dataflow staging-depth ablations for selected NPU configs."
+        description="Run end-to-end hybrid staging-depth ablations for selected NPU configs."
     )
     parser.add_argument(
         "--results-input",
@@ -588,13 +790,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=default_staging_results_path(),
     )
     parser.add_argument(
+        "--workload-variant",
+        choices=[*WORKLOAD_VARIANTS, "all"],
+        default="all",
+    )
+    parser.add_argument(
         "--family",
         choices=[*FAMILY_IDS, "all"],
         default="all",
     )
     parser.add_argument(
         "--seq-len",
-        choices=[*(str(value) for value in SEQUENCE_LADDER), "all"],
+        choices=[*(str(value) for value in STAGING_ABLATION_SEQUENCE_LENGTHS), "all"],
         default="all",
     )
     parser.add_argument(
@@ -607,6 +814,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, default=default_output_path())
     parser.add_argument("--plot-output", type=Path, default=default_plot_path())
+    parser.add_argument("--resume-input", type=Path, default=None)
+    parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -616,20 +825,46 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
-    rows = build_rows(
-        results_input=args.results_input.expanduser(),
-        staging_results=args.staging_results.expanduser(),
-        family_filter=str(args.family),
-        seq_len_filter=str(args.seq_len),
-        block_filter=str(args.block),
-        warmup_runs=args.warmup_runs,
-        runs_per_sample=args.runs_per_sample,
-        seed=int(args.seed),
+    warn_if_npu_power_mode_not_turbo(
+        LOGGER,
+        study_name="end-to-end staging ablation",
     )
-    write_rows(args.output.expanduser(), rows)
-    write_plot(args.plot_output.expanduser(), rows)
-    LOGGER.info("Wrote %d staging-ablation rows to %s", len(rows), args.output)
-    LOGGER.info("Wrote staging-ablation plot to %s", args.plot_output)
+    output_path = args.output.expanduser()
+    with hold_study_lock(
+        default_lock_path(output_path),
+        study_name="transformer_layer_new staging ablation study",
+    ):
+        resume_paths: tuple[Path, ...] = tuple()
+        if not args.no_resume:
+            if args.resume_input is not None:
+                resume_paths = (args.resume_input.expanduser(),)
+            else:
+                resume_paths = default_resume_paths(output_path)
+        existing_rows = load_existing_rows(resume_paths)
+        if resume_paths and existing_rows:
+            LOGGER.info(
+                "Reusing %d staging-ablation rows from %s",
+                len(existing_rows),
+                ", ".join(str(path) for path in resume_paths),
+            )
+        rows = build_rows(
+            results_input=args.results_input.expanduser(),
+            staging_results=args.staging_results.expanduser(),
+            workload_variant_filter=str(args.workload_variant),
+            family_filter=str(args.family),
+            seq_len_filter=str(args.seq_len),
+            block_filter=str(args.block),
+            warmup_runs=args.warmup_runs,
+            runs_per_sample=args.runs_per_sample,
+            seed=int(args.seed),
+            existing_rows=existing_rows,
+            benchmark_fn=benchmark_mode_subprocess,
+            checkpoint_fn=lambda current_rows: write_rows(output_path, current_rows),
+        )
+        write_rows(output_path, rows)
+        write_plot(args.plot_output.expanduser(), rows)
+        LOGGER.info("Wrote %d staging-ablation rows to %s", len(rows), output_path)
+        LOGGER.info("Wrote staging-ablation plot to %s", args.plot_output)
     return 0
 
 

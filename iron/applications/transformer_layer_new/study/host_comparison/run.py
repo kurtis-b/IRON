@@ -25,10 +25,16 @@ from matplotlib.patches import Patch
 import torch
 import torch.nn.functional as F
 
+from ..run_lock import default_lock_path, hold_study_lock
 from iron.applications.transformer_layer_new.study.end_to_end.cases import (
-    FAMILY_SPECS,
     effective_gflops_per_sec,
     effective_gflops_per_sec_per_watt,
+)
+from iron.applications.transformer_layer_new.pattern.reference import (
+    generate_golden_reference,
+)
+from iron.applications.transformer_layer_new.study.end_to_end.cases import (
+    FAMILY_SPECS,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.power import (
     create_power_monitor as create_cpu_power_monitor,
@@ -50,27 +56,39 @@ FINAL_ABS_TOL = 0.5
 FINAL_ERROR_THRESHOLD = 0.05
 SUPPORTED_HOST_BACKENDS: tuple[str, ...] = ("igpu",)
 SUPPORTED_CPU_POWER_BACKENDS: tuple[str, ...] = ("none", "turbostat_pkgwatt")
-SUPPORTED_IGPU_POWER_BACKENDS: tuple[str, ...] = ("none", "rocm-smi")
-COMPARISON_COLUMNS: tuple[str, ...] = ("igpu", *REFERENCE_EXECUTION_MODES)
+SUPPORTED_IGPU_POWER_BACKENDS: tuple[str, ...] = (
+    "none",
+    "rocm-smi",
+    "turbostat_pkgwatt",
+)
+COMPARISON_COLUMNS: tuple[str, ...] = (
+    "igpu",
+    "igpu_rocm_smi",
+    "igpu_turbostat_pkgwatt",
+    *REFERENCE_EXECUTION_MODES,
+)
 RESULTS_CSV_FIELDNAMES = (
+    "workload_variant",
     "study_case_id",
     "seq_len",
     "metric",
     *COMPARISON_COLUMNS,
 )
-PLOT_SERIES = (
+PLOT_SERIES_THROUGHPUT = (
     ("igpu", "iGPU", "#e07a5f"),
-    ("dataflow", "NPU Dataflow", "#1f6f8b"),
+    ("hybrid", "NPU", "#1f6f8b"),
+)
+PLOT_SERIES_PER_WATT = (
+    ("igpu_rocm_smi", "iGPU (ROCm-SMI)", "#e07a5f"),
+    ("igpu_turbostat_pkgwatt", "iGPU (Turbostat)", "#81b29a"),
+    ("hybrid", "NPU", "#1f6f8b"),
 )
 PLOT_FAMILY_ORDER = ("tinybert_512", "baseline_768", "baseline_1024")
 PLOT_SEQ_ORDER = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
 PLOT_FAMILY_LABELS = {
-    family_id: (
-        f"Head Dim = {hidden_size // num_heads} / "
-        f"Num Heads = {num_heads} / "
-        f"FFN Dim = {intermediate_size}"
-    )
-    for family_id, (hidden_size, intermediate_size, num_heads) in FAMILY_SPECS.items()
+    "tinybert_512": "TinyBERT",
+    "baseline_768": "BERT-Base",
+    "baseline_1024": "BERT-Large",
 }
 SUPPORTED_PLOT_SUFFIX = ".svg"
 TORCH_DTYPES: dict[str, torch.dtype] = {
@@ -90,6 +108,21 @@ def default_output_path() -> Path:
     )
 
 
+def default_resume_paths(output_path: Path) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    candidate = (
+        Path(__file__).resolve().parents[2]
+        / "results_final"
+        / "host_comparison"
+        / output_path.name
+    )
+    if candidate.exists():
+        paths.append(candidate)
+    if output_path.exists() and output_path not in paths:
+        paths.append(output_path)
+    return tuple(paths)
+
+
 def default_effective_gflops_plot_path(output_path: Path) -> Path:
     return output_path.with_name("effective_gflops_comparison.svg")
 
@@ -104,55 +137,21 @@ def generate_synthetic_reference(
     intermediate_size: int,
     num_attention_heads: int,
     *,
+    workload_variant: str,
     dtype: str,
     seed: int,
     include_output: bool,
 ) -> dict[str, torch.Tensor | dict[str, torch.Tensor] | None]:
-    torch.manual_seed(seed)
-    value_range = 0.05
-    torch_dtype = TORCH_DTYPES.get(dtype, torch.bfloat16)
-
-    input_tensor = torch.randn(seq_len, hidden_size, dtype=torch_dtype) * value_range
-
-    q_weight = torch.randn(hidden_size, hidden_size, dtype=torch_dtype) * value_range
-    k_weight = torch.randn(hidden_size, hidden_size, dtype=torch_dtype) * value_range
-    v_weight = torch.randn(hidden_size, hidden_size, dtype=torch_dtype) * value_range
-    attn_output_weight = (
-        torch.randn(hidden_size, hidden_size, dtype=torch_dtype) * value_range
+    return generate_golden_reference(
+        seq_len=seq_len,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_heads=num_attention_heads,
+        workload_variant=workload_variant,
+        dtype=dtype,
+        seed=seed,
+        include_output=include_output,
     )
-    ln1_weight = torch.rand(hidden_size, dtype=torch_dtype)
-    ffn_up_weight = (
-        torch.randn(hidden_size, intermediate_size, dtype=torch_dtype) * value_range
-    )
-    ffn_down_weight = (
-        torch.randn(intermediate_size, hidden_size, dtype=torch_dtype) * value_range
-    )
-    ln2_weight = torch.rand(hidden_size, dtype=torch_dtype)
-
-    output = None
-    weights = {
-        "q_weight": q_weight,
-        "k_weight": k_weight,
-        "v_weight": v_weight,
-        "attn_output_weight": attn_output_weight,
-        "ln1_weight": ln1_weight,
-        "ffn_up_weight": ffn_up_weight,
-        "ffn_down_weight": ffn_down_weight,
-        "ln2_weight": ln2_weight,
-    }
-    if include_output:
-        output = _forward_reference(
-            input_tensor,
-            weights,
-            num_attention_heads=num_attention_heads,
-        )
-
-    return {
-        "input": input_tensor,
-        "weights": weights,
-        "output": output,
-        "attention_mask": None,
-    }
 
 
 def _optional_float(value: object) -> float | None:
@@ -476,27 +475,58 @@ def _forward_reference(
     weights: dict[str, torch.Tensor],
     *,
     num_attention_heads: int,
+    workload_variant: str,
 ) -> torch.Tensor:
     seq_len, hidden_size = hidden_states.shape
     head_dim = hidden_size // num_attention_heads
 
-    q = torch.matmul(hidden_states, weights["q_weight"])
-    k = torch.matmul(hidden_states, weights["k_weight"])
-    v = torch.matmul(hidden_states, weights["v_weight"])
+    if workload_variant == "decoder_gpt2":
+        attn_input = F.layer_norm(
+            hidden_states,
+            (hidden_size,),
+            weights["ln1_weight"],
+            None,
+        )
+        residual_after_attention = hidden_states
+    else:
+        attn_input = hidden_states
+        residual_after_attention = hidden_states
+
+    q = torch.matmul(attn_input, weights["q_weight"])
+    k = torch.matmul(attn_input, weights["k_weight"])
+    v = torch.matmul(attn_input, weights["v_weight"])
 
     q = q.view(seq_len, num_attention_heads, head_dim).transpose(0, 1)
     k = k.view(seq_len, num_attention_heads, head_dim).transpose(0, 1)
     v = v.view(seq_len, num_attention_heads, head_dim).transpose(0, 1)
 
     attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim**0.5)
+    if workload_variant == "decoder_gpt2":
+        causal_mask = torch.tril(
+            torch.ones((seq_len, seq_len), device=hidden_states.device)
+        )
+        attn_scores = attn_scores.masked_fill(causal_mask == 0, -10000.0)
     attn_probs = F.softmax(attn_scores, dim=-1)
     attn_output = torch.matmul(attn_probs, v)
 
     attn_output = attn_output.transpose(0, 1).contiguous().view(seq_len, hidden_size)
     attn_output = torch.matmul(attn_output, weights["attn_output_weight"])
 
+    if workload_variant == "decoder_gpt2":
+        residual_hidden_states = attn_output + residual_after_attention
+        ffn_input = F.layer_norm(
+            residual_hidden_states,
+            (hidden_size,),
+            weights["ln2_weight"],
+            None,
+        )
+        intermediate = torch.matmul(ffn_input, weights["ffn_up_weight"])
+        intermediate = F.gelu(intermediate)
+        ffn_output = torch.matmul(intermediate, weights["ffn_down_weight"])
+        return ffn_output + residual_hidden_states
+
     hidden_states = F.layer_norm(
-        attn_output + hidden_states,
+        attn_output + residual_after_attention,
         (hidden_size,),
         weights["ln1_weight"],
         None,
@@ -519,7 +549,7 @@ def _host_power_monitor(
     sample_interval_sec: float,
     estimated_timed_window_sec: float | None,
 ):
-    if runtime_device.type == "cpu":
+    if power_backend == "turbostat_pkgwatt" or runtime_device.type == "cpu":
         return create_cpu_power_monitor(
             power_backend=power_backend,
             sample_interval_sec=sample_interval_sec,
@@ -533,6 +563,55 @@ def _host_power_monitor(
     )
 
 
+def _measure_host_power_stats(
+    *,
+    runtime_device: torch.device,
+    forward_once,
+    power_backend: str,
+    power_sample_interval_sec: float,
+    runs_per_sample: int,
+    avg_iteration_sec: float | None,
+    timed_total_sec: float,
+) -> dict[str, float | str | None]:
+    if power_backend == "none":
+        power_stats = empty_power_stats()
+        power_stats["power_backend"] = "none"
+        return power_stats
+
+    power_probe_runs = resolve_power_probe_runs(
+        avg_iteration_sec=avg_iteration_sec,
+        baseline_runs=runs_per_sample,
+        min_measurement_duration_sec=0.25,
+    )
+    estimated_window_sec = (
+        None
+        if avg_iteration_sec is None
+        else avg_iteration_sec * float(power_probe_runs)
+    )
+    sample_interval_sec = resolve_power_sample_interval_sec(
+        requested_interval_sec=power_sample_interval_sec,
+        estimated_timed_window_sec=estimated_window_sec,
+        min_interval_sec=0.05,
+    )
+    with _host_power_monitor(
+        runtime_device,
+        power_backend=power_backend,
+        sample_interval_sec=sample_interval_sec,
+        estimated_timed_window_sec=estimated_window_sec,
+    ) as power_monitor:
+        started = time.perf_counter()
+        for _ in range(power_probe_runs):
+            forward_once()
+            time.sleep(0)
+        elapsed_sec = time.perf_counter() - started
+    power_stats = power_monitor.stats(elapsed_sec)
+    if power_stats.get("avg_power_w") is not None:
+        power_stats["energy_j"] = float(power_stats["avg_power_w"]) * float(
+            timed_total_sec
+        )
+    return power_stats
+
+
 def benchmark_host_group(
     group: ReferenceGroup,
     *,
@@ -542,6 +621,7 @@ def benchmark_host_group(
     device_name: str,
     power_backend: str,
     power_sample_interval_sec: float,
+    extra_power_backends: tuple[str, ...] = (),
 ) -> dict[str, object]:
     runtime_device = resolve_host_device(device_name)
     if runtime_device.type == "cpu":
@@ -552,6 +632,7 @@ def benchmark_host_group(
         group.hidden_size,
         group.intermediate_size,
         group.num_attention_heads,
+        workload_variant=group.workload_variant,
         dtype=group.dtype,
         seed=seed,
         include_output=include_output,
@@ -579,6 +660,7 @@ def benchmark_host_group(
                 runtime_input,
                 runtime_weights,
                 num_attention_heads=group.num_attention_heads,
+                workload_variant=group.workload_variant,
             )
         if runtime_device.type == "cuda":
             torch.cuda.synchronize(runtime_device)
@@ -601,41 +683,27 @@ def benchmark_host_group(
             summary["measured_inference_count"]
         )
 
-    if power_backend == "none":
-        power_stats = empty_power_stats()
-        power_stats["power_backend"] = "none"
-    else:
-        power_probe_runs = resolve_power_probe_runs(
+    power_stats = _measure_host_power_stats(
+        runtime_device=runtime_device,
+        forward_once=forward_once,
+        power_backend=power_backend,
+        power_sample_interval_sec=power_sample_interval_sec,
+        runs_per_sample=runs_per_sample,
+        avg_iteration_sec=avg_iteration_sec,
+        timed_total_sec=float(summary["timed_total_sec"]),
+    )
+    extra_power_stats = {
+        backend: _measure_host_power_stats(
+            runtime_device=runtime_device,
+            forward_once=forward_once,
+            power_backend=backend,
+            power_sample_interval_sec=power_sample_interval_sec,
+            runs_per_sample=runs_per_sample,
             avg_iteration_sec=avg_iteration_sec,
-            baseline_runs=runs_per_sample,
-            min_measurement_duration_sec=0.25,
+            timed_total_sec=float(summary["timed_total_sec"]),
         )
-        estimated_window_sec = (
-            None
-            if avg_iteration_sec is None
-            else avg_iteration_sec * float(power_probe_runs)
-        )
-        sample_interval_sec = resolve_power_sample_interval_sec(
-            requested_interval_sec=power_sample_interval_sec,
-            estimated_timed_window_sec=estimated_window_sec,
-            min_interval_sec=0.05,
-        )
-        with _host_power_monitor(
-            runtime_device,
-            power_backend=power_backend,
-            sample_interval_sec=sample_interval_sec,
-            estimated_timed_window_sec=estimated_window_sec,
-        ) as power_monitor:
-            started = time.perf_counter()
-            for _ in range(power_probe_runs):
-                forward_once()
-                time.sleep(0)
-            elapsed_sec = time.perf_counter() - started
-        power_stats = power_monitor.stats(elapsed_sec)
-        if power_stats.get("avg_power_w") is not None:
-            power_stats["energy_j"] = float(power_stats["avg_power_w"]) * float(
-                summary["timed_total_sec"]
-            )
+        for backend in extra_power_backends
+    }
 
     validation = _validate_output(group, last_output, runtime_reference_output)
     effective_gflops = effective_gflops_per_sec(
@@ -659,6 +727,7 @@ def benchmark_host_group(
         ),
         "process_model": "in_process",
         "host_device": str(runtime_device),
+        "extra_power_stats": extra_power_stats,
         **validation,
     }
 
@@ -700,22 +769,164 @@ def _host_metric_value(
     return _optional_float(benchmark_result.get(metric_field))
 
 
+def _igpu_effective_gflops_per_watt_for_backend(
+    benchmark_result: dict[str, object] | None,
+    *,
+    power_backend: str,
+) -> float | None:
+    if benchmark_result is None:
+        return None
+    if str(benchmark_result.get("power_backend") or "") == power_backend:
+        return _host_metric_value(
+            benchmark_result,
+            "effective_gflops_per_sec_per_watt",
+        )
+    effective_gflops = _host_metric_value(benchmark_result, "effective_gflops_per_sec")
+    extra_stats = benchmark_result.get("extra_power_stats")
+    if not isinstance(extra_stats, dict):
+        return None
+    backend_stats = extra_stats.get(power_backend)
+    if not isinstance(backend_stats, dict):
+        return None
+    avg_power_w = _optional_float(backend_stats.get("avg_power_w"))
+    return effective_gflops_per_sec_per_watt(effective_gflops, avg_power_w)
+
+
 def _comparison_row(
     *,
     group: ReferenceGroup,
     metric: str,
     igpu_value: float | None,
+    igpu_rocm_smi_value: float | None = None,
+    igpu_turbostat_value: float | None = None,
     reference_values: dict[str, float | None],
 ) -> dict[str, object]:
     row: dict[str, object] = {
+        "workload_variant": group.workload_variant,
         "study_case_id": group.study_case_id,
         "seq_len": group.seq_len,
         "metric": metric,
         "igpu": igpu_value,
+        "igpu_rocm_smi": igpu_rocm_smi_value,
+        "igpu_turbostat_pkgwatt": igpu_turbostat_value,
     }
     for execution_mode in REFERENCE_EXECUTION_MODES:
         row[execution_mode] = reference_values.get(execution_mode)
     return row
+
+
+def _row_key(row: dict[str, object]) -> tuple[str, str, int, str]:
+    return (
+        str(row.get("workload_variant") or ""),
+        str(row.get("study_case_id") or ""),
+        int(float(str(row.get("seq_len") or 0))),
+        str(row.get("metric") or ""),
+    )
+
+
+def _normalized_existing_row(row: dict[str, str]) -> dict[str, object] | None:
+    metric = str(row.get("metric") or "").strip()
+    if not metric:
+        return None
+    study_case_id = str(row.get("study_case_id") or "").strip()
+    if not study_case_id:
+        return None
+    seq_len_text = str(row.get("seq_len") or "").strip()
+    if not seq_len_text:
+        return None
+    try:
+        seq_len = int(float(seq_len_text))
+    except ValueError:
+        return None
+    workload_variant = str(row.get("workload_variant") or "").strip()
+    if not workload_variant and study_case_id in FAMILY_SPECS:
+        workload_variant = FAMILY_SPECS[study_case_id].workload_variant
+    if not workload_variant:
+        return None
+    normalized: dict[str, object] = {
+        "workload_variant": workload_variant,
+        "study_case_id": study_case_id,
+        "seq_len": seq_len,
+        "metric": metric,
+        "igpu": row.get("igpu", ""),
+        "igpu_rocm_smi": row.get("igpu_rocm_smi", ""),
+        "igpu_turbostat_pkgwatt": row.get("igpu_turbostat_pkgwatt", ""),
+        "hybrid": row.get("hybrid", row.get("dataflow", "")),
+    }
+    return normalized
+
+
+def load_existing_rows(
+    paths: tuple[Path, ...],
+) -> dict[tuple[str, str, int, str], dict[str, object]]:
+    rows: dict[tuple[str, str, int, str], dict[str, object]] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                normalized = _normalized_existing_row(row)
+                if normalized is None:
+                    continue
+                rows[_row_key(normalized)] = normalized
+    return rows
+
+
+def _matching_reference_values(
+    row: dict[str, object],
+    reference_values: dict[str, float | None],
+) -> bool:
+    for execution_mode in REFERENCE_EXECUTION_MODES:
+        expected = reference_values.get(execution_mode)
+        actual = _optional_float(row.get(execution_mode))
+        if expected is None and actual is None:
+            continue
+        if expected is None or actual is None:
+            return False
+        if abs(float(expected) - float(actual)) > 1e-9:
+            return False
+    return True
+
+
+def reusable_rows_for_group(
+    existing_rows: dict[tuple[str, str, int, str], dict[str, object]],
+    *,
+    group: ReferenceGroup,
+    reference_effective_gflops: dict[str, float | None],
+    reference_effective_gflops_per_watt: dict[str, float | None],
+) -> list[dict[str, object]] | None:
+    throughput_row = existing_rows.get(
+        (
+            group.workload_variant,
+            group.study_case_id,
+            group.seq_len,
+            "effective_gflops_per_sec",
+        )
+    )
+    per_watt_row = existing_rows.get(
+        (
+            group.workload_variant,
+            group.study_case_id,
+            group.seq_len,
+            "effective_gflops_per_sec_per_watt",
+        )
+    )
+    if throughput_row is None or per_watt_row is None:
+        return None
+    if _optional_float(throughput_row.get("igpu")) is None:
+        return None
+    if _optional_float(per_watt_row.get("igpu_rocm_smi")) is None:
+        return None
+    if _optional_float(per_watt_row.get("igpu_turbostat_pkgwatt")) is None:
+        return None
+    if not _matching_reference_values(throughput_row, reference_effective_gflops):
+        return None
+    if not _matching_reference_values(
+        per_watt_row,
+        reference_effective_gflops_per_watt,
+    ):
+        return None
+    return [dict(throughput_row), dict(per_watt_row)]
 
 
 def _resolve_plot_path(path: Path) -> Path:
@@ -764,6 +975,11 @@ def render_metric_plot(
     variant: str = "standard",
 ) -> plt.Figure:
     metric_rows = [row for row in rows if str(row.get("metric") or "") == metric]
+    plot_series = (
+        PLOT_SERIES_THROUGHPUT
+        if metric == "effective_gflops_per_sec"
+        else PLOT_SERIES_PER_WATT
+    )
     plt.rcParams["svg.fonttype"] = "none"
     sns.set_theme(
         style="whitegrid",
@@ -803,24 +1019,14 @@ def render_metric_plot(
 
     study_case_ids = _ordered_study_case_ids(metric_rows)
     seq_lens = _ordered_seq_lens(metric_rows)
-    if variant == "slides" and len(study_case_ids) == 3:
-        fig, axes_grid = plt.subplots(2, 2, figsize=(22, 12), sharey=True)
-        axes = [
-            axes_grid[0][0],
-            axes_grid[0][1],
-            axes_grid[1][0],
-        ]
-        legend_ax = axes_grid[1][1]
-        legend_ax.set_axis_off()
-    else:
-        fig, axes_obj = plt.subplots(
-            1,
-            max(1, len(study_case_ids)),
-            figsize=(8 * max(1, len(study_case_ids)), 8),
-            sharey=True,
-        )
-        axes = [axes_obj] if len(study_case_ids) == 1 else list(axes_obj)
-        legend_ax = None
+    fig, axes_obj = plt.subplots(
+        1,
+        max(1, len(study_case_ids)),
+        figsize=(8 * max(1, len(study_case_ids)), 8),
+        sharey=True,
+    )
+    axes = [axes_obj] if len(study_case_ids) == 1 else list(axes_obj)
+    legend_ax = None
 
     for ax, study_case_id in zip(axes, study_case_ids, strict=True):
         family_rows = [
@@ -833,14 +1039,14 @@ def render_metric_plot(
                 int(row.get("seq_len") or 0): _optional_float(row.get(series_name))
                 for row in family_rows
             }
-            for series_name, _, _ in PLOT_SERIES
+            for series_name, _, _ in plot_series
         }
 
         x_positions = list(range(len(seq_lens)))
         group_width = 0.82
-        bar_width = group_width / float(len(PLOT_SERIES))
+        bar_width = group_width / float(len(plot_series))
 
-        for series_index, (series_name, _, color) in enumerate(PLOT_SERIES):
+        for series_index, (series_name, _, color) in enumerate(plot_series):
             x_values: list[float] = []
             y_values: list[float] = []
             for seq_index, seq_len in enumerate(seq_lens):
@@ -865,20 +1071,22 @@ def render_metric_plot(
 
         ax.set_xticks(x_positions)
         ax.set_xticklabels([str(seq_len) for seq_len in seq_lens], rotation=0)
-        ax.set_xlabel("Context Length (tokens)", fontsize=15)
+        ax.set_xlabel("Sequence Length", fontsize=15)
         ax.set_ylabel(y_axis_label, fontsize=15)
         ax.set_title(
             _format_study_case_label(study_case_id),
             loc="left",
             fontsize=18 if variant == "standard" else 20,
-            pad=12,
+            pad=6,
         )
         ax.grid(True, which="major", axis="y", linewidth=0.8, alpha=0.8)
         ax.tick_params(axis="both", labelsize=12 if variant == "standard" else 14)
+        if ax is not axes[0]:
+            ax.set_ylabel("")
 
     legend_handles = [
         Patch(facecolor=color, edgecolor="none", label=label)
-        for _, label, color in PLOT_SERIES
+        for _, label, color in plot_series
     ]
     if legend_ax is not None:
         legend_ax.legend(
@@ -891,10 +1099,10 @@ def render_metric_plot(
     else:
         fig.legend(
             handles=legend_handles,
-            loc="lower center",
-            ncol=len(PLOT_SERIES),
+            loc="center left",
+            ncol=1,
             frameon=False,
-            bbox_to_anchor=(0.5, 0.01),
+            bbox_to_anchor=(0.87, 0.5),
             fontsize=13 if variant == "standard" else 16,
         )
     fig.suptitle(
@@ -903,7 +1111,7 @@ def render_metric_plot(
         fontweight="bold",
         y=0.98 if variant == "standard" else 0.99,
     )
-    fig.tight_layout(rect=[0, 0.06, 1, 0.93])
+    fig.tight_layout(rect=[0, 0.03, 0.84, 0.92])
     return fig
 
 
@@ -939,14 +1147,14 @@ def write_plots(
         rows,
         metric="effective_gflops_per_sec",
         title="Effective Throughput Comparison",
-        y_axis_label="GFLOP / sec",
+        y_axis_label="GFLOPS",
     )
     write_metric_plot(
         _resolve_plot_path(effective_gflops_per_watt_plot_path),
         rows,
         metric="effective_gflops_per_sec_per_watt",
         title="Effective Throughput/W Comparison",
-        y_axis_label="GFLOP / sec / W",
+        y_axis_label="GFLOPS / W",
     )
 
 
@@ -988,6 +1196,7 @@ def build_rows_for_group(
     igpu_device_name: str,
     igpu_power_backend: str,
     igpu_power_sample_interval_sec: float,
+    existing_rows: dict[tuple[str, str, int, str], dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     resolved_warmup_runs, resolved_runs_per_sample = resolve_sampling(
         group,
@@ -1003,6 +1212,11 @@ def build_rows_for_group(
             "power_sample_interval_sec": igpu_power_sample_interval_sec,
         },
     }
+    igpu_measurement_backends = tuple(
+        backend
+        for backend in ("rocm-smi", "turbostat_pkgwatt")
+        if backend != str(igpu_power_backend)
+    )
 
     for backend in host_backends:
         try:
@@ -1015,6 +1229,9 @@ def build_rows_for_group(
                 power_backend=str(backend_configs[backend]["power_backend"]),
                 power_sample_interval_sec=float(
                     backend_configs[backend]["power_sample_interval_sec"]
+                ),
+                extra_power_backends=(
+                    igpu_measurement_backends if backend == "igpu" else tuple()
                 ),
             )
         except Exception as exc:
@@ -1038,6 +1255,19 @@ def build_rows_for_group(
         group,
         "effective_gflops_per_sec_per_watt",
     )
+    reused_rows = reusable_rows_for_group(
+        {} if existing_rows is None else existing_rows,
+        group=group,
+        reference_effective_gflops=reference_effective_gflops,
+        reference_effective_gflops_per_watt=reference_effective_gflops_per_watt,
+    )
+    if reused_rows is not None:
+        LOGGER.info(
+            "Reusing host comparison rows for %s seq_len=%s",
+            group.study_case_id,
+            group.seq_len,
+        )
+        return reused_rows
     return [
         _comparison_row(
             group=group,
@@ -1051,9 +1281,14 @@ def build_rows_for_group(
         _comparison_row(
             group=group,
             metric="effective_gflops_per_sec_per_watt",
-            igpu_value=_host_metric_value(
+            igpu_value=None,
+            igpu_rocm_smi_value=_igpu_effective_gflops_per_watt_for_backend(
                 benchmark_results["igpu"],
-                "effective_gflops_per_sec_per_watt",
+                power_backend="rocm-smi",
+            ),
+            igpu_turbostat_value=_igpu_effective_gflops_per_watt_for_backend(
+                benchmark_results["igpu"],
+                power_backend="turbostat_pkgwatt",
             ),
             reference_values=reference_effective_gflops_per_watt,
         ),
@@ -1098,6 +1333,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=default_reference_results_path(),
     )
     parser.add_argument("--output", type=Path, default=default_output_path())
+    parser.add_argument("--resume-input", type=Path, default=None)
+    parser.add_argument("--no-resume", action="store_true")
     parser.add_argument(
         "--effective-gflops-plot",
         "--tps-plot",
@@ -1130,56 +1367,77 @@ def main(argv: list[str] | None = None) -> int:
 
     reference_input = args.reference_input.expanduser()
     output_path = args.output.expanduser()
-    effective_gflops_plot_path = (
-        default_effective_gflops_plot_path(output_path)
-        if args.effective_gflops_plot is None
-        else _resolve_plot_path(args.effective_gflops_plot.expanduser())
-    )
-    effective_gflops_per_watt_plot_path = (
-        default_effective_gflops_per_watt_plot_path(output_path)
-        if args.effective_gflops_per_watt_plot is None
-        else _resolve_plot_path(args.effective_gflops_per_watt_plot.expanduser())
-    )
-
-    if not reference_input.exists():
-        LOGGER.warning(
-            "Reference end_to_end results not found at %s; writing empty host comparison outputs",
-            reference_input,
+    with hold_study_lock(
+        default_lock_path(output_path),
+        study_name="host comparison",
+    ):
+        resume_paths: tuple[Path, ...] = tuple()
+        if args.no_resume:
+            resume_paths = tuple()
+        elif args.resume_input is not None:
+            resume_paths = (args.resume_input.expanduser(),)
+        else:
+            resume_paths = default_resume_paths(output_path)
+        effective_gflops_plot_path = (
+            default_effective_gflops_plot_path(output_path)
+            if args.effective_gflops_plot is None
+            else _resolve_plot_path(args.effective_gflops_plot.expanduser())
         )
-        write_rows(output_path, [])
-        write_plots(
-            [],
-            effective_gflops_plot_path=effective_gflops_plot_path,
-            effective_gflops_per_watt_plot_path=effective_gflops_per_watt_plot_path,
+        effective_gflops_per_watt_plot_path = (
+            default_effective_gflops_per_watt_plot_path(output_path)
+            if args.effective_gflops_per_watt_plot is None
+            else _resolve_plot_path(args.effective_gflops_per_watt_plot.expanduser())
         )
-        return 0
 
-    groups = group_reference_rows(
-        load_reference_rows(reference_input),
-        family_filter=str(args.family),
-        seq_len_filter=str(args.seq_len),
-    )
+        if not reference_input.exists():
+            LOGGER.warning(
+                "Reference end_to_end results not found at %s; writing empty host comparison outputs",
+                reference_input,
+            )
+            write_rows(output_path, [])
+            write_plots(
+                [],
+                effective_gflops_plot_path=effective_gflops_plot_path,
+                effective_gflops_per_watt_plot_path=effective_gflops_per_watt_plot_path,
+            )
+            return 0
 
-    if not groups:
-        LOGGER.warning(
-            "No matching end_to_end rows found in %s for family=%s seq_len=%s; "
-            "writing empty host comparison outputs",
-            reference_input,
-            args.family,
-            args.seq_len,
+        groups = group_reference_rows(
+            load_reference_rows(reference_input),
+            family_filter=str(args.family),
+            seq_len_filter=str(args.seq_len),
         )
-        write_rows(output_path, [])
-        write_plots(
-            [],
-            effective_gflops_plot_path=effective_gflops_plot_path,
-            effective_gflops_per_watt_plot_path=effective_gflops_per_watt_plot_path,
-        )
-        return 0
 
-    rows: list[dict[str, object]] = []
-    for group in groups:
-        rows.extend(
-            build_rows_for_group(
+        if not groups:
+            LOGGER.warning(
+                "No matching end_to_end rows found in %s for family=%s seq_len=%s; "
+                "writing empty host comparison outputs",
+                reference_input,
+                args.family,
+                args.seq_len,
+            )
+            write_rows(output_path, [])
+            write_plots(
+                [],
+                effective_gflops_plot_path=effective_gflops_plot_path,
+                effective_gflops_per_watt_plot_path=effective_gflops_per_watt_plot_path,
+            )
+            return 0
+
+        existing_rows = load_existing_rows(resume_paths)
+        if resume_paths and existing_rows:
+            LOGGER.info(
+                "Loaded %d reusable host comparison rows from %s",
+                len(existing_rows),
+                ", ".join(str(path) for path in resume_paths),
+            )
+
+        row_map: dict[tuple[str, str, int, str], dict[str, object]] = dict(
+            existing_rows
+        )
+        rows: list[dict[str, object]] = list(row_map.values())
+        for group in groups:
+            for row in build_rows_for_group(
                 group,
                 warmup_runs=args.warmup_iters,
                 runs_per_sample=args.timed_iters,
@@ -1190,21 +1448,23 @@ def main(argv: list[str] | None = None) -> int:
                 igpu_power_sample_interval_sec=float(
                     args.igpu_power_sample_interval_sec
                 ),
-            )
-        )
+                existing_rows=existing_rows,
+            ):
+                row_map[_row_key(row)] = row
+            rows = list(row_map.values())
 
-    write_rows(output_path, rows)
-    write_plots(
-        rows,
-        effective_gflops_plot_path=effective_gflops_plot_path,
-        effective_gflops_per_watt_plot_path=effective_gflops_per_watt_plot_path,
-    )
-    LOGGER.info("Wrote %d host comparison rows to %s", len(rows), output_path)
-    LOGGER.info(
-        "Wrote comparison plots to %s and %s",
-        effective_gflops_plot_path,
-        effective_gflops_per_watt_plot_path,
-    )
+        write_rows(output_path, rows)
+        write_plots(
+            rows,
+            effective_gflops_plot_path=effective_gflops_plot_path,
+            effective_gflops_per_watt_plot_path=effective_gflops_per_watt_plot_path,
+        )
+        LOGGER.info("Wrote %d host comparison rows to %s", len(rows), output_path)
+        LOGGER.info(
+            "Wrote comparison plots to %s and %s",
+            effective_gflops_plot_path,
+            effective_gflops_per_watt_plot_path,
+        )
     return 0
 
 

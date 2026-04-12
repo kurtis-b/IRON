@@ -10,17 +10,32 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .cases import EXECUTION_MODES, FAMILY_IDS, SEQUENCE_LADDER
+from .cases import (
+    EXECUTION_MODES,
+    FAMILY_IDS,
+    FAMILY_SPECS,
+    SEQUENCE_LADDER,
+    canonical_execution_mode,
+    canonical_workload_variant,
+)
 
 _MODE_ORDER = {
     execution_mode: index for index, execution_mode in enumerate(EXECUTION_MODES)
 }
 
 
+def _normalized_execution_mode(value: object) -> str | None:
+    try:
+        return canonical_execution_mode(str(value or ""))
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True)
 class SelectedEndToEndRow:
     study_case_id: str
     study_case_label: str
+    workload_variant: str
     execution_mode: str
     seq_len: int
     hidden_size: int
@@ -62,7 +77,7 @@ def _eligible_row(row: dict[str, str]) -> bool:
         return False
     if row.get("run_status") != "passed":
         return False
-    if row.get("execution_mode") not in EXECUTION_MODES:
+    if _normalized_execution_mode(row.get("execution_mode")) is None:
         return False
     if _optional_int(row.get("seq_len")) is None:
         return False
@@ -72,21 +87,43 @@ def _eligible_row(row: dict[str, str]) -> bool:
     return True
 
 
+def _normalized_workload_variant(row: dict[str, str]) -> str | None:
+    value = str(row.get("workload_variant") or "").strip()
+    if value:
+        try:
+            return canonical_workload_variant(value)
+        except ValueError:
+            return None
+    family_id = str(row.get("study_case_id") or "")
+    if family_id in FAMILY_SPECS:
+        return FAMILY_SPECS[family_id].workload_variant
+    return None
+
+
 def _matches_filters(
     row: dict[str, str],
     *,
+    workload_variant_filter: str,
     family_filter: str,
     seq_len_filter: str,
     mode_filter: str,
 ) -> bool:
+    if workload_variant_filter != "all":
+        if _normalized_workload_variant(row) != canonical_workload_variant(
+            workload_variant_filter
+        ):
+            return False
     if family_filter != "all" and row.get("study_case_id") != family_filter:
         return False
     if seq_len_filter != "all" and _optional_int(row.get("seq_len")) != int(
         seq_len_filter
     ):
         return False
-    if mode_filter != "all" and row.get("execution_mode") != mode_filter:
-        return False
+    if mode_filter != "all":
+        if _normalized_execution_mode(
+            row.get("execution_mode")
+        ) != canonical_execution_mode(mode_filter):
+            return False
     return True
 
 
@@ -97,7 +134,10 @@ def _sorted_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         rows,
         key=lambda row: (
             family_order.get(str(row.get("study_case_id") or ""), len(FAMILY_IDS)),
-            _MODE_ORDER.get(str(row.get("execution_mode") or ""), len(EXECUTION_MODES)),
+            _MODE_ORDER.get(
+                _normalized_execution_mode(row.get("execution_mode")),
+                len(EXECUTION_MODES),
+            ),
             seq_order.get(_optional_int(row.get("seq_len")), len(SEQUENCE_LADDER)),
         ),
     )
@@ -113,6 +153,7 @@ def _load_json_dict(value: str) -> dict[str, Any]:
 def select_result_rows(
     rows: list[dict[str, str]],
     *,
+    workload_variant_filter: str = "all",
     family_filter: str = "all",
     seq_len_filter: str = "all",
     mode_filter: str = "all",
@@ -123,6 +164,7 @@ def select_result_rows(
             continue
         if not _matches_filters(
             row,
+            workload_variant_filter=workload_variant_filter,
             family_filter=family_filter,
             seq_len_filter=seq_len_filter,
             mode_filter=mode_filter,
@@ -133,7 +175,10 @@ def select_result_rows(
             SelectedEndToEndRow(
                 study_case_id=str(row.get("study_case_id") or ""),
                 study_case_label=str(row.get("study_case_label") or ""),
-                execution_mode=str(row.get("execution_mode") or ""),
+                workload_variant=str(_normalized_workload_variant(row) or ""),
+                execution_mode=canonical_execution_mode(
+                    str(row.get("execution_mode") or "")
+                ),
                 seq_len=int(_optional_int(row.get("seq_len")) or 0),
                 hidden_size=int(_optional_int(row.get("hidden_size")) or 0),
                 intermediate_size=int(_optional_int(row.get("intermediate_size")) or 0),

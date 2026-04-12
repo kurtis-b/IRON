@@ -9,6 +9,11 @@ import csv
 import logging
 from pathlib import Path
 
+from ..npu_runtime_checks import (
+    require_npu_power_mode_turbo,
+    warn_if_npu_power_mode_not_turbo,
+)
+from ..run_lock import default_lock_path, hold_study_lock
 import seaborn as sns
 from matplotlib import pyplot as plt
 
@@ -55,6 +60,21 @@ def default_output_path() -> Path:
         / "memcpy_bandwidth"
         / "results.csv"
     )
+
+
+def default_resume_paths(output_path: Path) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    candidate = (
+        Path(__file__).resolve().parents[2]
+        / "results_final"
+        / "memcpy_bandwidth"
+        / output_path.name
+    )
+    if candidate.exists():
+        paths.append(candidate)
+    if output_path.exists() and output_path not in paths:
+        paths.append(output_path)
+    return tuple(paths)
 
 
 def default_bandwidth_plot_path(output_path: Path) -> Path:
@@ -115,6 +135,7 @@ def benchmark_case(
     warmup_iters: int,
     timed_iters: int,
 ) -> dict[str, object]:
+    require_npu_power_mode_turbo(study_name="memcpy-bandwidth study")
     from iron.common.test_utils import run_test
     from iron.operators.mem_copy.op import AIEMemCopy
     from iron.operators.mem_copy.reference import generate_golden_reference
@@ -167,6 +188,48 @@ def _best_row_key(row: dict[str, object]) -> tuple[float, float, int, int, int]:
     )
 
 
+def _existing_row_key(row: dict[str, object]) -> str:
+    return str(row.get("case_id") or "")
+
+
+def load_existing_rows(
+    paths: tuple[Path, ...],
+) -> dict[str, dict[str, object]]:
+    rows: dict[str, dict[str, object]] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                key = _existing_row_key(row)
+                if key:
+                    rows[key] = dict(row)
+    return rows
+
+
+def reusable_existing_row(
+    existing_rows: dict[str, dict[str, object]],
+    *,
+    case: MemcpyBandwidthCase,
+    warmup_iters: int,
+    timed_iters: int,
+) -> dict[str, object] | None:
+    row = existing_rows.get(case.case_id)
+    if row is None:
+        return None
+    if str(row.get("warmup_iters") or "") != str(warmup_iters):
+        return None
+    if str(row.get("timed_iters") or "") != str(timed_iters):
+        return None
+    if str(row.get("run_status") or "") not in {
+        "passed",
+        "failed_validation",
+        "failed_exception",
+    }:
+        return None
+    return dict(row)
+
+
 def mark_peak_rows(rows: list[dict[str, object]]) -> None:
     for row in rows:
         row["is_size_peak"] = False
@@ -202,6 +265,7 @@ def build_rows(
     bypass_filter: str,
     warmup_iters: int,
     timed_iters: int,
+    existing_rows: dict[str, dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for case in iter_cases(
@@ -210,6 +274,16 @@ def build_rows(
         num_channels_filter=num_channels_filter,
         bypass_filter=bypass_filter,
     ):
+        reusable_row = reusable_existing_row(
+            {} if existing_rows is None else existing_rows,
+            case=case,
+            warmup_iters=warmup_iters,
+            timed_iters=timed_iters,
+        )
+        if reusable_row is not None:
+            rows.append(reusable_row)
+            LOGGER.info("Reusing memcpy bandwidth row for %s", case.case_id)
+            continue
         try:
             result = benchmark_case(
                 case,
@@ -403,6 +477,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-iters", type=int, default=10)
     parser.add_argument("--timed-iters", type=int, default=500)
     parser.add_argument("--output", type=Path, default=default_output_path())
+    parser.add_argument("--resume-input", type=Path, default=None)
+    parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--bandwidth-plot", type=Path, default=None)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
@@ -418,39 +494,58 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
+    warn_if_npu_power_mode_not_turbo(LOGGER, study_name="memcpy-bandwidth study")
 
     output_path = args.output.expanduser()
-    bandwidth_plot_path = (
-        default_bandwidth_plot_path(output_path)
-        if args.bandwidth_plot is None
-        else _resolve_plot_path(args.bandwidth_plot.expanduser())
-    )
-
-    rows = build_rows(
-        size_filter=str(args.size),
-        num_cores_filter=str(args.num_cores),
-        num_channels_filter=str(args.num_channels),
-        bypass_filter=str(args.bypass),
-        warmup_iters=int(args.warmup_iters),
-        timed_iters=int(args.timed_iters),
-    )
-    if not rows:
-        LOGGER.warning(
-            "No memcpy bandwidth cases matched size=%s num_cores=%s num_channels=%s "
-            "bypass=%s; writing empty CSV and placeholder plots",
-            args.size,
-            args.num_cores,
-            args.num_channels,
-            args.bypass,
+    with hold_study_lock(
+        default_lock_path(output_path),
+        study_name="memcpy-bandwidth study",
+    ):
+        if args.no_resume:
+            resume_paths: tuple[Path, ...] = tuple()
+        elif args.resume_input is not None:
+            resume_paths = (args.resume_input.expanduser(),)
+        else:
+            resume_paths = default_resume_paths(output_path)
+        bandwidth_plot_path = (
+            default_bandwidth_plot_path(output_path)
+            if args.bandwidth_plot is None
+            else _resolve_plot_path(args.bandwidth_plot.expanduser())
         )
+        existing_rows = load_existing_rows(resume_paths)
+        if resume_paths and existing_rows:
+            LOGGER.info(
+                "Loaded %d reusable memcpy bandwidth rows from %s",
+                len(existing_rows),
+                ", ".join(str(path) for path in resume_paths),
+            )
 
-    write_rows(output_path, rows)
-    write_plots(
-        rows,
-        bandwidth_plot_path=bandwidth_plot_path,
-    )
-    LOGGER.info("Wrote %d memcpy bandwidth rows to %s", len(rows), output_path)
-    LOGGER.info("Wrote memcpy bandwidth plot to %s", bandwidth_plot_path)
+        rows = build_rows(
+            size_filter=str(args.size),
+            num_cores_filter=str(args.num_cores),
+            num_channels_filter=str(args.num_channels),
+            bypass_filter=str(args.bypass),
+            warmup_iters=int(args.warmup_iters),
+            timed_iters=int(args.timed_iters),
+            existing_rows=existing_rows,
+        )
+        if not rows:
+            LOGGER.warning(
+                "No memcpy bandwidth cases matched size=%s num_cores=%s num_channels=%s "
+                "bypass=%s; writing empty CSV and placeholder plots",
+                args.size,
+                args.num_cores,
+                args.num_channels,
+                args.bypass,
+            )
+
+        write_rows(output_path, rows)
+        write_plots(
+            rows,
+            bandwidth_plot_path=bandwidth_plot_path,
+        )
+        LOGGER.info("Wrote %d memcpy bandwidth rows to %s", len(rows), output_path)
+        LOGGER.info("Wrote memcpy bandwidth plot to %s", bandwidth_plot_path)
     return 0
 
 

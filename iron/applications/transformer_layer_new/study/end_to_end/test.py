@@ -11,17 +11,25 @@ from pathlib import Path
 import torch
 
 from iron.applications.transformer_layer_new.study.end_to_end import modes
+from iron.applications.transformer_layer_new.study.end_to_end import (
+    run_staging_ablation,
+)
 from iron.applications.transformer_layer_new.study.end_to_end.cases import (
     EXECUTION_MODES,
-    MODE_OPERATORS,
     EndToEndWorkload,
     candidate_table_for_case,
+    get_case,
     load_default_candidate_payloads,
+    mode_operators,
+)
+from iron.applications.transformer_layer_new.pattern.runlist.op import (
+    resolve_runlist_operator_config,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.modes import (
     benchmark_mode,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.run import (
+    build_rows as build_end_to_end_rows,
     iteration_schedule,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.run_correctness_spot_checks import (
@@ -35,6 +43,8 @@ from iron.applications.transformer_layer_new.study.end_to_end.run_latency_variat
     summarize_latency_samples,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.run_staging_ablation import (
+    STAGING_ABLATION_SEQUENCE_LENGTHS,
+    ablation_iteration_schedule,
     build_rows as build_staging_rows,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.select import (
@@ -47,6 +57,7 @@ def _result_row(
     *,
     seq_len: str = "64",
     study_case_id: str = "baseline_768",
+    workload_variant: str = "encoder_bert",
     avg_latency_ms: str = "5.0",
     power_backend: str = "none",
     backend: str = "npu",
@@ -55,6 +66,7 @@ def _result_row(
         "study_id": "end_to_end",
         "study_case_id": study_case_id,
         "study_case_label": study_case_id,
+        "workload_variant": workload_variant,
         "backend": backend,
         "execution_mode": execution_mode,
         "pattern_label": execution_mode,
@@ -106,14 +118,95 @@ def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
             writer.writerow(row)
 
 
-def test_candidate_table_covers_only_dataflow_and_runlist():
+def test_candidate_table_covers_only_hybrid_and_runlist():
     payloads = load_default_candidate_payloads()
-    assert set(payloads) == {"dataflow", "runlist"}
+    assert set(payloads) == {"hybrid", "runlist"}
 
+
+def test_reset_pattern_run_buffers_respects_operator_opt_out():
+    class DummyOperator:
+        def __init__(self, *, enable_benchmark_buffer_reset: bool):
+            self.enable_benchmark_buffer_reset = enable_benchmark_buffer_reset
+            self.reset_buffer_names = ("scratch",)
+            self.buffers = {"scratch": 16}
+            self.writes: list[tuple[str, int]] = []
+
+        def write_buffer(self, name, data):
+            self.writes.append((name, len(data)))
+
+    enabled = DummyOperator(enable_benchmark_buffer_reset=True)
+    modes._reset_pattern_run_buffers(enabled)
+    assert enabled.writes == [("scratch", 16)]
+
+    disabled = DummyOperator(enable_benchmark_buffer_reset=False)
+    modes._reset_pattern_run_buffers(disabled)
+    assert disabled.writes == []
+
+
+def test_warm_up_pattern_runtime_prefers_runlist_warmup():
+    class DummyOperator:
+        def __init__(self):
+            self.calls = 0
+
+        def run_runlist(self):
+            self.calls += 1
+
+    operator = DummyOperator()
+    assert modes._warm_up_pattern_runtime(operator, 3) is True
+    assert operator.calls == 3
+
+
+def test_warm_up_pattern_runtime_falls_back_when_runlist_missing():
+    class DummyOperator:
+        pass
+
+    assert modes._warm_up_pattern_runtime(DummyOperator(), 1) is False
+
+
+def test_reset_pattern_output_buffer_zeros_output_when_present():
+    class DummyOperator:
+        def __init__(self):
+            self.buffers = {"output": 32}
+            self.buffer_static_data = {}
+            self.writes: list[tuple[str, int]] = []
+
+        def write_buffer(self, name, data):
+            self.writes.append((name, len(data)))
+
+    operator = DummyOperator()
+    modes._reset_pattern_output_buffer(operator)
+    assert operator.writes == [("output", 32)]
+
+
+def test_candidate_table_covers_every_operator_for_every_mode():
+    payloads = load_default_candidate_payloads()
     table = candidate_table_for_case("baseline_768", 64, payloads=payloads)
     assert set(table) == set(EXECUTION_MODES)
     for execution_mode in EXECUTION_MODES:
-        assert set(table[execution_mode]) == set(MODE_OPERATORS[execution_mode])
+        assert set(table[execution_mode]) == set(
+            mode_operators(execution_mode, "encoder_bert")
+        )
+
+
+def test_decoder_runlist_attn_scores_uses_row_batched_k_transpose_layout():
+    resolved = resolve_runlist_operator_config(
+        64,
+        768,
+        3072,
+        12,
+        workload_variant="decoder_gpt2",
+    )
+
+    assert resolved["attn_scores"]["batch_A"] == (12, 1)
+    assert resolved["attn_scores"]["batch_B"] == (12, 0)
+    assert resolved["attn_scores"]["batch_C"] == (12, 0)
+
+
+def test_staging_ablation_uses_lighter_default_iteration_schedule():
+    assert ablation_iteration_schedule(64) == (1, 10)
+    assert ablation_iteration_schedule(512) == (1, 5)
+    assert ablation_iteration_schedule(4096) == (1, 3)
+    assert ablation_iteration_schedule(8192) == (1, 2)
 
 
 def test_iteration_schedule_uses_100_timed_iterations_through_256():
@@ -126,26 +219,41 @@ def test_iteration_schedule_uses_100_timed_iterations_through_256():
 
 
 def test_new_benchmark_context_reuses_stable_build_scope():
-    first = modes._new_benchmark_context("mode dataflow 768 64")
-    second = modes._new_benchmark_context("mode dataflow 768 64")
+    first = modes._new_benchmark_context("mode hybrid 768 64 cfg_deadbeef")
+    second = modes._new_benchmark_context("mode hybrid 768 64 cfg_deadbeef")
     different = modes._new_benchmark_context("mode runlist 768 64")
 
     assert first.build_dir == second.build_dir
-    assert first.build_dir.name == "mode_dataflow_768_64"
+    assert first.build_dir.name == "mode_hybrid_768_64_cfg_deadbeef"
     assert different.build_dir != first.build_dir
+
+
+def test_isolated_candidate_scope_changes_with_candidate_config():
+    first = modes._new_benchmark_context(
+        modes._isolated_candidate_scope("hybrid_qkv_proj", {"tile_m": 16})
+    )
+    second = modes._new_benchmark_context(
+        modes._isolated_candidate_scope("hybrid_qkv_proj", {"tile_m": 32})
+    )
+    repeated = modes._new_benchmark_context(
+        modes._isolated_candidate_scope("hybrid_qkv_proj", {"tile_m": 16})
+    )
+
+    assert first.build_dir == repeated.build_dir
+    assert first.build_dir != second.build_dir
 
 
 def test_select_result_rows_parses_selected_config_and_filters_modes():
     rows = [
-        _result_row("dataflow", seq_len="64"),
+        _result_row("hybrid", seq_len="64"),
         _result_row("runlist", seq_len="64"),
-        _result_row("dataflow", seq_len="64", backend="gpu"),
+        _result_row("hybrid", seq_len="64", backend="gpu"),
     ]
 
     selected_rows = select_result_rows(rows)
 
     assert len(selected_rows) == 2
-    assert tuple(row.execution_mode for row in selected_rows) == ("dataflow", "runlist")
+    assert tuple(row.execution_mode for row in selected_rows) == ("hybrid", "runlist")
     assert selected_rows[0].selected_config == {"operator": {"tile_m": 16}}
 
 
@@ -190,10 +298,15 @@ def test_benchmark_mode_capture_latencies_and_forced_reference(monkeypatch):
         "_measure_power",
         lambda *args, **kwargs: {"power_backend": "none", "avg_power_w": None},
     )
+    monkeypatch.setattr(
+        modes,
+        "require_npu_power_mode_turbo",
+        lambda *, study_name: None,
+    )
 
     result = benchmark_mode(
-        "dataflow",
-        EndToEndWorkload(64, 768, 3072, 12),
+        "hybrid",
+        EndToEndWorkload("encoder_bert", 64, 768, 3072, 12),
         warmup_runs=1,
         runs_per_sample=2,
         seed=42,
@@ -207,14 +320,60 @@ def test_benchmark_mode_capture_latencies_and_forced_reference(monkeypatch):
     assert len(result["latency_samples_ms"]) == 2
 
 
+def test_benchmark_operator_candidate_uses_in_process_path_for_long_sequences(
+    monkeypatch,
+):
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        modes,
+        "require_npu_power_mode_turbo",
+        lambda *, study_name: None,
+    )
+
+    def fake_in_process(*args, **kwargs):
+        calls.append("in_process")
+        return {
+            "avg_latency_ms": 1.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+        }
+
+    def fake_subprocess(*args, **kwargs):
+        calls.append("subprocess")
+        raise AssertionError("long-sequence candidate tuning should stay in-process")
+
+    monkeypatch.setattr(
+        modes, "_benchmark_operator_candidate_in_process", fake_in_process
+    )
+    monkeypatch.setattr(
+        modes,
+        "_benchmark_operator_candidate_isolated_subprocess",
+        fake_subprocess,
+    )
+
+    result = modes.benchmark_operator_candidate(
+        "runlist",
+        "k_transpose",
+        EndToEndWorkload("decoder_gpt2", 8192, 768, 3072, 12),
+        {"num_aie_columns": 6, "num_channels": 2, "m": 64, "n": 128, "s": 8},
+        warmup_runs=1,
+        runs_per_sample=2,
+        seed=123,
+    )
+
+    assert result["run_status"] == "passed"
+    assert calls == ["in_process"]
+
+
 def test_correctness_rows_only_include_spot_check_sequences(monkeypatch, tmp_path):
     results_input = tmp_path / "results.csv"
     _write_csv(
         results_input,
         [
-            _result_row("dataflow", seq_len="512"),
+            _result_row("hybrid", seq_len="512"),
             _result_row("runlist", seq_len="2048"),
-            _result_row("dataflow", seq_len="4096"),
+            _result_row("hybrid", seq_len="4096"),
         ],
     )
 
@@ -230,6 +389,7 @@ def test_correctness_rows_only_include_spot_check_sequences(monkeypatch, tmp_pat
 
     rows = build_correctness_rows(
         results_input=results_input,
+        workload_variant_filter="all",
         family_filter="all",
         mode_filter="all",
         seed=42,
@@ -243,6 +403,57 @@ def test_correctness_rows_only_include_spot_check_sequences(monkeypatch, tmp_pat
     }
 
 
+def test_correctness_rows_reuse_matching_existing_row(tmp_path):
+    results_input = tmp_path / "results.csv"
+    _write_csv(results_input, [_result_row("hybrid", seq_len="512")])
+
+    existing_row = {
+        "study_id": "end_to_end_correctness_spot_checks",
+        "study_case_id": "baseline_768",
+        "study_case_label": "baseline_768",
+        "workload_variant": "encoder_bert",
+        "execution_mode": "dataflow",
+        "validation_mode": "exact_reference",
+        "seq_len": "512",
+        "hidden_size": "768",
+        "intermediate_size": "3072",
+        "num_attention_heads": "12",
+        "attention_head_size": "64",
+        "warmup_runs": "1",
+        "runs_per_sample": "10",
+        "avg_latency_ms": "3.5",
+        "validation_error_count": "0",
+        "run_status": "passed",
+        "failure_message": "",
+        "selected_candidate_ids_json": json.dumps(
+            {"candidate": "hybrid"}, sort_keys=True
+        ),
+        "selected_config_json": json.dumps(
+            {"operator": {"tile_m": 16}}, sort_keys=True
+        ),
+    }
+
+    def fail_benchmark(*args, **kwargs):
+        raise AssertionError(
+            "benchmark should not run when correctness row is reusable"
+        )
+
+    rows = build_correctness_rows(
+        results_input=results_input,
+        workload_variant_filter="all",
+        family_filter="all",
+        mode_filter="all",
+        seed=42,
+        existing_rows={
+            ("baseline_768", "encoder_bert", "hybrid", 512): existing_row,
+        },
+        benchmark_fn=fail_benchmark,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["avg_latency_ms"] == "3.5"
+
+
 def test_summarize_latency_samples_reports_expected_statistics():
     summary = summarize_latency_samples([1.0, 2.0, 3.0])
 
@@ -254,7 +465,7 @@ def test_summarize_latency_samples_reports_expected_statistics():
 
 def test_latency_variation_rows_capture_sample_statistics(monkeypatch, tmp_path):
     results_input = tmp_path / "results.csv"
-    _write_csv(results_input, [_result_row("dataflow", seq_len="64")])
+    _write_csv(results_input, [_result_row("hybrid", seq_len="64")])
 
     monkeypatch.setattr(
         "iron.applications.transformer_layer_new.study.end_to_end.run_latency_variation.benchmark_mode",
@@ -268,6 +479,7 @@ def test_latency_variation_rows_capture_sample_statistics(monkeypatch, tmp_path)
 
     rows = build_latency_rows(
         results_input=results_input,
+        workload_variant_filter="all",
         family_filter="all",
         mode_filter="all",
         warmup_runs=None,
@@ -281,10 +493,66 @@ def test_latency_variation_rows_capture_sample_statistics(monkeypatch, tmp_path)
     assert rows[0]["mean_latency_ms"] == 2.0
 
 
+def test_latency_variation_rows_reuse_matching_existing_row(tmp_path):
+    results_input = tmp_path / "results.csv"
+    _write_csv(results_input, [_result_row("hybrid", seq_len="64")])
+
+    existing_row = {
+        "study_id": "end_to_end_latency_variation",
+        "study_case_id": "baseline_768",
+        "study_case_label": "baseline_768",
+        "workload_variant": "encoder_bert",
+        "execution_mode": "hybrid",
+        "seq_len": "64",
+        "hidden_size": "768",
+        "intermediate_size": "3072",
+        "num_attention_heads": "12",
+        "attention_head_size": "64",
+        "warmup_runs": "1",
+        "runs_per_sample": "100",
+        "sample_count": "3",
+        "mean_latency_ms": "2.0",
+        "stddev_latency_ms": "0.0",
+        "min_latency_ms": "2.0",
+        "max_latency_ms": "2.0",
+        "validation_error_count": "0",
+        "run_status": "passed",
+        "failure_message": "",
+        "selected_candidate_ids_json": json.dumps(
+            {"candidate": "hybrid"}, sort_keys=True
+        ),
+        "selected_config_json": json.dumps(
+            {"operator": {"tile_m": 16}}, sort_keys=True
+        ),
+    }
+
+    def fail_benchmark(*args, **kwargs):
+        raise AssertionError(
+            "benchmark should not run when latency-variation row is reusable"
+        )
+
+    rows = build_latency_rows(
+        results_input=results_input,
+        workload_variant_filter="all",
+        family_filter="all",
+        mode_filter="all",
+        warmup_runs=None,
+        runs_per_sample=None,
+        seed=42,
+        existing_rows={
+            ("baseline_768", "encoder_bert", "hybrid", 64): existing_row,
+        },
+        benchmark_fn=fail_benchmark,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["mean_latency_ms"] == "2.0"
+
+
 def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
     results_input = tmp_path / "end_to_end.csv"
     staging_results = tmp_path / "staging.csv"
-    result_row = _result_row("dataflow", seq_len="64", avg_latency_ms="8.0")
+    result_row = _result_row("hybrid", seq_len="512", avg_latency_ms="8.0")
     result_row["selected_candidate_ids_json"] = json.dumps(
         {"mha_out_proj": "mha_0", "ffn": "ffn_0"},
         sort_keys=True,
@@ -317,7 +585,7 @@ def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
         [
             {
                 "family_id": "baseline_768",
-                "seq_len": "64",
+                "seq_len": "512",
                 "block_kind": "ffn",
                 "staging_depth": "1",
                 "avg_latency_ms": "4.0",
@@ -325,7 +593,7 @@ def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
             },
             {
                 "family_id": "baseline_768",
-                "seq_len": "64",
+                "seq_len": "512",
                 "block_kind": "ffn",
                 "staging_depth": "2",
                 "avg_latency_ms": "3.0",
@@ -333,7 +601,7 @@ def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
             },
             {
                 "family_id": "baseline_768",
-                "seq_len": "64",
+                "seq_len": "512",
                 "block_kind": "ffn",
                 "staging_depth": "4",
                 "avg_latency_ms": "2.0",
@@ -353,13 +621,12 @@ def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
         operator_config,
         **kwargs,
     ):
-        assert execution_mode == "dataflow"
+        assert execution_mode == "hybrid"
         assert power_backend == "none"
-        assert kwargs["scope_suffix"] in {
-            "staging_baseline_768_ffn_d1",
-            "staging_baseline_768_ffn_d2",
-            "staging_baseline_768_ffn_d4",
-        }
+        assert (
+            kwargs["scope_key_override"] == "staginggrp_encoder_bert_baseline_768_ffn"
+        )
+        assert "scope_suffix" not in kwargs or kwargs["scope_suffix"] is None
         depth = int(operator_config["ffn"]["down_proj_depth"])
         return {
             "avg_latency_ms": float(16 // depth),
@@ -373,6 +640,7 @@ def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
     rows = build_staging_rows(
         results_input=results_input,
         staging_results=staging_results,
+        workload_variant_filter="all",
         family_filter="all",
         seq_len_filter="all",
         block_filter="ffn",
@@ -387,7 +655,526 @@ def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
     assert all(row["source_staging_depth"] == 4 for row in rows)
     assert rows[0]["speedup_vs_depth1"] == 1.0
     assert rows[-1]["speedup_vs_source_depth"] == 1.0
-    assert rows[-1]["is_best_depth"] is True
+    assert rows[-1]["avg_latency_ms"] == "8.0"
+    assert rows[1]["is_best_depth"] is True
+
+
+def test_gpt2_small_seq128_hybrid_uses_parallel_heads_1():
+    payloads = load_default_candidate_payloads()
+    mha_candidates = payloads["hybrid"]["gpt2_small_768"]["128"]["mha_out_proj"]
+
+    assert mha_candidates == [
+        {
+            "candidate_id": "mha_128_ps4_ph1",
+            "config": {
+                "parallel_seq": 4,
+                "q_seq_tile": 32,
+                "kv_seq_tile": 32,
+                "emb_tile": 96,
+                "parallel_heads": 1,
+                "o_proj_acc_depth": 8,
+                "is_causal": True,
+            },
+        }
+    ]
+
+
+def test_staging_ablation_rows_reuse_matching_existing_row(tmp_path):
+    results_input = tmp_path / "end_to_end.csv"
+    staging_results = tmp_path / "staging.csv"
+    result_row = _result_row("hybrid", seq_len="512", avg_latency_ms="8.0")
+    result_row["selected_candidate_ids_json"] = json.dumps(
+        {"mha_out_proj": "mha_0", "ffn": "ffn_0"},
+        sort_keys=True,
+    )
+    selected_config = {
+        "qkv_proj": {"parallel_seq": 4},
+        "mha_out_proj": {
+            "parallel_seq": 2,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 96,
+            "parallel_heads": 4,
+            "o_proj_acc_depth": 2,
+        },
+        "add_norm1": {"tile_size": 768},
+        "ffn": {
+            "tile_m": 16,
+            "tile_k": 96,
+            "tile_n": 96,
+            "down_proj_depth": 4,
+        },
+        "add_norm2": {"tile_size": 768},
+    }
+    result_row["selected_config_json"] = json.dumps(selected_config, sort_keys=True)
+    _write_csv(results_input, [result_row])
+    _write_csv(
+        staging_results,
+        [
+            {
+                "family_id": "baseline_768",
+                "seq_len": "512",
+                "block_kind": "ffn",
+                "staging_depth": "1",
+                "avg_latency_ms": "4.0",
+                "run_status": "passed",
+            },
+            {
+                "family_id": "baseline_768",
+                "seq_len": "512",
+                "block_kind": "ffn",
+                "staging_depth": "4",
+                "avg_latency_ms": "2.0",
+                "run_status": "passed",
+            },
+        ],
+    )
+
+    reused_config = dict(selected_config)
+    reused_config["ffn"] = dict(selected_config["ffn"])
+    depth1_config = dict(selected_config)
+    depth1_config["ffn"] = dict(selected_config["ffn"])
+    depth1_config["ffn"]["down_proj_depth"] = 1
+    depth4_config = dict(selected_config)
+    depth4_config["ffn"] = dict(selected_config["ffn"])
+    depth4_config["ffn"]["down_proj_depth"] = 4
+    existing_row_depth1 = {
+        "study_id": "end_to_end_staging_ablation",
+        "study_case_id": "baseline_768",
+        "study_case_label": "baseline_768",
+        "workload_variant": "encoder_bert",
+        "execution_mode": "hybrid",
+        "seq_len": "512",
+        "hidden_size": "768",
+        "intermediate_size": "3072",
+        "num_attention_heads": "12",
+        "attention_head_size": "64",
+        "block_kind": "ffn",
+        "source_staging_depth": "4",
+        "staging_depth": "1",
+        "warmup_runs": "1",
+        "runs_per_sample": "5",
+        "avg_latency_ms": "16.0",
+        "compile_setup_time_ms": "1.0",
+        "effective_gflops_per_sec": "100.0",
+        "speedup_vs_source_depth": "0.25",
+        "speedup_vs_depth1": "1.0",
+        "validation_error_count": "0",
+        "run_status": "passed",
+        "failure_message": "",
+        "selected_candidate_ids_json": json.dumps(
+            {"mha_out_proj": "mha_0", "ffn": "ffn_0"},
+            sort_keys=True,
+        ),
+        "selected_config_json": json.dumps(depth1_config, sort_keys=True),
+        "is_best_depth": "False",
+    }
+    existing_row_depth4 = {
+        **existing_row_depth1,
+        "staging_depth": "4",
+        "avg_latency_ms": "4.0",
+        "effective_gflops_per_sec": "101.0",
+        "speedup_vs_source_depth": "1.0",
+        "speedup_vs_depth1": "4.0",
+        "selected_config_json": json.dumps(depth4_config, sort_keys=True),
+        "is_best_depth": "True",
+    }
+
+    def fail_benchmark(*args, **kwargs):
+        raise AssertionError(
+            "benchmark should not run when staging-ablation row is reusable"
+        )
+
+    rows = build_staging_rows(
+        results_input=results_input,
+        staging_results=staging_results,
+        workload_variant_filter="all",
+        family_filter="all",
+        seq_len_filter="all",
+        block_filter="ffn",
+        warmup_runs=None,
+        runs_per_sample=None,
+        seed=42,
+        existing_rows={
+            ("baseline_768", "encoder_bert", 512, "ffn", 1): existing_row_depth1,
+            ("baseline_768", "encoder_bert", 512, "ffn", 4): existing_row_depth4,
+        },
+        benchmark_fn=fail_benchmark,
+    )
+
+    assert len(rows) == 2
+    assert {row["avg_latency_ms"] for row in rows} == {"16.0", "8.0"}
+
+
+def test_staging_ablation_skips_removed_cases_manifest(tmp_path, monkeypatch):
+    results_input = tmp_path / "end_to_end.csv"
+    staging_results = tmp_path / "staging.csv"
+    removed_cases = tmp_path / "removed.csv"
+    result_row = _result_row("hybrid", seq_len="8192", avg_latency_ms="800.0")
+    result_row["selected_candidate_ids_json"] = json.dumps(
+        {"mha_out_proj": "mha_0"},
+        sort_keys=True,
+    )
+    result_row["selected_config_json"] = json.dumps(
+        {
+            "qkv_proj": {"parallel_seq": 4},
+            "mha_out_proj": {
+                "parallel_seq": 8,
+                "q_seq_tile": 32,
+                "kv_seq_tile": 64,
+                "emb_tile": 96,
+                "parallel_heads": 1,
+                "o_proj_acc_depth": 8,
+            },
+            "add_norm1": {"tile_size": 768},
+            "ffn": {
+                "tile_m": 32,
+                "tile_k": 96,
+                "tile_n": 48,
+                "down_proj_depth": 4,
+            },
+            "add_norm2": {"tile_size": 768},
+        },
+        sort_keys=True,
+    )
+    _write_csv(results_input, [result_row])
+    _write_csv(
+        staging_results,
+        [
+            {
+                "family_id": "baseline_768",
+                "seq_len": "8192",
+                "block_kind": "mha_out_proj",
+                "staging_depth": "1",
+                "avg_latency_ms": "10.0",
+                "run_status": "passed",
+            },
+            {
+                "family_id": "baseline_768",
+                "seq_len": "8192",
+                "block_kind": "mha_out_proj",
+                "staging_depth": "2",
+                "avg_latency_ms": "9.0",
+                "run_status": "passed",
+            },
+            {
+                "family_id": "baseline_768",
+                "seq_len": "8192",
+                "block_kind": "mha_out_proj",
+                "staging_depth": "4",
+                "avg_latency_ms": "8.0",
+                "run_status": "passed",
+            },
+            {
+                "family_id": "baseline_768",
+                "seq_len": "8192",
+                "block_kind": "mha_out_proj",
+                "staging_depth": "8",
+                "avg_latency_ms": "7.0",
+                "run_status": "passed",
+            },
+        ],
+    )
+    _write_csv(
+        removed_cases,
+        [
+            {
+                "study_case_id": "baseline_768",
+                "seq_len": "8192",
+                "block_kind": "mha_out_proj",
+                "staging_depth": "1",
+                "reason": "known timeout",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        run_staging_ablation, "removed_cases_path", lambda: removed_cases
+    )
+
+    benchmark_depths: list[int] = []
+
+    def fake_benchmark(*args, **kwargs):
+        benchmark_depths.append(
+            int(kwargs["operator_config"]["mha_out_proj"]["o_proj_acc_depth"])
+        )
+        return {
+            "avg_latency_ms": 20.0,
+            "compile_setup_time_ms": 1.0,
+            "effective_gflops_per_sec": 100.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    rows = build_staging_rows(
+        results_input=results_input,
+        staging_results=staging_results,
+        workload_variant_filter="all",
+        family_filter="all",
+        seq_len_filter="all",
+        block_filter="mha_out_proj",
+        warmup_runs=None,
+        runs_per_sample=None,
+        seed=42,
+        benchmark_fn=fake_benchmark,
+    )
+
+    assert [row["staging_depth"] for row in rows] == [2, 4, 8]
+    assert benchmark_depths == [2, 4]
+
+
+def test_staging_ablation_rows_reuse_source_depth_from_end_to_end_result(tmp_path):
+    results_input = tmp_path / "end_to_end.csv"
+    staging_results = tmp_path / "staging.csv"
+    result_row = _result_row("hybrid", seq_len="512", avg_latency_ms="8.0")
+    result_row["warmup_runs"] = "1"
+    result_row["runs_per_sample"] = "100"
+    result_row["compile_setup_time_ms"] = "12.5"
+    result_row["effective_gflops_per_sec"] = "123.0"
+    result_row["selected_candidate_ids_json"] = json.dumps(
+        {"mha_out_proj": "mha_0", "ffn": "ffn_0"},
+        sort_keys=True,
+    )
+    selected_config = {
+        "qkv_proj": {"parallel_seq": 4},
+        "mha_out_proj": {
+            "parallel_seq": 2,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 96,
+            "parallel_heads": 4,
+            "o_proj_acc_depth": 2,
+        },
+        "add_norm1": {"tile_size": 768},
+        "ffn": {
+            "tile_m": 16,
+            "tile_k": 96,
+            "tile_n": 96,
+            "down_proj_depth": 4,
+        },
+        "add_norm2": {"tile_size": 768},
+    }
+    result_row["selected_config_json"] = json.dumps(selected_config, sort_keys=True)
+    _write_csv(results_input, [result_row])
+    _write_csv(
+        staging_results,
+        [
+            {
+                "family_id": "baseline_768",
+                "seq_len": "512",
+                "block_kind": "ffn",
+                "staging_depth": "1",
+                "avg_latency_ms": "4.0",
+                "run_status": "passed",
+            },
+            {
+                "family_id": "baseline_768",
+                "seq_len": "512",
+                "block_kind": "ffn",
+                "staging_depth": "4",
+                "avg_latency_ms": "2.0",
+                "run_status": "passed",
+            },
+        ],
+    )
+
+    benchmark_calls = []
+
+    def fake_benchmark(*args, **kwargs):
+        benchmark_calls.append((args, kwargs))
+        operator_config = kwargs["operator_config"]
+        return {
+            "avg_latency_ms": 16.0,
+            "compile_setup_time_ms": 1.0,
+            "effective_gflops_per_sec": 100.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    rows = build_staging_rows(
+        results_input=results_input,
+        staging_results=staging_results,
+        workload_variant_filter="all",
+        family_filter="all",
+        seq_len_filter="all",
+        block_filter="ffn",
+        warmup_runs=None,
+        runs_per_sample=None,
+        seed=42,
+        benchmark_fn=fake_benchmark,
+    )
+
+    assert len(rows) == 2
+    source_depth_row = next(row for row in rows if row["staging_depth"] == 4)
+    assert source_depth_row["avg_latency_ms"] == "8.0"
+    assert source_depth_row["compile_setup_time_ms"] == "12.5"
+    assert source_depth_row["effective_gflops_per_sec"] == "123.0"
+    assert source_depth_row["warmup_runs"] == 1
+    assert source_depth_row["runs_per_sample"] == 100
+    assert len(benchmark_calls) == 1
+    assert benchmark_calls[0][1]["operator_config"]["ffn"]["down_proj_depth"] == 1
+
+
+def test_staging_ablation_skips_families_missing_staging_results(tmp_path):
+    results_input = tmp_path / "end_to_end.csv"
+    staging_results = tmp_path / "staging.csv"
+    result_row = _result_row(
+        "hybrid",
+        study_case_id="gpt2_small_768",
+        workload_variant="decoder_gpt2",
+        seq_len="512",
+        avg_latency_ms="8.0",
+    )
+    result_row["study_case_label"] = "GPT-2 Small"
+    result_row["selected_candidate_ids_json"] = json.dumps(
+        {"mha_out_proj": "mha_0", "ffn": "ffn_0"},
+        sort_keys=True,
+    )
+    result_row["selected_config_json"] = json.dumps(
+        {
+            "ln1": {"tile_size": 768},
+            "qkv_proj": {"parallel_seq": 4},
+            "mha_out_proj": {
+                "parallel_seq": 2,
+                "q_seq_tile": 32,
+                "kv_seq_tile": 32,
+                "emb_tile": 96,
+                "parallel_heads": 1,
+                "o_proj_acc_depth": 8,
+                "is_causal": True,
+            },
+            "add_norm": {"tile_size": 768},
+            "ffn": {
+                "tile_m": 16,
+                "tile_k": 96,
+                "tile_n": 96,
+                "down_proj_depth": 4,
+            },
+            "add": {"tile_size": 768},
+        },
+        sort_keys=True,
+    )
+    _write_csv(results_input, [result_row])
+    _write_csv(
+        staging_results,
+        [
+            {
+                "family_id": "baseline_768",
+                "seq_len": "512",
+                "block_kind": "ffn",
+                "staging_depth": "1",
+                "avg_latency_ms": "4.0",
+                "run_status": "passed",
+            },
+        ],
+    )
+
+    def fail_benchmark(*args, **kwargs):
+        raise AssertionError(
+            "benchmark should not run when staging results are missing for the family"
+        )
+
+    rows = build_staging_rows(
+        results_input=results_input,
+        staging_results=staging_results,
+        workload_variant_filter="all",
+        family_filter="all",
+        seq_len_filter="all",
+        block_filter="all",
+        warmup_runs=None,
+        runs_per_sample=None,
+        seed=42,
+        benchmark_fn=fail_benchmark,
+    )
+
+    assert rows == []
+
+
+def test_staging_ablation_filters_sequence_lengths_to_256_through_8192(tmp_path):
+    results_input = tmp_path / "end_to_end.csv"
+    staging_results = tmp_path / "staging.csv"
+    allowed_seq_len = str(STAGING_ABLATION_SEQUENCE_LENGTHS[1])
+    rows_in = [
+        _result_row("hybrid", seq_len="64", avg_latency_ms="8.0"),
+        _result_row("hybrid", seq_len=allowed_seq_len, avg_latency_ms="8.0"),
+        _result_row("hybrid", seq_len="16384", avg_latency_ms="8.0"),
+    ]
+    for row in rows_in:
+        row["selected_candidate_ids_json"] = json.dumps(
+            {"mha_out_proj": "mha_0", "ffn": "ffn_0"},
+            sort_keys=True,
+        )
+        row["selected_config_json"] = json.dumps(
+            {
+                "qkv_proj": {"parallel_seq": 4},
+                "mha_out_proj": {
+                    "parallel_seq": 2,
+                    "q_seq_tile": 32,
+                    "kv_seq_tile": 64,
+                    "emb_tile": 96,
+                    "parallel_heads": 1,
+                    "o_proj_acc_depth": 4,
+                },
+                "add_norm1": {"tile_size": 768},
+                "ffn": {
+                    "tile_m": 16,
+                    "tile_k": 96,
+                    "tile_n": 96,
+                    "down_proj_depth": 1,
+                },
+                "add_norm2": {"tile_size": 768},
+            },
+            sort_keys=True,
+        )
+    _write_csv(results_input, rows_in)
+    _write_csv(
+        staging_results,
+        [
+            {
+                "family_id": "baseline_768",
+                "seq_len": "64",
+                "block_kind": "ffn",
+                "staging_depth": "1",
+                "avg_latency_ms": "4.0",
+                "run_status": "passed",
+            },
+            {
+                "family_id": "baseline_768",
+                "seq_len": allowed_seq_len,
+                "block_kind": "ffn",
+                "staging_depth": "1",
+                "avg_latency_ms": "4.0",
+                "run_status": "passed",
+            },
+            {
+                "family_id": "baseline_768",
+                "seq_len": "16384",
+                "block_kind": "ffn",
+                "staging_depth": "1",
+                "avg_latency_ms": "4.0",
+                "run_status": "passed",
+            },
+        ],
+    )
+
+    def fail_benchmark(*args, **kwargs):
+        raise AssertionError("no benchmark should run for the source-depth-only case")
+
+    rows = build_staging_rows(
+        results_input=results_input,
+        staging_results=staging_results,
+        workload_variant_filter="all",
+        family_filter="all",
+        seq_len_filter="all",
+        block_filter="ffn",
+        warmup_runs=None,
+        runs_per_sample=None,
+        seed=42,
+        benchmark_fn=fail_benchmark,
+    )
+
+    assert [row["seq_len"] for row in rows] == [int(allowed_seq_len)]
 
 
 def test_fairness_rows_report_two_modes_and_new_schedule(tmp_path):
@@ -395,14 +1182,156 @@ def test_fairness_rows_report_two_modes_and_new_schedule(tmp_path):
     _write_csv(
         results_input,
         [
-            _result_row("dataflow", seq_len="64", power_backend="none"),
+            _result_row("hybrid", seq_len="64", power_backend="none"),
             _result_row("runlist", seq_len="64", power_backend="turbostat_pkgwatt"),
         ],
     )
 
     rows = build_fairness_rows(results_input)
 
-    assert {row["execution_mode"] for row in rows} == {"dataflow", "runlist"}
+    assert {row["execution_mode"] for row in rows} == {"hybrid", "runlist"}
+    assert {row["workload_variant"] for row in rows} == {
+        "encoder_bert",
+        "decoder_gpt2",
+    }
     schedule = json.loads(rows[0]["iteration_schedule_json"])
     assert schedule["64-256"]["runs_per_sample"] == 100
     assert rows[0]["selected_candidate_source"]
+
+
+def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
+    case = get_case("baseline_768", 64)
+    execution_mode = "hybrid"
+    operator_name = "op"
+    candidate = {"candidate_id": "cand0", "config": {"tile_m": 16}}
+    resolved_config = {"tile_m": 16}
+    resolved_config_json = json.dumps(resolved_config, sort_keys=True)
+    selected_candidate_ids_json = json.dumps({operator_name: "cand0"}, sort_keys=True)
+    selected_config_json = json.dumps({operator_name: resolved_config}, sort_keys=True)
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.candidate_table_for_case",
+        lambda study_case_id, seq_len: {
+            "hybrid": {operator_name: [candidate]},
+            "runlist": {operator_name: [candidate]},
+        },
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.mode_operators",
+        lambda execution_mode, workload_variant: (operator_name,),
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.resolve_mode_operator_config",
+        lambda execution_mode, workload, operator_config: {
+            operator_name: resolved_config
+        },
+    )
+
+    def fail_benchmark_operator_candidate(*args, **kwargs):
+        raise AssertionError("benchmark_operator_candidate should not be called")
+
+    def fail_benchmark_mode(*args, **kwargs):
+        raise AssertionError("benchmark_mode should not be called")
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.benchmark_operator_candidate",
+        fail_benchmark_operator_candidate,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.end_to_end.run.benchmark_mode",
+        fail_benchmark_mode,
+    )
+
+    tuning_rows, final_rows = build_end_to_end_rows(
+        case,
+        mode_filter=execution_mode,
+        warmup_runs=1,
+        runs_per_sample=2,
+        seed=42,
+        power_backend="none",
+        existing_tuning_rows={
+            (
+                case.study_case_id,
+                case.workload_variant,
+                execution_mode,
+                operator_name,
+                case.seq_len,
+                "cand0",
+            ): {
+                "study_id": "end_to_end_tuning",
+                "study_case_id": case.study_case_id,
+                "study_case_label": case.study_case_label,
+                "workload_variant": case.workload_variant,
+                "execution_mode": execution_mode,
+                "internal_operator": operator_name,
+                "candidate_id": "cand0",
+                "seq_len": str(case.seq_len),
+                "hidden_size": str(case.hidden_size),
+                "intermediate_size": str(case.intermediate_size),
+                "num_attention_heads": str(case.num_attention_heads),
+                "attention_head_size": str(case.attention_head_size),
+                "warmup_runs": "1",
+                "runs_per_sample": "2",
+                "avg_latency_ms": "5.0",
+                "bandwidth_gbps": "",
+                "validation_error_count": "0",
+                "run_status": "passed",
+                "failure_message": "",
+                "operator_config_json": resolved_config_json,
+                "is_operator_best": "True",
+            }
+        },
+        existing_final_rows={
+            (
+                case.study_case_id,
+                case.workload_variant,
+                execution_mode,
+                case.seq_len,
+            ): {
+                "study_id": "end_to_end",
+                "study_case_id": case.study_case_id,
+                "study_case_label": case.study_case_label,
+                "workload_variant": case.workload_variant,
+                "backend": "npu",
+                "execution_mode": execution_mode,
+                "pattern_label": "Hybrid Runlist+Dataflow",
+                "seq_len": str(case.seq_len),
+                "hidden_size": str(case.hidden_size),
+                "intermediate_size": str(case.intermediate_size),
+                "num_attention_heads": str(case.num_attention_heads),
+                "attention_head_size": str(case.attention_head_size),
+                "batch_size": "1",
+                "dtype": "bf16",
+                "use_bias": "False",
+                "weights_source": "synthetic",
+                "warmup_runs": "1",
+                "runs_per_sample": "2",
+                "measured_inference_count": "2",
+                "timed_total_sec": "0.1",
+                "avg_latency_ms": "5.0",
+                "compile_setup_time_ms": "1.0",
+                "host_qkv_precompute_ms": "",
+                "effective_gflops_per_sec": "100.0",
+                "power_backend": "none",
+                "avg_power_w": "",
+                "effective_gflops_per_sec_per_watt": "",
+                "npu_dispatch_count": "8",
+                "npu_unique_instruction_binary_count": "8",
+                "npu_unique_xclbin_count": "8",
+                "process_model": "in_process",
+                "validation_error_count": "0",
+                "run_status": "passed",
+                "failure_message": "",
+                "selected_candidate_ids_json": selected_candidate_ids_json,
+                "selected_config_json": selected_config_json,
+                "is_best": "False",
+            }
+        },
+    )
+
+    assert len(tuning_rows) == 1
+    assert tuning_rows[0]["candidate_id"] == "cand0"
+    assert tuning_rows[0]["run_status"] == "passed"
+    assert len(final_rows) == 1
+    assert final_rows[0]["execution_mode"] == execution_mode
+    assert final_rows[0]["selected_candidate_ids_json"] == selected_candidate_ids_json

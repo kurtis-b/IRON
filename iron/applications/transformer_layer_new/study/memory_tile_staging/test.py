@@ -14,6 +14,7 @@ from iron.applications.transformer_layer_new.study.memory_tile_staging.plot_stag
     write_canonical_plots,
 )
 from iron.applications.transformer_layer_new.study.memory_tile_staging.run import (
+    STAGING_SEQUENCE_LENGTHS,
     build_selection_rows,
     main,
     supported_staging_depths,
@@ -233,6 +234,90 @@ def test_build_selection_rows_sweeps_only_depth_and_computes_speedup(monkeypatch
     assert best_rows[0]["staging_depth"] == 12
 
 
+def test_build_selection_rows_reuses_existing_rows_and_skips_removed(monkeypatch):
+    selection = ReferenceSelection(
+        family_id="baseline_768",
+        family_label="768 / 3072 / 12",
+        seq_len=512,
+        block_kind="mha_out_proj",
+        source_candidate_index=0,
+        source_avg_latency_ms=5.0,
+        head_dim=64,
+        num_heads=12,
+        hidden_size=768,
+        ffn_dim=3072,
+        source_candidate=(8, 32, 64, 96, 1, 8),
+    )
+    benchmark_calls: list[int] = []
+
+    def fake_benchmark_candidate(
+        block_kind,
+        workload,
+        candidate,
+        *,
+        warmup_iters,
+        timed_iters,
+        seed,
+    ):
+        benchmark_calls.append(int(candidate[5]))
+        return {
+            "avg_latency_ms": 100.0 / int(candidate[5]),
+            "bandwidth_gbps": 5.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "error_message": "",
+        }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memory_tile_staging.run.benchmark_candidate",
+        fake_benchmark_candidate,
+    )
+
+    rows = build_selection_rows(
+        selection,
+        warmup_iters=1,
+        timed_iters=2,
+        seed=42,
+        existing_rows={
+            ("baseline_768", 512, "mha_out_proj", 2): {
+                "study_id": "memory_tile_staging",
+                "family_id": "baseline_768",
+                "family_label": "768 / 3072 / 12",
+                "seq_len": "512",
+                "block_kind": "mha_out_proj",
+                "source_candidate_index": "0",
+                "source_staging_depth": "8",
+                "staging_depth": "2",
+                "head_dim": "64",
+                "num_heads": "12",
+                "hidden_size": "768",
+                "ffn_dim": "3072",
+                "warmup_iters": "1",
+                "timed_iters": "2",
+                "avg_latency_ms": "50.0",
+                "bandwidth_gbps": "5.0",
+                "speedup_vs_depth1": "",
+                "validation_error_count": "0",
+                "run_status": "passed",
+                "is_best_depth": "False",
+                "error_message": "",
+                "mha_out_proj_parallel_seq": "8",
+                "mha_out_proj_q_seq_tile": "32",
+                "mha_out_proj_kv_seq_tile": "64",
+                "mha_out_proj_emb_tile": "96",
+                "mha_out_proj_parallel_heads": "1",
+                "mha_out_proj_o_proj_acc_depth": "2",
+            }
+        },
+        removed_case_notes={
+            ("baseline_768", 512, "mha_out_proj", 1): "known timeout",
+        },
+    )
+
+    assert [row["staging_depth"] for row in rows] == ["2", 4, 8]
+    assert benchmark_calls == [4, 8]
+
+
 def test_main_writes_csv_and_canonical_plots(monkeypatch, tmp_path):
     reference_input = tmp_path / "block_results.csv"
     fieldnames = list(_reference_row("mha_out_proj").keys())
@@ -300,13 +385,92 @@ def test_main_writes_csv_and_canonical_plots(monkeypatch, tmp_path):
     assert svg_path.exists()
     assert speedup_path.exists()
     assert (
-        "Dataflow Block MHA + Output Projection Latency by Memory-Tile Staging Depth"
+        "Hybrid Block MHA + Output Projection Latency by Memory-Tile Staging Depth"
         in svg_path.read_text(encoding="utf-8")
     )
     assert (
-        "Dataflow Block FFN Speedup by Memory-Tile Staging Depth"
+        "Hybrid Block FFN Speedup by Memory-Tile Staging Depth"
         in speedup_path.read_text(encoding="utf-8")
     )
+
+
+def test_main_reuses_existing_results_by_default(monkeypatch, tmp_path):
+    reference_input = tmp_path / "block_results.csv"
+    fieldnames = list(_reference_row("mha_out_proj").keys())
+    with reference_input.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(_reference_row("mha_out_proj"))
+
+    output_path = tmp_path / "memory_tile_staging.csv"
+    existing_rows = []
+    for depth in ("1", "2", "4", "8"):
+        existing_rows.append(
+            {
+                "study_id": "memory_tile_staging",
+                "family_id": "baseline_768",
+                "family_label": "768 / 3072 / 12",
+                "seq_len": "512",
+                "block_kind": "mha_out_proj",
+                "source_candidate_index": "0",
+                "source_staging_depth": "8",
+                "staging_depth": depth,
+                "head_dim": "64",
+                "num_heads": "12",
+                "hidden_size": "768",
+                "ffn_dim": "3072",
+                "warmup_iters": "1",
+                "timed_iters": "2",
+                "avg_latency_ms": "10.0",
+                "bandwidth_gbps": "5.0",
+                "speedup_vs_depth1": "1.0",
+                "validation_error_count": "0",
+                "run_status": "passed",
+                "is_best_depth": "False",
+                "error_message": "",
+                "mha_out_proj_parallel_seq": "8",
+                "mha_out_proj_q_seq_tile": "32",
+                "mha_out_proj_kv_seq_tile": "64",
+                "mha_out_proj_emb_tile": "96",
+                "mha_out_proj_parallel_heads": "1",
+                "mha_out_proj_o_proj_acc_depth": depth,
+                "ffn_num_aie_columns": "",
+                "ffn_b_col_maj": "",
+                "ffn_c_col_maj": "",
+                "ffn_tile_m": "",
+                "ffn_tile_k": "",
+                "ffn_tile_n": "",
+                "ffn_down_proj_depth": "",
+                "ffn_n_a_tiles_distributed": "",
+                "ffn_n_b_tiles_distributed": "",
+                "ffn_stage_only": "",
+                "ffn_gelu_stage": "",
+            }
+        )
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(existing_rows[0]))
+        writer.writeheader()
+        for row in existing_rows:
+            writer.writerow(row)
+
+    def fail_benchmark(*args, **kwargs):
+        raise AssertionError("benchmark_candidate should not be called")
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memory_tile_staging.run.benchmark_candidate",
+        fail_benchmark,
+    )
+
+    exit_code = main(
+        [
+            "--reference-input",
+            str(reference_input),
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
 
 
 def test_write_canonical_plots_renders_all_expected_outputs(tmp_path):
@@ -493,8 +657,12 @@ def test_render_plot_filters_sequence_lengths_to_256_through_8192(tmp_path):
     labels = [text.get_text() for text in legend.get_texts()]
     assert labels == ["256", "8192"]
     panel_titles = [ax.get_title(loc="left") for ax in fig.axes]
-    assert panel_titles == ["Head Dim = 64 / Num Heads = 12"]
+    assert panel_titles == ["BERT-Base"]
     plt.close(fig)
+
+
+def test_memory_tile_staging_sequence_window_is_256_through_8192():
+    assert STAGING_SEQUENCE_LENGTHS == (256, 512, 1024, 2048, 4096, 8192)
 
 
 def test_render_plot_keeps_ffn_dimension_only_for_ffn_titles(tmp_path):
@@ -579,7 +747,7 @@ def test_render_plot_keeps_ffn_dimension_only_for_ffn_titles(tmp_path):
     fig = render_plot(plot_rows, block_kind="ffn", metric="latency")
     panel_titles = [ax.get_title(loc="left") for ax in fig.axes]
     assert panel_titles == [
-        "Head Dim = 64 / Num Heads = 12 / FFN Dim = 3072",
-        "Head Dim = 64 / Num Heads = 16 / FFN Dim = 4096",
+        "BERT-Base",
+        "BERT-Large",
     ]
     plt.close(fig)

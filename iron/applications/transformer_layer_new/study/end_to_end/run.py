@@ -8,16 +8,21 @@ import argparse
 import csv
 import json
 import logging
+import sys
 from pathlib import Path
 
+from ..npu_runtime_checks import warn_if_npu_power_mode_not_turbo
+from ..run_lock import default_lock_path, hold_study_lock
 from .cases import (
     EXECUTION_MODES,
     FAMILY_IDS,
-    MODE_OPERATORS,
+    FAMILY_SPECS,
     SEQUENCE_LADDER,
+    WORKLOAD_VARIANTS,
     EndToEndCase,
     candidate_table_for_case,
     iter_cases,
+    mode_operators,
 )
 from .modes import (
     benchmark_mode,
@@ -27,11 +32,18 @@ from .modes import (
 from .power import SUPPORTED_POWER_BACKENDS
 
 LOGGER = logging.getLogger(__name__)
+csv.field_size_limit(sys.maxsize)
+
+
+def _pattern_label(execution_mode: str) -> str:
+    return "Hybrid Runlist+Dataflow" if execution_mode == "hybrid" else "Runlist"
+
 
 TUNING_CSV_FIELDNAMES = (
     "study_id",
     "study_case_id",
     "study_case_label",
+    "workload_variant",
     "execution_mode",
     "internal_operator",
     "candidate_id",
@@ -55,6 +67,7 @@ RESULTS_CSV_FIELDNAMES = (
     "study_id",
     "study_case_id",
     "study_case_label",
+    "workload_variant",
     "backend",
     "execution_mode",
     "pattern_label",
@@ -121,6 +134,160 @@ def default_tuning_output_path() -> Path:
     return Path(__file__).resolve().parents[2] / "results" / "end_to_end" / "tuning.csv"
 
 
+def default_resume_paths(output_path: Path) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    candidate = (
+        Path(__file__).resolve().parents[2]
+        / "results_final"
+        / "end_to_end"
+        / output_path.name
+    )
+    if candidate.exists():
+        paths.append(candidate)
+    if output_path.exists() and output_path not in paths:
+        paths.append(output_path)
+    return tuple(paths)
+
+
+def default_resume_tuning_paths(output_path: Path) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    candidate = (
+        Path(__file__).resolve().parents[2]
+        / "results_final"
+        / "end_to_end"
+        / output_path.name
+    )
+    if candidate.exists():
+        paths.append(candidate)
+    if output_path.exists() and output_path not in paths:
+        paths.append(output_path)
+    return tuple(paths)
+
+
+def _resume_execution_mode(value: object) -> str:
+    execution_mode = str(value or "")
+    return "hybrid" if execution_mode == "dataflow" else execution_mode
+
+
+def _resume_workload_variant(row: dict[str, str]) -> str:
+    workload_variant = str(row.get("workload_variant") or "")
+    if workload_variant:
+        return workload_variant
+    study_case_id = str(row.get("study_case_id") or "")
+    if study_case_id in FAMILY_SPECS:
+        return FAMILY_SPECS[study_case_id].workload_variant
+    return ""
+
+
+def _tuning_row_key(row: dict[str, str]) -> tuple[str, str, str, str, int, str]:
+    return (
+        str(row.get("study_case_id") or ""),
+        _resume_workload_variant(row),
+        _resume_execution_mode(row.get("execution_mode")),
+        str(row.get("internal_operator") or ""),
+        int(float(str(row.get("seq_len") or 0))),
+        str(row.get("candidate_id") or ""),
+    )
+
+
+def load_existing_tuning_rows(
+    paths: tuple[Path, ...],
+) -> dict[tuple[str, str, str, str, int, str], dict[str, object]]:
+    rows: dict[tuple[str, str, str, str, int, str], dict[str, object]] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if not str(row.get("candidate_id") or ""):
+                    continue
+                rows[_tuning_row_key(row)] = dict(row)
+    return rows
+
+
+def reusable_tuning_row(
+    existing_rows: dict[tuple[str, str, str, str, int, str], dict[str, object]],
+    *,
+    study_case_id: str,
+    workload_variant: str,
+    execution_mode: str,
+    operator_name: str,
+    seq_len: int,
+    candidate_id: str,
+    resolved_config_json: str,
+) -> dict[str, object] | None:
+    row = existing_rows.get(
+        (
+            study_case_id,
+            workload_variant,
+            execution_mode,
+            operator_name,
+            seq_len,
+            candidate_id,
+        )
+    )
+    if row is None:
+        return None
+    if str(row.get("operator_config_json") or "") != resolved_config_json:
+        return None
+    if str(row.get("run_status") or "") not in (
+        "passed",
+        "skipped_singleton_default",
+        "skipped_long_seq_default",
+    ):
+        return None
+    return dict(row)
+
+
+def _final_row_key(row: dict[str, str]) -> tuple[str, str, str, int]:
+    return (
+        str(row.get("study_case_id") or ""),
+        _resume_workload_variant(row),
+        _resume_execution_mode(row.get("execution_mode")),
+        int(float(str(row.get("seq_len") or 0))),
+    )
+
+
+def load_existing_final_rows(
+    paths: tuple[Path, ...],
+) -> dict[tuple[str, str, str, int], dict[str, object]]:
+    rows: dict[tuple[str, str, str, int], dict[str, object]] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                if not str(row.get("execution_mode") or ""):
+                    continue
+                rows[_final_row_key(row)] = dict(row)
+    return rows
+
+
+def reusable_final_row(
+    existing_rows: dict[tuple[str, str, str, int], dict[str, object]],
+    *,
+    study_case_id: str,
+    workload_variant: str,
+    execution_mode: str,
+    seq_len: int,
+    selected_candidate_ids_json: str,
+    selected_config_json: str,
+    power_backend: str,
+) -> dict[str, object] | None:
+    row = existing_rows.get((study_case_id, workload_variant, execution_mode, seq_len))
+    if row is None:
+        return None
+    if str(row.get("run_status") or "") != "passed":
+        return None
+    if str(row.get("selected_candidate_ids_json") or "") != selected_candidate_ids_json:
+        return None
+    if str(row.get("selected_config_json") or "") != selected_config_json:
+        return None
+    if power_backend != "auto" and str(row.get("power_backend") or "") != power_backend:
+        return None
+    return dict(row)
+
+
 def iteration_schedule(seq_len: int) -> tuple[int, int]:
     if seq_len <= 256:
         return (1, 100)
@@ -185,7 +352,7 @@ def _skip_isolated_singleton_benchmark(
     operator_name: str,
     candidates: list[dict[str, object]],
 ) -> bool:
-    return execution_mode != "dataflow" and len(candidates) == 1
+    return execution_mode != "hybrid" and len(candidates) == 1
 
 
 def _selected_default_row(
@@ -204,6 +371,7 @@ def _selected_default_row(
         "study_id": "end_to_end_tuning",
         "study_case_id": case.study_case_id,
         "study_case_label": case.study_case_label,
+        "workload_variant": case.workload_variant,
         "execution_mode": execution_mode,
         "internal_operator": operator_name,
         "candidate_id": candidate_id,
@@ -233,12 +401,15 @@ def tune_mode(
     runs_per_sample: int,
     seed: int,
     validate_long_seq_runlist: bool = True,
+    existing_tuning_rows: (
+        dict[tuple[str, str, str, str, int, str], dict[str, object]] | None
+    ) = None,
 ) -> tuple[list[dict[str, object]], dict[str, str], dict[str, dict[str, object]], str]:
     candidates_by_mode = candidate_table_for_case(case.study_case_id, case.seq_len)
     tuning_rows: list[dict[str, object]] = []
     selected_candidate_ids: dict[str, str] = {}
     selected_config: dict[str, dict[str, object]] = {}
-    operator_names = MODE_OPERATORS[execution_mode]
+    operator_names = mode_operators(execution_mode, case.workload_variant)
 
     LOGGER.info(
         "Tuning %s for %s (%d operator groups, warmup=%d, timed=%d)",
@@ -278,7 +449,17 @@ def tune_mode(
                     "runlist tuning because only one candidate remained"
                 )
             tuning_rows.append(
-                _selected_default_row(
+                reusable_tuning_row(
+                    {} if existing_tuning_rows is None else existing_tuning_rows,
+                    study_case_id=case.study_case_id,
+                    workload_variant=case.workload_variant,
+                    execution_mode=execution_mode,
+                    operator_name=operator_name,
+                    seq_len=case.seq_len,
+                    candidate_id=candidate["candidate_id"],
+                    resolved_config_json=json_dumps(resolved_config),
+                )
+                or _selected_default_row(
                     case=case,
                     execution_mode=execution_mode,
                     operator_name=operator_name,
@@ -319,6 +500,26 @@ def tune_mode(
                 case.workload,
                 {operator_name: dict(candidate["config"])},
             )[operator_name]
+            reused_row = reusable_tuning_row(
+                {} if existing_tuning_rows is None else existing_tuning_rows,
+                study_case_id=case.study_case_id,
+                workload_variant=case.workload_variant,
+                execution_mode=execution_mode,
+                operator_name=operator_name,
+                seq_len=case.seq_len,
+                candidate_id=candidate["candidate_id"],
+                resolved_config_json=json_dumps(resolved_config),
+            )
+            if reused_row is not None:
+                LOGGER.info(
+                    "[%s] Reusing %s candidate %s from existing tuning results",
+                    execution_mode,
+                    operator_name,
+                    candidate["candidate_id"],
+                )
+                reused_row["_resolved_config"] = resolved_config
+                operator_rows.append(reused_row)
+                continue
             result = benchmark_operator_candidate(
                 execution_mode,
                 operator_name,
@@ -333,6 +534,7 @@ def tune_mode(
                     "study_id": "end_to_end_tuning",
                     "study_case_id": case.study_case_id,
                     "study_case_label": case.study_case_label,
+                    "workload_variant": case.workload_variant,
                     "execution_mode": execution_mode,
                     "internal_operator": operator_name,
                     "candidate_id": candidate["candidate_id"],
@@ -439,6 +641,12 @@ def build_rows(
     runs_per_sample: int | None,
     seed: int,
     power_backend: str,
+    existing_tuning_rows: (
+        dict[tuple[str, str, str, str, int, str], dict[str, object]] | None
+    ) = None,
+    existing_final_rows: (
+        dict[tuple[str, str, str, int], dict[str, object]] | None
+    ) = None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     selected_modes = EXECUTION_MODES if mode_filter == "all" else (mode_filter,)
     resolved_warmup_runs, resolved_runs_per_sample = iteration_schedule(case.seq_len)
@@ -464,10 +672,13 @@ def build_rows(
                 runs_per_sample=resolved_runs_per_sample,
                 seed=seed,
                 validate_long_seq_runlist=False,
+                existing_tuning_rows=existing_tuning_rows,
             )
         )
         tuning_rows.extend(mode_tuning_rows)
 
+        selected_candidate_ids_json = json_dumps(selected_candidate_ids)
+        selected_config_json = json_dumps(selected_config)
         if tuning_failure:
             result = _failed_final_result(
                 power_backend=power_backend,
@@ -480,36 +691,90 @@ def build_rows(
                 tuning_failure,
             )
         else:
-            LOGGER.info(
-                "Running final %s benchmark for %s with selected operators %s",
-                execution_mode,
-                _case_descriptor(case),
-                json_dumps(selected_candidate_ids),
-            )
-            result = benchmark_mode(
-                execution_mode,
-                case.workload,
-                warmup_runs=resolved_warmup_runs,
-                runs_per_sample=resolved_runs_per_sample,
-                seed=seed,
+            reused_row = reusable_final_row(
+                {} if existing_final_rows is None else existing_final_rows,
+                study_case_id=case.study_case_id,
+                workload_variant=case.workload_variant,
+                execution_mode=execution_mode,
+                seq_len=case.seq_len,
+                selected_candidate_ids_json=selected_candidate_ids_json,
+                selected_config_json=selected_config_json,
                 power_backend=power_backend,
-                operator_config=selected_config,
             )
-            LOGGER.info(
-                "Completed final %s benchmark for %s -> %s",
-                execution_mode,
-                _case_descriptor(case),
-                _result_summary(result),
-            )
+            if reused_row is not None:
+                LOGGER.info(
+                    "Reusing final %s benchmark for %s with selected operators %s",
+                    execution_mode,
+                    _case_descriptor(case),
+                    selected_candidate_ids_json,
+                )
+                result = {
+                    key: value
+                    for key, value in reused_row.items()
+                    if key not in RESULTS_CSV_FIELDNAMES
+                }
+                result.update(
+                    {
+                        key: reused_row.get(key, "")
+                        for key in RESULTS_CSV_FIELDNAMES
+                        if key
+                        not in {
+                            "study_id",
+                            "study_case_id",
+                            "study_case_label",
+                            "workload_variant",
+                            "backend",
+                            "execution_mode",
+                            "pattern_label",
+                            "seq_len",
+                            "hidden_size",
+                            "intermediate_size",
+                            "num_attention_heads",
+                            "attention_head_size",
+                            "batch_size",
+                            "dtype",
+                            "use_bias",
+                            "weights_source",
+                            "warmup_runs",
+                            "runs_per_sample",
+                            "selected_candidate_ids_json",
+                            "selected_config_json",
+                            "is_best",
+                        }
+                    }
+                )
+            else:
+                LOGGER.info(
+                    "Running final %s benchmark for %s with selected operators %s",
+                    execution_mode,
+                    _case_descriptor(case),
+                    selected_candidate_ids_json,
+                )
+                result = benchmark_mode(
+                    execution_mode,
+                    case.workload,
+                    warmup_runs=resolved_warmup_runs,
+                    runs_per_sample=resolved_runs_per_sample,
+                    seed=seed,
+                    power_backend=power_backend,
+                    operator_config=selected_config,
+                )
+                LOGGER.info(
+                    "Completed final %s benchmark for %s -> %s",
+                    execution_mode,
+                    _case_descriptor(case),
+                    _result_summary(result),
+                )
 
         final_rows.append(
             {
                 "study_id": "end_to_end",
                 "study_case_id": case.study_case_id,
                 "study_case_label": case.study_case_label,
+                "workload_variant": case.workload_variant,
                 "backend": "npu",
                 "execution_mode": execution_mode,
-                "pattern_label": execution_mode,
+                "pattern_label": _pattern_label(execution_mode),
                 "seq_len": case.seq_len,
                 "hidden_size": case.hidden_size,
                 "intermediate_size": case.intermediate_size,
@@ -521,8 +786,8 @@ def build_rows(
                 "weights_source": "synthetic",
                 "warmup_runs": resolved_warmup_runs,
                 "runs_per_sample": resolved_runs_per_sample,
-                "selected_candidate_ids_json": json_dumps(selected_candidate_ids),
-                "selected_config_json": json_dumps(selected_config),
+                "selected_candidate_ids_json": selected_candidate_ids_json,
+                "selected_config_json": selected_config_json,
                 **result,
             }
         )
@@ -547,6 +812,11 @@ def write_rows(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark transformer_layer_new end-to-end study"
+    )
+    parser.add_argument(
+        "--workload-variant",
+        choices=[*WORKLOAD_VARIANTS, "all"],
+        default="all",
     )
     parser.add_argument(
         "--family",
@@ -575,6 +845,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--tuning-output", type=Path, default=default_tuning_output_path()
     )
+    parser.add_argument("--resume-input", type=Path, default=None)
+    parser.add_argument("--resume-tuning-input", type=Path, default=None)
+    parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -584,32 +857,98 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
+    warn_if_npu_power_mode_not_turbo(LOGGER, study_name="end-to-end study")
 
     output_path = args.output.expanduser()
     tuning_output_path = args.tuning_output.expanduser()
-    cases = tuple(iter_cases(args.family, args.seq_len))
+    with hold_study_lock(
+        default_lock_path(output_path),
+        study_name="transformer_layer_new end-to-end study",
+    ):
+        resume_output_paths: tuple[Path, ...] = tuple()
+        if args.no_resume:
+            resume_output_paths = tuple()
+        elif args.resume_input is not None:
+            resume_output_paths = (args.resume_input.expanduser(),)
+        else:
+            resume_output_paths = default_resume_paths(output_path)
 
-    LOGGER.info(
-        "Starting end-to-end study with %d case(s), mode=%s, power_backend=%s",
-        len(cases),
-        args.mode,
-        args.power_backend,
-    )
+        resume_tuning_paths: tuple[Path, ...] = tuple()
+        if args.no_resume:
+            resume_tuning_paths = tuple()
+        elif args.resume_tuning_input is not None:
+            resume_tuning_paths = (args.resume_tuning_input.expanduser(),)
+        else:
+            resume_tuning_paths = default_resume_tuning_paths(tuning_output_path)
+        cases = tuple(iter_cases(args.workload_variant, args.family, args.seq_len))
 
-    tuning_rows: list[dict[str, object]] = []
-    final_rows: list[dict[str, object]] = []
-    for case_index, case in enumerate(cases, start=1):
-        LOGGER.info("Case %d/%d: %s", case_index, len(cases), _case_descriptor(case))
-        case_tuning_rows, case_final_rows = build_rows(
-            case,
-            mode_filter=args.mode,
-            warmup_runs=args.warmup_iters,
-            runs_per_sample=args.timed_iters,
-            seed=args.seed,
-            power_backend=args.power_backend,
+        LOGGER.info(
+            "Starting end-to-end study with %d case(s), mode=%s, power_backend=%s",
+            len(cases),
+            args.mode,
+            args.power_backend,
         )
-        tuning_rows.extend(case_tuning_rows)
-        final_rows.extend(case_final_rows)
+
+        existing_tuning_rows = load_existing_tuning_rows(resume_tuning_paths)
+        existing_final_rows = load_existing_final_rows(resume_output_paths)
+        if resume_tuning_paths and existing_tuning_rows:
+            LOGGER.info(
+                "Loaded %d reusable tuning rows from %s",
+                len(existing_tuning_rows),
+                ", ".join(str(path) for path in resume_tuning_paths),
+            )
+        if resume_output_paths and existing_final_rows:
+            LOGGER.info(
+                "Loaded %d reusable final rows from %s",
+                len(existing_final_rows),
+                ", ".join(str(path) for path in resume_output_paths),
+            )
+
+        tuning_row_map: dict[tuple[str, str, str, str, int, str], dict[str, object]] = (
+            dict(existing_tuning_rows)
+        )
+        final_row_map: dict[tuple[str, str, str, int], dict[str, object]] = dict(
+            existing_final_rows
+        )
+        tuning_rows = list(tuning_row_map.values())
+        final_rows = list(final_row_map.values())
+        for case_index, case in enumerate(cases, start=1):
+            LOGGER.info(
+                "Case %d/%d: %s", case_index, len(cases), _case_descriptor(case)
+            )
+            case_tuning_rows, case_final_rows = build_rows(
+                case,
+                mode_filter=args.mode,
+                warmup_runs=args.warmup_iters,
+                runs_per_sample=args.timed_iters,
+                seed=args.seed,
+                power_backend=args.power_backend,
+                existing_tuning_rows=existing_tuning_rows,
+                existing_final_rows=existing_final_rows,
+            )
+            for row in case_tuning_rows:
+                tuning_row_map[
+                    _tuning_row_key({key: str(value) for key, value in row.items()})
+                ] = row
+            for row in case_final_rows:
+                final_row_map[
+                    _final_row_key({key: str(value) for key, value in row.items()})
+                ] = row
+            tuning_rows = list(tuning_row_map.values())
+            final_rows = list(final_row_map.values())
+            mark_best_rows(final_rows)
+            write_rows(output_path, fieldnames=RESULTS_CSV_FIELDNAMES, rows=final_rows)
+            write_rows(
+                tuning_output_path,
+                fieldnames=TUNING_CSV_FIELDNAMES,
+                rows=tuning_rows,
+            )
+            LOGGER.info(
+                "Checkpointed %d end-to-end rows and %d tuning rows",
+                len(final_rows),
+                len(tuning_rows),
+            )
+
         mark_best_rows(final_rows)
         write_rows(output_path, fieldnames=RESULTS_CSV_FIELDNAMES, rows=final_rows)
         write_rows(
@@ -617,21 +956,8 @@ def main(argv: list[str] | None = None) -> int:
             fieldnames=TUNING_CSV_FIELDNAMES,
             rows=tuning_rows,
         )
-        LOGGER.info(
-            "Checkpointed %d end-to-end rows and %d tuning rows",
-            len(final_rows),
-            len(tuning_rows),
-        )
-
-    mark_best_rows(final_rows)
-    write_rows(output_path, fieldnames=RESULTS_CSV_FIELDNAMES, rows=final_rows)
-    write_rows(
-        tuning_output_path,
-        fieldnames=TUNING_CSV_FIELDNAMES,
-        rows=tuning_rows,
-    )
-    LOGGER.info("Wrote %d end-to-end rows to %s", len(final_rows), output_path)
-    LOGGER.info("Wrote %d tuning rows to %s", len(tuning_rows), tuning_output_path)
+        LOGGER.info("Wrote %d end-to-end rows to %s", len(final_rows), output_path)
+        LOGGER.info("Wrote %d tuning rows to %s", len(tuning_rows), tuning_output_path)
     return 0
 
 

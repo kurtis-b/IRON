@@ -68,7 +68,13 @@ class ReferenceSelection:
 
 
 def default_reference_results_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "results" / "block" / "results.csv"
+    current = Path(__file__).resolve().parents[2] / "results" / "block" / "results.csv"
+    if current.exists():
+        return current
+    fallback = (
+        Path(__file__).resolve().parents[2] / "results_final" / "block" / "results.csv"
+    )
+    return fallback
 
 
 def load_reference_rows(path: str | Path) -> list[dict[str, str]]:

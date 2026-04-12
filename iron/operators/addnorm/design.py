@@ -100,19 +100,14 @@ def my_weighted_layer_norm(
     ]
     of_in1_l2l1s = [[None] * worker_lanes_per_column for _ in range(num_columns)]
     of_in2_l2l1s = [[None] * worker_lanes_per_column for _ in range(num_columns)]
-    of_adds = [[None] * worker_lanes_per_column for _ in range(num_columns)]
+    of_norms = [[None] * worker_lanes_per_column for _ in range(num_columns)]
     of_out_l1l2s = [[None] * worker_lanes_per_column for _ in range(num_columns)]
 
     # AIE Core Function declaration
-    eltwise_add_kernel = Kernel(
-        "eltwise_add_bf16_vector",
+    add_layer_norm_kernel = Kernel(
+        "add_layer_norm_rows",
         kernel_archive_path,
-        [worker_tile_ty, worker_tile_ty, worker_tile_ty, np.int32],
-    )
-    layer_norm_kernel = Kernel(
-        "layer_norm_rows",
-        kernel_archive_path,
-        [worker_tile_ty, worker_tile_ty, np.int32, np.int32],
+        [worker_tile_ty, worker_tile_ty, worker_tile_ty, np.int32, np.int32],
     )
     eltwise_mul_kernel = Kernel(
         "eltwise_mul_bf16_vector_rows",
@@ -121,38 +116,36 @@ def my_weighted_layer_norm(
     )
 
     # Define a task that will run on a compute tile
-    def core_body_stg1(of_in1, of_in2, of_add, add):
+    def core_body_stg1(of_in1, of_in2, of_norm, add_layer_norm):
         # Number of sub-vector "tile" iterations
         for _ in range_(N_div_n):
             elem_in1 = of_in1.acquire(1)
             elem_in2 = of_in2.acquire(1)
-            elem_out = of_add.acquire(1)
-            add(
+            elem_out = of_norm.acquire(1)
+            add_layer_norm(
                 elem_in1,
                 elem_in2,
                 elem_out,
-                per_tile_elements * worker_rows_to_process,
+                per_tile_elements,
+                worker_rows_to_process,
             )
             of_in1.release(1)
             of_in2.release(1)
-            of_add.release(1)
+            of_norm.release(1)
 
-    def core_body_stg2(of_add, weights, of_out, layer_norm, eltwise_mul):
+    def core_body_stg2(of_norm, weights, of_out, eltwise_mul):
         # Number of sub-vector "tile" iterations
         for _ in range_(N_div_n):
-            elem_in = of_add.acquire(1)
+            elem_in = of_norm.acquire(1)
             elem_out = of_out.acquire(1)
-            layer_norm(elem_in, elem_out, per_tile_elements, worker_rows_to_process)
-            # Reuse the normalized output tile so the weighted layer norm stage
-            # multiplies normalized values instead of the raw add result.
             eltwise_mul(
-                elem_out,
+                elem_in,
                 weights,
                 elem_out,
                 per_tile_elements,
                 worker_rows_to_process,
             )
-            of_add.release(1)
+            of_norm.release(1)
             of_out.release(1)
 
     # Split each column-wide tile through the memtile into per-lane subtiles,
@@ -199,8 +192,8 @@ def my_weighted_layer_norm(
             )
         )
         for lane in range(worker_lanes_per_column):
-            of_adds[i][lane] = ObjectFifo(
-                worker_tile_ty, name=f"add_{i}_{lane}", depth=fifodepth
+            of_norms[i][lane] = ObjectFifo(
+                worker_tile_ty, name=f"norm_{i}_{lane}", depth=fifodepth
             )
             weights_buffer = Buffer(
                 type=weights_ty,
@@ -213,8 +206,8 @@ def my_weighted_layer_norm(
                     [
                         of_in1_l2l1s[i][lane].cons(),
                         of_in2_l2l1s[i][lane].cons(),
-                        of_adds[i][lane].prod(),
-                        eltwise_add_kernel,
+                        of_norms[i][lane].prod(),
+                        add_layer_norm_kernel,
                     ],
                 )
             )
@@ -222,10 +215,9 @@ def my_weighted_layer_norm(
                 Worker(
                     core_body_stg2,
                     [
-                        of_adds[i][lane].cons(),
+                        of_norms[i][lane].cons(),
                         weights_buffer,
                         of_out_l1l2s[i][lane].prod(),
-                        layer_norm_kernel,
                         eltwise_mul_kernel,
                     ],
                 )

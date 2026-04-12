@@ -43,6 +43,30 @@ class AIETranspose(AIEOperatorBase):
         self.num_columns = num_aie_columns
         self.num_channels = num_channels
 
+        if self.M % self.num_channels != 0:
+            raise AIEOperatorConstraintError(
+                "AIETranspose: M must be divisible by num_channels "
+                f"(got M={self.M}, num_channels={self.num_channels})"
+            )
+        if self.N % self.num_columns != 0:
+            raise AIEOperatorConstraintError(
+                "AIETranspose: N must be divisible by num_aie_columns "
+                f"(got N={self.N}, num_aie_columns={self.num_columns})"
+            )
+
+        channel_rows = self.M // self.num_channels
+        column_cols = self.N // self.num_columns
+        if channel_rows % self.m != 0:
+            raise AIEOperatorConstraintError(
+                "AIETranspose: per-channel row partition must be divisible by m "
+                f"(got M/num_channels={channel_rows}, m={self.m})"
+            )
+        if column_cols % self.n != 0:
+            raise AIEOperatorConstraintError(
+                "AIETranspose: per-column column partition must be divisible by n "
+                f"(got N/num_aie_columns={column_cols}, n={self.n})"
+            )
+
         total_shimdma_channels = self.num_columns * self.num_channels
         if 1 > 1:
             total_shimdma_channels *= 1

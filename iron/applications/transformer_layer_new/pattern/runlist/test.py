@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 from iron.applications.transformer_layer_new.pattern.runlist.op import (
     AIETransformerRunlist,
+    _resolve_query_block_size,
 )
 from iron.applications.transformer_layer_new.pattern.reference import (
     generate_golden_reference,
@@ -66,17 +67,21 @@ def test_runlist_long_seq_uses_blocked_attention(aie_context):
     operator.set_up_artifacts()
     operator.set_up_runtime()
 
-    expected_block_count = 16384 // 4096
-    expected_attn_scratch_elems = 4096 * 16384 * 12
+    expected_query_block_size = _resolve_query_block_size(16384, 12)
+    expected_block_count = 16384 // expected_query_block_size
+    expected_attn_scratch_elems = expected_query_block_size * 16384 * 12
 
     assert operator.use_blocked_attention is True
     assert operator.use_long_seq_fallback is False
-    assert operator.query_block_size == 4096
+    assert operator.query_block_size == expected_query_block_size
     assert operator.query_block_count == expected_block_count
-    assert operator.operator_config["attn_scores"]["M"] == 4096
-    assert operator.operator_config["attn_output"]["M"] == 4096
+    assert operator.operator_config["attn_scores"]["M"] == expected_query_block_size
+    assert operator.operator_config["attn_output"]["M"] == expected_query_block_size
     assert operator.operator_config["attn_scale"]["size"] == expected_attn_scratch_elems
-    assert operator.operator_config["attn_softmax"]["rows"] == 4096 * 12
+    assert (
+        operator.operator_config["attn_softmax"]["rows"]
+        == expected_query_block_size * 12
+    )
     assert operator.buffers["attn_scores_output"] == expected_attn_scratch_elems * 2
     assert operator.buffers["attn_scaled_output"] == expected_attn_scratch_elems * 2
     assert operator.buffers["attn_weights_output"] == expected_attn_scratch_elems * 2

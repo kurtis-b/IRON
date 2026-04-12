@@ -8,6 +8,7 @@ import argparse
 import logging
 from pathlib import Path
 
+from ..npu_runtime_checks import warn_if_npu_power_mode_not_turbo
 from .cases import EXECUTION_MODES, FAMILY_IDS, SEQUENCE_LADDER, EndToEndCase, get_case
 from .power import SUPPORTED_POWER_BACKENDS
 from .run import (
@@ -100,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
+    warn_if_npu_power_mode_not_turbo(LOGGER, study_name="powered end-to-end sweep")
 
     output_path = (
         default_output_path(int(args.max_seq_len))

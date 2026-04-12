@@ -16,6 +16,7 @@ def generate_golden_reference(
     dtype: str = "bf16",
     seed: int = 42,
     *,
+    workload_variant: str = "encoder_bert",
     include_output: bool = True,
     include_attention_mask: bool | None = None,
 ) -> dict[str, torch.Tensor | dict[str, torch.Tensor] | None]:
@@ -35,11 +36,13 @@ def generate_golden_reference(
         include_attention_mask = include_output
 
     input_tensor = torch.randn(seq_len, hidden_size, dtype=dtype_torch) * val_range
-    attention_mask = (
-        torch.ones(seq_len, seq_len, dtype=dtype_torch)
-        if include_attention_mask
-        else None
-    )
+    if include_attention_mask:
+        if workload_variant == "decoder_gpt2":
+            attention_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=dtype_torch))
+        else:
+            attention_mask = torch.ones(seq_len, seq_len, dtype=dtype_torch)
+    else:
+        attention_mask = None
 
     head_dim = hidden_size // num_heads
     q_weight = torch.randn(hidden_size, hidden_size, dtype=dtype_torch) * val_range
@@ -75,15 +78,43 @@ def generate_golden_reference(
 
     output = None
     if include_output:
-        q = torch.matmul(input_tensor, q_weight)
-        k = torch.matmul(input_tensor, k_weight)
-        v = torch.matmul(input_tensor, v_weight)
+        if workload_variant == "encoder_bert":
+            attn_input = input_tensor
+            residual_after_attention = input_tensor
+            use_causal_attention = False
+            apply_post_attention_norm = True
+        elif workload_variant == "decoder_gpt2":
+            attn_input = torch.nn.functional.layer_norm(
+                input_tensor,
+                (hidden_size,),
+                ln1_weight,
+                ln1_bias,
+            )
+            residual_after_attention = input_tensor
+            apply_post_attention_norm = False
+            use_causal_attention = True
+        else:
+            raise ValueError(f"Unsupported workload_variant: {workload_variant}")
+
+        q = torch.matmul(attn_input, q_weight)
+        k = torch.matmul(attn_input, k_weight)
+        v = torch.matmul(attn_input, v_weight)
 
         q = q.view(seq_len, num_heads, head_dim).transpose(0, 1)
         k = k.view(seq_len, num_heads, head_dim).transpose(0, 1)
         v = v.view(seq_len, num_heads, head_dim).transpose(0, 1)
 
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim**0.5)
+        if use_causal_attention:
+            causal_mask = torch.triu(
+                torch.ones(
+                    seq_len, seq_len, dtype=torch.bool, device=attn_scores.device
+                ),
+                diagonal=1,
+            )
+            attn_scores = attn_scores.masked_fill(
+                causal_mask.unsqueeze(0), float("-inf")
+            )
         attn_probs = torch.nn.functional.softmax(attn_scores, dim=-1)
         attn_output = torch.matmul(attn_probs, v)
 
@@ -92,23 +123,41 @@ def generate_golden_reference(
         )
         attn_output = torch.matmul(attn_output, attn_output_weight)
 
-        hidden_states = torch.nn.functional.layer_norm(
-            attn_output + input_tensor,
-            (hidden_size,),
-            ln1_weight,
-            ln1_bias,
+        residual_hidden_states = attn_output + residual_after_attention
+        if apply_post_attention_norm:
+            hidden_states = torch.nn.functional.layer_norm(
+                residual_hidden_states,
+                (hidden_size,),
+                ln1_weight,
+                ln1_bias,
+            )
+        else:
+            hidden_states = residual_hidden_states
+
+        ffn_input = (
+            torch.nn.functional.layer_norm(
+                residual_hidden_states,
+                (hidden_size,),
+                ln2_weight,
+                ln2_bias,
+            )
+            if workload_variant == "decoder_gpt2"
+            else hidden_states
         )
 
-        intermediate = torch.matmul(hidden_states, ffn_up_weight)
+        intermediate = torch.matmul(ffn_input, ffn_up_weight)
         intermediate = torch.nn.functional.gelu(intermediate)
         ffn_output = torch.matmul(intermediate, ffn_down_weight)
 
-        output = torch.nn.functional.layer_norm(
-            ffn_output + hidden_states,
-            (hidden_size,),
-            ln2_weight,
-            ln2_bias,
-        )
+        if workload_variant == "decoder_gpt2":
+            output = ffn_output + residual_hidden_states
+        else:
+            output = torch.nn.functional.layer_norm(
+                ffn_output + hidden_states,
+                (hidden_size,),
+                ln2_weight,
+                ln2_bias,
+            )
 
     return {
         "input": input_tensor,

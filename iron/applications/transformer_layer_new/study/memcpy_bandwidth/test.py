@@ -14,6 +14,7 @@ from iron.applications.transformer_layer_new.study.memcpy_bandwidth.run import (
     CSV_FIELDNAMES,
     main,
     mark_peak_rows,
+    reusable_existing_row,
     write_peak_metric_plot,
     write_rows,
 )
@@ -217,6 +218,11 @@ def test_write_peak_metric_plot_writes_svg_labels(tmp_path):
 
 
 def test_main_writes_csv_and_plots_from_monkeypatched_benchmarks(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memcpy_bandwidth.run.require_npu_power_mode_turbo",
+        lambda *, study_name: None,
+    )
+
     def fake_benchmark_case(case, *, warmup_iters, timed_iters):
         assert warmup_iters == 10
         assert timed_iters == 4
@@ -265,6 +271,11 @@ def test_main_writes_csv_and_plots_from_monkeypatched_benchmarks(monkeypatch, tm
 
 
 def test_main_defaults_to_bypass_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memcpy_bandwidth.run.require_npu_power_mode_turbo",
+        lambda *, study_name: None,
+    )
+
     def fake_benchmark_case(case, *, warmup_iters, timed_iters):
         assert warmup_iters == 10
         assert timed_iters == 500
@@ -302,6 +313,11 @@ def test_main_defaults_to_bypass_only(monkeypatch, tmp_path):
 
 
 def test_main_emits_failed_exception_rows_without_aborting(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memcpy_bandwidth.run.require_npu_power_mode_turbo",
+        lambda *, study_name: None,
+    )
+
     def fake_benchmark_case(case, *, warmup_iters, timed_iters):
         del warmup_iters, timed_iters
         if case.bypass:
@@ -341,6 +357,86 @@ def test_main_emits_failed_exception_rows_without_aborting(monkeypatch, tmp_path
     assert [row["run_status"] for row in rows] == ["passed", "failed_exception"]
     assert rows[0]["is_size_peak"] == "True"
     assert rows[1]["failure_message"] == "boom"
+
+
+def test_reusable_existing_row_matches_case_and_sampling():
+    case = iter_cases(
+        size_filter="8388608",
+        num_cores_filter="8",
+        num_channels_filter="2",
+        bypass_filter="true",
+    )[0]
+    row = reusable_existing_row(
+        {
+            case.case_id: {
+                "case_id": case.case_id,
+                "warmup_iters": "10",
+                "timed_iters": "500",
+                "run_status": "passed",
+            }
+        },
+        case=case,
+        warmup_iters=10,
+        timed_iters=500,
+    )
+
+    assert row is not None
+    assert row["case_id"] == case.case_id
+
+
+def test_main_reuses_matching_existing_rows(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memcpy_bandwidth.run.require_npu_power_mode_turbo",
+        lambda *, study_name: None,
+    )
+
+    def fail_benchmark_case(*args, **kwargs):
+        raise AssertionError("benchmark_case should not be called")
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memcpy_bandwidth.run.benchmark_case",
+        fail_benchmark_case,
+    )
+
+    output_path = tmp_path / "results.csv"
+    write_rows(
+        output_path,
+        [
+            {
+                **_result(
+                    size_elements=8388608,
+                    num_cores=8,
+                    num_channels=2,
+                    bypass=True,
+                    tile_size=4096,
+                    latency_us=10.0,
+                    bandwidth_gbps=12.5,
+                ),
+                "warmup_iters": 10,
+                "timed_iters": 500,
+            }
+        ],
+    )
+
+    exit_code = main(
+        [
+            "--size",
+            "8388608",
+            "--num-cores",
+            "8",
+            "--num-channels",
+            "2",
+            "--bypass",
+            "true",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert exit_code == 0
+    rows = _read_csv_rows(output_path)
+    assert len(rows) == 1
+    assert rows[0]["bandwidth_gbps"] == "12.5"
 
 
 def test_main_rejects_out_of_surface_cli_choices(monkeypatch, tmp_path):

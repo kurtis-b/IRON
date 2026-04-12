@@ -8,7 +8,13 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
-REFERENCE_EXECUTION_MODES: tuple[str, ...] = ("dataflow",)
+from iron.applications.transformer_layer_new.study.end_to_end.cases import (
+    FAMILY_SPECS,
+    canonical_execution_mode,
+    canonical_workload_variant,
+)
+
+REFERENCE_EXECUTION_MODES: tuple[str, ...] = ("hybrid",)
 _REFERENCE_MODE_ORDER = {
     execution_mode: index
     for index, execution_mode in enumerate(REFERENCE_EXECUTION_MODES)
@@ -19,6 +25,7 @@ _REFERENCE_MODE_ORDER = {
 class ReferenceGroup:
     study_case_id: str
     study_case_label: str
+    workload_variant: str
     seq_len: int
     hidden_size: int
     intermediate_size: int
@@ -72,9 +79,26 @@ def _eligible_reference_row(row: dict[str, str]) -> bool:
         return False
     if row.get("run_status") != "passed":
         return False
-    if row.get("execution_mode") not in REFERENCE_EXECUTION_MODES:
+    try:
+        execution_mode = canonical_execution_mode(str(row.get("execution_mode") or ""))
+    except ValueError:
+        return False
+    if execution_mode not in REFERENCE_EXECUTION_MODES:
         return False
     return _optional_int(row.get("seq_len")) is not None
+
+
+def _normalized_workload_variant(row: dict[str, str]) -> str | None:
+    value = str(row.get("workload_variant") or "").strip()
+    if value:
+        try:
+            return canonical_workload_variant(value)
+        except ValueError:
+            return None
+    family_id = str(row.get("study_case_id") or "")
+    if family_id in FAMILY_SPECS:
+        return FAMILY_SPECS[family_id].workload_variant
+    return None
 
 
 def _matches_filters(
@@ -97,7 +121,7 @@ def _sorted_reference_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         rows,
         key=lambda row: (
             _REFERENCE_MODE_ORDER.get(
-                str(row.get("execution_mode") or ""),
+                canonical_execution_mode(str(row.get("execution_mode") or "")),
                 len(REFERENCE_EXECUTION_MODES),
             ),
             str(row.get("selected_candidate_ids_json") or ""),
@@ -156,7 +180,7 @@ def group_reference_rows(
     family_filter: str = "all",
     seq_len_filter: str = "all",
 ) -> tuple[ReferenceGroup, ...]:
-    grouped_rows: dict[tuple[str, int], list[dict[str, str]]] = {}
+    grouped_rows: dict[tuple[str, str, int], list[dict[str, str]]] = {}
 
     for row in rows:
         if not _eligible_reference_row(row):
@@ -169,9 +193,12 @@ def group_reference_rows(
             continue
         study_case_id = str(row.get("study_case_id") or "")
         seq_len = _optional_int(row.get("seq_len"))
-        if not study_case_id or seq_len is None:
+        workload_variant = _normalized_workload_variant(row)
+        if not study_case_id or seq_len is None or workload_variant is None:
             continue
-        grouped_rows.setdefault((study_case_id, seq_len), []).append(dict(row))
+        grouped_rows.setdefault((study_case_id, workload_variant, seq_len), []).append(
+            dict(row)
+        )
 
     groups: list[ReferenceGroup] = []
     for group_key in sorted(grouped_rows):
@@ -181,8 +208,9 @@ def group_reference_rows(
         groups.append(
             ReferenceGroup(
                 study_case_id=group_key[0],
+                workload_variant=group_key[1],
                 study_case_label=_required_shared_text(group_rows, "study_case_label"),
-                seq_len=group_key[1],
+                seq_len=group_key[2],
                 hidden_size=_required_shared_int(group_rows, "hidden_size"),
                 intermediate_size=_required_shared_int(group_rows, "intermediate_size"),
                 num_attention_heads=_required_shared_int(

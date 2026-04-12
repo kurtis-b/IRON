@@ -12,14 +12,17 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from matplotlib.patches import Patch
 
-from .cases import FAMILY_IDS
-
-FAMILY_ORDER = list(FAMILY_IDS)
+FAMILY_ORDER = ["tinybert_512", "baseline_768", "baseline_1024"]
+FAMILY_LABELS = {
+    "tinybert_512": "TinyBERT",
+    "baseline_768": "BERT-Base",
+    "baseline_1024": "BERT-Large",
+}
 SEQ_ORDER = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-BLOCK_ORDER = ["QKV Proj", "MHA Out Proj", "Add + Norm (x2)", "FFN"]
+BLOCK_ORDER = ["QKV Proj", "MHAO", "Add + Norm (x2)", "FFN"]
 BLOCK_COLORS = {
     "QKV Proj": "#1f6f8b",
-    "MHA Out Proj": "#e07a5f",
+    "MHAO": "#e07a5f",
     "Add + Norm (x2)": "#3d405b",
     "FFN": "#81b29a",
 }
@@ -27,7 +30,7 @@ PATTERN_COLOR = "#d8d4cf"
 PATTERN_EDGE = "#2b2b2b"
 BLOCK_KIND_MAP = {
     "qkv_proj": "QKV Proj",
-    "mha_out_proj": "MHA Out Proj",
+    "mha_out_proj": "MHAO",
     "add_norm1": "Add + Norm (x2)",
     "add_norm2": "Add + Norm (x2)",
     "ffn": "FFN",
@@ -56,20 +59,19 @@ def default_output_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "results" / "end_to_end"
 
 
-def variant_stem(variant: str) -> str:
-    return {
+def variant_stem(variant: str, y_scale: str = "log") -> str:
+    stem = {
         "standard": "dataflow_selected_blocks_vs_pattern_latency",
         "slides": "dataflow_selected_blocks_vs_pattern_latency_slides",
     }[variant]
+    if y_scale == "linear":
+        return f"{stem}_linear"
+    return stem
 
 
 def family_label(pattern_rows: pd.DataFrame) -> str:
     sample = pattern_rows.iloc[0]
-    return (
-        f"Head Dim = {int(sample['attention_head_size'])} / "
-        f"Num Heads = {int(sample['num_attention_heads'])} / "
-        f"FFN Dim = {int(sample['intermediate_size'])}"
-    )
+    return FAMILY_LABELS[str(sample["study_case_id"])]
 
 
 def load_plot_rows(
@@ -79,7 +81,7 @@ def load_plot_rows(
     tuning_df = pd.read_csv(tuning_csv)
 
     pattern_df = results_df[
-        (results_df["execution_mode"] == "dataflow")
+        (results_df["execution_mode"] == "hybrid")
         & (results_df["run_status"] == "passed")
     ].copy()
     pattern_df["seq_len"] = pattern_df["seq_len"].astype(int)
@@ -89,7 +91,7 @@ def load_plot_rows(
     )
 
     chosen_blocks = tuning_df[
-        (tuning_df["execution_mode"] == "dataflow")
+        (tuning_df["execution_mode"] == "hybrid")
         & (tuning_df["is_operator_best"].astype(str) == "True")
         & (tuning_df["run_status"] == "passed")
     ].copy()
@@ -116,6 +118,7 @@ def render_plot(
     block_df: pd.DataFrame,
     *,
     variant: str = "standard",
+    y_scale: str = "log",
 ) -> plt.Figure:
     if variant == "slides":
         context = "poster"
@@ -156,17 +159,11 @@ def render_plot(
         for family_id in FAMILY_ORDER
         if family_id in set(pattern_df["study_case_id"].astype(str).tolist())
     ]
-    if variant == "slides" and len(family_ids) == 3:
-        fig, axes_grid = plt.subplots(2, 2, figsize=(22, 12), sharey=True)
-        axes = [axes_grid[0][0], axes_grid[0][1], axes_grid[1][0]]
-        legend_ax = axes_grid[1][1]
-        legend_ax.set_axis_off()
-    else:
-        fig, axes_obj = plt.subplots(
-            1, max(1, len(family_ids)), figsize=figsize, sharey=True
-        )
-        axes = [axes_obj] if len(family_ids) == 1 else list(axes_obj)
-        legend_ax = None
+    fig, axes_obj = plt.subplots(
+        1, max(1, len(family_ids)), figsize=figsize, sharey=True
+    )
+    axes = [axes_obj] if len(family_ids) == 1 else list(axes_obj)
+    legend_ax = None
     bar_width = 0.34
     x_positions = list(range(len(SEQ_ORDER)))
 
@@ -236,29 +233,41 @@ def render_plot(
                 fontweight="bold",
             )
 
-        ax.set_yscale("log")
-        ymin, ymax = ax.get_ylim()
-        ax.set_ylim(ymin, max(ymax, max(pair_maxima) * 1.45))
+        if y_scale == "log":
+            ax.set_yscale("log")
+            ymin, ymax = ax.get_ylim()
+            ax.set_ylim(ymin, max(ymax, max(pair_maxima) * 1.45))
+        else:
+            ax.set_ylim(0, max(pair_maxima) * 1.18 if pair_maxima else 1.0)
         ax.set_xticks(x_positions)
         ax.set_xticklabels([str(seq_len) for seq_len in SEQ_ORDER], rotation=0)
-        ax.set_xlabel("Context Length (tokens)", fontsize=axis_label_size)
-        ax.set_ylabel("Latency (ms, log scale)", fontsize=axis_label_size)
+        ax.set_xlabel("Sequence Length", fontsize=axis_label_size)
+        ax.set_ylabel(
+            "Latency (ms, log scale)" if y_scale == "log" else "Latency (ms)",
+            fontsize=axis_label_size,
+        )
         ax.set_title(
             family_label(family_patterns),
             loc="left",
             fontsize=family_title_size,
-            pad=12,
+            pad=6,
         )
         ax.grid(True, which="major", axis="y", linewidth=0.8, alpha=0.8)
         ax.grid(True, which="minor", axis="y", linewidth=0.4, alpha=0.35)
         ax.tick_params(axis="both", labelsize=tick_label_size)
+        if ax is not axes[0]:
+            ax.set_ylabel("")
 
     legend_handles = [
         Patch(facecolor=BLOCK_COLORS[label], edgecolor="none", label=label)
         for label in BLOCK_ORDER
     ]
     legend_handles.append(
-        Patch(facecolor=PATTERN_COLOR, edgecolor=PATTERN_EDGE, label="Dataflow Pattern")
+        Patch(
+            facecolor=PATTERN_COLOR,
+            edgecolor=PATTERN_EDGE,
+            label="Hybrid Runlist+Dataflow End-to-End",
+        )
     )
     if legend_ax is not None:
         legend_ax.legend(
@@ -270,25 +279,25 @@ def render_plot(
     else:
         fig.legend(
             handles=legend_handles,
-            loc="lower center",
-            ncol=5,
+            loc="center left",
+            ncol=1,
             frameon=False,
-            bbox_to_anchor=(0.5, 0.01),
+            bbox_to_anchor=(0.87, 0.5),
             fontsize=legend_font_size,
         )
     fig.suptitle(
-        "Aggregate Latency of Blocks Compared to Dataflow Pattern Latency",
+        "Aggregate Latency of Blocks Compared to Hybrid Runlist+Dataflow End-to-End Latency",
         fontsize=suptitle_size,
         fontweight="bold",
         y=title_y,
     )
-    fig.tight_layout(rect=[0, 0.08, 1, 0.93])
+    fig.tight_layout(rect=[0, 0.03, 0.84, 0.92])
     return fig
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Render a stacked comparison of selected dataflow block latencies versus full-pattern latency."
+        description="Render a stacked comparison of selected hybrid block latencies versus full-pattern latency."
     )
     parser.add_argument(
         "--results",
@@ -319,6 +328,12 @@ def parse_args() -> argparse.Namespace:
         default="standard",
         help="Chart layout preset",
     )
+    parser.add_argument(
+        "--y-scale",
+        choices=["log", "linear"],
+        default="log",
+        help="Y-axis scaling mode",
+    )
     return parser.parse_args()
 
 
@@ -326,8 +341,8 @@ def main() -> None:
     args = parse_args()
     pattern_df, block_df = load_plot_rows(args.results, args.tuning)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    fig = render_plot(pattern_df, block_df, variant=args.variant)
-    stem = args.stem or variant_stem(args.variant)
+    fig = render_plot(pattern_df, block_df, variant=args.variant, y_scale=args.y_scale)
+    stem = args.stem or variant_stem(args.variant, args.y_scale)
     png_path = args.output_dir / f"{stem}.png"
     svg_path = args.output_dir / f"{stem}.svg"
     fig.savefig(png_path, dpi=220, bbox_inches="tight")

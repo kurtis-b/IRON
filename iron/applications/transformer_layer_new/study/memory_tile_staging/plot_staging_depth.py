@@ -20,19 +20,19 @@ from iron.applications.transformer_layer_new.study.block.cases import (
 from .select import STAGING_BLOCK_KINDS
 
 BLOCK_LABELS = {
-    "mha_out_proj": "Dataflow Block MHA + Output Projection",
-    "ffn": "Dataflow Block FFN",
+    "mha_out_proj": "Hybrid Block MHA + Output Projection",
+    "ffn": "Hybrid Block FFN",
 }
 FAMILY_LABELS_BY_BLOCK = {
     "mha_out_proj": {
-        "tinybert_512": "Head Dim = 64 / Num Heads = 8",
-        "baseline_768": "Head Dim = 64 / Num Heads = 12",
-        "baseline_1024": "Head Dim = 64 / Num Heads = 16",
+        "tinybert_512": "TinyBERT",
+        "baseline_768": "BERT-Base",
+        "baseline_1024": "BERT-Large",
     },
     "ffn": {
-        "tinybert_512": "Head Dim = 64 / Num Heads = 8 / FFN Dim = 2048",
-        "baseline_768": "Head Dim = 64 / Num Heads = 12 / FFN Dim = 3072",
-        "baseline_1024": "Head Dim = 64 / Num Heads = 16 / FFN Dim = 4096",
+        "tinybert_512": "TinyBERT",
+        "baseline_768": "BERT-Base",
+        "baseline_1024": "BERT-Large",
     },
 }
 SEQ_COLORS = {
@@ -61,12 +61,15 @@ def default_output_dir() -> Path:
     return default_results_csv().parent
 
 
-def variant_stem(block_kind: str, metric: str) -> str:
+def variant_stem(block_kind: str, metric: str, y_scale: str = "log") -> str:
     metric_stem = {
         "latency": "latency_by_staging_depth",
         "speedup": "speedup_by_staging_depth",
     }[metric]
-    return f"{block_kind}_{metric_stem}"
+    stem = f"{block_kind}_{metric_stem}"
+    if metric == "latency" and y_scale == "linear":
+        return f"{stem}_linear"
+    return stem
 
 
 def load_plot_rows(results_csv: Path) -> pd.DataFrame:
@@ -85,13 +88,14 @@ def render_plot(
     *,
     block_kind: str,
     metric: str,
+    y_scale: str = "log",
 ) -> plt.Figure:
     metric_column = {
         "latency": "avg_latency_ms",
         "speedup": "speedup_vs_depth1",
     }[metric]
     metric_label = {
-        "latency": "Latency (ms, log scale)",
+        "latency": "Latency (ms, log scale)" if y_scale == "log" else "Latency (ms)",
         "speedup": "Speedup vs Depth 1",
     }[metric]
     title = {
@@ -179,7 +183,7 @@ def render_plot(
                 markersize=7,
             )
 
-        if metric == "latency":
+        if metric == "latency" and y_scale == "log":
             ax.set_yscale("log")
         ax.set_xticks(all_depths)
         ax.set_xlabel("Staging Depth", fontsize=15)
@@ -188,11 +192,13 @@ def render_plot(
             FAMILY_LABELS_BY_BLOCK[block_kind][family_id],
             loc="left",
             fontsize=18,
-            pad=12,
+            pad=6,
         )
         ax.grid(True, which="major", axis="both", linewidth=0.8, alpha=0.8)
         ax.grid(True, which="minor", axis="y", linewidth=0.4, alpha=0.3)
         ax.tick_params(axis="both", labelsize=12)
+        if ax is not axes[0]:
+            ax.set_ylabel("")
 
     legend_handles = [
         Line2D(
@@ -209,11 +215,11 @@ def render_plot(
     ]
     fig.legend(
         handles=legend_handles,
-        loc="lower center",
-        ncol=min(5, len(legend_handles) or 1),
+        loc="center left",
+        ncol=1,
         frameon=False,
-        bbox_to_anchor=(0.5, 0.01),
-        title="Context Length (tokens)",
+        bbox_to_anchor=(0.87, 0.5),
+        title="Sequence Length",
         fontsize=12,
         title_fontsize=13,
     )
@@ -223,7 +229,7 @@ def render_plot(
         fontweight="bold",
         y=0.98,
     )
-    fig.tight_layout(rect=[0, 0.08, 1, 0.93])
+    fig.tight_layout(rect=[0, 0.03, 0.84, 0.92])
     return fig
 
 
@@ -233,9 +239,10 @@ def write_plot(
     output_path: Path,
     block_kind: str,
     metric: str,
+    y_scale: str = "log",
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig = render_plot(rows, block_kind=block_kind, metric=metric)
+    fig = render_plot(rows, block_kind=block_kind, metric=metric, y_scale=y_scale)
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
 
@@ -275,6 +282,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("latency", "speedup"),
         default=None,
     )
+    parser.add_argument(
+        "--y-scale",
+        choices=("log", "linear"),
+        default="log",
+    )
     return parser.parse_args(argv)
 
 
@@ -286,18 +298,20 @@ def main(argv: list[str] | None = None) -> None:
         write_canonical_plots(args.results, args.output_dir)
         return
 
-    stem = variant_stem(args.block, args.metric)
+    stem = variant_stem(args.block, args.metric, args.y_scale)
     write_plot(
         rows,
         output_path=args.output_dir / f"{stem}.png",
         block_kind=args.block,
         metric=args.metric,
+        y_scale=args.y_scale,
     )
     write_plot(
         rows,
         output_path=args.output_dir / f"{stem}.svg",
         block_kind=args.block,
         metric=args.metric,
+        y_scale=args.y_scale,
     )
 
 

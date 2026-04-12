@@ -16,6 +16,10 @@ from iron.operators.gemm.design_batched import (
     _expand_dma_tap_for_stride_limit,
     my_matmul as batched_gemm_design,
 )
+from iron.operators.gemm.design import (
+    my_matmul as gemm_design,
+    plan_gemm_fill_drain_tasks,
+)
 from iron.operators.gemm.reference import generate_golden_reference
 from iron.common.test_utils import run_test
 
@@ -301,3 +305,81 @@ def test_batched_gemm_design_avoids_oversized_dma_strides_for_large_attn_scores(
     module_text = str(module)
     assert "stride = 12582912" not in module_text
     assert "stride = 4194304" not in module_text
+
+
+def _tap_signature(tap: TensorAccessPattern) -> tuple[object, ...]:
+    return (
+        tuple(tap.tensor_dims),
+        int(tap.offset),
+        tuple(int(value) for value in tap.sizes),
+        tuple(int(value) for value in tap.strides),
+    )
+
+
+def test_plan_gemm_fill_drain_tasks_matches_current_runtime_taps():
+    plan = plan_gemm_fill_drain_tasks(
+        M=512,
+        K=768,
+        N=768,
+        m=64,
+        k=96,
+        n=48,
+        n_aie_cols=8,
+        b_col_maj=False,
+        c_col_maj=False,
+        separate_c_tiles=False,
+    )
+
+    runtime_A_taps, runtime_B_taps, runtime_C_taps = gemm_design(
+        dev="npu2",
+        M=512,
+        K=768,
+        N=768,
+        m=64,
+        k=96,
+        n=48,
+        n_aie_cols=8,
+        dtype_in_str="bf16",
+        dtype_out_str="bf16",
+        b_col_maj=False,
+        c_col_maj=False,
+        use_scalar=False,
+        emulate_bf16_mmul_with_bfp16=True,
+        prio_accuracy=False,
+        separate_c_tiles=False,
+        trace_size=0,
+        archive=None,
+        generate_taps=True,
+    )
+
+    assert [_tap_signature(tap) for tap in runtime_A_taps] == [
+        _tap_signature(tap) for tap in plan.A_taps
+    ]
+    assert [_tap_signature(tap) for tap in runtime_B_taps] == [
+        _tap_signature(tap) for tap in plan.B_taps
+    ]
+    assert [_tap_signature(tap) for tap in runtime_C_taps] == [
+        _tap_signature(tap) for tap in plan.C_taps
+    ]
+
+
+def test_plan_gemm_fill_drain_tasks_records_compute_tile_consumers():
+    plan = plan_gemm_fill_drain_tasks(
+        M=512,
+        K=768,
+        N=768,
+        m=64,
+        k=96,
+        n=48,
+        n_aie_cols=8,
+        b_col_maj=False,
+        c_col_maj=False,
+        separate_c_tiles=False,
+    )
+
+    assert plan.a_fills
+    assert plan.b_fills
+    assert plan.c_drains
+    assert plan.a_fills[0].compute_tiles[0] == (0, 0)
+    assert plan.b_fills[0].compute_tiles[0] == (0, 0)
+    assert plan.c_drains[0].compute_tiles[-1] == (3, 0)

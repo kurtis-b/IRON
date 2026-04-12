@@ -10,12 +10,16 @@ Status: `implemented`
 ## Goal
 
 Compare the ROCm iGPU reference path against the available end-to-end
-NPU `dataflow` rows for the same `(study_case_id, seq_len)`.
+NPU `hybrid` rows for the same `(study_case_id, seq_len)`.
+
+CPU is not part of the canonical host-comparison study.
 
 Compared columns:
 
 - `igpu`
-- `dataflow`
+- `igpu_rocm_smi`
+- `igpu_turbostat_pkgwatt`
+- `hybrid`
 
 ## Dependency
 
@@ -25,7 +29,13 @@ This study depends on completed end-to-end NPU outputs:
 
 It does not re-run NPU patterns. It benchmarks the requested host backend once
 per available `(study_case_id, seq_len)` and then joins those measurements with
-the retained NPU `dataflow` rows.
+the retained NPU `hybrid` rows.
+
+For the iGPU path, throughput is measured once per point. The per-watt outputs
+then reuse that throughput value with two separate power measurements:
+
+- `rocm-smi`
+- `turbostat_pkgwatt`
 
 ## Scheduling
 
@@ -45,8 +55,12 @@ Canonical outputs:
 - `results/host_comparison/effective_gflops_per_watt_comparison.svg`
 - `results/host_comparison/fairness_repeatability.csv`
 
-The comparison CSV keeps one row per `(study_case_id, seq_len, metric)` and
-uses the columns `igpu` and `dataflow`.
+The comparison CSV keeps one row per `(study_case_id, seq_len, metric)`.
+The throughput row uses `igpu` and `hybrid`, and the per-watt row uses
+`igpu_rocm_smi`, `igpu_turbostat_pkgwatt`, and `hybrid`.
+
+The fairness summary remains one row for the iGPU backend. It does not duplicate
+rows by power backend.
 
 ## Entry Points
 

@@ -13,6 +13,7 @@ def _chunked_attention(
     *,
     scale: float,
     query_block_size: int,
+    is_causal: bool,
 ) -> torch.Tensor:
     blocks: list[torch.Tensor] = []
     k_t = k.transpose(-1, -2)
@@ -20,12 +21,24 @@ def _chunked_attention(
         end = min(start + query_block_size, q.shape[1])
         q_block = q[:, start:end, :]
         scores = torch.matmul(q_block, k_t) * scale
+        if is_causal:
+            q_positions = torch.arange(
+                start,
+                end,
+                device=scores.device,
+            ).unsqueeze(1)
+            kv_positions = torch.arange(
+                k.shape[1],
+                device=scores.device,
+            ).unsqueeze(0)
+            causal_mask = kv_positions > q_positions
+            scores = scores.masked_fill(causal_mask.unsqueeze(0), float("-inf"))
         probs = torch.softmax(scores, dim=-1)
         blocks.append(torch.matmul(probs, v))
     return torch.cat(blocks, dim=1)
 
 
-def generate_golden_reference(heads=1, seq_len=256, d=64, seed=42):
+def generate_golden_reference(heads=1, seq_len=256, d=64, seed=42, is_causal=False):
     torch.manual_seed(seed)
     val_range = 4
 
@@ -47,6 +60,7 @@ def generate_golden_reference(heads=1, seq_len=256, d=64, seed=42):
             v.to(torch.float32),
             scale=scale,
             query_block_size=256,
+            is_causal=is_causal,
         ).to(torch.bfloat16)
     else:
         attention = torch.nn.functional.scaled_dot_product_attention(
@@ -54,7 +68,7 @@ def generate_golden_reference(heads=1, seq_len=256, d=64, seed=42):
             k,
             v,
             dropout_p=0.0,
-            is_causal=False,
+            is_causal=is_causal,
             scale=scale,
         )
     attention = attention.transpose(0, 1).contiguous().view(seq_len, embed_sz)

@@ -19,19 +19,45 @@ TEST_BERT = True
 
 def generate_test_params(extensive=False):
     if TEST_BERT:
-        params = [
-            # seq_len, head_dim, num_heads, parallel_seq, q_seq_tile, kv_seq_tile, emb_tile, parallel_heads, o_proj_acc_depth
-            (64, 64, 3, 1, 32, 64, 64, 1, 1),
-            (128, 64, 12, 1, 32, 64, 64, 1, 1),
-            (512, 64, 12, 1, 32, 64, 64, 1, 6),
-            (512, 64, 12, 1, 32, 64, 64, 6, 1),
-            (128, 64, 12, 4, 32, 64, 64, 1, 1),
-            (512, 64, 12, 2, 32, 64, 64, 1, 6),
-            (512, 64, 12, 8, 32, 64, 64, 1, 1),
-            # TinyBERT-6L-512
-            (512, 64, 8, 8, 32, 64, 64, 1, 8),
-            (512, 64, 8, 8, 64, 64, 64, 1, 8),
-        ]
+        base_params_by_causal = {
+            False: [
+                # seq_len, head_dim, num_heads, q_seq_tile, kv_seq_tile, emb_tile, parallel_seq, parallel_heads, o_proj_acc_depth
+                (64, 64, 3, 64, 64, 64, 1, 1, 1),
+                (64, 64, 12, 64, 64, 64, 1, 1, 1),
+                (64, 64, 12, 64, 64, 64, 1, 1, 6),
+                (128, 64, 12, 64, 64, 64, 1, 1, 1),
+                (128, 64, 12, 64, 64, 64, 1, 1, 2),
+                (128, 64, 12, 64, 64, 64, 2, 1, 1),
+                (256, 64, 12, 64, 64, 64, 1, 1, 1),
+                (256, 64, 12, 64, 64, 64, 1, 1, 4),
+                (512, 64, 12, 64, 64, 64, 1, 1, 6),
+                (512, 64, 12, 64, 64, 64, 1, 6, 1),
+                (512, 64, 12, 64, 64, 64, 2, 1, 6),
+                (512, 64, 12, 64, 64, 64, 8, 1, 1),
+                (512, 64, 12, 64, 64, 64, 8, 1, 6),
+                (512, 64, 12, 32, 64, 96, 8, 1, 8),
+                # TinyBERT-6L-512
+                (512, 64, 8, 64, 64, 64, 8, 1, 8),
+                (512, 64, 8, 64, 64, 64, 8, 1, 8),
+            ],
+            True: [
+                (64, 64, 3, 64, 64, 64, 1, 1, 1),
+                (64, 64, 12, 64, 64, 96, 1, 6, 8),
+                (128, 64, 12, 64, 64, 64, 1, 1, 1),
+                (128, 64, 12, 64, 64, 64, 2, 1, 1),
+                (128, 64, 16, 32, 32, 128, 2, 1, 8),
+                (512, 64, 12, 64, 64, 64, 1, 1, 6),
+                (512, 64, 12, 64, 64, 64, 1, 6, 1),
+                (512, 64, 12, 64, 64, 64, 2, 1, 6),
+                (512, 64, 12, 64, 64, 64, 8, 1, 1),
+                # TinyBERT-6L-512
+                (512, 64, 8, 64, 64, 64, 8, 1, 8),
+            ],
+        }
+        params = []
+        for is_causal in (False, True):
+            for base_param in base_params_by_causal[is_causal]:
+                params.append((*base_param, is_causal))
         extensive_params = []
     else:
         params = []
@@ -45,17 +71,19 @@ def generate_test_params(extensive=False):
         seq_len,
         head_dim,
         num_heads,
-        parallel_seq,
         q_seq_tile,
         kv_seq_tile,
         emb_tile,
+        parallel_seq,
         parallel_heads,
         o_proj_acc_depth,
+        is_causal,
     ) in params:
+        causal_suffix = "causal" if is_causal else "noncausal"
         names.append(
             f"mha_out_proj_{seq_len}seq_{head_dim}hdim_{num_heads}heads_"
-            f"ps{parallel_seq}_{q_seq_tile}q_{kv_seq_tile}kv_{emb_tile}e_"
-            f"ph{parallel_heads}_acc{o_proj_acc_depth}"
+            f"{q_seq_tile}q_{kv_seq_tile}kv_{emb_tile}e_ps{parallel_seq}_"
+            f"ph{parallel_heads}_acc{o_proj_acc_depth}_{causal_suffix}"
         )
 
     return params, names
@@ -78,52 +106,56 @@ all_params = [
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "seq_len,head_dim,num_heads,parallel_seq,q_seq_tile,kv_seq_tile,emb_tile,parallel_heads,o_proj_acc_depth",
+    "seq_len,head_dim,num_heads,q_seq_tile,kv_seq_tile,emb_tile,parallel_seq,parallel_heads,o_proj_acc_depth,is_causal",
     all_params,
 )
 def test_mha_out_proj(
     seq_len,
     head_dim,
     num_heads,
-    parallel_seq,
     q_seq_tile,
     kv_seq_tile,
     emb_tile,
+    parallel_seq,
     parallel_heads,
     o_proj_acc_depth,
+    is_causal,
     aie_context,
 ):
     logging.debug(
         "Testing MHA out projection with seq_len=%s head_dim=%s num_heads=%s "
-        "parallel_seq=%s q_seq_tile=%s kv_seq_tile=%s emb_tile=%s "
-        "parallel_heads=%s o_proj_acc_depth=%s",
+        "q_seq_tile=%s kv_seq_tile=%s emb_tile=%s parallel_seq=%s "
+        "parallel_heads=%s o_proj_acc_depth=%s is_causal=%s",
         seq_len,
         head_dim,
         num_heads,
-        parallel_seq,
         q_seq_tile,
         kv_seq_tile,
         emb_tile,
+        parallel_seq,
         parallel_heads,
         o_proj_acc_depth,
+        is_causal,
     )
 
     golden_ref = generate_golden_reference(
         heads=num_heads,
         seq_len=seq_len,
         d=head_dim,
+        is_causal=is_causal,
     )
 
     operator = AIEMHAOutProj(
         num_heads=num_heads,
         seq_len=seq_len,
         d=head_dim,
-        parallel_seq=parallel_seq,
         q_seq_tile=q_seq_tile,
         kv_seq_tile=kv_seq_tile,
         emb_tile=emb_tile,
+        parallel_seq=parallel_seq,
         parallel_heads=parallel_heads,
         o_proj_acc_depth=o_proj_acc_depth,
+        is_causal=is_causal,
         context=aie_context,
     )
 

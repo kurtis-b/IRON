@@ -15,6 +15,14 @@
 #define SCALE_VECTOR_LENGTH VECTOR_LENGTH
 #endif
 
+#ifndef B_Q_TILE
+#define B_Q_TILE VECTOR_LENGTH
+#endif
+
+#ifndef B_KV_TILE
+#define B_KV_TILE VECTOR_LENGTH
+#endif
+
 #define ROUNDING_MODE aie::rounding_mode::conv_even
 
 extern "C" {
@@ -109,13 +117,23 @@ void partial_softmax_bf16(bfloat16 *input,
 void passThroughLine(int32_t *in, int32_t *out, int32_t lineWidth);
 void zero_bf16(bfloat16 *buffer);
 
+static inline bool is_future_causal_block(const int32_t *idx_buffer, const int32_t B_q, const int32_t B_kv)
+{
+    const int32_t kv_block_idx = idx_buffer[0];
+    const int32_t q_block_idx = idx_buffer[1];
+    const int32_t q_block_start = q_block_idx * B_q;
+    const int32_t q_block_end = q_block_start + B_q - 1;
+    const int32_t kv_block_start = kv_block_idx * B_kv;
+    return kv_block_start > q_block_end;
+}
+
 void matmul_bf16_bf16_wrapper(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, int32_t *idx_buffer)
 {
 
     ::aie::set_rounding(ROUNDING_MODE);
 
 #if IS_CAUSAL
-    if (idx_buffer[0] > idx_buffer[1]) {
+    if (is_future_causal_block(idx_buffer, B_Q_TILE, B_KV_TILE)) {
         return;
     }
 #endif
@@ -142,30 +160,12 @@ void matmul_PV(bfloat16 *Q,
     ::aie::set_rounding(ROUNDING_MODE);
 
 #if IS_CAUSAL
-    if (idx_buffer[0] > idx_buffer[1]) {
+    if (is_future_causal_block(idx_buffer, B_q, B_KV_TILE)) {
         return;
     }
 #endif
 
-#if DEBUG == 0 && IS_CAUSAL
-    using Vec8bf16 = aie::vector<bfloat16, 8>;
-    if (first_iter != 0) {
-        for (int32_t l = 0; l < 8; l++) {
-            Vec8bf16 scale_row = aie::load_v<8>(scale_buffer + 3 * B_q + l * 8);
-
-            for (int32_t k = 0; k < 8; k++) {
-                bfloat16 scale_val = scale_row[k];
-                Vec8bf16 scale_vec = aie::broadcast<bfloat16, 8>(scale_val);
-
-                for (int32_t j = 0; j < 8; j++) {
-                    Vec8bf16 o_vec = aie::load_v<8>(out + j * 64 + k * 8 + l * 512);
-                    o_vec = aie::mul(o_vec, scale_vec);
-                    aie::store_v(out + j * 64 + k * 8 + l * 512, o_vec);
-                }
-            }
-        }
-    }
-#elif DEBUG == 0 || DEBUG == 1
+#if DEBUG == 0 || DEBUG == 1
     if (first_iter != 0) {
         scale_O_tile_rows(out, scale_buffer, 3 * B_q, B_q);
     }
@@ -186,23 +186,7 @@ void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_bu
         aie::store_v(scale_buffer + 2 * B_q + i, l_vec);
     }
 
-#if DEBUG == 0 && IS_CAUSAL
-    using Vec8bf16 = aie::vector<bfloat16, 8>;
-    for (int32_t l = 0; l < 8; l++) {
-        Vec8bf16 scale_row = aie::load_v<8>(scale_buffer + 2 * B_q + l * 8);
-
-        for (int32_t k = 0; k < 8; k++) {
-            bfloat16 scale_val = scale_row[k];
-            Vec8bf16 scale_vec = aie::broadcast<bfloat16, 8>(scale_val);
-
-            for (int32_t j = 0; j < 8; j++) {
-                Vec8bf16 o_vec = aie::load_v<8>(O + j * 64 + k * 8 + l * 512);
-                o_vec = aie::mul(o_vec, scale_vec);
-                aie::store_v(O + j * 64 + k * 8 + l * 512, o_vec);
-            }
-        }
-    }
-#elif DEBUG == 0 || DEBUG == 1
+#if DEBUG == 0 || DEBUG == 1
     scale_O_tile_rows(O, scale_buffer, 2 * B_q, B_q);
 #else
     copy_O_tile_rows(O, B_q);
@@ -226,9 +210,14 @@ void partial_softmax(bfloat16 *A,
     int32_t q_block_idx = idx_buffer[1];
     int32_t kv_block_idx = idx_buffer[0];
 
-    // Causal full mask: skip blocks strictly above diagonal
+    int32_t q_block_start = q_block_idx * B_q;
+    int32_t kv_block_start = kv_block_idx * B_kv;
+
+    // Causal full mask: skip blocks whose first KV position is already beyond
+    // the final valid query position in this block.
 #if IS_CAUSAL
-    if (kv_block_idx > q_block_idx) {
+    int32_t q_block_end = q_block_start + B_q - 1;
+    if (kv_block_start > q_block_end) {
         zero_bf16(P);
         return;
     }
@@ -277,19 +266,23 @@ void partial_softmax(bfloat16 *A,
         }
     }
 
-    // Diagonal small causal mask only within valid region (vectorized)
+    // Generic causal mask in global coordinates so it also works when
+    // B_q != B_kv. Each query row i may only see keys <= q_block_start + i.
 #if IS_CAUSAL
-    if (kv_block_idx == q_block_idx) {
+    {
         using Vec64bf16 = aie::vector<bfloat16, VECTOR_LENGTH>;
         Vec64bf16 lowest_vec = aie::broadcast<bfloat16, VECTOR_LENGTH>(std::numeric_limits<bfloat16>::lowest());
         for (int32_t i = 0; i < valid_q_rows; i++) {
-            int32_t j = i + 1;
+            int32_t first_invalid_local_col = q_block_start + i + 1 - kv_block_start;
+            if (first_invalid_local_col < 0)
+                first_invalid_local_col = 0;
+            if (first_invalid_local_col > valid_kv_cols)
+                first_invalid_local_col = valid_kv_cols;
+            int32_t j = first_invalid_local_col;
             if (j < valid_kv_cols) {
-                // Vectorized stores for upper triangle within valid_kv_cols
                 for (; j + VECTOR_LENGTH <= valid_kv_cols; j += VECTOR_LENGTH) {
                     aie::store_v(A + i * B_kv + j, lowest_vec);
                 }
-                // Remainder
                 for (; j < valid_kv_cols; ++j) {
                     A[i * B_kv + j] = std::numeric_limits<bfloat16>::lowest();
                 }
