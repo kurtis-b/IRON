@@ -91,13 +91,11 @@ void layer_norm_rows(const T *restrict input, T *restrict output, int32_t cols, 
 }
 
 template <typename T, int N>
-void add_layer_norm_rows(
-    const T *restrict input1,
-    const T *restrict input2,
-    T *restrict output,
-    int32_t cols,
-    int32_t rows_to_process
-)
+void add_layer_norm_rows(const T *restrict input1,
+                         const T *restrict input2,
+                         T *restrict output,
+                         int32_t cols,
+                         int32_t rows_to_process)
 {
     event0();
     constexpr float epsilon = 1e-5f;
@@ -206,21 +204,9 @@ void layer_norm_rows(bfloat16 *input, bfloat16 *output, int32_t cols, int32_t ro
     layer_norm_rows<bfloat16, 16>(input, output, cols, rows_to_process);
 }
 
-void add_layer_norm_rows(
-    bfloat16 *input1,
-    bfloat16 *input2,
-    bfloat16 *output,
-    int32_t cols,
-    int32_t rows_to_process
-)
+void add_layer_norm_rows(bfloat16 *input1, bfloat16 *input2, bfloat16 *output, int32_t cols, int32_t rows_to_process)
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
-    add_layer_norm_rows<bfloat16, 16>(
-        input1,
-        input2,
-        output,
-        cols,
-        rows_to_process
-    );
+    add_layer_norm_rows<bfloat16, 16>(input1, input2, output, cols, rows_to_process);
 }
 }
