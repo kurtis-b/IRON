@@ -1002,12 +1002,42 @@
       ],
       "k_transpose": [
         {
-          "candidate_id": "transpose_seq512_alt",
+          "candidate_id": "transpose_512_8c2ch_64x96",
           "config": {
             "num_aie_columns": 8,
-            "num_channels": 1,
+            "num_channels": 2,
             "m": 64,
-            "n": 32,
+            "n": 96,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_512_6c2ch_64x128",
+          "config": {
+            "num_aie_columns": 6,
+            "num_channels": 2,
+            "m": 64,
+            "n": 128,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_512_6c2ch_64x64",
+          "config": {
+            "num_aie_columns": 6,
+            "num_channels": 2,
+            "m": 64,
+            "n": 64,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_512_4c2ch_64x96",
+          "config": {
+            "num_aie_columns": 4,
+            "num_channels": 2,
+            "m": 64,
+            "n": 96,
             "s": 8
           }
         }
@@ -1027,12 +1057,32 @@
       ],
       "k_transpose": [
         {
-          "candidate_id": "transpose_seq1024_main",
+          "candidate_id": "transpose_1024_8c2ch_64x96",
           "config": {
             "num_aie_columns": 8,
             "num_channels": 2,
             "m": 64,
-            "n": 32,
+            "n": 96,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_1024_6c2ch_64x128",
+          "config": {
+            "num_aie_columns": 6,
+            "num_channels": 2,
+            "m": 64,
+            "n": 128,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_1024_4c2ch_64x96",
+          "config": {
+            "num_aie_columns": 4,
+            "num_channels": 2,
+            "m": 64,
+            "n": 96,
             "s": 8
           }
         }
@@ -1052,12 +1102,32 @@
       ],
       "k_transpose": [
         {
-          "candidate_id": "transpose_seq2048_main",
+          "candidate_id": "transpose_2048_8c2ch_64x96",
           "config": {
             "num_aie_columns": 8,
             "num_channels": 2,
             "m": 64,
-            "n": 32,
+            "n": 96,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_2048_6c2ch_64x128",
+          "config": {
+            "num_aie_columns": 6,
+            "num_channels": 2,
+            "m": 64,
+            "n": 128,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_2048_4c2ch_64x96",
+          "config": {
+            "num_aie_columns": 4,
+            "num_channels": 2,
+            "m": 64,
+            "n": 96,
             "s": 8
           }
         }
@@ -1077,12 +1147,32 @@
       ],
       "k_transpose": [
         {
-          "candidate_id": "transpose_seq4096_main",
+          "candidate_id": "transpose_4096_8c2ch_64x96",
           "config": {
             "num_aie_columns": 8,
             "num_channels": 2,
             "m": 64,
-            "n": 32,
+            "n": 96,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_4096_6c2ch_64x128",
+          "config": {
+            "num_aie_columns": 6,
+            "num_channels": 2,
+            "m": 64,
+            "n": 128,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_4096_4c2ch_64x96",
+          "config": {
+            "num_aie_columns": 4,
+            "num_channels": 2,
+            "m": 64,
+            "n": 96,
             "s": 8
           }
         }
@@ -1111,12 +1201,32 @@
       ],
       "k_transpose": [
         {
-          "candidate_id": "transpose_seq8192_main",
+          "candidate_id": "transpose_8192_8c2ch_64x96",
           "config": {
             "num_aie_columns": 8,
             "num_channels": 2,
             "m": 64,
-            "n": 32,
+            "n": 96,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_8192_6c2ch_64x128",
+          "config": {
+            "num_aie_columns": 6,
+            "num_channels": 2,
+            "m": 64,
+            "n": 128,
+            "s": 8
+          }
+        },
+        {
+          "candidate_id": "transpose_8192_4c2ch_64x96",
+          "config": {
+            "num_aie_columns": 4,
+            "num_channels": 2,
+            "m": 64,
+            "n": 96,
             "s": 8
           }
         }
@@ -1677,6 +1787,48 @@
         }
       ]
     },
+    "1024": {
+      "k_transpose": [
+        {
+          "candidate_id": "transpose_1024_64x128_2ch",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "m": 64,
+            "n": 128,
+            "s": 8
+          }
+        }
+      ]
+    },
+    "2048": {
+      "k_transpose": [
+        {
+          "candidate_id": "transpose_2048_64x128_2ch",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "m": 64,
+            "n": 128,
+            "s": 8
+          }
+        }
+      ]
+    },
+    "4096": {
+      "k_transpose": [
+        {
+          "candidate_id": "transpose_4096_64x128_2ch",
+          "config": {
+            "num_aie_columns": 8,
+            "num_channels": 2,
+            "m": 64,
+            "n": 128,
+            "s": 8
+          }
+        }
+      ]
+    },
     "8192": {
       "qkvo_proj": [
         {
@@ -1700,12 +1852,12 @@
       ],
       "k_transpose": [
         {
-          "candidate_id": "transpose_seq8192_main",
+          "candidate_id": "transpose_8192_64x128_2ch",
           "config": {
             "num_aie_columns": 8,
             "num_channels": 2,
             "m": 64,
-            "n": 32,
+            "n": 128,
             "s": 8
           }
         }

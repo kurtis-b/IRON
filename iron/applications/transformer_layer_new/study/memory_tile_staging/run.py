@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ..npu_runtime_checks import warn_if_npu_power_mode_not_turbo
 from ..run_lock import default_lock_path, hold_study_lock
-from iron.applications.transformer_layer_new.study.block.cases import (
+from iron.applications.transformer_layer_new.study.end_to_end.cases import (
     FAMILY_IDS,
     SEQUENCE_LADDER,
 )
@@ -243,10 +243,22 @@ def load_existing_rows(
 
 
 def _selection_descriptor(selection: ReferenceSelection) -> str:
+    benchmark_block_kind = selection.benchmark_block_kind or selection.block_kind
     return (
         f"{selection.family_id} seq_len={selection.seq_len} "
         f"block={selection.block_kind}"
+        + (
+            f" benchmark_block={benchmark_block_kind}"
+            if benchmark_block_kind != selection.block_kind
+            else ""
+        )
     )
+
+
+def _normalized_config_value(value: object) -> str:
+    if value in (None, "", "None"):
+        return ""
+    return str(value)
 
 
 def build_selection_rows(
@@ -305,8 +317,8 @@ def build_selection_rows(
             and str(existing_row.get("run_status") or "") == "passed"
         ):
             if all(
-                str(existing_row.get(column, ""))
-                == str(expected_config.get(column, ""))
+                _normalized_config_value(existing_row.get(column, ""))
+                == _normalized_config_value(expected_config.get(column, ""))
                 for column in CONFIG_COLUMNS_BY_BLOCK_KIND[selection.block_kind]
             ):
                 LOGGER.info(
@@ -324,7 +336,7 @@ def build_selection_rows(
             resolved_timed_iters,
         )
         result = benchmark_candidate(
-            selection.block_kind,
+            selection.benchmark_block_kind or selection.block_kind,
             selection.workload,
             candidate,
             warmup_iters=resolved_warmup_iters,
@@ -482,6 +494,12 @@ def main(argv: list[str] | None = None) -> int:
             seq_len_filter=str(args.seq_len),
             block_filter=str(args.block),
         )
+        allowed_seq_lens = set(STAGING_SEQUENCE_LENGTHS)
+        selections = [
+            selection
+            for selection in selections
+            if selection.seq_len in allowed_seq_lens
+        ]
         row_map: dict[tuple[str, int, str, int], dict[str, object]] = dict(
             existing_rows
         )

@@ -78,6 +78,12 @@ class AIEQKVProj(AIEOperatorBase):
             f"qkv_proj_{self.tile_m}x{self.tile_k}x{self.tile_n}_0_0_bf16_bf16"
             "_sc0_acc0_embf161_round1.a"
         )
+        mm_rename_symbols = {
+            "matmul_bf16_bf16": "matmul_bf16_bf16_qkv_proj",
+            "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_qkv_proj",
+            "zero_bf16": "zero_bf16_qkv_proj",
+            "zero_scalar_bf16": "zero_scalar_bf16_qkv_proj",
+        }
         kernel_flags = [
             f"-DDIM_M={self.tile_m}",
             f"-DDIM_K={self.tile_k}",
@@ -130,6 +136,7 @@ class AIEQKVProj(AIEOperatorBase):
                                     base_dir / "aie_kernels" / "aie2p" / "mm.cc"
                                 )
                             ],
+                            rename_symbols=mm_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
                             "zero_scalar.o",

@@ -12,7 +12,7 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
 
-from iron.applications.transformer_layer_new.study.block.cases import (
+from iron.applications.transformer_layer_new.study.end_to_end.cases import (
     FAMILY_IDS,
     SEQUENCE_LADDER,
 )
@@ -28,11 +28,15 @@ FAMILY_LABELS_BY_BLOCK = {
         "tinybert_512": "TinyBERT",
         "baseline_768": "BERT-Base",
         "baseline_1024": "BERT-Large",
+        "gpt2_small_768": "GPT-2 Small",
+        "gpt2_medium_1024": "GPT-2 Medium",
     },
     "ffn": {
         "tinybert_512": "TinyBERT",
         "baseline_768": "BERT-Base",
         "baseline_1024": "BERT-Large",
+        "gpt2_small_768": "GPT-2 Small",
+        "gpt2_medium_1024": "GPT-2 Medium",
     },
 }
 SEQ_COLORS = {

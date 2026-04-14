@@ -189,7 +189,7 @@ def reusable_existing_row(
     )
     if row is None:
         return None
-    if str(row.get("run_status") or "") not in ("passed", "failed_exception"):
+    if str(row.get("run_status") or "") != "passed":
         return None
     if int(float(str(row.get("warmup_runs") or 0))) != int(warmup_runs):
         return None
@@ -566,7 +566,8 @@ def build_rows(
                     operator_config=operator_config,
                     scope_key_override=(
                         f"staginggrp_{selected_row.workload_variant}_"
-                        f"{selected_row.study_case_id}_{block_kind}"
+                        f"{selected_row.study_case_id}_{selected_row.seq_len}_"
+                        f"{block_kind}_d{staging_depth}"
                     ),
                 )
                 rows.append(

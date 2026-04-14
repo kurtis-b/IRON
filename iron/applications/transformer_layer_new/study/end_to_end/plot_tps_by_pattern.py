@@ -12,11 +12,19 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
 
-FAMILY_ORDER = ["tinybert_512", "baseline_768", "baseline_1024"]
+FAMILY_ORDER = [
+    "tinybert_512",
+    "baseline_768",
+    "baseline_1024",
+    "gpt2_small_768",
+    "gpt2_medium_1024",
+]
 FAMILY_LABELS = {
     "tinybert_512": "TinyBERT",
     "baseline_768": "BERT-Base",
     "baseline_1024": "BERT-Large",
+    "gpt2_small_768": "GPT-2 Small",
+    "gpt2_medium_1024": "GPT-2 Medium",
 }
 MODE_ORDER = ["hybrid", "runlist"]
 SEQ_ORDER = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
@@ -66,7 +74,7 @@ def variant_stem(metric: str, variant: str, y_scale: str = "log") -> str:
 
 def family_label(results_rows: pd.DataFrame) -> str:
     sample = results_rows.iloc[0]
-    return FAMILY_LABELS[str(sample["study_case_id"])]
+    return FAMILY_LABELS.get(str(sample["study_case_id"]), str(sample["study_case_id"]))
 
 
 def load_plot_rows(results_csv: Path) -> pd.DataFrame:
@@ -110,7 +118,7 @@ def render_plot(
     }[metric]
     if variant == "slides":
         context = "poster"
-        figsize = (22, 8.5)
+        figsize = (34, 8.5)
         family_title_size = 20
         axis_label_size = 18
         tick_label_size = 14
@@ -119,7 +127,7 @@ def render_plot(
         title_y = 0.965
     else:
         context = "talk"
-        figsize = (20, 8)
+        figsize = (30, 8)
         family_title_size = 18
         axis_label_size = 15
         tick_label_size = 12
@@ -210,7 +218,7 @@ def render_plot(
             loc="center left",
             ncol=1,
             frameon=False,
-            bbox_to_anchor=(0.87, 0.5),
+            bbox_to_anchor=(0.91, 0.5),
             fontsize=legend_font_size,
         )
     fig.suptitle(
@@ -219,7 +227,7 @@ def render_plot(
         fontweight="bold",
         y=title_y,
     )
-    fig.tight_layout(rect=[0, 0.03, 0.84, 0.92])
+    fig.tight_layout(rect=[0, 0.03, 0.89, 0.92])
     return fig
 
 

@@ -348,12 +348,12 @@ def my_matmul(
         [C_up_proj_l1_ty, B_down_proj_l1_ty, C_down_proj_l1_ty, C_down_proj_l1_ty],
     )
     mem_copy_fcn = Kernel(
-        "passThroughLine",
+        "passThroughLine_ffn",
         archive_name,
         [C_down_proj_l1_ty, C_down_proj_l1_ty, np.int32],
     )
     eltwise_add_vector = Kernel(
-        "eltwise_add_bf16_vector",
+        "eltwise_add_bf16_vector_ffn",
         archive_name,
         [C_down_proj_l1_ty, C_down_proj_l1_ty, C_down_proj_l1_ty, np.int32],
     )

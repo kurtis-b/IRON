@@ -39,14 +39,14 @@ class AIEMHAOutProj(AIEOperatorBase):
         context=None,
         skip_add_to_list=False,
     ):
-        if is_causal and q_seq_tile != kv_seq_tile:
-            raise AIEOperatorConstraintError(
-                "AIEMHAOutProj: causal masking currently requires q_seq_tile == kv_seq_tile"
-            )
         if is_causal and seq_len % (parallel_seq * q_seq_tile) != 0:
             raise AIEOperatorConstraintError(
                 "AIEMHAOutProj: causal masking currently requires "
                 "seq_len to be divisible by parallel_seq * q_seq_tile"
+            )
+        if is_causal and q_seq_tile != kv_seq_tile:
+            raise AIEOperatorConstraintError(
+                "AIEMHAOutProj: causal masking currently requires q_seq_tile == kv_seq_tile"
             )
 
         self.num_heads = num_heads

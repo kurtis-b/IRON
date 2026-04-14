@@ -188,6 +188,46 @@ def test_candidate_table_covers_every_operator_for_every_mode():
         )
 
 
+def test_baseline_768_runlist_long_k_transpose_uses_large_tile_candidates():
+    payloads = load_default_candidate_payloads()
+    table = candidate_table_for_case("baseline_768", 512, payloads=payloads)
+    candidates = table["runlist"]["k_transpose"]
+
+    assert [candidate["candidate_id"] for candidate in candidates] == [
+        "transpose_512_8c2ch_64x96",
+        "transpose_512_6c2ch_64x128",
+        "transpose_512_6c2ch_64x64",
+        "transpose_512_4c2ch_64x96",
+    ]
+
+
+def test_baseline_1024_runlist_uses_64x128_k_transpose_for_long_sequences():
+    payloads = load_default_candidate_payloads()
+    table = candidate_table_for_case("baseline_1024", 1024, payloads=payloads)
+    candidate = table["runlist"]["k_transpose"][0]
+
+    assert candidate["candidate_id"] == "transpose_1024_64x128_2ch"
+    assert candidate["config"] == {
+        "num_aie_columns": 8,
+        "num_channels": 2,
+        "m": 64,
+        "n": 128,
+        "s": 8,
+    }
+
+
+def test_removed_runlist_manifest_prunes_bad_baseline_768_long_4c_transpose():
+    payloads = load_default_candidate_payloads()
+    table = candidate_table_for_case("baseline_768", 1024, payloads=payloads)
+
+    assert [
+        candidate["candidate_id"] for candidate in table["runlist"]["k_transpose"]
+    ] == [
+        "transpose_1024_8c2ch_64x96",
+        "transpose_1024_6c2ch_64x128",
+    ]
+
+
 def test_decoder_runlist_attn_scores_uses_row_batched_k_transpose_layout():
     resolved = resolve_runlist_operator_config(
         64,
@@ -623,9 +663,10 @@ def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
     ):
         assert execution_mode == "hybrid"
         assert power_backend == "none"
-        assert (
-            kwargs["scope_key_override"] == "staginggrp_encoder_bert_baseline_768_ffn"
-        )
+        assert kwargs["scope_key_override"] in {
+            "staginggrp_encoder_bert_baseline_768_512_ffn_d1",
+            "staginggrp_encoder_bert_baseline_768_512_ffn_d2",
+        }
         assert "scope_suffix" not in kwargs or kwargs["scope_suffix"] is None
         depth = int(operator_config["ffn"]["down_proj_depth"])
         return {
@@ -804,6 +845,124 @@ def test_staging_ablation_rows_reuse_matching_existing_row(tmp_path):
 
     assert len(rows) == 2
     assert {row["avg_latency_ms"] for row in rows} == {"16.0", "8.0"}
+
+
+def test_staging_ablation_does_not_reuse_failed_exception_rows(tmp_path):
+    results_input = tmp_path / "end_to_end.csv"
+    staging_results = tmp_path / "staging.csv"
+    result_row = _result_row("hybrid", seq_len="512", avg_latency_ms="8.0")
+    result_row["selected_candidate_ids_json"] = json.dumps(
+        {"mha_out_proj": "mha_0", "ffn": "ffn_0"},
+        sort_keys=True,
+    )
+    selected_config = {
+        "qkv_proj": {"parallel_seq": 4},
+        "mha_out_proj": {
+            "parallel_seq": 2,
+            "q_seq_tile": 32,
+            "kv_seq_tile": 64,
+            "emb_tile": 96,
+            "parallel_heads": 4,
+            "o_proj_acc_depth": 2,
+        },
+        "add_norm1": {"tile_size": 768},
+        "ffn": {
+            "tile_m": 16,
+            "tile_k": 96,
+            "tile_n": 96,
+            "down_proj_depth": 4,
+        },
+        "add_norm2": {"tile_size": 768},
+    }
+    result_row["selected_config_json"] = json.dumps(selected_config, sort_keys=True)
+    _write_csv(results_input, [result_row])
+    _write_csv(
+        staging_results,
+        [
+            {
+                "family_id": "baseline_768",
+                "seq_len": "512",
+                "block_kind": "ffn",
+                "staging_depth": "1",
+                "avg_latency_ms": "4.0",
+                "run_status": "passed",
+            },
+            {
+                "family_id": "baseline_768",
+                "seq_len": "512",
+                "block_kind": "ffn",
+                "staging_depth": "4",
+                "avg_latency_ms": "2.0",
+                "run_status": "passed",
+            },
+        ],
+    )
+
+    failed_config = dict(selected_config)
+    failed_config["ffn"] = dict(selected_config["ffn"])
+    failed_config["ffn"]["down_proj_depth"] = 1
+    failed_row = {
+        "study_id": "end_to_end_staging_ablation",
+        "study_case_id": "baseline_768",
+        "study_case_label": "baseline_768",
+        "workload_variant": "encoder_bert",
+        "execution_mode": "hybrid",
+        "seq_len": "512",
+        "hidden_size": "768",
+        "intermediate_size": "3072",
+        "num_attention_heads": "12",
+        "attention_head_size": "64",
+        "block_kind": "ffn",
+        "source_staging_depth": "4",
+        "staging_depth": "1",
+        "warmup_runs": "1",
+        "runs_per_sample": "5",
+        "avg_latency_ms": "99.0",
+        "compile_setup_time_ms": "1.0",
+        "effective_gflops_per_sec": "100.0",
+        "speedup_vs_source_depth": "0.25",
+        "speedup_vs_depth1": "1.0",
+        "validation_error_count": "0",
+        "run_status": "failed_exception",
+        "failure_message": "stale failure",
+        "selected_candidate_ids_json": json.dumps(
+            {"mha_out_proj": "mha_0", "ffn": "ffn_0"},
+            sort_keys=True,
+        ),
+        "selected_config_json": json.dumps(failed_config, sort_keys=True),
+        "is_best_depth": "False",
+    }
+    benchmark_calls = []
+
+    def fake_benchmark(*args, **kwargs):
+        benchmark_calls.append(1)
+        return {
+            "avg_latency_ms": 7.0,
+            "compile_setup_time_ms": 1.0,
+            "effective_gflops_per_sec": 101.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    rows = build_staging_rows(
+        results_input=results_input,
+        staging_results=staging_results,
+        workload_variant_filter="all",
+        family_filter="all",
+        seq_len_filter="all",
+        block_filter="ffn",
+        warmup_runs=1,
+        runs_per_sample=5,
+        seed=42,
+        existing_rows={
+            ("baseline_768", "encoder_bert", 512, "ffn", 1): failed_row,
+        },
+        benchmark_fn=fake_benchmark,
+    )
+
+    assert rows[0]["avg_latency_ms"] == 7.0
+    assert benchmark_calls == [1]
 
 
 def test_staging_ablation_skips_removed_cases_manifest(tmp_path, monkeypatch):

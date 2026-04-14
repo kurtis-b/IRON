@@ -9,15 +9,48 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from iron.applications.transformer_layer_new.study.block.cases import (
+from iron.applications.transformer_layer_new.study.block.cases import BlockWorkload
+from iron.applications.transformer_layer_new.study.end_to_end.cases import (
     FAMILY_IDS,
+    FAMILY_SPECS,
     SEQUENCE_LADDER,
-    BlockWorkload,
 )
 
 StagingBlockKind = Literal["mha_out_proj", "ffn"]
+SourceBlockKind = Literal["mha_out_proj", "mha_out_proj_causal", "ffn"]
 
 STAGING_BLOCK_KINDS: tuple[StagingBlockKind, ...] = ("mha_out_proj", "ffn")
+SOURCE_CONFIG_COLUMNS_BY_BLOCK_KIND: dict[SourceBlockKind, tuple[str, ...]] = {
+    "mha_out_proj": (
+        "mha_out_proj_parallel_seq",
+        "mha_out_proj_q_seq_tile",
+        "mha_out_proj_kv_seq_tile",
+        "mha_out_proj_emb_tile",
+        "mha_out_proj_parallel_heads",
+        "mha_out_proj_o_proj_acc_depth",
+    ),
+    "mha_out_proj_causal": (
+        "mha_out_proj_causal_parallel_seq",
+        "mha_out_proj_causal_q_seq_tile",
+        "mha_out_proj_causal_kv_seq_tile",
+        "mha_out_proj_causal_emb_tile",
+        "mha_out_proj_causal_parallel_heads",
+        "mha_out_proj_causal_o_proj_acc_depth",
+    ),
+    "ffn": (
+        "ffn_num_aie_columns",
+        "ffn_b_col_maj",
+        "ffn_c_col_maj",
+        "ffn_tile_m",
+        "ffn_tile_k",
+        "ffn_tile_n",
+        "ffn_down_proj_depth",
+        "ffn_n_a_tiles_distributed",
+        "ffn_n_b_tiles_distributed",
+        "ffn_stage_only",
+        "ffn_gelu_stage",
+    ),
+}
 CONFIG_COLUMNS_BY_BLOCK_KIND: dict[StagingBlockKind, tuple[str, ...]] = {
     "mha_out_proj": (
         "mha_out_proj_parallel_seq",
@@ -56,6 +89,7 @@ class ReferenceSelection:
     hidden_size: int
     ffn_dim: int
     source_candidate: tuple[object, ...]
+    benchmark_block_kind: str | None = None
 
     @property
     def workload(self) -> BlockWorkload:
@@ -120,13 +154,13 @@ def _required_bool(value: object) -> bool:
 
 
 def _parse_candidate(
-    block_kind: StagingBlockKind,
+    block_kind: SourceBlockKind,
     row: dict[str, str],
 ) -> tuple[object, ...]:
-    if block_kind == "mha_out_proj":
+    if block_kind in ("mha_out_proj", "mha_out_proj_causal"):
         return tuple(
             _required_int(row[column])
-            for column in CONFIG_COLUMNS_BY_BLOCK_KIND[block_kind]
+            for column in SOURCE_CONFIG_COLUMNS_BY_BLOCK_KIND[block_kind]
         )
 
     return (
@@ -146,7 +180,7 @@ def _parse_candidate(
 
 def _eligible_reference_row(row: dict[str, str]) -> bool:
     block_kind = str(row.get("block_kind") or "")
-    if block_kind not in STAGING_BLOCK_KINDS:
+    if block_kind not in SOURCE_CONFIG_COLUMNS_BY_BLOCK_KIND:
         return False
     if row.get("run_status") != "passed":
         return False
@@ -164,21 +198,41 @@ def _eligible_reference_row(row: dict[str, str]) -> bool:
 
 
 def _matches_filters(
-    row: dict[str, str],
     *,
+    family_id: str,
+    seq_len: int,
+    block_kind: StagingBlockKind,
     family_filter: str,
     seq_len_filter: str,
     block_filter: str,
 ) -> bool:
-    if family_filter != "all" and row.get("family_id") != family_filter:
+    if family_filter != "all" and family_id != family_filter:
         return False
-    if seq_len_filter != "all" and _optional_int(row.get("seq_len")) != int(
-        seq_len_filter
-    ):
+    if seq_len_filter != "all" and seq_len != int(seq_len_filter):
         return False
-    if block_filter != "all" and row.get("block_kind") != block_filter:
+    if block_filter != "all" and block_kind != block_filter:
         return False
     return True
+
+
+def _selection_targets(
+    *,
+    source_family_id: str,
+    source_block_kind: SourceBlockKind,
+) -> tuple[tuple[str, StagingBlockKind, str], ...]:
+    targets: list[tuple[str, StagingBlockKind, str]] = []
+    if source_block_kind in STAGING_BLOCK_KINDS:
+        targets.append((source_family_id, source_block_kind, source_block_kind))
+        if source_family_id == "baseline_768":
+            targets.append(("gpt2_small_768", source_block_kind, source_block_kind))
+        elif source_family_id == "baseline_1024":
+            targets.append(("gpt2_medium_1024", source_block_kind, source_block_kind))
+    elif source_block_kind == "mha_out_proj_causal":
+        if source_family_id == "baseline_768":
+            targets.append(("gpt2_small_768", "mha_out_proj", source_block_kind))
+        elif source_family_id == "baseline_1024":
+            targets.append(("gpt2_medium_1024", "mha_out_proj", source_block_kind))
+    return tuple(targets)
 
 
 def select_reference_rows(
@@ -196,45 +250,62 @@ def select_reference_rows(
     for row in rows:
         if not _eligible_reference_row(row):
             continue
-        if not _matches_filters(
-            row,
-            family_filter=family_filter,
-            seq_len_filter=seq_len_filter,
-            block_filter=block_filter,
+        source_family_id = str(row.get("family_id") or "")
+        source_block_kind = str(row["block_kind"])
+        seq_len = int(_optional_int(row.get("seq_len")) or 0)
+        for (
+            target_family_id,
+            target_block_kind,
+            benchmark_block_kind,
+        ) in _selection_targets(
+            source_family_id=source_family_id,
+            source_block_kind=source_block_kind,  # type: ignore[arg-type]
         ):
-            continue
+            if not _matches_filters(
+                family_id=target_family_id,
+                seq_len=seq_len,
+                block_kind=target_block_kind,
+                family_filter=family_filter,
+                seq_len_filter=seq_len_filter,
+                block_filter=block_filter,
+            ):
+                continue
 
-        block_kind = str(row["block_kind"])
-        selection = ReferenceSelection(
-            family_id=str(row.get("family_id") or ""),
-            family_label=str(row.get("family_label") or ""),
-            seq_len=int(_optional_int(row.get("seq_len")) or 0),
-            block_kind=block_kind,  # type: ignore[arg-type]
-            source_candidate_index=int(_optional_int(row.get("candidate_index")) or 0),
-            source_avg_latency_ms=float(
-                _optional_float(row.get("avg_latency_ms")) or 0
-            ),
-            head_dim=int(_optional_int(row.get("head_dim")) or 0),
-            num_heads=int(_optional_int(row.get("num_heads")) or 0),
-            hidden_size=int(_optional_int(row.get("hidden_size")) or 0),
-            ffn_dim=int(_optional_int(row.get("ffn_dim")) or 0),
-            source_candidate=_parse_candidate(block_kind, row),  # type: ignore[arg-type]
-        )
-        key = (
-            selection.family_id,
-            selection.seq_len,
-            selection.block_kind,
-        )
-        current = selections_by_key.get(key)
-        if current is None or (
-            selection.source_avg_latency_ms,
-            selection.source_candidate_index,
-        ) < (current[0], current[1]):
-            selections_by_key[key] = (
+            selection = ReferenceSelection(
+                family_id=target_family_id,
+                family_label=FAMILY_SPECS[target_family_id].display_label,
+                seq_len=seq_len,
+                block_kind=target_block_kind,
+                source_candidate_index=int(
+                    _optional_int(row.get("candidate_index")) or 0
+                ),
+                source_avg_latency_ms=float(
+                    _optional_float(row.get("avg_latency_ms")) or 0
+                ),
+                head_dim=int(_optional_int(row.get("head_dim")) or 0),
+                num_heads=int(_optional_int(row.get("num_heads")) or 0),
+                hidden_size=int(_optional_int(row.get("hidden_size")) or 0),
+                ffn_dim=int(_optional_int(row.get("ffn_dim")) or 0),
+                source_candidate=_parse_candidate(
+                    source_block_kind, row  # type: ignore[arg-type]
+                ),
+                benchmark_block_kind=benchmark_block_kind,
+            )
+            key = (
+                selection.family_id,
+                selection.seq_len,
+                selection.block_kind,
+            )
+            current = selections_by_key.get(key)
+            if current is None or (
                 selection.source_avg_latency_ms,
                 selection.source_candidate_index,
-                selection,
-            )
+            ) < (current[0], current[1]):
+                selections_by_key[key] = (
+                    selection.source_avg_latency_ms,
+                    selection.source_candidate_index,
+                    selection,
+                )
 
     block_order = {
         block_kind: index for index, block_kind in enumerate(STAGING_BLOCK_KINDS)

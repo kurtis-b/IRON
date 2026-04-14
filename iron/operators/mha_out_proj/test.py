@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -200,3 +201,62 @@ def test_mha_out_proj(
     assert (
         output_errors <= max_acceptable_errors
     ), f"Test failed for O with {output_errors} errors (max allowable: {max_acceptable_errors})"
+
+
+@pytest.mark.parametrize("o_proj_acc_depth", [1, 2, 4])
+def test_mha_out_proj_causal_low_acc_reuses_identical_col_groups(
+    o_proj_acc_depth,
+    aie_context,
+):
+    seq_len = 512
+    head_dim = 64
+    num_heads = 12
+    q_seq_tile = 32
+    kv_seq_tile = 32
+    emb_tile = 96
+    parallel_seq = 8
+    parallel_heads = 1
+    hidden = num_heads * head_dim
+
+    golden_ref = generate_golden_reference(
+        heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        is_causal=True,
+    )
+    repeated_block = torch.zeros((hidden, emb_tile), dtype=torch.bfloat16)
+    for i in range(emb_tile):
+        repeated_block[i, i] = 1
+    repeated_w_o = torch.cat([repeated_block] * (hidden // emb_tile), dim=1)
+
+    operator = AIEMHAOutProj(
+        num_heads=num_heads,
+        seq_len=seq_len,
+        d=head_dim,
+        q_seq_tile=q_seq_tile,
+        kv_seq_tile=kv_seq_tile,
+        emb_tile=emb_tile,
+        parallel_seq=parallel_seq,
+        parallel_heads=parallel_heads,
+        o_proj_acc_depth=o_proj_acc_depth,
+        is_causal=True,
+        context=aie_context,
+    )
+
+    operator.context.compile_all()
+    operator.context.prepare_runtime()
+    output = operator(
+        golden_ref["input_q"],
+        golden_ref["input_k"],
+        golden_ref["input_v"],
+        repeated_w_o,
+    ).to(torch.float32)
+
+    base_chunk = output[:, :emb_tile]
+    for start in range(emb_tile, hidden, emb_tile):
+        chunk = output[:, start : start + emb_tile]
+        diff = (chunk - base_chunk).abs()
+        assert int((diff > 0.01).sum().item()) == 0, (
+            f"causal repeated col-group mismatch at start={start} "
+            f"for acc={o_proj_acc_depth}, max_abs={float(diff.max().item())}"
+        )

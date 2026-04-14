@@ -216,12 +216,12 @@ def fused_qkv_proj(
             [C_l1_ty_internal, C_l1_ty, np.int32],
         )
         zero_kernel = Kernel(
-            f"zero{scalar_suffix}_f32",
+            f"zero{scalar_suffix}_f32_qkv_proj",
             archive_name,
             [C_l1_ty_internal],
         )
         matmul_kernel = Kernel(
-            f"matmul{scalar_suffix}_{dtype_in_str}_f32",
+            f"matmul{scalar_suffix}_{dtype_in_str}_f32_qkv_proj",
             archive_name,
             [A_l1_ty, B_l1_ty, C_l1_ty_internal],
         )
@@ -229,12 +229,12 @@ def fused_qkv_proj(
         fifo_depth_out = fifo_depth
         convert_copy_kernel = None
         zero_kernel = Kernel(
-            f"zero{scalar_suffix}_{dtype_out_str}",
+            f"zero{scalar_suffix}_{dtype_out_str}_qkv_proj",
             archive_name,
             [C_l1_ty],
         )
         matmul_kernel = Kernel(
-            f"matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}",
+            f"matmul{scalar_suffix}_{dtype_in_str}_{dtype_out_str}_qkv_proj",
             archive_name,
             [A_l1_ty, B_l1_ty, C_l1_ty],
         )

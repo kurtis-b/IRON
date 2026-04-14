@@ -115,7 +115,6 @@ def fused_mha(
     trace_size: int = 0,
 ):
     del trace_size
-    del is_causal
 
     embed_sz = heads * d
     sequence_parallel_mode = parallel_seq > 1
@@ -1233,8 +1232,8 @@ def fused_mha(
             rt.start(matmul_pv_workers[i])
             rt.start(o_proj_workers[i])
 
-        for q_block_idx in range(num_runtime_q_groups):
-            for col_group in range(num_o_col_groups):
+        for col_group in range(num_o_col_groups):
+            for q_block_idx in range(num_runtime_q_groups):
                 # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
                 tg = rt.task_group()
 
@@ -1338,7 +1337,6 @@ def fused_mha(
                     logging.debug(
                         f"  O tap: {O_tiles[q_block_idx * num_o_col_groups + col_group]}"
                     )
-
                 rt.finish_task_group(tg)
 
     my_program = Program(NPU2(), rt)

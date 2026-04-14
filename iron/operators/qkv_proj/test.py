@@ -10,6 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from common.aie_context import AIEContext
 from operators.qkv_proj.op import AIEQKVProj
 from operators.qkv_proj.reference import generate_golden_reference
 from iron.common.test_utils import run_test
@@ -158,3 +159,31 @@ def test_qkv_proj(
         assert (
             buf_errors <= max_acceptable_errors
         ), f"Test failed for {buf_name} with {buf_errors} errors (max allowable: {max_acceptable_errors})"
+
+
+def test_qkv_proj_artifacts_namespace_matmul_symbols(tmp_path):
+    context = AIEContext(use_runlist=False)
+    context.build_dir = tmp_path
+    context.build_dir.mkdir(parents=True, exist_ok=True)
+
+    operator = AIEQKVProj(
+        seq_len=64,
+        hidden_size=768,
+        tile_m=64,
+        tile_k=64,
+        tile_n=48,
+        parallel_seq=4,
+        parallel_emb=8,
+        context=context,
+    )
+    xclbin_artifact, _ = operator.get_artifacts()
+    archive = next(
+        dep
+        for dep in xclbin_artifact.depends
+        if dep.__class__.__name__ == "KernelArchiveArtifact"
+    )
+    mm_object = next(
+        dep for dep in archive.depends if dep.path.name.startswith("qkv_proj_")
+    )
+    assert mm_object.rename_symbols["matmul_bf16_bf16"] == "matmul_bf16_bf16_qkv_proj"
+    assert mm_object.rename_symbols["zero_bf16"] == "zero_bf16_qkv_proj"

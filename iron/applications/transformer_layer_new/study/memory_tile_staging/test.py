@@ -37,9 +37,11 @@ def _reference_row(
     is_best: str = "True",
 ) -> dict[str, str]:
     family_info = {
-        "tinybert_512": ("512 / 2048 / 8", "8", "512", "2048"),
-        "baseline_768": ("768 / 3072 / 12", "12", "768", "3072"),
-        "baseline_1024": ("1024 / 4096 / 16", "16", "1024", "4096"),
+        "tinybert_512": ("TinyBERT", "8", "512", "2048"),
+        "baseline_768": ("BERT-Base", "12", "768", "3072"),
+        "baseline_1024": ("BERT-Large", "16", "1024", "4096"),
+        "gpt2_small_768": ("GPT-2 Small", "12", "768", "3072"),
+        "gpt2_medium_1024": ("GPT-2 Medium", "16", "1024", "4096"),
     }[family_id]
     row = {
         "study_id": "block",
@@ -78,6 +80,25 @@ def _reference_row(
                 ),
                 "mha_out_proj_parallel_heads": "1",
                 "mha_out_proj_o_proj_acc_depth": "8",
+            }
+        )
+    elif block_kind == "mha_out_proj_causal":
+        row.update(
+            {
+                "mha_out_proj_causal_parallel_seq": "8",
+                "mha_out_proj_causal_q_seq_tile": "32",
+                "mha_out_proj_causal_kv_seq_tile": "64",
+                "mha_out_proj_causal_emb_tile": (
+                    "64"
+                    if family_id == "tinybert_512"
+                    else (
+                        "96"
+                        if family_id in {"baseline_768", "gpt2_small_768"}
+                        else "128"
+                    )
+                ),
+                "mha_out_proj_causal_parallel_heads": "1",
+                "mha_out_proj_causal_o_proj_acc_depth": "8",
             }
         )
     elif block_kind == "ffn":
@@ -119,7 +140,7 @@ def test_select_reference_rows_keeps_only_best_supported_blocks():
         _reference_row("mha_out_proj", avg_latency_ms="2.0", is_best="False"),
     ]
 
-    selections = select_reference_rows(rows)
+    selections = select_reference_rows(rows, family_filter="baseline_768")
 
     assert [selection.block_kind for selection in selections] == [
         "mha_out_proj",
@@ -140,6 +161,35 @@ def test_select_reference_rows_keeps_only_best_supported_blocks():
         None,
         1,
     )
+
+
+def test_select_reference_rows_generates_decoder_targets():
+    rows = [
+        _reference_row("ffn", family_id="baseline_768", avg_latency_ms="4.0"),
+        _reference_row(
+            "mha_out_proj_causal",
+            family_id="baseline_768",
+            avg_latency_ms="5.0",
+        ),
+    ]
+
+    selections = select_reference_rows(rows)
+    selection_keys = {
+        (
+            selection.family_id,
+            selection.block_kind,
+            selection.benchmark_block_kind or selection.block_kind,
+        )
+        for selection in selections
+    }
+
+    assert ("baseline_768", "ffn", "ffn") in selection_keys
+    assert ("gpt2_small_768", "ffn", "ffn") in selection_keys
+    assert (
+        "gpt2_small_768",
+        "mha_out_proj",
+        "mha_out_proj_causal",
+    ) in selection_keys
 
 
 def test_supported_staging_depths_cover_all_divisors_for_mha_out_proj():
@@ -232,6 +282,59 @@ def test_build_selection_rows_sweeps_only_depth_and_computes_speedup(monkeypatch
     best_rows = [row for row in rows if row["is_best_depth"] is True]
     assert len(best_rows) == 1
     assert best_rows[0]["staging_depth"] == 12
+
+
+def test_build_selection_rows_uses_causal_mha_benchmark_for_decoder(monkeypatch):
+    selection = ReferenceSelection(
+        family_id="gpt2_small_768",
+        family_label="GPT-2 Small",
+        seq_len=512,
+        block_kind="mha_out_proj",
+        source_candidate_index=0,
+        source_avg_latency_ms=5.0,
+        head_dim=64,
+        num_heads=12,
+        hidden_size=768,
+        ffn_dim=3072,
+        source_candidate=(8, 32, 64, 96, 1, 8),
+        benchmark_block_kind="mha_out_proj_causal",
+    )
+    seen_block_kinds: list[str] = []
+
+    def fake_benchmark_candidate(
+        block_kind,
+        workload,
+        candidate,
+        *,
+        warmup_iters,
+        timed_iters,
+        seed,
+    ):
+        seen_block_kinds.append(block_kind)
+        return {
+            "avg_latency_ms": 100.0 / int(candidate[5]),
+            "bandwidth_gbps": 5.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "error_message": "",
+        }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memory_tile_staging.run.benchmark_candidate",
+        fake_benchmark_candidate,
+    )
+
+    rows = build_selection_rows(
+        selection,
+        warmup_iters=1,
+        timed_iters=2,
+        seed=42,
+    )
+
+    assert rows
+    assert {row["block_kind"] for row in rows} == {"mha_out_proj"}
+    assert seen_block_kinds
+    assert set(seen_block_kinds) == {"mha_out_proj_causal"}
 
 
 def test_build_selection_rows_reuses_existing_rows_and_skips_removed(monkeypatch):

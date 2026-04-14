@@ -149,6 +149,15 @@ class AIEFFN(AIEOperatorBase):
             "zero_bf16": "zero_bf16_down_proj",
             "zero_scalar_bf16": "zero_scalar_bf16_down_proj",
         }
+        add_rename_symbols = {
+            "eltwise_add_bf16_scalar": "eltwise_add_bf16_scalar_ffn",
+            "eltwise_add_bf16_vector": "eltwise_add_bf16_vector_ffn",
+            "eltwise_add_f32_vector": "eltwise_add_f32_vector_ffn",
+        }
+        pass_through_rename_symbols = {
+            "passThroughLine": "passThroughLine_ffn",
+            "passThroughTile": "passThroughTile_ffn",
+        }
         kernel_flags_base.append("-Dbf16_bf16_ONLY")
         if round_conv_even:
             kernel_flags_base.append("-DROUND_CONV_EVEN")
@@ -239,6 +248,7 @@ class AIEFFN(AIEOperatorBase):
                                     base_dir / "aie_kernels" / "generic" / "add.cc"
                                 )
                             ],
+                            rename_symbols=add_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
                             f"gelu_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.o",
@@ -261,6 +271,7 @@ class AIEFFN(AIEOperatorBase):
                                     / "passThrough.cc"
                                 )
                             ],
+                            rename_symbols=pass_through_rename_symbols,
                         ),
                     ],
                 ),

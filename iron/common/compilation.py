@@ -439,14 +439,17 @@ class AieccCompilationRule(CompilationRule):
                 ]  # FIXME: this does not handle the case of multiple insts.bins with different flags from the same MLIR
                 if not do_compile_xclbin:
                     compile_cmd += ["--no-compile"]
-                if first_insts_bin.xclbin_input is not None:
-                    compile_cmd += [
-                        "--xclbin-input=" + str(first_insts_bin.xclbin_input.path)
-                    ]
-                    if first_insts_bin.kernel_name is not None:
-                        compile_cmd += [
-                            "--xclbin-kernel-name=" + first_insts_bin.kernel_name
-                        ]
+                insts_xclbin_input = first_insts_bin.xclbin_input
+                insts_kernel_name = first_insts_bin.kernel_name
+                if do_compile_xclbin:
+                    if insts_xclbin_input is None:
+                        insts_xclbin_input = first_xclbin.xclbin_input
+                    if insts_kernel_name is None:
+                        insts_kernel_name = first_xclbin.kernel_name
+                if insts_xclbin_input is not None:
+                    compile_cmd += ["--xclbin-input=" + str(insts_xclbin_input.path)]
+                if insts_kernel_name is not None:
+                    compile_cmd += ["--xclbin-kernel-name=" + insts_kernel_name]
                 compile_cmd += first_insts_bin.extra_flags + [
                     "--aie-generate-npu",
                     "--npu-insts-name=" + str(first_insts_bin.path),

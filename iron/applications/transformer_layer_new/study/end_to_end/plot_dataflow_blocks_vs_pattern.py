@@ -12,11 +12,19 @@ import seaborn as sns
 from matplotlib import pyplot as plt
 from matplotlib.patches import Patch
 
-FAMILY_ORDER = ["tinybert_512", "baseline_768", "baseline_1024"]
+FAMILY_ORDER = [
+    "tinybert_512",
+    "baseline_768",
+    "baseline_1024",
+    "gpt2_small_768",
+    "gpt2_medium_1024",
+]
 FAMILY_LABELS = {
     "tinybert_512": "TinyBERT",
     "baseline_768": "BERT-Base",
     "baseline_1024": "BERT-Large",
+    "gpt2_small_768": "GPT-2 Small",
+    "gpt2_medium_1024": "GPT-2 Medium",
 }
 SEQ_ORDER = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 BLOCK_ORDER = ["QKV Proj", "MHAO", "Add + Norm (x2)", "FFN"]
@@ -33,7 +41,10 @@ BLOCK_KIND_MAP = {
     "mha_out_proj": "MHAO",
     "add_norm1": "Add + Norm (x2)",
     "add_norm2": "Add + Norm (x2)",
+    "ln1": "Add + Norm (x2)",
+    "add_norm": "Add + Norm (x2)",
     "ffn": "FFN",
+    "add": "Add + Norm (x2)",
 }
 
 
@@ -71,11 +82,12 @@ def variant_stem(variant: str, y_scale: str = "log") -> str:
 
 def family_label(pattern_rows: pd.DataFrame) -> str:
     sample = pattern_rows.iloc[0]
-    return FAMILY_LABELS[str(sample["study_case_id"])]
+    return FAMILY_LABELS.get(str(sample["study_case_id"]), str(sample["study_case_id"]))
 
 
 def load_plot_rows(
-    results_csv: Path, tuning_csv: Path
+    results_csv: Path,
+    tuning_csv: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     results_df = pd.read_csv(results_csv)
     tuning_df = pd.read_csv(tuning_csv)
@@ -122,7 +134,7 @@ def render_plot(
 ) -> plt.Figure:
     if variant == "slides":
         context = "poster"
-        figsize = (22, 8.5)
+        figsize = (34, 8.5)
         family_title_size = 20
         axis_label_size = 18
         tick_label_size = 14
@@ -132,7 +144,7 @@ def render_plot(
         factor_font_size = 11
     else:
         context = "talk"
-        figsize = (20, 8)
+        figsize = (30, 8)
         family_title_size = 18
         axis_label_size = 15
         tick_label_size = 12
@@ -282,7 +294,7 @@ def render_plot(
             loc="center left",
             ncol=1,
             frameon=False,
-            bbox_to_anchor=(0.87, 0.5),
+            bbox_to_anchor=(0.91, 0.5),
             fontsize=legend_font_size,
         )
     fig.suptitle(
@@ -291,7 +303,7 @@ def render_plot(
         fontweight="bold",
         y=title_y,
     )
-    fig.tight_layout(rect=[0, 0.03, 0.84, 0.92])
+    fig.tight_layout(rect=[0, 0.03, 0.89, 0.92])
     return fig
 
 
@@ -341,7 +353,12 @@ def main() -> None:
     args = parse_args()
     pattern_df, block_df = load_plot_rows(args.results, args.tuning)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    fig = render_plot(pattern_df, block_df, variant=args.variant, y_scale=args.y_scale)
+    fig = render_plot(
+        pattern_df,
+        block_df,
+        variant=args.variant,
+        y_scale=args.y_scale,
+    )
     stem = args.stem or variant_stem(args.variant, args.y_scale)
     png_path = args.output_dir / f"{stem}.png"
     svg_path = args.output_dir / f"{stem}.svg"

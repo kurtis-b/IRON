@@ -9,6 +9,7 @@ import logging
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from common.aie_context import AIEContext
 from operators.ffn.op import AIEFFN
 from operators.ffn.reference import generate_golden_reference
 from iron.common.test_utils import run_test
@@ -223,6 +224,50 @@ def generate_test_params(extensive=False):
         names.append(name)
 
     return params, names
+
+
+def test_ffn_artifacts_namespace_helper_symbols(tmp_path):
+    context = AIEContext(use_runlist=False)
+    context.build_dir = tmp_path
+    context.build_dir.mkdir(parents=True, exist_ok=True)
+
+    operator = AIEFFN(
+        512,
+        768,
+        3072,
+        tile_m=16,
+        tile_k=96,
+        tile_n=64,
+        down_proj_depth=8,
+        num_aie_columns=8,
+        context=context,
+        b_col_maj=False,
+        c_col_maj=False,
+        emulate_bf16_mmul_with_bfp16=True,
+        n_a_tiles_distributed=4,
+        n_b_tiles_distributed=4,
+        stage_only=None,
+        gelu_stage=1,
+    )
+    xclbin_artifact, _ = operator.get_artifacts()
+    archive = next(
+        dep
+        for dep in xclbin_artifact.depends
+        if dep.__class__.__name__ == "KernelArchiveArtifact"
+    )
+    add_object = next(
+        dep for dep in archive.depends if dep.path.name.startswith("add_")
+    )
+    pass_through_object = next(
+        dep for dep in archive.depends if dep.path.name.startswith("passThrough_")
+    )
+    assert (
+        add_object.rename_symbols["eltwise_add_bf16_vector"]
+        == "eltwise_add_bf16_vector_ffn"
+    )
+    assert (
+        pass_through_object.rename_symbols["passThroughLine"] == "passThroughLine_ffn"
+    )
 
 
 regular_params, regular_names = generate_test_params(extensive=False)

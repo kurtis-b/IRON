@@ -302,6 +302,7 @@ void partial_softmax(bfloat16 *A,
     for (; i < valid_q_rows; i++) {
         partial_softmax_bf16(A + B_kv * i, P + B_kv * i, scale_buffer, B_kv, i, B_q, inv_scale);
     }
+
     // Zero out P rows corresponding to padded Q rows
     if (valid_q_rows < B_q) {
         for (int32_t i = valid_q_rows; i < B_q; i++) {

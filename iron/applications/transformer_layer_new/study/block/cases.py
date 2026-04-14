@@ -17,7 +17,6 @@ BlockKind = Literal[
     "addnorm",
     "layer_norm",
     "elementwise_add",
-    "causal_mask",
     "ffn",
 ]
 
@@ -36,7 +35,6 @@ BLOCK_KINDS: tuple[BlockKind, ...] = (
     "addnorm",
     "layer_norm",
     "elementwise_add",
-    "causal_mask",
     "ffn",
 )
 FAMILY_IDS: tuple[str, ...] = ("tinybert_512", "baseline_768", "baseline_1024")

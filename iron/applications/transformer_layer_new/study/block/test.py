@@ -35,7 +35,6 @@ def test_block_case_table_covers_retained_surface():
         "addnorm": 2,
         "layer_norm": 2,
         "elementwise_add": 2,
-        "causal_mask": 2,
         "ffn": 11,
     }
 
@@ -59,19 +58,16 @@ def test_decoder_only_blocks_are_present_only_for_decoder_like_shapes():
     assert tinybert_case.candidates("mha_out_proj_causal") == ()
     assert tinybert_case.candidates("layer_norm") == ()
     assert tinybert_case.candidates("elementwise_add") == ()
-    assert tinybert_case.candidates("causal_mask") == ()
 
     bert_case = get_case("baseline_768", 256)
     assert len(bert_case.candidates("mha_out_proj_causal")) == 1
     assert len(bert_case.candidates("layer_norm")) == 1
     assert len(bert_case.candidates("elementwise_add")) == 1
-    assert len(bert_case.candidates("causal_mask")) == 1
 
     long_seq_case = get_case("baseline_768", 8192)
     assert len(long_seq_case.candidates("mha_out_proj_causal")) == 1
     assert len(long_seq_case.candidates("layer_norm")) == 1
     assert len(long_seq_case.candidates("elementwise_add")) == 1
-    assert long_seq_case.candidates("causal_mask") == ()
 
 
 def test_removed_cases_manifest_prunes_known_bad_tinybert_qkv_candidate():
@@ -195,7 +191,6 @@ def test_main_writes_csv_for_selected_case(monkeypatch, tmp_path):
             "addnorm": 3.0,
             "layer_norm": 3.5,
             "elementwise_add": 3.75,
-            "causal_mask": 3.9,
             "ffn": 4.0,
         }
         return {
