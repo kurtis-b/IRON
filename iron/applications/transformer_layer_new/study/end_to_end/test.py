@@ -10,6 +10,9 @@ from pathlib import Path
 
 import torch
 
+from iron.applications.transformer_layer_new.study.end_to_end import (
+    power as power_module,
+)
 from iron.applications.transformer_layer_new.study.end_to_end import modes
 from iron.applications.transformer_layer_new.study.end_to_end import (
     run_staging_ablation,
@@ -27,6 +30,9 @@ from iron.applications.transformer_layer_new.pattern.runlist.op import (
 )
 from iron.applications.transformer_layer_new.study.end_to_end.modes import (
     benchmark_mode,
+)
+from iron.applications.transformer_layer_new.study.end_to_end.remeasure_power_only import (
+    updated_row_with_power_measurement,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.run import (
     build_rows as build_end_to_end_rows,
@@ -98,6 +104,14 @@ def _result_row(
         "min_power_w": "11.0",
         "max_power_w": "13.0",
         "power_sample_count": "6",
+        "raw_avg_power_w": "12.5",
+        "raw_min_power_w": "10.5",
+        "raw_max_power_w": "14.0",
+        "raw_power_sample_count": "7",
+        "power_std_w": "0.4",
+        "raw_power_std_w": "0.7",
+        "power_outlier_sample_count": "1",
+        "power_outlier_filter_applied": "True",
         "effective_gflops_per_sec_per_watt": "80.0",
         "npu_dispatch_count": "8",
         "npu_unique_instruction_binary_count": "8",
@@ -125,6 +139,59 @@ def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def test_summarize_power_samples_filters_large_outlier_conservatively():
+    samples_w = [5.0, 5.1, 5.0, 5.2, 4.9, 5.1, 5.0, 5.2, 5.1, 20.0]
+
+    stats = power_module.summarize_power_samples(samples_w, elapsed_sec=2.0)
+
+    assert stats["power_outlier_filter_applied"] is True
+    assert stats["power_outlier_sample_count"] == 1
+    assert stats["raw_power_sample_count"] == 10
+    assert stats["power_sample_count"] == 9
+    assert float(stats["raw_avg_power_w"]) > float(stats["avg_power_w"])
+    assert float(stats["raw_power_std_w"]) > float(stats["power_std_w"])
+    assert float(stats["energy_j"]) == float(stats["avg_power_w"]) * 2.0
+
+
+def test_summarize_power_samples_keeps_small_sample_sets_unfiltered():
+    samples_w = [5.0, 5.1, 5.0, 20.0]
+
+    stats = power_module.summarize_power_samples(samples_w, elapsed_sec=1.0)
+
+    assert stats["power_outlier_filter_applied"] is False
+    assert stats["power_outlier_sample_count"] == 0
+    assert stats["raw_power_sample_count"] == 4
+    assert stats["power_sample_count"] == 4
+    assert float(stats["raw_avg_power_w"]) == float(stats["avg_power_w"])
+
+
+def test_updated_row_with_power_measurement_copies_raw_and_filtered_fields():
+    existing_row = _result_row("hybrid")
+    power_result = {
+        "power_backend": "turbostat_pkgwatt",
+        "avg_power_w": 9.5,
+        "min_power_w": 9.1,
+        "max_power_w": 10.2,
+        "power_sample_count": 12,
+        "raw_avg_power_w": 10.0,
+        "raw_min_power_w": 9.1,
+        "raw_max_power_w": 18.0,
+        "raw_power_sample_count": 13,
+        "power_std_w": 0.3,
+        "raw_power_std_w": 2.2,
+        "power_outlier_sample_count": 1,
+        "power_outlier_filter_applied": True,
+    }
+
+    updated = updated_row_with_power_measurement(existing_row, power_result)
+
+    assert updated["avg_power_w"] == 9.5
+    assert updated["raw_avg_power_w"] == 10.0
+    assert updated["power_outlier_filter_applied"] is True
+    assert updated["power_outlier_sample_count"] == 1
+    assert float(updated["effective_gflops_per_sec_per_watt"]) == 105.26315789473684
 
 
 def test_candidate_table_covers_only_hybrid_and_runlist():

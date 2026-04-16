@@ -7,17 +7,43 @@ from __future__ import annotations
 from contextlib import nullcontext
 import math
 import shutil
+import statistics
 import subprocess
 import threading
 import time
 
 SUPPORTED_POWER_BACKENDS: tuple[str, ...] = ("auto", "none", "turbostat_pkgwatt")
+POWER_OUTLIER_FILTER_MIN_SAMPLE_COUNT = 10
+POWER_OUTLIER_FILTER_MIN_RETAINED_SAMPLE_COUNT = 6
+POWER_OUTLIER_MODIFIED_Z_THRESHOLD = 3.5
+PERSISTED_POWER_RESULT_FIELDS: tuple[str, ...] = (
+    "avg_power_w",
+    "min_power_w",
+    "max_power_w",
+    "power_sample_count",
+    "raw_avg_power_w",
+    "raw_min_power_w",
+    "raw_max_power_w",
+    "raw_power_sample_count",
+    "power_std_w",
+    "raw_power_std_w",
+    "power_outlier_sample_count",
+    "power_outlier_filter_applied",
+)
 
 
 def empty_power_stats() -> dict[str, float | str | None]:
     return {
         "power_backend": None,
         "avg_power_w": None,
+        "raw_avg_power_w": None,
+        "raw_min_power_w": None,
+        "raw_max_power_w": None,
+        "raw_power_sample_count": None,
+        "power_std_w": None,
+        "raw_power_std_w": None,
+        "power_outlier_sample_count": None,
+        "power_outlier_filter_applied": None,
         "raw_package_avg_power_w": None,
         "raw_package_min_power_w": None,
         "raw_package_max_power_w": None,
@@ -90,6 +116,114 @@ def power_probe_is_complete(
         and elapsed_sec >= float(min_measurement_duration_sec)
         and observed_sample_count >= int(min_sample_count)
     )
+
+
+def _percentile(sorted_values: list[float], fraction: float) -> float | None:
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    position = (len(sorted_values) - 1) * float(fraction)
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return float(sorted_values[lower_index])
+    weight = position - lower_index
+    return float(
+        sorted_values[lower_index] * (1.0 - weight)
+        + sorted_values[upper_index] * weight
+    )
+
+
+def detect_power_sample_outliers(samples_w: list[float]) -> list[bool]:
+    if len(samples_w) < 5:
+        return [False] * len(samples_w)
+
+    median_sample = statistics.median(samples_w)
+    absolute_deviations = [abs(sample - median_sample) for sample in samples_w]
+    median_absolute_deviation = statistics.median(absolute_deviations)
+    if median_absolute_deviation > 0:
+        return [
+            abs(0.6745 * (sample - median_sample) / median_absolute_deviation)
+            > POWER_OUTLIER_MODIFIED_Z_THRESHOLD
+            for sample in samples_w
+        ]
+
+    sorted_samples = sorted(samples_w)
+    q1 = _percentile(sorted_samples, 0.25)
+    q3 = _percentile(sorted_samples, 0.75)
+    if q1 is None or q3 is None:
+        return [False] * len(samples_w)
+    interquartile_range = q3 - q1
+    if interquartile_range <= 0:
+        return [False] * len(samples_w)
+    lower_bound = q1 - 1.5 * interquartile_range
+    upper_bound = q3 + 1.5 * interquartile_range
+    return [sample < lower_bound or sample > upper_bound for sample in samples_w]
+
+
+def summarize_power_samples(
+    samples_w: list[float],
+    *,
+    elapsed_sec: float | None = None,
+    min_filter_sample_count: int = POWER_OUTLIER_FILTER_MIN_SAMPLE_COUNT,
+    min_retained_sample_count: int = POWER_OUTLIER_FILTER_MIN_RETAINED_SAMPLE_COUNT,
+) -> dict[str, float | str | None]:
+    stats = empty_power_stats()
+    if not samples_w:
+        return stats
+
+    raw_avg_power_w = statistics.fmean(samples_w)
+    raw_std_power_w = statistics.stdev(samples_w) if len(samples_w) >= 2 else 0.0
+    filtered_samples = list(samples_w)
+    outlier_mask = [False] * len(samples_w)
+    power_outlier_filter_applied = False
+
+    if len(samples_w) >= int(min_filter_sample_count):
+        candidate_mask = detect_power_sample_outliers(samples_w)
+        candidate_filtered_samples = [
+            sample
+            for sample, is_outlier in zip(samples_w, candidate_mask)
+            if not is_outlier
+        ]
+        if len(candidate_filtered_samples) >= int(min_retained_sample_count) and len(
+            candidate_filtered_samples
+        ) < len(samples_w):
+            candidate_std_power_w = (
+                statistics.stdev(candidate_filtered_samples)
+                if len(candidate_filtered_samples) >= 2
+                else 0.0
+            )
+            if candidate_std_power_w < raw_std_power_w:
+                filtered_samples = candidate_filtered_samples
+                outlier_mask = candidate_mask
+                power_outlier_filter_applied = True
+
+    avg_power_w = statistics.fmean(filtered_samples)
+    power_std_w = (
+        statistics.stdev(filtered_samples) if len(filtered_samples) >= 2 else 0.0
+    )
+    stats.update(
+        {
+            "avg_power_w": avg_power_w,
+            "raw_avg_power_w": raw_avg_power_w,
+            "raw_min_power_w": min(samples_w),
+            "raw_max_power_w": max(samples_w),
+            "raw_power_sample_count": len(samples_w),
+            "power_std_w": power_std_w,
+            "raw_power_std_w": raw_std_power_w,
+            "power_outlier_sample_count": sum(
+                1 for is_outlier in outlier_mask if is_outlier
+            ),
+            "power_outlier_filter_applied": power_outlier_filter_applied,
+            "min_power_w": min(filtered_samples),
+            "max_power_w": max(filtered_samples),
+            "power_sample_count": len(filtered_samples),
+        }
+    )
+    if elapsed_sec is not None:
+        stats["energy_j"] = avg_power_w * float(elapsed_sec)
+    return stats
 
 
 def _run_turbostat_pkgwatt_samples(
@@ -237,19 +371,18 @@ class TurbostatPackagePowerMonitor:
             return stats
 
         avg_raw_w = sum(self.raw_package_samples_w) / len(self.raw_package_samples_w)
-        avg_pseudo_w = sum(self._pseudo_samples_w) / len(self._pseudo_samples_w)
+        filtered_stats = summarize_power_samples(
+            self._pseudo_samples_w,
+            elapsed_sec=elapsed_sec,
+        )
         stats.update(
             {
                 "raw_package_avg_power_w": avg_raw_w,
                 "raw_package_min_power_w": min(self.raw_package_samples_w),
                 "raw_package_max_power_w": max(self.raw_package_samples_w),
-                "avg_power_w": avg_pseudo_w,
-                "min_power_w": min(self._pseudo_samples_w),
-                "max_power_w": max(self._pseudo_samples_w),
-                "energy_j": avg_pseudo_w * elapsed_sec,
-                "power_sample_count": len(self._pseudo_samples_w),
             }
         )
+        stats.update(filtered_stats)
         return stats
 
 

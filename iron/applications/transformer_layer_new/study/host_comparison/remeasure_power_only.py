@@ -12,6 +12,8 @@ from pathlib import Path
 from ..run_lock import default_lock_path, hold_study_lock
 from ..end_to_end.cases import FAMILY_IDS, SEQUENCE_LADDER, WORKLOAD_VARIANTS
 from .run import (
+    DIRECT_COMPARISON_METRICS,
+    POWER_COMPARISON_METRICS,
     _comparison_row,
     _normalized_existing_row,
     _reference_metric_means,
@@ -21,6 +23,7 @@ from .run import (
     default_effective_gflops_per_watt_plot_path,
     default_effective_gflops_plot_path,
     default_output_path,
+    RESULTS_CSV_FIELDNAMES,
     resolve_sampling,
     write_plots,
 )
@@ -44,9 +47,8 @@ def write_rows(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         return
-    fieldnames = list(rows[0].keys())
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=RESULTS_CSV_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -81,109 +83,32 @@ def build_power_only_rows_for_group(
     igpu_power_backend: str,
     igpu_power_sample_interval_sec: float,
 ) -> list[dict[str, object]]:
-    reference_effective_gflops = _reference_metric_means(
-        group,
-        "effective_gflops_per_sec",
-    )
-    reference_effective_gflops_per_watt = _reference_metric_means(
-        group,
-        "effective_gflops_per_sec_per_watt",
-    )
-    reference_avg_latency_ms = _reference_metric_means(group, "avg_latency_ms")
-    reference_min_latency_ms = _reference_metric_means(group, "min_latency_ms")
-    reference_max_latency_ms = _reference_metric_means(group, "max_latency_ms")
-    reference_latency_sample_count = _reference_metric_means(
-        group,
-        "latency_sample_count",
-    )
-    reference_avg_power_w = _reference_metric_means(group, "avg_power_w")
-    reference_min_power_w = _reference_metric_means(group, "min_power_w")
-    reference_max_power_w = _reference_metric_means(group, "max_power_w")
-    reference_power_sample_count = _reference_metric_means(
-        group,
-        "power_sample_count",
-    )
-
-    existing_effective_gflops = _existing_group_value(
-        existing_rows,
-        workload_variant=group.workload_variant,
-        study_case_id=group.study_case_id,
-        seq_len=group.seq_len,
-        metric="effective_gflops_per_sec",
-        column="igpu",
-    )
-    existing_avg_latency_ms = _existing_group_value(
-        existing_rows,
-        workload_variant=group.workload_variant,
-        study_case_id=group.study_case_id,
-        seq_len=group.seq_len,
-        metric="avg_latency_ms",
-        column="igpu",
-    )
-    existing_min_latency_ms = _existing_group_value(
-        existing_rows,
-        workload_variant=group.workload_variant,
-        study_case_id=group.study_case_id,
-        seq_len=group.seq_len,
-        metric="min_latency_ms",
-        column="igpu",
-    )
-    existing_max_latency_ms = _existing_group_value(
-        existing_rows,
-        workload_variant=group.workload_variant,
-        study_case_id=group.study_case_id,
-        seq_len=group.seq_len,
-        metric="max_latency_ms",
-        column="igpu",
-    )
-    existing_latency_sample_count = _existing_group_value(
-        existing_rows,
-        workload_variant=group.workload_variant,
-        study_case_id=group.study_case_id,
-        seq_len=group.seq_len,
-        metric="latency_sample_count",
-        column="igpu",
-    )
-    existing_avg_power_w = _existing_group_value(
-        existing_rows,
-        workload_variant=group.workload_variant,
-        study_case_id=group.study_case_id,
-        seq_len=group.seq_len,
-        metric="avg_power_w",
-        column="igpu_rocm_smi",
-    )
-    existing_min_power_w = _existing_group_value(
-        existing_rows,
-        workload_variant=group.workload_variant,
-        study_case_id=group.study_case_id,
-        seq_len=group.seq_len,
-        metric="min_power_w",
-        column="igpu_rocm_smi",
-    )
-    existing_max_power_w = _existing_group_value(
-        existing_rows,
-        workload_variant=group.workload_variant,
-        study_case_id=group.study_case_id,
-        seq_len=group.seq_len,
-        metric="max_power_w",
-        column="igpu_rocm_smi",
-    )
-    existing_power_sample_count = _existing_group_value(
-        existing_rows,
-        workload_variant=group.workload_variant,
-        study_case_id=group.study_case_id,
-        seq_len=group.seq_len,
-        metric="power_sample_count",
-        column="igpu_rocm_smi",
-    )
-    existing_per_watt = _existing_group_value(
-        existing_rows,
-        workload_variant=group.workload_variant,
-        study_case_id=group.study_case_id,
-        seq_len=group.seq_len,
-        metric="effective_gflops_per_sec_per_watt",
-        column="igpu_rocm_smi",
-    )
+    reference_metric_values = {
+        metric: _reference_metric_means(group, metric)
+        for metric in (*DIRECT_COMPARISON_METRICS, *POWER_COMPARISON_METRICS)
+    }
+    existing_direct_metrics = {
+        metric: _existing_group_value(
+            existing_rows,
+            workload_variant=group.workload_variant,
+            study_case_id=group.study_case_id,
+            seq_len=group.seq_len,
+            metric=metric,
+            column="igpu",
+        )
+        for metric in DIRECT_COMPARISON_METRICS
+    }
+    existing_power_metrics = {
+        metric: _existing_group_value(
+            existing_rows,
+            workload_variant=group.workload_variant,
+            study_case_id=group.study_case_id,
+            seq_len=group.seq_len,
+            metric=metric,
+            column="igpu_rocm_smi",
+        )
+        for metric in POWER_COMPARISON_METRICS
+    }
 
     resolved_warmup_runs, resolved_runs_per_sample = resolve_sampling(
         group,
@@ -198,8 +123,10 @@ def build_power_only_rows_for_group(
         device_name=igpu_device_name,
         power_backend=igpu_power_backend,
         power_sample_interval_sec=igpu_power_sample_interval_sec,
-        existing_avg_latency_ms=existing_avg_latency_ms,
-        existing_effective_gflops_per_sec=existing_effective_gflops,
+        existing_avg_latency_ms=existing_direct_metrics["avg_latency_ms"],
+        existing_effective_gflops_per_sec=existing_direct_metrics[
+            "effective_gflops_per_sec"
+        ],
     )
 
     if str(power_result.get("run_status") or "") != "passed":
@@ -209,89 +136,33 @@ def build_power_only_rows_for_group(
             group.seq_len,
             power_result.get("failure_message") or power_result["run_status"],
         )
-        updated_avg_power_w = existing_avg_power_w
-        updated_min_power_w = existing_min_power_w
-        updated_max_power_w = existing_max_power_w
-        updated_power_sample_count = existing_power_sample_count
-        updated_per_watt = existing_per_watt
+        updated_power_metrics = dict(existing_power_metrics)
     else:
-        updated_avg_power_w = _optional_float(power_result.get("avg_power_w"))
-        updated_min_power_w = _optional_float(power_result.get("min_power_w"))
-        updated_max_power_w = _optional_float(power_result.get("max_power_w"))
-        updated_power_sample_count = _optional_float(
-            power_result.get("power_sample_count")
-        )
-        updated_per_watt = _optional_float(
-            power_result.get("effective_gflops_per_sec_per_watt")
-        )
+        updated_power_metrics = {
+            metric: _optional_float(power_result.get(metric))
+            for metric in POWER_COMPARISON_METRICS
+        }
 
-    return [
+    rows = [
         _comparison_row(
             group=group,
-            metric="effective_gflops_per_sec",
-            igpu_value=existing_effective_gflops,
-            reference_values=reference_effective_gflops,
-        ),
-        _comparison_row(
-            group=group,
-            metric="avg_latency_ms",
-            igpu_value=existing_avg_latency_ms,
-            reference_values=reference_avg_latency_ms,
-        ),
-        _comparison_row(
-            group=group,
-            metric="min_latency_ms",
-            igpu_value=existing_min_latency_ms,
-            reference_values=reference_min_latency_ms,
-        ),
-        _comparison_row(
-            group=group,
-            metric="max_latency_ms",
-            igpu_value=existing_max_latency_ms,
-            reference_values=reference_max_latency_ms,
-        ),
-        _comparison_row(
-            group=group,
-            metric="latency_sample_count",
-            igpu_value=existing_latency_sample_count,
-            reference_values=reference_latency_sample_count,
-        ),
-        _comparison_row(
-            group=group,
-            metric="effective_gflops_per_sec_per_watt",
-            igpu_value=None,
-            igpu_rocm_smi_value=updated_per_watt,
-            reference_values=reference_effective_gflops_per_watt,
-        ),
-        _comparison_row(
-            group=group,
-            metric="avg_power_w",
-            igpu_value=None,
-            igpu_rocm_smi_value=updated_avg_power_w,
-            reference_values=reference_avg_power_w,
-        ),
-        _comparison_row(
-            group=group,
-            metric="min_power_w",
-            igpu_value=None,
-            igpu_rocm_smi_value=updated_min_power_w,
-            reference_values=reference_min_power_w,
-        ),
-        _comparison_row(
-            group=group,
-            metric="max_power_w",
-            igpu_value=None,
-            igpu_rocm_smi_value=updated_max_power_w,
-            reference_values=reference_max_power_w,
-        ),
-        _comparison_row(
-            group=group,
-            metric="power_sample_count",
-            igpu_value=None,
-            igpu_rocm_smi_value=updated_power_sample_count,
-            reference_values=reference_power_sample_count,
-        ),
+            metric=metric,
+            igpu_value=existing_direct_metrics[metric],
+            reference_values=reference_metric_values[metric],
+        )
+        for metric in DIRECT_COMPARISON_METRICS
     ]
+    rows.extend(
+        _comparison_row(
+            group=group,
+            metric=metric,
+            igpu_value=None,
+            igpu_rocm_smi_value=updated_power_metrics[metric],
+            reference_values=reference_metric_values[metric],
+        )
+        for metric in POWER_COMPARISON_METRICS
+    )
+    return rows
 
 
 def _selected_group(

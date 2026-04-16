@@ -11,6 +11,7 @@ import torch
 from iron.applications.transformer_layer_new.study.host_comparison.run import (
     _forward_reference,
     _normalized_existing_row,
+    RocmSMIPowerMonitor,
     build_rows_for_group,
     configure_cpu_runtime_for_max_physical_cores,
     generate_synthetic_reference,
@@ -156,6 +157,20 @@ def test_rocm_power_policy_targets_at_least_ten_samples():
     assert estimated_window_sec / sample_interval_sec >= float(target_sample_count)
 
 
+def test_rocm_smi_power_monitor_stats_filter_outliers_when_variance_drops():
+    monitor = RocmSMIPowerMonitor()
+    monitor.samples_w = [10.0, 10.1, 9.9, 10.2, 10.0, 10.1, 9.8, 10.0, 10.2, 22.0]
+
+    stats = monitor.stats(elapsed_sec=2.0)
+
+    assert stats["power_outlier_filter_applied"] is True
+    assert stats["power_outlier_sample_count"] == 1
+    assert stats["raw_power_sample_count"] == 10
+    assert stats["power_sample_count"] == 9
+    assert float(stats["raw_avg_power_w"]) > float(stats["avg_power_w"])
+    assert float(stats["raw_power_std_w"]) > float(stats["power_std_w"])
+
+
 def test_configure_cpu_runtime_for_max_physical_cores(monkeypatch):
     recorded: dict[str, int] = {}
 
@@ -198,6 +213,13 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "avg_power_w": 10.0,
             "min_power_w": 9.0,
             "max_power_w": 12.0,
+            "raw_avg_power_w": 11.0,
+            "raw_min_power_w": 9.0,
+            "raw_max_power_w": 20.0,
+            "raw_power_sample_count": 10,
+            "power_std_w": 0.8,
+            "raw_power_std_w": 3.1,
+            "power_outlier_sample_count": 1,
             "energy_j": 5.0,
             "power_sample_count": 7,
             "extra_power_stats": {},
@@ -310,6 +332,69 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "metric": "power_sample_count",
             "igpu": None,
             "igpu_rocm_smi": 7,
+            "hybrid": None,
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": 64,
+            "metric": "raw_avg_power_w",
+            "igpu": None,
+            "igpu_rocm_smi": 11.0,
+            "hybrid": None,
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": 64,
+            "metric": "raw_min_power_w",
+            "igpu": None,
+            "igpu_rocm_smi": 9.0,
+            "hybrid": None,
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": 64,
+            "metric": "raw_max_power_w",
+            "igpu": None,
+            "igpu_rocm_smi": 20.0,
+            "hybrid": None,
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": 64,
+            "metric": "raw_power_sample_count",
+            "igpu": None,
+            "igpu_rocm_smi": 10,
+            "hybrid": None,
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": 64,
+            "metric": "power_std_w",
+            "igpu": None,
+            "igpu_rocm_smi": 0.8,
+            "hybrid": None,
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": 64,
+            "metric": "raw_power_std_w",
+            "igpu": None,
+            "igpu_rocm_smi": 3.1,
+            "hybrid": None,
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": 64,
+            "metric": "power_outlier_sample_count",
+            "igpu": None,
+            "igpu_rocm_smi": 1,
             "hybrid": None,
         },
     ]
@@ -468,6 +553,74 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
                 "igpu_rocm_smi": "7",
                 "hybrid": "",
             },
+            ("encoder_bert", "tinybert_512", 64, "raw_avg_power_w"): {
+                "workload_variant": "encoder_bert",
+                "study_case_id": "tinybert_512",
+                "seq_len": "64",
+                "metric": "raw_avg_power_w",
+                "igpu": "",
+                "igpu_rocm_smi": "11.0",
+                "hybrid": "",
+            },
+            ("encoder_bert", "tinybert_512", 64, "raw_min_power_w"): {
+                "workload_variant": "encoder_bert",
+                "study_case_id": "tinybert_512",
+                "seq_len": "64",
+                "metric": "raw_min_power_w",
+                "igpu": "",
+                "igpu_rocm_smi": "9.0",
+                "hybrid": "",
+            },
+            ("encoder_bert", "tinybert_512", 64, "raw_max_power_w"): {
+                "workload_variant": "encoder_bert",
+                "study_case_id": "tinybert_512",
+                "seq_len": "64",
+                "metric": "raw_max_power_w",
+                "igpu": "",
+                "igpu_rocm_smi": "20.0",
+                "hybrid": "",
+            },
+            ("encoder_bert", "tinybert_512", 64, "raw_power_sample_count"): {
+                "workload_variant": "encoder_bert",
+                "study_case_id": "tinybert_512",
+                "seq_len": "64",
+                "metric": "raw_power_sample_count",
+                "igpu": "",
+                "igpu_rocm_smi": "10",
+                "hybrid": "",
+            },
+            ("encoder_bert", "tinybert_512", 64, "power_std_w"): {
+                "workload_variant": "encoder_bert",
+                "study_case_id": "tinybert_512",
+                "seq_len": "64",
+                "metric": "power_std_w",
+                "igpu": "",
+                "igpu_rocm_smi": "0.8",
+                "hybrid": "",
+            },
+            ("encoder_bert", "tinybert_512", 64, "raw_power_std_w"): {
+                "workload_variant": "encoder_bert",
+                "study_case_id": "tinybert_512",
+                "seq_len": "64",
+                "metric": "raw_power_std_w",
+                "igpu": "",
+                "igpu_rocm_smi": "3.1",
+                "hybrid": "",
+            },
+            (
+                "encoder_bert",
+                "tinybert_512",
+                64,
+                "power_outlier_sample_count",
+            ): {
+                "workload_variant": "encoder_bert",
+                "study_case_id": "tinybert_512",
+                "seq_len": "64",
+                "metric": "power_outlier_sample_count",
+                "igpu": "",
+                "igpu_rocm_smi": "1",
+                "hybrid": "",
+            },
         },
     )
 
@@ -560,6 +713,69 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "metric": "power_sample_count",
             "igpu": "",
             "igpu_rocm_smi": "7",
+            "hybrid": "",
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "raw_avg_power_w",
+            "igpu": "",
+            "igpu_rocm_smi": "11.0",
+            "hybrid": "",
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "raw_min_power_w",
+            "igpu": "",
+            "igpu_rocm_smi": "9.0",
+            "hybrid": "",
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "raw_max_power_w",
+            "igpu": "",
+            "igpu_rocm_smi": "20.0",
+            "hybrid": "",
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "raw_power_sample_count",
+            "igpu": "",
+            "igpu_rocm_smi": "10",
+            "hybrid": "",
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "power_std_w",
+            "igpu": "",
+            "igpu_rocm_smi": "0.8",
+            "hybrid": "",
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "raw_power_std_w",
+            "igpu": "",
+            "igpu_rocm_smi": "3.1",
+            "hybrid": "",
+        },
+        {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "power_outlier_sample_count",
+            "igpu": "",
+            "igpu_rocm_smi": "1",
             "hybrid": "",
         },
     ]

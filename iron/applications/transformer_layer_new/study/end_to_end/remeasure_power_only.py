@@ -20,18 +20,10 @@ from .cases import (
     get_case,
 )
 from .modes import benchmark_mode_power_only
-from .power import SUPPORTED_POWER_BACKENDS
+from .power import PERSISTED_POWER_RESULT_FIELDS, SUPPORTED_POWER_BACKENDS
+from .run import RESULTS_CSV_FIELDNAMES
 
 LOGGER = logging.getLogger(__name__)
-
-POWER_RESULT_FIELDS = (
-    "power_backend",
-    "avg_power_w",
-    "min_power_w",
-    "max_power_w",
-    "power_sample_count",
-    "effective_gflops_per_sec_per_watt",
-)
 
 
 def default_output_path() -> Path:
@@ -60,9 +52,8 @@ def write_rows(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         return
-    fieldnames = list(rows[0].keys())
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=RESULTS_CSV_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -102,10 +93,8 @@ def updated_row_with_power_measurement(
         "power_backend",
         existing_row.get("power_backend", ""),
     )
-    updated["avg_power_w"] = power_result.get("avg_power_w")
-    updated["min_power_w"] = power_result.get("min_power_w")
-    updated["max_power_w"] = power_result.get("max_power_w")
-    updated["power_sample_count"] = power_result.get("power_sample_count")
+    for field in PERSISTED_POWER_RESULT_FIELDS:
+        updated[field] = power_result.get(field)
     updated["effective_gflops_per_sec_per_watt"] = effective_gflops_per_sec_per_watt(
         _optional_float(existing_row.get("effective_gflops_per_sec")),
         _optional_float(power_result.get("avg_power_w")),

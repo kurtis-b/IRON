@@ -29,7 +29,7 @@ from .modes import (
     benchmark_operator_candidate,
     resolve_mode_operator_config,
 )
-from .power import SUPPORTED_POWER_BACKENDS
+from .power import PERSISTED_POWER_RESULT_FIELDS, SUPPORTED_POWER_BACKENDS
 
 LOGGER = logging.getLogger(__name__)
 csv.field_size_limit(sys.maxsize)
@@ -95,10 +95,7 @@ RESULTS_CSV_FIELDNAMES = (
     "host_qkv_precompute_ms",
     "effective_gflops_per_sec",
     "power_backend",
-    "avg_power_w",
-    "min_power_w",
-    "max_power_w",
-    "power_sample_count",
+    *PERSISTED_POWER_RESULT_FIELDS,
     "effective_gflops_per_sec_per_watt",
     "npu_dispatch_count",
     "npu_unique_instruction_binary_count",

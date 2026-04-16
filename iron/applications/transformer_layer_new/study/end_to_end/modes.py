@@ -92,6 +92,7 @@ from .cases import (
     effective_gflops_per_sec_per_watt,
 )
 from .power import (
+    PERSISTED_POWER_RESULT_FIELDS,
     create_power_monitor,
     empty_power_stats,
     power_probe_is_complete,
@@ -128,6 +129,17 @@ DEFAULT_MIN_POWER_MEASUREMENT_DURATION_SEC = max(
     DEFAULT_POWER_SAMPLE_INTERVAL_SEC * DEFAULT_POWER_SAMPLE_TARGET_COUNT,
 )
 _LONG_SEQ_CANDIDATE_SUBPROCESS_MIN_SEQ_LEN = 8192
+
+
+def _empty_persisted_power_result() -> dict[str, object]:
+    return {field: None for field in PERSISTED_POWER_RESULT_FIELDS}
+
+
+def _apply_persisted_power_result(
+    result: dict[str, object], power_stats: dict[str, object]
+) -> None:
+    for field in PERSISTED_POWER_RESULT_FIELDS:
+        result[field] = power_stats.get(field)
 
 
 def _config_scope_key(
@@ -1788,10 +1800,7 @@ def benchmark_mode_subprocess(
         "compile_setup_time_ms": None,
         "effective_gflops_per_sec": None,
         "power_backend": "none" if power_backend == "auto" else power_backend,
-        "avg_power_w": None,
-        "min_power_w": None,
-        "max_power_w": None,
-        "power_sample_count": None,
+        **_empty_persisted_power_result(),
         "effective_gflops_per_sec_per_watt": None,
         "host_qkv_precompute_ms": None,
         "npu_dispatch_count": None,
@@ -1856,10 +1865,7 @@ def benchmark_mode(
         "compile_setup_time_ms": None,
         "effective_gflops_per_sec": None,
         "power_backend": "none" if power_backend == "auto" else power_backend,
-        "avg_power_w": None,
-        "min_power_w": None,
-        "max_power_w": None,
-        "power_sample_count": None,
+        **_empty_persisted_power_result(),
         "effective_gflops_per_sec_per_watt": None,
         "host_qkv_precompute_ms": None,
         "npu_dispatch_count": None,
@@ -1983,10 +1989,7 @@ def benchmark_mode(
         result["power_backend"] = power_stats.get(
             "power_backend", result["power_backend"]
         )
-        result["avg_power_w"] = power_stats.get("avg_power_w")
-        result["min_power_w"] = power_stats.get("min_power_w")
-        result["max_power_w"] = power_stats.get("max_power_w")
-        result["power_sample_count"] = power_stats.get("power_sample_count")
+        _apply_persisted_power_result(result, power_stats)
         result["effective_gflops_per_sec_per_watt"] = effective_gflops_per_sec_per_watt(
             result["effective_gflops_per_sec"],
             result["avg_power_w"],
@@ -2022,10 +2025,7 @@ def benchmark_mode_power_only(
     execution_mode = canonical_execution_mode(str(execution_mode))
     result = {
         "power_backend": "none" if power_backend == "auto" else power_backend,
-        "avg_power_w": None,
-        "min_power_w": None,
-        "max_power_w": None,
-        "power_sample_count": None,
+        **_empty_persisted_power_result(),
         "effective_gflops_per_sec_per_watt": None,
         "run_status": "failed_exception",
         "failure_message": "",
@@ -2106,10 +2106,7 @@ def benchmark_mode_power_only(
         result["power_backend"] = power_stats.get(
             "power_backend", result["power_backend"]
         )
-        result["avg_power_w"] = power_stats.get("avg_power_w")
-        result["min_power_w"] = power_stats.get("min_power_w")
-        result["max_power_w"] = power_stats.get("max_power_w")
-        result["power_sample_count"] = power_stats.get("power_sample_count")
+        _apply_persisted_power_result(result, power_stats)
         result["effective_gflops_per_sec_per_watt"] = effective_gflops_per_sec_per_watt(
             effective_gflops_per_sec_value,
             power_stats.get("avg_power_w"),

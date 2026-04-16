@@ -37,8 +37,10 @@ from iron.applications.transformer_layer_new.study.end_to_end.cases import (
     FAMILY_SPECS,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.power import (
+    PERSISTED_POWER_RESULT_FIELDS,
     create_power_monitor as create_cpu_power_monitor,
     power_probe_is_complete,
+    summarize_power_samples,
 )
 
 from .select import (
@@ -69,6 +71,33 @@ RESULTS_CSV_FIELDNAMES = (
     "seq_len",
     "metric",
     *COMPARISON_COLUMNS,
+)
+DIRECT_COMPARISON_METRICS: tuple[str, ...] = (
+    "effective_gflops_per_sec",
+    "avg_latency_ms",
+    "min_latency_ms",
+    "max_latency_ms",
+    "latency_sample_count",
+)
+POWER_AUDIT_METRICS: tuple[str, ...] = tuple(
+    field
+    for field in PERSISTED_POWER_RESULT_FIELDS
+    if field
+    not in {
+        "avg_power_w",
+        "min_power_w",
+        "max_power_w",
+        "power_sample_count",
+        "power_outlier_filter_applied",
+    }
+)
+POWER_COMPARISON_METRICS: tuple[str, ...] = (
+    "effective_gflops_per_sec_per_watt",
+    "avg_power_w",
+    "min_power_w",
+    "max_power_w",
+    "power_sample_count",
+    *POWER_AUDIT_METRICS,
 )
 PLOT_SERIES_THROUGHPUT = (
     ("igpu", "iGPU", "#e07a5f"),
@@ -208,6 +237,14 @@ def empty_power_stats() -> dict[str, float | str | None]:
     return {
         "power_backend": None,
         "avg_power_w": None,
+        "raw_avg_power_w": None,
+        "raw_min_power_w": None,
+        "raw_max_power_w": None,
+        "raw_power_sample_count": None,
+        "power_std_w": None,
+        "raw_power_std_w": None,
+        "power_outlier_sample_count": None,
+        "power_outlier_filter_applied": None,
         "min_power_w": None,
         "max_power_w": None,
         "energy_j": None,
@@ -307,15 +344,11 @@ class RocmSMIPowerMonitor:
         stats["power_backend"] = "rocm-smi"
         if not self.samples_w:
             return stats
-        avg_power_w = sum(self.samples_w) / len(self.samples_w)
         stats.update(
-            {
-                "avg_power_w": avg_power_w,
-                "min_power_w": min(self.samples_w),
-                "max_power_w": max(self.samples_w),
-                "energy_j": avg_power_w * elapsed_sec,
-                "power_sample_count": len(self.samples_w),
-            }
+            summarize_power_samples(
+                self.samples_w,
+                elapsed_sec=elapsed_sec,
+            )
         )
         return stats
 
@@ -809,11 +842,8 @@ def benchmark_host_group(
         **summary,
         "effective_gflops_per_sec": effective_gflops,
         "power_backend": power_stats.get("power_backend"),
-        "avg_power_w": power_stats.get("avg_power_w"),
-        "min_power_w": power_stats.get("min_power_w"),
-        "max_power_w": power_stats.get("max_power_w"),
+        **{field: power_stats.get(field) for field in PERSISTED_POWER_RESULT_FIELDS},
         "energy_j": power_stats.get("energy_j"),
-        "power_sample_count": power_stats.get("power_sample_count"),
         "effective_gflops_per_sec_per_watt": effective_gflops_per_sec_per_watt(
             effective_gflops,
             _optional_float(power_stats.get("avg_power_w")),
@@ -868,11 +898,10 @@ def benchmark_host_group_power_only(
         )
         return {
             "power_backend": power_stats.get("power_backend"),
-            "avg_power_w": power_stats.get("avg_power_w"),
-            "min_power_w": power_stats.get("min_power_w"),
-            "max_power_w": power_stats.get("max_power_w"),
+            **{
+                field: power_stats.get(field) for field in PERSISTED_POWER_RESULT_FIELDS
+            },
             "energy_j": power_stats.get("energy_j"),
-            "power_sample_count": power_stats.get("power_sample_count"),
             "effective_gflops_per_sec_per_watt": effective_gflops_per_sec_per_watt(
                 existing_effective_gflops_per_sec,
                 _optional_float(power_stats.get("avg_power_w")),
@@ -883,11 +912,8 @@ def benchmark_host_group_power_only(
     except Exception as exc:
         return {
             "power_backend": power_backend,
-            "avg_power_w": None,
-            "min_power_w": None,
-            "max_power_w": None,
+            **{field: None for field in PERSISTED_POWER_RESULT_FIELDS},
             "energy_j": None,
-            "power_sample_count": None,
             "effective_gflops_per_sec_per_watt": None,
             "run_status": "failed_exception",
             "failure_message": f"{type(exc).__name__}: {exc}",
@@ -1088,10 +1114,7 @@ def reusable_rows_for_group(
         "min_latency_ms",
         "max_latency_ms",
         "latency_sample_count",
-        "avg_power_w",
-        "min_power_w",
-        "max_power_w",
-        "power_sample_count",
+        *POWER_COMPARISON_METRICS[1:],
     )
     reused_rows = [dict(throughput_row), dict(per_watt_row)]
     for metric in required_metrics:
@@ -1418,33 +1441,17 @@ def build_rows_for_group(
                 benchmark_result=benchmark_results[backend],
             )
 
-    reference_effective_gflops = _reference_metric_means(
-        group,
-        "effective_gflops_per_sec",
-    )
-    reference_effective_gflops_per_watt = _reference_metric_means(
-        group,
-        "effective_gflops_per_sec_per_watt",
-    )
-    reference_avg_latency_ms = _reference_metric_means(group, "avg_latency_ms")
-    reference_min_latency_ms = _reference_metric_means(group, "min_latency_ms")
-    reference_max_latency_ms = _reference_metric_means(group, "max_latency_ms")
-    reference_latency_sample_count = _reference_metric_means(
-        group,
-        "latency_sample_count",
-    )
-    reference_avg_power_w = _reference_metric_means(group, "avg_power_w")
-    reference_min_power_w = _reference_metric_means(group, "min_power_w")
-    reference_max_power_w = _reference_metric_means(group, "max_power_w")
-    reference_power_sample_count = _reference_metric_means(
-        group,
-        "power_sample_count",
-    )
+    reference_metric_values = {
+        metric: _reference_metric_means(group, metric)
+        for metric in (*DIRECT_COMPARISON_METRICS, *POWER_COMPARISON_METRICS)
+    }
     reused_rows = reusable_rows_for_group(
         {} if existing_rows is None else existing_rows,
         group=group,
-        reference_effective_gflops=reference_effective_gflops,
-        reference_effective_gflops_per_watt=reference_effective_gflops_per_watt,
+        reference_effective_gflops=reference_metric_values["effective_gflops_per_sec"],
+        reference_effective_gflops_per_watt=reference_metric_values[
+            "effective_gflops_per_sec_per_watt"
+        ],
     )
     if reused_rows is not None:
         LOGGER.info(
@@ -1453,91 +1460,33 @@ def build_rows_for_group(
             group.seq_len,
         )
         return reused_rows
-    return [
+    rows = [
         _comparison_row(
             group=group,
-            metric="effective_gflops_per_sec",
-            igpu_value=_host_metric_value(
-                benchmark_results["igpu"],
-                "effective_gflops_per_sec",
-            ),
-            reference_values=reference_effective_gflops,
-        ),
-        _comparison_row(
-            group=group,
-            metric="avg_latency_ms",
-            igpu_value=_host_metric_value(benchmark_results["igpu"], "avg_latency_ms"),
-            reference_values=reference_avg_latency_ms,
-        ),
-        _comparison_row(
-            group=group,
-            metric="min_latency_ms",
-            igpu_value=_host_metric_value(benchmark_results["igpu"], "min_latency_ms"),
-            reference_values=reference_min_latency_ms,
-        ),
-        _comparison_row(
-            group=group,
-            metric="max_latency_ms",
-            igpu_value=_host_metric_value(benchmark_results["igpu"], "max_latency_ms"),
-            reference_values=reference_max_latency_ms,
-        ),
-        _comparison_row(
-            group=group,
-            metric="latency_sample_count",
-            igpu_value=_host_metric_value(
-                benchmark_results["igpu"],
-                "latency_sample_count",
-            ),
-            reference_values=reference_latency_sample_count,
-        ),
-        _comparison_row(
-            group=group,
-            metric="effective_gflops_per_sec_per_watt",
-            igpu_value=None,
-            igpu_rocm_smi_value=_igpu_effective_gflops_per_watt_for_backend(
-                benchmark_results["igpu"],
-                power_backend="rocm-smi",
-            ),
-            reference_values=reference_effective_gflops_per_watt,
-        ),
-        _comparison_row(
-            group=group,
-            metric="avg_power_w",
-            igpu_value=None,
-            igpu_rocm_smi_value=_host_metric_value(
-                benchmark_results["igpu"], "avg_power_w"
-            ),
-            reference_values=reference_avg_power_w,
-        ),
-        _comparison_row(
-            group=group,
-            metric="min_power_w",
-            igpu_value=None,
-            igpu_rocm_smi_value=_host_metric_value(
-                benchmark_results["igpu"], "min_power_w"
-            ),
-            reference_values=reference_min_power_w,
-        ),
-        _comparison_row(
-            group=group,
-            metric="max_power_w",
-            igpu_value=None,
-            igpu_rocm_smi_value=_host_metric_value(
-                benchmark_results["igpu"], "max_power_w"
-            ),
-            reference_values=reference_max_power_w,
-        ),
-        _comparison_row(
-            group=group,
-            metric="power_sample_count",
-            igpu_value=None,
-            igpu_rocm_smi_value=_host_metric_value(
-                benchmark_results["igpu"],
-                "power_sample_count",
-            ),
-            reference_values=reference_power_sample_count,
-        ),
+            metric=metric,
+            igpu_value=_host_metric_value(benchmark_results["igpu"], metric),
+            reference_values=reference_metric_values[metric],
+        )
+        for metric in DIRECT_COMPARISON_METRICS
     ]
+    rows.extend(
+        _comparison_row(
+            group=group,
+            metric=metric,
+            igpu_value=None,
+            igpu_rocm_smi_value=(
+                _igpu_effective_gflops_per_watt_for_backend(
+                    benchmark_results["igpu"],
+                    power_backend="rocm-smi",
+                )
+                if metric == "effective_gflops_per_sec_per_watt"
+                else _host_metric_value(benchmark_results["igpu"], metric)
+            ),
+            reference_values=reference_metric_values[metric],
+        )
+        for metric in POWER_COMPARISON_METRICS
+    )
+    return rows
 
 
 def write_rows(output_path: Path, rows: list[dict[str, object]]) -> None:
