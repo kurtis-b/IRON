@@ -60,6 +60,7 @@ def run_test(
     abs_tol=1e-6,
     warmup_iters=1,
     timed_iters=1,
+    return_timing_details=False,
 ):
     """
     Run operator test with specified input/output/intermediate buffers.
@@ -73,7 +74,11 @@ def run_test(
         abs_tol: Absolute tolerance for comparison of output and intermediate buffers
 
     Returns:
-        (errors: list, latency_us: float, bandwidth_gbps: float)
+        `(errors, latency_us, bandwidth_gbps)` by default.
+        When `return_timing_details=True`, returns
+        `(errors, latency_us, bandwidth_gbps, timing_details)` where
+        `timing_details` includes average/min/max timed latency in microseconds and
+        the timed sample count.
     """
     if intermediate_buffers is None:
         intermediate_buffers = {}
@@ -100,11 +105,22 @@ def run_test(
         operator.write_buffer(buf_name, data_np)
 
     # Run operator
-    elapsed_total = 0
+    timed_latencies_sec = []
     for _ in range(timed_iters):
-        elapsed_total += operator.run_runlist()
+        timed_latencies_sec.append(operator.run_runlist())
+    elapsed_total = sum(timed_latencies_sec)
     elapsed = elapsed_total / timed_iters
     latency_us = elapsed * 1e6
+    timing_details = {
+        "latency_sample_count": len(timed_latencies_sec),
+        "avg_latency_us": latency_us,
+        "min_latency_us": (
+            min(timed_latencies_sec) * 1e6 if timed_latencies_sec else None
+        ),
+        "max_latency_us": (
+            max(timed_latencies_sec) * 1e6 if timed_latencies_sec else None
+        ),
+    }
 
     # Verify outputs
     errors = {}
@@ -124,4 +140,6 @@ def run_test(
     total_bytes = input_bytes + output_bytes
     bandwidth_gbps = total_bytes / (latency_us * 1e-6) / 1e9
 
+    if return_timing_details:
+        return errors, latency_us, bandwidth_gbps, timing_details
     return errors, latency_us, bandwidth_gbps

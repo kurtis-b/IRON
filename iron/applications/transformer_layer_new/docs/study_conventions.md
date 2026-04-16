@@ -110,15 +110,13 @@ Its comparison columns are:
 
 - `igpu`
 - `igpu_rocm_smi`
-- `igpu_turbostat_pkgwatt`
 - `hybrid`
 
 The throughput row uses `igpu` and `hybrid`.
-The per-watt row uses the same iGPU throughput numerator with two power
-backends:
+The per-watt row uses the same iGPU throughput numerator with the ROCm-SMI
+power backend:
 
 - `igpu_rocm_smi`
-- `igpu_turbostat_pkgwatt`
 - `hybrid`
 
 ## Supporting Studies
@@ -137,6 +135,20 @@ The end-to-end staging-ablation CSV keeps one row per
 `(study_case_id, seq_len, block_kind, staging_depth)` for real `hybrid`
 reruns. It sweeps the selected `hybrid` config at different staging depths
 and can reuse the memory-tile staging depth ladder when that CSV is present.
+
+For unattended full-suite execution, use
+`study/unattended_reboot.py`. It keeps running normal jobs in one session,
+reboots only when a TTM transition is required for the iGPU `16384`
+host-comparison rows, and ends with `study/regenerate_plots.py` to refresh the
+summary plot suite from the collected results root after the normal TTM state
+has been restored. The unattended runner re-sources `/opt/xilinx/xrt/setup.sh`
+and the repo-local `ironenv` virtualenv before each resumed `python3`
+invocation after reboot.
+
+If a run is stopped intentionally, resume it with
+`python3 -m iron.applications.transformer_layer_new.study.unattended_reboot resume --state <state.json>`.
+When the run was started with `sudo`, the reboot hook is managed in the root
+crontab via `crontab`, not by direct edits under `/var/spool/cron/crontabs`.
 
 The host-comparison study remains separate from `study/end_to_end` by design.
 It consumes completed end-to-end NPU rows instead of re-running NPU patterns.

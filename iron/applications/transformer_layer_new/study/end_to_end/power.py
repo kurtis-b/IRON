@@ -19,8 +19,10 @@ def empty_power_stats() -> dict[str, float | str | None]:
         "power_backend": None,
         "avg_power_w": None,
         "raw_package_avg_power_w": None,
+        "raw_package_min_power_w": None,
         "raw_package_max_power_w": None,
         "quiescent_package_power_w": None,
+        "min_power_w": None,
         "max_power_w": None,
         "energy_j": None,
         "power_sample_count": None,
@@ -72,6 +74,22 @@ def resolve_power_probe_runs(
     if avg_iteration_sec is None or avg_iteration_sec <= 0:
         return runs
     return max(runs, int(math.ceil(min_measurement_duration_sec / avg_iteration_sec)))
+
+
+def power_probe_is_complete(
+    *,
+    completed_runs: int,
+    min_runs: int,
+    elapsed_sec: float,
+    min_measurement_duration_sec: float,
+    observed_sample_count: int,
+    min_sample_count: int,
+) -> bool:
+    return (
+        completed_runs >= int(min_runs)
+        and elapsed_sec >= float(min_measurement_duration_sec)
+        and observed_sample_count >= int(min_sample_count)
+    )
 
 
 def _run_turbostat_pkgwatt_samples(
@@ -207,6 +225,9 @@ class TurbostatPackagePowerMonitor:
             except Exception:
                 return
 
+    def current_sample_count(self) -> int:
+        return len(self._pseudo_samples_w)
+
     def stats(self, elapsed_sec: float) -> dict[str, float | str | None]:
         stats = empty_power_stats()
         stats["power_backend"] = "turbostat_pkgwatt"
@@ -220,8 +241,10 @@ class TurbostatPackagePowerMonitor:
         stats.update(
             {
                 "raw_package_avg_power_w": avg_raw_w,
+                "raw_package_min_power_w": min(self.raw_package_samples_w),
                 "raw_package_max_power_w": max(self.raw_package_samples_w),
                 "avg_power_w": avg_pseudo_w,
+                "min_power_w": min(self._pseudo_samples_w),
                 "max_power_w": max(self._pseudo_samples_w),
                 "energy_j": avg_pseudo_w * elapsed_sec,
                 "power_sample_count": len(self._pseudo_samples_w),

@@ -18,7 +18,6 @@ Compared columns:
 
 - `igpu`
 - `igpu_rocm_smi`
-- `igpu_turbostat_pkgwatt`
 - `hybrid`
 
 ## Dependency
@@ -31,11 +30,10 @@ It does not re-run NPU patterns. It benchmarks the requested host backend once
 per available `(study_case_id, seq_len)` and then joins those measurements with
 the retained NPU `hybrid` rows.
 
-For the iGPU path, throughput is measured once per point. The per-watt outputs
-then reuse that throughput value with two separate power measurements:
+For the iGPU path, throughput is measured once per point. The per-watt output
+then reuses that throughput value with a separate ROCm-SMI power measurement:
 
 - `rocm-smi`
-- `turbostat_pkgwatt`
 
 ## Scheduling
 
@@ -44,7 +42,12 @@ The default short-sequence schedule is:
 - `64`, `128`, `256`
   `warmup_runs=1`, `runs_per_sample=100`
 
-The remaining ladder follows the default policy in `run.py`.
+The remaining ladder is:
+
+- `512`, `1024`, `2048`
+  `warmup_runs=1`, `runs_per_sample=10`
+- `4096`, `8192`, `16384`
+  `warmup_runs=1`, `runs_per_sample=5`
 
 ## Outputs
 
@@ -57,10 +60,9 @@ Canonical outputs:
 
 The comparison CSV keeps one row per `(study_case_id, seq_len, metric)`.
 The throughput row uses `igpu` and `hybrid`, and the per-watt row uses
-`igpu_rocm_smi`, `igpu_turbostat_pkgwatt`, and `hybrid`.
+`igpu_rocm_smi` and `hybrid`.
 
-The fairness summary remains one row for the iGPU backend. It does not duplicate
-rows by power backend.
+The fairness summary remains one row for the iGPU backend.
 
 ## Entry Points
 

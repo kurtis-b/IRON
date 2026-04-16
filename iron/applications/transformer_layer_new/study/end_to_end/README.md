@@ -114,7 +114,7 @@ Validation policy:
 Environment:
 
 - `source /opt/xilinx/xrt/setup.sh`
-- `source ironenv/bin/activate`
+- `source ~/iron/ironenv/bin/activate`
 - `sudo xrt-smi configure --pmode turbo`
 - verify with `xrt-smi examine -r all`
 

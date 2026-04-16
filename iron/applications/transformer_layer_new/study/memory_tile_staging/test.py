@@ -398,6 +398,9 @@ def test_build_selection_rows_reuses_existing_rows_and_skips_removed(monkeypatch
                 "warmup_iters": "1",
                 "timed_iters": "2",
                 "avg_latency_ms": "50.0",
+                "latency_sample_count": "2",
+                "min_latency_ms": "50.0",
+                "max_latency_ms": "50.0",
                 "bandwidth_gbps": "5.0",
                 "speedup_vs_depth1": "",
                 "validation_error_count": "0",
@@ -428,6 +431,7 @@ def test_main_writes_csv_and_canonical_plots(monkeypatch, tmp_path):
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerow(_reference_row("mha_out_proj"))
+        writer.writerow(_reference_row("ffn"))
         writer.writerow(_reference_row("ffn"))
 
     def fake_benchmark_candidate(
@@ -507,49 +511,53 @@ def test_main_reuses_existing_results_by_default(monkeypatch, tmp_path):
 
     output_path = tmp_path / "memory_tile_staging.csv"
     existing_rows = []
-    for depth in ("1", "2", "4", "8"):
-        existing_rows.append(
-            {
-                "study_id": "memory_tile_staging",
-                "family_id": "baseline_768",
-                "family_label": "768 / 3072 / 12",
-                "seq_len": "512",
-                "block_kind": "mha_out_proj",
-                "source_candidate_index": "0",
-                "source_staging_depth": "8",
-                "staging_depth": depth,
-                "head_dim": "64",
-                "num_heads": "12",
-                "hidden_size": "768",
-                "ffn_dim": "3072",
-                "warmup_iters": "1",
-                "timed_iters": "2",
-                "avg_latency_ms": "10.0",
-                "bandwidth_gbps": "5.0",
-                "speedup_vs_depth1": "1.0",
-                "validation_error_count": "0",
-                "run_status": "passed",
-                "is_best_depth": "False",
-                "error_message": "",
-                "mha_out_proj_parallel_seq": "8",
-                "mha_out_proj_q_seq_tile": "32",
-                "mha_out_proj_kv_seq_tile": "64",
-                "mha_out_proj_emb_tile": "96",
-                "mha_out_proj_parallel_heads": "1",
-                "mha_out_proj_o_proj_acc_depth": depth,
-                "ffn_num_aie_columns": "",
-                "ffn_b_col_maj": "",
-                "ffn_c_col_maj": "",
-                "ffn_tile_m": "",
-                "ffn_tile_k": "",
-                "ffn_tile_n": "",
-                "ffn_down_proj_depth": "",
-                "ffn_n_a_tiles_distributed": "",
-                "ffn_n_b_tiles_distributed": "",
-                "ffn_stage_only": "",
-                "ffn_gelu_stage": "",
-            }
-        )
+    for family_id in ("baseline_768", "gpt2_small_768"):
+        for depth in ("1", "2", "4", "8"):
+            existing_rows.append(
+                {
+                    "study_id": "memory_tile_staging",
+                    "family_id": family_id,
+                    "family_label": "768 / 3072 / 12",
+                    "seq_len": "512",
+                    "block_kind": "mha_out_proj",
+                    "source_candidate_index": "0",
+                    "source_staging_depth": "8",
+                    "staging_depth": depth,
+                    "head_dim": "64",
+                    "num_heads": "12",
+                    "hidden_size": "768",
+                    "ffn_dim": "3072",
+                    "warmup_iters": "1",
+                    "timed_iters": "2",
+                    "avg_latency_ms": "10.0",
+                    "latency_sample_count": "2",
+                    "min_latency_ms": "10.0",
+                    "max_latency_ms": "10.0",
+                    "bandwidth_gbps": "5.0",
+                    "speedup_vs_depth1": "1.0",
+                    "validation_error_count": "0",
+                    "run_status": "passed",
+                    "is_best_depth": "False",
+                    "error_message": "",
+                    "mha_out_proj_parallel_seq": "8",
+                    "mha_out_proj_q_seq_tile": "32",
+                    "mha_out_proj_kv_seq_tile": "64",
+                    "mha_out_proj_emb_tile": "96",
+                    "mha_out_proj_parallel_heads": "1",
+                    "mha_out_proj_o_proj_acc_depth": depth,
+                    "ffn_num_aie_columns": "",
+                    "ffn_b_col_maj": "",
+                    "ffn_c_col_maj": "",
+                    "ffn_tile_m": "",
+                    "ffn_tile_k": "",
+                    "ffn_tile_n": "",
+                    "ffn_down_proj_depth": "",
+                    "ffn_n_a_tiles_distributed": "",
+                    "ffn_n_b_tiles_distributed": "",
+                    "ffn_stage_only": "",
+                    "ffn_gelu_stage": "",
+                }
+            )
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(existing_rows[0]))
         writer.writeheader()
@@ -574,6 +582,120 @@ def test_main_reuses_existing_results_by_default(monkeypatch, tmp_path):
     )
 
     assert exit_code == 0
+
+
+def test_main_preserves_unrelated_existing_results_when_running_filtered_selection(
+    monkeypatch, tmp_path
+):
+    reference_input = tmp_path / "block_results.csv"
+    fieldnames = list(_reference_row("mha_out_proj").keys())
+    with reference_input.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(_reference_row("mha_out_proj", family_id="baseline_768"))
+
+    output_path = tmp_path / "memory_tile_staging.csv"
+    existing_rows = [
+        {
+            "study_id": "memory_tile_staging",
+            "family_id": "gpt2_medium_1024",
+            "family_label": "1024 / 4096 / 16",
+            "seq_len": "8192",
+            "block_kind": "ffn",
+            "source_candidate_index": "0",
+            "source_staging_depth": "8",
+            "staging_depth": "1",
+            "head_dim": "64",
+            "num_heads": "16",
+            "hidden_size": "1024",
+            "ffn_dim": "4096",
+            "warmup_iters": "1",
+            "timed_iters": "2",
+            "avg_latency_ms": "10.0",
+            "latency_sample_count": "2",
+            "min_latency_ms": "10.0",
+            "max_latency_ms": "10.0",
+            "bandwidth_gbps": "5.0",
+            "speedup_vs_depth1": "1.0",
+            "validation_error_count": "0",
+            "run_status": "passed",
+            "is_best_depth": "False",
+            "error_message": "",
+            "mha_out_proj_parallel_seq": "",
+            "mha_out_proj_q_seq_tile": "",
+            "mha_out_proj_kv_seq_tile": "",
+            "mha_out_proj_emb_tile": "",
+            "mha_out_proj_parallel_heads": "",
+            "mha_out_proj_o_proj_acc_depth": "",
+            "ffn_num_aie_columns": "8",
+            "ffn_b_col_maj": "False",
+            "ffn_c_col_maj": "False",
+            "ffn_tile_m": "64",
+            "ffn_tile_k": "128",
+            "ffn_tile_n": "64",
+            "ffn_down_proj_depth": "1",
+            "ffn_n_a_tiles_distributed": "8",
+            "ffn_n_b_tiles_distributed": "2",
+            "ffn_stage_only": "",
+            "ffn_gelu_stage": "1",
+        }
+    ]
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(existing_rows[0]))
+        writer.writeheader()
+        writer.writerows(existing_rows)
+
+    def fake_benchmark_candidate(
+        block_kind,
+        workload,
+        candidate,
+        *,
+        warmup_iters,
+        timed_iters,
+        seed,
+    ):
+        depth = int(candidate[5] if block_kind == "mha_out_proj" else candidate[6])
+        return {
+            "avg_latency_ms": 100.0 / depth,
+            "latency_sample_count": timed_iters,
+            "min_latency_ms": 100.0 / depth,
+            "max_latency_ms": 100.0 / depth,
+            "bandwidth_gbps": 5.0 * depth,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "error_message": "",
+        }
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.memory_tile_staging.run.benchmark_candidate",
+        fake_benchmark_candidate,
+    )
+
+    exit_code = main(
+        [
+            "--reference-input",
+            str(reference_input),
+            "--family",
+            "baseline_768",
+            "--seq-len",
+            "512",
+            "--block",
+            "mha_out_proj",
+            "--output",
+            str(output_path),
+            "--warmup-iters",
+            "1",
+            "--timed-iters",
+            "2",
+        ]
+    )
+
+    assert exit_code == 0
+    rows = _read_csv_rows(output_path)
+    assert {(row["family_id"], row["seq_len"], row["block_kind"]) for row in rows} == {
+        ("baseline_768", "512", "mha_out_proj"),
+        ("gpt2_medium_1024", "8192", "ffn"),
+    }
 
 
 def test_write_canonical_plots_renders_all_expected_outputs(tmp_path):

@@ -94,6 +94,7 @@ from .cases import (
 from .power import (
     create_power_monitor,
     empty_power_stats,
+    power_probe_is_complete,
     resolve_power_probe_runs,
     resolve_power_sample_interval_sec,
     resolve_requested_power_backend,
@@ -118,7 +119,14 @@ FINAL_ERROR_THRESHOLD = 0.05
 REFERENCE_VALIDATION_MAX_SEQ_LEN = 512
 DEFAULT_POWER_SAMPLE_INTERVAL_SEC = 0.1
 DEFAULT_QUIESCENT_BASELINE_DURATION_SEC = 0.5
-DEFAULT_MIN_POWER_MEASUREMENT_DURATION_SEC = 1.0
+# Target slightly more than 10 turbostat samples so setup/teardown jitter still
+# leaves at least 10 saved samples on short power probes.
+DEFAULT_MIN_POWER_SAMPLE_COUNT = 10
+DEFAULT_POWER_SAMPLE_TARGET_COUNT = 12
+DEFAULT_MIN_POWER_MEASUREMENT_DURATION_SEC = max(
+    1.0,
+    DEFAULT_POWER_SAMPLE_INTERVAL_SEC * DEFAULT_POWER_SAMPLE_TARGET_COUNT,
+)
 _LONG_SEQ_CANDIDATE_SUBPROCESS_MIN_SEQ_LEN = 8192
 
 
@@ -341,12 +349,41 @@ def _summarize_latencies(latencies_sec: list[float]) -> dict[str, float | int | 
     measured_inference_count = len(latencies_sec)
     timed_total_sec = sum(latencies_sec)
     avg_latency_ms = None
+    min_latency_ms = None
+    max_latency_ms = None
     if measured_inference_count:
         avg_latency_ms = (timed_total_sec / measured_inference_count) * 1000.0
+        min_latency_ms = min(latencies_sec) * 1000.0
+        max_latency_ms = max(latencies_sec) * 1000.0
     return {
         "timed_total_sec": timed_total_sec,
         "measured_inference_count": measured_inference_count,
+        "latency_sample_count": measured_inference_count,
         "avg_latency_ms": avg_latency_ms,
+        "min_latency_ms": min_latency_ms,
+        "max_latency_ms": max_latency_ms,
+    }
+
+
+def _latency_stats_ms_from_timing_details(
+    timing_details: dict[str, object] | None,
+) -> dict[str, float | int | None]:
+    if not timing_details:
+        return {
+            "latency_sample_count": None,
+            "min_latency_ms": None,
+            "max_latency_ms": None,
+        }
+    min_latency_us = timing_details.get("min_latency_us")
+    max_latency_us = timing_details.get("max_latency_us")
+    return {
+        "latency_sample_count": timing_details.get("latency_sample_count"),
+        "min_latency_ms": (
+            None if min_latency_us in ("", None) else float(min_latency_us) / 1000.0
+        ),
+        "max_latency_ms": (
+            None if max_latency_us in ("", None) else float(max_latency_us) / 1000.0
+        ),
     }
 
 
@@ -480,6 +517,7 @@ def _measure_power(
     sample_interval_sec = resolve_power_sample_interval_sec(
         requested_interval_sec=DEFAULT_POWER_SAMPLE_INTERVAL_SEC,
         estimated_timed_window_sec=estimated_window_sec,
+        min_sample_count=DEFAULT_POWER_SAMPLE_TARGET_COUNT,
     )
 
     try:
@@ -490,10 +528,21 @@ def _measure_power(
             estimated_timed_window_sec=estimated_window_sec,
         ) as power_monitor:
             started = time.perf_counter()
-            for _ in range(power_probe_runs):
+            completed_runs = 0
+            while True:
                 forward_once()
+                completed_runs += 1
                 time.sleep(0)
-            elapsed_sec = time.perf_counter() - started
+                elapsed_sec = time.perf_counter() - started
+                if power_probe_is_complete(
+                    completed_runs=completed_runs,
+                    min_runs=power_probe_runs,
+                    elapsed_sec=elapsed_sec,
+                    min_measurement_duration_sec=DEFAULT_MIN_POWER_MEASUREMENT_DURATION_SEC,
+                    observed_sample_count=power_monitor.current_sample_count(),
+                    min_sample_count=DEFAULT_MIN_POWER_SAMPLE_COUNT,
+                ):
+                    break
         stats = power_monitor.stats(elapsed_sec)
         if stats.get("avg_power_w") is not None:
             stats["energy_j"] = float(stats["avg_power_w"]) * timed_total_sec
@@ -703,7 +752,7 @@ def _benchmark_gemm(
                 output_buffers["C_0"] = reference["output"].flatten()
             total_output_size = int(gemm_kwargs["M"]) * int(gemm_kwargs["N"])
 
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             input_buffers,
             output_buffers,
@@ -711,6 +760,7 @@ def _benchmark_gemm(
             abs_tol=GEMM_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"C": sum(len(value) for value in errors.values())},
@@ -721,6 +771,7 @@ def _benchmark_gemm(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -754,7 +805,7 @@ def _benchmark_qkv_proj(
             seed=seed,
         )
         operator = AIEQKVProj(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {
                 "A": reference["input"].flatten(),
@@ -769,6 +820,7 @@ def _benchmark_qkv_proj(
             abs_tol=BLOCK_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {
@@ -783,6 +835,7 @@ def _benchmark_qkv_proj(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -818,7 +871,7 @@ def _benchmark_mha_out_proj(
             is_causal=workload.workload_variant == "decoder_gpt2",
         )
         operator = AIEMHAOutProj(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {
                 "Q": reference["input_q"].flatten(),
@@ -831,6 +884,7 @@ def _benchmark_mha_out_proj(
             abs_tol=BLOCK_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"O": len(errors.get("O", []))},
@@ -843,6 +897,7 @@ def _benchmark_mha_out_proj(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -887,7 +942,7 @@ def _benchmark_addnorm(
             context=context,
             **kwargs,
         )
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {
                 "input1": reference["input1"],
@@ -898,6 +953,7 @@ def _benchmark_addnorm(
             abs_tol=ADDNORM_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
@@ -908,6 +964,7 @@ def _benchmark_addnorm(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -944,7 +1001,7 @@ def _benchmark_ffn(
             c_col_maj=bool(kwargs["c_col_maj"]),
         )
         operator = AIEFFN(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {
                 "A": reference["input"].flatten(),
@@ -956,6 +1013,7 @@ def _benchmark_ffn(
             abs_tol=BLOCK_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"C": len(errors.get("C", []))},
@@ -967,6 +1025,7 @@ def _benchmark_ffn(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -1000,7 +1059,7 @@ def _benchmark_transpose(
             seed=seed,
         )
         operator = AIETranspose(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {"input": reference["input"]},
             {"output": reference["output"]},
@@ -1008,12 +1067,14 @@ def _benchmark_transpose(
             abs_tol=EXACT_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -1047,7 +1108,7 @@ def _benchmark_softmax(
             seed=seed,
         )
         operator = AIESoftmax(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {"in": reference["input"]},
             {"output": reference["output"]},
@@ -1055,12 +1116,14 @@ def _benchmark_softmax(
             abs_tol=EXACT_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -1106,7 +1169,7 @@ def _benchmark_elementwise_mul(
         )["attn_scale"]
         input_buffers, output_buffers = _elementwise_mul_buffers(kwargs, seed=seed)
         operator = AIEElementwiseMul(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             input_buffers,
             output_buffers,
@@ -1114,12 +1177,14 @@ def _benchmark_elementwise_mul(
             abs_tol=EXACT_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -1152,7 +1217,7 @@ def _benchmark_elementwise_add(
             seed=seed,
         )
         operator = AIEElementwiseAdd(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {"input1": reference["A"], "input2": reference["B"]},
             {"output": reference["C"]},
@@ -1160,12 +1225,14 @@ def _benchmark_elementwise_add(
             abs_tol=EXACT_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -1198,7 +1265,7 @@ def _benchmark_hybrid_elementwise_add(
             seed=seed,
         )
         operator = AIEElementwiseAdd(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {"input1": reference["A"], "input2": reference["B"]},
             {"output": reference["C"]},
@@ -1206,12 +1273,14 @@ def _benchmark_hybrid_elementwise_add(
             abs_tol=EXACT_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -1252,7 +1321,7 @@ def _benchmark_layer_norm(
             seed=seed,
         )
         operator = AIELayerNorm(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {"input": reference["input"]},
             {"output": reference["output"]},
@@ -1260,12 +1329,14 @@ def _benchmark_layer_norm(
             abs_tol=LAYER_NORM_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -1302,7 +1373,7 @@ def _benchmark_hybrid_layer_norm(
             seed=seed,
         )
         operator = AIELayerNorm(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {"input": reference["input"]},
             {"output": reference["output"]},
@@ -1310,12 +1381,14 @@ def _benchmark_hybrid_layer_norm(
             abs_tol=LAYER_NORM_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -1348,7 +1421,7 @@ def _benchmark_gelu(
             seed=seed,
         )
         operator = AIEGELU(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {"input": reference["input"]},
             {"output": reference["output"]},
@@ -1356,12 +1429,14 @@ def _benchmark_gelu(
             abs_tol=EXACT_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -1398,7 +1473,7 @@ def _benchmark_causal_mask(
             seed=seed,
         )
         operator = AIECausalMask(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {"input1": reference["input"]},
             {"output": reference["output"]},
@@ -1406,12 +1481,14 @@ def _benchmark_causal_mask(
             abs_tol=EXACT_ABS_TOL,
             warmup_iters=warmup_runs,
             timed_iters=runs_per_sample,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -1515,7 +1592,10 @@ def _benchmark_operator_candidate_in_process(
         )
     except Exception as exc:
         return {
+            "latency_sample_count": "",
             "avg_latency_ms": "",
+            "min_latency_ms": "",
+            "max_latency_ms": "",
             "bandwidth_gbps": "",
             "validation_error_count": "",
             "run_status": "failed_exception",
@@ -1593,7 +1673,10 @@ def _benchmark_operator_candidate_isolated_subprocess(
         failure_message = str(result.get("failure_message", failure_message))
 
     return {
+        "latency_sample_count": "",
         "avg_latency_ms": "",
+        "min_latency_ms": "",
+        "max_latency_ms": "",
         "bandwidth_gbps": "",
         "validation_error_count": "",
         "run_status": "failed_exception",
@@ -1698,11 +1781,17 @@ def benchmark_mode_subprocess(
     return {
         "timed_total_sec": 0.0,
         "measured_inference_count": 0,
+        "latency_sample_count": 0,
         "avg_latency_ms": None,
+        "min_latency_ms": None,
+        "max_latency_ms": None,
         "compile_setup_time_ms": None,
         "effective_gflops_per_sec": None,
         "power_backend": "none" if power_backend == "auto" else power_backend,
         "avg_power_w": None,
+        "min_power_w": None,
+        "max_power_w": None,
+        "power_sample_count": None,
         "effective_gflops_per_sec_per_watt": None,
         "host_qkv_precompute_ms": None,
         "npu_dispatch_count": None,
@@ -1760,11 +1849,17 @@ def benchmark_mode(
     result = {
         "timed_total_sec": 0.0,
         "measured_inference_count": 0,
+        "latency_sample_count": 0,
         "avg_latency_ms": None,
+        "min_latency_ms": None,
+        "max_latency_ms": None,
         "compile_setup_time_ms": None,
         "effective_gflops_per_sec": None,
         "power_backend": "none" if power_backend == "auto" else power_backend,
         "avg_power_w": None,
+        "min_power_w": None,
+        "max_power_w": None,
+        "power_sample_count": None,
         "effective_gflops_per_sec_per_watt": None,
         "host_qkv_precompute_ms": None,
         "npu_dispatch_count": None,
@@ -1889,12 +1984,137 @@ def benchmark_mode(
             "power_backend", result["power_backend"]
         )
         result["avg_power_w"] = power_stats.get("avg_power_w")
+        result["min_power_w"] = power_stats.get("min_power_w")
+        result["max_power_w"] = power_stats.get("max_power_w")
+        result["power_sample_count"] = power_stats.get("power_sample_count")
         result["effective_gflops_per_sec_per_watt"] = effective_gflops_per_sec_per_watt(
             result["effective_gflops_per_sec"],
             result["avg_power_w"],
         )
 
         result.update(_validate_output(workload, output, reference["output"]))
+        return result
+    except Exception as exc:
+        result["run_status"] = "failed_exception"
+        result["failure_message"] = f"{type(exc).__name__}: {exc}"
+        return result
+    finally:
+        if operator is not None:
+            _cleanup_operator_runtime(operator)
+
+
+def benchmark_mode_power_only(
+    execution_mode: ExecutionMode,
+    workload: EndToEndWorkload,
+    *,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+    power_backend: str,
+    operator_config: dict[str, dict[str, object]] | None = None,
+    avg_latency_ms: float | None,
+    timed_total_sec: float,
+    effective_gflops_per_sec_value: float | None,
+    scope_key_override: str | None = None,
+    scope_suffix: str | None = None,
+) -> dict[str, object]:
+    require_npu_power_mode_turbo(study_name="end-to-end benchmark")
+    execution_mode = canonical_execution_mode(str(execution_mode))
+    result = {
+        "power_backend": "none" if power_backend == "auto" else power_backend,
+        "avg_power_w": None,
+        "min_power_w": None,
+        "max_power_w": None,
+        "power_sample_count": None,
+        "effective_gflops_per_sec_per_watt": None,
+        "run_status": "failed_exception",
+        "failure_message": "",
+    }
+
+    reference = generate_golden_reference(
+        workload.seq_len,
+        workload.hidden_size,
+        workload.intermediate_size,
+        workload.num_attention_heads,
+        seed=seed,
+        workload_variant=workload.workload_variant,
+        include_output=False,
+        include_attention_mask=False,
+    )
+    scope_key = (
+        scope_key_override
+        if scope_key_override is not None
+        else _config_scope_key(execution_mode, workload, operator_config)
+    )
+    scope = (
+        f"mode_{execution_mode}_{workload.hidden_size}_{workload.seq_len}_{scope_key}"
+    )
+    if scope_suffix:
+        scope = f"{scope}_{scope_suffix}"
+    context = _new_benchmark_context(scope)
+    operator = None
+    compile_attempt = 0
+    try:
+        while True:
+            operator = _build_operator(
+                execution_mode,
+                workload,
+                reference["weights"],
+                context=context,
+                operator_config=operator_config,
+            )
+            try:
+                operator.context.compile_all()
+                operator.context.prepare_runtime()
+                break
+            except RuntimeError as exc:
+                if compile_attempt == 0 and _is_retryable_linker_failure(exc):
+                    logging.warning(
+                        "Retrying power-only %s %s seq_len=%s from a clean build scope after linker failure in %s",
+                        execution_mode,
+                        workload.workload_variant,
+                        workload.seq_len,
+                        context.build_dir,
+                    )
+                    context.reset_runtime()
+                    shutil.rmtree(context.build_dir, ignore_errors=True)
+                    context = _fresh_benchmark_context_for_build_dir(context.build_dir)
+                    compile_attempt += 1
+                    continue
+                raise
+
+        output_shape = (workload.seq_len, workload.hidden_size)
+
+        def forward_once():
+            return _run_pattern_once(
+                operator,
+                reference["input"],
+                output_shape=output_shape,
+            )
+
+        if not _warm_up_pattern_runtime(operator, warmup_runs):
+            for _ in range(warmup_runs):
+                forward_once()
+
+        power_stats = _measure_power(
+            forward_once,
+            requested_power_backend=power_backend,
+            runs_per_sample=runs_per_sample,
+            avg_latency_ms=avg_latency_ms,
+            timed_total_sec=timed_total_sec,
+        )
+        result["power_backend"] = power_stats.get(
+            "power_backend", result["power_backend"]
+        )
+        result["avg_power_w"] = power_stats.get("avg_power_w")
+        result["min_power_w"] = power_stats.get("min_power_w")
+        result["max_power_w"] = power_stats.get("max_power_w")
+        result["power_sample_count"] = power_stats.get("power_sample_count")
+        result["effective_gflops_per_sec_per_watt"] = effective_gflops_per_sec_per_watt(
+            effective_gflops_per_sec_value,
+            power_stats.get("avg_power_w"),
+        )
+        result["run_status"] = "passed"
         return result
     except Exception as exc:
         result["run_status"] = "failed_exception"

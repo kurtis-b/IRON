@@ -34,18 +34,21 @@ from iron.applications.transformer_layer_new.study.end_to_end.run import (
 )
 from iron.applications.transformer_layer_new.study.end_to_end.run_correctness_spot_checks import (
     build_rows as build_correctness_rows,
+    merge_rows as merge_correctness_rows,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.run_fairness_repeatability import (
     build_rows as build_fairness_rows,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.run_latency_variation import (
     build_rows as build_latency_rows,
+    merge_rows as merge_latency_rows,
     summarize_latency_samples,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.run_staging_ablation import (
     STAGING_ABLATION_SEQUENCE_LENGTHS,
     ablation_iteration_schedule,
     build_rows as build_staging_rows,
+    merge_rows as merge_staging_rows,
 )
 from iron.applications.transformer_layer_new.study.end_to_end.select import (
     select_result_rows,
@@ -82,13 +85,19 @@ def _result_row(
         "warmup_runs": "1",
         "runs_per_sample": "100" if int(seq_len) <= 256 else "10",
         "measured_inference_count": "10",
+        "latency_sample_count": "10",
         "timed_total_sec": "0.5",
         "avg_latency_ms": avg_latency_ms,
+        "min_latency_ms": avg_latency_ms,
+        "max_latency_ms": avg_latency_ms,
         "compile_setup_time_ms": "1.0",
         "host_qkv_precompute_ms": "",
         "effective_gflops_per_sec": "1000.0",
         "power_backend": power_backend,
         "avg_power_w": "12.0",
+        "min_power_w": "11.0",
+        "max_power_w": "13.0",
+        "power_sample_count": "6",
         "effective_gflops_per_sec_per_watt": "80.0",
         "npu_dispatch_count": "8",
         "npu_unique_instruction_binary_count": "8",
@@ -247,6 +256,54 @@ def test_staging_ablation_uses_lighter_default_iteration_schedule():
     assert ablation_iteration_schedule(512) == (1, 5)
     assert ablation_iteration_schedule(4096) == (1, 3)
     assert ablation_iteration_schedule(8192) == (1, 2)
+
+
+def test_end_to_end_power_defaults_target_at_least_ten_samples():
+    avg_iteration_sec = 0.008
+    power_probe_runs = modes.resolve_power_probe_runs(
+        avg_iteration_sec=avg_iteration_sec,
+        baseline_runs=100,
+        min_measurement_duration_sec=modes.DEFAULT_MIN_POWER_MEASUREMENT_DURATION_SEC,
+    )
+    estimated_window_sec = avg_iteration_sec * float(power_probe_runs)
+    sample_interval_sec = modes.resolve_power_sample_interval_sec(
+        requested_interval_sec=modes.DEFAULT_POWER_SAMPLE_INTERVAL_SEC,
+        estimated_timed_window_sec=estimated_window_sec,
+        min_sample_count=modes.DEFAULT_POWER_SAMPLE_TARGET_COUNT,
+    )
+
+    assert modes.DEFAULT_MIN_POWER_SAMPLE_COUNT == 10
+    assert modes.DEFAULT_POWER_SAMPLE_TARGET_COUNT >= 10
+    assert estimated_window_sec / sample_interval_sec >= float(
+        modes.DEFAULT_POWER_SAMPLE_TARGET_COUNT
+    )
+
+
+def test_power_probe_is_complete_requires_runs_duration_and_samples():
+    assert not modes.power_probe_is_complete(
+        completed_runs=12,
+        min_runs=12,
+        elapsed_sec=1.2,
+        min_measurement_duration_sec=1.2,
+        observed_sample_count=9,
+        min_sample_count=10,
+    )
+    assert not modes.power_probe_is_complete(
+        completed_runs=11,
+        min_runs=12,
+        elapsed_sec=1.2,
+        min_measurement_duration_sec=1.2,
+        observed_sample_count=10,
+        min_sample_count=10,
+    )
+    assert modes.power_probe_is_complete(
+        completed_runs=12,
+        min_runs=12,
+        elapsed_sec=1.2,
+        min_measurement_duration_sec=1.2,
+        observed_sample_count=10,
+        min_sample_count=10,
+    )
 
 
 def test_iteration_schedule_uses_100_timed_iterations_through_256():
@@ -462,6 +519,9 @@ def test_correctness_rows_reuse_matching_existing_row(tmp_path):
         "warmup_runs": "1",
         "runs_per_sample": "10",
         "avg_latency_ms": "3.5",
+        "latency_sample_count": "10",
+        "min_latency_ms": "3.0",
+        "max_latency_ms": "4.0",
         "validation_error_count": "0",
         "run_status": "passed",
         "failure_message": "",
@@ -492,6 +552,35 @@ def test_correctness_rows_reuse_matching_existing_row(tmp_path):
 
     assert len(rows) == 1
     assert rows[0]["avg_latency_ms"] == "3.5"
+
+
+def test_correctness_merge_rows_preserves_unrelated_existing_rows():
+    existing = {
+        ("baseline_768", "encoder_bert", "hybrid", 512): {
+            "study_case_id": "baseline_768",
+            "workload_variant": "encoder_bert",
+            "execution_mode": "hybrid",
+            "seq_len": "512",
+            "avg_latency_ms": "3.5",
+        }
+    }
+    current = [
+        {
+            "study_case_id": "baseline_1024",
+            "workload_variant": "encoder_bert",
+            "execution_mode": "runlist",
+            "seq_len": 2048,
+            "avg_latency_ms": 4.2,
+        }
+    ]
+
+    merged = merge_correctness_rows(existing, current)
+
+    assert len(merged) == 2
+    assert {str(row["study_case_id"]) for row in merged} == {
+        "baseline_768",
+        "baseline_1024",
+    }
 
 
 def test_summarize_latency_samples_reports_expected_statistics():
@@ -587,6 +676,35 @@ def test_latency_variation_rows_reuse_matching_existing_row(tmp_path):
 
     assert len(rows) == 1
     assert rows[0]["mean_latency_ms"] == "2.0"
+
+
+def test_latency_merge_rows_preserves_unrelated_existing_rows():
+    existing = {
+        ("baseline_768", "encoder_bert", "hybrid", 64): {
+            "study_case_id": "baseline_768",
+            "workload_variant": "encoder_bert",
+            "execution_mode": "hybrid",
+            "seq_len": "64",
+            "mean_latency_ms": "2.0",
+        }
+    }
+    current = [
+        {
+            "study_case_id": "gpt2_medium_1024",
+            "workload_variant": "decoder_gpt2",
+            "execution_mode": "hybrid",
+            "seq_len": 1024,
+            "mean_latency_ms": 8.0,
+        }
+    ]
+
+    merged = merge_latency_rows(existing, current)
+
+    assert len(merged) == 2
+    assert {str(row["study_case_id"]) for row in merged} == {
+        "baseline_768",
+        "gpt2_medium_1024",
+    }
 
 
 def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
@@ -700,6 +818,66 @@ def test_staging_ablation_rows_join_staging_and_end_to_end_results(tmp_path):
     assert rows[1]["is_best_depth"] is True
 
 
+def test_staging_merge_rows_replaces_targeted_scope_and_preserves_others():
+    existing = {
+        ("baseline_768", "encoder_bert", 512, "ffn", 1): {
+            "study_case_id": "baseline_768",
+            "workload_variant": "encoder_bert",
+            "seq_len": "512",
+            "block_kind": "ffn",
+            "staging_depth": "1",
+            "avg_latency_ms": "16.0",
+        },
+        ("baseline_768", "encoder_bert", 512, "ffn", 2): {
+            "study_case_id": "baseline_768",
+            "workload_variant": "encoder_bert",
+            "seq_len": "512",
+            "block_kind": "ffn",
+            "staging_depth": "2",
+            "avg_latency_ms": "8.0",
+        },
+        ("baseline_1024", "encoder_bert", 512, "ffn", 1): {
+            "study_case_id": "baseline_1024",
+            "workload_variant": "encoder_bert",
+            "seq_len": "512",
+            "block_kind": "ffn",
+            "staging_depth": "1",
+            "avg_latency_ms": "20.0",
+        },
+    }
+    current = [
+        {
+            "study_case_id": "baseline_768",
+            "workload_variant": "encoder_bert",
+            "seq_len": 512,
+            "block_kind": "ffn",
+            "staging_depth": 4,
+            "avg_latency_ms": 4.0,
+        }
+    ]
+
+    merged = merge_staging_rows(
+        existing,
+        current,
+        active_scopes={("baseline_768", "encoder_bert", 512, "ffn")},
+    )
+
+    assert len(merged) == 2
+    assert {
+        (
+            str(row["study_case_id"]),
+            str(row["workload_variant"]),
+            int(float(str(row["seq_len"]))),
+            str(row["block_kind"]),
+            int(float(str(row["staging_depth"]))),
+        )
+        for row in merged
+    } == {
+        ("baseline_768", "encoder_bert", 512, "ffn", 4),
+        ("baseline_1024", "encoder_bert", 512, "ffn", 1),
+    }
+
+
 def test_gpt2_small_seq128_hybrid_uses_parallel_heads_1():
     payloads = load_default_candidate_payloads()
     mha_candidates = payloads["hybrid"]["gpt2_small_768"]["128"]["mha_out_proj"]
@@ -800,6 +978,9 @@ def test_staging_ablation_rows_reuse_matching_existing_row(tmp_path):
         "effective_gflops_per_sec": "100.0",
         "speedup_vs_source_depth": "0.25",
         "speedup_vs_depth1": "1.0",
+        "latency_sample_count": "10",
+        "min_latency_ms": "16.0",
+        "max_latency_ms": "16.0",
         "validation_error_count": "0",
         "run_status": "passed",
         "failure_message": "",
@@ -817,6 +998,9 @@ def test_staging_ablation_rows_reuse_matching_existing_row(tmp_path):
         "effective_gflops_per_sec": "101.0",
         "speedup_vs_source_depth": "1.0",
         "speedup_vs_depth1": "4.0",
+        "latency_sample_count": "10",
+        "min_latency_ms": "4.0",
+        "max_latency_ms": "4.0",
         "selected_config_json": json.dumps(depth4_config, sort_keys=True),
         "is_best_depth": "True",
     }
@@ -1431,7 +1615,10 @@ def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
                 "attention_head_size": str(case.attention_head_size),
                 "warmup_runs": "1",
                 "runs_per_sample": "2",
+                "latency_sample_count": "2",
                 "avg_latency_ms": "5.0",
+                "min_latency_ms": "5.0",
+                "max_latency_ms": "5.0",
                 "bandwidth_gbps": "",
                 "validation_error_count": "0",
                 "run_status": "passed",
@@ -1466,13 +1653,19 @@ def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
                 "warmup_runs": "1",
                 "runs_per_sample": "2",
                 "measured_inference_count": "2",
+                "latency_sample_count": "2",
                 "timed_total_sec": "0.1",
                 "avg_latency_ms": "5.0",
+                "min_latency_ms": "5.0",
+                "max_latency_ms": "5.0",
                 "compile_setup_time_ms": "1.0",
                 "host_qkv_precompute_ms": "",
                 "effective_gflops_per_sec": "100.0",
                 "power_backend": "none",
                 "avg_power_w": "",
+                "min_power_w": "",
+                "max_power_w": "",
+                "power_sample_count": "",
                 "effective_gflops_per_sec_per_watt": "",
                 "npu_dispatch_count": "8",
                 "npu_unique_instruction_binary_count": "8",

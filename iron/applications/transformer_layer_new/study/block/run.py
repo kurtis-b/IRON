@@ -138,6 +138,9 @@ CSV_FIELDNAMES = (
     "hidden_size",
     "ffn_dim",
     "avg_latency_ms",
+    "latency_sample_count",
+    "min_latency_ms",
+    "max_latency_ms",
     "bandwidth_gbps",
     "warmup_iters",
     "timed_iters",
@@ -170,6 +173,28 @@ def _case_descriptor(family_id: str, workload: BlockWorkload) -> str:
         f"{family_id} seq_len={workload.seq_len} hidden={workload.hidden_size} "
         f"ffn={workload.ffn_dim} heads={workload.num_heads}"
     )
+
+
+def _latency_stats_ms_from_timing_details(
+    timing_details: dict[str, object] | None,
+) -> dict[str, float | int | None]:
+    if not timing_details:
+        return {
+            "latency_sample_count": None,
+            "min_latency_ms": None,
+            "max_latency_ms": None,
+        }
+    min_latency_us = timing_details.get("min_latency_us")
+    max_latency_us = timing_details.get("max_latency_us")
+    return {
+        "latency_sample_count": timing_details.get("latency_sample_count"),
+        "min_latency_ms": (
+            None if min_latency_us in ("", None) else float(min_latency_us) / 1000.0
+        ),
+        "max_latency_ms": (
+            None if max_latency_us in ("", None) else float(max_latency_us) / 1000.0
+        ),
+    }
 
 
 def _should_use_aggressive_cleanup(seq_len: int) -> bool:
@@ -400,7 +425,7 @@ def _benchmark_qkv_proj(
         operator = AIEQKVProj(
             context=context, **operator_kwargs(workload, "qkv_proj", candidate)
         )
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {
                 "A": reference["input"].flatten(),
@@ -415,6 +440,7 @@ def _benchmark_qkv_proj(
             abs_tol=ABS_TOL,
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {
@@ -428,6 +454,7 @@ def _benchmark_qkv_proj(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -479,7 +506,7 @@ def _benchmark_mha_out_proj_variant(
                 candidate,
             ),
         )
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {
                 "Q": reference["input_q"].flatten(),
@@ -492,6 +519,7 @@ def _benchmark_mha_out_proj_variant(
             abs_tol=ABS_TOL,
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"O": len(errors.get("O", []))},
@@ -504,6 +532,7 @@ def _benchmark_mha_out_proj_variant(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -556,7 +585,7 @@ def _benchmark_addnorm(
             context=context,
             **addnorm_kwargs,
         )
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {
                 "input1": reference["input1"],
@@ -567,6 +596,7 @@ def _benchmark_addnorm(
             abs_tol=ABS_TOL,
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
@@ -574,6 +604,7 @@ def _benchmark_addnorm(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -600,7 +631,7 @@ def _benchmark_layer_norm(
             seed=seed,
         )
         operator = AIELayerNorm(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {"input": reference["input"]},
             {"output": reference["output"]},
@@ -608,6 +639,7 @@ def _benchmark_layer_norm(
             abs_tol=LAYER_NORM_ABS_TOL,
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
@@ -615,6 +647,7 @@ def _benchmark_layer_norm(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -638,7 +671,7 @@ def _benchmark_elementwise_add(
             seed=seed,
         )
         operator = AIEElementwiseAdd(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {"input1": reference["A"], "input2": reference["B"]},
             {"output": reference["C"]},
@@ -646,6 +679,7 @@ def _benchmark_elementwise_add(
             abs_tol=EXACT_ABS_TOL,
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
@@ -653,6 +687,7 @@ def _benchmark_elementwise_add(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -680,7 +715,7 @@ def _benchmark_causal_mask(
             seed=seed,
         )
         operator = AIECausalMask(context=context, **kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {"input1": reference["input"]},
             {"output": reference["output"]},
@@ -688,6 +723,7 @@ def _benchmark_causal_mask(
             abs_tol=EXACT_ABS_TOL,
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
+            return_timing_details=True,
         )
         validation = _threshold_validation_result(
             {"output": len(errors.get("output", []))},
@@ -700,6 +736,7 @@ def _benchmark_causal_mask(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -727,7 +764,7 @@ def _benchmark_ffn(
             c_col_maj=bool(ffn_kwargs["c_col_maj"]),
         )
         operator = AIEFFN(context=context, **ffn_kwargs)
-        errors, latency_us, bandwidth_gbps = run_test(
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
             operator,
             {
                 "A": reference["input"].flatten(),
@@ -739,6 +776,7 @@ def _benchmark_ffn(
             abs_tol=ABS_TOL,
             warmup_iters=warmup_iters,
             timed_iters=timed_iters,
+            return_timing_details=True,
         )
         stage_only = ffn_kwargs["stage_only"]
         validation = _threshold_validation_result(
@@ -750,6 +788,7 @@ def _benchmark_ffn(
         )
         return {
             "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
             "bandwidth_gbps": bandwidth_gbps,
             **validation,
         }
@@ -1006,6 +1045,13 @@ def reusable_existing_row(
     if _config_signature_from_row(row, block_kind) != _config_signature_from_candidate(
         block_kind, candidate
     ):
+        return None
+    required_fields = (
+        "latency_sample_count",
+        "min_latency_ms",
+        "max_latency_ms",
+    )
+    if any(str(row.get(field) or "").strip() == "" for field in required_fields):
         return None
     return dict(row)
 

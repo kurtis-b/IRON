@@ -42,6 +42,9 @@ RESULTS_CSV_FIELDNAMES = (
     "warmup_runs",
     "runs_per_sample",
     "avg_latency_ms",
+    "latency_sample_count",
+    "min_latency_ms",
+    "max_latency_ms",
     "validation_error_count",
     "run_status",
     "failure_message",
@@ -113,6 +116,16 @@ def load_existing_rows(
     return rows
 
 
+def merge_rows(
+    existing_rows: dict[tuple[str, str, str, int], dict[str, object]],
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    merged = {key: dict(value) for key, value in existing_rows.items()}
+    for row in rows:
+        merged[_row_key(row)] = dict(row)
+    return [merged[key] for key in sorted(merged)]
+
+
 def reusable_existing_row(
     existing_rows: dict[tuple[str, str, str, int], dict[str, object]],
     *,
@@ -138,6 +151,13 @@ def reusable_existing_row(
         return None
     if str(row.get("selected_config_json") or "") != selected_config_json:
         return None
+    required_fields = (
+        "latency_sample_count",
+        "min_latency_ms",
+        "max_latency_ms",
+    )
+    if any(str(row.get(field) or "").strip() == "" for field in required_fields):
+        return None
     return dict(row)
 
 
@@ -162,12 +182,17 @@ def validation_mode_for_seq_len(seq_len: int) -> str:
     return "numerical_spot_check"
 
 
+def _matches_seq_len_filter(seq_len: int, seq_len_filter: str) -> bool:
+    return seq_len_filter == "all" or int(seq_len) == int(seq_len_filter)
+
+
 def build_rows(
     *,
     results_input: Path,
     workload_variant_filter: str,
     family_filter: str,
     mode_filter: str,
+    seq_len_filter: str = "all",
     seed: int,
     existing_rows: dict[tuple[str, str, str, int], dict[str, object]] | None = None,
     benchmark_fn=None,
@@ -183,6 +208,7 @@ def build_rows(
             mode_filter=mode_filter,
         )
         if row.seq_len in SPOT_CHECK_SEQ_LENS
+        and _matches_seq_len_filter(row.seq_len, seq_len_filter)
     ]
 
     rows: list[dict[str, object]] = []
@@ -245,6 +271,9 @@ def build_rows(
                 "warmup_runs": warmup_runs,
                 "runs_per_sample": runs_per_sample,
                 "avg_latency_ms": result.get("avg_latency_ms"),
+                "latency_sample_count": result.get("latency_sample_count"),
+                "min_latency_ms": result.get("min_latency_ms"),
+                "max_latency_ms": result.get("max_latency_ms"),
                 "validation_error_count": result.get("validation_error_count", ""),
                 "run_status": result.get("run_status", ""),
                 "failure_message": result.get("failure_message", ""),
@@ -290,6 +319,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=[*EXECUTION_MODES, "all"],
         default="all",
     )
+    parser.add_argument(
+        "--seq-len",
+        choices=[*(str(value) for value in SPOT_CHECK_SEQ_LENS), "all"],
+        default="all",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, default=default_output_path())
     parser.add_argument("--resume-input", type=Path, default=None)
@@ -330,13 +364,17 @@ def main(argv: list[str] | None = None) -> int:
             workload_variant_filter=str(args.workload_variant),
             family_filter=str(args.family),
             mode_filter=str(args.mode),
+            seq_len_filter=str(args.seq_len),
             seed=int(args.seed),
             existing_rows=existing_rows,
             benchmark_fn=benchmark_mode_subprocess,
         )
-        write_rows(output_path, rows)
+        merged_rows = merge_rows(existing_rows, rows)
+        write_rows(output_path, merged_rows)
         LOGGER.info(
-            "Wrote %d correctness spot-check rows to %s", len(rows), output_path
+            "Wrote %d correctness spot-check rows to %s",
+            len(merged_rows),
+            output_path,
         )
     return 0
 

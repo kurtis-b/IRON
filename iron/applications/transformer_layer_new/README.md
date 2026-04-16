@@ -78,33 +78,95 @@ benchmark sweep, not a metadata-only summary. It reruns the selected `hybrid`
 config at different `mha_out_proj` and `ffn` staging depths, and can mirror the
 depth ladder from `results/memory_tile_staging/results.csv`.
 
-Current paper-facing figure scripts live in:
+Key study, plot, and automation entry points live in:
 
+- `study/block/plot_best_latency.py`
 - `study/end_to_end/plot_tps_by_pattern.py`
+- `study/end_to_end/plot_dataflow_blocks_vs_pattern.py`
 - `study/end_to_end/run_latency_variation.py`
 - `study/end_to_end/run_staging_ablation.py`
 - `study/memory_tile_staging/plot_staging_depth.py`
 - `study/resource_usage/run.py`
 - `study/host_comparison/run.py`
 - `study/roofline/run.py`
+- `study/regenerate_plots.py`
+- `study/unattended_reboot.py`
 
 ## Recommended Run Order
 
-There is no single wrapper that runs the full paper-facing study suite.
-The canonical order is:
+For unattended full-suite execution with a final summary-plot regeneration
+pass, use:
+
+```bash
+source /opt/xilinx/xrt/setup.sh
+source ~/iron/ironenv/bin/activate
+cd ~/iron
+sudo env PATH="$PATH" LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" PYTHONPATH="${PYTHONPATH:-}" \
+  python3 -m iron.applications.transformer_layer_new.study.unattended_reboot start \
+    --run-id full_suite_$(date +%Y%m%d_%H%M%S) \
+    --run-user "$USER"
+```
+
+The unattended runner records a baseline PC temperature at start, checks the
+current temperature before each queued job, waits up to `5s` for the machine to
+cool below `1.05x` that baseline, and writes per-job baseline/pre/post thermal
+rows to `results_unattended_<run_id>/automation/temperature_log.csv`.
+
+The reboot-resume hook also sources `/opt/xilinx/xrt/setup.sh` and the
+repo-local `ironenv` virtualenv before invoking `python3`, so the resumed
+runner uses the same Python environment after each boot as the initial start.
+It also resolves and stores the absolute `amd-ttm` path at start, so rebooted
+steps do not depend on `~/.local/bin` being present in `PATH`.
+
+Normal unattended jobs now run back-to-back in a single session. The runner
+only reboots when a TTM transition is required for the iGPU `16384`
+host-comparison rows, and then resumes through the installed `@reboot` hook.
+The final plot-regeneration step runs after the runner has restored the normal
+TTM state.
+
+TODO:
+- split latency/throughput collection from power collection for `end_to_end`
+  and `host_comparison`
+- keep the main unattended queue latency-only by default, with no reboot policy
+  attached to those jobs
+- add a separate power-refresh queue that reuses saved latency/throughput,
+  reruns only the workload executions needed for power sampling, and optionally
+  reboots between those power jobs when cleaner energy-efficiency measurements
+  are desired
+- recompute GFLOPS/W from the saved throughput and refreshed power rows instead
+  of forcing full timed-latency reruns
+
+To continue a previously stopped unattended run from its next incomplete job,
+use:
+
+```bash
+source /opt/xilinx/xrt/setup.sh
+source ~/iron/ironenv/bin/activate
+cd ~/iron
+sudo env PATH="$PATH" LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" PYTHONPATH="${PYTHONPATH:-}" \
+  python3 -m iron.applications.transformer_layer_new.study.unattended_reboot resume \
+    --state /path/to/results_unattended_<run_id>/automation/state.json
+```
+
+When the unattended run is started with `sudo`, the installed reboot hook lives
+in the root crontab. Let the runner manage that entry through `crontab`; do not
+edit `/var/spool/cron/crontabs` directly.
+
+The manual canonical order is:
 
 1. `python -m iron.applications.transformer_layer_new.study.block.run`
-2. `python -m iron.applications.transformer_layer_new.study.end_to_end.run`
-3. `python -m iron.applications.transformer_layer_new.study.end_to_end.run_correctness_spot_checks`
-4. `python -m iron.applications.transformer_layer_new.study.end_to_end.run_latency_variation`
-5. `python -m iron.applications.transformer_layer_new.study.end_to_end.run_staging_ablation`
-6. `python -m iron.applications.transformer_layer_new.study.end_to_end.run_fairness_repeatability`
-7. `python -m iron.applications.transformer_layer_new.study.memory_tile_staging.run`
+2. `python -m iron.applications.transformer_layer_new.study.memory_tile_staging.run`
+3. `python -m iron.applications.transformer_layer_new.study.end_to_end.run`
+4. `python -m iron.applications.transformer_layer_new.study.end_to_end.run_correctness_spot_checks`
+5. `python -m iron.applications.transformer_layer_new.study.end_to_end.run_latency_variation`
+6. `python -m iron.applications.transformer_layer_new.study.end_to_end.run_staging_ablation`
+7. `python -m iron.applications.transformer_layer_new.study.end_to_end.run_fairness_repeatability`
 8. `python -m iron.applications.transformer_layer_new.study.host_comparison.run`
 9. `python -m iron.applications.transformer_layer_new.study.host_comparison.run_fairness_repeatability`
-10. `python -m iron.applications.transformer_layer_new.study.resource_usage.run`
-11. `python -m iron.applications.transformer_layer_new.study.memcpy_bandwidth.run`
+10. `python -m iron.applications.transformer_layer_new.study.memcpy_bandwidth.run`
+11. `python -m iron.applications.transformer_layer_new.study.resource_usage.run`
 12. `python -m iron.applications.transformer_layer_new.study.roofline.run`
+13. `python -m iron.applications.transformer_layer_new.study.regenerate_plots`
 
 Dependency notes:
 
@@ -152,7 +214,7 @@ call fails before writing that datapoint.
 
 ## Host Comparison Environment
 
-The repo-root [requirements.txt](/home/agi-demo/iron/requirements.txt) stays
+The repo-root `requirements.txt` stays
 generic for the wider codebase.
 
 For the iGPU host comparison on Ubuntu 24.04 / Python 3.12 Ryzen APU systems:
@@ -162,8 +224,8 @@ For the iGPU host comparison on Ubuntu 24.04 / Python 3.12 Ryzen APU systems:
    `pip install -r iron/applications/transformer_layer_new/requirements.txt`
 
 The canonical host comparison study is iGPU-only. It writes one throughput
-series and two iGPU per-watt series using `rocm-smi` and `turbostat_pkgwatt`
-from the same measured iGPU throughput run.
+series and one iGPU per-watt series using `rocm-smi` from the same measured
+iGPU throughput run.
 
 ## Documentation Map
 

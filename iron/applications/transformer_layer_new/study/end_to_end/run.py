@@ -54,7 +54,10 @@ TUNING_CSV_FIELDNAMES = (
     "attention_head_size",
     "warmup_runs",
     "runs_per_sample",
+    "latency_sample_count",
     "avg_latency_ms",
+    "min_latency_ms",
+    "max_latency_ms",
     "bandwidth_gbps",
     "validation_error_count",
     "run_status",
@@ -83,13 +86,19 @@ RESULTS_CSV_FIELDNAMES = (
     "warmup_runs",
     "runs_per_sample",
     "measured_inference_count",
+    "latency_sample_count",
     "timed_total_sec",
     "avg_latency_ms",
+    "min_latency_ms",
+    "max_latency_ms",
     "compile_setup_time_ms",
     "host_qkv_precompute_ms",
     "effective_gflops_per_sec",
     "power_backend",
     "avg_power_w",
+    "min_power_w",
+    "max_power_w",
+    "power_sample_count",
     "effective_gflops_per_sec_per_watt",
     "npu_dispatch_count",
     "npu_unique_instruction_binary_count",
@@ -236,6 +245,14 @@ def reusable_tuning_row(
         "skipped_long_seq_default",
     ):
         return None
+    if str(row.get("run_status") or "") == "passed":
+        required_fields = (
+            "latency_sample_count",
+            "min_latency_ms",
+            "max_latency_ms",
+        )
+        if any(row.get(field) in ("", None) for field in required_fields):
+            return None
     return dict(row)
 
 
@@ -285,6 +302,17 @@ def reusable_final_row(
         return None
     if power_backend != "auto" and str(row.get("power_backend") or "") != power_backend:
         return None
+    required_fields = (
+        "latency_sample_count",
+        "min_latency_ms",
+        "max_latency_ms",
+    )
+    if any(row.get(field) in ("", None) for field in required_fields):
+        return None
+    if str(row.get("power_backend") or "") != "none":
+        power_fields = ("min_power_w", "max_power_w", "power_sample_count")
+        if any(row.get(field) in ("", None) for field in power_fields):
+            return None
     return dict(row)
 
 
@@ -327,13 +355,19 @@ def _failed_final_result(
 ) -> dict[str, object]:
     return {
         "measured_inference_count": 0,
+        "latency_sample_count": 0,
         "timed_total_sec": 0.0,
         "avg_latency_ms": None,
+        "min_latency_ms": None,
+        "max_latency_ms": None,
         "compile_setup_time_ms": None,
         "host_qkv_precompute_ms": None,
         "effective_gflops_per_sec": None,
         "power_backend": "none" if power_backend == "auto" else power_backend,
         "avg_power_w": None,
+        "min_power_w": None,
+        "max_power_w": None,
+        "power_sample_count": None,
         "effective_gflops_per_sec_per_watt": None,
         "npu_dispatch_count": None,
         "npu_unique_instruction_binary_count": None,
@@ -382,7 +416,10 @@ def _selected_default_row(
         "attention_head_size": case.attention_head_size,
         "warmup_runs": warmup_runs,
         "runs_per_sample": runs_per_sample,
+        "latency_sample_count": "",
         "avg_latency_ms": "",
+        "min_latency_ms": "",
+        "max_latency_ms": "",
         "bandwidth_gbps": "",
         "validation_error_count": "",
         "run_status": run_status,

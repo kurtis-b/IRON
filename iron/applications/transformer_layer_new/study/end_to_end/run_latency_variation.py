@@ -151,6 +151,16 @@ def load_existing_rows(
     return rows
 
 
+def merge_rows(
+    existing_rows: dict[tuple[str, str, str, int], dict[str, object]],
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    merged = {key: dict(value) for key, value in existing_rows.items()}
+    for row in rows:
+        merged[_row_key(row)] = dict(row)
+    return [merged[key] for key in sorted(merged)]
+
+
 def reusable_existing_row(
     existing_rows: dict[tuple[str, str, str, int], dict[str, object]],
     *,
@@ -205,6 +215,10 @@ def _resolved_sampling(
     return resolved_warmup_runs, resolved_runs_per_sample
 
 
+def _matches_seq_len_filter(seq_len: int, seq_len_filter: str) -> bool:
+    return seq_len_filter == "all" or int(seq_len) == int(seq_len_filter)
+
+
 def summarize_latency_samples(
     latency_samples_ms: list[float],
 ) -> dict[str, float | int | None]:
@@ -235,6 +249,7 @@ def build_rows(
     workload_variant_filter: str,
     family_filter: str,
     mode_filter: str,
+    seq_len_filter: str = "all",
     warmup_runs: int | None,
     runs_per_sample: int | None,
     seed: int,
@@ -250,6 +265,11 @@ def build_rows(
         family_filter=family_filter,
         mode_filter=mode_filter,
     )
+    selected_rows = [
+        row
+        for row in selected_rows
+        if _matches_seq_len_filter(row.seq_len, seq_len_filter)
+    ]
     rows: list[dict[str, object]] = []
     for selected_row in selected_rows:
         case = get_case(selected_row.study_case_id, selected_row.seq_len)
@@ -470,6 +490,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=[*EXECUTION_MODES, "all"],
         default="all",
     )
+    parser.add_argument(
+        "--seq-len",
+        choices=[*(str(value) for value in SEQUENCE_LADDER), "all"],
+        default="all",
+    )
     parser.add_argument("--warmup-iters", type=int, default=None)
     parser.add_argument("--timed-iters", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -508,21 +533,31 @@ def main(argv: list[str] | None = None) -> int:
                 len(existing_rows),
                 ", ".join(str(path) for path in resume_paths),
             )
+        checkpoint_fn = lambda current_rows: write_rows(
+            output_path,
+            merge_rows(existing_rows, current_rows),
+        )
         rows = build_rows(
             results_input=args.results_input.expanduser(),
             workload_variant_filter=str(args.workload_variant),
             family_filter=str(args.family),
             mode_filter=str(args.mode),
+            seq_len_filter=str(args.seq_len),
             warmup_runs=args.warmup_iters,
             runs_per_sample=args.timed_iters,
             seed=int(args.seed),
             existing_rows=existing_rows,
             benchmark_fn=benchmark_mode_subprocess,
-            checkpoint_fn=lambda current_rows: write_rows(output_path, current_rows),
+            checkpoint_fn=checkpoint_fn,
         )
-        write_rows(output_path, rows)
-        write_plot(args.plot_output.expanduser(), rows)
-        LOGGER.info("Wrote %d latency-variation rows to %s", len(rows), output_path)
+        merged_rows = merge_rows(existing_rows, rows)
+        write_rows(output_path, merged_rows)
+        write_plot(args.plot_output.expanduser(), merged_rows)
+        LOGGER.info(
+            "Wrote %d latency-variation rows to %s",
+            len(merged_rows),
+            output_path,
+        )
         LOGGER.info("Wrote latency-variation plot to %s", args.plot_output)
     return 0
 

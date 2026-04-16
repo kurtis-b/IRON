@@ -13,6 +13,7 @@ from iron.applications.transformer_layer_new.study.memcpy_bandwidth.cases import
 from iron.applications.transformer_layer_new.study.memcpy_bandwidth.run import (
     CSV_FIELDNAMES,
     main,
+    merge_rows,
     mark_peak_rows,
     reusable_existing_row,
     write_peak_metric_plot,
@@ -53,6 +54,9 @@ def _result(
         "warmup_iters": 1,
         "timed_iters": 10,
         "latency_us": latency_us,
+        "latency_sample_count": 10 if latency_us is not None else None,
+        "min_latency_us": latency_us,
+        "max_latency_us": latency_us,
         "bandwidth_gbps": bandwidth_gbps,
         "validation_error_count": 0,
         "run_status": run_status,
@@ -264,9 +268,12 @@ def test_main_writes_csv_and_plots_from_monkeypatched_benchmarks(monkeypatch, tm
     assert exit_code == 0
     rows = _read_csv_rows(output_path)
     assert len(rows) == 2
-    assert rows[0]["run_status"] == "passed"
-    assert rows[0]["is_overall_peak"] == "False"
-    assert rows[-1]["is_overall_peak"] == "True"
+    rows_by_case = {row["case_id"]: row for row in rows}
+    assert all(row["run_status"] == "passed" for row in rows)
+    assert (
+        rows_by_case["memcpy_8388608_cores8_ch2_kernel"]["is_overall_peak"] == "False"
+    )
+    assert rows_by_case["memcpy_8388608_cores8_ch2_bypass"]["is_overall_peak"] == "True"
     assert bandwidth_plot_path.exists()
 
 
@@ -312,6 +319,39 @@ def test_main_defaults_to_bypass_only(monkeypatch, tmp_path):
     assert {row["bypass"] for row in rows} == {"True"}
 
 
+def test_merge_rows_preserves_unrelated_existing_cases():
+    existing = {
+        "memcpy_8388608_cores16_ch2_bypass": _result(
+            size_elements=8388608,
+            num_cores=16,
+            num_channels=2,
+            bypass=True,
+            tile_size=4096,
+            latency_us=100.0,
+            bandwidth_gbps=67.0,
+        )
+    }
+    current = [
+        _result(
+            size_elements=8388608,
+            num_cores=8,
+            num_channels=2,
+            bypass=True,
+            tile_size=4096,
+            latency_us=120.0,
+            bandwidth_gbps=40.0,
+        )
+    ]
+
+    merged = merge_rows(existing, current)
+
+    assert len(merged) == 2
+    assert {row["case_id"] for row in merged} == {
+        "memcpy_8388608_cores16_ch2_bypass",
+        "memcpy_8388608_cores8_ch2_bypass",
+    }
+
+
 def test_main_emits_failed_exception_rows_without_aborting(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "iron.applications.transformer_layer_new.study.memcpy_bandwidth.run.require_npu_power_mode_turbo",
@@ -354,9 +394,14 @@ def test_main_emits_failed_exception_rows_without_aborting(monkeypatch, tmp_path
     assert exit_code == 0
     rows = _read_csv_rows(output_path)
     assert len(rows) == 2
-    assert [row["run_status"] for row in rows] == ["passed", "failed_exception"]
-    assert rows[0]["is_size_peak"] == "True"
-    assert rows[1]["failure_message"] == "boom"
+    rows_by_case = {row["case_id"]: row for row in rows}
+    assert rows_by_case["memcpy_8388608_cores8_ch2_kernel"]["run_status"] == "passed"
+    assert (
+        rows_by_case["memcpy_8388608_cores8_ch2_bypass"]["run_status"]
+        == "failed_exception"
+    )
+    assert rows_by_case["memcpy_8388608_cores8_ch2_kernel"]["is_size_peak"] == "True"
+    assert rows_by_case["memcpy_8388608_cores8_ch2_bypass"]["failure_message"] == "boom"
 
 
 def test_reusable_existing_row_matches_case_and_sampling():
@@ -373,6 +418,9 @@ def test_reusable_existing_row_matches_case_and_sampling():
                 "warmup_iters": "10",
                 "timed_iters": "500",
                 "run_status": "passed",
+                "latency_sample_count": "500",
+                "min_latency_us": "1.0",
+                "max_latency_us": "2.0",
             }
         },
         case=case,

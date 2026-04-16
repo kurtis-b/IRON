@@ -52,6 +52,9 @@ RESULTS_CSV_FIELDNAMES = (
     "warmup_iters",
     "timed_iters",
     "avg_latency_ms",
+    "latency_sample_count",
+    "min_latency_ms",
+    "max_latency_ms",
     "bandwidth_gbps",
     "speedup_vs_depth1",
     "validation_error_count",
@@ -261,6 +264,15 @@ def _normalized_config_value(value: object) -> str:
     return str(value)
 
 
+def _has_latency_summary(row: dict[str, object]) -> bool:
+    required_fields = (
+        "latency_sample_count",
+        "min_latency_ms",
+        "max_latency_ms",
+    )
+    return all(str(row.get(field) or "").strip() != "" for field in required_fields)
+
+
 def build_selection_rows(
     selection: ReferenceSelection,
     *,
@@ -315,6 +327,7 @@ def build_selection_rows(
         if (
             existing_row is not None
             and str(existing_row.get("run_status") or "") == "passed"
+            and _has_latency_summary(existing_row)
         ):
             if all(
                 _normalized_config_value(existing_row.get(column, ""))
@@ -503,13 +516,6 @@ def main(argv: list[str] | None = None) -> int:
         row_map: dict[tuple[str, int, str, int], dict[str, object]] = dict(
             existing_rows
         )
-        active_selection_keys = {_selection_key(selection) for selection in selections}
-        row_map = {
-            key: value
-            for key, value in row_map.items()
-            if key[:3] in active_selection_keys
-        }
-
         total_selections = len(selections)
         for index, selection in enumerate(selections, start=1):
             selection_rows = build_selection_rows(

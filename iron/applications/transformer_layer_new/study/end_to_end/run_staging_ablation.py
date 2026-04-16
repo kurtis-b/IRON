@@ -71,6 +71,9 @@ RESULTS_CSV_FIELDNAMES = (
     "warmup_runs",
     "runs_per_sample",
     "avg_latency_ms",
+    "latency_sample_count",
+    "min_latency_ms",
+    "max_latency_ms",
     "compile_setup_time_ms",
     "effective_gflops_per_sec",
     "speedup_vs_source_depth",
@@ -171,6 +174,22 @@ def load_existing_rows(
     return rows
 
 
+def merge_rows(
+    existing_rows: dict[tuple[str, str, int, str, int], dict[str, object]],
+    rows: list[dict[str, object]],
+    *,
+    active_scopes: set[tuple[str, str, int, str]],
+) -> list[dict[str, object]]:
+    merged = {
+        key: dict(value)
+        for key, value in existing_rows.items()
+        if key[:4] not in active_scopes
+    }
+    for row in rows:
+        merged[_row_key(row)] = dict(row)
+    return [merged[key] for key in sorted(merged)]
+
+
 def reusable_existing_row(
     existing_rows: dict[tuple[str, str, int, str, int], dict[str, object]],
     *,
@@ -198,6 +217,13 @@ def reusable_existing_row(
     if str(row.get("selected_candidate_ids_json") or "") != selected_candidate_ids_json:
         return None
     if str(row.get("selected_config_json") or "") != selected_config_json:
+        return None
+    required_fields = (
+        "latency_sample_count",
+        "min_latency_ms",
+        "max_latency_ms",
+    )
+    if any(str(row.get(field) or "").strip() == "" for field in required_fields):
         return None
     return dict(row)
 
@@ -588,6 +614,9 @@ def build_rows(
                         "warmup_runs": resolved_warmup_runs,
                         "runs_per_sample": resolved_runs_per_sample,
                         "avg_latency_ms": result.get("avg_latency_ms"),
+                        "latency_sample_count": result.get("latency_sample_count"),
+                        "min_latency_ms": result.get("min_latency_ms"),
+                        "max_latency_ms": result.get("max_latency_ms"),
                         "compile_setup_time_ms": result.get("compile_setup_time_ms"),
                         "effective_gflops_per_sec": result.get(
                             "effective_gflops_per_sec"
@@ -621,6 +650,40 @@ def write_rows(output_path: Path, rows: list[dict[str, object]]) -> None:
             writer.writerow(
                 {field: row.get(field, "") for field in RESULTS_CSV_FIELDNAMES}
             )
+
+
+def _active_scopes(
+    *,
+    results_input: Path,
+    workload_variant_filter: str,
+    family_filter: str,
+    seq_len_filter: str,
+    block_filter: str,
+) -> set[tuple[str, str, int, str]]:
+    selected_rows = select_result_rows(
+        load_result_rows(results_input),
+        workload_variant_filter=workload_variant_filter,
+        family_filter=family_filter,
+        seq_len_filter=seq_len_filter,
+        mode_filter="hybrid",
+    )
+    allowed_seq_lens = set(STAGING_ABLATION_SEQUENCE_LENGTHS)
+    scopes: set[tuple[str, str, int, str]] = set()
+    for selected_row in selected_rows:
+        if selected_row.seq_len not in allowed_seq_lens:
+            continue
+        for block_kind in STAGING_BLOCK_KINDS:
+            if block_filter != "all" and block_kind != block_filter:
+                continue
+            scopes.add(
+                (
+                    selected_row.study_case_id,
+                    selected_row.workload_variant,
+                    selected_row.seq_len,
+                    block_kind,
+                )
+            )
+    return scopes
 
 
 def render_plot(rows: list[dict[str, object]]) -> plt.Figure:
@@ -848,6 +911,17 @@ def main(argv: list[str] | None = None) -> int:
                 len(existing_rows),
                 ", ".join(str(path) for path in resume_paths),
             )
+        active_scopes = _active_scopes(
+            results_input=args.results_input.expanduser(),
+            workload_variant_filter=str(args.workload_variant),
+            family_filter=str(args.family),
+            seq_len_filter=str(args.seq_len),
+            block_filter=str(args.block),
+        )
+        checkpoint_fn = lambda current_rows: write_rows(
+            output_path,
+            merge_rows(existing_rows, current_rows, active_scopes=active_scopes),
+        )
         rows = build_rows(
             results_input=args.results_input.expanduser(),
             staging_results=args.staging_results.expanduser(),
@@ -860,11 +934,16 @@ def main(argv: list[str] | None = None) -> int:
             seed=int(args.seed),
             existing_rows=existing_rows,
             benchmark_fn=benchmark_mode_subprocess,
-            checkpoint_fn=lambda current_rows: write_rows(output_path, current_rows),
+            checkpoint_fn=checkpoint_fn,
         )
-        write_rows(output_path, rows)
-        write_plot(args.plot_output.expanduser(), rows)
-        LOGGER.info("Wrote %d staging-ablation rows to %s", len(rows), output_path)
+        merged_rows = merge_rows(existing_rows, rows, active_scopes=active_scopes)
+        write_rows(output_path, merged_rows)
+        write_plot(args.plot_output.expanduser(), merged_rows)
+        LOGGER.info(
+            "Wrote %d staging-ablation rows to %s",
+            len(merged_rows),
+            output_path,
+        )
         LOGGER.info("Wrote staging-ablation plot to %s", args.plot_output)
     return 0
 

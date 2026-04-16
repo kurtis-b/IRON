@@ -38,6 +38,7 @@ from iron.applications.transformer_layer_new.study.end_to_end.cases import (
 )
 from iron.applications.transformer_layer_new.study.end_to_end.power import (
     create_power_monitor as create_cpu_power_monitor,
+    power_probe_is_complete,
 )
 
 from .select import (
@@ -56,15 +57,10 @@ FINAL_ABS_TOL = 0.5
 FINAL_ERROR_THRESHOLD = 0.05
 SUPPORTED_HOST_BACKENDS: tuple[str, ...] = ("igpu",)
 SUPPORTED_CPU_POWER_BACKENDS: tuple[str, ...] = ("none", "turbostat_pkgwatt")
-SUPPORTED_IGPU_POWER_BACKENDS: tuple[str, ...] = (
-    "none",
-    "rocm-smi",
-    "turbostat_pkgwatt",
-)
+SUPPORTED_IGPU_POWER_BACKENDS: tuple[str, ...] = ("none", "rocm-smi")
 COMPARISON_COLUMNS: tuple[str, ...] = (
     "igpu",
     "igpu_rocm_smi",
-    "igpu_turbostat_pkgwatt",
     *REFERENCE_EXECUTION_MODES,
 )
 RESULTS_CSV_FIELDNAMES = (
@@ -80,7 +76,6 @@ PLOT_SERIES_THROUGHPUT = (
 )
 PLOT_SERIES_PER_WATT = (
     ("igpu_rocm_smi", "iGPU (ROCm-SMI)", "#e07a5f"),
-    ("igpu_turbostat_pkgwatt", "iGPU (Turbostat)", "#81b29a"),
     ("hybrid", "NPU", "#1f6f8b"),
 )
 PLOT_FAMILY_ORDER = ("tinybert_512", "baseline_768", "baseline_1024")
@@ -97,6 +92,22 @@ TORCH_DTYPES: dict[str, torch.dtype] = {
     "fp32": torch.float32,
     "float32": torch.float32,
 }
+ROCM_SMI_MIN_POWER_SAMPLE_INTERVAL_SEC = 0.05
+ROCM_SMI_MIN_POWER_SAMPLE_COUNT = 10
+# rocm-smi collects one sample per subprocess invocation, so target more than
+# the minimum desired count when picking the poll interval.
+ROCM_SMI_POWER_SAMPLE_TARGET_COUNT = 20
+ROCM_SMI_MIN_POWER_MEASUREMENT_DURATION_SEC = max(
+    1.2,
+    ROCM_SMI_MIN_POWER_SAMPLE_INTERVAL_SEC * ROCM_SMI_POWER_SAMPLE_TARGET_COUNT,
+)
+TURBOSTAT_MIN_POWER_SAMPLE_INTERVAL_SEC = 0.1
+TURBOSTAT_MIN_POWER_SAMPLE_COUNT = 10
+TURBOSTAT_POWER_SAMPLE_TARGET_COUNT = 12
+TURBOSTAT_MIN_POWER_MEASUREMENT_DURATION_SEC = max(
+    1.0,
+    TURBOSTAT_MIN_POWER_SAMPLE_INTERVAL_SEC * TURBOSTAT_POWER_SAMPLE_TARGET_COUNT,
+)
 
 
 def default_output_path() -> Path:
@@ -197,10 +208,25 @@ def empty_power_stats() -> dict[str, float | str | None]:
     return {
         "power_backend": None,
         "avg_power_w": None,
+        "min_power_w": None,
         "max_power_w": None,
         "energy_j": None,
         "power_sample_count": None,
     }
+
+
+def resolve_power_sampling_policy(*, power_backend: str) -> tuple[float, float, int]:
+    if power_backend == "rocm-smi":
+        return (
+            ROCM_SMI_MIN_POWER_MEASUREMENT_DURATION_SEC,
+            ROCM_SMI_MIN_POWER_SAMPLE_INTERVAL_SEC,
+            ROCM_SMI_POWER_SAMPLE_TARGET_COUNT,
+        )
+    return (
+        TURBOSTAT_MIN_POWER_MEASUREMENT_DURATION_SEC,
+        TURBOSTAT_MIN_POWER_SAMPLE_INTERVAL_SEC,
+        TURBOSTAT_POWER_SAMPLE_TARGET_COUNT,
+    )
 
 
 def resolve_power_sample_interval_sec(
@@ -273,6 +299,9 @@ class RocmSMIPowerMonitor:
                 pass
             self._stop_event.wait(self.sample_interval_sec)
 
+    def current_sample_count(self) -> int:
+        return len(self.samples_w)
+
     def stats(self, elapsed_sec: float) -> dict[str, float | str | None]:
         stats = empty_power_stats()
         stats["power_backend"] = "rocm-smi"
@@ -282,6 +311,7 @@ class RocmSMIPowerMonitor:
         stats.update(
             {
                 "avg_power_w": avg_power_w,
+                "min_power_w": min(self.samples_w),
                 "max_power_w": max(self.samples_w),
                 "energy_j": avg_power_w * elapsed_sec,
                 "power_sample_count": len(self.samples_w),
@@ -374,9 +404,7 @@ def iteration_schedule(seq_len: int) -> tuple[int, int]:
         return (1, 100)
     if seq_len <= 2048:
         return (1, 10)
-    if seq_len <= 4096:
-        return (1, 5)
-    return (1, 2)
+    return (1, 5)
 
 
 def resolve_sampling(
@@ -399,12 +427,19 @@ def _summarize_latencies(latencies_sec: list[float]) -> dict[str, float | int | 
     measured_inference_count = len(latencies_sec)
     timed_total_sec = sum(latencies_sec)
     avg_latency_ms = None
+    min_latency_ms = None
+    max_latency_ms = None
     if measured_inference_count:
         avg_latency_ms = (timed_total_sec / measured_inference_count) * 1000.0
+        min_latency_ms = min(latencies_sec) * 1000.0
+        max_latency_ms = max(latencies_sec) * 1000.0
     return {
         "measured_inference_count": measured_inference_count,
+        "latency_sample_count": measured_inference_count,
         "timed_total_sec": timed_total_sec,
         "avg_latency_ms": avg_latency_ms,
+        "min_latency_ms": min_latency_ms,
+        "max_latency_ms": max_latency_ms,
     }
 
 
@@ -476,6 +511,7 @@ def _forward_reference(
     *,
     num_attention_heads: int,
     workload_variant: str,
+    causal_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     seq_len, hidden_size = hidden_states.shape
     head_dim = hidden_size // num_attention_heads
@@ -502,10 +538,16 @@ def _forward_reference(
 
     attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (head_dim**0.5)
     if workload_variant == "decoder_gpt2":
-        causal_mask = torch.tril(
-            torch.ones((seq_len, seq_len), device=hidden_states.device)
-        )
-        attn_scores = attn_scores.masked_fill(causal_mask == 0, -10000.0)
+        if causal_mask is None:
+            causal_mask = torch.triu(
+                torch.ones(
+                    (seq_len, seq_len),
+                    device=hidden_states.device,
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            )
+        attn_scores = attn_scores.masked_fill(causal_mask, -10000.0)
     attn_probs = F.softmax(attn_scores, dim=-1)
     attn_output = torch.matmul(attn_probs, v)
 
@@ -578,10 +620,20 @@ def _measure_host_power_stats(
         power_stats["power_backend"] = "none"
         return power_stats
 
+    (
+        min_measurement_duration_sec,
+        min_interval_sec,
+        target_sample_count,
+    ) = resolve_power_sampling_policy(power_backend=power_backend)
+    required_sample_count = (
+        ROCM_SMI_MIN_POWER_SAMPLE_COUNT
+        if power_backend == "rocm-smi"
+        else TURBOSTAT_MIN_POWER_SAMPLE_COUNT
+    )
     power_probe_runs = resolve_power_probe_runs(
         avg_iteration_sec=avg_iteration_sec,
         baseline_runs=runs_per_sample,
-        min_measurement_duration_sec=0.25,
+        min_measurement_duration_sec=min_measurement_duration_sec,
     )
     estimated_window_sec = (
         None
@@ -591,7 +643,8 @@ def _measure_host_power_stats(
     sample_interval_sec = resolve_power_sample_interval_sec(
         requested_interval_sec=power_sample_interval_sec,
         estimated_timed_window_sec=estimated_window_sec,
-        min_interval_sec=0.05,
+        min_sample_count=target_sample_count,
+        min_interval_sec=min_interval_sec,
     )
     with _host_power_monitor(
         runtime_device,
@@ -600,10 +653,21 @@ def _measure_host_power_stats(
         estimated_timed_window_sec=estimated_window_sec,
     ) as power_monitor:
         started = time.perf_counter()
-        for _ in range(power_probe_runs):
+        completed_runs = 0
+        while True:
             forward_once()
+            completed_runs += 1
             time.sleep(0)
-        elapsed_sec = time.perf_counter() - started
+            elapsed_sec = time.perf_counter() - started
+            if power_probe_is_complete(
+                completed_runs=completed_runs,
+                min_runs=power_probe_runs,
+                elapsed_sec=elapsed_sec,
+                min_measurement_duration_sec=min_measurement_duration_sec,
+                observed_sample_count=power_monitor.current_sample_count(),
+                min_sample_count=required_sample_count,
+            ):
+                break
     power_stats = power_monitor.stats(elapsed_sec)
     if power_stats.get("avg_power_w") is not None:
         power_stats["energy_j"] = float(power_stats["avg_power_w"]) * float(
@@ -612,21 +676,16 @@ def _measure_host_power_stats(
     return power_stats
 
 
-def benchmark_host_group(
+def _prepare_host_forward_once(
     group: ReferenceGroup,
     *,
-    warmup_runs: int,
-    runs_per_sample: int,
     seed: int,
     device_name: str,
-    power_backend: str,
-    power_sample_interval_sec: float,
-    extra_power_backends: tuple[str, ...] = (),
-) -> dict[str, object]:
+    include_output: bool,
+) -> tuple[torch.device, torch.Tensor | None, object]:
     runtime_device = resolve_host_device(device_name)
     if runtime_device.type == "cpu":
         configure_cpu_runtime_for_max_physical_cores()
-    include_output = group.seq_len <= REFERENCE_VALIDATION_MAX_SEQ_LEN
     reference = generate_synthetic_reference(
         group.seq_len,
         group.hidden_size,
@@ -650,9 +709,19 @@ def benchmark_host_group(
     }
     runtime_reference_output = (
         reference["output"].to(runtime_device)
-        if isinstance(reference["output"], torch.Tensor)
+        if include_output and isinstance(reference["output"], torch.Tensor)
         else None
     )
+    runtime_causal_mask = None
+    if group.workload_variant == "decoder_gpt2":
+        runtime_causal_mask = torch.triu(
+            torch.ones(
+                (group.seq_len, group.seq_len),
+                device=runtime_device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
 
     def forward_once() -> torch.Tensor:
         with torch.no_grad():
@@ -661,10 +730,33 @@ def benchmark_host_group(
                 runtime_weights,
                 num_attention_heads=group.num_attention_heads,
                 workload_variant=group.workload_variant,
+                causal_mask=runtime_causal_mask,
             )
         if runtime_device.type == "cuda":
             torch.cuda.synchronize(runtime_device)
         return output
+
+    return runtime_device, runtime_reference_output, forward_once
+
+
+def benchmark_host_group(
+    group: ReferenceGroup,
+    *,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+    device_name: str,
+    power_backend: str,
+    power_sample_interval_sec: float,
+    extra_power_backends: tuple[str, ...] = (),
+) -> dict[str, object]:
+    include_output = group.seq_len <= REFERENCE_VALIDATION_MAX_SEQ_LEN
+    runtime_device, runtime_reference_output, forward_once = _prepare_host_forward_once(
+        group,
+        seed=seed,
+        device_name=device_name,
+        include_output=include_output,
+    )
 
     for _ in range(warmup_runs):
         forward_once()
@@ -718,6 +810,7 @@ def benchmark_host_group(
         "effective_gflops_per_sec": effective_gflops,
         "power_backend": power_stats.get("power_backend"),
         "avg_power_w": power_stats.get("avg_power_w"),
+        "min_power_w": power_stats.get("min_power_w"),
         "max_power_w": power_stats.get("max_power_w"),
         "energy_j": power_stats.get("energy_j"),
         "power_sample_count": power_stats.get("power_sample_count"),
@@ -730,6 +823,75 @@ def benchmark_host_group(
         "extra_power_stats": extra_power_stats,
         **validation,
     }
+
+
+def benchmark_host_group_power_only(
+    group: ReferenceGroup,
+    *,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+    device_name: str,
+    power_backend: str,
+    power_sample_interval_sec: float,
+    existing_avg_latency_ms: float | None,
+    existing_effective_gflops_per_sec: float | None,
+) -> dict[str, object]:
+    try:
+        runtime_device, _, forward_once = _prepare_host_forward_once(
+            group,
+            seed=seed,
+            device_name=device_name,
+            include_output=False,
+        )
+        for _ in range(warmup_runs):
+            forward_once()
+
+        avg_iteration_sec = (
+            None
+            if existing_avg_latency_ms is None or existing_avg_latency_ms <= 0
+            else existing_avg_latency_ms / 1000.0
+        )
+        timed_total_sec = (
+            0.0
+            if existing_avg_latency_ms is None or existing_avg_latency_ms <= 0
+            else avg_iteration_sec * float(runs_per_sample)
+        )
+        power_stats = _measure_host_power_stats(
+            runtime_device=runtime_device,
+            forward_once=forward_once,
+            power_backend=power_backend,
+            power_sample_interval_sec=power_sample_interval_sec,
+            runs_per_sample=runs_per_sample,
+            avg_iteration_sec=avg_iteration_sec,
+            timed_total_sec=timed_total_sec,
+        )
+        return {
+            "power_backend": power_stats.get("power_backend"),
+            "avg_power_w": power_stats.get("avg_power_w"),
+            "min_power_w": power_stats.get("min_power_w"),
+            "max_power_w": power_stats.get("max_power_w"),
+            "energy_j": power_stats.get("energy_j"),
+            "power_sample_count": power_stats.get("power_sample_count"),
+            "effective_gflops_per_sec_per_watt": effective_gflops_per_sec_per_watt(
+                existing_effective_gflops_per_sec,
+                _optional_float(power_stats.get("avg_power_w")),
+            ),
+            "run_status": "passed",
+            "failure_message": "",
+        }
+    except Exception as exc:
+        return {
+            "power_backend": power_backend,
+            "avg_power_w": None,
+            "min_power_w": None,
+            "max_power_w": None,
+            "energy_j": None,
+            "power_sample_count": None,
+            "effective_gflops_per_sec_per_watt": None,
+            "run_status": "failed_exception",
+            "failure_message": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def _float_mean(values: list[float]) -> float | None:
@@ -798,7 +960,6 @@ def _comparison_row(
     metric: str,
     igpu_value: float | None,
     igpu_rocm_smi_value: float | None = None,
-    igpu_turbostat_value: float | None = None,
     reference_values: dict[str, float | None],
 ) -> dict[str, object]:
     row: dict[str, object] = {
@@ -808,7 +969,6 @@ def _comparison_row(
         "metric": metric,
         "igpu": igpu_value,
         "igpu_rocm_smi": igpu_rocm_smi_value,
-        "igpu_turbostat_pkgwatt": igpu_turbostat_value,
     }
     for execution_mode in REFERENCE_EXECUTION_MODES:
         row[execution_mode] = reference_values.get(execution_mode)
@@ -850,7 +1010,6 @@ def _normalized_existing_row(row: dict[str, str]) -> dict[str, object] | None:
         "metric": metric,
         "igpu": row.get("igpu", ""),
         "igpu_rocm_smi": row.get("igpu_rocm_smi", ""),
-        "igpu_turbostat_pkgwatt": row.get("igpu_turbostat_pkgwatt", ""),
         "hybrid": row.get("hybrid", row.get("dataflow", "")),
     }
     return normalized
@@ -917,8 +1076,6 @@ def reusable_rows_for_group(
         return None
     if _optional_float(per_watt_row.get("igpu_rocm_smi")) is None:
         return None
-    if _optional_float(per_watt_row.get("igpu_turbostat_pkgwatt")) is None:
-        return None
     if not _matching_reference_values(throughput_row, reference_effective_gflops):
         return None
     if not _matching_reference_values(
@@ -926,7 +1083,30 @@ def reusable_rows_for_group(
         reference_effective_gflops_per_watt,
     ):
         return None
-    return [dict(throughput_row), dict(per_watt_row)]
+    required_metrics = (
+        "avg_latency_ms",
+        "min_latency_ms",
+        "max_latency_ms",
+        "latency_sample_count",
+        "avg_power_w",
+        "min_power_w",
+        "max_power_w",
+        "power_sample_count",
+    )
+    reused_rows = [dict(throughput_row), dict(per_watt_row)]
+    for metric in required_metrics:
+        row = existing_rows.get(
+            (
+                group.workload_variant,
+                group.study_case_id,
+                group.seq_len,
+                metric,
+            )
+        )
+        if row is None:
+            return None
+        reused_rows.append(dict(row))
+    return reused_rows
 
 
 def _resolve_plot_path(path: Path) -> Path:
@@ -1212,12 +1392,6 @@ def build_rows_for_group(
             "power_sample_interval_sec": igpu_power_sample_interval_sec,
         },
     }
-    igpu_measurement_backends = tuple(
-        backend
-        for backend in ("rocm-smi", "turbostat_pkgwatt")
-        if backend != str(igpu_power_backend)
-    )
-
     for backend in host_backends:
         try:
             benchmark_results[backend] = benchmark_host_group(
@@ -1229,9 +1403,6 @@ def build_rows_for_group(
                 power_backend=str(backend_configs[backend]["power_backend"]),
                 power_sample_interval_sec=float(
                     backend_configs[backend]["power_sample_interval_sec"]
-                ),
-                extra_power_backends=(
-                    igpu_measurement_backends if backend == "igpu" else tuple()
                 ),
             )
         except Exception as exc:
@@ -1254,6 +1425,20 @@ def build_rows_for_group(
     reference_effective_gflops_per_watt = _reference_metric_means(
         group,
         "effective_gflops_per_sec_per_watt",
+    )
+    reference_avg_latency_ms = _reference_metric_means(group, "avg_latency_ms")
+    reference_min_latency_ms = _reference_metric_means(group, "min_latency_ms")
+    reference_max_latency_ms = _reference_metric_means(group, "max_latency_ms")
+    reference_latency_sample_count = _reference_metric_means(
+        group,
+        "latency_sample_count",
+    )
+    reference_avg_power_w = _reference_metric_means(group, "avg_power_w")
+    reference_min_power_w = _reference_metric_means(group, "min_power_w")
+    reference_max_power_w = _reference_metric_means(group, "max_power_w")
+    reference_power_sample_count = _reference_metric_means(
+        group,
+        "power_sample_count",
     )
     reused_rows = reusable_rows_for_group(
         {} if existing_rows is None else existing_rows,
@@ -1280,17 +1465,77 @@ def build_rows_for_group(
         ),
         _comparison_row(
             group=group,
+            metric="avg_latency_ms",
+            igpu_value=_host_metric_value(benchmark_results["igpu"], "avg_latency_ms"),
+            reference_values=reference_avg_latency_ms,
+        ),
+        _comparison_row(
+            group=group,
+            metric="min_latency_ms",
+            igpu_value=_host_metric_value(benchmark_results["igpu"], "min_latency_ms"),
+            reference_values=reference_min_latency_ms,
+        ),
+        _comparison_row(
+            group=group,
+            metric="max_latency_ms",
+            igpu_value=_host_metric_value(benchmark_results["igpu"], "max_latency_ms"),
+            reference_values=reference_max_latency_ms,
+        ),
+        _comparison_row(
+            group=group,
+            metric="latency_sample_count",
+            igpu_value=_host_metric_value(
+                benchmark_results["igpu"],
+                "latency_sample_count",
+            ),
+            reference_values=reference_latency_sample_count,
+        ),
+        _comparison_row(
+            group=group,
             metric="effective_gflops_per_sec_per_watt",
             igpu_value=None,
             igpu_rocm_smi_value=_igpu_effective_gflops_per_watt_for_backend(
                 benchmark_results["igpu"],
                 power_backend="rocm-smi",
             ),
-            igpu_turbostat_value=_igpu_effective_gflops_per_watt_for_backend(
-                benchmark_results["igpu"],
-                power_backend="turbostat_pkgwatt",
-            ),
             reference_values=reference_effective_gflops_per_watt,
+        ),
+        _comparison_row(
+            group=group,
+            metric="avg_power_w",
+            igpu_value=None,
+            igpu_rocm_smi_value=_host_metric_value(
+                benchmark_results["igpu"], "avg_power_w"
+            ),
+            reference_values=reference_avg_power_w,
+        ),
+        _comparison_row(
+            group=group,
+            metric="min_power_w",
+            igpu_value=None,
+            igpu_rocm_smi_value=_host_metric_value(
+                benchmark_results["igpu"], "min_power_w"
+            ),
+            reference_values=reference_min_power_w,
+        ),
+        _comparison_row(
+            group=group,
+            metric="max_power_w",
+            igpu_value=None,
+            igpu_rocm_smi_value=_host_metric_value(
+                benchmark_results["igpu"], "max_power_w"
+            ),
+            reference_values=reference_max_power_w,
+        ),
+        _comparison_row(
+            group=group,
+            metric="power_sample_count",
+            igpu_value=None,
+            igpu_rocm_smi_value=_host_metric_value(
+                benchmark_results["igpu"],
+                "power_sample_count",
+            ),
+            reference_values=reference_power_sample_count,
         ),
     ]
 

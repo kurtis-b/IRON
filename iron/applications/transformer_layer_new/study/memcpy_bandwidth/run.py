@@ -44,6 +44,9 @@ CSV_FIELDNAMES = (
     "warmup_iters",
     "timed_iters",
     "latency_us",
+    "latency_sample_count",
+    "min_latency_us",
+    "max_latency_us",
     "bandwidth_gbps",
     "validation_error_count",
     "run_status",
@@ -150,7 +153,7 @@ def benchmark_case(
         tile_size=case.tile_size,
         context=context,
     )
-    errors, latency_us, bandwidth_gbps = run_test(
+    errors, latency_us, bandwidth_gbps, timing_details = run_test(
         operator,
         {"input": reference["inout"]},
         {"output": reference["inout"]},
@@ -158,9 +161,13 @@ def benchmark_case(
         abs_tol=ABS_TOL,
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
+        return_timing_details=True,
     )
     return {
         "latency_us": latency_us,
+        "latency_sample_count": timing_details.get("latency_sample_count"),
+        "min_latency_us": timing_details.get("min_latency_us"),
+        "max_latency_us": timing_details.get("max_latency_us"),
         "bandwidth_gbps": bandwidth_gbps,
         **_validation_result(errors),
     }
@@ -169,6 +176,9 @@ def benchmark_case(
 def _failed_result(message: str) -> dict[str, object]:
     return {
         "latency_us": None,
+        "latency_sample_count": None,
+        "min_latency_us": None,
+        "max_latency_us": None,
         "bandwidth_gbps": None,
         "validation_error_count": 0,
         "run_status": "failed_exception",
@@ -207,6 +217,16 @@ def load_existing_rows(
     return rows
 
 
+def merge_rows(
+    existing_rows: dict[str, dict[str, object]],
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    merged = {str(key): dict(value) for key, value in existing_rows.items()}
+    for row in rows:
+        merged[_existing_row_key(row)] = dict(row)
+    return [merged[key] for key in sorted(merged)]
+
+
 def reusable_existing_row(
     existing_rows: dict[str, dict[str, object]],
     *,
@@ -227,6 +247,14 @@ def reusable_existing_row(
         "failed_exception",
     }:
         return None
+    if str(row.get("run_status") or "") in {"passed", "failed_validation"}:
+        required_fields = (
+            "latency_sample_count",
+            "min_latency_us",
+            "max_latency_us",
+        )
+        if any(str(row.get(field) or "").strip() == "" for field in required_fields):
+            return None
     return dict(row)
 
 
@@ -539,12 +567,17 @@ def main(argv: list[str] | None = None) -> int:
                 args.bypass,
             )
 
-        write_rows(output_path, rows)
+        merged_rows = merge_rows(existing_rows, rows)
+        write_rows(output_path, merged_rows)
         write_plots(
-            rows,
+            merged_rows,
             bandwidth_plot_path=bandwidth_plot_path,
         )
-        LOGGER.info("Wrote %d memcpy bandwidth rows to %s", len(rows), output_path)
+        LOGGER.info(
+            "Wrote %d memcpy bandwidth rows to %s",
+            len(merged_rows),
+            output_path,
+        )
         LOGGER.info("Wrote memcpy bandwidth plot to %s", bandwidth_plot_path)
     return 0
 
