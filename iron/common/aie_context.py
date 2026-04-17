@@ -71,8 +71,6 @@ class AIEContext:
             bo.write(np.frombuffer(buffer_data, dtype=np.uint8), 0)
             self.static_data_pool[buffer_data] = bo
 
-        shared_kernel_handles = {}
-
         for op in self.operators:
             if len(op.kernels) == 0:
                 continue
@@ -90,15 +88,9 @@ class AIEContext:
                     handle = self.device_manager.get_kernel_handle(
                         str(xclbin.path), xclbin_kernel_name, str(insts.path)
                     )
-                    shared_key = (str(xclbin.path), xclbin_kernel_name)
-                    if shared_key in shared_kernel_handles:
-                        context, kernel = shared_kernel_handles[shared_key]
-                    else:
-                        context, kernel = handle.context, handle.kernel
-                        shared_kernel_handles[shared_key] = (context, kernel)
                     op.xrt_kernels[kernel_name] = (
-                        context,
-                        kernel,
+                        handle.context,
+                        handle.kernel,
                         handle.insts_bo,
                         len(handle.insts),
                     )

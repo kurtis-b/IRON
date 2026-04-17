@@ -278,7 +278,7 @@ def render_plot(
         Patch(
             facecolor=PATTERN_COLOR,
             edgecolor=PATTERN_EDGE,
-            label="Hybrid Runlist+Dataflow End-to-End",
+            label="Hybrid End-to-End",
         )
     )
     if legend_ax is not None:
@@ -298,7 +298,7 @@ def render_plot(
             fontsize=legend_font_size,
         )
     fig.suptitle(
-        "Aggregate Latency of Blocks Compared to Hybrid Runlist+Dataflow End-to-End Latency",
+        "Aggregate Latency of Blocks Compared to Hybrid End-to-End Latency",
         fontsize=suptitle_size,
         fontweight="bold",
         y=title_y,

@@ -101,11 +101,15 @@ POWER_COMPARISON_METRICS: tuple[str, ...] = (
 )
 PLOT_SERIES_THROUGHPUT = (
     ("igpu", "iGPU", "#e07a5f"),
-    ("hybrid", "NPU", "#1f6f8b"),
+    ("hybrid", "NPU Hybrid", "#1f6f8b"),
+    ("runlist", "NPU Runlist", "#b85c38"),
+    ("offload", "NPU Offload", "#6c9a3b"),
 )
 PLOT_SERIES_PER_WATT = (
     ("igpu_rocm_smi", "iGPU (ROCm-SMI)", "#e07a5f"),
-    ("hybrid", "NPU", "#1f6f8b"),
+    ("hybrid", "NPU Hybrid", "#1f6f8b"),
+    ("runlist", "NPU Runlist", "#b85c38"),
+    ("offload", "NPU Offload", "#6c9a3b"),
 )
 PLOT_FAMILY_ORDER = ("tinybert_512", "baseline_768", "baseline_1024")
 PLOT_SEQ_ORDER = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
@@ -1036,8 +1040,12 @@ def _normalized_existing_row(row: dict[str, str]) -> dict[str, object] | None:
         "metric": metric,
         "igpu": row.get("igpu", ""),
         "igpu_rocm_smi": row.get("igpu_rocm_smi", ""),
-        "hybrid": row.get("hybrid", row.get("dataflow", "")),
     }
+    for execution_mode in REFERENCE_EXECUTION_MODES:
+        if execution_mode == "hybrid":
+            normalized[execution_mode] = row.get("hybrid", row.get("dataflow", ""))
+        else:
+            normalized[execution_mode] = row.get(execution_mode, "")
     return normalized
 
 

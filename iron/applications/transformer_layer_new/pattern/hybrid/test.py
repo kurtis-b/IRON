@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
-from iron.applications.transformer_layer_new.pattern.dataflow.op import (
+from iron.applications.transformer_layer_new.pattern.hybrid.op import (
     AIETransformerHybrid,
 )
 from iron.applications.transformer_layer_new.pattern.reference import (

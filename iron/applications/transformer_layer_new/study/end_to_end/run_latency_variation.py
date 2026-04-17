@@ -61,14 +61,17 @@ RESULTS_CSV_FIELDNAMES = (
 MODE_COLORS = {
     "hybrid": "#1f6f8b",
     "runlist": "#e07a5f",
+    "offload": "#6c9a3b",
 }
 MODE_MARKERS = {
     "hybrid": "o",
     "runlist": "s",
+    "offload": "^",
 }
 MODE_LABELS = {
     "hybrid": "Hybrid",
     "runlist": "Runlist",
+    "offload": "GEMM Offload",
 }
 FAMILY_LABELS = {
     "tinybert_512": "TinyBERT",

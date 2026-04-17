@@ -34,7 +34,7 @@ from .memory_tile_staging.select import STAGING_BLOCK_KINDS
 LOGGER = logging.getLogger(__name__)
 
 STUDY_PACKAGE = "iron.applications.transformer_layer_new.study"
-STATE_VERSION = 2
+STATE_VERSION = 3
 DEFAULT_HOST_COMPARISON_16384_TTM_GB = 26
 CRON_MARKER_PREFIX = "# transformer-layer-unattended:"
 DEFAULT_RETRY_LIMIT = 2
@@ -860,6 +860,233 @@ def build_smoke_test_job_plan(
     ]
 
 
+def build_execution_smoke_job_plan(
+    *,
+    results_root: Path,
+    source_results_root: Path,
+) -> list[dict[str, Any]]:
+    paths = _output_paths(results_root)
+    family_id = "baseline_768"
+    workload_variant = "encoder_bert"
+    seq_len = 512
+
+    jobs = [
+        _module_job(
+            job_id="execution_smoke_prepare_fixtures",
+            description="execution smoke prepare fixtures",
+            module=f"{STUDY_PACKAGE}.unattended_smoke_job",
+            argv=[
+                "prepare-execution-fixtures",
+                "--source-root",
+                str(source_results_root),
+                "--target-root",
+                str(results_root),
+            ],
+            privileged_setup=[],
+            max_attempts=1,
+        )
+    ]
+
+    for execution_mode in EXECUTION_MODES:
+        jobs.append(
+            _module_job(
+                job_id=f"execution_smoke_end_to_end_{execution_mode}",
+                description=f"execution smoke end_to_end mode={execution_mode}",
+                module=f"{STUDY_PACKAGE}.end_to_end.run",
+                argv=[
+                    "--workload-variant",
+                    workload_variant,
+                    "--family",
+                    family_id,
+                    "--seq-len",
+                    str(seq_len),
+                    "--mode",
+                    execution_mode,
+                    "--power-backend",
+                    "turbostat_pkgwatt",
+                    "--output",
+                    str(paths["end_to_end_results"]),
+                    "--tuning-output",
+                    str(paths["end_to_end_tuning"]),
+                    "--resume-input",
+                    str(paths["end_to_end_results"]),
+                    "--resume-tuning-input",
+                    str(paths["end_to_end_tuning"]),
+                ],
+                privileged_setup=[],
+            )
+        )
+
+    for execution_mode in EXECUTION_MODES:
+        jobs.append(
+            _module_job(
+                job_id=f"execution_smoke_correctness_{execution_mode}",
+                description=f"execution smoke correctness mode={execution_mode}",
+                module=f"{STUDY_PACKAGE}.end_to_end.run_correctness_spot_checks",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--workload-variant",
+                    workload_variant,
+                    "--family",
+                    family_id,
+                    "--mode",
+                    execution_mode,
+                    "--seq-len",
+                    str(seq_len),
+                    "--output",
+                    str(paths["correctness_results"]),
+                    "--resume-input",
+                    str(paths["correctness_results"]),
+                ],
+                privileged_setup=[],
+            )
+        )
+
+    for execution_mode in EXECUTION_MODES:
+        jobs.append(
+            _module_job(
+                job_id=f"execution_smoke_latency_variation_{execution_mode}",
+                description=f"execution smoke latency variation mode={execution_mode}",
+                module=f"{STUDY_PACKAGE}.end_to_end.run_latency_variation",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--workload-variant",
+                    workload_variant,
+                    "--family",
+                    family_id,
+                    "--mode",
+                    execution_mode,
+                    "--seq-len",
+                    str(seq_len),
+                    "--output",
+                    str(paths["latency_variation_results"]),
+                    "--plot-output",
+                    str(paths["latency_variation_plot"]),
+                    "--resume-input",
+                    str(paths["latency_variation_results"]),
+                ],
+                privileged_setup=[],
+            )
+        )
+
+    jobs.extend(
+        [
+            _module_job(
+                job_id="execution_smoke_end_to_end_fairness",
+                description="execution smoke end_to_end fairness",
+                module=f"{STUDY_PACKAGE}.end_to_end.run_fairness_repeatability",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--output",
+                    str(paths["end_to_end_fairness"]),
+                ],
+                privileged_setup=[],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="execution_smoke_host_comparison",
+                description="execution smoke host comparison",
+                module=f"{STUDY_PACKAGE}.host_comparison.run",
+                argv=[
+                    "--reference-input",
+                    str(paths["end_to_end_results"]),
+                    "--family",
+                    family_id,
+                    "--seq-len",
+                    str(seq_len),
+                    "--host-backends",
+                    "igpu",
+                    "--igpu-power-backend",
+                    "rocm-smi",
+                    "--output",
+                    str(paths["host_comparison_results"]),
+                    "--resume-input",
+                    str(paths["host_comparison_results"]),
+                ],
+                privileged_setup=[],
+            ),
+            _module_job(
+                job_id="execution_smoke_host_comparison_fairness",
+                description="execution smoke host comparison fairness",
+                module=f"{STUDY_PACKAGE}.host_comparison.run_fairness_repeatability",
+                argv=[
+                    "--output",
+                    str(paths["host_comparison_fairness"]),
+                ],
+                privileged_setup=[],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="execution_smoke_resource_usage",
+                description="execution smoke resource usage",
+                module=f"{STUDY_PACKAGE}.resource_usage.run",
+                argv=[
+                    "--scope",
+                    "all",
+                    "--family",
+                    family_id,
+                    "--seq-len",
+                    str(seq_len),
+                    "--block-results-input",
+                    str(paths["block_results"]),
+                    "--end-to-end-results-input",
+                    str(paths["end_to_end_results"]),
+                    "--output-dir",
+                    str(paths["resource_usage_dir"]),
+                ],
+                privileged_setup=[],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="execution_smoke_roofline",
+                description="execution smoke roofline",
+                module=f"{STUDY_PACKAGE}.roofline.run",
+                argv=[
+                    "--family",
+                    family_id,
+                    "--end-to-end-results-input",
+                    str(paths["end_to_end_results"]),
+                    "--end-to-end-tuning-input",
+                    str(paths["end_to_end_tuning"]),
+                    "--memcpy-results-input",
+                    str(paths["memcpy_results"]),
+                    "--output-dir",
+                    str(paths["roofline_dir"]),
+                ],
+                privileged_setup=[],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="execution_smoke_regenerate_plots",
+                description="execution smoke regenerate plots",
+                module=f"{STUDY_PACKAGE}.regenerate_plots",
+                argv=[
+                    "--results-root",
+                    str(results_root),
+                ],
+                privileged_setup=[],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="execution_smoke_verify_results",
+                description="execution smoke verify results",
+                module=f"{STUDY_PACKAGE}.unattended_smoke_job",
+                argv=[
+                    "verify-execution-results",
+                    "--results-root",
+                    str(results_root),
+                ],
+                privileged_setup=[],
+                max_attempts=1,
+            ),
+        ]
+    )
+    return jobs
+
+
 def create_state(
     *,
     run_id: str,
@@ -873,12 +1100,18 @@ def create_state(
     temperature_source: str = "",
     amd_ttm_path: str = "",
     normal_ttm_pages_limit: int | None = None,
+    plan_kind: str = "full",
+    source_results_root: Path | None = None,
 ) -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
         "run_id": run_id,
         "repo_root": str(repo),
         "results_root": str(results_root),
+        "source_results_root": (
+            "" if source_results_root is None else str(source_results_root)
+        ),
+        "plan_kind": plan_kind,
         "run_user": run_user,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "status": "pending",
@@ -1143,22 +1376,59 @@ def _merge_job_progress(
     return merged
 
 
+def _job_specs_match(
+    expected_job: dict[str, Any], existing_job: dict[str, Any]
+) -> bool:
+    return {key: expected_job.get(key) for key in JOB_SPEC_KEYS} == {
+        key: existing_job.get(key) for key in JOB_SPEC_KEYS
+    }
+
+
+def _expected_jobs_for_state(state: dict[str, Any]) -> list[dict[str, Any]]:
+    plan_kind = str(state.get("plan_kind") or "full")
+    results_root = Path(state["results_root"])
+    host_comparison_16384_ttm_gb = int(
+        state.get(
+            "host_comparison_16384_ttm_gb",
+            DEFAULT_HOST_COMPARISON_16384_TTM_GB,
+        )
+    )
+    if plan_kind == "plot_smoke":
+        source_results_root = str(state.get("source_results_root") or "").strip()
+        if not source_results_root:
+            source_results_root = str(app_root() / "results")
+        return build_smoke_test_job_plan(
+            results_root=results_root,
+            source_results_root=Path(source_results_root),
+        )
+    if plan_kind == "execution_smoke":
+        source_results_root = str(state.get("source_results_root") or "").strip()
+        if not source_results_root:
+            source_results_root = str(app_root() / "results")
+        return build_execution_smoke_job_plan(
+            results_root=results_root,
+            source_results_root=Path(source_results_root),
+        )
+    return build_job_plan(
+        results_root=results_root,
+        host_comparison_16384_ttm_gb=host_comparison_16384_ttm_gb,
+    )
+
+
 def _migrate_state_for_current_runner(state: dict[str, Any]) -> bool:
     changed = _ensure_normal_ttm_pages_limit(state)
-    expected_jobs = build_job_plan(
-        results_root=Path(state["results_root"]),
-        host_comparison_16384_ttm_gb=int(
-            state.get(
-                "host_comparison_16384_ttm_gb",
-                DEFAULT_HOST_COMPARISON_16384_TTM_GB,
-            )
-        ),
-    )
+    expected_jobs = _expected_jobs_for_state(state)
     expected_ids = [str(job["id"]) for job in expected_jobs]
     existing_jobs = list(state.get("jobs", []))
     existing_ids = [str(job.get("id", "")) for job in existing_jobs]
+    specs_match = len(existing_jobs) == len(expected_jobs) and all(
+        _job_specs_match(expected_job, existing_job)
+        for expected_job, existing_job in zip(expected_jobs, existing_jobs)
+    )
     needs_job_migration = (
-        int(state.get("version", 1)) < STATE_VERSION or existing_ids != expected_ids
+        int(state.get("version", 1)) < STATE_VERSION
+        or existing_ids != expected_ids
+        or not specs_match
     )
     if needs_job_migration:
         old_current_job_id = None
@@ -1469,6 +1739,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     smoke.add_argument("--log-level", default="INFO")
 
+    execution_smoke = subparsers.add_parser(
+        "execution-smoke-test",
+        help="Run a reduced unattended execution smoke without installing a boot hook.",
+    )
+    execution_smoke.add_argument(
+        "--run-id", default=f"execution_smoke_{default_run_id()}"
+    )
+    execution_smoke.add_argument("--state", type=Path, default=None)
+    execution_smoke.add_argument("--results-root", type=Path, default=None)
+    execution_smoke.add_argument(
+        "--source-results-root",
+        type=Path,
+        default=None,
+        help="Existing results root used as the input fixture source for ancillary outputs.",
+    )
+    execution_smoke.add_argument("--run-user", default=default_run_user())
+    execution_smoke.add_argument(
+        "--reboot-command",
+        default="true",
+        help="Command used between smoke-test jobs. Defaults to a no-op.",
+    )
+    execution_smoke.add_argument("--log-level", default="INFO")
+
     return parser.parse_args(argv)
 
 
@@ -1517,6 +1810,7 @@ def _start(args: argparse.Namespace) -> int:
         temperature_source=temperature_source,
         amd_ttm_path=amd_ttm_path,
         normal_ttm_pages_limit=normal_ttm_pages_limit,
+        plan_kind="full",
     )
     write_state(state_path, state)
     _record_baseline_temperature(results_root, state)
@@ -1612,6 +1906,8 @@ def _smoke_test(args: argparse.Namespace) -> int:
         jobs=jobs,
         baseline_temperature_c=baseline_temperature_c,
         temperature_source=temperature_source,
+        plan_kind="plot_smoke",
+        source_results_root=source_results_root,
     )
     write_state(state_path, state)
     _record_baseline_temperature(results_root, state)
@@ -1632,6 +1928,65 @@ def _smoke_test(args: argparse.Namespace) -> int:
     )
 
 
+def _execution_smoke_test(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO)
+    )
+    repo = repo_root()
+    run_id = str(args.run_id)
+    results_root = (
+        args.results_root.expanduser()
+        if args.results_root is not None
+        else default_results_root(run_id)
+    )
+    state_path = (
+        args.state.expanduser()
+        if args.state is not None
+        else default_state_path(run_id)
+    )
+    source_results_root = (
+        args.source_results_root.expanduser()
+        if args.source_results_root is not None
+        else app_root() / "results"
+    )
+    reboot_command = shlex.split(str(args.reboot_command))
+    jobs = build_execution_smoke_job_plan(
+        results_root=results_root,
+        source_results_root=source_results_root,
+    )
+    baseline_temperature_c, temperature_source = _read_pc_temperature_c()
+    state = create_state(
+        run_id=run_id,
+        repo=repo,
+        results_root=results_root,
+        run_user=str(args.run_user),
+        host_comparison_16384_ttm_gb=DEFAULT_HOST_COMPARISON_16384_TTM_GB,
+        reboot_command=reboot_command,
+        jobs=jobs,
+        baseline_temperature_c=baseline_temperature_c,
+        temperature_source=temperature_source,
+        plan_kind="execution_smoke",
+        source_results_root=source_results_root,
+    )
+    write_state(state_path, state)
+    _record_baseline_temperature(results_root, state)
+
+    max_steps = len(jobs) + 2
+    for _ in range(max_steps):
+        exit_code = run_next_job(state_path)
+        state = load_state(state_path)
+        if str(state.get("status")) == "completed":
+            print(render_status(state))
+            return 0
+        if str(state.get("status")) == "failed":
+            print(render_status(state))
+            return int(exit_code or 1)
+
+    raise RuntimeError(
+        "Execution smoke test did not converge within the expected number of steps"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "start":
@@ -1646,6 +2001,8 @@ def main(argv: list[str] | None = None) -> int:
         return _resume(args)
     if args.command == "smoke-test":
         return _smoke_test(args)
+    if args.command == "execution-smoke-test":
+        return _execution_smoke_test(args)
     raise ValueError(f"Unsupported command: {args.command}")
 
 

@@ -31,8 +31,11 @@ from iron.operators.causal_mask.op import AIECausalMask
 from iron.operators.softmax.op import AIESoftmax
 from iron.operators.transpose.op import AIETranspose
 
-from iron.applications.transformer_layer_new.pattern.dataflow.op import (
+from iron.applications.transformer_layer_new.pattern.hybrid.op import (
     resolve_hybrid_operator_config,
+)
+from iron.applications.transformer_layer_new.pattern.offload.op import (
+    AIETransformerOffload,
 )
 from iron.applications.transformer_layer_new.pattern.runlist.op import (
     AIETransformerRunlist,
@@ -60,7 +63,7 @@ from iron.applications.transformer_layer_new.study.resource_usage.analysis impor
 
 LOGGER = logging.getLogger(__name__)
 
-Scope = Literal["all", "dataflow_blocks", "hybrid_ops", "runlist_ops"]
+Scope = Literal["all", "dataflow_blocks", "hybrid_ops", "runlist_ops", "offload_ops"]
 
 APP_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = APP_ROOT.parents[2]
@@ -181,6 +184,7 @@ RUNLIST_FIELDNAMES = (
 )
 
 HYBRID_FIELDNAMES = RUNLIST_FIELDNAMES
+OFFLOAD_FIELDNAMES = RUNLIST_FIELDNAMES
 
 _LEADING_PREFIX_RE = re.compile(r"(?P<prefix>\d+)_")
 _LAYER_NORM_HASH_RE = re.compile(r"_[0-9a-f]{12}$")
@@ -276,7 +280,7 @@ def _leading_numeric_prefix(path: Path) -> int:
 def _artifact_sort_key(
     path: Path,
     *,
-    artifact_kind: Literal["isolated", "hybrid_mode", "runlist_mode"],
+    artifact_kind: Literal["isolated", "hybrid_mode", "runlist_mode", "offload_mode"],
 ) -> tuple[int, int, str]:
     parent_name = path.parent.name
     if artifact_kind == "isolated":
@@ -309,12 +313,21 @@ def _artifact_sort_key(
             rank = 2
         else:
             rank = 3
-    else:
+    elif artifact_kind == "runlist_mode":
         if parent_name.startswith("mode_runlist_"):
             rank = 0
         elif re.match(r"\d+_mode_runlist_", parent_name):
             rank = 1
         elif re.match(r"\d+_runlist_", parent_name):
+            rank = 2
+        else:
+            rank = 3
+    else:
+        if parent_name.startswith("mode_offload_"):
+            rank = 0
+        elif re.match(r"\d+_mode_offload_", parent_name):
+            rank = 1
+        elif re.match(r"\d+_offload_", parent_name):
             rank = 2
         else:
             rank = 3
@@ -844,6 +857,32 @@ def _hybrid_operator_artifact_specs(
     raise ValueError(f"Unsupported hybrid logical operator: {logical_operator}")
 
 
+def _offload_operator_artifact_specs(
+    workload: EndToEndWorkload,
+    logical_operator: str,
+    operator_config: dict[str, object],
+    *,
+    workload_variant: str,
+) -> tuple[ArtifactSpec, ...]:
+    with tempfile.TemporaryDirectory(prefix="tl_resource_usage_") as tempdir:
+        context = _make_temporary_context(tempdir)
+        operator = AIETransformerOffload(
+            seq_len=workload.seq_len,
+            hidden_size=workload.hidden_size,
+            intermediate_size=workload.intermediate_size,
+            num_heads=workload.num_attention_heads,
+            workload_variant=workload_variant,
+            operator_config={logical_operator: operator_config},
+            context=context,
+        )
+        operator.set_up_artifacts()
+        insts_artifact = getattr(operator, f"{logical_operator}_insts")
+        return _artifact_specs_for_names(
+            f"{insts_artifact.path.stem}.mlir.prj",
+            f"{operator.shared_gemm_xclbin.path.stem}.mlir.prj",
+        )
+
+
 def _find_mode_scope_dir(
     build_root: Path,
     *,
@@ -891,7 +930,7 @@ def _locate_artifact(
     *,
     specs: tuple[ArtifactSpec, ...],
     preferred_scope_dir: Path | None,
-    artifact_kind: Literal["isolated", "hybrid_mode", "runlist_mode"],
+    artifact_kind: Literal["isolated", "hybrid_mode", "runlist_mode", "offload_mode"],
 ) -> ArtifactMatch:
     notes: list[str] = []
     if not index.build_root.exists():
@@ -1354,6 +1393,99 @@ def export_runlist_selected_ops(
     return export_rows
 
 
+def export_offload_selected_ops(
+    *,
+    end_to_end_results_input: str | Path,
+    family_filter: str,
+    seq_len_filter: str,
+    build_index: BuildArtifactIndex,
+) -> list[dict[str, object]]:
+    selected_rows = select_result_rows(
+        load_result_rows(end_to_end_results_input),
+        family_filter=family_filter,
+        seq_len_filter=seq_len_filter,
+        mode_filter="offload",
+    )
+    export_rows: list[dict[str, object]] = []
+    for selected_row in selected_rows:
+        workload = EndToEndWorkload(
+            workload_variant=selected_row.workload_variant,
+            seq_len=selected_row.seq_len,
+            hidden_size=selected_row.hidden_size,
+            intermediate_size=selected_row.intermediate_size,
+            num_attention_heads=selected_row.num_attention_heads,
+        )
+        preferred_scope_dir = _find_mode_scope_dir(
+            build_index.build_root,
+            execution_mode="offload",
+            hidden_size=selected_row.hidden_size,
+            seq_len=selected_row.seq_len,
+        )
+        for logical_operator in mode_operators(
+            "offload", selected_row.workload_variant
+        ):
+            if logical_operator not in selected_row.selected_config:
+                continue
+            try:
+                specs = _offload_operator_artifact_specs(
+                    workload,
+                    logical_operator,
+                    selected_row.selected_config[logical_operator],
+                    workload_variant=selected_row.workload_variant,
+                )
+                match = _locate_artifact(
+                    build_index,
+                    specs=specs,
+                    preferred_scope_dir=preferred_scope_dir,
+                    artifact_kind="offload_mode",
+                )
+                resource_row = _resource_row(match)
+                search_mode = specs[0].search_mode
+                search_name = specs[0].search_name
+            except Exception as exc:
+                resource_row = _resource_row(
+                    ArtifactMatch(
+                        preferred_scope_dir=preferred_scope_dir,
+                        artifact_group_dir=None,
+                        artifact_prj_dir=None,
+                        artifact_input_physical_mlir=None,
+                        artifact_missing=True,
+                        artifact_missing_note="artifact resolution failed",
+                        run_status="failed_exception",
+                        error_message=str(exc),
+                    )
+                )
+                search_mode = ""
+                search_name = ""
+
+            export_rows.append(
+                {
+                    "execution_mode": "offload",
+                    "study_case_id": selected_row.study_case_id,
+                    "study_case_label": selected_row.study_case_label,
+                    "workload_variant": selected_row.workload_variant,
+                    "family_id": selected_row.study_case_id,
+                    "seq_len": selected_row.seq_len,
+                    "hidden_size": selected_row.hidden_size,
+                    "intermediate_size": selected_row.intermediate_size,
+                    "num_attention_heads": selected_row.num_attention_heads,
+                    "attention_head_size": selected_row.attention_head_size,
+                    "logical_operator": logical_operator,
+                    "selected_candidate_id": selected_row.selected_candidate_ids.get(
+                        logical_operator, ""
+                    ),
+                    "operator_config_json": json.dumps(
+                        selected_row.selected_config[logical_operator],
+                        sort_keys=True,
+                    ),
+                    "artifact_search_mode": search_mode,
+                    "artifact_search_name": search_name,
+                    **resource_row,
+                }
+            )
+    return export_rows
+
+
 def _write_csv(
     path: Path,
     fieldnames: Iterable[str],
@@ -1375,7 +1507,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scope",
-        choices=("all", "dataflow_blocks", "hybrid_ops", "runlist_ops"),
+        choices=("all", "dataflow_blocks", "hybrid_ops", "runlist_ops", "offload_ops"),
         default="all",
     )
     parser.add_argument("--family", choices=("all", *FAMILY_IDS), default="all")
@@ -1468,6 +1600,17 @@ def main(argv: list[str] | None = None) -> int:
         runlist_output = args.output_dir / "runlist_selected_ops.csv"
         _write_csv(runlist_output, RUNLIST_FIELDNAMES, runlist_rows)
         LOGGER.info("Wrote %d runlist rows to %s", len(runlist_rows), runlist_output)
+
+    if args.scope in ("all", "offload_ops"):
+        offload_rows = export_offload_selected_ops(
+            end_to_end_results_input=args.end_to_end_results_input,
+            family_filter=args.family,
+            seq_len_filter=args.seq_len,
+            build_index=build_index,
+        )
+        offload_output = args.output_dir / "offload_selected_ops.csv"
+        _write_csv(offload_output, OFFLOAD_FIELDNAMES, offload_rows)
+        LOGGER.info("Wrote %d offload rows to %s", len(offload_rows), offload_output)
 
     return 0
 

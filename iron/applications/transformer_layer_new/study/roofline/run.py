@@ -49,14 +49,17 @@ NPU_SHIM_TILES = 8
 MODE_LABELS = {
     "hybrid": "Hybrid",
     "runlist": "Runlist",
+    "offload": "GEMM Offload",
 }
 MODE_COLORS = {
     "hybrid": "#1f6f8b",
     "runlist": "#e07a5f",
+    "offload": "#6c9a3b",
 }
 MODE_MARKERS = {
     "hybrid": "o",
     "runlist": "s",
+    "offload": "^",
 }
 FAMILY_LABELS = {
     "tinybert_512": "TinyBERT",
@@ -83,6 +86,16 @@ RUNLIST_OPERATOR_SHORT_LABELS = {
     "gelu": "GELU",
     "down_proj": "DOWN",
     "ln2": "LN2",
+}
+OFFLOAD_OPERATOR_SHORT_LABELS = {
+    "q_proj": "Q",
+    "k_proj": "K",
+    "v_proj": "V",
+    "attn_scores": "AS",
+    "attn_output": "AO",
+    "output_proj": "O",
+    "up_proj": "UP",
+    "down_proj": "DOWN",
 }
 KERNEL_POINTS_FIELDNAMES = (
     "study_case_id",
@@ -229,6 +242,8 @@ def _family_label(study_case_id: str) -> str:
 def _operator_short_label(execution_mode: str, logical_operator: str) -> str:
     if execution_mode == "hybrid":
         return HYBRID_OPERATOR_SHORT_LABELS.get(logical_operator, logical_operator)
+    if execution_mode == "offload":
+        return OFFLOAD_OPERATOR_SHORT_LABELS.get(logical_operator, logical_operator)
     return RUNLIST_OPERATOR_SHORT_LABELS.get(logical_operator, logical_operator)
 
 
@@ -428,6 +443,16 @@ def _runlist_operator_bytes_and_flops(
     raise ValueError(f"Unsupported runlist logical operator: {logical_operator}")
 
 
+def _offload_operator_bytes_and_flops(
+    *,
+    logical_operator: str,
+    operator_config: dict[str, object],
+) -> tuple[float, float]:
+    if logical_operator in OFFLOAD_OPERATOR_SHORT_LABELS:
+        return _gemm_bytes_and_flops(operator_config)
+    raise ValueError(f"Unsupported offload logical operator: {logical_operator}")
+
+
 def operator_bytes_and_flops(
     *,
     execution_mode: str,
@@ -447,6 +472,11 @@ def operator_bytes_and_flops(
         )
     if execution_mode == "runlist":
         return _runlist_operator_bytes_and_flops(
+            logical_operator=logical_operator,
+            operator_config=operator_config,
+        )
+    if execution_mode == "offload":
+        return _offload_operator_bytes_and_flops(
             logical_operator=logical_operator,
             operator_config=operator_config,
         )
@@ -517,6 +547,16 @@ def _runlist_operator_compute_tiles(
     raise ValueError(f"Unsupported runlist logical operator: {logical_operator}")
 
 
+def _offload_operator_compute_tiles(
+    *,
+    logical_operator: str,
+    operator_config: dict[str, object],
+) -> int:
+    if logical_operator in OFFLOAD_OPERATOR_SHORT_LABELS:
+        return _positive_config_int(operator_config, "num_aie_columns") * 4
+    raise ValueError(f"Unsupported offload logical operator: {logical_operator}")
+
+
 def operator_compute_tiles_used(
     *,
     execution_mode: str,
@@ -530,6 +570,11 @@ def operator_compute_tiles_used(
         )
     if execution_mode == "runlist":
         return _runlist_operator_compute_tiles(
+            logical_operator=logical_operator,
+            operator_config=operator_config,
+        )
+    if execution_mode == "offload":
+        return _offload_operator_compute_tiles(
             logical_operator=logical_operator,
             operator_config=operator_config,
         )
@@ -583,6 +628,16 @@ def _runlist_operator_shim_tiles(
     raise ValueError(f"Unsupported runlist logical operator: {logical_operator}")
 
 
+def _offload_operator_shim_tiles(
+    *,
+    logical_operator: str,
+    operator_config: dict[str, object],
+) -> int:
+    if logical_operator in OFFLOAD_OPERATOR_SHORT_LABELS:
+        return _positive_config_int(operator_config, "num_aie_columns")
+    raise ValueError(f"Unsupported offload logical operator: {logical_operator}")
+
+
 def operator_shim_tiles_used(
     *,
     execution_mode: str,
@@ -596,6 +651,11 @@ def operator_shim_tiles_used(
         )
     if execution_mode == "runlist":
         return _runlist_operator_shim_tiles(
+            logical_operator=logical_operator,
+            operator_config=operator_config,
+        )
+    if execution_mode == "offload":
+        return _offload_operator_shim_tiles(
             logical_operator=logical_operator,
             operator_config=operator_config,
         )
@@ -614,6 +674,22 @@ def _runlist_query_block_count(
     return max(1, seq_len // query_block_size)
 
 
+def _offload_query_block_count(
+    *,
+    seq_len: int,
+    selected_config: dict[str, dict[str, object]],
+) -> int:
+    attn_scores_config = selected_config.get("attn_scores", {})
+    query_block_size = (
+        _optional_int(attn_scores_config.get("query_block_size"))
+        or _optional_int(attn_scores_config.get("M"))
+        or seq_len
+    )
+    if query_block_size <= 0 or seq_len % query_block_size != 0:
+        return 1
+    return max(1, seq_len // query_block_size)
+
+
 def operator_multiplicity(
     *,
     execution_mode: str,
@@ -622,6 +698,22 @@ def operator_multiplicity(
     selected_config: dict[str, dict[str, object]],
 ) -> int:
     if execution_mode == "hybrid":
+        return 1
+    if execution_mode == "offload":
+        if logical_operator in {"attn_scores", "attn_output"}:
+            num_heads = (
+                _optional_int(
+                    selected_config.get(logical_operator, {}).get("num_heads")
+                )
+                or 1
+            )
+            return (
+                _offload_query_block_count(
+                    seq_len=seq_len,
+                    selected_config=selected_config,
+                )
+                * num_heads
+            )
         return 1
 
     if logical_operator == "qkvo_proj":

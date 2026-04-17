@@ -14,7 +14,7 @@ from iron.applications.transformer_layer_new.study.end_to_end.cases import (
     canonical_workload_variant,
 )
 
-REFERENCE_EXECUTION_MODES: tuple[str, ...] = ("hybrid",)
+REFERENCE_EXECUTION_MODES: tuple[str, ...] = ("hybrid", "runlist", "offload")
 _REFERENCE_MODE_ORDER = {
     execution_mode: index
     for index, execution_mode in enumerate(REFERENCE_EXECUTION_MODES)
@@ -185,6 +185,7 @@ def group_reference_rows(
     for row in rows:
         if not _eligible_reference_row(row):
             continue
+        execution_mode = canonical_execution_mode(str(row.get("execution_mode") or ""))
         if not _matches_filters(
             row,
             family_filter=family_filter,
@@ -196,8 +197,10 @@ def group_reference_rows(
         workload_variant = _normalized_workload_variant(row)
         if not study_case_id or seq_len is None or workload_variant is None:
             continue
+        normalized_row = dict(row)
+        normalized_row["execution_mode"] = execution_mode
         grouped_rows.setdefault((study_case_id, workload_variant, seq_len), []).append(
-            dict(row)
+            normalized_row
         )
 
     groups: list[ReferenceGroup] = []

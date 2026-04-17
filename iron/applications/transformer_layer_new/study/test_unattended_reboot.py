@@ -22,6 +22,8 @@ from iron.applications.transformer_layer_new.study.unattended_reboot import (
     _temperature_log_path,
     _wait_for_temperature_gate,
     _start,
+    STATE_VERSION,
+    build_execution_smoke_job_plan,
     build_job_plan,
     build_smoke_test_job_plan,
     create_state,
@@ -114,6 +116,73 @@ def test_build_smoke_test_job_plan_is_small_and_self_verifying():
         "verify-results",
         "--results-root",
         "/tmp/results_unattended_smoke",
+    ]
+
+
+def test_build_execution_smoke_job_plan_covers_three_patterns_and_exports():
+    jobs = build_execution_smoke_job_plan(
+        results_root=Path("/tmp/results_unattended_exec_smoke"),
+        source_results_root=Path("/tmp/results_fixture"),
+    )
+
+    assert jobs[0]["id"] == "execution_smoke_prepare_fixtures"
+    assert jobs[0]["argv"] == [
+        "prepare-execution-fixtures",
+        "--source-root",
+        "/tmp/results_fixture",
+        "--target-root",
+        "/tmp/results_unattended_exec_smoke",
+    ]
+    assert [
+        job["id"]
+        for job in jobs
+        if str(job["id"])
+        in {
+            "execution_smoke_end_to_end_hybrid",
+            "execution_smoke_end_to_end_runlist",
+            "execution_smoke_end_to_end_offload",
+        }
+    ] == [
+        "execution_smoke_end_to_end_hybrid",
+        "execution_smoke_end_to_end_runlist",
+        "execution_smoke_end_to_end_offload",
+    ]
+    assert [
+        job["id"]
+        for job in jobs
+        if str(job["id"])
+        in {
+            "execution_smoke_correctness_hybrid",
+            "execution_smoke_correctness_runlist",
+            "execution_smoke_correctness_offload",
+        }
+    ] == [
+        "execution_smoke_correctness_hybrid",
+        "execution_smoke_correctness_runlist",
+        "execution_smoke_correctness_offload",
+    ]
+    assert [
+        job["id"]
+        for job in jobs
+        if str(job["id"])
+        in {
+            "execution_smoke_latency_variation_hybrid",
+            "execution_smoke_latency_variation_runlist",
+            "execution_smoke_latency_variation_offload",
+        }
+    ] == [
+        "execution_smoke_latency_variation_hybrid",
+        "execution_smoke_latency_variation_runlist",
+        "execution_smoke_latency_variation_offload",
+    ]
+    assert any(job["id"] == "execution_smoke_host_comparison" for job in jobs)
+    assert any(job["id"] == "execution_smoke_resource_usage" for job in jobs)
+    assert any(job["id"] == "execution_smoke_roofline" for job in jobs)
+    assert jobs[-1]["id"] == "execution_smoke_verify_results"
+    assert jobs[-1]["argv"] == [
+        "verify-execution-results",
+        "--results-root",
+        "/tmp/results_unattended_exec_smoke",
     ]
 
 
@@ -742,7 +811,7 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
     )
 
     assert _migrate_state_for_current_runner(state) is True
-    assert state["version"] == 2
+    assert state["version"] == STATE_VERSION
     assert state["normal_ttm_pages_limit"] == 3993375
     assert state["jobs"][state["current_job_index"]]["id"] == baseline_job_id
 
@@ -767,6 +836,47 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
     assert roofline_index < baseline_16384_index < regenerate_index
     assert state["jobs"][tinybert_16384_index]["status"] == "passed"
     assert state["jobs"][tinybert_16384_index]["attempts"] == 3
+
+
+def test_migrate_state_for_current_runner_refreshes_stale_execution_smoke_job_spec(
+    monkeypatch, tmp_path
+):
+    results_root = tmp_path / "results"
+    source_results_root = tmp_path / "source_results"
+    jobs = build_execution_smoke_job_plan(
+        results_root=results_root,
+        source_results_root=source_results_root,
+    )
+    state = create_state(
+        run_id="execution_smoke_test",
+        repo=tmp_path / "repo",
+        results_root=results_root,
+        run_user="runner",
+        host_comparison_16384_ttm_gb=26,
+        reboot_command=["reboot"],
+        jobs=jobs,
+        plan_kind="execution_smoke",
+        source_results_root=source_results_root,
+    )
+    roofline_job = next(
+        job for job in state["jobs"] if job["id"] == "execution_smoke_roofline"
+    )
+    roofline_job["argv"] = ["--family", "baseline_768", "--seq-len", "512"]
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot._ttm_config_exists",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot._current_ttm_pages_limit",
+        lambda: 3993375,
+    )
+
+    assert _migrate_state_for_current_runner(state) is True
+    migrated_roofline_job = next(
+        job for job in state["jobs"] if job["id"] == "execution_smoke_roofline"
+    )
+    assert "--seq-len" not in migrated_roofline_job["argv"]
 
 
 def test_start_rejects_existing_ttm_config(monkeypatch, tmp_path):

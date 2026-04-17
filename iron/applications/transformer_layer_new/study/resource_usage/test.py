@@ -433,6 +433,79 @@ def test_export_hybrid_rows_prefer_mode_scope_artifact(
     assert rows[0]["artifact_group_dir"] == str(mode_scope)
 
 
+def test_export_offload_rows_prefer_mode_scope_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    results_path = tmp_path / "results_all_power.csv"
+    _write_end_to_end_results(
+        results_path,
+        [
+            {
+                "backend": "npu",
+                "run_status": "passed",
+                "execution_mode": "offload",
+                "study_case_id": "baseline_768",
+                "study_case_label": "768 / 3072 / 12",
+                "workload_variant": "encoder_bert",
+                "seq_len": "64",
+                "hidden_size": "768",
+                "intermediate_size": "3072",
+                "num_attention_heads": "12",
+                "attention_head_size": "64",
+                "warmup_runs": "1",
+                "runs_per_sample": "10",
+                "selected_candidate_ids_json": json.dumps({"q_proj": "q_proj_default"}),
+                "selected_config_json": json.dumps(
+                    {
+                        "q_proj": {
+                            "M": 64,
+                            "K": 768,
+                            "N": 768,
+                            "tile_m": 64,
+                            "tile_k": 64,
+                            "tile_n": 64,
+                            "num_aie_columns": 8,
+                            "use_static_weight": True,
+                            "prio_accuracy": False,
+                            "emulate_bf16_mmul_with_bfp16": True,
+                        }
+                    }
+                ),
+            }
+        ],
+    )
+
+    build_root = tmp_path / "build"
+    mode_scope = build_root / "mode_offload_768_64"
+    _write_input_physical(
+        mode_scope / "encoder_offload_q_proj_exact.mlir.prj",
+        _sample_physical_mlir(),
+    )
+    monkeypatch.setattr(
+        resource_usage_run,
+        "_offload_operator_artifact_specs",
+        lambda workload, logical_operator, operator_config, **kwargs: (
+            resource_usage_run.ArtifactSpec(
+                "exact", "encoder_offload_q_proj_exact.mlir.prj"
+            ),
+        ),
+    )
+
+    rows = resource_usage_run.export_offload_selected_ops(
+        end_to_end_results_input=results_path,
+        family_filter="all",
+        seq_len_filter="all",
+        build_index=resource_usage_run.build_artifact_index(build_root),
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["execution_mode"] == "offload"
+    assert rows[0]["artifact_missing"] is False
+    assert rows[0]["logical_operator"] == "q_proj"
+    assert rows[0]["artifact_group_dir"] == str(mode_scope)
+
+
 def test_runlist_blocked_attention_specs_use_selected_counterpart_config(
     monkeypatch,
 ) -> None:

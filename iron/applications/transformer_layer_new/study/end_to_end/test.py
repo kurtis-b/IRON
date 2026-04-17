@@ -194,9 +194,9 @@ def test_updated_row_with_power_measurement_copies_raw_and_filtered_fields():
     assert float(updated["effective_gflops_per_sec_per_watt"]) == 105.26315789473684
 
 
-def test_candidate_table_covers_only_hybrid_and_runlist():
+def test_candidate_table_covers_all_execution_modes():
     payloads = load_default_candidate_payloads()
-    assert set(payloads) == {"hybrid", "runlist"}
+    assert set(payloads) == set(EXECUTION_MODES)
 
 
 def test_reset_pattern_run_buffers_respects_operator_opt_out():
@@ -1587,7 +1587,7 @@ def test_staging_ablation_filters_sequence_lengths_to_256_through_8192(tmp_path)
     assert [row["seq_len"] for row in rows] == [int(allowed_seq_len)]
 
 
-def test_fairness_rows_report_two_modes_and_new_schedule(tmp_path):
+def test_fairness_rows_report_all_modes_and_new_schedule(tmp_path):
     results_input = tmp_path / "results.csv"
     _write_csv(
         results_input,
@@ -1599,7 +1599,7 @@ def test_fairness_rows_report_two_modes_and_new_schedule(tmp_path):
 
     rows = build_fairness_rows(results_input)
 
-    assert {row["execution_mode"] for row in rows} == {"hybrid", "runlist"}
+    assert {row["execution_mode"] for row in rows} == set(EXECUTION_MODES)
     assert {row["workload_variant"] for row in rows} == {
         "encoder_bert",
         "decoder_gpt2",
@@ -1707,7 +1707,7 @@ def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
                 "workload_variant": case.workload_variant,
                 "backend": "npu",
                 "execution_mode": execution_mode,
-                "pattern_label": "Hybrid Runlist+Dataflow",
+                "pattern_label": "Hybrid",
                 "seq_len": str(case.seq_len),
                 "hidden_size": str(case.hidden_size),
                 "intermediate_size": str(case.intermediate_size),

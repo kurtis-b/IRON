@@ -11,12 +11,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, cast
 
-ExecutionMode = Literal["hybrid", "runlist"]
+ExecutionMode = Literal["hybrid", "runlist", "offload"]
 WorkloadVariant = Literal["encoder_bert", "decoder_gpt2"]
 
 EXECUTION_MODES: tuple[ExecutionMode, ...] = (
     "hybrid",
     "runlist",
+    "offload",
 )
 WORKLOAD_VARIANTS: tuple[WorkloadVariant, ...] = (
     "encoder_bert",
@@ -135,6 +136,28 @@ MODE_OPERATORS: dict[ExecutionMode, dict[WorkloadVariant, tuple[str, ...]]] = {
             "ln2",
             "up_proj",
             "gelu",
+            "down_proj",
+        ),
+    },
+    "offload": {
+        "encoder_bert": (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "attn_scores",
+            "attn_output",
+            "output_proj",
+            "up_proj",
+            "down_proj",
+        ),
+        "decoder_gpt2": (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "attn_scores",
+            "attn_output",
+            "output_proj",
+            "up_proj",
             "down_proj",
         ),
     },

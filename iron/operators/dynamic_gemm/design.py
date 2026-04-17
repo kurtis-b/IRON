@@ -983,20 +983,24 @@ def my_matmul(
         for phase in transfer_plan.phases:
             if not phase.has_work:
                 continue
-            rt.inline_ops(set_rtps(phase.worker_tile_counts), rtps)
-            for row in range(n_aie_rows):
-                for col in range(n_aie_cols):
-                    rt.set_barrier(worker_barriers[row][col], 1)
+            group_worker_counts = tuple(
+                tuple(1 if count > 0 else 0 for count in row_counts)
+                for row_counts in phase.worker_tile_counts
+            )
             for group_id in _phase_group_order(phase.tasks):
+                rt.inline_ops(set_rtps(group_worker_counts), rtps)
+                for row in range(n_aie_rows):
+                    for col in range(n_aie_cols):
+                        rt.set_barrier(worker_barriers[row][col], 1)
                 tg = rt.task_group()
                 for task in phase.tasks:
                     if task.group_id != group_id:
                         continue
                     _emit_task(task, tg)
                 rt.finish_task_group(tg)
-            for row in range(n_aie_rows):
-                for col in range(n_aie_cols):
-                    rt.set_barrier(worker_barriers[row][col], 0)
+                for row in range(n_aie_rows):
+                    for col in range(n_aie_cols):
+                        rt.set_barrier(worker_barriers[row][col], 0)
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 

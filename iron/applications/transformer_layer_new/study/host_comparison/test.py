@@ -82,9 +82,15 @@ def _reference_row(
     }
 
 
-def test_group_reference_rows_keeps_only_passing_hybrid_npu_rows():
+def test_group_reference_rows_keeps_only_passing_reference_npu_rows():
     rows = [
         _reference_row(),
+        _reference_row(
+            execution_mode="offload",
+            avg_latency_ms="6.0",
+            effective_gflops_per_sec="6400.0",
+            effective_gflops_per_sec_per_watt="533.3",
+        ),
         _reference_row(backend="gpu"),
         _reference_row(run_status="failed_validation", seq_len="128"),
         _reference_row(execution_mode="runlist"),
@@ -191,12 +197,24 @@ def test_configure_cpu_runtime_for_max_physical_cores(monkeypatch):
     assert recorded["set_num_threads"] == 12
 
 
-def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
+def test_build_rows_for_group_aggregates_igpu_and_npu_reference_modes(monkeypatch):
     group = group_reference_rows(
         [
             _reference_row(
                 effective_gflops_per_sec="100.0",
                 effective_gflops_per_sec_per_watt="10.0",
+            ),
+            _reference_row(
+                execution_mode="runlist",
+                avg_latency_ms="7.0",
+                effective_gflops_per_sec="90.0",
+                effective_gflops_per_sec_per_watt="9.0",
+            ),
+            _reference_row(
+                execution_mode="offload",
+                avg_latency_ms="6.0",
+                effective_gflops_per_sec="120.0",
+                effective_gflops_per_sec_per_watt="12.0",
             ),
         ]
     )[0]
@@ -243,7 +261,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
         igpu_power_sample_interval_sec=0.2,
     )
 
-    assert rows == [
+    expected_rows = [
         {
             "workload_variant": "encoder_bert",
             "study_case_id": "tinybert_512",
@@ -252,6 +270,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": 800.0,
             "igpu_rocm_smi": None,
             "hybrid": 100.0,
+            "runlist": 90.0,
         },
         {
             "workload_variant": "encoder_bert",
@@ -261,6 +280,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": 4.0,
             "igpu_rocm_smi": None,
             "hybrid": 5.0,
+            "runlist": 7.0,
         },
         {
             "workload_variant": "encoder_bert",
@@ -270,6 +290,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": 3.5,
             "igpu_rocm_smi": None,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -279,6 +300,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": 4.5,
             "igpu_rocm_smi": None,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -288,6 +310,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": 100,
             "igpu_rocm_smi": None,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -297,6 +320,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 80.0,
             "hybrid": 10.0,
+            "runlist": 9.0,
         },
         {
             "workload_variant": "encoder_bert",
@@ -306,6 +330,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 10.0,
             "hybrid": 12.0,
+            "runlist": 12.0,
         },
         {
             "workload_variant": "encoder_bert",
@@ -315,6 +340,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 9.0,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -324,6 +350,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 12.0,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -333,6 +360,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 7,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -342,6 +370,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 11.0,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -351,6 +380,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 9.0,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -360,6 +390,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 20.0,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -369,6 +400,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 10,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -378,6 +410,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 0.8,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -387,6 +420,7 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 3.1,
             "hybrid": None,
+            "runlist": None,
         },
         {
             "workload_variant": "encoder_bert",
@@ -396,8 +430,28 @@ def test_build_rows_for_group_aggregates_igpu_and_hybrid(monkeypatch):
             "igpu": None,
             "igpu_rocm_smi": 1,
             "hybrid": None,
+            "runlist": None,
         },
     ]
+    mode_values = {
+        "runlist": {
+            "effective_gflops_per_sec": 90.0,
+            "avg_latency_ms": 7.0,
+            "effective_gflops_per_sec_per_watt": 9.0,
+            "avg_power_w": 12.0,
+        },
+        "offload": {
+            "effective_gflops_per_sec": 120.0,
+            "avg_latency_ms": 6.0,
+            "effective_gflops_per_sec_per_watt": 12.0,
+            "avg_power_w": 12.0,
+        },
+    }
+    for row in expected_rows:
+        row["runlist"] = mode_values["runlist"].get(str(row["metric"]))
+        row["offload"] = mode_values["offload"].get(str(row["metric"]))
+
+    assert rows == expected_rows
 
 
 def test_build_rows_for_group_blanks_missing_igpu_backend(monkeypatch):
@@ -438,7 +492,23 @@ def test_build_rows_for_group_blanks_missing_igpu_backend(monkeypatch):
 
 
 def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
-    group = group_reference_rows([_reference_row()])[0]
+    group = group_reference_rows(
+        [
+            _reference_row(),
+            _reference_row(
+                execution_mode="runlist",
+                avg_latency_ms="7.0",
+                effective_gflops_per_sec="3200.0",
+                effective_gflops_per_sec_per_watt="266.7",
+            ),
+            _reference_row(
+                execution_mode="offload",
+                avg_latency_ms="6.0",
+                effective_gflops_per_sec="6400.0",
+                effective_gflops_per_sec_per_watt="533.3",
+            ),
+        ]
+    )[0]
 
     def fail_benchmark(*args, **kwargs):
         raise AssertionError("benchmark_host_group should not be called")
@@ -447,6 +517,205 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
         "iron.applications.transformer_layer_new.study.host_comparison.run.benchmark_host_group",
         fail_benchmark,
     )
+
+    existing_rows = {
+        ("encoder_bert", "tinybert_512", 64, "effective_gflops_per_sec"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "effective_gflops_per_sec",
+            "igpu": "800.0",
+            "igpu_rocm_smi": "",
+            "hybrid": "12800.0",
+            "runlist": "3200.0",
+        },
+        (
+            "encoder_bert",
+            "tinybert_512",
+            64,
+            "effective_gflops_per_sec_per_watt",
+        ): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "effective_gflops_per_sec_per_watt",
+            "igpu": "",
+            "igpu_rocm_smi": "80.0",
+            "hybrid": "1066.7",
+            "runlist": "266.7",
+        },
+        ("encoder_bert", "tinybert_512", 64, "avg_latency_ms"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "avg_latency_ms",
+            "igpu": "4.0",
+            "igpu_rocm_smi": "",
+            "hybrid": "5.0",
+            "runlist": "7.0",
+        },
+        ("encoder_bert", "tinybert_512", 64, "min_latency_ms"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "min_latency_ms",
+            "igpu": "3.5",
+            "igpu_rocm_smi": "",
+            "hybrid": "",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "max_latency_ms"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "max_latency_ms",
+            "igpu": "4.5",
+            "igpu_rocm_smi": "",
+            "hybrid": "",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "latency_sample_count"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "latency_sample_count",
+            "igpu": "100",
+            "igpu_rocm_smi": "",
+            "hybrid": "",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "avg_power_w"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "avg_power_w",
+            "igpu": "",
+            "igpu_rocm_smi": "10.0",
+            "hybrid": "12.0",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "min_power_w"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "min_power_w",
+            "igpu": "",
+            "igpu_rocm_smi": "9.0",
+            "hybrid": "",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "max_power_w"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "max_power_w",
+            "igpu": "",
+            "igpu_rocm_smi": "12.0",
+            "hybrid": "",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "power_sample_count"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "power_sample_count",
+            "igpu": "",
+            "igpu_rocm_smi": "7",
+            "hybrid": "",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "raw_avg_power_w"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "raw_avg_power_w",
+            "igpu": "",
+            "igpu_rocm_smi": "11.0",
+            "hybrid": "",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "raw_min_power_w"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "raw_min_power_w",
+            "igpu": "",
+            "igpu_rocm_smi": "9.0",
+            "hybrid": "",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "raw_max_power_w"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "raw_max_power_w",
+            "igpu": "",
+            "igpu_rocm_smi": "20.0",
+            "hybrid": "",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "raw_power_sample_count"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "raw_power_sample_count",
+            "igpu": "",
+            "igpu_rocm_smi": "10",
+            "hybrid": "",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "power_std_w"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "power_std_w",
+            "igpu": "",
+            "igpu_rocm_smi": "0.8",
+            "hybrid": "",
+            "runlist": "",
+        },
+        ("encoder_bert", "tinybert_512", 64, "raw_power_std_w"): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "raw_power_std_w",
+            "igpu": "",
+            "igpu_rocm_smi": "3.1",
+            "hybrid": "",
+            "runlist": "",
+        },
+        (
+            "encoder_bert",
+            "tinybert_512",
+            64,
+            "power_outlier_sample_count",
+        ): {
+            "workload_variant": "encoder_bert",
+            "study_case_id": "tinybert_512",
+            "seq_len": "64",
+            "metric": "power_outlier_sample_count",
+            "igpu": "",
+            "igpu_rocm_smi": "1",
+            "hybrid": "",
+            "runlist": "",
+        },
+    }
+    mode_values = {
+        "runlist": {
+            "effective_gflops_per_sec": "3200.0",
+            "effective_gflops_per_sec_per_watt": "266.7",
+            "avg_latency_ms": "7.0",
+        },
+        "offload": {
+            "effective_gflops_per_sec": "6400.0",
+            "effective_gflops_per_sec_per_watt": "533.3",
+            "avg_latency_ms": "6.0",
+        },
+    }
+    for existing_row in existing_rows.values():
+        existing_row["offload"] = mode_values["offload"].get(
+            str(existing_row["metric"]), ""
+        )
 
     rows = build_rows_for_group(
         group,
@@ -457,174 +726,9 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
         igpu_device_name="cuda:0",
         igpu_power_backend="rocm-smi",
         igpu_power_sample_interval_sec=0.2,
-        existing_rows={
-            ("encoder_bert", "tinybert_512", 64, "effective_gflops_per_sec"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "effective_gflops_per_sec",
-                "igpu": "800.0",
-                "igpu_rocm_smi": "",
-                "hybrid": "12800.0",
-            },
-            (
-                "encoder_bert",
-                "tinybert_512",
-                64,
-                "effective_gflops_per_sec_per_watt",
-            ): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "effective_gflops_per_sec_per_watt",
-                "igpu": "",
-                "igpu_rocm_smi": "80.0",
-                "hybrid": "1066.7",
-            },
-            ("encoder_bert", "tinybert_512", 64, "avg_latency_ms"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "avg_latency_ms",
-                "igpu": "4.0",
-                "igpu_rocm_smi": "",
-                "hybrid": "5.0",
-            },
-            ("encoder_bert", "tinybert_512", 64, "min_latency_ms"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "min_latency_ms",
-                "igpu": "3.5",
-                "igpu_rocm_smi": "",
-                "hybrid": "",
-            },
-            ("encoder_bert", "tinybert_512", 64, "max_latency_ms"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "max_latency_ms",
-                "igpu": "4.5",
-                "igpu_rocm_smi": "",
-                "hybrid": "",
-            },
-            ("encoder_bert", "tinybert_512", 64, "latency_sample_count"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "latency_sample_count",
-                "igpu": "100",
-                "igpu_rocm_smi": "",
-                "hybrid": "",
-            },
-            ("encoder_bert", "tinybert_512", 64, "avg_power_w"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "avg_power_w",
-                "igpu": "",
-                "igpu_rocm_smi": "10.0",
-                "hybrid": "12.0",
-            },
-            ("encoder_bert", "tinybert_512", 64, "min_power_w"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "min_power_w",
-                "igpu": "",
-                "igpu_rocm_smi": "9.0",
-                "hybrid": "",
-            },
-            ("encoder_bert", "tinybert_512", 64, "max_power_w"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "max_power_w",
-                "igpu": "",
-                "igpu_rocm_smi": "12.0",
-                "hybrid": "",
-            },
-            ("encoder_bert", "tinybert_512", 64, "power_sample_count"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "power_sample_count",
-                "igpu": "",
-                "igpu_rocm_smi": "7",
-                "hybrid": "",
-            },
-            ("encoder_bert", "tinybert_512", 64, "raw_avg_power_w"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "raw_avg_power_w",
-                "igpu": "",
-                "igpu_rocm_smi": "11.0",
-                "hybrid": "",
-            },
-            ("encoder_bert", "tinybert_512", 64, "raw_min_power_w"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "raw_min_power_w",
-                "igpu": "",
-                "igpu_rocm_smi": "9.0",
-                "hybrid": "",
-            },
-            ("encoder_bert", "tinybert_512", 64, "raw_max_power_w"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "raw_max_power_w",
-                "igpu": "",
-                "igpu_rocm_smi": "20.0",
-                "hybrid": "",
-            },
-            ("encoder_bert", "tinybert_512", 64, "raw_power_sample_count"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "raw_power_sample_count",
-                "igpu": "",
-                "igpu_rocm_smi": "10",
-                "hybrid": "",
-            },
-            ("encoder_bert", "tinybert_512", 64, "power_std_w"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "power_std_w",
-                "igpu": "",
-                "igpu_rocm_smi": "0.8",
-                "hybrid": "",
-            },
-            ("encoder_bert", "tinybert_512", 64, "raw_power_std_w"): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "raw_power_std_w",
-                "igpu": "",
-                "igpu_rocm_smi": "3.1",
-                "hybrid": "",
-            },
-            (
-                "encoder_bert",
-                "tinybert_512",
-                64,
-                "power_outlier_sample_count",
-            ): {
-                "workload_variant": "encoder_bert",
-                "study_case_id": "tinybert_512",
-                "seq_len": "64",
-                "metric": "power_outlier_sample_count",
-                "igpu": "",
-                "igpu_rocm_smi": "1",
-                "hybrid": "",
-            },
-        },
+        existing_rows=existing_rows,
     )
-
-    assert rows == [
+    expected_rows = [
         {
             "workload_variant": "encoder_bert",
             "study_case_id": "tinybert_512",
@@ -633,6 +737,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "800.0",
             "igpu_rocm_smi": "",
             "hybrid": "12800.0",
+            "runlist": "3200.0",
         },
         {
             "workload_variant": "encoder_bert",
@@ -642,6 +747,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "80.0",
             "hybrid": "1066.7",
+            "runlist": "266.7",
         },
         {
             "workload_variant": "encoder_bert",
@@ -651,6 +757,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "4.0",
             "igpu_rocm_smi": "",
             "hybrid": "5.0",
+            "runlist": "7.0",
         },
         {
             "workload_variant": "encoder_bert",
@@ -660,6 +767,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "3.5",
             "igpu_rocm_smi": "",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -669,6 +777,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "4.5",
             "igpu_rocm_smi": "",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -678,6 +787,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "100",
             "igpu_rocm_smi": "",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -687,6 +797,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "10.0",
             "hybrid": "12.0",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -696,6 +807,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "9.0",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -705,6 +817,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "12.0",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -714,6 +827,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "7",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -723,6 +837,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "11.0",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -732,6 +847,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "9.0",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -741,6 +857,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "20.0",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -750,6 +867,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "10",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -759,6 +877,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "0.8",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -768,6 +887,7 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "3.1",
             "hybrid": "",
+            "runlist": "",
         },
         {
             "workload_variant": "encoder_bert",
@@ -777,8 +897,18 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "igpu": "",
             "igpu_rocm_smi": "1",
             "hybrid": "",
+            "runlist": "",
         },
     ]
+    for expected_row in expected_rows:
+        expected_row["runlist"] = mode_values["runlist"].get(
+            str(expected_row["metric"]), ""
+        )
+        expected_row["offload"] = mode_values["offload"].get(
+            str(expected_row["metric"]), ""
+        )
+
+    assert rows == expected_rows
 
 
 def test_build_fairness_rows_emits_igpu_metadata():
@@ -789,7 +919,9 @@ def test_build_fairness_rows_emits_igpu_metadata():
 
     assert [row["backend"] for row in rows] == ["igpu"]
     assert all(
-        json.loads(row["reference_execution_modes_json"]) == ["hybrid"] for row in rows
+        json.loads(row["reference_execution_modes_json"])
+        == ["hybrid", "runlist", "offload"]
+        for row in rows
     )
     schedule = json.loads(rows[0]["iteration_schedule_json"])
     assert schedule["8192-16384"]["runs_per_sample"] == 5
@@ -814,6 +946,8 @@ def test_normalized_existing_row_upgrades_legacy_schema():
         "igpu": "800.0",
         "igpu_rocm_smi": "",
         "hybrid": "12800.0",
+        "runlist": "",
+        "offload": "",
     }
 
 

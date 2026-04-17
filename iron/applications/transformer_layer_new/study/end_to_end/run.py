@@ -36,7 +36,13 @@ csv.field_size_limit(sys.maxsize)
 
 
 def _pattern_label(execution_mode: str) -> str:
-    return "Hybrid Runlist+Dataflow" if execution_mode == "hybrid" else "Runlist"
+    if execution_mode == "hybrid":
+        return "Hybrid"
+    if execution_mode == "runlist":
+        return "Runlist"
+    if execution_mode == "offload":
+        return "GEMM Offload"
+    return execution_mode
 
 
 TUNING_CSV_FIELDNAMES = (

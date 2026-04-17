@@ -70,9 +70,13 @@ from iron.operators.transpose.reference import (
     generate_golden_reference as generate_transpose_reference,
 )
 
-from iron.applications.transformer_layer_new.pattern.dataflow.op import (
+from iron.applications.transformer_layer_new.pattern.hybrid.op import (
     AIETransformerHybrid,
     resolve_hybrid_operator_config,
+)
+from iron.applications.transformer_layer_new.pattern.offload.op import (
+    AIETransformerOffload,
+    resolve_offload_operator_config,
 )
 from iron.applications.transformer_layer_new.pattern.reference import (
     generate_golden_reference,
@@ -241,6 +245,15 @@ def resolve_mode_operator_config(
             workload_variant=workload.workload_variant,
             operator_config=operator_config,
         )
+    if execution_mode == "offload":
+        return resolve_offload_operator_config(
+            workload.seq_len,
+            workload.hidden_size,
+            workload.intermediate_size,
+            workload.num_attention_heads,
+            workload_variant=workload.workload_variant,
+            operator_config=operator_config,
+        )
     raise ValueError(f"Unsupported execution mode: {execution_mode}")
 
 
@@ -268,6 +281,8 @@ def _build_operator(
         operator = AIETransformerHybrid(**common_kwargs)
     elif execution_mode == "runlist":
         operator = AIETransformerRunlist(**common_kwargs)
+    elif execution_mode == "offload":
+        operator = AIETransformerOffload(**common_kwargs)
     else:
         raise ValueError(f"Unsupported execution mode: {execution_mode}")
 
@@ -303,6 +318,21 @@ def _metadata_for_operator(
     *,
     compile_setup_time_ms: float | None,
 ) -> dict[str, object]:
+    if execution_mode == "offload":
+        query_block_count = int(getattr(operator, "query_block_count", 1))
+        dispatch_count = 6 + (2 * workload.num_attention_heads * query_block_count)
+        return {
+            "compile_setup_time_ms": compile_setup_time_ms,
+            "npu_dispatch_count": dispatch_count,
+            "npu_unique_instruction_binary_count": _unique_suffix_artifact_count(
+                operator, "_insts"
+            ),
+            "npu_unique_xclbin_count": _unique_suffix_artifact_count(
+                operator, "_xclbin"
+            ),
+            "process_model": "in_process",
+        }
+
     if execution_mode == "runlist" and getattr(
         operator, "use_long_seq_fallback", False
     ):
@@ -1592,6 +1622,42 @@ def _benchmark_operator_candidate_in_process(
         ("runlist", "ln2"): lambda *args, **kwargs: _benchmark_layer_norm(
             *args, operator_name="ln2", **kwargs
         ),
+        ("offload", "q_proj"): lambda *args, **kwargs: _benchmark_gemm_from_offload(
+            *args, operator_name="q_proj", **kwargs
+        ),
+        ("offload", "k_proj"): lambda *args, **kwargs: _benchmark_gemm_from_offload(
+            *args, operator_name="k_proj", **kwargs
+        ),
+        ("offload", "v_proj"): lambda *args, **kwargs: _benchmark_gemm_from_offload(
+            *args, operator_name="v_proj", **kwargs
+        ),
+        (
+            "offload",
+            "attn_scores",
+        ): lambda *args, **kwargs: _benchmark_gemm_from_offload(
+            *args, operator_name="attn_scores", **kwargs
+        ),
+        (
+            "offload",
+            "attn_output",
+        ): lambda *args, **kwargs: _benchmark_gemm_from_offload(
+            *args, operator_name="attn_output", **kwargs
+        ),
+        (
+            "offload",
+            "output_proj",
+        ): lambda *args, **kwargs: _benchmark_gemm_from_offload(
+            *args, operator_name="output_proj", **kwargs
+        ),
+        ("offload", "up_proj"): lambda *args, **kwargs: _benchmark_gemm_from_offload(
+            *args, operator_name="up_proj", **kwargs
+        ),
+        (
+            "offload",
+            "down_proj",
+        ): lambda *args, **kwargs: _benchmark_gemm_from_offload(
+            *args, operator_name="down_proj", **kwargs
+        ),
     }
 
     try:
@@ -1836,6 +1902,43 @@ def _benchmark_gemm_from_runlist(
         runs_per_sample=runs_per_sample,
         seed=seed,
         scope_prefix=f"runlist_{operator_name}",
+    )
+
+
+def _benchmark_gemm_from_offload(
+    workload: EndToEndWorkload,
+    candidate_config: dict[str, object],
+    *,
+    operator_name: str,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+) -> dict[str, object]:
+    resolved_kwargs = resolve_offload_operator_config(
+        workload.seq_len,
+        workload.hidden_size,
+        workload.intermediate_size,
+        workload.num_attention_heads,
+        workload_variant=workload.workload_variant,
+        operator_config={operator_name: candidate_config},
+    )[operator_name]
+    kwargs = {
+        key: value
+        for key, value in resolved_kwargs.items()
+        if key
+        not in {
+            "use_static_weight",
+            "query_block_size",
+            "num_heads",
+        }
+    }
+    return _benchmark_gemm(
+        kwargs,
+        warmup_runs=warmup_runs,
+        runs_per_sample=runs_per_sample,
+        seed=seed,
+        use_static_weight=bool(resolved_kwargs.get("use_static_weight", False)),
+        scope_prefix=f"offload_{operator_name}",
     )
 
 
