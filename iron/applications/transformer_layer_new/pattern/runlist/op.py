@@ -375,6 +375,8 @@ class AIETransformerRunlist(AIEOperatorBase):
         self.down_proj_insts = None
         self.reset_buffer_names = ()
         self.enable_benchmark_buffer_reset = False
+        self.device_input_buffer_names = ("input",)
+        self.host_output_buffer_names = ("output",)
 
         AIEOperatorBase.__init__(self, context=context)
 

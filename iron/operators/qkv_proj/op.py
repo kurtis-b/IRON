@@ -177,6 +177,8 @@ class AIEQKVProj(AIEOperatorBase):
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
+        self.device_input_buffer_names = ("A", "B")
+        self.host_output_buffer_names = ("Q", "K", "V")
         static_weight = None
         if self.weight is not None:
             static_weight = torch_to_numpy(self.weight)

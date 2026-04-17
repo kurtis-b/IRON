@@ -979,9 +979,46 @@ def _igpu_effective_gflops_per_watt_for_backend(
         return None
     backend_stats = extra_stats.get(power_backend)
     if not isinstance(backend_stats, dict):
-        return None
+        if power_backend != "rocm-smi":
+            return None
+        return effective_gflops_per_sec_per_watt(
+            effective_gflops,
+            _host_metric_value(benchmark_result, "avg_power_w"),
+        )
     avg_power_w = _optional_float(backend_stats.get("avg_power_w"))
     return effective_gflops_per_sec_per_watt(effective_gflops, avg_power_w)
+
+
+def _repair_missing_igpu_rocm_smi_per_watt_rows(
+    rows: dict[tuple[str, str, int, str], dict[str, object]],
+) -> dict[tuple[str, str, int, str], dict[str, object]]:
+    repaired_rows = dict(rows)
+    for row_key, row in rows.items():
+        workload_variant, study_case_id, seq_len, metric = row_key
+        if metric != "effective_gflops_per_sec_per_watt":
+            continue
+        if _optional_float(row.get("igpu_rocm_smi")) is not None:
+            continue
+        throughput_row = rows.get(
+            (workload_variant, study_case_id, seq_len, "effective_gflops_per_sec")
+        )
+        avg_power_row = rows.get(
+            (workload_variant, study_case_id, seq_len, "avg_power_w")
+        )
+        repaired_value = effective_gflops_per_sec_per_watt(
+            _optional_float(
+                None if throughput_row is None else throughput_row.get("igpu")
+            ),
+            _optional_float(
+                None if avg_power_row is None else avg_power_row.get("igpu_rocm_smi")
+            ),
+        )
+        if repaired_value is None:
+            continue
+        repaired_row = dict(row)
+        repaired_row["igpu_rocm_smi"] = repaired_value
+        repaired_rows[row_key] = repaired_row
+    return repaired_rows
 
 
 def _comparison_row(
@@ -1062,7 +1099,7 @@ def load_existing_rows(
                 if normalized is None:
                     continue
                 rows[_row_key(normalized)] = normalized
-    return rows
+    return _repair_missing_igpu_rocm_smi_per_watt_rows(rows)
 
 
 def _matching_reference_values(
@@ -1653,6 +1690,7 @@ def main(argv: list[str] | None = None) -> int:
                 existing_rows=existing_rows,
             ):
                 row_map[_row_key(row)] = row
+            row_map = _repair_missing_igpu_rocm_smi_per_watt_rows(row_map)
             rows = list(row_map.values())
 
         write_rows(output_path, rows)

@@ -12,10 +12,13 @@ from pathlib import Path
 
 from iron.applications.transformer_layer_new.study.unattended_reboot import (
     _cron_command,
+    _current_npu_power_mode,
+    _discover_default_smoke_source_results_root,
     _job_command,
     _migrate_state_for_current_runner,
     _prepare_state_for_resume,
     _resolve_amd_ttm_path,
+    _results_root_contains_required_files,
     _record_baseline_temperature,
     _resume,
     _run_privileged_action,
@@ -30,6 +33,10 @@ from iron.applications.transformer_layer_new.study.unattended_reboot import (
     run_next_job,
     write_state,
     render_status,
+)
+from iron.applications.transformer_layer_new.study.unattended_smoke_job import (
+    REQUIRED_EXECUTION_FIXTURE_FILES,
+    REQUIRED_RESULTS_FILES,
 )
 
 
@@ -96,6 +103,32 @@ def test_build_job_plan_ends_with_plot_regeneration():
         "--results-root",
         "/tmp/results_unattended",
     ]
+
+
+def test_build_job_plan_places_16384_host_comparison_jobs_at_tail():
+    jobs = build_job_plan(
+        results_root=Path("/tmp/results_unattended"),
+        host_comparison_16384_ttm_gb=26,
+    )
+
+    fairness_index = next(
+        index
+        for index, job in enumerate(jobs)
+        if job["id"] == "host_comparison_fairness"
+    )
+    regenerate_index = next(
+        index for index, job in enumerate(jobs) if job["id"] == "regenerate_plots_all"
+    )
+    roofline_index = next(
+        index for index, job in enumerate(jobs) if job["id"] == "roofline_all"
+    )
+    tinybert_16384_index = next(
+        index
+        for index, job in enumerate(jobs)
+        if job["id"] == "host_comparison_igpu_tinybert_512_16384"
+    )
+
+    assert roofline_index < tinybert_16384_index < fairness_index < regenerate_index
 
 
 def test_build_smoke_test_job_plan_is_small_and_self_verifying():
@@ -184,6 +217,59 @@ def test_build_execution_smoke_job_plan_covers_three_patterns_and_exports():
         "--results-root",
         "/tmp/results_unattended_exec_smoke",
     ]
+
+
+def test_results_root_contains_required_files(tmp_path):
+    results_root = tmp_path / "results"
+    (results_root / "block").mkdir(parents=True)
+    (results_root / "end_to_end").mkdir(parents=True)
+    (results_root / "memory_tile_staging").mkdir(parents=True)
+    (results_root / "host_comparison").mkdir(parents=True)
+    (results_root / "block" / "results.csv").write_text("x\n", encoding="utf-8")
+    (results_root / "end_to_end" / "results_all_power.csv").write_text(
+        "x\n", encoding="utf-8"
+    )
+    (results_root / "end_to_end" / "tuning_all_power.csv").write_text(
+        "x\n", encoding="utf-8"
+    )
+    (results_root / "memory_tile_staging" / "results.csv").write_text(
+        "x\n", encoding="utf-8"
+    )
+    (results_root / "host_comparison" / "results.csv").write_text(
+        "x\n", encoding="utf-8"
+    )
+
+    assert _results_root_contains_required_files(results_root, REQUIRED_RESULTS_FILES)
+    assert not _results_root_contains_required_files(
+        results_root, REQUIRED_EXECUTION_FIXTURE_FILES
+    )
+
+
+def test_discover_default_smoke_source_results_root_prefers_valid_unattended_root(
+    monkeypatch, tmp_path
+):
+    tracked_results = tmp_path / "results"
+    tracked_results.mkdir()
+
+    invalid_unattended = tmp_path / "results_unattended_incomplete"
+    (invalid_unattended / "block").mkdir(parents=True)
+    (invalid_unattended / "block" / "results.csv").write_text("x\n", encoding="utf-8")
+
+    valid_unattended = tmp_path / "results_unattended_valid"
+    for rel_path in REQUIRED_EXECUTION_FIXTURE_FILES:
+        target = valid_unattended.joinpath(*rel_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot.app_root",
+        lambda: tmp_path,
+    )
+
+    assert (
+        _discover_default_smoke_source_results_root(REQUIRED_EXECUTION_FIXTURE_FILES)
+        == valid_unattended
+    )
 
 
 def test_render_status_reports_progress_and_failures():
@@ -421,6 +507,40 @@ def test_clear_ttm_is_noop_when_ttm_config_is_absent(monkeypatch):
     assert invoked == []
 
 
+def test_current_npu_power_mode_parses_xrt_smi_output(monkeypatch):
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot.subprocess.run",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            returncode=0,
+            stdout="Platform\n  Power Mode             : Turbo \n",
+        ),
+    )
+
+    assert _current_npu_power_mode() == "Turbo"
+
+
+def test_set_turbo_is_noop_when_device_already_in_turbo(monkeypatch):
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot._current_npu_power_mode",
+        lambda: "Turbo",
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot._run_subprocess",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("set_turbo should not invoke xrt-smi when already turbo")
+        ),
+    )
+
+    log_handle = io.StringIO()
+    _run_privileged_action(
+        {"action": "set_turbo"},
+        log_handle=log_handle,
+        state={},
+    )
+
+    assert "already in Turbo mode" in log_handle.getvalue()
+
+
 def test_set_ttm_declines_immediate_reboot_prompt(monkeypatch):
     recorded: dict[str, object] = {}
 
@@ -515,6 +635,81 @@ def test_run_next_job_reboots_before_running_when_ttm_change_is_needed(
     assert saved_state["jobs"][0]["started_at"] == ""
     assert recorded["action"] == {"action": "set_ttm_gb", "value": 26}
     assert recorded["reboot"] is True
+
+
+def test_run_next_job_stops_on_repeated_ttm_reboot_boundary(monkeypatch, tmp_path):
+    state_path = tmp_path / "state.json"
+    state = create_state(
+        run_id="test",
+        repo=tmp_path / "repo",
+        results_root=tmp_path / "results",
+        run_user="runner",
+        host_comparison_16384_ttm_gb=26,
+        reboot_command=["reboot"],
+        jobs=[
+            {
+                "id": "job_with_ttm",
+                "description": "job with ttm",
+                "module": "example.module",
+                "argv": [],
+                "privileged_setup": [{"action": "set_ttm_gb", "value": 26}],
+                "max_attempts": 2,
+                "attempts": 0,
+                "status": "pending",
+                "log_path": "",
+                "last_exit_code": None,
+                "last_error": "",
+                "started_at": "",
+                "finished_at": "",
+            }
+        ],
+        normal_ttm_pages_limit=3993373,
+    )
+    state["pending_reboot_job_id"] = "job_with_ttm"
+    state["pending_reboot_actions_json"] = '[{"action": "set_ttm_gb", "value": 26}]'
+    write_state(state_path, state)
+
+    removed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot._ensure_baseline_temperature",
+        lambda state_path, state: (50.0, "sensors:k10temp-pci-00c3"),
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot._migrate_state_for_current_runner",
+        lambda state: False,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot._ttm_action_requires_reboot",
+        lambda action, state: True,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot._run_privileged_action",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "should not rerun privileged action when reboot loop is detected"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot._schedule_reboot",
+        lambda state: (_ for _ in ()).throw(
+            AssertionError(
+                "should not schedule another reboot when reboot loop is detected"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer_new.study.unattended_reboot.remove_crontab_entry",
+        lambda path: removed.setdefault("path", str(path)),
+    )
+
+    assert run_next_job(state_path) == 1
+    saved_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved_state["status"] == "failed"
+    assert saved_state["jobs"][0]["status"] == "failed"
+    assert "avoid a reboot loop" in saved_state["jobs"][0]["last_error"]
+    assert removed["path"] == str(state_path)
 
 
 def test_run_next_job_continues_without_reboot_for_normal_jobs(monkeypatch, tmp_path):
@@ -783,6 +978,7 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
     state["jobs"] = [dict(job) for job in state["jobs"]]
     state["baseline_ttm_pages_limit"] = 6815744
     state.pop("normal_ttm_pages_limit", None)
+    state.pop("plan_layout", None)
 
     baseline_job_id = "host_comparison_igpu_baseline_768_64"
     baseline_index = next(
@@ -820,6 +1016,11 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
         for index, job in enumerate(state["jobs"])
         if job["id"] == "host_comparison_igpu_baseline_768_16384"
     )
+    fairness_index = next(
+        index
+        for index, job in enumerate(state["jobs"])
+        if job["id"] == "host_comparison_fairness"
+    )
     roofline_index = next(
         index for index, job in enumerate(state["jobs"]) if job["id"] == "roofline_all"
     )
@@ -833,7 +1034,7 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
         for index, job in enumerate(state["jobs"])
         if job["id"] == "host_comparison_igpu_tinybert_512_16384"
     )
-    assert roofline_index < baseline_16384_index < regenerate_index
+    assert fairness_index < roofline_index < baseline_16384_index < regenerate_index
     assert state["jobs"][tinybert_16384_index]["status"] == "passed"
     assert state["jobs"][tinybert_16384_index]["attempts"] == 3
 

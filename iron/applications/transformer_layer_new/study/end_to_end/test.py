@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 
 from iron.applications.transformer_layer_new.study.end_to_end import (
+    plot_tps_by_pattern,
     power as power_module,
 )
 from iron.applications.transformer_layer_new.study.end_to_end import modes
@@ -132,6 +133,36 @@ def _result_row(
     }
 
 
+def test_plot_tps_by_pattern_keeps_offload_rows(tmp_path):
+    results_path = tmp_path / "results_all_power.csv"
+    rows = [
+        _result_row("hybrid"),
+        _result_row("runlist"),
+        _result_row("offload"),
+    ]
+    with results_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    df = plot_tps_by_pattern.load_plot_rows(results_path)
+
+    assert list(df["execution_mode"].cat.categories) == [
+        "hybrid",
+        "runlist",
+        "offload",
+    ]
+    assert set(df["execution_mode"].astype(str)) == {"hybrid", "runlist", "offload"}
+
+    fig = plot_tps_by_pattern.render_plot(df, metric="throughput")
+    try:
+        legend_labels = [text.get_text() for text in fig.legends[0].texts]
+    finally:
+        plot_tps_by_pattern.plt.close(fig)
+
+    assert legend_labels == ["Hybrid", "Runlist", "Offload"]
+
+
 def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
     fieldnames = list(rows[0]) if rows else []
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -197,6 +228,80 @@ def test_updated_row_with_power_measurement_copies_raw_and_filtered_fields():
 def test_candidate_table_covers_all_execution_modes():
     payloads = load_default_candidate_payloads()
     assert set(payloads) == set(EXECUTION_MODES)
+
+
+@torch.no_grad()
+def test_hybrid_low_seq_candidates_are_augmented():
+    payloads = load_default_candidate_payloads()
+
+    for seq_len in (64, 128, 256):
+        table = candidate_table_for_case("baseline_768", seq_len, payloads=payloads)
+        hybrid = table["hybrid"]
+        assert any(
+            candidate["candidate_id"] == "qkv_low_emb"
+            for candidate in hybrid["qkv_proj"]
+        )
+        assert any(
+            candidate["candidate_id"] == "mha_low_footprint"
+            for candidate in hybrid["mha_out_proj"]
+        )
+        assert any(
+            candidate["candidate_id"] == "ffn_low_cols4" for candidate in hybrid["ffn"]
+        )
+        assert any(
+            candidate["candidate_id"] == "addnorm_cols4"
+            for candidate in hybrid["add_norm1"]
+        )
+        assert any(
+            candidate["candidate_id"] == "addnorm_cols4"
+            for candidate in hybrid["add_norm2"]
+        )
+
+
+@torch.no_grad()
+def test_runlist_low_seq_candidates_are_augmented():
+    payloads = load_default_candidate_payloads()
+
+    for seq_len in (64, 128, 256):
+        table = candidate_table_for_case("baseline_768", seq_len, payloads=payloads)
+        runlist = table["runlist"]
+        assert any(
+            candidate["candidate_id"] == "qkvo_proj_cols4"
+            for candidate in runlist["qkvo_proj"]
+        )
+        assert any(
+            candidate["candidate_id"] == "scores_low_cols"
+            for candidate in runlist["attn_scores"]
+        )
+        assert any(
+            candidate["candidate_id"] == "output_low_cols"
+            for candidate in runlist["attn_output"]
+        )
+        assert any(
+            candidate["candidate_id"] == "attn_scale_low_footprint"
+            for candidate in runlist["attn_scale"]
+        )
+        assert any(
+            candidate["candidate_id"] == "attn_softmax_low_footprint"
+            for candidate in runlist["attn_softmax"]
+        )
+        assert any(
+            candidate["candidate_id"] == "up_proj_cols4"
+            for candidate in runlist["up_proj"]
+        )
+        assert any(
+            candidate["candidate_id"] == "down_proj_cols4"
+            for candidate in runlist["down_proj"]
+        )
+
+
+@torch.no_grad()
+def test_offload_candidates_remain_singleton_only():
+    payloads = load_default_candidate_payloads()
+
+    for seq_len in (64, 128, 256):
+        table = candidate_table_for_case("baseline_768", seq_len, payloads=payloads)
+        assert all(len(candidates) == 1 for candidates in table["offload"].values())
 
 
 def test_reset_pattern_run_buffers_respects_operator_opt_out():

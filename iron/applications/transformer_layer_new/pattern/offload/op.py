@@ -47,23 +47,93 @@ _WEIGHT_BUFFER_BY_OPERATOR = {
     "down_proj": "ffn_down_weight",
 }
 _OFFLOAD_SHARED_GEMM_DEFAULTS = {
-    "tile_m": 64,
-    "tile_k": 64,
-    "tile_n": 64,
     "num_aie_columns": 8,
     "b_col_maj": False,
     "c_col_maj": False,
     "prio_accuracy": False,
     "emulate_bf16_mmul_with_bfp16": True,
 }
+_OFFLOAD_TILE_MEMORY_TARGET_BYTES = 64 * 1024
+_OFFLOAD_TILE_M_CANDIDATES = (64, 32, 16, 8)
+_OFFLOAD_TILE_KN_CANDIDATES = (256, 192, 160, 128, 96, 80, 64, 48, 32, 24, 16, 8)
 
 
 def _require_supported_num_aie_columns(num_aie_columns: int) -> None:
     if int(num_aie_columns) != int(_OFFLOAD_SHARED_GEMM_DEFAULTS["num_aie_columns"]):
         raise ValueError(
-            "AIETransformerOffload uses a fixed shared GEMM topology of "
-            "tile_m=tile_k=tile_n=64 with num_aie_columns=8"
+            "AIETransformerOffload uses a single shared GEMM topology per "
+            "operator instance with num_aie_columns=8"
         )
+
+
+def _pick_shared_offload_topology(
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_heads: int,
+    *,
+    query_block_size: int,
+) -> dict[str, int]:
+    head_dim = hidden_size // num_heads
+    m_values = (seq_len, query_block_size)
+    k_values = (hidden_size, intermediate_size, seq_len, head_dim)
+    n_values = (hidden_size, intermediate_size, seq_len, head_dim)
+
+    def _supports_row_shape(tile_m: int) -> bool:
+        full_m = 4 * tile_m
+        return all(
+            value % tile_m == 0 and not (value % full_m != 0 and value < full_m)
+            for value in m_values
+        )
+
+    tile_m = next(
+        candidate
+        for candidate in _OFFLOAD_TILE_M_CANDIDATES
+        if _supports_row_shape(candidate)
+    )
+
+    valid_tile_k = [
+        candidate
+        for candidate in _OFFLOAD_TILE_KN_CANDIDATES
+        if all(value % candidate == 0 for value in k_values)
+    ]
+    valid_tile_n = [
+        candidate
+        for candidate in _OFFLOAD_TILE_KN_CANDIDATES
+        if all(value % candidate == 0 for value in n_values)
+    ]
+    if not valid_tile_k or not valid_tile_n:
+        raise ValueError(
+            "Unable to choose a shared offload GEMM tile_k/tile_n that divides "
+            "all logical GEMM dimensions for this workload"
+        )
+
+    best_choice: tuple[int, int] | None = None
+    best_score: tuple[int, int, int] | None = None
+    for tile_k in valid_tile_k:
+        for tile_n in valid_tile_n:
+            tile_bytes = 2 * (tile_m * tile_k + tile_k * tile_n + tile_m * tile_n)
+            if tile_bytes > _OFFLOAD_TILE_MEMORY_TARGET_BYTES:
+                continue
+            score = (
+                tile_bytes,
+                min(tile_k, tile_n),
+                max(tile_k, tile_n),
+            )
+            if best_score is None or score > best_score:
+                best_choice = (tile_k, tile_n)
+                best_score = score
+
+    if best_choice is None:
+        # Fall back to the largest legal pair even if it cannot reach the target.
+        best_choice = (max(valid_tile_k), max(valid_tile_n))
+
+    tile_k, tile_n = best_choice
+    return {
+        "tile_m": int(tile_m),
+        "tile_k": int(tile_k),
+        "tile_n": int(tile_n),
+    }
 
 
 def default_offload_operator_config(
@@ -81,6 +151,13 @@ def default_offload_operator_config(
 
     head_dim = hidden_size // num_heads
     query_block_size = _resolve_query_block_size(seq_len, num_heads)
+    shared_topology = _pick_shared_offload_topology(
+        seq_len,
+        hidden_size,
+        intermediate_size,
+        num_heads,
+        query_block_size=query_block_size,
+    )
 
     def _gemm_config(
         M: int,
@@ -92,6 +169,7 @@ def default_offload_operator_config(
     ) -> dict[str, object]:
         config = {
             **_OFFLOAD_SHARED_GEMM_DEFAULTS,
+            **shared_topology,
             "M": M,
             "K": K,
             "N": N,
@@ -263,6 +341,7 @@ class AIETransformerOffload(AIEOperatorBase):
         self.down_proj_insts = None
         self.reset_buffer_names = ()
         self.enable_benchmark_buffer_reset = False
+        self.host_output_buffer_names = ("output",)
 
         AIEOperatorBase.__init__(self, context=context)
 

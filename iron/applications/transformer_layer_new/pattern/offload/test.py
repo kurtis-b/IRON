@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 from iron.applications.transformer_layer_new.pattern.offload.op import (
     AIETransformerOffload,
+    resolve_offload_operator_config,
 )
 from iron.applications.transformer_layer_new.pattern.offload.reference import (
     generate_golden_reference,
@@ -24,6 +25,35 @@ def _configure_weights(operator, golden_ref):
     operator.attn_output_weight = golden_ref["weights"]["attn_output_weight"]
     operator.ffn_up_weight = golden_ref["weights"]["ffn_up_weight"]
     operator.ffn_down_weight = golden_ref["weights"]["ffn_down_weight"]
+
+
+def test_offload_runtime_sync_metadata():
+    operator = AIETransformerOffload(
+        seq_len=512,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_heads=12,
+    )
+
+    assert operator.host_output_buffer_names == ("output",)
+
+
+def test_offload_short_seq_uses_smaller_shared_tile_m():
+    seq64 = resolve_offload_operator_config(64, 768, 3072, 12)
+    seq128 = resolve_offload_operator_config(128, 768, 3072, 12)
+    seq256 = resolve_offload_operator_config(256, 768, 3072, 12)
+
+    assert {config["tile_m"] for config in seq64.values()} == {16}
+    assert {config["tile_k"] for config in seq64.values()} == {64}
+    assert {config["tile_n"] for config in seq64.values()} == {64}
+
+    assert {config["tile_m"] for config in seq128.values()} == {32}
+    assert {config["tile_k"] for config in seq128.values()} == {64}
+    assert {config["tile_n"] for config in seq128.values()} == {64}
+
+    assert {config["tile_m"] for config in seq256.values()} == {64}
+    assert {config["tile_k"] for config in seq256.values()} == {64}
+    assert {config["tile_n"] for config in seq256.values()} == {64}
 
 
 def test_offload_artifacts_share_one_xclbin(aie_context):

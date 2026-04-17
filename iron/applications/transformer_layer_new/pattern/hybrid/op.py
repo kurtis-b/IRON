@@ -210,6 +210,8 @@ class AIETransformerHybrid(AIEOperatorBase):
         self.add_xclbin = None
         self.add_insts = None
         self.reset_buffer_names = ()
+        self.device_input_buffer_names = ("input",)
+        self.host_output_buffer_names = ("output",)
 
         AIEOperatorBase.__init__(self, context=context)
 

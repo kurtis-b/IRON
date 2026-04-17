@@ -15,6 +15,7 @@ from iron.applications.transformer_layer_new.study.host_comparison.run import (
     build_rows_for_group,
     configure_cpu_runtime_for_max_physical_cores,
     generate_synthetic_reference,
+    load_existing_rows,
     resolve_power_probe_runs,
     resolve_power_sample_interval_sec,
     resolve_power_sampling_policy,
@@ -949,6 +950,29 @@ def test_normalized_existing_row_upgrades_legacy_schema():
         "runlist": "",
         "offload": "",
     }
+
+
+def test_load_existing_rows_repairs_missing_igpu_per_watt_from_existing_rows(tmp_path):
+    csv_path = tmp_path / "results.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "workload_variant,study_case_id,seq_len,metric,igpu,igpu_rocm_smi,hybrid,runlist,offload",
+                "encoder_bert,tinybert_512,64,effective_gflops_per_sec,800.0,,100.0,90.0,120.0",
+                "encoder_bert,tinybert_512,64,effective_gflops_per_sec_per_watt,,,10.0,9.0,12.0",
+                "encoder_bert,tinybert_512,64,avg_power_w,,10.0,12.0,12.0,12.0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rows = load_existing_rows((csv_path,))
+
+    repaired_row = rows[
+        ("encoder_bert", "tinybert_512", 64, "effective_gflops_per_sec_per_watt")
+    ]
+    assert repaired_row["igpu_rocm_smi"] == 80.0
 
 
 def test_decoder_forward_reference_matches_shared_transformer_reference():

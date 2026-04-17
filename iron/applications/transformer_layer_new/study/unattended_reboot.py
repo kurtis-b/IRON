@@ -30,11 +30,15 @@ from .end_to_end.run_staging_ablation import STAGING_ABLATION_SEQUENCE_LENGTHS
 from .memcpy_bandwidth.cases import iter_cases as iter_memcpy_cases
 from .memory_tile_staging.run import STAGING_SEQUENCE_LENGTHS
 from .memory_tile_staging.select import STAGING_BLOCK_KINDS
+from .unattended_smoke_job import (
+    REQUIRED_EXECUTION_FIXTURE_FILES,
+    REQUIRED_RESULTS_FILES,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 STUDY_PACKAGE = "iron.applications.transformer_layer_new.study"
-STATE_VERSION = 3
+STATE_VERSION = 4
 DEFAULT_HOST_COMPARISON_16384_TTM_GB = 26
 CRON_MARKER_PREFIX = "# transformer-layer-unattended:"
 DEFAULT_RETRY_LIMIT = 2
@@ -76,6 +80,43 @@ def repo_root() -> Path:
 
 def app_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def _results_root_contains_required_files(
+    results_root: Path,
+    required_files: tuple[tuple[str, str], ...],
+) -> bool:
+    return all(results_root.joinpath(*parts).exists() for parts in required_files)
+
+
+def _discover_default_smoke_source_results_root(
+    required_files: tuple[tuple[str, str], ...],
+) -> Path:
+    candidates: list[Path] = []
+    tracked_results_root = app_root() / "results"
+    if tracked_results_root.exists():
+        candidates.append(tracked_results_root)
+
+    unattended_roots = sorted(
+        (
+            path
+            for path in app_root().iterdir()
+            if path.is_dir() and path.name.startswith("results_unattended_")
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    candidates.extend(unattended_roots)
+
+    for candidate in candidates:
+        if _results_root_contains_required_files(candidate, required_files):
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not find a results root with the required smoke-test fixtures. "
+        "Pass --source-results-root explicitly or generate a compatible unattended "
+        "results root first."
+    )
 
 
 def default_results_root(run_id: str) -> Path:
@@ -471,6 +512,7 @@ def build_job_plan(
     *,
     results_root: Path,
     host_comparison_16384_ttm_gb: int,
+    plan_layout: str = "high_ttm_tail_v2",
 ) -> list[dict[str, Any]]:
     paths = _output_paths(results_root)
     jobs: list[dict[str, Any]] = []
@@ -715,19 +757,6 @@ def build_job_plan(
                 normal_host_comparison_jobs.append(job)
 
     jobs.extend(normal_host_comparison_jobs)
-    jobs.append(
-        _module_job(
-            job_id="host_comparison_fairness",
-            description="host_comparison fairness_repeatability",
-            module=f"{STUDY_PACKAGE}.host_comparison.run_fairness_repeatability",
-            argv=[
-                "--output",
-                str(paths["host_comparison_fairness"]),
-            ],
-            privileged_setup=[_setup_ttm(None)],
-            max_attempts=1,
-        )
-    )
 
     for case in iter_memcpy_cases(
         size_filter="all",
@@ -758,45 +787,60 @@ def build_job_plan(
             )
         )
 
-    jobs.extend(
-        [
-            _module_job(
-                job_id="resource_usage_all",
-                description="resource_usage all",
-                module=f"{STUDY_PACKAGE}.resource_usage.run",
-                argv=[
-                    "--scope",
-                    "all",
-                    "--block-results-input",
-                    str(paths["block_results"]),
-                    "--end-to-end-results-input",
-                    str(paths["end_to_end_results"]),
-                    "--output-dir",
-                    str(paths["resource_usage_dir"]),
-                ],
-                privileged_setup=[_setup_ttm(None)],
-                max_attempts=1,
-            ),
-            _module_job(
-                job_id="roofline_all",
-                description="roofline all",
-                module=f"{STUDY_PACKAGE}.roofline.run",
-                argv=[
-                    "--end-to-end-results-input",
-                    str(paths["end_to_end_results"]),
-                    "--end-to-end-tuning-input",
-                    str(paths["end_to_end_tuning"]),
-                    "--memcpy-results-input",
-                    str(paths["memcpy_results"]),
-                    "--output-dir",
-                    str(paths["roofline_dir"]),
-                ],
-                privileged_setup=[_setup_ttm(None)],
-                max_attempts=1,
-            ),
-        ]
-    )
-    jobs.extend(high_ttm_host_comparison_jobs)
+    post_host_comparison_jobs = [
+        _module_job(
+            job_id="host_comparison_fairness",
+            description="host_comparison fairness_repeatability",
+            module=f"{STUDY_PACKAGE}.host_comparison.run_fairness_repeatability",
+            argv=[
+                "--output",
+                str(paths["host_comparison_fairness"]),
+            ],
+            privileged_setup=[_setup_ttm(None)],
+            max_attempts=1,
+        ),
+        _module_job(
+            job_id="resource_usage_all",
+            description="resource_usage all",
+            module=f"{STUDY_PACKAGE}.resource_usage.run",
+            argv=[
+                "--scope",
+                "all",
+                "--block-results-input",
+                str(paths["block_results"]),
+                "--end-to-end-results-input",
+                str(paths["end_to_end_results"]),
+                "--output-dir",
+                str(paths["resource_usage_dir"]),
+            ],
+            privileged_setup=[_setup_ttm(None)],
+            max_attempts=1,
+        ),
+        _module_job(
+            job_id="roofline_all",
+            description="roofline all",
+            module=f"{STUDY_PACKAGE}.roofline.run",
+            argv=[
+                "--end-to-end-results-input",
+                str(paths["end_to_end_results"]),
+                "--end-to-end-tuning-input",
+                str(paths["end_to_end_tuning"]),
+                "--memcpy-results-input",
+                str(paths["memcpy_results"]),
+                "--output-dir",
+                str(paths["roofline_dir"]),
+            ],
+            privileged_setup=[_setup_ttm(None)],
+            max_attempts=1,
+        ),
+    ]
+    if plan_layout == "legacy":
+        jobs.extend(post_host_comparison_jobs)
+        jobs.extend(high_ttm_host_comparison_jobs)
+    else:
+        jobs.extend(post_host_comparison_jobs[1:])
+        jobs.extend(high_ttm_host_comparison_jobs)
+        jobs.append(post_host_comparison_jobs[0])
     jobs.append(
         _module_job(
             job_id="regenerate_plots_all",
@@ -1101,6 +1145,7 @@ def create_state(
     amd_ttm_path: str = "",
     normal_ttm_pages_limit: int | None = None,
     plan_kind: str = "full",
+    plan_layout: str = "high_ttm_tail_v2",
     source_results_root: Path | None = None,
 ) -> dict[str, Any]:
     return {
@@ -1112,6 +1157,7 @@ def create_state(
             "" if source_results_root is None else str(source_results_root)
         ),
         "plan_kind": plan_kind,
+        "plan_layout": plan_layout,
         "run_user": run_user,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "status": "pending",
@@ -1125,12 +1171,15 @@ def create_state(
         "temperature_threshold_ratio": DEFAULT_TEMPERATURE_THRESHOLD_RATIO,
         "temperature_poll_interval_seconds": DEFAULT_TEMPERATURE_POLL_INTERVAL_SECONDS,
         "temperature_max_wait_seconds": DEFAULT_TEMPERATURE_MAX_WAIT_SECONDS,
+        "pending_reboot_job_id": "",
+        "pending_reboot_actions_json": "[]",
         "jobs": (
             list(jobs)
             if jobs is not None
             else build_job_plan(
                 results_root=results_root,
                 host_comparison_16384_ttm_gb=host_comparison_16384_ttm_gb,
+                plan_layout=plan_layout,
             )
         ),
     }
@@ -1230,6 +1279,28 @@ def _run_subprocess(
     return process.wait()
 
 
+def _current_npu_power_mode() -> str | None:
+    try:
+        result = subprocess.run(
+            ["xrt-smi", "examine", "-r", "all"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if "Power Mode" not in line:
+            continue
+        _, _, value = line.partition(":")
+        mode = value.strip()
+        if mode:
+            return mode
+    return None
+
+
 def _run_privileged_action(
     action: dict[str, Any], *, log_handle, state: dict[str, Any]
 ) -> None:
@@ -1241,6 +1312,14 @@ def _run_privileged_action(
         prefix = ["sudo", "-n"]
 
     if action_name == "set_turbo":
+        current_power_mode = _current_npu_power_mode()
+        if current_power_mode is not None and current_power_mode.lower() == "turbo":
+            log_handle.write(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                "Skipping xrt-smi configure --pmode turbo because the device is "
+                "already in Turbo mode\n"
+            )
+            return
         argv = [*prefix, "xrt-smi", "configure", "--pmode", "turbo"]
     elif action_name == "clear_ttm":
         if not _ttm_config_exists():
@@ -1386,6 +1465,7 @@ def _job_specs_match(
 
 def _expected_jobs_for_state(state: dict[str, Any]) -> list[dict[str, Any]]:
     plan_kind = str(state.get("plan_kind") or "full")
+    plan_layout = str(state.get("plan_layout") or "")
     results_root = Path(state["results_root"])
     host_comparison_16384_ttm_gb = int(
         state.get(
@@ -1409,9 +1489,12 @@ def _expected_jobs_for_state(state: dict[str, Any]) -> list[dict[str, Any]]:
             results_root=results_root,
             source_results_root=Path(source_results_root),
         )
+    if not plan_layout:
+        plan_layout = "legacy"
     return build_job_plan(
         results_root=results_root,
         host_comparison_16384_ttm_gb=host_comparison_16384_ttm_gb,
+        plan_layout=plan_layout,
     )
 
 
@@ -1468,6 +1551,10 @@ def _schedule_reboot(state: dict[str, Any]) -> None:
     subprocess.run(command, check=True)
 
 
+def _pending_reboot_actions_json(actions: list[dict[str, Any]]) -> str:
+    return json.dumps(actions, sort_keys=True)
+
+
 def run_next_job(state_path: Path) -> int:
     state = load_state(state_path)
     if _migrate_state_for_current_runner(state):
@@ -1505,15 +1592,51 @@ def run_next_job(state_path: Path) -> int:
                 if _is_ttm_action(action) and _ttm_action_requires_reboot(action, state)
             ]
             if pending_ttm_actions:
+                pending_job_id = str(state.get("pending_reboot_job_id") or "")
+                pending_actions_json = str(
+                    state.get("pending_reboot_actions_json") or "[]"
+                )
+                current_actions_json = _pending_reboot_actions_json(pending_ttm_actions)
+                if (
+                    pending_job_id == str(job["id"])
+                    and pending_actions_json == current_actions_json
+                ):
+                    job["status"] = "failed"
+                    job["last_exit_code"] = 1
+                    job["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    job["last_error"] = (
+                        "TTM state still requires the same reboot-triggering action "
+                        "after reboot. Stopping unattended execution to avoid a "
+                        "reboot loop."
+                    )
+                    state["status"] = "failed"
+                    state["pending_reboot_job_id"] = ""
+                    state["pending_reboot_actions_json"] = "[]"
+                    write_state(state_path, state)
+                    remove_crontab_entry(state_path)
+                    handle.write(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"Refusing to schedule another reboot for {job['description']} "
+                        "because the same TTM action is still pending after reboot\n"
+                    )
+                    LOGGER.error(
+                        "Stopping unattended execution to avoid a reboot loop on %s",
+                        job["description"],
+                    )
+                    return 1
                 handle.write(
                     f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Preparing TTM state for "
                     f"{job['description']} before reboot\n"
                 )
                 for action in pending_ttm_actions:
                     _run_privileged_action(action, log_handle=handle, state=state)
+                state["pending_reboot_job_id"] = str(job["id"])
+                state["pending_reboot_actions_json"] = current_actions_json
                 write_state(state_path, state)
                 _schedule_reboot(state)
                 return 0
+            state["pending_reboot_job_id"] = ""
+            state["pending_reboot_actions_json"] = "[]"
 
             job["attempts"] = int(job.get("attempts", 0)) + 1
             job["status"] = "running"
@@ -1888,7 +2011,7 @@ def _smoke_test(args: argparse.Namespace) -> int:
     source_results_root = (
         args.source_results_root.expanduser()
         if args.source_results_root is not None
-        else app_root() / "results"
+        else _discover_default_smoke_source_results_root(REQUIRED_RESULTS_FILES)
     )
     reboot_command = shlex.split(str(args.reboot_command))
     jobs = build_smoke_test_job_plan(
@@ -1947,7 +2070,9 @@ def _execution_smoke_test(args: argparse.Namespace) -> int:
     source_results_root = (
         args.source_results_root.expanduser()
         if args.source_results_root is not None
-        else app_root() / "results"
+        else _discover_default_smoke_source_results_root(
+            REQUIRED_EXECUTION_FIXTURE_FILES
+        )
     )
     reboot_command = shlex.split(str(args.reboot_command))
     jobs = build_execution_smoke_job_plan(

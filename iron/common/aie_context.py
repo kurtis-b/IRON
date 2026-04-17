@@ -69,6 +69,7 @@ class AIEContext:
                 0x10000,
             )
             bo.write(np.frombuffer(buffer_data, dtype=np.uint8), 0)
+            bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             self.static_data_pool[buffer_data] = bo
 
         for op in self.operators:
@@ -94,6 +95,7 @@ class AIEContext:
                         handle.insts_bo,
                         len(handle.insts),
                     )
+                    op._sync_insts_bo_to_device_if_needed(handle.insts_bo)
             else:
                 op.xrt_kernels = {}
 
@@ -185,6 +187,13 @@ class AIEContext:
                     )
                 op.buffer_bos[alias_name] = op.buffer_bos[target_name]
 
+            op._buffer_dirty_to_device = {
+                buffer_name: False
+                for buffer_name in op.buffers
+                if buffer_name not in alias_map
+                and buffer_name not in op.buffer_static_data
+            }
+
             # Setup runlist
             if lazy_kernel_loading or not op.xrt_kernels:
                 op.xrt_runlist = None
@@ -246,6 +255,8 @@ class AIEContext:
             op.buffer_bos = {}
             op.xrt_kernels = {}
             op.xrt_runlist = None
+            op._buffer_dirty_to_device = {}
+            op._insts_bos_synced_to_device = set()
 
         if reset_device:
             # Drop Python references to XRT objects before the host runtime's

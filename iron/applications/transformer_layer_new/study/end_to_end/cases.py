@@ -356,6 +356,227 @@ def _copy_candidate(candidate: CandidateRecord) -> CandidateRecord:
     }
 
 
+def _candidate_config_key(config: dict[str, Any]) -> str:
+    return json.dumps(config, sort_keys=True, separators=(",", ":"))
+
+
+def _append_candidate_if_missing(
+    candidates: list[dict[str, Any]],
+    *,
+    candidate_id: str,
+    config: dict[str, Any],
+) -> None:
+    if any(str(candidate["candidate_id"]) == candidate_id for candidate in candidates):
+        return
+    config_key = _candidate_config_key(config)
+    if any(
+        _candidate_config_key(dict(candidate["config"])) == config_key
+        for candidate in candidates
+    ):
+        return
+    candidates.append({"candidate_id": candidate_id, "config": dict(config)})
+
+
+def _augment_hybrid_candidate_payload(payload: dict[str, Any]) -> None:
+    for family_id, family_payload in payload.items():
+        if str(family_id).startswith("_") or not isinstance(family_payload, dict):
+            continue
+        hidden_size = FAMILY_SPECS[family_id].hidden_size
+        for seq_key in ("64", "128", "256"):
+            seq_payload = family_payload.get(seq_key)
+            if not isinstance(seq_payload, dict):
+                continue
+
+            qkv_candidates = seq_payload.get("qkv_proj")
+            if isinstance(qkv_candidates, list) and qkv_candidates:
+                existing_parallel_emb = sorted(
+                    {
+                        int(candidate["config"].get("parallel_emb", 1))
+                        for candidate in qkv_candidates
+                    }
+                )
+                reduced_parallel_emb = max(1, existing_parallel_emb[0] // 2)
+                qkv_config = dict(qkv_candidates[0]["config"])
+                # Short-sequence qkv needs a genuinely small-footprint fallback,
+                # not just a slightly narrower version of the existing wide
+                # candidate set. Keep the bucket's tile_m family, but shrink the
+                # emb partition all the way down and use the narrow tile_n shape
+                # that is already proven in standalone qkv coverage.
+                qkv_config["tile_k"] = min(int(qkv_config.get("tile_k", 64)), 64)
+                qkv_config["tile_n"] = min(int(qkv_config.get("tile_n", 16)), 16)
+                qkv_config["parallel_emb"] = min(reduced_parallel_emb, 1)
+                _append_candidate_if_missing(
+                    qkv_candidates,
+                    candidate_id="qkv_low_emb",
+                    config=qkv_config,
+                )
+
+            mha_candidates = seq_payload.get("mha_out_proj")
+            if isinstance(mha_candidates, list) and mha_candidates:
+                existing_parallel_seq = sorted(
+                    {
+                        int(candidate["config"].get("parallel_seq", 1))
+                        for candidate in mha_candidates
+                    }
+                )
+                existing_parallel_heads = sorted(
+                    {
+                        int(candidate["config"].get("parallel_heads", 1))
+                        for candidate in mha_candidates
+                    }
+                )
+                # Some short-sequence GPT-2 buckets are already pinned to a single
+                # minimal-head candidate. Keep that contract unchanged instead of
+                # inventing a second option that widens the search space but does
+                # not meaningfully reduce footprint further.
+                if len(mha_candidates) == 1 and existing_parallel_heads[0] <= 1:
+                    continue
+                mha_config = dict(mha_candidates[0]["config"])
+                reduced_parallel_seq = max(1, existing_parallel_seq[0] // 2)
+                if reduced_parallel_seq < existing_parallel_seq[0]:
+                    mha_config["parallel_seq"] = reduced_parallel_seq
+                else:
+                    mha_config["parallel_heads"] = max(
+                        1, existing_parallel_heads[0] // 2
+                    )
+                _append_candidate_if_missing(
+                    mha_candidates,
+                    candidate_id="mha_low_footprint",
+                    config=mha_config,
+                )
+
+            ffn_candidates = seq_payload.get("ffn")
+            if isinstance(ffn_candidates, list) and ffn_candidates:
+                ffn_config = dict(ffn_candidates[-1]["config"])
+                ffn_config["num_aie_columns"] = 4
+                if "down_proj_depth" in ffn_config:
+                    ffn_config["down_proj_depth"] = max(
+                        1, min(int(ffn_config["down_proj_depth"]), 4)
+                    )
+                if "n_a_tiles_distributed" in ffn_config:
+                    ffn_config["n_a_tiles_distributed"] = max(
+                        1, min(int(ffn_config["n_a_tiles_distributed"]), 4)
+                    )
+                if "n_b_tiles_distributed" in ffn_config:
+                    ffn_config["n_b_tiles_distributed"] = max(
+                        1, min(int(ffn_config["n_b_tiles_distributed"]), 4)
+                    )
+                _append_candidate_if_missing(
+                    ffn_candidates,
+                    candidate_id="ffn_low_cols4",
+                    config=ffn_config,
+                )
+
+            for operator_name in ("add_norm1", "add_norm2", "add_norm"):
+                addnorm_candidates = seq_payload.get(operator_name)
+                if not isinstance(addnorm_candidates, list) or not addnorm_candidates:
+                    continue
+                addnorm_config = dict(addnorm_candidates[0]["config"])
+                addnorm_config["num_aie_columns"] = 4
+                addnorm_config.setdefault("tile_size", hidden_size)
+                _append_candidate_if_missing(
+                    addnorm_candidates,
+                    candidate_id="addnorm_cols4",
+                    config=addnorm_config,
+                )
+
+
+def _augment_runlist_candidate_payload(payload: dict[str, Any]) -> None:
+    reduced_gemm_ops = ("qkvo_proj", "up_proj", "down_proj")
+    reduced_one_d_ops = (
+        "attn_scale",
+        "attn_softmax",
+        "add",
+        "ln1",
+        "ln2",
+        "add_norm",
+        "gelu",
+        "causal_mask",
+    )
+
+    for family_payload in payload.values():
+        if not isinstance(family_payload, dict):
+            continue
+        for seq_key in ("64", "128", "256"):
+            seq_payload = family_payload.get(seq_key)
+            if not isinstance(seq_payload, dict):
+                continue
+
+            for operator_name in reduced_gemm_ops:
+                candidates = seq_payload.get(operator_name)
+                if not isinstance(candidates, list) or not candidates:
+                    continue
+                config = dict(candidates[0]["config"])
+                if "num_aie_columns" not in config:
+                    continue
+                config["num_aie_columns"] = 4
+                _append_candidate_if_missing(
+                    candidates,
+                    candidate_id=f"{operator_name}_cols4",
+                    config=config,
+                )
+
+            for operator_name, candidate_id in (
+                ("attn_scores", "scores_low_cols"),
+                ("attn_output", "output_low_cols"),
+            ):
+                candidates = seq_payload.get(operator_name)
+                if not isinstance(candidates, list) or not candidates:
+                    continue
+                config = dict(candidates[0]["config"])
+                if "num_aie_columns" not in config:
+                    continue
+                config["num_aie_columns"] = max(2, int(config["num_aie_columns"]) // 2)
+                _append_candidate_if_missing(
+                    candidates,
+                    candidate_id=candidate_id,
+                    config=config,
+                )
+
+            k_transpose_candidates = seq_payload.get("k_transpose")
+            if (
+                isinstance(k_transpose_candidates, list)
+                and k_transpose_candidates
+                and len(k_transpose_candidates) < 2
+            ):
+                transpose_config = dict(k_transpose_candidates[0]["config"])
+                if "num_aie_columns" in transpose_config:
+                    transpose_config["num_aie_columns"] = max(
+                        4, int(transpose_config["num_aie_columns"]) // 2
+                    )
+                if "num_channels" in transpose_config:
+                    transpose_config["num_channels"] = max(
+                        1, int(transpose_config["num_channels"]) // 2
+                    )
+                _append_candidate_if_missing(
+                    k_transpose_candidates,
+                    candidate_id="transpose_low_footprint",
+                    config=transpose_config,
+                )
+
+            for operator_name in reduced_one_d_ops:
+                candidates = seq_payload.get(operator_name)
+                if not isinstance(candidates, list) or not candidates:
+                    continue
+                config = dict(candidates[0]["config"])
+                changed = False
+                if "num_aie_columns" in config:
+                    config["num_aie_columns"] = max(
+                        4, int(config["num_aie_columns"]) // 2
+                    )
+                    changed = True
+                if "num_channels" in config:
+                    config["num_channels"] = max(1, int(config["num_channels"]) // 2)
+                    changed = True
+                if not changed:
+                    continue
+                _append_candidate_if_missing(
+                    candidates,
+                    candidate_id=f"{operator_name}_low_footprint",
+                    config=config,
+                )
+
+
 def _validate_candidates_payload(
     payload: Any,
     *,
@@ -439,6 +660,10 @@ def load_candidate_payload(
         source=candidate_path,
         execution_mode=canonical_mode,
     )
+    if canonical_mode == "hybrid":
+        _augment_hybrid_candidate_payload(payload)
+    elif canonical_mode == "runlist":
+        _augment_runlist_candidate_payload(payload)
     return payload
 
 

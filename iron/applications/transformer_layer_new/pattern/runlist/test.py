@@ -55,6 +55,18 @@ all_params = [
 ]
 
 
+def test_runlist_runtime_sync_metadata():
+    operator = AIETransformerRunlist(
+        seq_len=512,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_heads=12,
+    )
+
+    assert operator.device_input_buffer_names == ("input",)
+    assert operator.host_output_buffer_names == ("output",)
+
+
 def test_runlist_long_seq_uses_blocked_attention(aie_context):
     operator = AIETransformerRunlist(
         seq_len=16384,

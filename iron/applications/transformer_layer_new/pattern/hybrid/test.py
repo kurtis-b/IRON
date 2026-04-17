@@ -54,6 +54,18 @@ all_params = [
 ]
 
 
+def test_hybrid_runtime_sync_metadata():
+    operator = AIETransformerHybrid(
+        seq_len=512,
+        hidden_size=768,
+        intermediate_size=3072,
+        num_heads=12,
+    )
+
+    assert operator.device_input_buffer_names == ("input",)
+    assert operator.host_output_buffer_names == ("output",)
+
+
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",

@@ -484,17 +484,14 @@ def fused_qkv_proj(
         rt.start(*workers)
         projection_outputs = (Q, K, V)
 
-        def set_rtps(*args):
-            for rtps_row in args:
-                for rtp_row_col in rtps_row:
-                    rtp_row_col[0] = K_div_k
-                    rtp_row_col[1] = n_c_row_tiles_per_core * n_c_col_tiles_per_core
+        def set_rtps(n_tiles_per_core: int):
+            def _set_rtps(*args):
+                for rtps_row in args:
+                    for rtp_row_col in rtps_row:
+                        rtp_row_col[0] = K_div_k
+                        rtp_row_col[1] = n_tiles_per_core
 
-        rt.inline_ops(set_rtps, rtps)
-
-        for row in range(n_aie_rows):
-            for col in range(parallel_emb):
-                rt.set_barrier(worker_barriers[row][col], 1)
+            return _set_rtps
 
         for tb in range((n_c_row_tiles_per_core + tb_max_n_rows - 1) // tb_max_n_rows):
             for pingpong in [0, 1]:
@@ -505,6 +502,12 @@ def fused_qkv_proj(
                 if current_tb_n_rows <= 0:
                     break
                 for projection_idx in range(3):
+                    rt.inline_ops(
+                        set_rtps(current_tb_n_rows * n_projection_tile_groups), rtps
+                    )
+                    for row in range(n_aie_rows):
+                        for col in range(parallel_emb):
+                            rt.set_barrier(worker_barriers[row][col], 1)
                     tg = rt.task_group()
                     for row in range(n_aie_rows):
                         for tile_row in range(current_tb_n_rows):
@@ -524,6 +527,17 @@ def fused_qkv_proj(
                                 ),
                             )
                     for col in range(parallel_emb):
+                        for tile_row in range(current_tb_n_rows):
+                            b_taps = [make_b_taps(col)[projection_idx]]
+                            for B_tile in b_taps:
+                                rt.fill(
+                                    B_l3l2_fifos[col].prod(),
+                                    B,
+                                    tap=B_tile,
+                                    task_group=tg,
+                                    placement=Tile(col, 0),
+                                )
+
                         c_taps = make_c_taps(row_base, current_tb_n_rows, col)
                         c_taps = [c_taps[projection_idx]]
                         for C_tile in c_taps:
@@ -535,21 +549,10 @@ def fused_qkv_proj(
                                 task_group=tg,
                                 placement=Tile(col, 0),
                             )
-
-                        for tile_row in range(current_tb_n_rows):
-                            b_taps = [make_b_taps(col)[projection_idx]]
-                            for B_tile in b_taps:
-                                rt.fill(
-                                    B_l3l2_fifos[col].prod(),
-                                    B,
-                                    tap=B_tile,
-                                    task_group=tg,
-                                    placement=Tile(col, 0),
-                                )
                     rt.finish_task_group(tg)
-        for row in range(n_aie_rows):
-            for col in range(parallel_emb):
-                rt.set_barrier(worker_barriers[row][col], 0)
+                    for row in range(n_aie_rows):
+                        for col in range(parallel_emb):
+                            rt.set_barrier(worker_barriers[row][col], 0)
 
     return Program(dev_ty, rt).resolve_program(SequentialPlacer())
 

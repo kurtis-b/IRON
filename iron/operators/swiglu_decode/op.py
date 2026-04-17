@@ -141,6 +141,14 @@ class AIESwiGLUDecode(AIEOperatorBase):
         self.add_artifacts(artifacts)
 
     def set_up_runtime(self):
+        self.device_input_buffer_names = ("input",)
+        self.host_output_buffer_names = (
+            "left",
+            "left_swished",
+            "right",
+            "intermediate",
+            "output",
+        )
         self.add_buffer("input", self.embedding_dim)
         self.add_buffer(
             "weights_1",
