@@ -1,27 +1,47 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import torch
-import numpy as np
-from ml_dtypes import bfloat16
+import hashlib
 from pathlib import Path
+
+import numpy as np
+import torch
+from ml_dtypes import bfloat16
 
 from iron.common import (
     AIEOperatorBase,
     AIEOperatorConstraintError,
-    XclbinArtifact,
     InstsBinArtifact,
+    KernelArchiveArtifact,
     KernelObjectArtifact,
-    SourceArtifact,
     PythonGeneratedMLIRArtifact,
+    SourceArtifact,
+    XclbinArtifact,
 )
+from iron.common.utils import torch_to_numpy
 
 
 class AIELayerNorm(AIEOperatorBase):
-    """AIE-accelerated LAYER NORM operator"""
+    """AIE-accelerated LAYER NORM operator."""
+
+    @staticmethod
+    def _weight_signature(weights):
+        if isinstance(weights, np.ndarray):
+            weight_np = np.ascontiguousarray(weights)
+        else:
+            weight_np = np.ascontiguousarray(torch_to_numpy(weights))
+        return hashlib.sha1(weight_np.view(np.uint8)).hexdigest()[:12]
 
     def __init__(
-        self, size, num_aie_columns, num_channels, tile_size, trace_size=0, context=None
+        self,
+        size,
+        num_aie_columns=None,
+        num_channels=None,
+        tile_size=None,
+        weights=None,
+        trace_size=0,
+        context=None,
+        skip_add_to_list=False,
     ):
         max_multiple = num_aie_columns * tile_size
         padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
@@ -31,6 +51,7 @@ class AIELayerNorm(AIEOperatorBase):
         self.trace_size = trace_size
         self.num_aie_columns = num_aie_columns
         self.num_channels = num_channels
+        self.weight = weights
 
         total_shimdma_channels = self.num_aie_columns * self.num_channels
         assert total_shimdma_channels <= 16, "Conservative ShimDMA limit"
@@ -38,48 +59,105 @@ class AIELayerNorm(AIEOperatorBase):
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
-    def set_up_artifacts(self):
+    def get_artifacts(self, prefix="weighted_layer_norm_"):
         operator_dir = Path(__file__).parent
-        file_name_base = f"layer_norm_{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
+        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
 
-        mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{file_name_base}.mlir",
-            import_path=operator_dir / "design.py",
-            callback_fn="my_layer_norm",
-            callback_args=[
-                self.context.device_manager.device_type,
-                self.size,
-                self.num_aie_columns,
-                self.num_channels,
-                self.trace_size,
-                self.tile_size,
-            ],
-        )
-
-        xclbin_artifact = XclbinArtifact.new(
-            f"{file_name_base}.xclbin",
-            depends=[
-                mlir_artifact,
-                KernelObjectArtifact.new(
-                    f"layer_norm.o",
-                    depends=[
-                        SourceArtifact.new(
-                            self.context.base_dir
-                            / "aie_kernels"
-                            / "aie2p"
-                            / "layer_norm.cc"
-                        )
-                    ],
-                ),
-            ],
-        )
+        if self.weight is not None:
+            weight_signature = self._weight_signature(self.weight)
+            file_name_base = f"{file_name_base}_{weight_signature}"
+            weight_file_name = self.context.build_dir / f"{file_name_base}_weights.npy"
+            np.save(weight_file_name, torch_to_numpy(self.weight))
+            mlir_artifact = PythonGeneratedMLIRArtifact.new(
+                f"{file_name_base}.mlir",
+                import_path=operator_dir / "design_weighted.py",
+                callback_fn="my_weighted_layer_norm",
+                callback_args=[
+                    self.context.device_manager.device_type,
+                    self.size,
+                    self.num_aie_columns,
+                    self.num_channels,
+                    self.tile_size,
+                    weight_file_name,
+                    self.trace_size,
+                ],
+            )
+            xclbin_artifact = XclbinArtifact.new(
+                f"{file_name_base}.xclbin",
+                depends=[
+                    mlir_artifact,
+                    KernelArchiveArtifact.new(
+                        "layer_norm_archive.a",
+                        depends=[
+                            KernelObjectArtifact.new(
+                                "layer_norm.o",
+                                depends=[
+                                    SourceArtifact.new(
+                                        self.context.base_dir
+                                        / "aie_kernels"
+                                        / "aie2p"
+                                        / "layer_norm.cc"
+                                    )
+                                ],
+                            ),
+                            KernelObjectArtifact.new(
+                                "mul.o",
+                                depends=[
+                                    SourceArtifact.new(
+                                        self.context.base_dir
+                                        / "aie_kernels"
+                                        / "generic"
+                                        / "mul.cc"
+                                    )
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            )
+        else:
+            mlir_artifact = PythonGeneratedMLIRArtifact.new(
+                f"{file_name_base}.mlir",
+                import_path=operator_dir / "design.py",
+                callback_fn="my_layer_norm",
+                callback_args=[
+                    self.context.device_manager.device_type,
+                    self.size,
+                    self.num_aie_columns,
+                    self.num_channels,
+                    self.trace_size,
+                    self.tile_size,
+                ],
+            )
+            xclbin_artifact = XclbinArtifact.new(
+                f"{file_name_base}.xclbin",
+                depends=[
+                    mlir_artifact,
+                    KernelObjectArtifact.new(
+                        "layer_norm.o",
+                        depends=[
+                            SourceArtifact.new(
+                                self.context.base_dir
+                                / "aie_kernels"
+                                / "aie2p"
+                                / "layer_norm.cc"
+                            )
+                        ],
+                    ),
+                ],
+            )
 
         insts_artifact = InstsBinArtifact.new(
             f"{file_name_base}.bin", depends=[mlir_artifact]
         )
+        return xclbin_artifact, insts_artifact
 
+    def set_up_artifacts(self):
+        xclbin_artifact, insts_artifact = self.get_artifacts()
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
         self.add_artifacts([xclbin_artifact, insts_artifact])
@@ -95,7 +173,8 @@ class AIELayerNorm(AIEOperatorBase):
         )
         self.add_to_runlist("layer_norm", "input", "output")
 
-    def forward(self, x):
+    def forward(self, x, y=None):
+        del y
         if x.numel() > self.size:
             raise AIEOperatorConstraintError(
                 "AIELayerNorm: input too large for configured size"

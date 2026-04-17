@@ -6,6 +6,7 @@ from .dequant.op import AIEDequant
 from .elementwise_add.op import AIEElementwiseAdd
 from .elementwise_mul.op import AIEElementwiseMul
 from .gelu.op import AIEGELU
+from .dynamic_gemm.op import AIEDynamicGEMM
 from .gemm.op import AIEGEMM
 from .gemv.op import AIEGEMV
 from .layer_norm.op import AIELayerNorm

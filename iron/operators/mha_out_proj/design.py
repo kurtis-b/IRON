@@ -1,0 +1,1350 @@
+# SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+from ml_dtypes import bfloat16
+import numpy as np
+
+from aie.iron import (
+    Buffer,
+    Kernel,
+    ObjectFifo,
+    Program,
+    Runtime,
+    Worker,
+    WorkerRuntimeBarrier,
+)
+from aie.helpers.taplib import TensorTiler2D, TensorAccessSequence, TensorAccessPattern
+from aie.iron.controlflow import range_
+from aie.iron.device import NPU2, Tile
+from aie.iron.placers import SequentialPlacer
+
+base_dir = Path(__file__).parent
+
+dtype_map = {
+    "bf16": bfloat16,
+    "f32": np.float32,
+}
+
+microkernel_mac_dim_map = {
+    "npu": {
+        "bf16": (4, 8, 4),
+    },
+    "npu2": {
+        "bf16": {
+            # emulate_bf16_mmul_with_bfp16
+            True: (8, 8, 8),
+            False: (4, 8, 8),
+        },
+    },
+}
+
+
+def main():
+    argparser = argparse.ArgumentParser(
+        prog="AIE MHA Output Projection MLIR Design",
+        description="Emits MLIR code for a fused attention and output projection design",
+    )
+    argparser.add_argument("--heads", type=int, default=1)
+    argparser.add_argument("--seq-len", type=int, default=256)
+    argparser.add_argument("-d", type=int, default=64)
+    argparser.add_argument("--parallel-seq", type=int, default=1)
+    argparser.add_argument("--q-seq-tile", type=int, default=32)
+    argparser.add_argument("--kv-seq-tile", type=int, default=64)
+    argparser.add_argument("--emb-tile", type=int, default=64)
+    argparser.add_argument("--o-proj-acc-depth", type=int, default=1)
+    argparser.add_argument("--parallel-heads", type=int, default=1)
+    argparser.add_argument("--is-causal", action="store_true")
+    argparser.add_argument("--emulate-bf16-mmul-with-bfp16", type=bool, default=True)
+    argparser.add_argument("--trace_size", type=int, default=0)
+    argparser.add_argument("--kernel-archive", type=str, default="mha_kernels.a")
+    argparser.add_argument(
+        "--output-file-path",
+        "-o",
+        type=str,
+        default=base_dir / "build" / f"my_mha.mlir",
+        help="Output file path for the generated MLIR module",
+    )
+
+    args = argparser.parse_args()
+
+    maybe_module = fused_mha(
+        heads=args.heads,
+        seq_len=args.seq_len,
+        d=args.d,
+        parallel_seq=args.parallel_seq,
+        q_seq_tile=args.q_seq_tile,
+        kv_seq_tile=args.kv_seq_tile,
+        emb_tile=args.emb_tile,
+        o_proj_acc_depth=args.o_proj_acc_depth,
+        parallel_heads=args.parallel_heads,
+        is_causal=args.is_causal,
+        emulate_bf16_mmul_with_bfp16=args.emulate_bf16_mmul_with_bfp16,
+        kernel_archive=args.kernel_archive,
+        trace_size=args.trace_size,
+    )
+
+    output_file_path = Path(args.output_file_path)
+
+    with open(output_file_path, "w") as f:
+        f.write(str(maybe_module))
+
+    logging.info(f"MLIR module written to {output_file_path}")
+
+
+# TODO: Add back parallel sequence blocks?
+
+
+def fused_mha(
+    heads: int,
+    seq_len: int,
+    d: int,
+    parallel_seq: int,
+    q_seq_tile: int,
+    kv_seq_tile: int,
+    emb_tile: int,
+    o_proj_acc_depth: int,
+    parallel_heads: int,
+    is_causal: bool,
+    emulate_bf16_mmul_with_bfp16: bool,
+    kernel_archive: str,
+    trace_size: int = 0,
+):
+    del trace_size
+
+    embed_sz = heads * d
+    sequence_parallel_mode = parallel_seq > 1
+    parallel_lanes = (
+        parallel_seq * parallel_heads if sequence_parallel_mode else parallel_heads
+    )
+    parallel_seq_join_distribute = (
+        parallel_seq // 2
+        if sequence_parallel_mode and parallel_lanes > 6
+        else parallel_seq
+    )
+
+    of_depth = 2
+    o_proj_weight_consumer_depth = 1
+    o_proj_partial_depth = 1
+    dtype_str = "bf16"
+
+    num_q_seq_blocks = seq_len // q_seq_tile
+    num_kv_seq_blocks = seq_len // kv_seq_tile
+    num_qkv_head_block_per_parallel_head = heads // parallel_heads
+    num_runtime_q_groups = (
+        num_q_seq_blocks // parallel_seq if sequence_parallel_mode else num_q_seq_blocks
+    )
+    assert embed_sz % (emb_tile * o_proj_acc_depth) == 0, (
+        "embed_sz must be divisible by emb_tile * o_proj_acc_depth "
+        f"({embed_sz} % ({emb_tile} * {o_proj_acc_depth}) != 0)"
+    )
+    num_o_col_groups = embed_sz // (emb_tile * o_proj_acc_depth)
+
+    # r, s, t are the dimensions required by the microkernel MAC instructions.
+    mac_dims = microkernel_mac_dim_map["npu2"][dtype_str]
+    r, s, t = mac_dims[emulate_bf16_mmul_with_bfp16]
+
+    assert heads > 0, "Number of heads must be greater than 0"
+    assert parallel_seq > 0, "parallel_seq must be greater than 0"
+    assert (
+        heads % parallel_heads == 0
+    ), "Number of heads must be divisible by parallel_heads"
+    assert (
+        seq_len % (parallel_seq * q_seq_tile) == 0
+    ), "seq_len must be divisible by parallel_seq * q_seq_tile"
+    if sequence_parallel_mode:
+        assert parallel_seq in (
+            2,
+            4,
+            6,
+            8,
+        ), "parallel sequence lowering currently supports ps in {2, 4, 6, 8}"
+
+    assert (
+        q_seq_tile % r == 0
+    ), f"q_seq_tile must be divisible by r ({q_seq_tile} % {r} != 0)"
+    assert (
+        kv_seq_tile % t == 0
+    ), f"kv_seq_tile must be divisible by t ({kv_seq_tile} % {t} != 0)"
+    assert d % s == 0, f"d must be divisible by s ({d} % {s} != 0)"
+
+    assert seq_len % q_seq_tile == 0, "seq_len must be divisible by q_seq_tile"
+
+    dtype = dtype_map[dtype_str]
+
+    inv_scale = (1 / np.sqrt(d)) * 1.4453125
+
+    # Tensors living in DRAM
+    W_O_ty = np.ndarray[
+        (embed_sz, embed_sz),
+        np.dtype[dtype],
+    ]
+    Q_ty = np.ndarray[
+        (seq_len, embed_sz),
+        np.dtype[dtype],
+    ]
+    K_ty = np.ndarray[
+        (seq_len, embed_sz),
+        np.dtype[dtype],
+    ]
+    V_ty = np.ndarray[
+        (seq_len, embed_sz),
+        np.dtype[dtype],
+    ]
+    O_ty = np.ndarray[
+        (seq_len, embed_sz),
+        np.dtype[dtype],
+    ]
+
+    # Tensors living on the AIE-array
+    q_ty = np.ndarray[(q_seq_tile, d), np.dtype[dtype]]
+    k_ty = np.ndarray[(d, kv_seq_tile), np.dtype[dtype]]
+    qk_ty = np.ndarray[(q_seq_tile, kv_seq_tile), np.dtype[dtype]]
+    v_ty = np.ndarray[(kv_seq_tile, d), np.dtype[dtype]]
+    s_ty = np.ndarray[(4 * q_seq_tile,), np.dtype[dtype]]
+    wo_ty = np.ndarray[(d, emb_tile), np.dtype[dtype]]
+    o_ty = np.ndarray[(q_seq_tile, emb_tile), np.dtype[dtype]]
+
+    # AIE kernel declarations
+    bin_name = kernel_archive
+
+    zero_kernel = Kernel(f"zero_{dtype_str}", bin_name, [qk_ty])
+    zero_kernel_q = Kernel(f"zero_{dtype_str}_rowmaj", bin_name, [q_ty])
+
+    memcopy_kernel_scale = Kernel(f"passThroughLine", bin_name, [s_ty, s_ty, np.int32])
+
+    scale_buffer_init_kernel = Kernel("init_scale_buffer", bin_name, [s_ty, np.int32])
+
+    partial_softmax_kernel = Kernel(
+        "partial_softmax",
+        bin_name,
+        [
+            qk_ty,
+            qk_ty,
+            s_ty,
+            np.ndarray[(2,), np.dtype[np.int32]],
+            dtype,
+            np.int32,
+            np.int32,
+            np.int32,
+            np.int32,
+        ],
+    )
+
+    matmul_QK = Kernel(
+        f"matmul_bf16_bf16_wrapper",
+        bin_name,
+        [q_ty, k_ty, qk_ty, np.ndarray[(2,), np.dtype[np.int32]]],
+    )
+
+    matmul_PV = Kernel(
+        "matmul_PV",
+        bin_name,
+        [
+            qk_ty,
+            v_ty,
+            q_ty,
+            s_ty,
+            np.int32,
+            np.int32,
+            np.ndarray[(2,), np.dtype[np.int32]],
+        ],
+    )
+
+    rescale_O = Kernel(
+        "rescale_O",
+        bin_name,
+        [q_ty, s_ty, np.int32, np.ndarray[(2,), np.dtype[np.int32]]],
+    )
+
+    zero_kernel_o_proj = Kernel(
+        f"zero_{dtype_str}_o_proj",
+        bin_name,
+        [o_ty],
+    )
+    matmul_kernel_o_proj = Kernel(
+        f"matmul_with_acc_bf16_bf16_o_proj",
+        bin_name,
+        [q_ty, wo_ty, o_ty, o_ty],
+    )
+    mem_copy_o_proj = Kernel(
+        "passThroughLine_o_proj",
+        bin_name,
+        [o_ty, o_ty, np.int32],
+    )
+    eltwise_add_vector = Kernel(
+        "eltwise_add_bf16_vector_o_proj",
+        bin_name,
+        [o_ty, o_ty, o_ty, np.int32],
+    )
+
+    # AIE-array data movement with object fifos
+    q_dims = [(q_seq_tile // r, r * d), (d // s, s), (r, d), (s, 1)]
+    q_group_ty = np.ndarray[(q_seq_tile, d * parallel_heads), np.dtype[dtype]]
+    q_group_dims = [
+        (q_seq_tile // r, r * d * parallel_heads),
+        (d * parallel_heads // s, s),
+        (r, d * parallel_heads),
+        (s, 1),
+    ]
+
+    if sequence_parallel_mode:
+        inQ = ObjectFifo(
+            np.ndarray[
+                (parallel_seq_join_distribute * q_seq_tile, d * parallel_heads),
+                np.dtype[dtype],
+            ],
+            name="inQ",
+            depth=of_depth,
+        )
+        outer_lane_count = parallel_seq_join_distribute * parallel_heads
+        memQ = list(
+            inQ.cons().split(
+                offsets=[
+                    (
+                        (lane // parallel_heads) * q_seq_tile * d * parallel_heads
+                        + (lane % parallel_heads) * q_seq_tile * d
+                    )
+                    for lane in range(outer_lane_count)
+                ],
+                obj_types=[q_ty] * outer_lane_count,
+                names=[f"memQ{lane}" for lane in range(outer_lane_count)],
+                dims_to_stream=[q_dims] * outer_lane_count,
+                depths=[of_depth] * outer_lane_count,
+                placement=Tile(col=6 if parallel_lanes > 6 else 0, row=1),
+            )
+        )
+        if parallel_lanes > 6:
+            inQ2 = ObjectFifo(
+                np.ndarray[
+                    (parallel_seq_join_distribute * q_seq_tile, d * parallel_heads),
+                    np.dtype[dtype],
+                ],
+                name="inQ2",
+                depth=of_depth,
+            )
+            memQ += list(
+                inQ2.cons().split(
+                    offsets=[
+                        (
+                            (lane // parallel_heads) * q_seq_tile * d * parallel_heads
+                            + (lane % parallel_heads) * q_seq_tile * d
+                        )
+                        for lane in range(outer_lane_count)
+                    ],
+                    obj_types=[q_ty] * outer_lane_count,
+                    names=[
+                        f"memQ{outer_lane_count + lane}"
+                        for lane in range(outer_lane_count)
+                    ],
+                    dims_to_stream=[q_dims] * outer_lane_count,
+                    depths=[of_depth] * outer_lane_count,
+                    placement=Tile(col=7, row=1),
+                )
+            )
+    else:
+        inQ = ObjectFifo(
+            np.ndarray[(q_seq_tile, d * parallel_heads), np.dtype[dtype]],
+            name="inQ",
+            depth=of_depth,
+        )
+        memQ = inQ.cons().split(
+            offsets=[q_seq_tile * d * i for i in range(parallel_heads)],
+            obj_types=[q_ty] * parallel_heads,
+            names=[f"memQ{i}" for i in range(parallel_heads)],
+            dims_to_stream=[q_dims] * parallel_heads,
+            depths=[of_depth] * parallel_heads,
+            placement=Tile(col=0, row=1),
+        )  # Split between N parallel blocks of heads
+
+    # VJUNG: The SequentialPlacer will place all of these on the same MemTile if Placement is specified. We would need a list of placement in case of one-many or many-one.
+    # I think the Sequential Placer will fail if we do a split/join with more than 6 I/Os cuz it tries to place them all on the same tile.
+
+    # K is stored in column-major order
+    k_dims = [(kv_seq_tile // t, t * d), (d // s, s), (t, d), (s, 1)]
+    if sequence_parallel_mode:
+        inK = ObjectFifo(
+            np.ndarray[(kv_seq_tile, d * parallel_heads), np.dtype[dtype]],
+            name="inK",
+            depth=of_depth,
+        )
+        memK = list(
+            inK.cons().split(
+                offsets=[kv_seq_tile * d * head for head in range(parallel_heads)],
+                obj_types=[k_ty] * parallel_heads,
+                names=[f"memKHead{head}" for head in range(parallel_heads)],
+                dims_to_stream=[k_dims] * parallel_heads,
+                depths=[of_depth] * parallel_heads,
+                placement=Tile(col=1, row=1),
+            )
+        )
+    else:
+        inK = ObjectFifo(
+            np.ndarray[(kv_seq_tile, d * parallel_heads), np.dtype[dtype]],
+            name="inK",
+            depth=of_depth,
+        )
+        memK = inK.cons().split(
+            offsets=[kv_seq_tile * d * i for i in range(parallel_heads)],
+            obj_types=[k_ty] * parallel_heads,
+            names=[f"memK{i}" for i in range(parallel_heads)],
+            dims_to_stream=[k_dims] * parallel_heads,
+            depths=[of_depth] * parallel_heads,
+            placement=Tile(col=1, row=1),
+        )  # Split between N parallel blocks of heads
+
+    v_dims = [
+        (kv_seq_tile // s, s * d),
+        (d // t, t),
+        (s, d),
+        (t, 1),
+    ]
+
+    if sequence_parallel_mode:
+        inV = ObjectFifo(
+            np.ndarray[(kv_seq_tile, d * parallel_heads), np.dtype[dtype]],
+            name="inV",
+            depth=of_depth,
+        )
+        memV = list(
+            inV.cons().split(
+                offsets=[kv_seq_tile * d * head for head in range(parallel_heads)],
+                obj_types=[v_ty] * parallel_heads,
+                names=[f"memVHead{head}" for head in range(parallel_heads)],
+                dims_to_stream=[v_dims] * parallel_heads,
+                depths=[of_depth] * parallel_heads,
+                placement=Tile(col=2, row=1),
+            )
+        )
+    else:
+        inV = ObjectFifo(
+            np.ndarray[(kv_seq_tile, d * parallel_heads), np.dtype[dtype]],
+            name="inV",
+            depth=of_depth,
+        )
+        memV = inV.cons().split(
+            offsets=[kv_seq_tile * d * i for i in range(parallel_heads)],
+            obj_types=[v_ty] * parallel_heads,
+            names=[f"memV{i}" for i in range(parallel_heads)],
+            dims_to_stream=[v_dims] * parallel_heads,
+            depths=[of_depth] * parallel_heads,
+            placement=Tile(col=2, row=1),
+        )  # Split between N parallel blocks of heads
+
+    memA = []
+    # Data layout transformation to execute softmax without microtiles
+    # First send microkernel tiles across the sequence dimension of the output,
+    # then place those microkernel tiles in the correct locations with another DMA
+    a_dims_out = [
+        (kv_seq_tile // s, r * s),
+        (q_seq_tile // r, kv_seq_tile * r),
+        (r * s, 1),
+    ]
+    a_dims_in = [(kv_seq_tile // s, s), (q_seq_tile, kv_seq_tile), (s, 1)]
+    for i in range(parallel_lanes):
+        memA.append(
+            ObjectFifo(
+                qk_ty,
+                depth=of_depth,
+                name=f"memA{i}",
+                dims_to_stream=a_dims_out,
+                dims_from_stream_per_cons=a_dims_in,
+            )
+        )  # Local to 1 parallel block of heads
+
+    memP = []
+    # Data layout transformation to turn tile into microtiles again for mmul
+    # First send microkernel tiles across the sequence dimension of the output,
+    # then place those microkernel tiles in the correct locations with another DMA
+    p_dims_out = [(kv_seq_tile // s, s), (q_seq_tile, kv_seq_tile), (s, 1)]
+    p_dims_in = [
+        (kv_seq_tile // s, r * s),
+        (q_seq_tile // r, kv_seq_tile * r),
+        (r * s, 1),
+    ]
+    for i in range(parallel_lanes):
+        memP.append(
+            ObjectFifo(
+                qk_ty,
+                depth=of_depth,
+                name=f"memP{i}",
+                dims_to_stream=p_dims_out,
+                dims_from_stream_per_cons=p_dims_in,
+            )
+        )  # Local to 1 parallel block of heads
+
+    # Scale buffer for partial softmax
+    scaleOF = []
+    for i in range(parallel_lanes):
+        scaleOF.append(
+            ObjectFifo(s_ty, depth=of_depth, name=f"scaleOF{i}")
+        )  # Local to 1 parallel lane
+
+    # Output projection weights
+    ow_dims = [
+        (d // s, s * emb_tile),
+        (emb_tile // t, t),
+        (s, emb_tile),
+        (t, 1),
+    ]
+
+    if sequence_parallel_mode:
+        inOW = ObjectFifo(
+            np.ndarray[(d * parallel_heads, emb_tile), np.dtype[dtype]],
+            name="inOW",
+            depth=of_depth,
+        )
+        memOW = list(
+            inOW.cons().split(
+                offsets=[d * emb_tile * head for head in range(parallel_heads)],
+                obj_types=[wo_ty] * parallel_heads,
+                names=[f"memOWHead{head}" for head in range(parallel_heads)],
+                dims_to_stream=[ow_dims] * parallel_heads,
+                depths=[o_proj_weight_consumer_depth] * parallel_heads,
+                placement=Tile(col=3, row=1),
+            )
+        )
+    else:
+        inOW = ObjectFifo(
+            np.ndarray[(d * parallel_heads, emb_tile), np.dtype[dtype]],
+            name="inOW",
+            depth=of_depth,
+        )
+        memOW = inOW.cons().split(
+            offsets=[d * emb_tile * i for i in range(parallel_heads)],
+            obj_types=[wo_ty] * parallel_heads,
+            names=[f"memOW{i}" for i in range(parallel_heads)],
+            dims_to_stream=[ow_dims] * parallel_heads,
+            depths=[o_proj_weight_consumer_depth] * parallel_heads,
+            placement=Tile(col=3, row=1),
+        )  # Split between N parallel blocks of heads
+
+    # Partial out proj tiles to store accumulations in MTs
+    outOProj = []
+    outOProjAccumIn = []
+    outOProjAccumOut = []
+
+    accum_memtile_cols: list[int] = []
+    # The accumulation FIFOs consume BD IDs proportional to acc depth. Greedily
+    # spread them across memtile columns, taking the existing Q/K/V/W_O and O
+    # fanout into account, so higher-acc retained shapes do not concentrate all
+    # staging on a few memtiles.
+    base_memtile_load = {col: 0 for col in range(8)}
+    base_memtile_load[1] += parallel_heads
+    base_memtile_load[2] += parallel_heads
+    base_memtile_load[3] += parallel_heads
+    if sequence_parallel_mode:
+        if parallel_lanes > 6:
+            base_memtile_load[6] += outer_lane_count + parallel_seq_join_distribute
+            base_memtile_load[7] += outer_lane_count + parallel_seq_join_distribute
+        else:
+            base_memtile_load[0] += outer_lane_count
+            base_memtile_load[7] += parallel_seq_join_distribute
+        candidate_memtile_cols = list(range(8))
+    else:
+        # Reserve memtile 7 for the final joined O drain and spread the non-sequence
+        # accumulation FIFOs across the free memtiles next to the O-proj row.
+        base_memtile_load[0] += parallel_heads
+        base_memtile_load[7] += 1
+        candidate_memtile_cols = [4, 5, 6]
+
+    current_memtile_load = dict(base_memtile_load)
+    for lane_idx in range(parallel_lanes):
+        col = min(candidate_memtile_cols, key=lambda c: (current_memtile_load[c], c))
+        accum_memtile_cols.append(col)
+        current_memtile_load[col] += 2 * o_proj_acc_depth
+
+    def accum_memtile_col(lane_idx: int) -> int:
+        return accum_memtile_cols[lane_idx]
+
+    for i in range(parallel_lanes):
+        outOProj.append(
+            ObjectFifo(q_ty, depth=o_proj_partial_depth, name=f"outOProj{i}")
+        )  # Local to 1 parallel lane
+        outOProjAccumOut.append(ObjectFifo(o_ty, depth=1, name=f"outOProjAccumOut{i}"))
+        outOProjAccumIn.append(
+            outOProjAccumOut[i]
+            .cons(depth=o_proj_acc_depth)
+            .forward(
+                name=f"outOProjAccumIn{i}",
+                depth=o_proj_acc_depth,
+                placement=Tile(
+                    col=accum_memtile_col(i),
+                    row=1,
+                ),
+            )
+        )  # Local to 1 parallel lane
+
+    outOPart = []
+    if sequence_parallel_mode:
+        if parallel_heads > 1:
+            outOPart = [[] for _ in range(parallel_seq)]
+            for seq_lane in range(parallel_seq):
+                for head_lane in range(parallel_heads - 1):
+                    outOPart[seq_lane].append(
+                        ObjectFifo(
+                            o_ty,
+                            depth=o_proj_partial_depth,
+                            name=f"outOPart{seq_lane}_{head_lane}",
+                        )
+                    )
+    else:
+        for i in range(parallel_heads - 1):
+            outOPart.append(
+                ObjectFifo(o_ty, depth=o_proj_partial_depth, name=f"outOPart{i}")
+            )
+
+    o_dims = [(q_seq_tile // r, r * emb_tile), (r, t), (emb_tile // t, r * t), (t, 1)]
+    if sequence_parallel_mode:
+        memO = ObjectFifo(
+            np.ndarray[
+                (parallel_seq_join_distribute * q_seq_tile, emb_tile),
+                np.dtype[dtype],
+            ],
+            name="memO",
+            dims_to_stream=o_dims,
+        )
+        outO = memO.prod().join(
+            offsets=[
+                q_seq_tile * emb_tile * i for i in range(parallel_seq_join_distribute)
+            ],
+            obj_types=[o_ty] * parallel_seq_join_distribute,
+            names=[f"outO{i}" for i in range(parallel_seq_join_distribute)],
+            depths=[of_depth] * parallel_seq_join_distribute,
+            placement=Tile(col=6 if parallel_lanes > 6 else 7, row=1),
+        )
+        if parallel_lanes > 6:
+            memO2 = ObjectFifo(
+                np.ndarray[
+                    (parallel_seq_join_distribute * q_seq_tile, emb_tile),
+                    np.dtype[dtype],
+                ],
+                name="memO2",
+                dims_to_stream=o_dims,
+            )
+            outO += memO2.prod().join(
+                offsets=[
+                    q_seq_tile * emb_tile * i
+                    for i in range(parallel_seq_join_distribute)
+                ],
+                obj_types=[o_ty] * parallel_seq_join_distribute,
+                names=[
+                    f"outO{i + parallel_seq_join_distribute}"
+                    for i in range(parallel_seq_join_distribute)
+                ],
+                depths=[of_depth] * parallel_seq_join_distribute,
+                placement=Tile(col=7, row=1),
+            )
+    else:
+        memO = ObjectFifo(
+            o_ty,
+            name="memO",
+            dims_to_stream=o_dims,
+        )
+        outO = memO.prod().join(  # TODO: Check if this becomes a forward operation--or might give an error
+            offsets=[q_seq_tile * emb_tile],
+            obj_types=[o_ty],
+            names=[f"outO{i}"],
+            depths=[of_depth],
+            placement=Tile(col=7, row=1),
+        )  # Join onto the output OF
+
+    def batched_matmul_qk(
+        of_q,
+        of_k,
+        of_a_out,
+        zero,
+        matmul_QK,
+        q_block_bias,
+        q_block_stride,
+        barrier,
+        idx_buffer,
+    ):
+        for _ in range_(sys.maxsize):
+            barrier.wait_for_value(1)
+
+            idx_buffer[0] = 0
+            idx_buffer[1] = q_block_bias
+
+            for _ in range_(num_runtime_q_groups):
+                for _ in range_(num_qkv_head_block_per_parallel_head):
+
+                    elem_in_q = of_q.acquire(1)
+
+                    for _ in range_(num_kv_seq_blocks):
+
+                        elem_in_k = of_k.acquire(1)
+                        elem_a_out = of_a_out.acquire(1)
+
+                        zero(elem_a_out)
+                        matmul_QK(elem_in_q, elem_in_k, elem_a_out, idx_buffer)
+
+                        of_k.release(1)
+                        of_a_out.release(1)
+
+                        idx_buffer[0] += 1
+                    idx_buffer[0] = 0
+
+                    of_q.release(1)
+
+                idx_buffer[1] += q_block_stride
+
+            barrier.release_with_value(0)
+
+    def softmax(
+        of_in_a,
+        of_out_p,
+        of_out_scale,
+        partial_softmax,
+        init_scale_buffer,
+        memcopy_kernel_scale,
+        q_block_bias,
+        q_block_stride,
+        barrier,
+        idx_buffer,
+        scale_buffer,
+    ):
+        # VJUNG: The index buffer count how many Q and KV block this worker has processed
+        # From this info we can infer the position in A and P
+
+        for _ in range_(sys.maxsize):
+            barrier.wait_for_value(1)
+
+            # VJUNG: Required otherwise the buffer is maintained when doing warmup!
+            idx_buffer[0] = 0
+            idx_buffer[1] = q_block_bias
+
+            for _ in range_(num_runtime_q_groups):
+                for _ in range_(num_qkv_head_block_per_parallel_head):
+
+                    init_scale_buffer(scale_buffer, q_seq_tile)
+
+                    for _ in range_(num_kv_seq_blocks):
+
+                        elt_of_out_p = of_out_p.acquire(1)
+                        elt_of_in_a = of_in_a.acquire(1)
+                        elt_of_out_scale = of_out_scale.acquire(1)
+
+                        partial_softmax(
+                            elt_of_in_a,
+                            elt_of_out_p,
+                            scale_buffer,
+                            idx_buffer,
+                            inv_scale,
+                            q_seq_tile,
+                            kv_seq_tile,
+                            seq_len,
+                            seq_len,
+                        )
+                        memcopy_kernel_scale(
+                            scale_buffer, elt_of_out_scale, 4 * q_seq_tile
+                        )
+
+                        of_in_a.release(1)
+                        of_out_p.release(1)
+                        of_out_scale.release(1)
+
+                        idx_buffer[0] += 1
+                    idx_buffer[0] = 0
+
+                idx_buffer[1] += q_block_stride
+
+            barrier.release_with_value(0)
+
+    def batched_matmul_pv(
+        of_p,
+        of_v,
+        of_scale,
+        of_o_out,
+        zero,
+        matmul_PV,
+        rescale_O,
+        q_block_bias,
+        q_block_stride,
+        barrier,
+        idx_buffer,
+    ):
+        for _ in range_(sys.maxsize):
+            barrier.wait_for_value(1)
+
+            # VJUNG: Required otherwise the buffer is maintained when doing warmup!
+            idx_buffer[0] = 0
+            idx_buffer[1] = q_block_bias
+
+            for _ in range_(num_runtime_q_groups):
+                for _ in range_(num_qkv_head_block_per_parallel_head):
+
+                    elem_o_out = of_o_out.acquire(1)
+
+                    zero(elem_o_out)
+
+                    ### First iteration, don't rescale O_{i-1}
+                    elem_in_p = of_p.acquire(1)
+                    elem_in_v = of_v.acquire(1)
+                    elt_of_out_scale = of_scale.acquire(1)
+
+                    matmul_PV(
+                        elem_in_p,
+                        elem_in_v,
+                        elem_o_out,
+                        elt_of_out_scale,
+                        q_seq_tile,
+                        0,
+                        idx_buffer,
+                    )
+
+                    of_p.release(1)
+                    of_v.release(1)
+                    of_scale.release(1)
+
+                    idx_buffer[0] += 1
+                    ###
+
+                    if num_kv_seq_blocks > 2:
+                        for _ in range_(num_kv_seq_blocks - 2):
+                            elem_in_p = of_p.acquire(1)
+                            elem_in_v = of_v.acquire(1)
+                            elt_of_out_scale2 = of_scale.acquire(1)
+
+                            matmul_PV(
+                                elem_in_p,
+                                elem_in_v,
+                                elem_o_out,
+                                elt_of_out_scale2,
+                                q_seq_tile,
+                                1,
+                                idx_buffer,
+                            )
+
+                            of_p.release(1)
+                            of_v.release(1)
+                            of_scale.release(1)
+
+                            idx_buffer[0] += 1
+
+                    ### Last iteration, final rescaling
+                    if num_kv_seq_blocks > 1:
+                        elem_in_p = of_p.acquire(1)
+                        elem_in_v = of_v.acquire(1)
+                        elt_of_out_scale3 = of_scale.acquire(1)
+
+                        matmul_PV(
+                            elem_in_p,
+                            elem_in_v,
+                            elem_o_out,
+                            elt_of_out_scale3,
+                            q_seq_tile,
+                            1,
+                            idx_buffer,
+                        )
+                        rescale_O(elem_o_out, elt_of_out_scale3, q_seq_tile, idx_buffer)
+
+                        of_p.release(1)
+                        of_v.release(1)
+                        of_scale.release(1)
+
+                        idx_buffer[0] += 1
+                    # else:
+                    else:
+                        rescale_O(elem_o_out, elt_of_out_scale, q_seq_tile, idx_buffer)
+                        idx_buffer[0] += 1
+                    ###
+
+                    idx_buffer[0] = 0
+                    of_o_out.release(1)
+
+                idx_buffer[1] += q_block_stride
+
+            barrier.release_with_value(0)
+
+    def matmul_o_proj(
+        of_o_in,
+        of_ow_in,
+        of_o_acc_in,
+        of_o_acc_out,
+        of_o_out,
+        buffer_to_reduce,
+        zero,
+        matmul,
+        add,
+        copy,
+    ):
+        """
+        Amount of work for prev stages to generate its ouptut to next stage for one head:
+            QK: q_seq_tile * d * kv_seq_tile
+            S: q_seq_tile * kv_seq_tile
+            PV: q_seq_tile * kv_seq_tile * d * (seq_len // q_seq_tile)
+        Amount of work for prev stages to process generate full row outputs:
+            QK: q_seq_tile * d * kv_seq_tile * (seq_len // q_seq_tile)
+            S: q_seq_tile * kv_seq_tile * (seq_len // q_seq_tile)
+            PV: q_seq_tile * kv_seq_tile * d * (seq_len // q_seq_tile) * (embed_dim // d)
+        Output projection needs all heads to generate one output tile:
+            O: q_seq_tile * d * emb_tile * (embed_dim // d)
+        So full rows are generated after this amount of compute:
+            O: q_seq_tile * d * emb_tile * (embed_dim // d) * (embed_dim // emb_tile)
+        The output from PV can be reused to partially accumulate output tiles:
+            O: q_seq_tile * d * emb_tile * (embed_dim // emb_tile)
+        """
+
+        for _ in range_(sys.maxsize):
+
+            # First iteration just passes the partial C tile through
+            for _ in range_(o_proj_acc_depth):
+
+                elem_out_o_acc = of_o_acc_out.acquire(1)
+                zero(elem_out_o_acc)
+                of_o_acc_out.release(1)
+
+            for _ in range_(num_qkv_head_block_per_parallel_head):
+
+                elem_in_o = of_o_in.acquire(1)
+
+                for _ in range_(o_proj_acc_depth):
+
+                    elem_in_o_acc = of_o_acc_in.acquire(1)
+                    elem_in_ow = of_ow_in.acquire(1)
+                    elem_out_o_acc = of_o_acc_out.acquire(1)
+                    matmul(elem_in_o, elem_in_ow, elem_in_o_acc, elem_out_o_acc)
+                    of_o_acc_out.release(1)
+                    of_ow_in.release(1)
+                    of_o_acc_in.release(1)
+
+                of_o_in.release(1)
+
+            for _ in range_(o_proj_acc_depth):
+
+                # Acquire what's in L2, which is the final accumulated result for the tile
+                elem_in_o_acc = of_o_acc_in.acquire(1)
+
+                if buffer_to_reduce:
+
+                    # Don't send any new data to MT, i.e. of_o_acc_out, because that will affect
+                    # the data in the subsequent tiles. It's sufficient to just use
+                    # the internal buffer as input and output
+                    partial_o_acc = buffer_to_reduce.acquire(1)
+                    add(
+                        partial_o_acc,
+                        elem_in_o_acc,
+                        elem_in_o_acc,
+                        q_seq_tile * emb_tile,
+                    )
+                    buffer_to_reduce.release(1)
+
+                elem_out_o = of_o_out.acquire(1)
+                copy(elem_in_o_acc, elem_out_o, q_seq_tile * emb_tile)
+                of_o_acc_in.release(1)
+                of_o_out.release(1)
+
+    # Create worker from task
+    matmul_workers = []
+    softmax_workers = []
+    matmul_pv_workers = []
+    o_proj_workers = []
+    worker_barriers = [
+        [WorkerRuntimeBarrier(initial_value=0) for _ in range(parallel_lanes)]
+        for _ in range(3)
+    ]
+    q_block_stride = parallel_seq if sequence_parallel_mode else 1
+    for i in range(parallel_lanes):
+        seq_lane = i // parallel_heads if sequence_parallel_mode else 0
+        head_lane = i % parallel_heads if sequence_parallel_mode else i
+        idx_buffer_qk = Buffer(
+            initial_value=np.array([0, seq_lane], dtype=np.int32),
+            name=f"idx_buffer_qk_{i}",
+        )
+        matmul_workers.append(
+            Worker(
+                batched_matmul_qk,
+                fn_args=[
+                    memQ[i].cons(),
+                    (
+                        memK[head_lane].cons()
+                        if sequence_parallel_mode
+                        else memK[i].cons()
+                    ),
+                    memA[i].prod(),
+                    zero_kernel,
+                    matmul_QK,
+                    seq_lane,
+                    q_block_stride,
+                    worker_barriers[0][i],
+                    idx_buffer_qk,
+                ],
+                stack_size=0xD00,
+                placement=Tile(col=i, row=2),
+                while_true=False,
+            )
+        )
+        idx_buffer_softmax = Buffer(
+            initial_value=np.array([0, seq_lane], dtype=np.int32),
+            name=f"idx_buffer_softmax_{i}",
+        )
+        scale_buffer_softmax = Buffer(
+            initial_value=np.zeros(shape=(4 * q_seq_tile,), dtype=dtype),
+            name=f"scale_buffer_softmax_{i}",
+        )
+        softmax_workers.append(
+            Worker(
+                softmax,
+                fn_args=[
+                    memA[i].cons(),
+                    memP[i].prod(),
+                    scaleOF[i].prod(),
+                    partial_softmax_kernel,
+                    scale_buffer_init_kernel,
+                    memcopy_kernel_scale,
+                    seq_lane,
+                    q_block_stride,
+                    worker_barriers[1][i],
+                    idx_buffer_softmax,
+                    scale_buffer_softmax,
+                ],
+                stack_size=0xD00,
+                placement=Tile(col=i, row=3),
+                while_true=False,
+            )
+        )
+        idx_buffer_pv = Buffer(
+            initial_value=np.array([0, seq_lane], dtype=np.int32),
+            name=f"idx_buffer_pv_{i}",
+        )
+        matmul_pv_workers.append(
+            Worker(
+                batched_matmul_pv,
+                fn_args=[
+                    memP[i].cons(),
+                    (
+                        memV[head_lane].cons()
+                        if sequence_parallel_mode
+                        else memV[i].cons()
+                    ),
+                    scaleOF[i].cons(),
+                    outOProj[i].prod(),
+                    zero_kernel_q,
+                    matmul_PV,
+                    rescale_O,
+                    seq_lane,
+                    q_block_stride,
+                    worker_barriers[2][i],
+                    idx_buffer_pv,
+                ],
+                stack_size=0xD00,
+                placement=Tile(col=i, row=4),
+                while_true=False,
+            )
+        )
+        o_proj_workers.append(
+            Worker(
+                matmul_o_proj,
+                fn_args=[
+                    outOProj[i].cons(),
+                    (
+                        memOW[head_lane].cons()
+                        if sequence_parallel_mode
+                        else memOW[i].cons()
+                    ),
+                    outOProjAccumIn[i].cons(depth=1),
+                    outOProjAccumOut[i].prod(),
+                    (
+                        (
+                            outOPart[seq_lane][head_lane].prod()
+                            if sequence_parallel_mode
+                            and parallel_heads > 1
+                            and head_lane < parallel_heads - 1
+                            else outO[seq_lane].prod()
+                        )
+                        if sequence_parallel_mode
+                        else (
+                            outOPart[i].prod()
+                            if i < parallel_heads - 1
+                            else outO[0].prod()
+                        )
+                    ),
+                    (
+                        (
+                            None
+                            if head_lane == 0
+                            else outOPart[seq_lane][head_lane - 1].cons()
+                        )
+                        if sequence_parallel_mode and parallel_heads > 1
+                        else (
+                            None
+                            if sequence_parallel_mode
+                            else (outOPart[i - 1].cons() if i > 0 else None)
+                        )
+                    ),
+                    zero_kernel_o_proj,
+                    matmul_kernel_o_proj,
+                    eltwise_add_vector,
+                    mem_copy_o_proj,
+                ],
+                stack_size=0xD00,
+                placement=Tile(col=i, row=5),
+                while_true=False,
+            )
+        )
+
+    # Define tensor access patterns for inputs/outputs
+    # A and B are tiled across M and N respectively, while C is tiled across M and N
+    # NOTE: It's important that the tiling of Q/K/V are such that the subsequent tiles
+    # across the heads, not the sequence length (i.e. how it's done in the MHA operator),
+    # because the cores execute on each head. However, we have to keep in mind that
+    # K/v need to have the full sequence length passed for each head.
+    if sequence_parallel_mode:
+        q_tile_rows = parallel_seq_join_distribute * q_seq_tile
+        q_tiles_base = TensorTiler2D.group_tiler(
+            (seq_len, embed_sz),
+            (q_tile_rows, d * parallel_heads),
+            (1, num_qkv_head_block_per_parallel_head),
+        )
+    else:
+        q_tiles_base = TensorTiler2D.group_tiler(
+            (seq_len, embed_sz),
+            (q_seq_tile, d),
+            (1, heads),
+        )
+
+    k_tiles_base = TensorTiler2D.group_tiler(
+        (seq_len, embed_sz),
+        (kv_seq_tile, d),
+        (num_kv_seq_blocks, parallel_heads),
+    )
+
+    v_tiles_base = TensorTiler2D.group_tiler(
+        (seq_len, embed_sz),
+        (kv_seq_tile, d),
+        (num_kv_seq_blocks, parallel_heads),
+    )
+
+    Q_tiles = q_tiles_base
+    K_tiles = k_tiles_base
+    V_tiles = v_tiles_base
+
+    # NOTE: Dividing by num_o_col_groups to get the correct number of tiles expected
+    # in the runtime seequence. Also not including o_proj_acc_depth in the tile col
+    # dim because the WO buffers operate on tiles with size emb_tile. If we
+    # use a tile col dim of emb_tile * o_proj_acc_depth, then the (d, emb_tile)
+    # used for WO will be wrong as the data is written contiguously based on the
+    # access pattern, i.e. written contiguously as rows of size emb_tile * o_proj_acc_depth,
+    # when it should be rows of size emb_tile
+    WO_tiles = TensorTiler2D.group_tiler(
+        (embed_sz, embed_sz),
+        (d, emb_tile),
+        (parallel_heads, embed_sz // emb_tile // num_o_col_groups),
+    )
+    # Flip the first two dimensions of WO so that the 3rd dimension iterates over rows for splitting
+    # to FIFOs and 4th dimension iterates over columns for partial accumulations
+    for tile in WO_tiles:
+        tile._sizes = [tile._sizes[1], tile._sizes[0], tile._sizes[2], tile._sizes[3]]
+        tile._strides = [
+            tile._strides[1],
+            tile._strides[0],
+            tile._strides[2],
+            tile._strides[3],
+        ]
+    o_tile_rows = (
+        parallel_seq_join_distribute * q_seq_tile
+        if sequence_parallel_mode
+        else q_seq_tile
+    )
+    O_tiles = TensorTiler2D.group_tiler(
+        (seq_len, embed_sz),
+        (o_tile_rows, emb_tile),
+        (1, embed_sz // emb_tile // num_o_col_groups),
+    )
+
+    def legalize_tap(tap: TensorAccessPattern, max_dim_size: int):
+
+        sizes = list(tap._sizes)
+        strides = list(tap._strides)
+
+        # Skip if no need to legalize
+        if all(size <= max_dim_size for size in sizes):
+            return tap
+
+        # Split oversized dimensions (working backwards to preserve indices)
+        i = len(sizes) - 1
+        while i >= 0:
+            if sizes[i] > max_dim_size:
+                # Calculate quotient and remainder for splitting
+                multiplier = 1
+                while sizes[i] > max_dim_size:
+                    sizes[i] //= 2
+                    multiplier *= 2
+                quotient = multiplier
+                remainder = sizes[i]
+
+                # Insert new outer dimension before this one
+                sizes.insert(i, quotient)
+                strides.insert(i, strides[i] * remainder)
+
+                # Update the inner dimension
+                sizes[i + 1] = remainder
+                # stride[i + 1] stays the same
+
+                i -= 1  # Skip the newly inserted dimension
+            i -= 1
+
+        # Remove leading dimensions with size 1
+        while sizes and sizes[0] == 1:
+            sizes.pop(0)
+            strides.pop(0)
+
+        # Check that the number of dimensions does not exceed hardware limit
+        if len(sizes) > 4:
+            raise ValueError(
+                f"Cannot legalize: resulting dimensions {len(sizes)} exceed maximum of 4 "
+                f"supported by hardware (sizes: {sizes}, strides: {strides})"
+            )
+
+        tap._sizes = sizes
+        tap._strides = strides
+
+        return tap
+
+    def legalize_tas(tas: TensorAccessSequence):
+
+        max_dim_size = 1023  # Max DMA dimension size for memTile DMA on NPU2
+
+        for tap in tas:
+            tap = legalize_tap(tap, max_dim_size)
+
+    legalize_tas(Q_tiles)
+    legalize_tas(K_tiles)
+    legalize_tas(V_tiles)
+    legalize_tas(WO_tiles)
+    legalize_tas(O_tiles)
+
+    # Runtime operations to move data to/from the AIE-array
+    rt = Runtime()
+    with rt.sequence(W_O_ty, Q_ty, K_ty, V_ty, O_ty) as (W_O, Q, K, V, O):
+        for stage in range(3):
+            for lane in range(parallel_lanes):
+                rt.set_barrier(worker_barriers[stage][lane], 1)
+
+        for i in range(parallel_lanes):
+            rt.start(matmul_workers[i])
+            rt.start(softmax_workers[i])
+            rt.start(matmul_pv_workers[i])
+            rt.start(o_proj_workers[i])
+
+        for col_group in range(num_o_col_groups):
+            for q_block_idx in range(num_runtime_q_groups):
+                # Initialize a group for parallel drain tasks, with fill resources free'd when drains complete.
+                tg = rt.task_group()
+
+                if sequence_parallel_mode and parallel_lanes > 6:
+                    rt.fill(
+                        inQ.prod(),
+                        Q,
+                        tap=Q_tiles[2 * q_block_idx],
+                        placement=Tile(col=6, row=0),
+                        task_group=tg,
+                    )
+                    rt.fill(
+                        inQ2.prod(),
+                        Q,
+                        tap=Q_tiles[2 * q_block_idx + 1],
+                        placement=Tile(col=7, row=0),
+                        task_group=tg,
+                    )
+                else:
+                    rt.fill(
+                        inQ.prod(),
+                        Q,
+                        tap=Q_tiles[q_block_idx],
+                        placement=Tile(col=0, row=0),
+                        task_group=tg,
+                    )
+                logging.debug(
+                    f"Scheduling fills for q block {q_block_idx}, col group {col_group} for Q, K, V, W_O, and O"
+                )
+                if sequence_parallel_mode and parallel_lanes > 6:
+                    logging.debug(f"  Q tap 0: {Q_tiles[2 * q_block_idx]}")
+                    logging.debug(f"  Q tap 1: {Q_tiles[2 * q_block_idx + 1]}")
+                else:
+                    logging.debug(f"  Q tap: {Q_tiles[q_block_idx]}")
+                for head_idx in range(heads // parallel_heads):
+                    tg_head = rt.task_group()
+                    rt.fill(
+                        inK.prod(),
+                        K,
+                        tap=K_tiles[head_idx],
+                        placement=Tile(col=1, row=0),
+                        task_group=tg_head,
+                        wait=True,
+                    )
+                    rt.fill(
+                        inV.prod(),
+                        V,
+                        tap=V_tiles[head_idx],
+                        placement=Tile(col=2, row=0),
+                        task_group=tg_head,
+                        wait=True,
+                    )
+                    rt.fill(
+                        inOW.prod(),
+                        W_O,
+                        tap=WO_tiles[head_idx * num_o_col_groups + col_group],
+                        placement=Tile(col=3, row=0),
+                        task_group=tg_head,
+                        wait=True,
+                    )
+                    rt.finish_task_group(tg_head)
+                    logging.debug(f"    K tap: {K_tiles[head_idx]}")
+                    logging.debug(f"    V tap: {V_tiles[head_idx]}")
+                    logging.debug(
+                        f"    W_O tap: {WO_tiles[head_idx * num_o_col_groups + col_group]}"
+                    )
+
+                if sequence_parallel_mode and parallel_lanes > 6:
+                    rt.drain(
+                        memO.cons(),
+                        O,
+                        tap=O_tiles[(2 * q_block_idx) * num_o_col_groups + col_group],
+                        wait=True,
+                        placement=Tile(col=6, row=0),
+                        task_group=tg,
+                    )
+                    rt.drain(
+                        memO2.cons(),
+                        O,
+                        tap=O_tiles[
+                            (2 * q_block_idx + 1) * num_o_col_groups + col_group
+                        ],
+                        wait=True,
+                        placement=Tile(col=7, row=0),
+                        task_group=tg,
+                    )
+                    logging.debug(
+                        "  O taps: %s / %s",
+                        O_tiles[(2 * q_block_idx) * num_o_col_groups + col_group],
+                        O_tiles[(2 * q_block_idx + 1) * num_o_col_groups + col_group],
+                    )
+                else:
+                    rt.drain(
+                        memO.cons(),
+                        O,
+                        tap=O_tiles[q_block_idx * num_o_col_groups + col_group],
+                        wait=True,
+                        placement=Tile(col=7, row=0),
+                        task_group=tg,
+                    )
+                    logging.debug(
+                        f"  O tap: {O_tiles[q_block_idx * num_o_col_groups + col_group]}"
+                    )
+                rt.finish_task_group(tg)
+
+    my_program = Program(NPU2(), rt)
+
+    # Place components (assign them resources on the device) and generate an MLIR module
+    module = my_program.resolve_program(SequentialPlacer())
+    return module
+
+
+if __name__ == "__main__":
+    main()

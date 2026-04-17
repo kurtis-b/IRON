@@ -1,28 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import torch
-import numpy as np
-from ml_dtypes import bfloat16
 import logging
 from pathlib import Path
+
+import numpy as np
+import torch
+from ml_dtypes import bfloat16
 
 from iron.common import (
     AIEOperatorBase,
     AIEOperatorConstraintError,
-    XclbinArtifact,
     InstsBinArtifact,
-    KernelObjectArtifact,
     KernelArchiveArtifact,
-    SourceArtifact,
+    KernelObjectArtifact,
     PythonGeneratedMLIRArtifact,
+    SourceArtifact,
+    XclbinArtifact,
 )
-
-from iron.common.utils import torch_to_numpy, numpy_to_torch
+from iron.common.utils import numpy_to_torch, torch_to_numpy
 
 
 class AIEGEMM(AIEOperatorBase):
-    """AIE-accelerated General Matrix Multiplication (GEMM) layer"""
+    """AIE-accelerated General Matrix Multiplication (GEMM) layer."""
 
     def __init__(
         self,
@@ -33,22 +33,31 @@ class AIEGEMM(AIEOperatorBase):
         tile_m=64,
         tile_k=64,
         tile_n=64,
-        # TODO: Add support for partitioning M and/or K
-        # partition_M=1,
-        # partition_K=1,
         partition_N=1,
         num_aie_columns=8,
+        batch_A=(1, 0),
+        batch_B=(1, 0),
+        batch_C=(1, 0),
         context=None,
+        skip_add_to_list=False,
         **gemm_kwargs,
     ):
-
         self.tile_m = tile_m
         self.tile_k = tile_k
         self.tile_n = tile_n
         self.num_aie_columns = num_aie_columns
+        self.partition_N = partition_N
+        self.batch_A = batch_A
+        self.batch_B = batch_B
+        self.batch_C = batch_C
+        self.input_a_buffer_shape = gemm_kwargs.pop("input_a_buffer_shape", None)
+        self.input_b_buffer_shape = gemm_kwargs.pop("input_b_buffer_shape", None)
+        self.output_c_buffer_shape = gemm_kwargs.pop("output_c_buffer_shape", None)
+        self.input_a_offset = gemm_kwargs.pop("input_a_offset", 0)
+        self.input_b_offset = gemm_kwargs.pop("input_b_offset", 0)
+        self.output_c_offset = gemm_kwargs.pop("output_c_offset", 0)
         self.gemm_args = gemm_kwargs
 
-        # Set frequently accessed gemm_args
         self.b_col_maj = gemm_kwargs.get("b_col_maj", False)
         self.c_col_maj = gemm_kwargs.get("c_col_maj", False)
         self.weight = (
@@ -58,42 +67,145 @@ class AIEGEMM(AIEOperatorBase):
         )
         self.static_weight_shape = (K, N)
 
-        # The operator's M, K, N represent what the NPU operator supports.
-        # Calls to forward() may supply matrices of different sizes, and the
-        # Python code will perform necessary padding/repeated application of
-        # the NPU operator.
-        assert (
-            N % partition_N == 0
-        ), f"N ({N}) must be divisible by partition_N ({partition_N})"
-        M_padded, K_padded, N_padded = self._get_padded_dims(
-            M, K, N // partition_N, tile_m, tile_k, tile_n
-        )
+        if len(batch_A) != 2 or len(batch_B) != 2 or len(batch_C) != 2:
+            raise AIEOperatorConstraintError(
+                "batch_A, batch_B, and batch_C must be 2-tuples of (batch_size, batch_stride_dim)"
+            )
+        if self._uses_batched_layout() and partition_N != 1:
+            raise AIEOperatorConstraintError(
+                "partition_N > 1 is not supported together with batched GEMM"
+            )
+        if batch_C[0] == 1 and (batch_A[0] > 1 or batch_B[0] > 1):
+            raise AIEOperatorConstraintError(
+                "batch_A/batch_B > 1 requires batch_C > 1 in AIEGEMM"
+            )
+        if self._uses_batched_layout() and use_static_weight and batch_B[0] > 1:
+            raise AIEOperatorConstraintError(
+                "Static weights are only supported for batch_B=(1, 0) in batched GEMM"
+            )
+        if not self._uses_batched_layout() and (
+            self.input_a_buffer_shape is not None
+            or self.input_b_buffer_shape is not None
+            or self.output_c_buffer_shape is not None
+            or self.input_a_offset != 0
+            or self.input_b_offset != 0
+            or self.output_c_offset != 0
+        ):
+            raise AIEOperatorConstraintError(
+                "Buffer window overrides are only supported for batched GEMM"
+            )
+
+        if self._uses_batched_layout():
+            M_padded, K_padded, N_padded = self._get_padded_dims(M, K, N)
+        else:
+            if N % partition_N != 0:
+                raise AIEOperatorConstraintError(
+                    f"N ({N}) must be divisible by partition_N ({partition_N})"
+                )
+            M_padded, K_padded, N_padded = self._get_padded_dims(M, K, N // partition_N)
         self.M = M_padded
         self.K = K_padded
         self.N = N_padded
-        self.partition_N = partition_N
 
-        # Artifacts created by set_up_artifacts()
         self.xclbin_artifact = None
         self.insts_artifact = None
+        self.runtime_xclbin_artifact = None
+        self.runtime_kernel_name = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
-    def get_artifacts(self, prefix="gemm_"):
-        # Extract parameters from self
+    def bind_artifacts(
+        self,
+        xclbin_artifact,
+        insts_artifact,
+        *,
+        runtime_xclbin_artifact=None,
+        runtime_kernel_name=None,
+    ):
+        self.xclbin_artifact = xclbin_artifact
+        self.insts_artifact = insts_artifact
+        self.runtime_xclbin_artifact = runtime_xclbin_artifact
+        self.runtime_kernel_name = runtime_kernel_name
+
+    def _uses_batched_layout(self):
+        return self.batch_C[0] > 1
+
+    @staticmethod
+    def _buffer_shape_element_count(shape):
+        return int(np.prod(shape))
+
+    def _buffer_window_name_suffix(self):
+        if not self._uses_batched_layout():
+            return ""
+
+        parts = []
+        for label, shape in (
+            ("bufA", self.input_a_buffer_shape),
+            ("bufB", self.input_b_buffer_shape),
+            ("bufC", self.output_c_buffer_shape),
+        ):
+            if shape is not None:
+                parts.append(f"{label}{shape[0]}x{shape[1]}")
+        for label, offset in (
+            ("offA", self.input_a_offset),
+            ("offB", self.input_b_offset),
+            ("offC", self.output_c_offset),
+        ):
+            if offset:
+                parts.append(f"{label}{offset}")
+        if not parts:
+            return ""
+        return "_" + "_".join(parts)
+
+    def _get_runtime_dims(self):
+        num_aie_rows = 4
+        min_M = self.tile_m * num_aie_rows
+        min_K = self.tile_k
+        min_N = self.tile_n * self.num_aie_columns
+        return min_M, min_K, min_N
+
+    def _get_artifact_name_base(self, prefix, M, K, N, include_partition_suffix=True):
+        dtype_in = self.gemm_args.get("dtype_in", "bf16")
+        dtype_out = self.gemm_args.get("dtype_out", "bf16")
+        emulate_bf16_mmul_with_bfp16 = self.gemm_args.get(
+            "emulate_bf16_mmul_with_bfp16", True
+        )
+        prio_accuracy = self.gemm_args.get("prio_accuracy", False)
+        use_scalar = self.gemm_args.get("use_scalar", False)
+        round_conv_even = self.gemm_args.get("round_conv_even", True)
+        file_name_total_base = (
+            f"{prefix}{M}x{K}x{N}_{self.num_aie_columns}_{self.tile_m}x{self.tile_k}x{self.tile_n}"
+            f"_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
+            f"_{dtype_in}_{dtype_out}"
+            f"_sc{int(use_scalar)}"
+            f"_acc{int(prio_accuracy)}"
+            f"_embf16{int(emulate_bf16_mmul_with_bfp16)}"
+            f"_round{int(round_conv_even)}"
+        )
+        if self._uses_batched_layout():
+            file_name_total_base += (
+                f"_batchA{self.batch_A[0]}d{self.batch_A[1]}"
+                f"_batchB{self.batch_B[0]}d{self.batch_B[1]}"
+                f"_batchC{self.batch_C[0]}d{self.batch_C[1]}"
+            )
+            file_name_total_base += self._buffer_window_name_suffix()
+        else:
+            file_name_total_base += "_ctiles1"
+        if (
+            not self._uses_batched_layout()
+            and include_partition_suffix
+            and self.partition_N > 1
+        ):
+            file_name_total_base += f"_partN{self.partition_N}"
+        return file_name_total_base
+
+    def _build_mlir_artifact(self, prefix, M, K, N, include_partition_suffix=True):
         operator_dir = Path(__file__).parent
-        tile_m = self.tile_m
-        tile_k = self.tile_k
-        tile_n = self.tile_n
-        M = self.M
-        K = self.K
-        N = self.N
-        num_aie_columns = self.num_aie_columns
         base_dir = self.context.base_dir
         device_str = self.context.device_manager.device_str()
 
-        b_col_maj = self.b_col_maj
-        c_col_maj = self.c_col_maj
         dtype_in = self.gemm_args.get("dtype_in", "bf16")
         dtype_out = self.gemm_args.get("dtype_out", "bf16")
         emulate_bf16_mmul_with_bfp16 = self.gemm_args.get(
@@ -103,6 +215,11 @@ class AIEGEMM(AIEOperatorBase):
         use_scalar = self.gemm_args.get("use_scalar", False)
         round_conv_even = self.gemm_args.get("round_conv_even", True)
 
+        tile_m = self.tile_m
+        tile_k = self.tile_k
+        tile_n = self.tile_n
+        num_aie_columns = self.num_aie_columns
+
         if emulate_bf16_mmul_with_bfp16:
             min_tile_m, min_tile_k, min_tile_n = 8, 8, 8
         else:
@@ -111,14 +228,26 @@ class AIEGEMM(AIEOperatorBase):
         assert tile_k >= min_tile_k, f"tile_k ({tile_k}) must be >= {min_tile_k}"
         assert tile_n >= min_tile_n, f"tile_n ({tile_n}) must be >= {min_tile_n}"
 
-        file_name_tile_base = f"{prefix}{tile_m}x{tile_k}x{tile_n}"
-        file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}"
-        xclbin_kernel_name = f"gemm_{file_name_tile_base}"
+        file_name_total_base = self._get_artifact_name_base(
+            prefix,
+            M,
+            K,
+            N,
+            include_partition_suffix=include_partition_suffix,
+        )
+
+        kernel_archive = (
+            f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
+            f"_{dtype_in}_{dtype_out}"
+            f"_sc{int(use_scalar)}"
+            f"_acc{int(prio_accuracy)}"
+            f"_embf16{int(emulate_bf16_mmul_with_bfp16)}"
+            f"_round{int(round_conv_even)}.a"
+        )
         kernel_flags = [
             f"-DDIM_M={tile_m}",
             f"-DDIM_K={tile_k}",
             f"-DDIM_N={tile_n}",
-            "-DROUND_CONV_EVEN",
         ]
         if prio_accuracy:
             kernel_flags.append("-Dbf16_f32_ONLY")
@@ -128,51 +257,78 @@ class AIEGEMM(AIEOperatorBase):
             kernel_flags.append("-DROUND_CONV_EVEN")
         if emulate_bf16_mmul_with_bfp16:
             kernel_flags.append("-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16")
-        if b_col_maj:
+        if self.b_col_maj:
             kernel_flags.append("-DB_COL_MAJ")
-        if c_col_maj:
+        if self.c_col_maj:
             kernel_flags.append("-DC_COL_MAJ")
 
-        kernel_archive = (
-            f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.a"
-        )
+        if self._uses_batched_layout():
+            mlir_artifact = PythonGeneratedMLIRArtifact.new(
+                f"{file_name_total_base}.mlir",
+                import_path=operator_dir / "design_batched.py",
+                callback_fn="my_matmul",
+                callback_kwargs={
+                    "dev": device_str,
+                    "M": M,
+                    "K": K,
+                    "N": N,
+                    "m": tile_m,
+                    "k": tile_k,
+                    "n": tile_n,
+                    "n_aie_cols": num_aie_columns,
+                    "dtype_in_str": dtype_in,
+                    "dtype_out_str": dtype_out,
+                    "b_col_maj": int(self.b_col_maj),
+                    "c_col_maj": int(self.c_col_maj),
+                    "use_scalar": use_scalar,
+                    "emulate_bf16_mmul_with_bfp16": emulate_bf16_mmul_with_bfp16,
+                    "prio_accuracy": prio_accuracy,
+                    "trace_size": 0,
+                    "archive": kernel_archive,
+                    "generate_taps": False,
+                    "batch_A": self.batch_A,
+                    "batch_B": self.batch_B,
+                    "batch_C": self.batch_C,
+                    "input_a_buffer_shape": self.input_a_buffer_shape,
+                    "input_b_buffer_shape": self.input_b_buffer_shape,
+                    "output_c_buffer_shape": self.output_c_buffer_shape,
+                    "input_a_offset": self.input_a_offset,
+                    "input_b_offset": self.input_b_offset,
+                    "output_c_offset": self.output_c_offset,
+                },
+                requires_context=False,
+            )
+        else:
+            mlir_artifact = PythonGeneratedMLIRArtifact.new(
+                f"{file_name_total_base}.mlir",
+                import_path=operator_dir / "design.py",
+                callback_fn="my_matmul",
+                callback_kwargs={
+                    "dev": device_str,
+                    "M": M,
+                    "K": K,
+                    "N": N,
+                    "m": tile_m,
+                    "k": tile_k,
+                    "n": tile_n,
+                    "n_aie_cols": num_aie_columns,
+                    "dtype_in_str": dtype_in,
+                    "dtype_out_str": dtype_out,
+                    "b_col_maj": int(self.b_col_maj),
+                    "c_col_maj": int(self.c_col_maj),
+                    "use_scalar": use_scalar,
+                    "emulate_bf16_mmul_with_bfp16": emulate_bf16_mmul_with_bfp16,
+                    "prio_accuracy": prio_accuracy,
+                    # Keep one general non-batched topology so partition_N only
+                    # affects workload insts/runtime sequencing, not xclbin identity.
+                    "separate_c_tiles": 1,
+                    "trace_size": 0,
+                    "archive": kernel_archive,
+                    "generate_taps": False,
+                },
+                requires_context=False,
+            )
 
-        mlir_artifact = PythonGeneratedMLIRArtifact.new(
-            f"{file_name_total_base}.mlir",
-            import_path=operator_dir / "design.py",
-            callback_fn="my_matmul",
-            callback_kwargs={
-                "dev": device_str,
-                "M": M,
-                "K": K,
-                "N": N,
-                "m": tile_m,
-                "k": tile_k,
-                "n": tile_n,
-                "n_aie_cols": num_aie_columns,
-                "dtype_in_str": dtype_in,
-                "dtype_out_str": dtype_out,
-                "b_col_maj": int(b_col_maj),
-                "c_col_maj": int(c_col_maj),
-                "use_scalar": use_scalar,
-                "emulate_bf16_mmul_with_bfp16": emulate_bf16_mmul_with_bfp16,
-                "prio_accuracy": prio_accuracy,
-                "separate_c_tiles": int(self.partition_N > 1),
-                "trace_size": 0,
-                "archive": kernel_archive,
-                "generate_taps": False,
-            },
-            requires_context=False,
-        )
-
-        # FIXME: We should be able to reuse the same xclbin for same tile
-        # sizes, only swapping out the instruction sequence for different
-        # problem sizes. However, there seem to be cases where this does
-        # not work and the GEMM appears to be misconfigured for the wrong
-        # size (resulting in a timeout when trying to run it). Perhaps
-        # XRT is caching something, or something is wrong with the run-
-        # time parameter (synchronization)? For now, create separate
-        # xclbins for each problem size.
         xclbin_artifact = XclbinArtifact.new(
             f"{file_name_total_base}.xclbin",
             depends=[
@@ -181,11 +337,23 @@ class AIEGEMM(AIEOperatorBase):
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.o",
+                            (
+                                f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
+                                f"_acc{int(prio_accuracy)}_embf16{int(emulate_bf16_mmul_with_bfp16)}"
+                                f"_round{int(round_conv_even)}.o"
+                            ),
                             extra_flags=kernel_flags,
                             depends=[
                                 SourceArtifact.new(
                                     base_dir / "aie_kernels" / "aie2p" / "mm.cc"
+                                )
+                            ],
+                        ),
+                        KernelObjectArtifact.new(
+                            "zero_scalar.o",
+                            [
+                                SourceArtifact.new(
+                                    base_dir / "aie_kernels" / "aie2p" / "zero.cc"
                                 )
                             ],
                         ),
@@ -205,24 +373,53 @@ class AIEGEMM(AIEOperatorBase):
             ],
             extra_flags=["--dynamic-objFifos"],
         )
-
         insts_artifact = InstsBinArtifact.new(
             f"{file_name_total_base}.bin",
             depends=[mlir_artifact],
             extra_flags=["--dynamic-objFifos"],
         )
+        return xclbin_artifact, insts_artifact
 
-        return (xclbin_artifact, insts_artifact)
+    def get_artifacts(self, prefix="gemm_"):
+        return self._build_mlir_artifact(prefix, self.M, self.K, self.N)
+
+    def get_insts_artifact(self, prefix="gemm_", xclbin_input=None, kernel_name=None):
+        _, insts_artifact = self._build_mlir_artifact(prefix, self.M, self.K, self.N)
+        insts_artifact.xclbin_input = xclbin_input
+        insts_artifact.kernel_name = (
+            kernel_name
+            if kernel_name is not None
+            else (
+                xclbin_input.kernel_name
+                if xclbin_input is not None and hasattr(xclbin_input, "kernel_name")
+                else None
+            )
+        )
+        return insts_artifact
+
+    def get_runtime_xclbin_artifact(self, prefix="gemm_runtime_"):
+        runtime_M, runtime_K, runtime_N = self._get_runtime_dims()
+        xclbin_artifact, _ = self._build_mlir_artifact(
+            prefix,
+            runtime_M,
+            runtime_K,
+            runtime_N,
+            include_partition_suffix=False,
+        )
+        return xclbin_artifact
 
     def set_up_artifacts(self):
-        # Describe required artifacts (xclbin, insts.bin)
-        device_str = self.context.device_manager.device_str()
-        xclbin_artifact, insts_artifact = self.get_artifacts()
-
-        self.xclbin_artifact = xclbin_artifact
-        self.insts_artifact = insts_artifact
-
-        self.add_artifacts([xclbin_artifact, insts_artifact])
+        if self.xclbin_artifact is None or self.insts_artifact is None:
+            xclbin_artifact, insts_artifact = self.get_artifacts()
+            self.xclbin_artifact = xclbin_artifact
+            self.insts_artifact = insts_artifact
+        artifacts = [self.xclbin_artifact, self.insts_artifact]
+        if (
+            self.runtime_xclbin_artifact is not None
+            and self.runtime_xclbin_artifact is not self.xclbin_artifact
+        ):
+            artifacts.append(self.runtime_xclbin_artifact)
+        self.add_artifacts(artifacts)
 
     def set_up_runtime(self):
         static_weights = None
@@ -230,72 +427,96 @@ class AIEGEMM(AIEOperatorBase):
             static_weights = self.weight.T
             if isinstance(static_weights, torch.Tensor):
                 static_weights = torch_to_numpy(static_weights)
+
+        runtime_xclbin_artifact = self.runtime_xclbin_artifact or self.xclbin_artifact
+        runtime_kernel_name = (
+            self.runtime_kernel_name or runtime_xclbin_artifact.kernel_name
+        )
         self.add_kernel(
             "gemm",
-            self.xclbin_artifact,
-            self.xclbin_artifact.kernel_name,
+            runtime_xclbin_artifact,
+            runtime_kernel_name,
             self.insts_artifact,
         )
+
+        if self._uses_batched_layout():
+            a_count = (
+                self._buffer_shape_element_count(self.input_a_buffer_shape)
+                if self.input_a_buffer_shape is not None
+                else self.M * self.K * self.batch_A[0]
+            )
+            self.add_buffer("A", a_count)
+            if static_weights is None:
+                b_count = (
+                    self._buffer_shape_element_count(self.input_b_buffer_shape)
+                    if self.input_b_buffer_shape is not None
+                    else self.K * self.N * self.batch_B[0]
+                )
+                self.add_buffer("B", b_count)
+            else:
+                self.add_buffer("B", self.K * self.N, static_data=static_weights)
+            c_count = (
+                self._buffer_shape_element_count(self.output_c_buffer_shape)
+                if self.output_c_buffer_shape is not None
+                else self.M * self.N * self.batch_C[0]
+            )
+            self.add_buffer("C", c_count)
+            self.add_to_runlist("gemm", "A", "B", "C")
+            return
+
         self.add_buffer("A", self.M * self.K)
         B_parts = self._partition_B(static_weights)
         for i, B_part in enumerate(B_parts):
-            self.add_buffer(
-                f"B_{i}",
-                self.K * self.N,
-                static_data=B_part,
-            )
+            if B_part is None:
+                self.add_buffer(f"B_{i}", self.K * self.N)
+            else:
+                self.add_buffer(f"B_{i}", self.K * self.N, static_data=B_part)
             self.add_buffer(f"C_{i}", self.M * self.N)
             self.add_to_runlist("gemm", "A", f"B_{i}", f"C_{i}")
 
     def _get_B_dims(self, B_shape):
-        """Extract K and N dimensions from B matrix shape based on layout.
-
-        Returns:
-            tuple: (K, N) dimensions regardless of B's layout
-        """
         if self.b_col_maj:
-            return B_shape[-1], B_shape[-2]  # B is (N, K) -> return (K, N)
-        else:
-            return B_shape[-2], B_shape[-1]  # B is (K, N) -> return (K, N)
+            return B_shape[-1], B_shape[-2]
+        return B_shape[-2], B_shape[-1]
 
     def forward(self, A, B=None):
-        """Forward pass through GEMM operation: C = A @ B"""
-        B_shape = B.shape if B is not None else self.static_weight_shape
+        """Forward pass through GEMM operation: C = A @ B."""
+        if self._uses_batched_layout():
+            return self._do_batched_gemm(A, B)
 
-        # Determine output dimensions based on matrix layout
+        B_shape = B.shape if B is not None else self.static_weight_shape
         K2, N = self._get_B_dims(B_shape)
         N_part = N // self.partition_N
-
-        # Build expected output shape based on C layout
         expected_output_shape = (
             A.shape[:-2] + (N, A.shape[-1]) if self.c_col_maj else A.shape[:-1] + (N,)
         )
 
-        # Remove batch dimension, if any
         if len(A.shape) > 2:
             A = A.view(-1, A.shape[-1])
         if B is not None and len(B.shape) > 2:
             B = B.view(-1, B_shape[-1])
 
         M, K = A.shape
-
         applicable = (
             K == K2
             and (M <= self.M or not self.c_col_maj)
             and K <= self.K
-            and N <= self.N
+            and N <= self.N * self.partition_N
         )
         if not applicable:
             raise AIEOperatorConstraintError("AIEGEMM: incompatible tensor shape(s)")
 
         A_padded = self._pad_A(torch_to_numpy(A))
-        if B is not None:
-            B_parts = self._partition_B(torch_to_numpy(B))
-        else:
-            B_parts = None
+        B_parts = self._partition_B(torch_to_numpy(B)) if B is not None else None
 
         logging.debug(
-            f"Executing GEMM for dimensions M={M}, K={K}, N={N} using NPU operator with M={self.M}, K={self.N}, N={self.N}"
+            "Executing GEMM for dimensions M=%s, K=%s, N=%s using NPU operator with M=%s, K=%s, N=%s",
+            M,
+            K,
+            N,
+            self.M,
+            self.K,
+            self.N,
         )
 
         if self.c_col_maj:
@@ -304,7 +525,7 @@ class AIEGEMM(AIEOperatorBase):
             result_padded = np.zeros((M, N), dtype=A_padded.dtype)
         for M_lo in range(0, M, self.M):
             A_part = A_padded[M_lo : M_lo + self.M, :]
-            result_parts = self._execute_aie_operation(A_part, B_parts)
+            result_parts = self._execute_partitioned_aie_operation(A_part, B_parts)
             max_M = min(M_lo + self.M, M)
             for part in range(self.partition_N):
                 if self.c_col_maj:
@@ -316,81 +537,165 @@ class AIEGEMM(AIEOperatorBase):
                         result_parts[part][:max_M, :N_part]
                     )
 
-        # GEMM produces 2D result, reshape to expected output shape
         if self.c_col_maj:
             result = numpy_to_torch(result_padded[:N, :M])
         else:
             result = numpy_to_torch(result_padded[:M, :N])
-        result = result.view(expected_output_shape)
+        return result.view(expected_output_shape)
 
-        return result
+    def _get_gemm_shapes(self, mtx_shape, batch_params):
+        batch_size, batch_stride_dim = batch_params
+        if batch_size == 1:
+            return mtx_shape
+        if batch_stride_dim == 0:
+            if batch_size == mtx_shape[0]:
+                return mtx_shape[1:]
+            raise AIEOperatorConstraintError("AIEGEMM: unexpected batched tensor shape")
+        if batch_size == mtx_shape[1]:
+            return mtx_shape[0], mtx_shape[2]
+        raise AIEOperatorConstraintError("AIEGEMM: unexpected batched tensor shape")
 
-    def _get_padded_dims(self, M, K, N, tile_m, tile_k, tile_n):
-        num_aie_columns = self.num_aie_columns
+    def _do_batched_gemm(self, A, B=None):
+        B_shape = B.shape if B is not None else self.weight.T.shape
+        K2, N = self._get_gemm_shapes(B_shape, self.batch_B)
+        M, K = self._get_gemm_shapes(A.shape, self.batch_A)
+        batch_size_C, batch_stride_dim_C = self.batch_C
+        expected_output_shape = (
+            (batch_size_C, M, N) if batch_stride_dim_C == 0 else (M, batch_size_C, N)
+        )
+        applicable = K == K2 and M <= self.M and K <= self.K and N <= self.N
+        if not applicable:
+            raise AIEOperatorConstraintError("AIEGEMM: incompatible tensor shape(s)")
+
+        A_padded = self._pad_A_batched(torch_to_numpy(A))
+        B_padded = self._pad_B_batched(torch_to_numpy(B)) if B is not None else None
+
+        logging.debug(
+            "Executing batched GEMM for dimensions M=%s, K=%s, N=%s using NPU operator with M=%s, K=%s, N=%s",
+            M,
+            K,
+            N,
+            self.M,
+            self.K,
+            self.N,
+        )
+
+        if batch_stride_dim_C == 0:
+            result_padded = np.zeros((batch_size_C, M, self.N), dtype=A_padded.dtype)
+            for M_lo in range(0, M, self.M):
+                if self.batch_A[1] == 0:
+                    A_part = A_padded[:, M_lo : M_lo + self.M, :]
+                else:
+                    A_part = A_padded[M_lo : M_lo + self.M, :, :]
+                result_part = self._execute_batched_aie_operation(A_part, B_padded)
+                max_M = min(M_lo + self.M, M)
+                result_padded[:, M_lo:max_M, :N] = result_part[:, :max_M, :N]
+            result = numpy_to_torch(result_padded[:, :M, :N])
+        else:
+            result_padded = np.zeros((M, batch_size_C, self.N), dtype=A_padded.dtype)
+            for M_lo in range(0, M, self.M):
+                if self.batch_A[1] == 0:
+                    A_part = A_padded[:, M_lo : M_lo + self.M, :]
+                else:
+                    A_part = A_padded[M_lo : M_lo + self.M, :, :]
+                result_part = self._execute_batched_aie_operation(A_part, B_padded)
+                max_M = min(M_lo + self.M, M)
+                result_padded[M_lo:max_M, :, :N] = result_part[:max_M, :, :N]
+            result = numpy_to_torch(result_padded[:M, :, :N])
+
+        return result.view(expected_output_shape)
+
+    def _get_padded_dims(self, M, K, N):
         num_aie_rows = 4
-
-        min_M = tile_m * num_aie_rows
-        min_K = tile_k
-        min_N = tile_n * num_aie_columns
-
-        # Calculate padded dimensions
+        min_M = self.tile_m * num_aie_rows
+        min_K = self.tile_k
+        min_N = self.tile_n * self.num_aie_columns
         M_padded = ((M + min_M - 1) // min_M) * min_M
         K_padded = ((K + min_K - 1) // min_K) * min_K
         N_padded = ((N + min_N - 1) // min_N) * min_N
-
         return M_padded, K_padded, N_padded
 
     def _pad_A(self, A_np):
-        """Pad A matrix to match operator dimensions (M, K)"""
         M, K = A_np.shape
         if M % self.M == 0 and K == self.K:
             return A_np
-
         M_padded = ((M + self.M - 1) // self.M) * self.M
         A_padded = np.zeros((M_padded, self.K), dtype=A_np.dtype)
         A_padded[:M, :K] = A_np
         return A_padded
 
+    def _pad_A_batched(self, A_np):
+        batch_size, batch_stride_dim = self.batch_A
+        if batch_stride_dim == 0:
+            M, K = A_np.shape[1:]
+            if M % self.M == 0 and K == self.K:
+                return A_np
+            M_multiple = ((M + self.M - 1) // self.M) * self.M
+            A_padded = np.zeros((batch_size, M_multiple, self.K), dtype=A_np.dtype)
+            A_padded[:, :M, :K] = A_np
+            return A_padded
+
+        M, K = self._get_gemm_shapes(A_np.shape, self.batch_A)
+        if M % self.M == 0 and K == self.K:
+            return A_np
+        M_multiple = ((M + self.M - 1) // self.M) * self.M
+        A_padded = np.zeros((M_multiple, batch_size, self.K), dtype=A_np.dtype)
+        A_padded[:M, :, :K] = A_np
+        return A_padded
+
     def _pad_B(self, B_np):
-        """Pad B matrix to match operator dimensions based on layout"""
         if self.b_col_maj:
             N, K = B_np.shape
             if N == self.N and K == self.K:
                 return B_np
             B_padded = np.zeros((self.N, self.K), dtype=B_np.dtype)
             B_padded[:N, :K] = B_np
-        else:
-            K, N = B_np.shape
-            if K == self.K and N == self.N:
-                return B_np
-            B_padded = np.zeros((self.K, self.N), dtype=B_np.dtype)
-            B_padded[:K, :N] = B_np
+            return B_padded
+
+        K, N = B_np.shape
+        if K == self.K and N == self.N:
+            return B_np
+        B_padded = np.zeros((self.K, self.N), dtype=B_np.dtype)
+        B_padded[:K, :N] = B_np
         return B_padded
 
-    def _partition_B(self, B):
-        B_parts = [None] * self.partition_N
-        if B is None:
-            return B_parts
+    def _pad_B_batched(self, B_np):
+        batch_size, batch_stride_dim = self.batch_B
+        if batch_stride_dim == 0:
+            K, N = B_np.shape[1:]
+            if K == self.K and N == self.N:
+                return B_np
+            B_padded = np.zeros((batch_size, self.K, self.N), dtype=B_np.dtype)
+            B_padded[:, :K, :N] = B_np
+            return B_padded
+
+        K, N = self._get_gemm_shapes(B_np.shape, self.batch_B)
+        if K == self.K and N == self.N:
+            return B_np
+        B_padded = np.zeros((self.K, batch_size, self.N), dtype=B_np.dtype)
+        B_padded[:K, :, :N] = B_np
+        return B_padded
+
+    def _partition_B(self, B_np):
+        parts = [None] * self.partition_N
+        if B_np is None:
+            return parts
         for i in range(self.partition_N):
             col_start = i * self.N
             col_end = (i + 1) * self.N
-
-            # Just in case, pad the weights before adding the buffer
             if self.b_col_maj:
-                B_parts[i] = self._pad_B(B[col_start:col_end, :])
+                parts[i] = self._pad_B(B_np[col_start:col_end, :])
             else:
-                B_parts[i] = self._pad_B(B[:, col_start:col_end])
-        self.static_weight_shape = B_parts[0].shape
-        return B_parts
+                parts[i] = self._pad_B(B_np[:, col_start:col_end])
+        self.static_weight_shape = parts[0].shape
+        return parts
 
-    def _execute_aie_operation(self, A_np, B_nps=None):
-        """Execute GEMM operation on AIE hardware"""
+    def _execute_partitioned_aie_operation(self, A_np, B_nps=None):
         M, K = A_np.shape
         B_shape = B_nps[0].shape if B_nps is not None else self.static_weight_shape
         K2, N = self._get_B_dims(B_shape)
         C_shape = (N, M) if self.c_col_maj else (M, N)
 
-        # Validate dimensions match operator configuration
         assert M == self.M
         assert K == K2 and K == self.K
         assert N == self.N
@@ -398,25 +703,29 @@ class AIEGEMM(AIEOperatorBase):
         self.write_buffer("A", A_np)
         if B_nps is not None:
             for i, B_np in enumerate(B_nps):
-                self.add_buffer(
-                    f"B_{i}",
-                    self.M * self.N,
-                    static_data=B_np,
-                )
+                self.write_buffer(f"B_{i}", B_np)
         self.run_runlist()
-        result_nps = [
+        return [
             self.read_buffer(f"C_{i}", shape=C_shape, dtype=bfloat16)
             for i in range(self.partition_N)
         ]
 
-        # Check for NaN and fail hard
-        # for result_np in result_nps:
-        #     if np.isnan(result_np).any():
-        #         nan_count = np.isnan(result_np).sum()
-        #         total_count = result_np.size
-        #         raise RuntimeError(
-        #             f"AIE execution returned {nan_count}/{total_count} NaN values. "
-        #         )
+    def _execute_batched_aie_operation(self, A_np, B_np=None):
+        M, K = self._get_gemm_shapes(A_np.shape, self.batch_A)
+        if B_np is not None:
+            K2, N = self._get_gemm_shapes(B_np.shape, self.batch_B)
+        else:
+            K2, N = self._get_gemm_shapes(self.weight.T.shape, self.batch_B)
 
-        # Convert back to torch tensor
-        return result_nps
+        assert M == self.M
+        assert K == K2 and K == self.K
+        assert N == self.N
+
+        self.write_buffer("A", A_np)
+        if B_np is not None:
+            self.write_buffer("B", B_np)
+        self.run_runlist()
+
+        if self.batch_C[1] == 0:
+            return self.read_buffer("C", shape=(self.batch_C[0], M, N), dtype=bfloat16)
+        return self.read_buffer("C", shape=(M, self.batch_C[0], N), dtype=bfloat16)

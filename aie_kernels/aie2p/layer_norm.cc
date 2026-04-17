@@ -48,6 +48,98 @@ template <typename T, int N> void layer_norm(const T *restrict input, T *restric
     event1();
 }
 
+template <typename T, int N>
+void layer_norm_rows(const T *restrict input, T *restrict output, int32_t cols, int32_t rows_to_process)
+{
+    event0();
+    constexpr float epsilon = 1e-5f;
+
+    int vector_chunks = cols / N;
+    for (int row = 0; row < rows_to_process; row++) {
+        ::aie::vector<T, N> sum_acc = ::aie::zeros<T, N>();
+        ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
+        int input_index = row * cols;
+        for (int i = 0; i < vector_chunks; i++) {
+            ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_index);
+            sum_acc = ::aie::add(sum_acc, reg_a);
+            ::aie::vector<float, N> sq_acc = ::aie::mul(reg_a, reg_a);
+            sum_sq_acc = ::aie::add(sum_sq_acc, sq_acc);
+            input_index += N;
+        }
+        input_index -= cols;
+
+        float sum_of_vals = ::aie::reduce_add(sum_acc);
+        float sum_of_sq_vals = ::aie::reduce_add(sum_sq_acc);
+
+        float mean = sum_of_vals / float(cols);
+        float mean_sq = mean * mean;
+        float variance = (sum_of_sq_vals / float(cols)) - mean_sq;
+        float inv_std = aie::invsqrt(variance + epsilon);
+
+        ::aie::vector<T, N> mean_v = ::aie::broadcast<T, N>(mean);
+        ::aie::vector<T, N> inv_std_v = ::aie::broadcast<T, N>(inv_std);
+
+        for (int i = 0; i < vector_chunks; i++) {
+            ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input + input_index);
+            ::aie::vector<T, N> diff_v = ::aie::sub(reg_a, mean_v);
+            ::aie::vector<T, N> norm_v = ::aie::mul(diff_v, inv_std_v);
+            ::aie::store_v(output + input_index, norm_v);
+            input_index += N;
+        }
+    }
+    event1();
+}
+
+template <typename T, int N>
+void add_layer_norm_rows(const T *restrict input1,
+                         const T *restrict input2,
+                         T *restrict output,
+                         int32_t cols,
+                         int32_t rows_to_process)
+{
+    event0();
+    constexpr float epsilon = 1e-5f;
+
+    int vector_chunks = cols / N;
+    for (int row = 0; row < rows_to_process; row++) {
+        ::aie::vector<T, N> sum_acc = ::aie::zeros<T, N>();
+        ::aie::vector<float, N> sum_sq_acc = ::aie::zeros<float, N>();
+        int input_index = row * cols;
+        for (int i = 0; i < vector_chunks; i++) {
+            ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input1 + input_index);
+            ::aie::vector<T, N> reg_b = ::aie::load_v<N>(input2 + input_index);
+            ::aie::vector<T, N> reg_sum = ::aie::add(reg_a, reg_b);
+            sum_acc = ::aie::add(sum_acc, reg_sum);
+            ::aie::vector<float, N> sq_acc = ::aie::mul(reg_sum, reg_sum);
+            sum_sq_acc = ::aie::add(sum_sq_acc, sq_acc);
+            input_index += N;
+        }
+        input_index -= cols;
+
+        float sum_of_vals = ::aie::reduce_add(sum_acc);
+        float sum_of_sq_vals = ::aie::reduce_add(sum_sq_acc);
+
+        float mean = sum_of_vals / float(cols);
+        float mean_sq = mean * mean;
+        float variance = (sum_of_sq_vals / float(cols)) - mean_sq;
+        float inv_std = aie::invsqrt(variance + epsilon);
+
+        ::aie::vector<T, N> mean_v = ::aie::broadcast<T, N>(mean);
+        ::aie::vector<T, N> inv_std_v = ::aie::broadcast<T, N>(inv_std);
+
+        for (int i = 0; i < vector_chunks; i++) {
+            ::aie::vector<T, N> reg_a = ::aie::load_v<N>(input1 + input_index);
+            ::aie::vector<T, N> reg_b = ::aie::load_v<N>(input2 + input_index);
+            ::aie::vector<T, N> reg_sum = ::aie::add(reg_a, reg_b);
+            ::aie::vector<T, N> diff_v = ::aie::sub(reg_sum, mean_v);
+            ::aie::vector<T, N> norm_v = ::aie::mul(diff_v, inv_std_v);
+            ::aie::store_v(output + input_index, norm_v);
+            input_index += N;
+        }
+    }
+    event1();
+}
+
 // The below kernel increases the accuracy of the output by performing the calculations in f32, with performance
 // cost of a lower bandwidth by up to 2x.
 void layer_norm_bf16_f32_calculation(const bfloat16 *restrict input, bfloat16 *restrict output, int32_t cols)
@@ -104,5 +196,17 @@ void layer_norm(bfloat16 *input, bfloat16 *output, int32_t cols)
 {
     ::aie::set_rounding(aie::rounding_mode::conv_even);
     layer_norm<bfloat16, 16>(input, output, cols);
+}
+
+void layer_norm_rows(bfloat16 *input, bfloat16 *output, int32_t cols, int32_t rows_to_process)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    layer_norm_rows<bfloat16, 16>(input, output, cols, rows_to_process);
+}
+
+void add_layer_norm_rows(bfloat16 *input1, bfloat16 *input2, bfloat16 *output, int32_t cols, int32_t rows_to_process)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    add_layer_norm_rows<bfloat16, 16>(input1, input2, output, cols, rows_to_process);
 }
 }

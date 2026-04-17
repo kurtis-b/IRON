@@ -29,6 +29,7 @@ class AIEElementwiseAdd(AIEOperatorBase):
         num_channels=None,
         tile_size=None,
         context=None,
+        skip_add_to_list=False,
     ):
         max_multiple = num_aie_columns * tile_size
         padded_size = ((size + max_multiple - 1) // max_multiple) * max_multiple
@@ -38,21 +39,19 @@ class AIEElementwiseAdd(AIEOperatorBase):
 
         self.num_aie_columns = num_aie_columns
         self.num_channels = num_channels
-        # Enforce ShimDMA limits for elementwise_add (uses 2 inputs per core)
-        # Maximum safe configuration: 8 columns × 2 channels = 16 ShimDMA channels
         total_shimdma_channels = self.num_aie_columns * self.num_channels
         assert total_shimdma_channels <= 16, "Conservative ShimDMA limit"
 
-        # Artifacts created by set_up_artifacts()
         self.xclbin_artifact = None
         self.insts_artifact = None
 
-        AIEOperatorBase.__init__(self, context=context)
+        AIEOperatorBase.__init__(
+            self, context=context, skip_add_to_list=skip_add_to_list
+        )
 
-    def set_up_artifacts(self):
-        # Compilation artifacts
+    def get_artifacts(self, prefix="add_"):
         operator_dir = Path(__file__).parent
-        file_name_base = f"add_{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
+        file_name_base = f"{prefix}{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -73,7 +72,7 @@ class AIEElementwiseAdd(AIEOperatorBase):
             depends=[
                 mlir_artifact,
                 KernelObjectArtifact.new(
-                    f"add.o",
+                    "add.o",
                     depends=[
                         SourceArtifact.new(
                             self.context.base_dir / "aie_kernels" / "generic" / "add.cc"
@@ -87,14 +86,15 @@ class AIEElementwiseAdd(AIEOperatorBase):
             f"{file_name_base}.bin", depends=[mlir_artifact]
         )
 
+        return xclbin_artifact, insts_artifact
+
+    def set_up_artifacts(self):
+        xclbin_artifact, insts_artifact = self.get_artifacts()
         self.xclbin_artifact = xclbin_artifact
         self.insts_artifact = insts_artifact
-
-        artifacts = [xclbin_artifact, insts_artifact]
-        self.add_artifacts(artifacts)
+        self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
-        # Runtime setup
         self.add_buffer("input1", self.size)
         self.add_buffer("input2", self.size)
         self.add_buffer("output", self.size)
@@ -107,7 +107,6 @@ class AIEElementwiseAdd(AIEOperatorBase):
         self.add_to_runlist("eltwise_add", "input1", "input2", "output")
 
     def forward(self, x, y):
-        """Forward pass for element-wise addition"""
         applicable = (
             len(x.shape) >= 1
             and len(y.shape) >= 1
@@ -123,7 +122,6 @@ class AIEElementwiseAdd(AIEOperatorBase):
                 "AIEElementwiseAdd: incompatible tensor shape(s)"
             )
 
-        # Always flatten to [batch, orig_size]
         original_shape = x.shape
         batch = x.shape[0] if x.dim() > 1 else 1
         x_flat = x.reshape(batch, -1)
@@ -136,25 +134,17 @@ class AIEElementwiseAdd(AIEOperatorBase):
 
         out = self._execute_aie_operation(x_flat, y_flat)
 
-        # Remove padding if added
         numel = np.prod(original_shape)
         if pad_len > 0:
             out = out.reshape(-1)[..., :numel]
-        # Restore original shape
         out = out.reshape(*original_shape)
 
         return out
 
     def _execute_aie_operation(self, x, y):
-        """Execute element-wise addition operation on AIE hardware"""
-        # x, y are [batch, size]
-        batch = x.shape[0] if x.dim() > 1 else 1
-
-        # Flatten inputs for AIE processing
         x_flat = x.view(-1)
         y_flat = y.view(-1)
 
-        # Verify size matches expected
         if len(x_flat) != self.size or len(y_flat) != self.size:
             raise AIEOperatorConstraintError(
                 f"Input size x={len(x_flat)}, y={len(y_flat)} doesn't match configured size {self.size}"
