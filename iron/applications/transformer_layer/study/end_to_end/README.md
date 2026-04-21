@@ -46,7 +46,7 @@ Environment:
 
 ```bash
 source /opt/xilinx/xrt/setup.sh
-source ~/iron/ironenv/bin/activate
+source /path/to/iron/ironenv/bin/activate
 sudo xrt-smi configure --pmode turbo
 xrt-smi examine -r all
 ```

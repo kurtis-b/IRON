@@ -37,7 +37,6 @@ class AIEOperatorBase(ABC):
         self.kernels = {}  # Name -> (xclbin_path, xclbin_kernel_name, insts_path)
         self.buffers = {}  # Name -> required buffer size in bytes
         self.buffer_static_data = {}
-        self.buffer_aliases = {}  # Alias name -> target buffer name
         self.runlist = (
             []
         )  # List of (kernel_name, buffers_name, buffer_name...), will be executed in sequence
@@ -99,31 +98,18 @@ class AIEOperatorBase(ABC):
     def get_bo(self, buffer_name):
         return self.buffer_bos[buffer_name]
 
-    def _resolve_buffer_name(self, buffer_name):
-        seen = set()
-        resolved = buffer_name
-        while resolved in self.buffer_aliases:
-            if resolved in seen:
-                raise RuntimeError(
-                    f"Cycle detected while resolving buffer alias {buffer_name}"
-                )
-            seen.add(resolved)
-            resolved = self.buffer_aliases[resolved]
-        return resolved
-
     def _normalize_runtime_buffer_names(self, buffer_names):
         ordered = []
         seen = set()
         for buffer_name in buffer_names:
-            resolved = self._resolve_buffer_name(buffer_name)
-            if resolved not in self.buffer_bos:
+            if buffer_name not in self.buffer_bos:
                 raise RuntimeError(
                     f"Runtime sync metadata refers to unknown buffer '{buffer_name}'"
                 )
-            if resolved in seen:
+            if buffer_name in seen:
                 continue
-            seen.add(resolved)
-            ordered.append(resolved)
+            seen.add(buffer_name)
+            ordered.append(buffer_name)
         return tuple(ordered)
 
     def _configured_device_input_buffers(self):
@@ -134,7 +120,7 @@ class AIEOperatorBase(ABC):
                 buffer_arg
                 for _, *buffer_args in self.runlist
                 for buffer_arg in buffer_args
-                if self._resolve_buffer_name(buffer_arg) not in self.buffer_static_data
+                if buffer_arg not in self.buffer_static_data
             ]
         )
 
@@ -144,7 +130,7 @@ class AIEOperatorBase(ABC):
                 buffer_arg
                 for _, *buffer_args in self.runlist
                 for buffer_arg in buffer_args
-                if self._resolve_buffer_name(buffer_arg) not in self.buffer_static_data
+                if buffer_arg not in self.buffer_static_data
             ]
         )
 
@@ -156,53 +142,47 @@ class AIEOperatorBase(ABC):
                 buffer_arg
                 for _, *buffer_args in self.runlist
                 for buffer_arg in buffer_args
-                if self._resolve_buffer_name(buffer_arg) not in self.buffer_static_data
+                if buffer_arg not in self.buffer_static_data
             ]
         )
 
     def _runtime_output_buffers_for_call(self, buffer_args):
-        resolved_args = [
-            self._resolve_buffer_name(buffer_arg) for buffer_arg in buffer_args
-        ]
         configured_outputs = set(self._configured_host_output_buffers())
         matched_outputs = []
         seen = set()
-        for resolved_arg in resolved_args:
-            if resolved_arg not in configured_outputs or resolved_arg in seen:
+        for buffer_arg in buffer_args:
+            if buffer_arg not in configured_outputs or buffer_arg in seen:
                 continue
-            seen.add(resolved_arg)
-            matched_outputs.append(resolved_arg)
+            seen.add(buffer_arg)
+            matched_outputs.append(buffer_arg)
         if matched_outputs:
             return tuple(matched_outputs)
-        if not resolved_args:
+        if not buffer_args:
             return ()
-        return (resolved_args[-1],)
+        return (buffer_args[-1],)
 
     def _mark_buffer_dirty_to_device(self, buffer_name):
-        resolved = self._resolve_buffer_name(buffer_name)
-        if resolved in self.buffer_static_data:
+        if buffer_name in self.buffer_static_data:
             return
-        self._buffer_dirty_to_device[resolved] = True
+        self._buffer_dirty_to_device[buffer_name] = True
 
     def _sync_buffer_to_device_if_needed(self, buffer_name):
-        resolved = self._resolve_buffer_name(buffer_name)
-        if resolved in self.buffer_static_data:
+        if buffer_name in self.buffer_static_data:
             return
-        if not self._buffer_dirty_to_device.get(resolved, False):
+        if not self._buffer_dirty_to_device.get(buffer_name, False):
             return
-        self.buffer_bos[resolved].sync(
+        self.buffer_bos[buffer_name].sync(
             pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE
         )
-        self._buffer_dirty_to_device[resolved] = False
+        self._buffer_dirty_to_device[buffer_name] = False
 
     def _sync_buffer_from_device(self, buffer_name):
-        resolved = self._resolve_buffer_name(buffer_name)
-        if resolved in self.buffer_static_data:
+        if buffer_name in self.buffer_static_data:
             return
-        self.buffer_bos[resolved].sync(
+        self.buffer_bos[buffer_name].sync(
             pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
         )
-        self._buffer_dirty_to_device[resolved] = False
+        self._buffer_dirty_to_device[buffer_name] = False
 
     def _sync_insts_bo_to_device_if_needed(self, insts_bo):
         insts_bo_id = id(insts_bo)
@@ -236,8 +216,7 @@ class AIEOperatorBase(ABC):
 
     def write_buffer(self, buffer_name, array):
         """Write buffer from a numpy array into a XRT buffer object"""
-        resolved_name = self._resolve_buffer_name(buffer_name)
-        if resolved_name in self.buffer_static_data:
+        if buffer_name in self.buffer_static_data:
             raise RuntimeError(f"Cannot write to static buffer: {buffer_name}")
 
         # Normalize the source
@@ -249,14 +228,14 @@ class AIEOperatorBase(ABC):
         # Create a flattened 1D byte view of the source
         src_bytes = src.ravel().view(np.uint8)
 
-        bo = self.get_bo(resolved_name)
+        bo = self.get_bo(buffer_name)
         mv = bo.map()  # byte accessible memory view
         # Interpret the buffer as a 1-dimensional array
         dst_bytes = np.frombuffer(mv, dtype=np.uint8, count=bo.size())
 
         # The BO is an existing array, so copyto() can be called, which doesn't create a new array
         np.copyto(dst_bytes[: src_bytes.size], src_bytes, casting="no")
-        self._mark_buffer_dirty_to_device(resolved_name)
+        self._mark_buffer_dirty_to_device(buffer_name)
 
     @abstractmethod
     def set_up_artifacts(self):
@@ -277,7 +256,6 @@ class AIEOperatorBase(ABC):
         Subclasses are expected to overwrite set_up(); they may register any artifacts that they need to be compiled there.
         """
         context = self.context
-        comp.CompilationArtifact._instances.clear()
         self.set_up_artifacts()
         self._move_artifact_paths()
         work_list = comp.get_work_list(self.artifacts)
@@ -315,13 +293,6 @@ class AIEOperatorBase(ABC):
             else:
                 artifact.set_path(context.build_dir / artifact.path)
             todo.extend(artifact.depends)
-            logging.debug(
-                f"Moved artifact: {artifact.path}, depends on {len(artifact.depends)}, left {len(todo)}."
-            )
-            if len(artifact.depends) > 1:
-                logging.debug(
-                    f"    Depends on more than 1: {', '.join(str(d.path) for d in artifact.depends)}"
-                )
 
     def run_runlist(self):
         elapsed = 0.0
@@ -345,41 +316,12 @@ class AIEOperatorBase(ABC):
         return elapsed
 
     def run_kernel_once(self, kernel_name, *buffer_args):
-        lazy_kernel_loading = getattr(self, "lazy_kernel_loading", False)
-        if lazy_kernel_loading:
-            if kernel_name in self.xrt_kernels:
-                context, xrt_kernel, insts_bo, insts_len = self.xrt_kernels[kernel_name]
-            else:
-                xclbin_artifact, xclbin_kernel_name, insts_artifact = self.kernels[
-                    kernel_name
-                ]
-                handle = self.context.device_manager.get_kernel_handle(
-                    str(xclbin_artifact.path),
-                    xclbin_kernel_name,
-                    str(insts_artifact.path),
-                )
-                context, xrt_kernel, insts_bo, insts_len = (
-                    handle.context,
-                    handle.kernel,
-                    handle.insts_bo,
-                    len(handle.insts),
-                )
-                self.xrt_kernels[kernel_name] = (
-                    context,
-                    xrt_kernel,
-                    insts_bo,
-                    insts_len,
-                )
-        else:
-            context, xrt_kernel, insts_bo, insts_len = self.xrt_kernels[kernel_name]
+        _, xrt_kernel, insts_bo, insts_len = self.xrt_kernels[kernel_name]
         self._sync_insts_bo_to_device_if_needed(insts_bo)
         output_buffer_args = self._runtime_output_buffers_for_call(buffer_args)
         for buffer_arg in buffer_args:
             self._sync_buffer_to_device_if_needed(buffer_arg)
-        bos = [
-            self.buffer_bos[self._resolve_buffer_name(buffer_arg)]
-            for buffer_arg in buffer_args
-        ]
+        bos = [self.buffer_bos[buffer_arg] for buffer_arg in buffer_args]
         start = time.perf_counter()
         result = xrt_kernel(3, insts_bo, insts_len, *bos).wait()
         stop = time.perf_counter()

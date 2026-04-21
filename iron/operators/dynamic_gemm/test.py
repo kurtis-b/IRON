@@ -168,7 +168,6 @@ def test_dynamic_gemm_uses_single_runtime_buffers(aie_context):
     op.set_up_runtime()
 
     assert set(op.buffers.keys()) == {"A", "B", "C"}
-    assert op.buffer_aliases == {}
     assert op.buffers["A"] == 256 * 768 * 2
     assert op.buffers["B"] == 768 * 720 * 2
     assert op.buffers["C"] == 256 * 720 * 2

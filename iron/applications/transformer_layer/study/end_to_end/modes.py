@@ -816,7 +816,7 @@ def _benchmark_gemm(
                             col_hi = (i + 1) * int(gemm_kwargs["N"]) // partition_N
                             input_buffers[f"B_{i}"] = full_b[:, col_lo:col_hi].flatten()
                 else:
-                    input_buffers["B_0"] = reference["input_b"].flatten()
+                    input_buffers["B"] = reference["input_b"].flatten()
 
             if partition_N > 1:
                 full_c = reference["output"]
@@ -831,7 +831,7 @@ def _benchmark_gemm(
                         col_hi = (i + 1) * int(gemm_kwargs["N"]) // partition_N
                         output_buffers[f"C_{i}"] = full_c[:, col_lo:col_hi].flatten()
             else:
-                output_buffers["C_0"] = reference["output"].flatten()
+                output_buffers["C"] = reference["output"].flatten()
             total_output_size = int(gemm_kwargs["M"]) * int(gemm_kwargs["N"])
 
         errors, latency_us, bandwidth_gbps, timing_details = run_test(

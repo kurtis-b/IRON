@@ -142,25 +142,10 @@ class AIEDynamicGEMM(AIEOperatorBase):
 
         self.xclbin_artifact = None
         self.insts_artifact = None
-        self.runtime_xclbin_artifact = None
-        self.runtime_kernel_name = None
 
         AIEOperatorBase.__init__(
             self, context=context, skip_add_to_list=skip_add_to_list
         )
-
-    def bind_artifacts(
-        self,
-        xclbin_artifact,
-        insts_artifact,
-        *,
-        runtime_xclbin_artifact=None,
-        runtime_kernel_name=None,
-    ):
-        self.xclbin_artifact = xclbin_artifact
-        self.insts_artifact = insts_artifact
-        self.runtime_xclbin_artifact = runtime_xclbin_artifact
-        self.runtime_kernel_name = runtime_kernel_name
 
     def _get_runtime_dims(self):
         num_aie_rows = 4
@@ -328,12 +313,15 @@ class AIEDynamicGEMM(AIEOperatorBase):
         return xclbin_artifact, insts_artifact
 
     def get_artifacts(self, prefix="dynamic_gemm_"):
-        xclbin_artifact = self.get_runtime_xclbin_artifact(prefix=prefix)
-        insts_artifact = self.get_insts_artifact(
-            prefix=prefix,
-            xclbin_input=xclbin_artifact,
-            kernel_name=xclbin_artifact.kernel_name,
+        xclbin_artifact, insts_artifact = self._build_mlir_artifact(
+            prefix,
+            self.M,
+            self.K,
+            self.N,
+            include_workload_dims=True,
         )
+        insts_artifact.xclbin_input = None
+        insts_artifact.kernel_name = None
         return xclbin_artifact, insts_artifact
 
     def get_insts_artifact(
@@ -373,33 +361,17 @@ class AIEDynamicGEMM(AIEOperatorBase):
         return xclbin_artifact
 
     def set_up_artifacts(self):
-        if self.xclbin_artifact is None:
-            self.xclbin_artifact = self.get_runtime_xclbin_artifact()
-        if self.runtime_xclbin_artifact is None:
-            self.runtime_xclbin_artifact = self.xclbin_artifact
-        if self.insts_artifact is None:
-            runtime_kernel_name = (
-                self.runtime_kernel_name or self.runtime_xclbin_artifact.kernel_name
-            )
-            self.insts_artifact = self.get_insts_artifact(
-                xclbin_input=self.runtime_xclbin_artifact,
-                kernel_name=runtime_kernel_name,
-            )
-
-        artifacts = [self.xclbin_artifact, self.insts_artifact]
-        if self.runtime_xclbin_artifact is not self.xclbin_artifact:
-            artifacts.append(self.runtime_xclbin_artifact)
-        self.add_artifacts(artifacts)
+        if self.xclbin_artifact is None or self.insts_artifact is None:
+            xclbin_artifact, insts_artifact = self.get_artifacts()
+            self.xclbin_artifact = xclbin_artifact
+            self.insts_artifact = insts_artifact
+        self.add_artifacts([self.xclbin_artifact, self.insts_artifact])
 
     def set_up_runtime(self):
-        runtime_xclbin_artifact = self.runtime_xclbin_artifact or self.xclbin_artifact
-        runtime_kernel_name = (
-            self.runtime_kernel_name or runtime_xclbin_artifact.kernel_name
-        )
         self.add_kernel(
             "dynamic_gemm",
-            runtime_xclbin_artifact,
-            runtime_kernel_name,
+            self.xclbin_artifact,
+            self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
 

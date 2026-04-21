@@ -1,0 +1,8 @@
+family_id,seq_len,block_kind,candidate_index,reason
+tinybert_512,256,qkv_proj,1,known_unstable_qkv_shape
+tinybert_512,512,qkv_proj,1,known_unstable_qkv_shape
+tinybert_512,1024,qkv_proj,1,known_unstable_qkv_shape
+tinybert_512,2048,qkv_proj,1,known_unstable_qkv_shape
+tinybert_512,4096,qkv_proj,1,known_unstable_qkv_shape
+tinybert_512,8192,qkv_proj,1,known_unstable_qkv_shape
+tinybert_512,16384,qkv_proj,1,known_unstable_qkv_shape

@@ -11,6 +11,7 @@ SPDX-License-Identifier = "CC0-1.0"
 
 [[annotations]]
 path = [
+    "iron/applications/transformer_layer/study/block/removed_cases.csv",
     "iron/applications/transformer_layer/study/end_to_end/hybrid_candidates.json",
     "iron/applications/transformer_layer/study/end_to_end/runlist_candidates.json",
     "iron/applications/transformer_layer/study/end_to_end/runlist_removed_candidates.csv",

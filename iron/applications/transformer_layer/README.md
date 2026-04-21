@@ -63,8 +63,8 @@ For unattended full-suite execution:
 
 ```bash
 source /opt/xilinx/xrt/setup.sh
-source ~/iron/ironenv/bin/activate
-cd ~/iron
+source /path/to/iron/ironenv/bin/activate
+cd /path/to/iron
 python3 -m iron.applications.transformer_layer.study.unattended_reboot start \
   --run-id full_suite_$(date +%Y%m%d_%H%M%S) \
   --run-user "$USER" \
@@ -75,8 +75,8 @@ To resume a stopped unattended run:
 
 ```bash
 source /opt/xilinx/xrt/setup.sh
-source ~/iron/ironenv/bin/activate
-cd ~/iron
+source /path/to/iron/ironenv/bin/activate
+cd /path/to/iron
 python3 -m iron.applications.transformer_layer.study.unattended_reboot resume \
   --state /path/to/results_unattended_<run_id>/automation/state.json \
   --log-level INFO

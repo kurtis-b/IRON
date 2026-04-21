@@ -4,11 +4,10 @@
 import numpy as np
 import gc
 import logging
-from pathlib import Path
 import os
+from pathlib import Path
 
 from .aie_device_manager import AIEDeviceManager, pyxrt
-from . import compilation as comp
 import aie.utils.config
 
 
@@ -42,14 +41,13 @@ class AIEContext:
         for op in self.operators:
             op.compile()
 
-    def prepare_runtime(self, describe_runtime=True):
+    def prepare_runtime(self):
         """Setup XRT runtime for all registered operators"""
         if self._runtime_prepared:
             return
 
-        if describe_runtime:
-            for op in self.operators:
-                op.set_up_runtime()
+        for op in self.operators:
+            op.set_up_runtime()
 
         # Pools of preallocated buffer objects; each buffer object is allocated
         # once at program start and then reused across operators where possible.
@@ -79,25 +77,17 @@ class AIEContext:
             logging.info(f"Preparing runtime for AIE operator: {op.__class__.__name__}")
 
             # Set up kernels
-            lazy_kernel_loading = getattr(op, "lazy_kernel_loading", False)
-            if not lazy_kernel_loading:
-                for kernel_name, (
-                    xclbin,
-                    xclbin_kernel_name,
-                    insts,
-                ) in op.kernels.items():
-                    handle = self.device_manager.get_kernel_handle(
-                        str(xclbin.path), xclbin_kernel_name, str(insts.path)
-                    )
-                    op.xrt_kernels[kernel_name] = (
-                        handle.context,
-                        handle.kernel,
-                        handle.insts_bo,
-                        len(handle.insts),
-                    )
-                    op._sync_insts_bo_to_device_if_needed(handle.insts_bo)
-            else:
-                op.xrt_kernels = {}
+            for kernel_name, (xclbin, xclbin_kernel_name, insts) in op.kernels.items():
+                handle = self.device_manager.get_kernel_handle(
+                    str(xclbin.path), xclbin_kernel_name, str(insts.path)
+                )
+                op.xrt_kernels[kernel_name] = (
+                    handle.context,
+                    handle.kernel,
+                    handle.insts_bo,
+                    len(handle.insts),
+                )
+                op._sync_insts_bo_to_device_if_needed(handle.insts_bo)
 
             # If multiple buffers (of the same binned size) are used in the
             # same kernel invocation OR across different invocations with shared
@@ -148,11 +138,7 @@ class AIEContext:
 
             # Allocate buffers
             buffer_allocations = {}
-            alias_map = op.buffer_aliases
             for buffer_name, buffer_min_size in op.buffers.items():
-                if buffer_name in alias_map:
-                    # Alias BOs are resolved after target buffers are allocated.
-                    continue
                 if buffer_name in op.buffer_static_data:
                     static_data = op.buffer_static_data[buffer_name]
                     op.buffer_bos[buffer_name] = self.static_data_pool[static_data]
@@ -179,23 +165,14 @@ class AIEContext:
                 buffer_allocations[buffer_name] = (alloc_pool, alloc_idx)
                 op.buffer_bos[buffer_name] = bo_pools[alloc_pool][alloc_idx]
 
-            # Resolve alias BOs after concrete allocations.
-            for alias_name, target_name in alias_map.items():
-                if target_name not in op.buffer_bos:
-                    raise RuntimeError(
-                        f"Alias target buffer '{target_name}' not allocated for alias '{alias_name}'."
-                    )
-                op.buffer_bos[alias_name] = op.buffer_bos[target_name]
-
             op._buffer_dirty_to_device = {
                 buffer_name: False
                 for buffer_name in op.buffers
-                if buffer_name not in alias_map
-                and buffer_name not in op.buffer_static_data
+                if buffer_name not in op.buffer_static_data
             }
 
             # Setup runlist
-            if lazy_kernel_loading or not op.xrt_kernels:
+            if not op.xrt_kernels:
                 op.xrt_runlist = None
             else:
                 context = next(iter(op.xrt_kernels.values()))[0]

@@ -109,25 +109,10 @@ class AIEGEMM(AIEOperatorBase):
 
         self.xclbin_artifact = None
         self.insts_artifact = None
-        self.runtime_xclbin_artifact = None
-        self.runtime_kernel_name = None
 
         AIEOperatorBase.__init__(
             self, context=context, skip_add_to_list=skip_add_to_list
         )
-
-    def bind_artifacts(
-        self,
-        xclbin_artifact,
-        insts_artifact,
-        *,
-        runtime_xclbin_artifact=None,
-        runtime_kernel_name=None,
-    ):
-        self.xclbin_artifact = xclbin_artifact
-        self.insts_artifact = insts_artifact
-        self.runtime_xclbin_artifact = runtime_xclbin_artifact
-        self.runtime_kernel_name = runtime_kernel_name
 
     def _uses_batched_layout(self):
         return self.batch_C[0] > 1
@@ -165,6 +150,16 @@ class AIEGEMM(AIEOperatorBase):
         min_K = self.tile_k
         min_N = self.tile_n * self.num_aie_columns
         return min_M, min_K, min_N
+
+    def _partitioned_b_buffer_name(self, partition_index: int) -> str:
+        if self.partition_N == 1:
+            return "B"
+        return f"B_{partition_index}"
+
+    def _partitioned_c_buffer_name(self, partition_index: int) -> str:
+        if self.partition_N == 1:
+            return "C"
+        return f"C_{partition_index}"
 
     def _get_artifact_name_base(self, prefix, M, K, N, include_partition_suffix=True):
         dtype_in = self.gemm_args.get("dtype_in", "bf16")
@@ -381,7 +376,12 @@ class AIEGEMM(AIEOperatorBase):
         return xclbin_artifact, insts_artifact
 
     def get_artifacts(self, prefix="gemm_"):
-        return self._build_mlir_artifact(prefix, self.M, self.K, self.N)
+        xclbin_artifact, insts_artifact = self._build_mlir_artifact(
+            prefix, self.M, self.K, self.N
+        )
+        insts_artifact.xclbin_input = None
+        insts_artifact.kernel_name = None
+        return xclbin_artifact, insts_artifact
 
     def get_insts_artifact(self, prefix="gemm_", xclbin_input=None, kernel_name=None):
         _, insts_artifact = self._build_mlir_artifact(prefix, self.M, self.K, self.N)
@@ -413,13 +413,7 @@ class AIEGEMM(AIEOperatorBase):
             xclbin_artifact, insts_artifact = self.get_artifacts()
             self.xclbin_artifact = xclbin_artifact
             self.insts_artifact = insts_artifact
-        artifacts = [self.xclbin_artifact, self.insts_artifact]
-        if (
-            self.runtime_xclbin_artifact is not None
-            and self.runtime_xclbin_artifact is not self.xclbin_artifact
-        ):
-            artifacts.append(self.runtime_xclbin_artifact)
-        self.add_artifacts(artifacts)
+        self.add_artifacts([self.xclbin_artifact, self.insts_artifact])
 
     def set_up_runtime(self):
         static_weights = None
@@ -428,14 +422,10 @@ class AIEGEMM(AIEOperatorBase):
             if isinstance(static_weights, torch.Tensor):
                 static_weights = torch_to_numpy(static_weights)
 
-        runtime_xclbin_artifact = self.runtime_xclbin_artifact or self.xclbin_artifact
-        runtime_kernel_name = (
-            self.runtime_kernel_name or runtime_xclbin_artifact.kernel_name
-        )
         self.add_kernel(
             "gemm",
-            runtime_xclbin_artifact,
-            runtime_kernel_name,
+            self.xclbin_artifact,
+            self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
 
@@ -467,12 +457,14 @@ class AIEGEMM(AIEOperatorBase):
         self.add_buffer("A", self.M * self.K)
         B_parts = self._partition_B(static_weights)
         for i, B_part in enumerate(B_parts):
+            b_name = self._partitioned_b_buffer_name(i)
+            c_name = self._partitioned_c_buffer_name(i)
             if B_part is None:
-                self.add_buffer(f"B_{i}", self.K * self.N)
+                self.add_buffer(b_name, self.K * self.N)
             else:
-                self.add_buffer(f"B_{i}", self.K * self.N, static_data=B_part)
-            self.add_buffer(f"C_{i}", self.M * self.N)
-            self.add_to_runlist("gemm", "A", f"B_{i}", f"C_{i}")
+                self.add_buffer(b_name, self.K * self.N, static_data=B_part)
+            self.add_buffer(c_name, self.M * self.N)
+            self.add_to_runlist("gemm", "A", b_name, c_name)
 
     def _get_B_dims(self, B_shape):
         if self.b_col_maj:
@@ -703,10 +695,12 @@ class AIEGEMM(AIEOperatorBase):
         self.write_buffer("A", A_np)
         if B_nps is not None:
             for i, B_np in enumerate(B_nps):
-                self.write_buffer(f"B_{i}", B_np)
+                self.write_buffer(self._partitioned_b_buffer_name(i), B_np)
         self.run_runlist()
         return [
-            self.read_buffer(f"C_{i}", shape=C_shape, dtype=bfloat16)
+            self.read_buffer(
+                self._partitioned_c_buffer_name(i), shape=C_shape, dtype=bfloat16
+            )
             for i in range(self.partition_N)
         ]
 
