@@ -6,14 +6,19 @@ from __future__ import annotations
 
 import csv
 import json
+from pathlib import Path
 
 import torch
 
 from iron.applications.transformer_layer.study.host_comparison.remeasure_power_only import (
+    _ensure_exploratory_output_path,
+    canonical_output_path as canonical_host_refresh_output_path,
     main as remeasure_power_only_main,
 )
 from iron.applications.transformer_layer.study.host_comparison.run import (
+    HOST_COMPARISON_STUDY_NAME,
     RESULTS_CSV_FIELDNAMES,
+    _compatible_resume_paths,
     _forward_reference,
     _normalized_existing_row,
     RocmSMIPowerMonitor,
@@ -34,6 +39,9 @@ from iron.applications.transformer_layer.study.host_comparison.select import (
     default_reference_results_path,
     group_reference_rows,
 )
+from iron.applications.transformer_layer.study.end_to_end.validation import (
+    REFERENCE_TOLERANCE_VALIDATION_MODE,
+)
 
 
 def _reference_row(
@@ -52,6 +60,11 @@ def _reference_row(
     num_heads = "8" if study_case_id == "tinybert_512" else "12"
     return {
         "study_id": "end_to_end",
+        "campaign_id": "canonical",
+        "repeat_index": "0",
+        "matched_run_id": (
+            f"canonical:{study_case_id}:{execution_mode}:seq{seq_len}:repeat0"
+        ),
         "study_case_id": study_case_id,
         "study_case_label": study_case_id,
         "workload_variant": "encoder_bert",
@@ -74,9 +87,31 @@ def _reference_row(
         "avg_latency_ms": avg_latency_ms,
         "effective_gflops_per_sec": effective_gflops_per_sec,
         "power_backend": "turbostat_pkgwatt",
+        "power_boundary": "package",
+        "power_estimation_method": "delta_package_power",
+        "baseline_policy": "quiescent_package_power",
+        "baseline_avg_power_w": "5.0",
+        "active_avg_power_w": "17.0",
+        "sensor_source": "turbostat:PkgWatt",
+        "temperature_source": "unavailable",
         "avg_power_w": "12.0",
+        "min_power_w": "11.0",
+        "max_power_w": "13.0",
+        "power_sample_count": "8",
+        "raw_avg_power_w": "12.5",
+        "raw_min_power_w": "11.0",
+        "raw_max_power_w": "14.0",
+        "raw_power_sample_count": "9",
+        "power_std_w": "0.4",
+        "raw_power_std_w": "0.6",
+        "power_outlier_sample_count": "1",
+        "power_outlier_filter_applied": "True",
+        "raw_package_avg_power_w": "17.0",
+        "raw_package_min_power_w": "16.0",
+        "raw_package_max_power_w": "18.0",
         "effective_gflops_per_sec_per_watt": effective_gflops_per_sec_per_watt,
         "process_model": "in_process",
+        "validation_mode": REFERENCE_TOLERANCE_VALIDATION_MODE,
         "validation_error_count": "0",
         "run_status": run_status,
         "failure_message": "",
@@ -86,6 +121,40 @@ def _reference_row(
         "selected_config_json": json.dumps({"tile_m": 16}, sort_keys=True),
         "is_best": "False",
     }
+
+
+def _reference_group_rows(**kwargs) -> list[dict[str, str]]:
+    return [
+        _reference_row(execution_mode="hybrid", **kwargs),
+        _reference_row(
+            execution_mode="runlist",
+            avg_latency_ms="7.0",
+            effective_gflops_per_sec="90.0",
+            effective_gflops_per_sec_per_watt="9.0",
+            **kwargs,
+        ),
+        _reference_row(
+            execution_mode="offload",
+            avg_latency_ms="6.0",
+            effective_gflops_per_sec="120.0",
+            effective_gflops_per_sec_per_watt="12.0",
+            **kwargs,
+        ),
+    ]
+
+
+def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(rows[0]) if rows else []
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def test_group_reference_rows_keeps_only_passing_reference_npu_rows():
@@ -114,12 +183,80 @@ def test_group_reference_rows_keeps_only_passing_reference_npu_rows():
     )
 
 
+def test_group_reference_rows_requires_complete_mode_set():
+    rows = [
+        _reference_row(execution_mode="hybrid"),
+        _reference_row(execution_mode="runlist"),
+    ]
+
+    try:
+        group_reference_rows(rows)
+    except ValueError as exc:
+        assert "must contain exactly one row for each execution mode" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_group_reference_rows_rejects_multiple_campaign_ids():
+    rows = _reference_group_rows()
+    rows[0]["campaign_id"] = "campaign_a"
+    rows[1]["campaign_id"] = "campaign_b"
+    rows[2]["campaign_id"] = "campaign_b"
+
+    try:
+        group_reference_rows(rows)
+    except ValueError as exc:
+        assert "multiple campaign IDs" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_compatible_resume_paths_requires_matching_manifest(monkeypatch, tmp_path):
+    resume_ok = tmp_path / "ok" / "results.csv"
+    resume_bad = tmp_path / "bad" / "results.csv"
+    _write_csv(
+        resume_ok,
+        [{field: "" for field in RESULTS_CSV_FIELDNAMES}],
+    )
+    _write_csv(
+        resume_bad,
+        [{field: "" for field in RESULTS_CSV_FIELDNAMES}],
+    )
+    _write_json(
+        resume_ok.with_name("campaign_manifest.json"),
+        {
+            "campaign_id": "canonical",
+            "git_sha": "abc123",
+            "study_name": HOST_COMPARISON_STUDY_NAME,
+        },
+    )
+    _write_json(
+        resume_bad.with_name("campaign_manifest.json"),
+        {
+            "campaign_id": "canonical",
+            "git_sha": "stale",
+            "study_name": HOST_COMPARISON_STUDY_NAME,
+        },
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.host_comparison.run.current_git_sha",
+        lambda: "abc123",
+    )
+
+    paths = _compatible_resume_paths(
+        (resume_ok, resume_bad),
+        campaign_id="canonical",
+    )
+
+    assert paths == (resume_ok,)
+
+
 def test_default_reference_results_path_prefers_powered_results():
     assert default_reference_results_path().name == "results_all_power.csv"
 
 
 def test_resolve_sampling_uses_100_timed_iterations_for_short_sequences():
-    group = group_reference_rows([_reference_row()])[0]
+    group = group_reference_rows(_reference_group_rows())[0]
 
     warmup_runs, runs_per_sample = resolve_sampling(
         group,
@@ -132,7 +269,7 @@ def test_resolve_sampling_uses_100_timed_iterations_for_short_sequences():
 
 
 def test_resolve_sampling_uses_10_timed_iterations_for_8192_and_16384_sequences():
-    group = group_reference_rows([_reference_row(seq_len="8192")])[0]
+    group = group_reference_rows(_reference_group_rows(seq_len="8192"))[0]
 
     warmup_runs, runs_per_sample = resolve_sampling(
         group,
@@ -145,7 +282,7 @@ def test_resolve_sampling_uses_10_timed_iterations_for_8192_and_16384_sequences(
 
 
 def test_resolve_sampling_keeps_4096_at_5_timed_iterations():
-    group = group_reference_rows([_reference_row(seq_len="4096")])[0]
+    group = group_reference_rows(_reference_group_rows(seq_len="4096"))[0]
 
     warmup_runs, runs_per_sample = resolve_sampling(
         group,
@@ -218,6 +355,7 @@ def test_turbostat_long_sequence_power_policy_extends_probe_window():
 def test_rocm_smi_power_monitor_stats_filter_outliers_when_variance_drops():
     monitor = RocmSMIPowerMonitor()
     monitor.samples_w = [10.0, 10.1, 9.9, 10.2, 10.0, 10.1, 9.8, 10.0, 10.2, 22.0]
+    monitor._delta_samples_w = list(monitor.samples_w)
 
     stats = monitor.stats(elapsed_sec=2.0)
 
@@ -227,6 +365,8 @@ def test_rocm_smi_power_monitor_stats_filter_outliers_when_variance_drops():
     assert stats["power_sample_count"] == 9
     assert float(stats["raw_avg_power_w"]) > float(stats["avg_power_w"])
     assert float(stats["raw_power_std_w"]) > float(stats["power_std_w"])
+    assert stats["power_estimation_method"] == "delta_package_power"
+    assert stats["baseline_policy"] == "quiescent_package_power"
 
 
 def test_rocm_smi_power_monitor_records_sample_failures():
@@ -498,20 +638,71 @@ def test_build_rows_for_group_aggregates_igpu_and_npu_reference_modes(monkeypatc
         },
     ]
     mode_values = {
+        "hybrid": {
+            "effective_gflops_per_sec": 100.0,
+            "avg_latency_ms": 5.0,
+            "effective_gflops_per_sec_per_watt": 10.0,
+            "avg_power_w": 12.0,
+            "min_power_w": 11.0,
+            "max_power_w": 13.0,
+            "power_sample_count": 8,
+            "raw_avg_power_w": 12.5,
+            "raw_min_power_w": 11.0,
+            "raw_max_power_w": 14.0,
+            "raw_power_sample_count": 9,
+            "power_std_w": 0.4,
+            "raw_power_std_w": 0.6,
+            "power_outlier_sample_count": 1,
+        },
         "runlist": {
             "effective_gflops_per_sec": 90.0,
             "avg_latency_ms": 7.0,
             "effective_gflops_per_sec_per_watt": 9.0,
             "avg_power_w": 12.0,
+            "min_power_w": 11.0,
+            "max_power_w": 13.0,
+            "power_sample_count": 8,
+            "raw_avg_power_w": 12.5,
+            "raw_min_power_w": 11.0,
+            "raw_max_power_w": 14.0,
+            "raw_power_sample_count": 9,
+            "power_std_w": 0.4,
+            "raw_power_std_w": 0.6,
+            "power_outlier_sample_count": 1,
         },
         "offload": {
             "effective_gflops_per_sec": 120.0,
             "avg_latency_ms": 6.0,
             "effective_gflops_per_sec_per_watt": 12.0,
             "avg_power_w": 12.0,
+            "min_power_w": 11.0,
+            "max_power_w": 13.0,
+            "power_sample_count": 8,
+            "raw_avg_power_w": 12.5,
+            "raw_min_power_w": 11.0,
+            "raw_max_power_w": 14.0,
+            "raw_power_sample_count": 9,
+            "power_std_w": 0.4,
+            "raw_power_std_w": 0.6,
+            "power_outlier_sample_count": 1,
         },
     }
     for row in expected_rows:
+        row.update(
+            {
+                "campaign_id": "canonical",
+                "repeat_index": 0,
+                "matched_run_id": "canonical:tinybert_512:paired:seq64:repeat0",
+                "power_boundary_policy_family": "package",
+                "igpu_power_boundary": "package",
+                "npu_power_boundary": "package",
+                "igpu_power_estimation_method": "delta_package_power",
+                "npu_power_estimation_method": "delta_package_power",
+                "igpu_baseline_policy": "quiescent_package_power",
+                "npu_baseline_policy": "quiescent_package_power",
+            }
+        )
+        row["hybrid"] = mode_values["hybrid"].get(str(row["metric"]), row["hybrid"])
         row["runlist"] = mode_values["runlist"].get(str(row["metric"]))
         row["offload"] = mode_values["offload"].get(str(row["metric"]))
 
@@ -519,7 +710,7 @@ def test_build_rows_for_group_aggregates_igpu_and_npu_reference_modes(monkeypatc
 
 
 def test_build_rows_for_group_blanks_missing_igpu_backend(monkeypatch):
-    group = group_reference_rows([_reference_row()])[0]
+    group = group_reference_rows(_reference_group_rows())[0]
 
     monkeypatch.setattr(
         "iron.applications.transformer_layer.study.host_comparison.run.benchmark_host_group",
@@ -770,18 +961,63 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
             "runlist": "",
         },
     }
+    existing_rows = {
+        ("canonical", 0, *key): {
+            "campaign_id": "canonical",
+            "repeat_index": "0",
+            "matched_run_id": "canonical:tinybert_512:paired:seq64:repeat0",
+            **value,
+        }
+        for key, value in existing_rows.items()
+    }
     mode_values = {
+        "hybrid": {
+            "effective_gflops_per_sec": "12800.0",
+            "effective_gflops_per_sec_per_watt": "1066.7",
+            "avg_latency_ms": "5.0",
+            "avg_power_w": "12.0",
+            "min_power_w": "11.0",
+            "max_power_w": "13.0",
+            "power_sample_count": "8",
+            "raw_avg_power_w": "12.5",
+            "raw_min_power_w": "11.0",
+            "raw_max_power_w": "14.0",
+            "raw_power_sample_count": "9",
+            "power_std_w": "0.4",
+            "raw_power_std_w": "0.6",
+            "power_outlier_sample_count": "1",
+        },
         "runlist": {
             "effective_gflops_per_sec": "3200.0",
             "effective_gflops_per_sec_per_watt": "266.7",
             "avg_latency_ms": "7.0",
             "avg_power_w": "12.0",
+            "min_power_w": "11.0",
+            "max_power_w": "13.0",
+            "power_sample_count": "8",
+            "raw_avg_power_w": "12.5",
+            "raw_min_power_w": "11.0",
+            "raw_max_power_w": "14.0",
+            "raw_power_sample_count": "9",
+            "power_std_w": "0.4",
+            "raw_power_std_w": "0.6",
+            "power_outlier_sample_count": "1",
         },
         "offload": {
             "effective_gflops_per_sec": "6400.0",
             "effective_gflops_per_sec_per_watt": "533.3",
             "avg_latency_ms": "6.0",
             "avg_power_w": "12.0",
+            "min_power_w": "11.0",
+            "max_power_w": "13.0",
+            "power_sample_count": "8",
+            "raw_avg_power_w": "12.5",
+            "raw_min_power_w": "11.0",
+            "raw_max_power_w": "14.0",
+            "raw_power_sample_count": "9",
+            "power_std_w": "0.4",
+            "raw_power_std_w": "0.6",
+            "power_outlier_sample_count": "1",
         },
     }
     for existing_row in existing_rows.values():
@@ -974,6 +1210,23 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
         },
     ]
     for expected_row in expected_rows:
+        expected_row.update(
+            {
+                "campaign_id": "canonical",
+                "repeat_index": 0,
+                "matched_run_id": "canonical:tinybert_512:paired:seq64:repeat0",
+                "power_boundary_policy_family": "package",
+                "igpu_power_boundary": "package",
+                "npu_power_boundary": "package",
+                "igpu_power_estimation_method": "delta_package_power",
+                "npu_power_estimation_method": "delta_package_power",
+                "igpu_baseline_policy": "quiescent_package_power",
+                "npu_baseline_policy": "quiescent_package_power",
+            }
+        )
+        expected_row["hybrid"] = mode_values["hybrid"].get(
+            str(expected_row["metric"]), expected_row["hybrid"]
+        )
         expected_row["runlist"] = mode_values["runlist"].get(
             str(expected_row["metric"]), ""
         )
@@ -1000,25 +1253,76 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
     assert comparable_rows == expected_rows_by_metric
 
 
-def test_build_fairness_rows_emits_igpu_metadata():
+def test_build_fairness_rows_emits_igpu_metadata(tmp_path):
+    reference_path = tmp_path / "reference.csv"
+    with reference_path.open("w", newline="", encoding="utf-8") as handle:
+        reference_rows = _reference_group_rows()
+        writer = csv.DictWriter(handle, fieldnames=list(reference_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(reference_rows)
+
     rows = build_fairness_rows(
+        reference_input=reference_path,
         igpu_device="cuda:0",
         igpu_power_backend="rocm-smi",
+        repeat_count=2,
+        benchmark_latency_fn=lambda *args, **kwargs: {
+            "avg_latency_ms": 4.0,
+            "latency_sample_count": 10,
+            "min_latency_ms": 3.5,
+            "max_latency_ms": 4.5,
+            "effective_gflops_per_sec": 800.0,
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        },
+        benchmark_power_fn=lambda *args, **kwargs: {
+            "power_backend": "rocm-smi",
+            "power_boundary": "package",
+            "power_estimation_method": "delta_package_power",
+            "baseline_policy": "quiescent_package_power",
+            "baseline_avg_power_w": 5.0,
+            "active_avg_power_w": 15.0,
+            "sensor_source": "rocm-smi:socket_or_package",
+            "temperature_source": "unavailable",
+            "avg_power_w": 10.0,
+            "min_power_w": 9.0,
+            "max_power_w": 11.0,
+            "power_sample_count": 8,
+            "raw_avg_power_w": 10.0,
+            "raw_min_power_w": 9.0,
+            "raw_max_power_w": 11.0,
+            "raw_power_sample_count": 8,
+            "power_std_w": 0.4,
+            "raw_power_std_w": 0.4,
+            "power_outlier_sample_count": 0,
+            "power_outlier_filter_applied": False,
+            "raw_package_avg_power_w": None,
+            "raw_package_min_power_w": None,
+            "raw_package_max_power_w": None,
+            "effective_gflops_per_sec_per_watt": 80.0,
+            "run_status": "passed",
+            "failure_message": "",
+        },
     )
 
-    assert [row["backend"] for row in rows] == ["igpu"]
+    assert len(rows) == 2
+    assert {row["repeat_index"] for row in rows} == {0, 1}
     assert all(
         json.loads(row["reference_execution_modes_json"])
         == ["hybrid", "runlist", "offload"]
         for row in rows
     )
-    schedule = json.loads(rows[0]["iteration_schedule_json"])
-    assert schedule["8192-16384"]["runs_per_sample"] == 10
+    assert rows[0]["device"] == "cuda:0"
+    assert rows[0]["power_mean_w"] == 10.0
 
 
 def test_normalized_existing_row_keeps_current_schema():
     normalized = _normalized_existing_row(
         {
+            "campaign_id": "canonical",
+            "repeat_index": "0",
+            "matched_run_id": "canonical:tinybert_512:paired:seq64:repeat0",
             "study_case_id": "tinybert_512",
             "seq_len": "64",
             "metric": "effective_gflops_per_sec",
@@ -1028,10 +1332,20 @@ def test_normalized_existing_row_keeps_current_schema():
     )
 
     assert normalized == {
+        "campaign_id": "canonical",
+        "repeat_index": 0,
+        "matched_run_id": "canonical:tinybert_512:paired:seq64:repeat0",
         "workload_variant": "encoder_bert",
         "study_case_id": "tinybert_512",
         "seq_len": 64,
         "metric": "effective_gflops_per_sec",
+        "power_boundary_policy_family": "package",
+        "igpu_power_boundary": "package",
+        "npu_power_boundary": "package",
+        "igpu_power_estimation_method": "delta_package_power",
+        "npu_power_estimation_method": "delta_package_power",
+        "igpu_baseline_policy": "quiescent_package_power",
+        "npu_baseline_policy": "quiescent_package_power",
         "igpu": "800.0",
         "igpu_rocm_smi": "",
         "hybrid": "12800.0",
@@ -1045,10 +1359,10 @@ def test_load_existing_rows_repairs_missing_igpu_per_watt_from_existing_rows(tmp
     csv_path.write_text(
         "\n".join(
             [
-                "workload_variant,study_case_id,seq_len,metric,igpu,igpu_rocm_smi,hybrid,runlist,offload",
-                "encoder_bert,tinybert_512,64,effective_gflops_per_sec,800.0,,100.0,90.0,120.0",
-                "encoder_bert,tinybert_512,64,effective_gflops_per_sec_per_watt,,,10.0,9.0,12.0",
-                "encoder_bert,tinybert_512,64,avg_power_w,,10.0,12.0,12.0,12.0",
+                "campaign_id,repeat_index,workload_variant,study_case_id,seq_len,metric,igpu,igpu_rocm_smi,hybrid,runlist,offload",
+                "canonical,0,encoder_bert,tinybert_512,64,effective_gflops_per_sec,800.0,,100.0,90.0,120.0",
+                "canonical,0,encoder_bert,tinybert_512,64,effective_gflops_per_sec_per_watt,,,10.0,9.0,12.0",
+                "canonical,0,encoder_bert,tinybert_512,64,avg_power_w,,10.0,12.0,12.0,12.0",
             ]
         )
         + "\n",
@@ -1058,7 +1372,14 @@ def test_load_existing_rows_repairs_missing_igpu_per_watt_from_existing_rows(tmp
     rows = load_existing_rows((csv_path,))
 
     repaired_row = rows[
-        ("encoder_bert", "tinybert_512", 64, "effective_gflops_per_sec_per_watt")
+        (
+            "canonical",
+            0,
+            "encoder_bert",
+            "tinybert_512",
+            64,
+            "effective_gflops_per_sec_per_watt",
+        )
     ]
     assert repaired_row["igpu_rocm_smi"] == 80.0
 
@@ -1081,9 +1402,10 @@ def test_remeasure_power_only_fails_without_selected_reference_groups(
 
     reference_path = tmp_path / "reference.csv"
     with reference_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(_reference_row().keys()))
+        reference_rows = _reference_group_rows()
+        writer = csv.DictWriter(handle, fieldnames=list(reference_rows[0].keys()))
         writer.writeheader()
-        writer.writerow(_reference_row())
+        writer.writerows(reference_rows)
 
     monkeypatch.setattr(
         "iron.applications.transformer_layer.study.host_comparison.remeasure_power_only.write_plots",
@@ -1104,6 +1426,15 @@ def test_remeasure_power_only_fails_without_selected_reference_groups(
         == 1
     )
     assert output_path.read_text(encoding="utf-8") == original_text
+
+
+def test_remeasure_power_only_rejects_canonical_output_path():
+    try:
+        _ensure_exploratory_output_path(canonical_host_refresh_output_path())
+    except ValueError as exc:
+        assert "must not overwrite" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected canonical output path to be rejected")
 
 
 def test_remeasure_power_only_preserves_untargeted_existing_rows(tmp_path, monkeypatch):
@@ -1162,9 +1493,10 @@ def test_remeasure_power_only_preserves_untargeted_existing_rows(tmp_path, monke
 
     reference_path = tmp_path / "reference.csv"
     with reference_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(_reference_row().keys()))
+        reference_rows = _reference_group_rows()
+        writer = csv.DictWriter(handle, fieldnames=list(reference_rows[0].keys()))
         writer.writeheader()
-        writer.writerow(_reference_row())
+        writer.writerows(reference_rows)
 
     monkeypatch.setattr(
         "iron.applications.transformer_layer.study.host_comparison.remeasure_power_only.write_plots",

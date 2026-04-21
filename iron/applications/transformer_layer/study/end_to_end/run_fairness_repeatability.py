@@ -10,32 +10,64 @@ import json
 import logging
 from pathlib import Path
 
-from ..run_lock import default_lock_path, hold_study_lock
-from .cases import (
-    EXECUTION_MODES,
-    FAMILY_IDS,
-    FAMILY_SPECS,
-    WORKLOAD_VARIANTS,
-    SEQUENCE_LADDER,
-    default_candidates_path,
-    mode_operators,
+from ..campaign import (
+    DEFAULT_REPEAT_COUNT,
+    matched_run_id,
+    summarize_repeat_values,
 )
+from ..run_lock import default_lock_path, hold_study_lock
+from .cases import EXECUTION_MODES, FAMILY_IDS, WORKLOAD_VARIANTS, get_case
+from .modes import benchmark_mode, benchmark_mode_power_only
+from .power import PERSISTED_POWER_RESULT_FIELDS, SUPPORTED_POWER_BACKENDS
 from .run import iteration_schedule
-from .select import default_results_path, load_result_rows
+from .select import default_results_path, load_result_rows, select_result_rows
 
 LOGGER = logging.getLogger(__name__)
 
 RESULTS_CSV_FIELDNAMES = (
     "study_id",
+    "campaign_id",
+    "repeat_index",
+    "matched_run_id",
+    "study_case_id",
+    "study_case_label",
     "workload_variant",
     "execution_mode",
-    "operator_candidate_count_summary_json",
-    "iteration_schedule_json",
-    "observed_power_backends_json",
-    "observed_selected_row_count",
-    "validation_policy",
-    "latency_variation_policy",
-    "selected_candidate_source",
+    "seq_len",
+    "hidden_size",
+    "intermediate_size",
+    "num_attention_heads",
+    "attention_head_size",
+    "warmup_runs",
+    "runs_per_sample",
+    "avg_latency_ms",
+    "latency_sample_count",
+    "min_latency_ms",
+    "max_latency_ms",
+    "effective_gflops_per_sec",
+    "power_backend",
+    *PERSISTED_POWER_RESULT_FIELDS,
+    "effective_gflops_per_sec_per_watt",
+    "validation_error_count",
+    "run_status",
+    "failure_message",
+    "selected_candidate_ids_json",
+    "selected_config_json",
+    "repeat_count",
+    "latency_mean_ms",
+    "latency_median_ms",
+    "latency_stddev_ms",
+    "latency_iqr_ms",
+    "latency_min_repeat_ms",
+    "latency_max_repeat_ms",
+    "latency_ci95_ms",
+    "power_mean_w",
+    "power_median_w",
+    "power_stddev_w",
+    "power_iqr_w",
+    "power_min_repeat_w",
+    "power_max_repeat_w",
+    "power_ci95_w",
 )
 
 
@@ -48,120 +80,200 @@ def default_output_path() -> Path:
     )
 
 
-def _candidate_payload_path(execution_mode: str) -> Path:
-    return default_candidates_path(execution_mode)
-
-
-def _candidate_count_summary(
-    execution_mode: str,
-    workload_variant: str,
-) -> dict[str, dict[str, int]]:
-    payload = json.loads(
-        _candidate_payload_path(execution_mode).read_text(encoding="utf-8")
+def _resolved_sampling(selected_row) -> tuple[int, int]:
+    scheduled_warmup_runs, scheduled_runs_per_sample = iteration_schedule(
+        selected_row.seq_len
     )
-    variant_families = [
-        family_id
-        for family_id in FAMILY_IDS
-        if FAMILY_SPECS[family_id].workload_variant == workload_variant
-    ]
-    summary: dict[str, dict[str, int]] = {
-        operator_name: {"min": 10**9, "max": 0}
-        for operator_name in mode_operators(execution_mode, workload_variant)
-    }
-    for family_id in variant_families:
-        family_payload = payload[family_id]
-        for seq_key in ("all", *(str(seq_len) for seq_len in SEQUENCE_LADDER)):
-            seq_payload = family_payload.get(seq_key, {})
-            for operator_name, counts in summary.items():
-                candidate_count = len(
-                    seq_payload.get(
-                        operator_name,
-                        family_payload.get("all", {}).get(operator_name, []),
-                    )
-                )
-                counts["min"] = min(counts["min"], candidate_count)
-                counts["max"] = max(counts["max"], candidate_count)
-    return summary
+    warmup_runs = (
+        scheduled_warmup_runs
+        if selected_row.warmup_runs in (None, 0)
+        else int(selected_row.warmup_runs)
+    )
+    runs_per_sample = (
+        scheduled_runs_per_sample
+        if selected_row.runs_per_sample in (None, 0)
+        else int(selected_row.runs_per_sample)
+    )
+    return warmup_runs, runs_per_sample
 
 
-def _iteration_schedule_summary() -> dict[str, dict[str, int]]:
+def _repeat_stats(values: list[float], *, stem: str, suffix: str) -> dict[str, object]:
+    stats = summarize_repeat_values(values, prefix=stem)
     return {
-        "64-256": {
-            "warmup_runs": iteration_schedule(64)[0],
-            "runs_per_sample": iteration_schedule(64)[1],
-        },
-        "512-2048": {
-            "warmup_runs": iteration_schedule(512)[0],
-            "runs_per_sample": iteration_schedule(512)[1],
-        },
-        "4096": {
-            "warmup_runs": iteration_schedule(4096)[0],
-            "runs_per_sample": iteration_schedule(4096)[1],
-        },
-        "8192-16384": {
-            "warmup_runs": iteration_schedule(8192)[0],
-            "runs_per_sample": iteration_schedule(8192)[1],
-        },
+        "repeat_count": stats["repeat_count"],
+        f"{stem}_mean{suffix}": stats[f"{stem}_mean"],
+        f"{stem}_median{suffix}": stats[f"{stem}_median"],
+        f"{stem}_stddev{suffix}": stats[f"{stem}_stddev"],
+        f"{stem}_iqr{suffix}": stats[f"{stem}_iqr"],
+        f"{stem}_min_repeat{suffix}": stats[f"{stem}_min"],
+        f"{stem}_max_repeat{suffix}": stats[f"{stem}_max"],
+        f"{stem}_ci95{suffix}": stats[f"{stem}_ci95"],
     }
 
 
-def build_rows(results_input: Path) -> list[dict[str, object]]:
-    observed_rows = load_result_rows(results_input) if results_input.exists() else []
+def _apply_group_stats(rows: list[dict[str, object]]) -> None:
+    latency_values = [
+        float(row["avg_latency_ms"])
+        for row in rows
+        if row.get("run_status") == "passed"
+        and row.get("avg_latency_ms") not in (None, "")
+    ]
+    power_values = [
+        float(row["avg_power_w"])
+        for row in rows
+        if row.get("run_status") == "passed"
+        and row.get("avg_power_w") not in (None, "")
+    ]
+    latency_stats = _repeat_stats(latency_values, stem="latency", suffix="_ms")
+    power_stats = _repeat_stats(power_values, stem="power", suffix="_w")
+    for row in rows:
+        row.update(latency_stats)
+        row.update(power_stats)
+
+
+def build_rows(
+    results_input: Path,
+    *,
+    workload_variant_filter: str = "all",
+    family_filter: str = "all",
+    mode_filter: str = "all",
+    seq_len_filter: str = "all",
+    seed: int = 42,
+    power_backend: str = "auto",
+    repeat_count: int = DEFAULT_REPEAT_COUNT,
+    benchmark_latency_fn=None,
+    benchmark_power_fn=None,
+    benchmark_validation_fn=None,
+) -> list[dict[str, object]]:
+    if benchmark_latency_fn is None:
+        benchmark_latency_fn = benchmark_mode
+    if benchmark_power_fn is None:
+        benchmark_power_fn = benchmark_mode_power_only
+    if benchmark_validation_fn is None:
+        benchmark_validation_fn = benchmark_mode
+
+    selected_rows = select_result_rows(
+        load_result_rows(results_input),
+        workload_variant_filter=workload_variant_filter,
+        family_filter=family_filter,
+        seq_len_filter=seq_len_filter,
+        mode_filter=mode_filter,
+    )
     rows: list[dict[str, object]] = []
-    for workload_variant in WORKLOAD_VARIANTS:
-        for execution_mode in EXECUTION_MODES:
-            mode_rows = [
-                row
-                for row in observed_rows
-                if row.get("backend") == "npu"
-                and str(row.get("execution_mode") or "") == execution_mode
-                and (
-                    str(row.get("workload_variant") or "").strip() == workload_variant
-                    or (
-                        not str(row.get("workload_variant") or "").strip()
-                        and row.get("study_case_id") in FAMILY_SPECS
-                        and FAMILY_SPECS[str(row.get("study_case_id"))].workload_variant
-                        == workload_variant
-                    )
-                )
-            ]
-            power_backends = sorted(
-                {
-                    str(row.get("power_backend") or "")
-                    for row in mode_rows
-                    if str(row.get("power_backend") or "")
-                }
+    for selected_row in selected_rows:
+        case = get_case(selected_row.study_case_id, selected_row.seq_len)
+        warmup_runs, runs_per_sample = _resolved_sampling(selected_row)
+        selected_candidate_ids_json = json.dumps(
+            selected_row.selected_candidate_ids,
+            sort_keys=True,
+        )
+        selected_config_json = json.dumps(
+            selected_row.selected_config,
+            sort_keys=True,
+        )
+        group_rows: list[dict[str, object]] = []
+        requested_power_backend = str(
+            selected_row.row.get("power_backend") or power_backend
+        )
+        for repeat_index in range(int(repeat_count)):
+            matched_id = matched_run_id(
+                campaign_id=selected_row.campaign_id,
+                study_case_id=selected_row.study_case_id,
+                execution_mode=selected_row.execution_mode,
+                seq_len=selected_row.seq_len,
+                repeat_index=repeat_index,
             )
-            rows.append(
-                {
-                    "study_id": "end_to_end_fairness_repeatability",
-                    "workload_variant": workload_variant,
-                    "execution_mode": execution_mode,
-                    "operator_candidate_count_summary_json": json.dumps(
-                        _candidate_count_summary(execution_mode, workload_variant),
-                        sort_keys=True,
-                    ),
-                    "iteration_schedule_json": json.dumps(
-                        _iteration_schedule_summary(),
-                        sort_keys=True,
-                    ),
-                    "observed_power_backends_json": json.dumps(power_backends),
-                    "observed_selected_row_count": len(mode_rows),
-                    "validation_policy": (
-                        "Main end-to-end runner uses exact reference validation through "
-                        "seq_len=512 and finite-output validation above that threshold; "
-                        "paper correctness spot checks rerun exact validation at 512 and 2048."
-                    ),
-                    "latency_variation_policy": (
-                        "Latency-variation runs reuse the selected end-to-end warmup and "
-                        "timed-iteration schedule unless explicitly overridden."
-                    ),
-                    "selected_candidate_source": (
-                        "selected end-to-end results input CSV "
-                        "selected_candidate_ids_json and selected_config_json"
-                    ),
-                }
+            latency_result = benchmark_latency_fn(
+                selected_row.execution_mode,
+                case.workload,
+                warmup_runs=warmup_runs,
+                runs_per_sample=runs_per_sample,
+                seed=seed,
+                power_backend="none",
+                operator_config=selected_row.selected_config,
+                include_reference_output=False,
+                scope_suffix=f"fairness_latency_repeat_{repeat_index}",
             )
+            validation_result = benchmark_validation_fn(
+                selected_row.execution_mode,
+                case.workload,
+                warmup_runs=0,
+                runs_per_sample=1,
+                seed=seed,
+                power_backend="none",
+                operator_config=selected_row.selected_config,
+                include_reference_output=True,
+                scope_suffix=f"fairness_validation_repeat_{repeat_index}",
+            )
+            power_result = benchmark_power_fn(
+                selected_row.execution_mode,
+                case.workload,
+                warmup_runs=warmup_runs,
+                runs_per_sample=runs_per_sample,
+                seed=seed,
+                power_backend=requested_power_backend,
+                operator_config=selected_row.selected_config,
+                avg_latency_ms=latency_result.get("avg_latency_ms"),
+                timed_total_sec=float(latency_result.get("timed_total_sec") or 0.0),
+                effective_gflops_per_sec_value=latency_result.get(
+                    "effective_gflops_per_sec"
+                ),
+                scope_suffix=f"fairness_power_repeat_{repeat_index}",
+            )
+
+            run_status = "passed"
+            failure_message = ""
+            for candidate_result in (
+                latency_result,
+                power_result,
+                validation_result,
+            ):
+                candidate_status = str(candidate_result.get("run_status") or "")
+                if candidate_status != "passed":
+                    run_status = candidate_status
+                    failure_message = str(candidate_result.get("failure_message") or "")
+                    break
+
+            row = {
+                "study_id": "end_to_end_fairness_repeatability",
+                "campaign_id": selected_row.campaign_id,
+                "repeat_index": repeat_index,
+                "matched_run_id": matched_id,
+                "study_case_id": selected_row.study_case_id,
+                "study_case_label": selected_row.study_case_label,
+                "workload_variant": selected_row.workload_variant,
+                "execution_mode": selected_row.execution_mode,
+                "seq_len": selected_row.seq_len,
+                "hidden_size": selected_row.hidden_size,
+                "intermediate_size": selected_row.intermediate_size,
+                "num_attention_heads": selected_row.num_attention_heads,
+                "attention_head_size": selected_row.attention_head_size,
+                "warmup_runs": warmup_runs,
+                "runs_per_sample": runs_per_sample,
+                "avg_latency_ms": latency_result.get("avg_latency_ms"),
+                "latency_sample_count": latency_result.get("latency_sample_count"),
+                "min_latency_ms": latency_result.get("min_latency_ms"),
+                "max_latency_ms": latency_result.get("max_latency_ms"),
+                "effective_gflops_per_sec": latency_result.get(
+                    "effective_gflops_per_sec"
+                ),
+                "power_backend": power_result.get("power_backend"),
+                "effective_gflops_per_sec_per_watt": power_result.get(
+                    "effective_gflops_per_sec_per_watt"
+                ),
+                "validation_error_count": validation_result.get(
+                    "validation_error_count", ""
+                ),
+                "run_status": run_status,
+                "failure_message": failure_message,
+                "selected_candidate_ids_json": selected_candidate_ids_json,
+                "selected_config_json": selected_config_json,
+            }
+            for field in PERSISTED_POWER_RESULT_FIELDS:
+                row[field] = power_result.get(field)
+            group_rows.append(row)
+        _apply_group_stats(group_rows)
+        rows.extend(group_rows)
     return rows
 
 
@@ -178,13 +290,32 @@ def write_rows(output_path: Path, rows: list[dict[str, object]]) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Write a fairness/repeatability summary for the end-to-end NPU study."
+        description="Run paired repeatability measurements for selected end-to-end NPU configs."
+    )
+    parser.add_argument("--results-input", type=Path, default=default_results_path())
+    parser.add_argument(
+        "--workload-variant",
+        choices=[*WORKLOAD_VARIANTS, "all"],
+        default="all",
     )
     parser.add_argument(
-        "--results-input",
-        type=Path,
-        default=default_results_path(),
+        "--family",
+        choices=[*FAMILY_IDS, "all"],
+        default="all",
     )
+    parser.add_argument("--seq-len", default="all")
+    parser.add_argument(
+        "--mode",
+        choices=[*EXECUTION_MODES, "all"],
+        default="all",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--power-backend",
+        choices=list(SUPPORTED_POWER_BACKENDS),
+        default="auto",
+    )
+    parser.add_argument("--repeat-count", type=int, default=DEFAULT_REPEAT_COUNT)
     parser.add_argument("--output", type=Path, default=default_output_path())
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
@@ -200,9 +331,20 @@ def main(argv: list[str] | None = None) -> int:
         default_lock_path(output_path),
         study_name="end-to-end fairness repeatability",
     ):
-        rows = build_rows(args.results_input.expanduser())
+        rows = build_rows(
+            args.results_input.expanduser(),
+            workload_variant_filter=str(args.workload_variant),
+            family_filter=str(args.family),
+            mode_filter=str(args.mode),
+            seq_len_filter=str(args.seq_len),
+            seed=int(args.seed),
+            power_backend=str(args.power_backend),
+            repeat_count=int(args.repeat_count),
+        )
         write_rows(output_path, rows)
-        LOGGER.info("Wrote %d fairness rows to %s", len(rows), output_path)
+        LOGGER.info(
+            "Wrote %d fairness-repeatability rows to %s", len(rows), output_path
+        )
     return 0
 
 

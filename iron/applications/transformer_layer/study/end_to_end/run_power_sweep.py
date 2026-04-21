@@ -8,6 +8,7 @@ import argparse
 import logging
 from pathlib import Path
 
+from ..campaign import DEFAULT_CAMPAIGN_ID, DEFAULT_REPEAT_INDEX
 from ..npu_runtime_checks import warn_if_npu_power_mode_not_turbo
 from .cases import EXECUTION_MODES, FAMILY_IDS, SEQUENCE_LADDER, EndToEndCase, get_case
 from .power import SUPPORTED_POWER_BACKENDS
@@ -16,6 +17,8 @@ from .run import (
     TUNING_CSV_FIELDNAMES,
     build_rows,
     mark_best_rows,
+    default_output_path as canonical_output_path,
+    default_tuning_output_path as canonical_tuning_output_path,
     write_rows,
 )
 
@@ -48,17 +51,37 @@ def iter_selected_cases(
 
 
 def default_output_path(max_seq_len: int) -> Path:
-    results_dir = Path(__file__).resolve().parents[2] / "results" / "end_to_end"
+    results_dir = (
+        Path(__file__).resolve().parents[2] / "results_exploratory" / "end_to_end"
+    )
     if int(max_seq_len) == max(SEQUENCE_LADDER):
-        return results_dir / "results_all_power.csv"
-    return results_dir / f"results_upto{max_seq_len}_power.csv"
+        return results_dir / "results_all_power_power_sweep.csv"
+    return results_dir / f"results_upto{max_seq_len}_power_sweep.csv"
 
 
 def default_tuning_output_path(max_seq_len: int) -> Path:
-    results_dir = Path(__file__).resolve().parents[2] / "results" / "end_to_end"
+    results_dir = (
+        Path(__file__).resolve().parents[2] / "results_exploratory" / "end_to_end"
+    )
     if int(max_seq_len) == max(SEQUENCE_LADDER):
-        return results_dir / "tuning_all_power.csv"
-    return results_dir / f"tuning_upto{max_seq_len}_power.csv"
+        return results_dir / "tuning_all_power_power_sweep.csv"
+    return results_dir / f"tuning_upto{max_seq_len}_power_sweep.csv"
+
+
+def _ensure_exploratory_output_paths(
+    output_path: Path,
+    tuning_output_path: Path,
+) -> None:
+    canonical_paths = {
+        canonical_output_path().resolve(),
+        canonical_tuning_output_path().resolve(),
+    }
+    for path in (output_path, tuning_output_path):
+        if path.resolve() in canonical_paths:
+            raise ValueError(
+                "run_power_sweep is exploratory and must not overwrite canonical "
+                "paper outputs"
+            )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -113,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.tuning_output is None
         else args.tuning_output.expanduser()
     )
+    _ensure_exploratory_output_paths(output_path, tuning_output_path)
     cases = iter_selected_cases(args.family, max_seq_len=int(args.max_seq_len))
 
     LOGGER.info(
@@ -129,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.info("Case %d/%d: %s", case_index, len(cases), _case_descriptor(case))
         case_tuning_rows, case_final_rows = build_rows(
             case,
+            campaign_id=(
+                f"{DEFAULT_CAMPAIGN_ID}_power_sweep_upto{int(args.max_seq_len)}"
+            ),
+            repeat_index=DEFAULT_REPEAT_INDEX,
             mode_filter=args.mode,
             warmup_runs=args.warmup_iters,
             runs_per_sample=args.timed_iters,

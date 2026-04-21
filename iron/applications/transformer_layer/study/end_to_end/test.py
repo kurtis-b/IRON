@@ -21,6 +21,7 @@ from iron.applications.transformer_layer.study.end_to_end import (
 from iron.applications.transformer_layer.study.end_to_end.cases import (
     EXECUTION_MODES,
     EndToEndWorkload,
+    candidate_inventory_for_case,
     candidate_table_for_case,
     get_case,
     load_default_candidate_payloads,
@@ -33,7 +34,13 @@ from iron.applications.transformer_layer.study.end_to_end.modes import (
     benchmark_mode,
 )
 from iron.applications.transformer_layer.study.end_to_end.remeasure_power_only import (
+    _ensure_exploratory_output_path,
+    canonical_output_path as canonical_power_refresh_output_path,
     updated_row_with_power_measurement,
+)
+from iron.applications.transformer_layer.study.end_to_end.run import (
+    END_TO_END_STUDY_NAME,
+    _compatible_resume_paths,
 )
 from iron.applications.transformer_layer.study.end_to_end.run import (
     build_rows as build_end_to_end_rows,
@@ -51,6 +58,9 @@ from iron.applications.transformer_layer.study.end_to_end.run_latency_variation 
     merge_rows as merge_latency_rows,
     summarize_latency_samples,
 )
+from iron.applications.transformer_layer.study.end_to_end.run_power_sweep import (
+    _ensure_exploratory_output_paths,
+)
 from iron.applications.transformer_layer.study.end_to_end.run_staging_ablation import (
     STAGING_ABLATION_SEQUENCE_LENGTHS,
     ablation_iteration_schedule,
@@ -58,7 +68,11 @@ from iron.applications.transformer_layer.study.end_to_end.run_staging_ablation i
     merge_rows as merge_staging_rows,
 )
 from iron.applications.transformer_layer.study.end_to_end.select import (
+    load_result_rows,
     select_result_rows,
+)
+from iron.applications.transformer_layer.study.end_to_end.validation import (
+    REFERENCE_TOLERANCE_VALIDATION_MODE,
 )
 
 
@@ -74,6 +88,11 @@ def _result_row(
 ) -> dict[str, str]:
     return {
         "study_id": "end_to_end",
+        "campaign_id": "canonical",
+        "repeat_index": "0",
+        "matched_run_id": (
+            f"canonical:{study_case_id}:{execution_mode}:seq{seq_len}:repeat0"
+        ),
         "study_case_id": study_case_id,
         "study_case_label": study_case_id,
         "workload_variant": workload_variant,
@@ -89,6 +108,19 @@ def _result_row(
         "dtype": "bf16",
         "use_bias": "False",
         "weights_source": "synthetic",
+        "joint_search_policy": "isolated_operator_screen_then_top_3_estimated_joint_full_patterns",
+        "joint_candidate_count_total": "9",
+        "joint_candidates_evaluated": "3",
+        "selected_joint_rank": "1",
+        "selection_provenance": "best_found_under_declared_topk_joint_search",
+        "candidate_inventory_json": json.dumps(
+            {"operator": ["cand0", "cand1"]},
+            sort_keys=True,
+        ),
+        "candidate_count_by_operator_json": json.dumps(
+            {"operator": 2},
+            sort_keys=True,
+        ),
         "warmup_runs": "1",
         "runs_per_sample": "100" if int(seq_len) <= 256 else "10",
         "measured_inference_count": "10",
@@ -101,6 +133,17 @@ def _result_row(
         "host_qkv_precompute_ms": "",
         "effective_gflops_per_sec": "1000.0",
         "power_backend": power_backend,
+        "power_boundary": "package",
+        "power_estimation_method": (
+            "none" if power_backend == "none" else "delta_package_power"
+        ),
+        "baseline_policy": (
+            "none" if power_backend == "none" else "quiescent_package_power"
+        ),
+        "baseline_avg_power_w": "" if power_backend == "none" else "5.0",
+        "active_avg_power_w": "" if power_backend == "none" else "17.5",
+        "sensor_source": "" if power_backend == "none" else "turbostat:PkgWatt",
+        "temperature_source": "" if power_backend == "none" else "unavailable",
         "avg_power_w": "12.0",
         "min_power_w": "11.0",
         "max_power_w": "13.0",
@@ -113,11 +156,15 @@ def _result_row(
         "raw_power_std_w": "0.7",
         "power_outlier_sample_count": "1",
         "power_outlier_filter_applied": "True",
+        "raw_package_avg_power_w": "" if power_backend == "none" else "17.5",
+        "raw_package_min_power_w": "" if power_backend == "none" else "15.5",
+        "raw_package_max_power_w": "" if power_backend == "none" else "19.0",
         "effective_gflops_per_sec_per_watt": "80.0",
         "npu_dispatch_count": "8",
         "npu_unique_instruction_binary_count": "8",
         "npu_unique_xclbin_count": "8",
         "process_model": "in_process",
+        "validation_mode": REFERENCE_TOLERANCE_VALIDATION_MODE,
         "validation_error_count": "0",
         "run_status": "passed",
         "failure_message": "",
@@ -164,12 +211,18 @@ def test_plot_tps_by_pattern_keeps_offload_rows(tmp_path):
 
 
 def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(rows[0]) if rows else []
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def test_summarize_power_samples_filters_large_outlier_conservatively():
@@ -198,6 +251,65 @@ def test_summarize_power_samples_keeps_small_sample_sets_unfiltered():
     assert float(stats["raw_avg_power_w"]) == float(stats["avg_power_w"])
 
 
+def test_turbostat_monitor_keeps_negative_delta_samples():
+    monitor = power_module.TurbostatPackagePowerMonitor(sample_interval_sec=0.1)
+    monitor.quiescent_package_power_w = 10.0
+    monitor.raw_package_samples_w = [9.0, 11.0]
+    monitor._pseudo_samples_w = [-1.0, 1.0]
+
+    stats = monitor.stats(elapsed_sec=1.0)
+
+    assert stats["avg_power_w"] == 0.0
+    assert stats["min_power_w"] == -1.0
+    assert stats["power_estimation_method"] == "delta_package_power"
+
+
+def test_compatible_resume_paths_requires_matching_manifest(monkeypatch, tmp_path):
+    resume_ok = tmp_path / "ok" / "results.csv"
+    resume_bad = tmp_path / "bad" / "results.csv"
+    _write_csv(resume_ok, [_result_row("hybrid")])
+    _write_csv(resume_bad, [_result_row("hybrid")])
+    _write_json(
+        resume_ok.with_name("campaign_manifest.json"),
+        {
+            "campaign_id": "canonical",
+            "git_sha": "abc123",
+            "study_name": END_TO_END_STUDY_NAME,
+        },
+    )
+    _write_json(
+        resume_bad.with_name("campaign_manifest.json"),
+        {
+            "campaign_id": "wrong_campaign",
+            "git_sha": "abc123",
+            "study_name": END_TO_END_STUDY_NAME,
+        },
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.end_to_end.run.current_git_sha",
+        lambda: "abc123",
+    )
+
+    paths = _compatible_resume_paths(
+        (resume_ok, resume_bad),
+        campaign_id="canonical",
+    )
+
+    assert paths == (resume_ok,)
+
+
+def test_power_sweep_refuses_canonical_output_paths():
+    try:
+        _ensure_exploratory_output_paths(
+            canonical_power_refresh_output_path(),
+            canonical_power_refresh_output_path().with_name("tuning_all_power.csv"),
+        )
+    except ValueError as exc:
+        assert "exploratory" in str(exc)
+    else:
+        raise AssertionError("expected canonical output paths to be rejected")
+
+
 def test_updated_row_with_power_measurement_copies_raw_and_filtered_fields():
     existing_row = _result_row("hybrid")
     power_result = {
@@ -223,6 +335,26 @@ def test_updated_row_with_power_measurement_copies_raw_and_filtered_fields():
     assert updated["power_outlier_filter_applied"] is True
     assert updated["power_outlier_sample_count"] == 1
     assert float(updated["effective_gflops_per_sec_per_watt"]) == 105.26315789473684
+
+
+def test_select_result_rows_reject_rows_without_search_provenance(tmp_path):
+    results_path = tmp_path / "results.csv"
+    row = _result_row("hybrid")
+    row["joint_search_policy"] = ""
+    _write_csv(results_path, [row])
+
+    selected_rows = select_result_rows(load_result_rows(results_path))
+
+    assert selected_rows == ()
+
+
+def test_remeasure_power_only_rejects_canonical_output_path():
+    try:
+        _ensure_exploratory_output_path(canonical_power_refresh_output_path())
+    except ValueError as exc:
+        assert "must not overwrite" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected canonical output path to be rejected")
 
 
 def test_candidate_table_covers_all_execution_modes():
@@ -380,6 +512,17 @@ def test_offload_candidates_remain_singleton_only():
     for seq_len in (64, 128, 256, 16384):
         table = candidate_table_for_case("baseline_768", seq_len, payloads=payloads)
         assert all(len(candidates) == 1 for candidates in table["offload"].values())
+
+
+@torch.no_grad()
+def test_candidate_inventory_for_case_reports_effective_augmented_search_space():
+    payloads = load_default_candidate_payloads()
+
+    inventory = candidate_inventory_for_case("baseline_768", 64, payloads=payloads)
+
+    assert "qkv_low_emb" in inventory["hybrid"]["qkv_proj"]
+    assert "qkvo_proj_cols4" in inventory["runlist"]["qkvo_proj"]
+    assert inventory["offload"]["q_proj"] == ("default",)
 
 
 @torch.no_grad()
@@ -790,8 +933,7 @@ def test_correctness_rows_only_include_spot_check_sequences(monkeypatch, tmp_pat
     assert len(rows) == 2
     assert {row["seq_len"] for row in rows} == {512, 2048}
     assert {row["validation_mode"] for row in rows} == {
-        "exact_reference",
-        "numerical_spot_check",
+        REFERENCE_TOLERANCE_VALIDATION_MODE
     }
 
 
@@ -801,11 +943,14 @@ def test_correctness_rows_reuse_matching_existing_row(tmp_path):
 
     existing_row = {
         "study_id": "end_to_end_correctness_spot_checks",
+        "campaign_id": "canonical",
+        "repeat_index": "0",
+        "matched_run_id": "canonical:baseline_768:hybrid:seq512:repeat0",
         "study_case_id": "baseline_768",
         "study_case_label": "baseline_768",
         "workload_variant": "encoder_bert",
         "execution_mode": "hybrid",
-        "validation_mode": "exact_reference",
+        "validation_mode": REFERENCE_TOLERANCE_VALIDATION_MODE,
         "seq_len": "512",
         "hidden_size": "768",
         "intermediate_size": "3072",
@@ -840,7 +985,14 @@ def test_correctness_rows_reuse_matching_existing_row(tmp_path):
         mode_filter="all",
         seed=42,
         existing_rows={
-            ("baseline_768", "encoder_bert", "hybrid", 512): existing_row,
+            (
+                "canonical",
+                0,
+                "baseline_768",
+                "encoder_bert",
+                "hybrid",
+                512,
+            ): existing_row,
         },
         benchmark_fn=fail_benchmark,
     )
@@ -851,7 +1003,7 @@ def test_correctness_rows_reuse_matching_existing_row(tmp_path):
 
 def test_correctness_merge_rows_preserves_unrelated_existing_rows():
     existing = {
-        ("baseline_768", "encoder_bert", "hybrid", 512): {
+        ("canonical", 0, "baseline_768", "encoder_bert", "hybrid", 512): {
             "study_case_id": "baseline_768",
             "workload_variant": "encoder_bert",
             "execution_mode": "hybrid",
@@ -923,6 +1075,9 @@ def test_latency_variation_rows_reuse_matching_existing_row(tmp_path):
 
     existing_row = {
         "study_id": "end_to_end_latency_variation",
+        "campaign_id": "canonical",
+        "repeat_index": "0",
+        "matched_run_id": "canonical:baseline_768:hybrid:seq64:repeat0",
         "study_case_id": "baseline_768",
         "study_case_label": "baseline_768",
         "workload_variant": "encoder_bert",
@@ -964,7 +1119,14 @@ def test_latency_variation_rows_reuse_matching_existing_row(tmp_path):
         runs_per_sample=None,
         seed=42,
         existing_rows={
-            ("baseline_768", "encoder_bert", "hybrid", 64): existing_row,
+            (
+                "canonical",
+                0,
+                "baseline_768",
+                "encoder_bert",
+                "hybrid",
+                64,
+            ): existing_row,
         },
         benchmark_fn=fail_benchmark,
     )
@@ -975,7 +1137,7 @@ def test_latency_variation_rows_reuse_matching_existing_row(tmp_path):
 
 def test_latency_merge_rows_preserves_unrelated_existing_rows():
     existing = {
-        ("baseline_768", "encoder_bert", "hybrid", 64): {
+        ("canonical", 0, "baseline_768", "encoder_bert", "hybrid", 64): {
             "study_case_id": "baseline_768",
             "workload_variant": "encoder_bert",
             "execution_mode": "hybrid",
@@ -1815,28 +1977,88 @@ def test_staging_ablation_filters_sequence_lengths_to_256_through_8192(tmp_path)
     assert [row["seq_len"] for row in rows] == [int(allowed_seq_len)]
 
 
-def test_fairness_rows_report_all_modes_and_new_schedule(tmp_path):
+def test_fairness_rows_run_paired_repeats_and_export_group_stats(tmp_path):
     results_input = tmp_path / "results.csv"
     _write_csv(
         results_input,
         [
-            _result_row("hybrid", seq_len="64", power_backend="none"),
-            _result_row("runlist", seq_len="64", power_backend="turbostat_pkgwatt"),
+            _result_row("hybrid", seq_len="64", power_backend="turbostat_pkgwatt"),
         ],
     )
 
-    rows = build_fairness_rows(results_input)
+    latency_calls = {"count": 0}
+    power_calls = {"count": 0}
 
-    assert {row["execution_mode"] for row in rows} == set(EXECUTION_MODES)
-    assert {row["workload_variant"] for row in rows} == {
-        "encoder_bert",
-        "decoder_gpt2",
+    def fake_latency(*args, **kwargs):
+        latency_calls["count"] += 1
+        return {
+            "avg_latency_ms": 5.0 + latency_calls["count"],
+            "latency_sample_count": 10,
+            "min_latency_ms": 4.0,
+            "max_latency_ms": 6.0,
+            "timed_total_sec": 0.05,
+            "effective_gflops_per_sec": 100.0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    def fake_power(*args, **kwargs):
+        power_calls["count"] += 1
+        return {
+            "power_backend": "turbostat_pkgwatt",
+            "power_boundary": "package",
+            "power_estimation_method": "delta_package_power",
+            "baseline_policy": "quiescent_package_power",
+            "baseline_avg_power_w": 5.0,
+            "active_avg_power_w": 17.0,
+            "sensor_source": "turbostat:PkgWatt",
+            "temperature_source": "unavailable",
+            "avg_power_w": 12.0 + power_calls["count"],
+            "min_power_w": 11.0,
+            "max_power_w": 13.0,
+            "power_sample_count": 8,
+            "raw_avg_power_w": 12.5,
+            "raw_min_power_w": 11.0,
+            "raw_max_power_w": 14.0,
+            "raw_power_sample_count": 9,
+            "power_std_w": 0.4,
+            "raw_power_std_w": 0.6,
+            "power_outlier_sample_count": 1,
+            "power_outlier_filter_applied": True,
+            "raw_package_avg_power_w": 17.0,
+            "raw_package_min_power_w": 16.0,
+            "raw_package_max_power_w": 18.0,
+            "effective_gflops_per_sec_per_watt": 8.0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    def fake_validation(*args, **kwargs):
+        return {
+            "validation_error_count": 0,
+            "run_status": "passed",
+            "failure_message": "",
+        }
+
+    rows = build_fairness_rows(
+        results_input,
+        repeat_count=3,
+        benchmark_latency_fn=fake_latency,
+        benchmark_power_fn=fake_power,
+        benchmark_validation_fn=fake_validation,
+    )
+
+    assert len(rows) == 3
+    assert {row["repeat_index"] for row in rows} == {0, 1, 2}
+    assert {row["matched_run_id"] for row in rows} == {
+        "canonical:baseline_768:hybrid:seq64:repeat0",
+        "canonical:baseline_768:hybrid:seq64:repeat1",
+        "canonical:baseline_768:hybrid:seq64:repeat2",
     }
-    schedule = json.loads(rows[0]["iteration_schedule_json"])
-    assert schedule["64-256"]["runs_per_sample"] == 100
-    assert schedule["4096"]["runs_per_sample"] == 10
-    assert schedule["8192-16384"]["runs_per_sample"] == 5
-    assert rows[0]["selected_candidate_source"]
+    assert rows[0]["repeat_count"] == 3
+    assert rows[0]["power_estimation_method"] == "delta_package_power"
+    assert rows[0]["latency_mean_ms"] == 7.0
+    assert rows[0]["power_mean_w"] == 14.0
 
 
 def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
@@ -1854,6 +2076,7 @@ def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
         lambda study_case_id, seq_len: {
             "hybrid": {operator_name: [candidate]},
             "runlist": {operator_name: [candidate]},
+            "offload": {operator_name: [candidate]},
         },
     )
     monkeypatch.setattr(
@@ -1881,9 +2104,27 @@ def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
         "iron.applications.transformer_layer.study.end_to_end.run.benchmark_mode",
         fail_benchmark_mode,
     )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.end_to_end.run._validate_joint_mode_candidates",
+        lambda *args, **kwargs: (
+            [],
+            {operator_name: "cand0"},
+            {operator_name: resolved_config},
+            {
+                "joint_search_policy": "isolated_operator_screen_then_top_3_estimated_joint_full_patterns",
+                "joint_candidate_count_total": 1,
+                "joint_candidates_evaluated": 1,
+                "selected_joint_rank": 1,
+                "selection_provenance": "exhaustive_joint_search_best",
+            },
+            "",
+        ),
+    )
 
     tuning_rows, final_rows = build_end_to_end_rows(
         case,
+        campaign_id="canonical",
+        repeat_index=0,
         mode_filter=execution_mode,
         warmup_runs=1,
         runs_per_sample=2,
@@ -1891,6 +2132,8 @@ def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
         power_backend="none",
         existing_tuning_rows={
             (
+                "canonical",
+                0,
                 case.study_case_id,
                 case.workload_variant,
                 execution_mode,
@@ -1899,12 +2142,18 @@ def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
                 "cand0",
             ): {
                 "study_id": "end_to_end_tuning",
+                "campaign_id": "canonical",
+                "repeat_index": "0",
                 "study_case_id": case.study_case_id,
                 "study_case_label": case.study_case_label,
                 "workload_variant": case.workload_variant,
                 "execution_mode": execution_mode,
                 "internal_operator": operator_name,
                 "candidate_id": "cand0",
+                "selection_stage": "isolated_operator",
+                "joint_rank": "",
+                "joint_candidate_ids_json": "",
+                "estimated_joint_latency_ms": "",
                 "seq_len": str(case.seq_len),
                 "hidden_size": str(case.hidden_size),
                 "intermediate_size": str(case.intermediate_size),
@@ -1926,12 +2175,17 @@ def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
         },
         existing_final_rows={
             (
+                "canonical",
+                0,
                 case.study_case_id,
                 case.workload_variant,
                 execution_mode,
                 case.seq_len,
             ): {
                 "study_id": "end_to_end",
+                "campaign_id": "canonical",
+                "repeat_index": "0",
+                "matched_run_id": "canonical:baseline_768:hybrid:seq64:repeat0",
                 "study_case_id": case.study_case_id,
                 "study_case_label": case.study_case_label,
                 "workload_variant": case.workload_variant,
@@ -1947,6 +2201,19 @@ def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
                 "dtype": "bf16",
                 "use_bias": "False",
                 "weights_source": "synthetic",
+                "joint_search_policy": "isolated_operator_screen_then_top_3_estimated_joint_full_patterns",
+                "joint_candidate_count_total": "1",
+                "joint_candidates_evaluated": "1",
+                "selected_joint_rank": "1",
+                "selection_provenance": "exhaustive_joint_search_best",
+                "candidate_inventory_json": json.dumps(
+                    {operator_name: ["cand0"]},
+                    sort_keys=True,
+                ),
+                "candidate_count_by_operator_json": json.dumps(
+                    {operator_name: 1},
+                    sort_keys=True,
+                ),
                 "warmup_runs": "1",
                 "runs_per_sample": "2",
                 "measured_inference_count": "2",
@@ -1959,15 +2226,34 @@ def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
                 "host_qkv_precompute_ms": "",
                 "effective_gflops_per_sec": "100.0",
                 "power_backend": "none",
+                "power_boundary": "",
+                "power_estimation_method": "",
+                "baseline_policy": "",
+                "baseline_avg_power_w": "",
+                "active_avg_power_w": "",
+                "sensor_source": "",
+                "temperature_source": "",
                 "avg_power_w": "",
                 "min_power_w": "",
                 "max_power_w": "",
                 "power_sample_count": "",
+                "raw_avg_power_w": "",
+                "raw_min_power_w": "",
+                "raw_max_power_w": "",
+                "raw_power_sample_count": "",
+                "power_std_w": "",
+                "raw_power_std_w": "",
+                "power_outlier_sample_count": "",
+                "power_outlier_filter_applied": "",
+                "raw_package_avg_power_w": "",
+                "raw_package_min_power_w": "",
+                "raw_package_max_power_w": "",
                 "effective_gflops_per_sec_per_watt": "",
                 "npu_dispatch_count": "8",
                 "npu_unique_instruction_binary_count": "8",
                 "npu_unique_xclbin_count": "8",
                 "process_model": "in_process",
+                "validation_mode": REFERENCE_TOLERANCE_VALIDATION_MODE,
                 "validation_error_count": "0",
                 "run_status": "passed",
                 "failure_message": "",
@@ -1984,3 +2270,4 @@ def test_build_rows_reuses_matching_tuning_and_final_rows(monkeypatch):
     assert len(final_rows) == 1
     assert final_rows[0]["execution_mode"] == execution_mode
     assert final_rows[0]["selected_candidate_ids_json"] == selected_candidate_ids_json
+    assert final_rows[0]["selection_provenance"] == "exhaustive_joint_search_best"

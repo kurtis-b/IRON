@@ -32,6 +32,7 @@ The shared case matrix is:
 Canonical outputs live under a results root such as `results/` or
 `results_unattended_<run_id>/`, including:
 
+- `artifact_manifest.json`
 - `block/results.csv`
 - `end_to_end/results_all_power.csv`
 - `end_to_end/tuning_all_power.csv`
@@ -88,6 +89,24 @@ plots after restoring the normal TTM state.
 
 The unattended runner must be able to invoke `xrt-smi`, `amd-ttm`, and
 `reboot` without an interactive password prompt.
+
+After a full unattended run completes, publish the validated artifact tree into
+the canonical `results/` location:
+
+```bash
+source /opt/xilinx/xrt/setup.sh
+source /path/to/iron/ironenv/bin/activate
+cd /path/to/iron
+python3 -m iron.applications.transformer_layer.study.publish_results_root \
+  --source-root /path/to/results_unattended_<run_id> \
+  --force
+```
+
+`publish_results_root` validates the source tree, copies the retained
+paper-facing study outputs into `results/`, and writes `artifact_manifest.json`
+so the published artifact root records the campaign ID, git SHA, tool paths,
+and study command lines. Legacy `transformer_layer_new/results` outputs are not
+canonical evidence.
 
 Manual order:
 

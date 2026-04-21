@@ -14,6 +14,9 @@ from iron.applications.transformer_layer.study.resource_usage import (
 from iron.applications.transformer_layer.study.resource_usage.analysis import (
     parse_input_physical_mlir,
 )
+from iron.applications.transformer_layer.study.end_to_end.validation import (
+    REFERENCE_TOLERANCE_VALIDATION_MODE,
+)
 
 
 def _write_input_physical(prj_dir: Path, content: str) -> None:
@@ -85,6 +88,46 @@ def _write_block_results(path: Path, rows: list[dict[str, object]]) -> None:
 
 
 def _write_end_to_end_results(path: Path, rows: list[dict[str, object]]) -> None:
+    enriched_rows: list[dict[str, object]] = []
+    for index, row in enumerate(rows):
+        selected_candidate_ids = json.loads(
+            str(row.get("selected_candidate_ids_json") or "{}")
+        )
+        candidate_inventory = {
+            str(operator): [str(candidate_id)]
+            for operator, candidate_id in selected_candidate_ids.items()
+        }
+        candidate_count_by_operator = {
+            str(operator): len(candidate_ids)
+            for operator, candidate_ids in candidate_inventory.items()
+        }
+        joint_candidate_count = max(1, len(candidate_inventory))
+        enriched_rows.append(
+            {
+                "campaign_id": "canonical",
+                "repeat_index": 0,
+                "matched_run_id": (
+                    f"canonical:{row.get('study_case_id')}:{row.get('execution_mode')}:"
+                    f"seq{row.get('seq_len')}:repeat{index}"
+                ),
+                "joint_search_policy": "exhaustive_joint_search",
+                "joint_candidate_count_total": joint_candidate_count,
+                "joint_candidates_evaluated": joint_candidate_count,
+                "selected_joint_rank": 1,
+                "selection_provenance": "exhaustive_joint_search_best",
+                "candidate_inventory_json": json.dumps(
+                    candidate_inventory,
+                    sort_keys=True,
+                ),
+                "candidate_count_by_operator_json": json.dumps(
+                    candidate_count_by_operator,
+                    sort_keys=True,
+                ),
+                "validation_mode": REFERENCE_TOLERANCE_VALIDATION_MODE,
+                **row,
+            }
+        )
+
     fieldnames = [
         "backend",
         "run_status",
@@ -99,6 +142,17 @@ def _write_end_to_end_results(path: Path, rows: list[dict[str, object]]) -> None
         "attention_head_size",
         "warmup_runs",
         "runs_per_sample",
+        "campaign_id",
+        "repeat_index",
+        "matched_run_id",
+        "joint_search_policy",
+        "joint_candidate_count_total",
+        "joint_candidates_evaluated",
+        "selected_joint_rank",
+        "selection_provenance",
+        "candidate_inventory_json",
+        "candidate_count_by_operator_json",
+        "validation_mode",
         "selected_candidate_ids_json",
         "selected_config_json",
     ]
@@ -106,7 +160,7 @@ def _write_end_to_end_results(path: Path, rows: list[dict[str, object]]) -> None
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(enriched_rows)
 
 
 def test_parse_input_physical_mlir_extracts_resource_usage(tmp_path: Path) -> None:

@@ -104,6 +104,11 @@ from .power import (
     resolve_power_sample_interval_sec,
     resolve_requested_power_backend,
 )
+from .validation import (
+    FINAL_ABS_TOL,
+    FINAL_ERROR_THRESHOLD,
+    FINAL_REL_TOL,
+)
 from ..npu_runtime_checks import require_npu_power_mode_turbo
 
 GEMM_REL_TOL = 0.1
@@ -118,10 +123,7 @@ EXACT_REL_TOL = 0.04
 EXACT_ABS_TOL = 1e-6
 LAYER_NORM_REL_TOL = 0.1
 LAYER_NORM_ABS_TOL = 0.1
-FINAL_REL_TOL = 0.1
-FINAL_ABS_TOL = 0.5
-FINAL_ERROR_THRESHOLD = 0.05
-REFERENCE_VALIDATION_MAX_SEQ_LEN = 512
+REFERENCE_VALIDATION_MAX_SEQ_LEN = 16384
 DEFAULT_POWER_SAMPLE_INTERVAL_SEC = 0.1
 DEFAULT_QUIESCENT_BASELINE_DURATION_SEC = 0.5
 # Use a longer default power window so the saved rows are less sensitive to

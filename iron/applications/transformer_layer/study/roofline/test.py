@@ -9,14 +9,22 @@ import json
 from pathlib import Path
 
 from iron.applications.transformer_layer.study.roofline import run as roofline_run
+from iron.applications.transformer_layer.study.end_to_end.validation import (
+    REFERENCE_TOLERANCE_VALIDATION_MODE,
+)
 
 
 def _write_csv(
     path: Path, *, fieldnames: list[str], rows: list[dict[str, object]]
 ) -> None:
+    resolved_fieldnames = list(fieldnames)
+    for row in rows:
+        for key in row:
+            if key not in resolved_fieldnames:
+                resolved_fieldnames.append(str(key))
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=resolved_fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -150,6 +158,15 @@ def _result_row(
         if study_case_id in {"gpt2_small_768", "gpt2_medium_1024"}
         else "encoder_bert"
     )
+    candidate_inventory = {
+        str(operator): [str(candidate_id)]
+        for operator, candidate_id in selected_candidate_ids.items()
+    }
+    candidate_count_by_operator = {
+        str(operator): len(candidate_ids)
+        for operator, candidate_ids in candidate_inventory.items()
+    }
+    joint_candidate_count = max(1, len(candidate_inventory))
     return {
         "backend": "npu",
         "run_status": "passed",
@@ -164,8 +181,24 @@ def _result_row(
         "attention_head_size": hidden_size // num_attention_heads,
         "warmup_runs": 1,
         "runs_per_sample": 10,
+        "campaign_id": "canonical",
+        "repeat_index": 0,
+        "matched_run_id": (
+            f"canonical:{study_case_id}:{execution_mode}:seq{seq_len}:repeat0"
+        ),
         "avg_latency_ms": avg_latency_ms,
         "effective_gflops_per_sec": effective_gflops_per_sec,
+        "joint_search_policy": "exhaustive_joint_search",
+        "joint_candidate_count_total": joint_candidate_count,
+        "joint_candidates_evaluated": joint_candidate_count,
+        "selected_joint_rank": 1,
+        "selection_provenance": "exhaustive_joint_search_best",
+        "candidate_inventory_json": json.dumps(candidate_inventory, sort_keys=True),
+        "candidate_count_by_operator_json": json.dumps(
+            candidate_count_by_operator,
+            sort_keys=True,
+        ),
+        "validation_mode": REFERENCE_TOLERANCE_VALIDATION_MODE,
         "selected_candidate_ids_json": json.dumps(
             selected_candidate_ids, sort_keys=True
         ),

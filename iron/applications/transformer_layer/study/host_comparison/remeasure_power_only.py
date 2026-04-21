@@ -16,13 +16,14 @@ from .run import (
     POWER_COMPARISON_METRICS,
     _comparison_row,
     _normalized_existing_row,
+    _reference_metadata_value,
     _reference_metric_means,
     _resolve_plot_path,
     _row_key,
     benchmark_host_group_power_only,
     default_effective_gflops_per_watt_plot_path,
     default_effective_gflops_plot_path,
-    default_output_path,
+    default_output_path as canonical_output_path,
     RESULTS_CSV_FIELDNAMES,
     resolve_sampling,
     write_plots,
@@ -34,6 +35,15 @@ from .select import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def default_output_path() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "results_exploratory"
+        / "host_comparison"
+        / "results_power_refresh.csv"
+    )
 
 
 def load_rows(path: Path) -> list[dict[str, str]]:
@@ -59,16 +69,28 @@ def _optional_float(value: object) -> float | None:
     return float(str(value))
 
 
+def _ensure_exploratory_output_path(path: Path) -> None:
+    if path.resolve() == canonical_output_path().resolve():
+        raise ValueError(
+            "remeasure_power_only is exploratory and must not overwrite the "
+            "canonical host-comparison paper results"
+        )
+
+
 def _existing_group_value(
-    existing_rows: dict[tuple[str, str, int, str], dict[str, object]],
+    existing_rows: dict[tuple[str, int, str, str, int, str], dict[str, object]],
     *,
+    campaign_id: str,
+    repeat_index: int,
     workload_variant: str,
     study_case_id: str,
     seq_len: int,
     metric: str,
     column: str,
 ) -> float | None:
-    row = existing_rows.get((workload_variant, study_case_id, seq_len, metric))
+    row = existing_rows.get(
+        (campaign_id, repeat_index, workload_variant, study_case_id, seq_len, metric)
+    )
     if row is None:
         return None
     return _optional_float(row.get(column))
@@ -77,7 +99,7 @@ def _existing_group_value(
 def build_power_only_rows_for_group(
     *,
     group,
-    existing_rows: dict[tuple[str, str, int, str], dict[str, object]],
+    existing_rows: dict[tuple[str, int, str, str, int, str], dict[str, object]],
     seed: int,
     igpu_device_name: str,
     igpu_power_backend: str,
@@ -90,6 +112,8 @@ def build_power_only_rows_for_group(
     existing_direct_metrics = {
         metric: _existing_group_value(
             existing_rows,
+            campaign_id=group.campaign_id,
+            repeat_index=group.repeat_index,
             workload_variant=group.workload_variant,
             study_case_id=group.study_case_id,
             seq_len=group.seq_len,
@@ -101,6 +125,8 @@ def build_power_only_rows_for_group(
     existing_power_metrics = {
         metric: _existing_group_value(
             existing_rows,
+            campaign_id=group.campaign_id,
+            repeat_index=group.repeat_index,
             workload_variant=group.workload_variant,
             study_case_id=group.study_case_id,
             seq_len=group.seq_len,
@@ -142,6 +168,22 @@ def build_power_only_rows_for_group(
             metric: _optional_float(power_result.get(metric))
             for metric in POWER_COMPARISON_METRICS
         }
+    igpu_power_estimation_method = str(
+        power_result.get("power_estimation_method") or "delta_package_power"
+    )
+    igpu_baseline_policy = str(
+        power_result.get("baseline_policy") or "quiescent_package_power"
+    )
+    npu_power_estimation_method = _reference_metadata_value(
+        group,
+        "power_estimation_method",
+        default="delta_package_power",
+    )
+    npu_baseline_policy = _reference_metadata_value(
+        group,
+        "baseline_policy",
+        default="quiescent_package_power",
+    )
 
     rows = [
         _comparison_row(
@@ -149,6 +191,10 @@ def build_power_only_rows_for_group(
             metric=metric,
             igpu_value=existing_direct_metrics[metric],
             reference_values=reference_metric_values[metric],
+            igpu_power_estimation_method=igpu_power_estimation_method,
+            npu_power_estimation_method=npu_power_estimation_method,
+            igpu_baseline_policy=igpu_baseline_policy,
+            npu_baseline_policy=npu_baseline_policy,
         )
         for metric in DIRECT_COMPARISON_METRICS
     ]
@@ -159,6 +205,10 @@ def build_power_only_rows_for_group(
             igpu_value=None,
             igpu_rocm_smi_value=updated_power_metrics[metric],
             reference_values=reference_metric_values[metric],
+            igpu_power_estimation_method=igpu_power_estimation_method,
+            npu_power_estimation_method=npu_power_estimation_method,
+            igpu_baseline_policy=igpu_baseline_policy,
+            npu_baseline_policy=npu_baseline_policy,
         )
         for metric in POWER_COMPARISON_METRICS
     )
@@ -229,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     reference_input = args.reference_input.expanduser()
     output_path = args.output.expanduser()
+    _ensure_exploratory_output_path(output_path)
     effective_gflops_plot_path = (
         default_effective_gflops_plot_path(output_path)
         if args.effective_gflops_plot is None
@@ -278,9 +329,9 @@ def main(argv: list[str] | None = None) -> int:
             for row in existing_row_list
             if (normalized := _normalized_existing_row(row)) is not None
         }
-        updated_row_map: dict[tuple[str, str, int, str], dict[str, object]] = dict(
-            existing_rows
-        )
+        updated_row_map: dict[
+            tuple[str, int, str, str, int, str], dict[str, object]
+        ] = dict(existing_rows)
         for group in selected_groups:
             for row in build_power_only_rows_for_group(
                 group=group,

@@ -25,6 +25,14 @@ from matplotlib.patches import Patch
 import torch
 import torch.nn.functional as F
 
+from ..campaign import (
+    current_git_sha,
+    load_output_campaign_manifest,
+    manifest_matches_checkout,
+    normalize_campaign_id,
+    normalize_repeat_index,
+    write_campaign_manifest,
+)
 from ..run_lock import default_lock_path, hold_study_lock
 from iron.applications.transformer_layer.study.end_to_end.cases import (
     effective_gflops_per_sec,
@@ -42,6 +50,12 @@ from iron.applications.transformer_layer.study.end_to_end.power import (
     power_probe_is_complete,
     summarize_power_samples,
 )
+from iron.applications.transformer_layer.study.end_to_end.validation import (
+    FINAL_ABS_TOL,
+    FINAL_ERROR_THRESHOLD,
+    FINAL_REL_TOL,
+    validation_policy_manifest,
+)
 
 from .select import (
     REFERENCE_EXECUTION_MODES,
@@ -52,11 +66,9 @@ from .select import (
 )
 
 LOGGER = logging.getLogger(__name__)
+HOST_COMPARISON_STUDY_NAME = "transformer_layer host comparison"
 
-REFERENCE_VALIDATION_MAX_SEQ_LEN = 512
-FINAL_REL_TOL = 0.1
-FINAL_ABS_TOL = 0.5
-FINAL_ERROR_THRESHOLD = 0.05
+REFERENCE_VALIDATION_MAX_SEQ_LEN = 16384
 SUPPORTED_HOST_BACKENDS: tuple[str, ...] = ("igpu",)
 SUPPORTED_CPU_POWER_BACKENDS: tuple[str, ...] = ("none", "turbostat_pkgwatt")
 SUPPORTED_IGPU_POWER_BACKENDS: tuple[str, ...] = ("none", "rocm-smi")
@@ -66,10 +78,20 @@ COMPARISON_COLUMNS: tuple[str, ...] = (
     *REFERENCE_EXECUTION_MODES,
 )
 RESULTS_CSV_FIELDNAMES = (
+    "campaign_id",
+    "repeat_index",
+    "matched_run_id",
     "workload_variant",
     "study_case_id",
     "seq_len",
     "metric",
+    "power_boundary_policy_family",
+    "igpu_power_boundary",
+    "npu_power_boundary",
+    "igpu_power_estimation_method",
+    "npu_power_estimation_method",
+    "igpu_baseline_policy",
+    "npu_baseline_policy",
     *COMPARISON_COLUMNS,
 )
 DIRECT_COMPARISON_METRICS: tuple[str, ...] = (
@@ -79,17 +101,14 @@ DIRECT_COMPARISON_METRICS: tuple[str, ...] = (
     "max_latency_ms",
     "latency_sample_count",
 )
-POWER_AUDIT_METRICS: tuple[str, ...] = tuple(
-    field
-    for field in PERSISTED_POWER_RESULT_FIELDS
-    if field
-    not in {
-        "avg_power_w",
-        "min_power_w",
-        "max_power_w",
-        "power_sample_count",
-        "power_outlier_filter_applied",
-    }
+POWER_AUDIT_METRICS: tuple[str, ...] = (
+    "raw_avg_power_w",
+    "raw_min_power_w",
+    "raw_max_power_w",
+    "raw_power_sample_count",
+    "power_std_w",
+    "raw_power_std_w",
+    "power_outlier_sample_count",
 )
 POWER_COMPARISON_METRICS: tuple[str, ...] = (
     "effective_gflops_per_sec_per_watt",
@@ -106,7 +125,7 @@ PLOT_SERIES_THROUGHPUT = (
     ("offload", "NPU Offload", "#6c9a3b"),
 )
 PLOT_SERIES_PER_WATT = (
-    ("igpu_rocm_smi", "iGPU (ROCm-SMI)", "#e07a5f"),
+    ("igpu_rocm_smi", "iGPU Delta Package", "#e07a5f"),
     ("hybrid", "NPU Hybrid", "#1f6f8b"),
     ("runlist", "NPU Runlist", "#b85c38"),
     ("offload", "NPU Offload", "#6c9a3b"),
@@ -140,6 +159,7 @@ ROCM_SMI_LONG_MIN_POWER_MEASUREMENT_DURATION_SEC = max(
     3.0,
     ROCM_SMI_MIN_POWER_SAMPLE_INTERVAL_SEC * ROCM_SMI_LONG_POWER_SAMPLE_TARGET_COUNT,
 )
+ROCM_SMI_QUIESCENT_BASELINE_DURATION_SEC = 0.5
 TURBOSTAT_MIN_POWER_SAMPLE_INTERVAL_SEC = 0.1
 TURBOSTAT_MIN_POWER_SAMPLE_COUNT = 16
 TURBOSTAT_POWER_SAMPLE_TARGET_COUNT = 20
@@ -178,6 +198,33 @@ def default_resume_paths(output_path: Path) -> tuple[Path, ...]:
     if output_path.exists() and output_path not in paths:
         paths.append(output_path)
     return tuple(paths)
+
+
+def _compatible_resume_paths(
+    paths: tuple[Path, ...],
+    *,
+    campaign_id: str,
+) -> tuple[Path, ...]:
+    git_sha = current_git_sha()
+    compatible_paths: list[Path] = []
+    for path in paths:
+        manifest = load_output_campaign_manifest(path)
+        if manifest_matches_checkout(
+            manifest,
+            campaign_id=campaign_id,
+            git_sha=git_sha,
+            study_name=HOST_COMPARISON_STUDY_NAME,
+        ):
+            compatible_paths.append(path)
+            continue
+        LOGGER.warning(
+            "Skipping resume path %s because its campaign manifest is missing or "
+            "does not match campaign_id=%s and git_sha=%s",
+            path,
+            normalize_campaign_id(campaign_id),
+            git_sha or "unknown",
+        )
+    return tuple(compatible_paths)
 
 
 def default_effective_gflops_plot_path(output_path: Path) -> Path:
@@ -253,6 +300,13 @@ def parse_rocm_smi_average_power_w(
 def empty_power_stats() -> dict[str, float | str | None]:
     return {
         "power_backend": None,
+        "power_boundary": None,
+        "power_estimation_method": None,
+        "baseline_policy": None,
+        "baseline_avg_power_w": None,
+        "active_avg_power_w": None,
+        "sensor_source": None,
+        "temperature_source": None,
         "avg_power_w": None,
         "raw_avg_power_w": None,
         "raw_min_power_w": None,
@@ -262,6 +316,10 @@ def empty_power_stats() -> dict[str, float | str | None]:
         "raw_power_std_w": None,
         "power_outlier_sample_count": None,
         "power_outlier_filter_applied": None,
+        "raw_package_avg_power_w": None,
+        "raw_package_min_power_w": None,
+        "raw_package_max_power_w": None,
+        "quiescent_package_power_w": None,
         "min_power_w": None,
         "max_power_w": None,
         "energy_j": None,
@@ -334,10 +392,16 @@ class RocmSMIPowerMonitor:
         *,
         device_index: int = 0,
         sample_interval_sec: float = 0.2,
+        quiescent_baseline_duration_sec: float = (
+            ROCM_SMI_QUIESCENT_BASELINE_DURATION_SEC
+        ),
     ):
         self.device_index = int(device_index)
         self.sample_interval_sec = float(sample_interval_sec)
+        self.quiescent_baseline_duration_sec = float(quiescent_baseline_duration_sec)
         self.samples_w: list[float] = []
+        self._delta_samples_w: list[float] = []
+        self.quiescent_package_power_w: float | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._card_label = f"card{self.device_index}"
@@ -345,6 +409,7 @@ class RocmSMIPowerMonitor:
         self._first_error_message = ""
 
     def __enter__(self):
+        self.quiescent_package_power_w = self._measure_quiescent_baseline()
         self._thread = threading.Thread(target=self._sample_loop, daemon=True)
         self._thread.start()
         return self
@@ -356,28 +421,51 @@ class RocmSMIPowerMonitor:
         return False
 
     def _sample_loop(self) -> None:
+        baseline = self.quiescent_package_power_w or 0.0
         while not self._stop_event.is_set():
-            try:
-                result = subprocess.run(
-                    ["rocm-smi", "--showpower", "--json"],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                sample = parse_rocm_smi_average_power_w(
-                    result.stdout,
-                    card_label=self._card_label,
-                )
-                if sample is not None:
-                    self.samples_w.append(sample)
-                else:
-                    self._record_sample_failure(
-                        "rocm-smi output did not contain a socket/package power "
-                        f"reading for {self._card_label}"
-                    )
-            except Exception as exc:
-                self._record_sample_failure(f"{type(exc).__name__}: {exc}")
+            sample = self._read_sample()
+            if sample is not None:
+                self.samples_w.append(sample)
+                self._delta_samples_w.append(sample - baseline)
             self._stop_event.wait(self.sample_interval_sec)
+
+    def _read_sample(self) -> float | None:
+        try:
+            result = subprocess.run(
+                ["rocm-smi", "--showpower", "--json"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            sample = parse_rocm_smi_average_power_w(
+                result.stdout,
+                card_label=self._card_label,
+            )
+            if sample is None:
+                self._record_sample_failure(
+                    "rocm-smi output did not contain a socket/package power "
+                    f"reading for {self._card_label}"
+                )
+            return sample
+        except Exception as exc:
+            self._record_sample_failure(f"{type(exc).__name__}: {exc}")
+            return None
+
+    def _measure_quiescent_baseline(self) -> float | None:
+        deadline = time.perf_counter() + self.quiescent_baseline_duration_sec
+        baseline_samples: list[float] = []
+        while True:
+            sample = self._read_sample()
+            if sample is not None:
+                baseline_samples.append(sample)
+            if time.perf_counter() >= deadline and baseline_samples:
+                break
+            if time.perf_counter() >= deadline and not baseline_samples:
+                break
+            time.sleep(self.sample_interval_sec)
+        if not baseline_samples:
+            return None
+        return sum(baseline_samples) / float(len(baseline_samples))
 
     def current_sample_count(self) -> int:
         return len(self.samples_w)
@@ -402,14 +490,43 @@ class RocmSMIPowerMonitor:
 
     def stats(self, elapsed_sec: float) -> dict[str, float | str | None]:
         stats = empty_power_stats()
-        stats["power_backend"] = "rocm-smi"
-        if not self.samples_w:
+        if not self.samples_w and not self._delta_samples_w:
+            stats.update(
+                {
+                    "power_backend": "rocm-smi",
+                    "power_boundary": "package",
+                    "power_estimation_method": "delta_package_power",
+                    "baseline_policy": "quiescent_package_power",
+                    "quiescent_package_power_w": self.quiescent_package_power_w,
+                    "baseline_avg_power_w": self.quiescent_package_power_w,
+                    "sensor_source": "rocm-smi:socket_or_package",
+                    "temperature_source": "unavailable",
+                }
+            )
             return stats
+        raw_samples = self.samples_w if self.samples_w else self._delta_samples_w
+        avg_raw_w = sum(raw_samples) / float(len(raw_samples))
         stats.update(
             summarize_power_samples(
-                self.samples_w,
+                self._delta_samples_w if self._delta_samples_w else raw_samples,
                 elapsed_sec=elapsed_sec,
             )
+        )
+        stats.update(
+            {
+                "power_backend": "rocm-smi",
+                "power_boundary": "package",
+                "power_estimation_method": "delta_package_power",
+                "baseline_policy": "quiescent_package_power",
+                "quiescent_package_power_w": self.quiescent_package_power_w,
+                "baseline_avg_power_w": self.quiescent_package_power_w,
+                "active_avg_power_w": avg_raw_w,
+                "sensor_source": "rocm-smi:socket_or_package",
+                "temperature_source": "unavailable",
+                "raw_package_avg_power_w": avg_raw_w,
+                "raw_package_min_power_w": min(raw_samples),
+                "raw_package_max_power_w": max(raw_samples),
+            }
         )
         return stats
 
@@ -419,6 +536,7 @@ def create_rocm_power_monitor(
     power_backend: str,
     device_index: int = 0,
     sample_interval_sec: float = 0.2,
+    quiescent_baseline_duration_sec: float = ROCM_SMI_QUIESCENT_BASELINE_DURATION_SEC,
 ):
     if power_backend == "none":
         return nullcontext(None)
@@ -429,6 +547,7 @@ def create_rocm_power_monitor(
     return RocmSMIPowerMonitor(
         device_index=device_index,
         sample_interval_sec=sample_interval_sec,
+        quiescent_baseline_duration_sec=quiescent_baseline_duration_sec,
     )
 
 
@@ -1053,6 +1172,36 @@ def _reference_metric_means(
     }
 
 
+def _reference_metadata_value(
+    group: ReferenceGroup,
+    field: str,
+    *,
+    default: str,
+) -> str:
+    values = {
+        str(reference_row.get(field) or "").strip()
+        for reference_row in group.rows
+        if str(reference_row.get(field) or "").strip()
+    }
+    if len(values) == 1:
+        return next(iter(values))
+    return default
+
+
+def _metadata_value(
+    payload: dict[str, object] | None,
+    field: str,
+    *,
+    default: str,
+) -> str:
+    if not isinstance(payload, dict):
+        return default
+    value = str(payload.get(field) or "").strip()
+    if not value or value == "None":
+        return default
+    return value
+
+
 def _host_metric_value(
     benchmark_result: dict[str, object] | None,
     metric_field: str,
@@ -1093,20 +1242,36 @@ def _igpu_effective_gflops_per_watt_for_backend(
 
 
 def _repair_missing_igpu_rocm_smi_per_watt_rows(
-    rows: dict[tuple[str, str, int, str], dict[str, object]],
-) -> dict[tuple[str, str, int, str], dict[str, object]]:
+    rows: dict[tuple[str, int, str, str, int, str], dict[str, object]],
+) -> dict[tuple[str, int, str, str, int, str], dict[str, object]]:
     repaired_rows = dict(rows)
     for row_key, row in rows.items():
-        workload_variant, study_case_id, seq_len, metric = row_key
+        campaign_id, repeat_index, workload_variant, study_case_id, seq_len, metric = (
+            row_key
+        )
         if metric != "effective_gflops_per_sec_per_watt":
             continue
         if _optional_float(row.get("igpu_rocm_smi")) is not None:
             continue
         throughput_row = rows.get(
-            (workload_variant, study_case_id, seq_len, "effective_gflops_per_sec")
+            (
+                campaign_id,
+                repeat_index,
+                workload_variant,
+                study_case_id,
+                seq_len,
+                "effective_gflops_per_sec",
+            )
         )
         avg_power_row = rows.get(
-            (workload_variant, study_case_id, seq_len, "avg_power_w")
+            (
+                campaign_id,
+                repeat_index,
+                workload_variant,
+                study_case_id,
+                seq_len,
+                "avg_power_w",
+            )
         )
         repaired_value = effective_gflops_per_sec_per_watt(
             _optional_float(
@@ -1131,12 +1296,26 @@ def _comparison_row(
     igpu_value: float | None,
     igpu_rocm_smi_value: float | None = None,
     reference_values: dict[str, float | None],
+    igpu_power_estimation_method: str = "delta_package_power",
+    npu_power_estimation_method: str = "delta_package_power",
+    igpu_baseline_policy: str = "quiescent_package_power",
+    npu_baseline_policy: str = "quiescent_package_power",
 ) -> dict[str, object]:
     row: dict[str, object] = {
+        "campaign_id": group.campaign_id,
+        "repeat_index": group.repeat_index,
+        "matched_run_id": group.matched_run_id,
         "workload_variant": group.workload_variant,
         "study_case_id": group.study_case_id,
         "seq_len": group.seq_len,
         "metric": metric,
+        "power_boundary_policy_family": "package",
+        "igpu_power_boundary": "package",
+        "npu_power_boundary": "package",
+        "igpu_power_estimation_method": igpu_power_estimation_method,
+        "npu_power_estimation_method": npu_power_estimation_method,
+        "igpu_baseline_policy": igpu_baseline_policy,
+        "npu_baseline_policy": npu_baseline_policy,
         "igpu": igpu_value,
         "igpu_rocm_smi": igpu_rocm_smi_value,
     }
@@ -1145,8 +1324,10 @@ def _comparison_row(
     return row
 
 
-def _row_key(row: dict[str, object]) -> tuple[str, str, int, str]:
+def _row_key(row: dict[str, object]) -> tuple[str, int, str, str, int, str]:
     return (
+        normalize_campaign_id(row.get("campaign_id")),
+        normalize_repeat_index(row.get("repeat_index")),
         str(row.get("workload_variant") or ""),
         str(row.get("study_case_id") or ""),
         int(float(str(row.get("seq_len") or 0))),
@@ -1174,10 +1355,30 @@ def _normalized_existing_row(row: dict[str, str]) -> dict[str, object] | None:
     if not workload_variant:
         return None
     normalized: dict[str, object] = {
+        "campaign_id": normalize_campaign_id(row.get("campaign_id")),
+        "repeat_index": normalize_repeat_index(row.get("repeat_index")),
+        "matched_run_id": str(row.get("matched_run_id") or "").strip(),
         "workload_variant": workload_variant,
         "study_case_id": study_case_id,
         "seq_len": seq_len,
         "metric": metric,
+        "power_boundary_policy_family": row.get(
+            "power_boundary_policy_family", "package"
+        ),
+        "igpu_power_boundary": row.get("igpu_power_boundary", "package"),
+        "npu_power_boundary": row.get("npu_power_boundary", "package"),
+        "igpu_power_estimation_method": row.get(
+            "igpu_power_estimation_method", "delta_package_power"
+        ),
+        "npu_power_estimation_method": row.get(
+            "npu_power_estimation_method", "delta_package_power"
+        ),
+        "igpu_baseline_policy": row.get(
+            "igpu_baseline_policy", "quiescent_package_power"
+        ),
+        "npu_baseline_policy": row.get(
+            "npu_baseline_policy", "quiescent_package_power"
+        ),
         "igpu": row.get("igpu", ""),
         "igpu_rocm_smi": row.get("igpu_rocm_smi", ""),
     }
@@ -1188,8 +1389,8 @@ def _normalized_existing_row(row: dict[str, str]) -> dict[str, object] | None:
 
 def load_existing_rows(
     paths: tuple[Path, ...],
-) -> dict[tuple[str, str, int, str], dict[str, object]]:
-    rows: dict[tuple[str, str, int, str], dict[str, object]] = {}
+) -> dict[tuple[str, int, str, str, int, str], dict[str, object]]:
+    rows: dict[tuple[str, int, str, str, int, str], dict[str, object]] = {}
     for path in paths:
         if not path.exists():
             continue
@@ -1203,7 +1404,7 @@ def load_existing_rows(
 
 
 def reusable_rows_for_group(
-    existing_rows: dict[tuple[str, str, int, str], dict[str, object]],
+    existing_rows: dict[tuple[str, int, str, str, int, str], dict[str, object]],
     *,
     group: ReferenceGroup,
     reference_metric_values: dict[str, dict[str, float | None]],
@@ -1212,6 +1413,8 @@ def reusable_rows_for_group(
     for metric in DIRECT_COMPARISON_METRICS:
         row = existing_rows.get(
             (
+                group.campaign_id,
+                group.repeat_index,
                 group.workload_variant,
                 group.study_case_id,
                 group.seq_len,
@@ -1229,11 +1432,25 @@ def reusable_rows_for_group(
                 metric=metric,
                 igpu_value=igpu_value,
                 reference_values=reference_metric_values[metric],
+                igpu_power_estimation_method=str(
+                    row.get("igpu_power_estimation_method") or "delta_package_power"
+                ),
+                npu_power_estimation_method=str(
+                    row.get("npu_power_estimation_method") or "delta_package_power"
+                ),
+                igpu_baseline_policy=str(
+                    row.get("igpu_baseline_policy") or "quiescent_package_power"
+                ),
+                npu_baseline_policy=str(
+                    row.get("npu_baseline_policy") or "quiescent_package_power"
+                ),
             )
         )
     for metric in POWER_COMPARISON_METRICS:
         row = existing_rows.get(
             (
+                group.campaign_id,
+                group.repeat_index,
                 group.workload_variant,
                 group.study_case_id,
                 group.seq_len,
@@ -1252,6 +1469,18 @@ def reusable_rows_for_group(
                 igpu_value=None,
                 igpu_rocm_smi_value=igpu_rocm_smi_value,
                 reference_values=reference_metric_values[metric],
+                igpu_power_estimation_method=str(
+                    row.get("igpu_power_estimation_method") or "delta_package_power"
+                ),
+                npu_power_estimation_method=str(
+                    row.get("npu_power_estimation_method") or "delta_package_power"
+                ),
+                igpu_baseline_policy=str(
+                    row.get("igpu_baseline_policy") or "quiescent_package_power"
+                ),
+                npu_baseline_policy=str(
+                    row.get("npu_baseline_policy") or "quiescent_package_power"
+                ),
             )
         )
     return reused_rows
@@ -1362,13 +1591,18 @@ def render_metric_plot(
             for row in metric_rows
             if str(row.get("study_case_id") or "") == study_case_id
         ]
-        series_values = {
-            series_name: {
-                int(row.get("seq_len") or 0): _optional_float(row.get(series_name))
-                for row in family_rows
+        series_values: dict[str, dict[int, float | None]] = {}
+        for series_name, _, _ in plot_series:
+            values_by_seq: dict[int, list[float]] = {}
+            for row in family_rows:
+                value = _optional_float(row.get(series_name))
+                if value is None:
+                    continue
+                values_by_seq.setdefault(int(row.get("seq_len") or 0), []).append(value)
+            series_values[series_name] = {
+                seq_len: _float_mean(values)
+                for seq_len, values in values_by_seq.items()
             }
-            for series_name, _, _ in plot_series
-        }
 
         x_positions = list(range(len(seq_lens)))
         group_width = 0.82
@@ -1481,7 +1715,7 @@ def write_plots(
         _resolve_plot_path(effective_gflops_per_watt_plot_path),
         rows,
         metric="effective_gflops_per_sec_per_watt",
-        title="Effective Throughput/W Comparison",
+        title="Effective Throughput per Incremental Package Watt",
         y_axis_label="GFLOPS / W",
     )
 
@@ -1535,7 +1769,9 @@ def build_rows_for_group(
     igpu_device_name: str,
     igpu_power_backend: str,
     igpu_power_sample_interval_sec: float,
-    existing_rows: dict[tuple[str, str, int, str], dict[str, object]] | None = None,
+    existing_rows: (
+        dict[tuple[str, int, str, str, int, str], dict[str, object]] | None
+    ) = None,
 ) -> list[dict[str, object]]:
     resolved_warmup_runs, resolved_runs_per_sample = resolve_sampling(
         group,
@@ -1592,12 +1828,36 @@ def build_rows_for_group(
                 group,
                 benchmark_result=benchmark_results[backend],
             )
+    igpu_power_estimation_method = _metadata_value(
+        benchmark_results["igpu"],
+        "power_estimation_method",
+        default="delta_package_power",
+    )
+    igpu_baseline_policy = _metadata_value(
+        benchmark_results["igpu"],
+        "baseline_policy",
+        default="quiescent_package_power",
+    )
+    npu_power_estimation_method = _reference_metadata_value(
+        group,
+        "power_estimation_method",
+        default="delta_package_power",
+    )
+    npu_baseline_policy = _reference_metadata_value(
+        group,
+        "baseline_policy",
+        default="quiescent_package_power",
+    )
     rows = [
         _comparison_row(
             group=group,
             metric=metric,
             igpu_value=_host_metric_value(benchmark_results["igpu"], metric),
             reference_values=reference_metric_values[metric],
+            igpu_power_estimation_method=igpu_power_estimation_method,
+            npu_power_estimation_method=npu_power_estimation_method,
+            igpu_baseline_policy=igpu_baseline_policy,
+            npu_baseline_policy=npu_baseline_policy,
         )
         for metric in DIRECT_COMPARISON_METRICS
     ]
@@ -1615,6 +1875,10 @@ def build_rows_for_group(
                 else _host_metric_value(benchmark_results["igpu"], metric)
             ),
             reference_values=reference_metric_values[metric],
+            igpu_power_estimation_method=igpu_power_estimation_method,
+            npu_power_estimation_method=npu_power_estimation_method,
+            igpu_baseline_policy=igpu_baseline_policy,
+            npu_baseline_policy=npu_baseline_policy,
         )
         for metric in POWER_COMPARISON_METRICS
     )
@@ -1661,6 +1925,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=default_output_path())
     parser.add_argument("--resume-input", type=Path, default=None)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--manifest-output", type=Path, default=None)
     parser.add_argument(
         "--effective-gflops-plot",
         "--tps-plot",
@@ -1693,6 +1958,11 @@ def main(argv: list[str] | None = None) -> int:
 
     reference_input = args.reference_input.expanduser()
     output_path = args.output.expanduser()
+    manifest_output_path = (
+        output_path.with_name("campaign_manifest.json")
+        if args.manifest_output is None
+        else args.manifest_output.expanduser()
+    )
     with hold_study_lock(
         default_lock_path(output_path),
         study_name="host comparison",
@@ -1750,6 +2020,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
+        resume_paths = _compatible_resume_paths(
+            resume_paths,
+            campaign_id=groups[0].campaign_id,
+        )
         existing_rows = load_existing_rows(resume_paths)
         if resume_paths and existing_rows:
             LOGGER.info(
@@ -1758,7 +2032,7 @@ def main(argv: list[str] | None = None) -> int:
                 ", ".join(str(path) for path in resume_paths),
             )
 
-        row_map: dict[tuple[str, str, int, str], dict[str, object]] = dict(
+        row_map: dict[tuple[str, int, str, str, int, str], dict[str, object]] = dict(
             existing_rows
         )
         rows: list[dict[str, object]] = list(row_map.values())
@@ -1785,6 +2059,30 @@ def main(argv: list[str] | None = None) -> int:
             rows,
             effective_gflops_plot_path=effective_gflops_plot_path,
             effective_gflops_per_watt_plot_path=effective_gflops_per_watt_plot_path,
+        )
+        write_campaign_manifest(
+            manifest_output_path,
+            campaign_id=(groups[0].campaign_id if groups else "canonical"),
+            study_name=HOST_COMPARISON_STUDY_NAME,
+            command_line=[
+                "python3",
+                "-m",
+                "iron.applications.transformer_layer.study.host_comparison.run",
+                *(sys.argv[1:] if argv is None else argv),
+            ],
+            output_files=(
+                output_path,
+                effective_gflops_plot_path,
+                effective_gflops_per_watt_plot_path,
+            ),
+            extra={
+                "reference_input": str(reference_input),
+                "igpu_device": str(args.igpu_device),
+                "igpu_power_backend": str(args.igpu_power_backend),
+                "power_estimation_method": "delta_package_power",
+                "baseline_policy": "quiescent_package_power",
+                "validation_policy": validation_policy_manifest(),
+            },
         )
         LOGGER.info("Wrote %d host comparison rows to %s", len(rows), output_path)
         LOGGER.info(

@@ -8,12 +8,16 @@ import argparse
 import shutil
 from pathlib import Path
 
+from .artifact_integrity import validate_canonical_results_root
+
 REQUIRED_RESULTS_FILES = (
     ("block", "results.csv"),
     ("end_to_end", "results_all_power.csv"),
     ("end_to_end", "tuning_all_power.csv"),
+    ("end_to_end", "campaign_manifest.json"),
     ("memory_tile_staging", "results.csv"),
     ("host_comparison", "results.csv"),
+    ("host_comparison", "campaign_manifest.json"),
 )
 
 REQUIRED_EXECUTION_FIXTURE_FILES = (
@@ -26,7 +30,7 @@ REQUIRED_PLOT_FILES = (
     ("block", "best_latency_by_block.svg"),
     ("end_to_end", "effective_gflops_per_second_by_pattern.svg"),
     ("end_to_end", "latency_by_pattern.svg"),
-    ("end_to_end", "dataflow_selected_blocks_vs_pattern_latency.svg"),
+    ("end_to_end", "hybrid_selected_blocks_vs_pattern_latency.svg"),
     ("memory_tile_staging", "mha_out_proj_latency_by_staging_depth.svg"),
     ("host_comparison", "effective_gflops_comparison.svg"),
     ("host_comparison", "effective_gflops_per_watt_comparison.svg"),
@@ -36,11 +40,13 @@ REQUIRED_EXECUTION_OUTPUT_FILES = (
     ("block", "results.csv"),
     ("end_to_end", "results_all_power.csv"),
     ("end_to_end", "tuning_all_power.csv"),
+    ("end_to_end", "campaign_manifest.json"),
     ("end_to_end", "correctness_spot_checks.csv"),
     ("end_to_end", "latency_variation.csv"),
     ("end_to_end", "latency_variation_by_pattern.svg"),
     ("end_to_end", "fairness_repeatability.csv"),
     ("host_comparison", "results.csv"),
+    ("host_comparison", "campaign_manifest.json"),
     ("host_comparison", "fairness_repeatability.csv"),
     ("resource_usage", "dataflow_block_best_configs.csv"),
     ("resource_usage", "hybrid_selected_ops.csv"),
@@ -86,6 +92,7 @@ def _verify_required_outputs(results_root: Path) -> None:
             "Smoke-test plot regeneration did not produce expected outputs:\n"
             + "\n".join(missing)
         )
+    validate_canonical_results_root(results_root)
 
 
 def _verify_execution_outputs(results_root: Path) -> None:
@@ -102,6 +109,7 @@ def _verify_execution_outputs(results_root: Path) -> None:
         raise FileNotFoundError(
             "Execution smoke did not produce expected outputs:\n" + "\n".join(missing)
         )
+    validate_canonical_results_root(results_root)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

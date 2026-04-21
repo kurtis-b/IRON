@@ -10,6 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..campaign import (
+    DEFAULT_CAMPAIGN_ID,
+    normalize_campaign_id,
+    normalize_matched_run_id,
+    normalize_repeat_index,
+    optional_int,
+)
 from .cases import (
     EXECUTION_MODES,
     FAMILY_IDS,
@@ -18,6 +25,7 @@ from .cases import (
     canonical_execution_mode,
     canonical_workload_variant,
 )
+from .validation import REFERENCE_TOLERANCE_VALIDATION_MODE
 
 _MODE_ORDER = {
     execution_mode: index for index, execution_mode in enumerate(EXECUTION_MODES)
@@ -33,6 +41,9 @@ def _normalized_execution_mode(value: object) -> str | None:
 
 @dataclass(frozen=True)
 class SelectedEndToEndRow:
+    campaign_id: str
+    repeat_index: int
+    matched_run_id: str
     study_case_id: str
     study_case_label: str
     workload_variant: str
@@ -66,12 +77,6 @@ def load_result_rows(path: str | Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def _optional_int(value: object) -> int | None:
-    if value in (None, "", "None"):
-        return None
-    return int(float(str(value)))
-
-
 def _eligible_row(row: dict[str, str]) -> bool:
     if row.get("backend") != "npu":
         return False
@@ -79,10 +84,25 @@ def _eligible_row(row: dict[str, str]) -> bool:
         return False
     if _normalized_execution_mode(row.get("execution_mode")) is None:
         return False
-    if _optional_int(row.get("seq_len")) is None:
+    if optional_int(row.get("seq_len")) is None:
         return False
     selected_config_json = str(row.get("selected_config_json") or "").strip()
     if not selected_config_json:
+        return False
+    required_selection_fields = (
+        "joint_search_policy",
+        "joint_candidate_count_total",
+        "joint_candidates_evaluated",
+        "selection_provenance",
+        "candidate_inventory_json",
+        "candidate_count_by_operator_json",
+    )
+    if any(
+        str(row.get(field) or "").strip() == "" for field in required_selection_fields
+    ):
+        return False
+    validation_mode = str(row.get("validation_mode") or "").strip()
+    if validation_mode != REFERENCE_TOLERANCE_VALIDATION_MODE:
         return False
     return True
 
@@ -103,11 +123,21 @@ def _normalized_workload_variant(row: dict[str, str]) -> str | None:
 def _matches_filters(
     row: dict[str, str],
     *,
+    campaign_id_filter: str,
+    repeat_index_filter: str,
     workload_variant_filter: str,
     family_filter: str,
     seq_len_filter: str,
     mode_filter: str,
 ) -> bool:
+    if campaign_id_filter != "all":
+        if normalize_campaign_id(row.get("campaign_id")) != normalize_campaign_id(
+            campaign_id_filter
+        ):
+            return False
+    if repeat_index_filter != "all":
+        if normalize_repeat_index(row.get("repeat_index")) != int(repeat_index_filter):
+            return False
     if workload_variant_filter != "all":
         if _normalized_workload_variant(row) != canonical_workload_variant(
             workload_variant_filter
@@ -115,7 +145,7 @@ def _matches_filters(
             return False
     if family_filter != "all" and row.get("study_case_id") != family_filter:
         return False
-    if seq_len_filter != "all" and _optional_int(row.get("seq_len")) != int(
+    if seq_len_filter != "all" and optional_int(row.get("seq_len")) != int(
         seq_len_filter
     ):
         return False
@@ -138,7 +168,7 @@ def _sorted_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
                 _normalized_execution_mode(row.get("execution_mode")),
                 len(EXECUTION_MODES),
             ),
-            seq_order.get(_optional_int(row.get("seq_len")), len(SEQUENCE_LADDER)),
+            seq_order.get(optional_int(row.get("seq_len")), len(SEQUENCE_LADDER)),
         ),
     )
 
@@ -153,6 +183,8 @@ def _load_json_dict(value: str) -> dict[str, Any]:
 def select_result_rows(
     rows: list[dict[str, str]],
     *,
+    campaign_id_filter: str = "all",
+    repeat_index_filter: str = "all",
     workload_variant_filter: str = "all",
     family_filter: str = "all",
     seq_len_filter: str = "all",
@@ -164,6 +196,8 @@ def select_result_rows(
             continue
         if not _matches_filters(
             row,
+            campaign_id_filter=campaign_id_filter,
+            repeat_index_filter=repeat_index_filter,
             workload_variant_filter=workload_variant_filter,
             family_filter=family_filter,
             seq_len_filter=seq_len_filter,
@@ -171,25 +205,38 @@ def select_result_rows(
         ):
             continue
 
+        campaign_id = normalize_campaign_id(row.get("campaign_id"))
+        repeat_index = normalize_repeat_index(row.get("repeat_index"))
+        study_case_id = str(row.get("study_case_id") or "")
+        execution_mode = canonical_execution_mode(str(row.get("execution_mode") or ""))
+        seq_len = int(optional_int(row.get("seq_len")) or 0)
         selected.append(
             SelectedEndToEndRow(
-                study_case_id=str(row.get("study_case_id") or ""),
+                campaign_id=campaign_id,
+                repeat_index=repeat_index,
+                matched_run_id=normalize_matched_run_id(
+                    row.get("matched_run_id"),
+                    campaign_id=campaign_id,
+                    study_case_id=study_case_id,
+                    execution_mode=execution_mode,
+                    seq_len=seq_len,
+                    repeat_index=repeat_index,
+                ),
+                study_case_id=study_case_id,
                 study_case_label=str(row.get("study_case_label") or ""),
                 workload_variant=str(_normalized_workload_variant(row) or ""),
-                execution_mode=canonical_execution_mode(
-                    str(row.get("execution_mode") or "")
-                ),
-                seq_len=int(_optional_int(row.get("seq_len")) or 0),
-                hidden_size=int(_optional_int(row.get("hidden_size")) or 0),
-                intermediate_size=int(_optional_int(row.get("intermediate_size")) or 0),
+                execution_mode=execution_mode,
+                seq_len=seq_len,
+                hidden_size=int(optional_int(row.get("hidden_size")) or 0),
+                intermediate_size=int(optional_int(row.get("intermediate_size")) or 0),
                 num_attention_heads=int(
-                    _optional_int(row.get("num_attention_heads")) or 0
+                    optional_int(row.get("num_attention_heads")) or 0
                 ),
                 attention_head_size=int(
-                    _optional_int(row.get("attention_head_size")) or 0
+                    optional_int(row.get("attention_head_size")) or 0
                 ),
-                warmup_runs=_optional_int(row.get("warmup_runs")),
-                runs_per_sample=_optional_int(row.get("runs_per_sample")),
+                warmup_runs=optional_int(row.get("warmup_runs")),
+                runs_per_sample=optional_int(row.get("runs_per_sample")),
                 selected_candidate_ids={
                     str(key): str(value)
                     for key, value in _load_json_dict(
@@ -210,6 +257,7 @@ def select_result_rows(
 
 
 __all__ = [
+    "DEFAULT_CAMPAIGN_ID",
     "SelectedEndToEndRow",
     "default_results_path",
     "load_result_rows",

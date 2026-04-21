@@ -18,6 +18,7 @@ from matplotlib import pyplot as plt
 from matplotlib.lines import Line2D
 import seaborn as sns
 
+from ..campaign import normalize_campaign_id, normalize_repeat_index
 from ..npu_runtime_checks import warn_if_npu_power_mode_not_turbo
 from ..run_lock import default_lock_path, hold_study_lock
 from .cases import (
@@ -36,6 +37,9 @@ LOGGER = logging.getLogger(__name__)
 
 RESULTS_CSV_FIELDNAMES = (
     "study_id",
+    "campaign_id",
+    "repeat_index",
+    "matched_run_id",
     "study_case_id",
     "study_case_label",
     "workload_variant",
@@ -129,8 +133,10 @@ def _resume_workload_variant(row: dict[str, str]) -> str:
     return ""
 
 
-def _row_key(row: dict[str, str]) -> tuple[str, str, str, int]:
+def _row_key(row: dict[str, str]) -> tuple[str, int, str, str, str, int]:
     return (
+        normalize_campaign_id(row.get("campaign_id")),
+        normalize_repeat_index(row.get("repeat_index")),
         str(row.get("study_case_id") or ""),
         _resume_workload_variant(row),
         _resume_execution_mode(row.get("execution_mode")),
@@ -140,8 +146,8 @@ def _row_key(row: dict[str, str]) -> tuple[str, str, str, int]:
 
 def load_existing_rows(
     paths: tuple[Path, ...],
-) -> dict[tuple[str, str, str, int], dict[str, object]]:
-    rows: dict[tuple[str, str, str, int], dict[str, object]] = {}
+) -> dict[tuple[str, int, str, str, str, int], dict[str, object]]:
+    rows: dict[tuple[str, int, str, str, str, int], dict[str, object]] = {}
     for path in paths:
         if not path.exists():
             continue
@@ -154,7 +160,7 @@ def load_existing_rows(
 
 
 def merge_rows(
-    existing_rows: dict[tuple[str, str, str, int], dict[str, object]],
+    existing_rows: dict[tuple[str, int, str, str, str, int], dict[str, object]],
     rows: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     merged = {key: dict(value) for key, value in existing_rows.items()}
@@ -164,8 +170,10 @@ def merge_rows(
 
 
 def reusable_existing_row(
-    existing_rows: dict[tuple[str, str, str, int], dict[str, object]],
+    existing_rows: dict[tuple[str, int, str, str, str, int], dict[str, object]],
     *,
+    campaign_id: str,
+    repeat_index: int,
     study_case_id: str,
     workload_variant: str,
     execution_mode: str,
@@ -175,7 +183,16 @@ def reusable_existing_row(
     selected_candidate_ids_json: str,
     selected_config_json: str,
 ) -> dict[str, object] | None:
-    row = existing_rows.get((study_case_id, workload_variant, execution_mode, seq_len))
+    row = existing_rows.get(
+        (
+            normalize_campaign_id(campaign_id),
+            int(repeat_index),
+            study_case_id,
+            workload_variant,
+            execution_mode,
+            seq_len,
+        )
+    )
     if row is None:
         return None
     if str(row.get("run_status") or "") != "passed":
@@ -255,7 +272,9 @@ def build_rows(
     warmup_runs: int | None,
     runs_per_sample: int | None,
     seed: int,
-    existing_rows: dict[tuple[str, str, str, int], dict[str, object]] | None = None,
+    existing_rows: (
+        dict[tuple[str, int, str, str, str, int], dict[str, object]] | None
+    ) = None,
     benchmark_fn=None,
     checkpoint_fn=None,
 ) -> list[dict[str, object]]:
@@ -290,6 +309,8 @@ def build_rows(
         )
         reused_row = reusable_existing_row(
             {} if existing_rows is None else existing_rows,
+            campaign_id=selected_row.campaign_id,
+            repeat_index=selected_row.repeat_index,
             study_case_id=selected_row.study_case_id,
             workload_variant=selected_row.workload_variant,
             execution_mode=selected_row.execution_mode,
@@ -328,6 +349,9 @@ def build_rows(
         rows.append(
             {
                 "study_id": "end_to_end_latency_variation",
+                "campaign_id": selected_row.campaign_id,
+                "repeat_index": selected_row.repeat_index,
+                "matched_run_id": selected_row.matched_run_id,
                 "study_case_id": selected_row.study_case_id,
                 "study_case_label": selected_row.study_case_label,
                 "workload_variant": selected_row.workload_variant,

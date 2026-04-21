@@ -10,6 +10,11 @@ import json
 import logging
 from pathlib import Path
 
+from ..campaign import (
+    normalize_campaign_id,
+    normalize_matched_run_id,
+    normalize_repeat_index,
+)
 from ..npu_runtime_checks import warn_if_npu_power_mode_not_turbo
 from ..run_lock import default_lock_path, hold_study_lock
 from .cases import (
@@ -23,12 +28,16 @@ from .cases import (
 from .modes import benchmark_mode, benchmark_mode_subprocess
 from .run import iteration_schedule
 from .select import default_results_path, load_result_rows, select_result_rows
+from .validation import REFERENCE_TOLERANCE_VALIDATION_MODE
 
 LOGGER = logging.getLogger(__name__)
 
 SPOT_CHECK_SEQ_LENS: tuple[int, ...] = (512, 2048)
 RESULTS_CSV_FIELDNAMES = (
     "study_id",
+    "campaign_id",
+    "repeat_index",
+    "matched_run_id",
     "study_case_id",
     "study_case_label",
     "workload_variant",
@@ -91,8 +100,10 @@ def _resume_workload_variant(row: dict[str, str]) -> str:
     return ""
 
 
-def _row_key(row: dict[str, str]) -> tuple[str, str, str, int]:
+def _row_key(row: dict[str, str]) -> tuple[str, int, str, str, str, int]:
     return (
+        normalize_campaign_id(row.get("campaign_id")),
+        normalize_repeat_index(row.get("repeat_index")),
         str(row.get("study_case_id") or ""),
         _resume_workload_variant(row),
         _resume_execution_mode(row.get("execution_mode")),
@@ -102,8 +113,8 @@ def _row_key(row: dict[str, str]) -> tuple[str, str, str, int]:
 
 def load_existing_rows(
     paths: tuple[Path, ...],
-) -> dict[tuple[str, str, str, int], dict[str, object]]:
-    rows: dict[tuple[str, str, str, int], dict[str, object]] = {}
+) -> dict[tuple[str, int, str, str, str, int], dict[str, object]]:
+    rows: dict[tuple[str, int, str, str, str, int], dict[str, object]] = {}
     for path in paths:
         if not path.exists():
             continue
@@ -116,7 +127,7 @@ def load_existing_rows(
 
 
 def merge_rows(
-    existing_rows: dict[tuple[str, str, str, int], dict[str, object]],
+    existing_rows: dict[tuple[str, int, str, str, str, int], dict[str, object]],
     rows: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     merged = {key: dict(value) for key, value in existing_rows.items()}
@@ -126,8 +137,10 @@ def merge_rows(
 
 
 def reusable_existing_row(
-    existing_rows: dict[tuple[str, str, str, int], dict[str, object]],
+    existing_rows: dict[tuple[str, int, str, str, str, int], dict[str, object]],
     *,
+    campaign_id: str,
+    repeat_index: int,
     study_case_id: str,
     workload_variant: str,
     execution_mode: str,
@@ -137,7 +150,16 @@ def reusable_existing_row(
     selected_candidate_ids_json: str,
     selected_config_json: str,
 ) -> dict[str, object] | None:
-    row = existing_rows.get((study_case_id, workload_variant, execution_mode, seq_len))
+    row = existing_rows.get(
+        (
+            normalize_campaign_id(campaign_id),
+            int(repeat_index),
+            study_case_id,
+            workload_variant,
+            execution_mode,
+            seq_len,
+        )
+    )
     if row is None:
         return None
     if str(row.get("run_status") or "") != "passed":
@@ -149,6 +171,8 @@ def reusable_existing_row(
     if str(row.get("selected_candidate_ids_json") or "") != selected_candidate_ids_json:
         return None
     if str(row.get("selected_config_json") or "") != selected_config_json:
+        return None
+    if str(row.get("validation_mode") or "") != REFERENCE_TOLERANCE_VALIDATION_MODE:
         return None
     required_fields = (
         "latency_sample_count",
@@ -176,9 +200,8 @@ def _resolved_sampling(case: EndToEndCase, selected_row) -> tuple[int, int]:
 
 
 def validation_mode_for_seq_len(seq_len: int) -> str:
-    if seq_len == 512:
-        return "exact_reference"
-    return "numerical_spot_check"
+    del seq_len
+    return REFERENCE_TOLERANCE_VALIDATION_MODE
 
 
 def _matches_seq_len_filter(seq_len: int, seq_len_filter: str) -> bool:
@@ -193,7 +216,9 @@ def build_rows(
     mode_filter: str,
     seq_len_filter: str = "all",
     seed: int,
-    existing_rows: dict[tuple[str, str, str, int], dict[str, object]] | None = None,
+    existing_rows: (
+        dict[tuple[str, int, str, str, str, int], dict[str, object]] | None
+    ) = None,
     benchmark_fn=None,
 ) -> list[dict[str, object]]:
     if benchmark_fn is None:
@@ -224,6 +249,8 @@ def build_rows(
         )
         reused_row = reusable_existing_row(
             {} if existing_rows is None else existing_rows,
+            campaign_id=selected_row.campaign_id,
+            repeat_index=selected_row.repeat_index,
             study_case_id=selected_row.study_case_id,
             workload_variant=selected_row.workload_variant,
             execution_mode=selected_row.execution_mode,
@@ -257,6 +284,9 @@ def build_rows(
         rows.append(
             {
                 "study_id": "end_to_end_correctness_spot_checks",
+                "campaign_id": selected_row.campaign_id,
+                "repeat_index": selected_row.repeat_index,
+                "matched_run_id": selected_row.matched_run_id,
                 "study_case_id": selected_row.study_case_id,
                 "study_case_label": selected_row.study_case_label,
                 "workload_variant": selected_row.workload_variant,

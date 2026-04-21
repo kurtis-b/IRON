@@ -234,11 +234,17 @@ def test_results_root_contains_required_files(tmp_path):
     (results_root / "end_to_end" / "tuning_all_power.csv").write_text(
         "x\n", encoding="utf-8"
     )
+    (results_root / "end_to_end" / "campaign_manifest.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
     (results_root / "memory_tile_staging" / "results.csv").write_text(
         "x\n", encoding="utf-8"
     )
     (results_root / "host_comparison" / "results.csv").write_text(
         "x\n", encoding="utf-8"
+    )
+    (results_root / "host_comparison" / "campaign_manifest.json").write_text(
+        "{}\n", encoding="utf-8"
     )
 
     assert _results_root_contains_required_files(results_root, REQUIRED_RESULTS_FILES)
@@ -459,6 +465,10 @@ def test_start_persists_resolved_amd_ttm_path(monkeypatch, tmp_path):
         lambda run_user: "/tmp/fake-amd-ttm",
     )
     monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.unattended_reboot._ttm_config_exists",
+        lambda: False,
+    )
+    monkeypatch.setattr(
         "iron.applications.transformer_layer.study.unattended_reboot._current_ttm_pages_limit",
         lambda: 3993375,
     )
@@ -510,6 +520,10 @@ def test_start_rejects_unreadable_current_ttm_pages_limit(monkeypatch, tmp_path)
     monkeypatch.setattr(
         "iron.applications.transformer_layer.study.unattended_reboot._resolve_amd_ttm_path",
         lambda run_user: "/tmp/fake-amd-ttm",
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.unattended_reboot._ttm_config_exists",
+        lambda: False,
     )
     monkeypatch.setattr(
         "iron.applications.transformer_layer.study.unattended_reboot._current_ttm_pages_limit",

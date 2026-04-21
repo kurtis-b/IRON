@@ -11,6 +11,7 @@ from pathlib import Path
 
 from matplotlib import pyplot as plt
 
+from .artifact_integrity import validate_canonical_results_root
 from .block.plot_best_latency import (
     load_best_rows as load_block_rows,
     plot_best_latency,
@@ -28,6 +29,7 @@ from .end_to_end.plot_tps_by_pattern import (
 )
 from .host_comparison.run import write_plots as write_host_comparison_plots
 from .memory_tile_staging.plot_staging_depth import write_canonical_plots
+from .results_manifest import write_results_root_manifest
 
 LOGGER = logging.getLogger(__name__)
 
@@ -159,6 +161,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=default_results_root(),
         help="Root directory containing block/, end_to_end/, memory_tile_staging/, and host_comparison/ results",
     )
+    parser.add_argument("--skip-integrity-checks", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -168,7 +171,12 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
-    regenerate_all_plots(args.results_root.expanduser())
+    results_root = args.results_root.expanduser()
+    write_results_root_manifest(results_root)
+    if not args.skip_integrity_checks:
+        validate_canonical_results_root(results_root)
+    regenerate_all_plots(results_root)
+    write_results_root_manifest(results_root)
     return 0
 
 

@@ -6,7 +6,13 @@ SPDX-License-Identifier: Apache-2.0
 # Host Comparison Study
 
 This study benchmarks the ROCm iGPU path and joins those measurements with the
-completed end-to-end NPU rows for the same `(study_case_id, seq_len)`.
+completed end-to-end NPU rows from the same canonical campaign and repeat. The
+join requires exactly one selected NPU row per
+`(campaign_id, repeat_index, study_case_id, seq_len, execution_mode)`.
+Each joined reference group must contain all three retained NPU modes
+(`hybrid`, `runlist`, `offload`) from one campaign only, and those NPU rows
+must already be validated with the canonical `reference_tolerance_validation`
+policy from the end-to-end study.
 
 Dependencies:
 
@@ -21,8 +27,15 @@ Reference columns in `results/host_comparison/results.csv`:
 - `offload`
 
 The throughput plot uses `igpu` plus the NPU reference modes. The per-watt plot
-uses the same measured iGPU throughput numerator with ROCm-SMI power samples in
-`igpu_rocm_smi`, again alongside the NPU reference modes.
+uses the same measured iGPU throughput numerator with ROCm-SMI
+delta-package-power samples in `igpu_rocm_smi`, again alongside the NPU
+reference modes. The CSV records the power-boundary policy family, the NPU/iGPU
+estimation methods, and both baseline policies so the comparison does not
+silently mix incompatible power semantics.
+
+Resume reuse is manifest-gated. Existing host-comparison rows are only reused
+when the sibling `campaign_manifest.json` matches the requested `campaign_id`,
+the host-comparison study name, and the current git SHA.
 
 Canonical outputs:
 
@@ -40,7 +53,10 @@ Entry points:
 `remeasure_power_only` preserves the existing host latency and throughput rows,
 remeasures only iGPU power for the selected groups, updates the
 `igpu_rocm_smi` power and per-watt columns, and regenerates the host-comparison
-plots.
+plots. It writes exploratory refreshes under `results_exploratory/` and refuses
+to overwrite the canonical `results/host_comparison/results.csv`. It remains an
+exploratory/support workflow and is not part of the canonical paper-number
+generation path.
 
 Environment on Ubuntu 24.04 / Python 3.12 Ryzen APU systems:
 

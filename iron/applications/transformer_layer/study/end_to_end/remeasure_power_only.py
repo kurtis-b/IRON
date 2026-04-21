@@ -26,12 +26,21 @@ from .run import RESULTS_CSV_FIELDNAMES
 LOGGER = logging.getLogger(__name__)
 
 
-def default_output_path() -> Path:
+def canonical_output_path() -> Path:
     return (
         Path(__file__).resolve().parents[2]
         / "results"
         / "end_to_end"
         / "results_all_power.csv"
+    )
+
+
+def default_output_path() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "results_exploratory"
+        / "end_to_end"
+        / "results_all_power_power_refresh.csv"
     )
 
 
@@ -102,6 +111,14 @@ def updated_row_with_power_measurement(
     return updated
 
 
+def _ensure_exploratory_output_path(path: Path) -> None:
+    if path.resolve() == canonical_output_path().resolve():
+        raise ValueError(
+            "remeasure_power_only is exploratory and must not overwrite the "
+            "canonical end-to-end paper results"
+        )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Remeasure end-to-end NPU power only and rewrite GFLOPS/W"
@@ -143,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
     output_path = args.output.expanduser()
+    _ensure_exploratory_output_path(output_path)
     with hold_study_lock(
         default_lock_path(output_path),
         study_name="end-to-end power-only refresh",

@@ -8,10 +8,19 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..campaign import (
+    matched_run_id,
+    normalize_campaign_id,
+    normalize_repeat_index,
+    optional_int,
+)
 from iron.applications.transformer_layer.study.end_to_end.cases import (
     FAMILY_SPECS,
     canonical_execution_mode,
     canonical_workload_variant,
+)
+from iron.applications.transformer_layer.study.end_to_end.validation import (
+    REFERENCE_TOLERANCE_VALIDATION_MODE,
 )
 
 REFERENCE_EXECUTION_MODES: tuple[str, ...] = ("hybrid", "runlist", "offload")
@@ -23,6 +32,9 @@ _REFERENCE_MODE_ORDER = {
 
 @dataclass(frozen=True)
 class ReferenceGroup:
+    campaign_id: str
+    repeat_index: int
+    matched_run_id: str
     study_case_id: str
     study_case_label: str
     workload_variant: str
@@ -57,12 +69,6 @@ def load_reference_rows(path: str | Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def _optional_int(value: object) -> int | None:
-    if value in (None, "", "None"):
-        return None
-    return int(float(str(value)))
-
-
 def _optional_bool(value: object) -> bool | None:
     if value in (None, "", "None"):
         return None
@@ -85,7 +91,12 @@ def _eligible_reference_row(row: dict[str, str]) -> bool:
         return False
     if execution_mode not in REFERENCE_EXECUTION_MODES:
         return False
-    return _optional_int(row.get("seq_len")) is not None
+    if optional_int(row.get("seq_len")) is None:
+        return False
+    validation_mode = str(row.get("validation_mode") or "").strip()
+    if validation_mode != REFERENCE_TOLERANCE_VALIDATION_MODE:
+        return False
+    return True
 
 
 def _normalized_workload_variant(row: dict[str, str]) -> str | None:
@@ -104,12 +115,22 @@ def _normalized_workload_variant(row: dict[str, str]) -> str | None:
 def _matches_filters(
     row: dict[str, str],
     *,
+    campaign_id_filter: str,
+    repeat_index_filter: str,
     family_filter: str,
     seq_len_filter: str,
 ) -> bool:
+    if campaign_id_filter != "all":
+        if normalize_campaign_id(row.get("campaign_id")) != normalize_campaign_id(
+            campaign_id_filter
+        ):
+            return False
+    if repeat_index_filter != "all":
+        if normalize_repeat_index(row.get("repeat_index")) != int(repeat_index_filter):
+            return False
     if family_filter != "all" and row.get("study_case_id") != family_filter:
         return False
-    if seq_len_filter != "all" and _optional_int(row.get("seq_len")) != int(
+    if seq_len_filter != "all" and optional_int(row.get("seq_len")) != int(
         seq_len_filter
     ):
         return False
@@ -140,7 +161,7 @@ def _required_shared_text(rows: list[dict[str, str]], field: str) -> str:
 
 
 def _required_shared_int(rows: list[dict[str, str]], field: str) -> int:
-    values = {_optional_int(row.get(field)) for row in rows}
+    values = {optional_int(row.get(field)) for row in rows}
     if None in values or len(values) != 1:
         raise ValueError(
             f"Reference rows disagree on field {field!r}: {sorted(values)}"
@@ -150,9 +171,7 @@ def _required_shared_int(rows: list[dict[str, str]], field: str) -> int:
 
 def _optional_uniform_int(rows: list[dict[str, str]], field: str) -> int | None:
     values = {
-        _optional_int(row.get(field))
-        for row in rows
-        if row.get(field) not in ("", None)
+        optional_int(row.get(field)) for row in rows if row.get(field) not in ("", None)
     }
     if not values:
         return None
@@ -177,10 +196,12 @@ def _optional_uniform_bool(rows: list[dict[str, str]], field: str) -> bool | Non
 def group_reference_rows(
     rows: list[dict[str, str]],
     *,
+    campaign_id_filter: str = "all",
+    repeat_index_filter: str = "all",
     family_filter: str = "all",
     seq_len_filter: str = "all",
 ) -> tuple[ReferenceGroup, ...]:
-    grouped_rows: dict[tuple[str, str, int], list[dict[str, str]]] = {}
+    grouped_rows: dict[tuple[str, int, str, str, int], list[dict[str, str]]] = {}
 
     for row in rows:
         if not _eligible_reference_row(row):
@@ -188,32 +209,64 @@ def group_reference_rows(
         execution_mode = canonical_execution_mode(str(row.get("execution_mode") or ""))
         if not _matches_filters(
             row,
+            campaign_id_filter=campaign_id_filter,
+            repeat_index_filter=repeat_index_filter,
             family_filter=family_filter,
             seq_len_filter=seq_len_filter,
         ):
             continue
         study_case_id = str(row.get("study_case_id") or "")
-        seq_len = _optional_int(row.get("seq_len"))
+        seq_len = optional_int(row.get("seq_len"))
         workload_variant = _normalized_workload_variant(row)
+        campaign_id = normalize_campaign_id(row.get("campaign_id"))
+        repeat_index = normalize_repeat_index(row.get("repeat_index"))
         if not study_case_id or seq_len is None or workload_variant is None:
             continue
         normalized_row = dict(row)
         normalized_row["execution_mode"] = execution_mode
-        grouped_rows.setdefault((study_case_id, workload_variant, seq_len), []).append(
-            normalized_row
-        )
+        grouped_rows.setdefault(
+            (campaign_id, repeat_index, study_case_id, workload_variant, seq_len), []
+        ).append(normalized_row)
 
     groups: list[ReferenceGroup] = []
+    campaign_ids = {group_key[0] for group_key in grouped_rows}
+    if len(campaign_ids) > 1:
+        raise ValueError(
+            "Reference input spans multiple campaign IDs; select a single canonical "
+            "campaign before running host comparison"
+        )
     for group_key in sorted(grouped_rows):
         group_rows = _sorted_reference_rows(grouped_rows[group_key])
+        modes = [str(row.get("execution_mode") or "") for row in group_rows]
+        if len(set(modes)) != len(modes):
+            raise ValueError(
+                f"Reference group {group_key} contains duplicate execution modes: {modes}"
+            )
+        if tuple(modes) != REFERENCE_EXECUTION_MODES:
+            missing_modes = [
+                mode for mode in REFERENCE_EXECUTION_MODES if mode not in set(modes)
+            ]
+            raise ValueError(
+                f"Reference group {group_key} must contain exactly one row for each "
+                f"execution mode {REFERENCE_EXECUTION_MODES}; missing {missing_modes}"
+            )
         attention_head_size = _required_shared_int(group_rows, "attention_head_size")
         use_bias = _optional_uniform_bool(group_rows, "use_bias")
         groups.append(
             ReferenceGroup(
-                study_case_id=group_key[0],
-                workload_variant=group_key[1],
+                campaign_id=group_key[0],
+                repeat_index=group_key[1],
+                matched_run_id=matched_run_id(
+                    campaign_id=group_key[0],
+                    study_case_id=group_key[2],
+                    execution_mode="paired",
+                    seq_len=group_key[4],
+                    repeat_index=group_key[1],
+                ),
+                study_case_id=group_key[2],
+                workload_variant=group_key[3],
                 study_case_label=_required_shared_text(group_rows, "study_case_label"),
-                seq_len=group_key[2],
+                seq_len=group_key[4],
                 hidden_size=_required_shared_int(group_rows, "hidden_size"),
                 intermediate_size=_required_shared_int(group_rows, "intermediate_size"),
                 num_attention_heads=_required_shared_int(

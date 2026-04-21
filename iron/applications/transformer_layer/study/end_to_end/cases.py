@@ -166,6 +166,7 @@ MODE_OPERATORS: dict[ExecutionMode, dict[WorkloadVariant, tuple[str, ...]]] = {
 CandidateRecord = dict[str, Any]
 ModeCandidateTable = dict[ExecutionMode, dict[str, tuple[CandidateRecord, ...]]]
 CandidatePayloads = dict[ExecutionMode, dict[str, Any]]
+CandidateInventory = dict[ExecutionMode, dict[str, tuple[str, ...]]]
 
 
 def canonical_execution_mode(execution_mode: str) -> ExecutionMode:
@@ -760,3 +761,52 @@ def candidate_table_for_case(
                     f"mode={execution_mode} operator={operator_name}"
                 )
     return merged
+
+
+def candidate_inventory_for_case(
+    study_case_id: str,
+    seq_len: int,
+    *,
+    payloads: CandidatePayloads | None = None,
+) -> CandidateInventory:
+    table = candidate_table_for_case(study_case_id, seq_len, payloads=payloads)
+    return {
+        execution_mode: {
+            operator_name: tuple(
+                str(candidate["candidate_id"]) for candidate in candidates
+            )
+            for operator_name, candidates in operators.items()
+        }
+        for execution_mode, operators in table.items()
+    }
+
+
+def candidate_count_by_operator(
+    inventory: dict[str, tuple[str, ...]],
+) -> dict[str, int]:
+    return {
+        operator_name: len(candidate_ids)
+        for operator_name, candidate_ids in inventory.items()
+    }
+
+
+def candidate_policy_manifest() -> dict[str, dict[str, object]]:
+    manifest: dict[str, dict[str, object]] = {}
+    for execution_mode in EXECUTION_MODES:
+        removed_path = removed_candidates_path(execution_mode)
+        removed_candidate_ids = load_removed_candidate_ids(execution_mode)
+        if execution_mode == "hybrid":
+            augmentation_policy = "short_sequence_low_footprint_fallbacks"
+        elif execution_mode == "runlist":
+            augmentation_policy = "short_sequence_low_footprint_fallbacks"
+        else:
+            augmentation_policy = "none"
+        manifest[execution_mode] = {
+            "candidate_source_file": default_candidates_path(execution_mode).name,
+            "loader_augmentation_policy": augmentation_policy,
+            "removed_candidates_file": (
+                removed_path.name if removed_path.exists() else None
+            ),
+            "removed_candidate_count": len(removed_candidate_ids),
+        }
+    return manifest

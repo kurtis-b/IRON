@@ -17,6 +17,13 @@ POWER_OUTLIER_FILTER_MIN_SAMPLE_COUNT = 10
 POWER_OUTLIER_FILTER_MIN_RETAINED_SAMPLE_COUNT = 6
 POWER_OUTLIER_MODIFIED_Z_THRESHOLD = 3.5
 PERSISTED_POWER_RESULT_FIELDS: tuple[str, ...] = (
+    "power_boundary",
+    "power_estimation_method",
+    "baseline_policy",
+    "baseline_avg_power_w",
+    "active_avg_power_w",
+    "sensor_source",
+    "temperature_source",
     "avg_power_w",
     "min_power_w",
     "max_power_w",
@@ -29,12 +36,22 @@ PERSISTED_POWER_RESULT_FIELDS: tuple[str, ...] = (
     "raw_power_std_w",
     "power_outlier_sample_count",
     "power_outlier_filter_applied",
+    "raw_package_avg_power_w",
+    "raw_package_min_power_w",
+    "raw_package_max_power_w",
 )
 
 
 def empty_power_stats() -> dict[str, float | str | None]:
     return {
         "power_backend": None,
+        "power_boundary": None,
+        "power_estimation_method": None,
+        "baseline_policy": None,
+        "baseline_avg_power_w": None,
+        "active_avg_power_w": None,
+        "sensor_source": None,
+        "temperature_source": None,
         "avg_power_w": None,
         "raw_avg_power_w": None,
         "raw_min_power_w": None,
@@ -341,7 +358,7 @@ class TurbostatPackagePowerMonitor:
                     break
                 for sample in parse_turbostat_pkgwatt_samples(raw_line):
                     self.raw_package_samples_w.append(sample)
-                    self._pseudo_samples_w.append(max(sample - baseline, 0.0))
+                    self._pseudo_samples_w.append(sample - baseline)
         except Exception:
             return
 
@@ -355,7 +372,7 @@ class TurbostatPackagePowerMonitor:
                 )
                 for sample in samples:
                     self.raw_package_samples_w.append(sample)
-                    self._pseudo_samples_w.append(max(sample - baseline, 0.0))
+                    self._pseudo_samples_w.append(sample - baseline)
             except Exception:
                 return
 
@@ -365,12 +382,19 @@ class TurbostatPackagePowerMonitor:
     def stats(self, elapsed_sec: float) -> dict[str, float | str | None]:
         stats = empty_power_stats()
         stats["power_backend"] = "turbostat_pkgwatt"
+        stats["power_boundary"] = "package"
+        stats["power_estimation_method"] = "delta_package_power"
+        stats["baseline_policy"] = "quiescent_package_power"
         stats["quiescent_package_power_w"] = self.quiescent_package_power_w
+        stats["baseline_avg_power_w"] = self.quiescent_package_power_w
+        stats["sensor_source"] = "turbostat:PkgWatt"
+        stats["temperature_source"] = "unavailable"
 
         if not self.raw_package_samples_w:
             return stats
 
         avg_raw_w = sum(self.raw_package_samples_w) / len(self.raw_package_samples_w)
+        stats["active_avg_power_w"] = avg_raw_w
         filtered_stats = summarize_power_samples(
             self._pseudo_samples_w,
             elapsed_sec=elapsed_sec,
@@ -382,7 +406,12 @@ class TurbostatPackagePowerMonitor:
                 "raw_package_max_power_w": max(self.raw_package_samples_w),
             }
         )
-        stats.update(filtered_stats)
+        for key, value in filtered_stats.items():
+            # Keep monitor-level metadata such as estimation method and sensor
+            # source when the sample summary leaves those fields unset.
+            if value is None and stats.get(key) is not None:
+                continue
+            stats[key] = value
         return stats
 
 

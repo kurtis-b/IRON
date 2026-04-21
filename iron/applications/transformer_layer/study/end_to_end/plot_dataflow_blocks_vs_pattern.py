@@ -72,8 +72,8 @@ def default_output_dir() -> Path:
 
 def variant_stem(variant: str, y_scale: str = "log") -> str:
     stem = {
-        "standard": "dataflow_selected_blocks_vs_pattern_latency",
-        "slides": "dataflow_selected_blocks_vs_pattern_latency_slides",
+        "standard": "hybrid_selected_blocks_vs_pattern_latency",
+        "slides": "hybrid_selected_blocks_vs_pattern_latency_slides",
     }[variant]
     if y_scale == "linear":
         return f"{stem}_linear"
