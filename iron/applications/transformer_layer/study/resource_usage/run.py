@@ -809,9 +809,7 @@ def _hybrid_operator_artifact_specs(
                 dataflow_base_name = base_name.replace(
                     "encoder_hybrid_", "encoder_dataflow_", 1
                 )
-                specs.append(
-                    ArtifactSpec("glob", f"{dataflow_base_name}_*.mlir.prj")
-                )
+                specs.append(ArtifactSpec("glob", f"{dataflow_base_name}_*.mlir.prj"))
                 specs.append(ArtifactSpec("exact", f"{dataflow_base_name}.mlir.prj"))
             return tuple(specs)
 

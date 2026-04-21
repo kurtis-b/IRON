@@ -273,8 +273,7 @@ def test_gpt2_small_long_seq_hybrid_qkv_candidates_include_parallel_emb_6():
     for seq_len in (256, 16384):
         table = candidate_table_for_case("gpt2_small_768", seq_len, payloads=payloads)
         assert any(
-            candidate["candidate_id"] == "qkv_1"
-            and candidate["config"] == expected
+            candidate["candidate_id"] == "qkv_1" and candidate["config"] == expected
             for candidate in table["hybrid"]["qkv_proj"]
         )
 
@@ -295,8 +294,7 @@ def test_1024_hidden_hybrid_qkv_candidates_include_k32_n128_variant():
         for seq_len in (512, 16384):
             table = candidate_table_for_case(family, seq_len, payloads=payloads)
             assert any(
-                candidate["candidate_id"] == "qkv_1"
-                and candidate["config"] == expected
+                candidate["candidate_id"] == "qkv_1" and candidate["config"] == expected
                 for candidate in table["hybrid"]["qkv_proj"]
             )
 
@@ -388,18 +386,14 @@ def test_offload_candidates_remain_singleton_only():
 def test_offload_long_seq_768_static_weight_candidates_use_k96_n48():
     payloads = load_default_candidate_payloads()
 
-    expected = (
-        {"candidate_id": "k96_n48", "config": {"tile_k": 96, "tile_n": 48}},
-    )
+    expected = ({"candidate_id": "k96_n48", "config": {"tile_k": 96, "tile_n": 48}},)
 
     for family in ("baseline_768", "gpt2_small_768"):
         table = candidate_table_for_case(family, 16384, payloads=payloads)["offload"]
         for operator_name in ("q_proj", "k_proj", "v_proj", "output_proj", "down_proj"):
             assert table[operator_name] == expected
         for operator_name in ("attn_scores", "attn_output", "up_proj"):
-            assert table[operator_name] == (
-                {"candidate_id": "default", "config": {}},
-            )
+            assert table[operator_name] == ({"candidate_id": "default", "config": {}},)
 
 
 def test_reset_pattern_run_buffers_respects_operator_opt_out():
@@ -550,7 +544,9 @@ def test_end_to_end_power_defaults_target_at_least_twenty_samples():
     assert min_measurement_duration_sec >= 2.0
     assert min_power_sample_count >= 16
     assert target_power_sample_count >= 20
-    assert estimated_window_sec / sample_interval_sec >= float(target_power_sample_count)
+    assert estimated_window_sec / sample_interval_sec >= float(
+        target_power_sample_count
+    )
 
 
 def test_end_to_end_short_sequences_use_longer_power_probe_policy():

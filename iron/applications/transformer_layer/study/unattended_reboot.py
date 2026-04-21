@@ -263,7 +263,9 @@ def _ttm_pages_for_gb(gb_value: int) -> int:
 
 
 def _ttm_pages_limit_matches_normal(current_pages: int, normal_pages: int) -> bool:
-    return abs(int(current_pages) - int(normal_pages)) <= NORMAL_TTM_PAGES_LIMIT_TOLERANCE
+    return (
+        abs(int(current_pages) - int(normal_pages)) <= NORMAL_TTM_PAGES_LIMIT_TOLERANCE
+    )
 
 
 def _is_ttm_action(action: dict[str, Any]) -> bool:

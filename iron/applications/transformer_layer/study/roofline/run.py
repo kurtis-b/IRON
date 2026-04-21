@@ -290,7 +290,9 @@ def build_resource_usage_index(
         workload_variant = str(row.get("workload_variant") or "")
         logical_operator = str(row.get("logical_operator") or "")
         seq_len = _optional_int(row.get("seq_len"))
-        candidate_id = str(row.get("selected_candidate_id") or row.get("candidate_id") or "")
+        candidate_id = str(
+            row.get("selected_candidate_id") or row.get("candidate_id") or ""
+        )
         if (
             execution_mode is None
             or not study_case_id
@@ -326,7 +328,9 @@ def build_resource_usage_index(
     return index
 
 
-def load_resource_usage_index(paths: Iterable[Path]) -> dict[ResourceUsageKey, ResourceUsageTileCounts]:
+def load_resource_usage_index(
+    paths: Iterable[Path],
+) -> dict[ResourceUsageKey, ResourceUsageTileCounts]:
     rows: list[dict[str, str]] = []
     for path in paths:
         resolved = path.expanduser()
@@ -1199,7 +1203,9 @@ def build_implementation_points(
                 omission_note = f"missing selected config for {logical_operator}"
                 total_bytes = 0.0
                 break
-            candidate_id = str(selected_row.selected_candidate_ids.get(logical_operator) or "")
+            candidate_id = str(
+                selected_row.selected_candidate_ids.get(logical_operator) or ""
+            )
             compute_tiles_used, shim_tiles_used = resolved_operator_tile_counts(
                 execution_mode=selected_row.execution_mode,
                 study_case_id=selected_row.study_case_id,
