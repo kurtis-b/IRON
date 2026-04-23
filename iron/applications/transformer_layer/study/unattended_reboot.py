@@ -73,6 +73,13 @@ JOB_SPEC_KEYS = {
     "privileged_setup",
     "max_attempts",
 }
+PAPER_PLAN_KIND = "paper_p0"
+PAPER_FAMILY_IDS: tuple[str, ...] = ("baseline_768", "gpt2_small_768")
+PAPER_BLOCK_FAMILY_IDS: tuple[str, ...] = ("baseline_768",)
+PAPER_SEQUENCE_LENGTHS: tuple[int, ...] = (256, 2048, 8192)
+PAPER_BLOCK_KINDS: tuple[str, ...] = ("mha_out_proj", "ffn")
+PAPER_HELPER_WARMUP_RUNS = 1
+PAPER_HELPER_RUNS_PER_SAMPLE = 3
 
 
 def repo_root() -> Path:
@@ -348,10 +355,31 @@ def _output_paths(results_root: Path) -> dict[str, Path]:
         "latency_variation_plot": results_root
         / "end_to_end"
         / "latency_variation_by_pattern.svg",
+        "offload_breakdown_results": results_root
+        / "end_to_end"
+        / "offload_breakdown.csv",
+        "offload_breakdown_plot": results_root
+        / "end_to_end"
+        / "offload_breakdown.svg",
+        "runlist_launch_ablation_results": results_root
+        / "end_to_end"
+        / "runlist_launch_ablation.csv",
         "staging_ablation_results": results_root
         / "end_to_end"
         / "staging_ablation.csv",
         "staging_ablation_plot": results_root / "end_to_end" / "staging_ablation.svg",
+        "search_validation_results": results_root
+        / "end_to_end"
+        / "search_validation.csv",
+        "search_validation_taxonomy": results_root
+        / "end_to_end"
+        / "search_validation_failure_taxonomy.csv",
+        "error_distribution_results": results_root
+        / "end_to_end"
+        / "error_distribution.csv",
+        "error_distribution_plot": results_root
+        / "end_to_end"
+        / "error_histograms.svg",
         "end_to_end_fairness": results_root
         / "end_to_end"
         / "fairness_repeatability.csv",
@@ -365,10 +393,18 @@ def _output_paths(results_root: Path) -> dict[str, Path]:
         "host_comparison_fairness": results_root
         / "host_comparison"
         / "fairness_repeatability.csv",
+        "analysis_dir": results_root / "analysis",
+        "crossover_report_results": results_root
+        / "analysis"
+        / "crossover_report.csv",
         "memcpy_results": results_root / "memcpy_bandwidth" / "results.csv",
         "resource_usage_dir": results_root / "resource_usage",
         "roofline_dir": results_root / "roofline",
     }
+
+
+def _workload_variant_for_family(family_id: str) -> str:
+    return "decoder_gpt2" if family_id.startswith("gpt2_") else "encoder_bert"
 
 
 def _collect_temperature_inputs(node: Any) -> list[float]:
@@ -748,6 +784,63 @@ def build_job_plan(
             max_attempts=1,
         )
     )
+    jobs.extend(
+        [
+            _module_job(
+                job_id="offload_partitioning_all",
+                description="offload partitioning all",
+                module=f"{STUDY_PACKAGE}.offload_partitioning.run_query_block_sweep",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--output",
+                    str(paths["offload_breakdown_results"]),
+                ],
+                privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+            ),
+            _module_job(
+                job_id="runlist_launch_ablation_all",
+                description="runlist launch ablation all",
+                module=f"{STUDY_PACKAGE}.runlist_launch_ablation.run",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--output",
+                    str(paths["runlist_launch_ablation_results"]),
+                ],
+                privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+            ),
+            _module_job(
+                job_id="search_validation_all",
+                description="search validation all",
+                module=f"{STUDY_PACKAGE}.search_validation.run",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--tuning-input",
+                    str(paths["end_to_end_tuning"]),
+                    "--output",
+                    str(paths["search_validation_results"]),
+                    "--taxonomy-output",
+                    str(paths["search_validation_taxonomy"]),
+                ],
+                privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="correctness_error_distribution_all",
+                description="correctness error distribution all",
+                module=f"{STUDY_PACKAGE}.correctness.error_distribution",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--output",
+                    str(paths["error_distribution_results"]),
+                ],
+                privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+            ),
+        ]
+    )
 
     for family_id in FAMILY_IDS:
         for seq_len in SEQUENCE_LADDER:
@@ -757,8 +850,8 @@ def build_job_plan(
             else:
                 privileged_setup.append(_setup_ttm(None))
             job = _module_job(
-                job_id=f"host_comparison_igpu_{family_id}_{seq_len}",
-                description=f"host_comparison igpu {family_id} seq={seq_len}",
+                job_id=f"host_comparison_{family_id}_{seq_len}",
+                description=f"host_comparison all {family_id} seq={seq_len}",
                 module=f"{STUDY_PACKAGE}.host_comparison.run",
                 argv=[
                     "--reference-input",
@@ -768,9 +861,11 @@ def build_job_plan(
                     "--seq-len",
                     str(seq_len),
                     "--host-backends",
-                    "igpu",
+                    "all",
                     "--igpu-power-backend",
                     "rocm-smi",
+                    "--cpu-power-backend",
+                    "turbostat_pkgwatt",
                     "--output",
                     str(paths["host_comparison_results"]),
                     "--resume-input",
@@ -820,6 +915,8 @@ def build_job_plan(
             description="host_comparison fairness_repeatability",
             module=f"{STUDY_PACKAGE}.host_comparison.run_fairness_repeatability",
             argv=[
+                "--reference-input",
+                str(paths["host_comparison_results"]),
                 "--output",
                 str(paths["host_comparison_fairness"]),
             ],
@@ -860,6 +957,23 @@ def build_job_plan(
             privileged_setup=[_setup_ttm(None)],
             max_attempts=1,
         ),
+        _module_job(
+            job_id="crossover_report_all",
+            description="analysis crossover report all",
+            module=f"{STUDY_PACKAGE}.analysis.crossover_report",
+            argv=[
+                "--end-to-end-input",
+                str(paths["end_to_end_results"]),
+                "--roofline-input",
+                str(paths["roofline_dir"] / "implementation_points.csv"),
+                "--memcpy-input",
+                str(paths["memcpy_results"]),
+                "--output",
+                str(paths["crossover_report_results"]),
+            ],
+            privileged_setup=[_setup_ttm(None)],
+            max_attempts=1,
+        ),
     ]
     if plan_layout == "legacy":
         jobs.extend(post_host_comparison_jobs)
@@ -880,6 +994,335 @@ def build_job_plan(
             privileged_setup=[_setup_ttm(None)],
             max_attempts=1,
         )
+    )
+
+    return jobs
+
+
+def build_paper_p0_job_plan(*, results_root: Path) -> list[dict[str, Any]]:
+    paths = _output_paths(results_root)
+    jobs: list[dict[str, Any]] = []
+
+    for family_id in PAPER_BLOCK_FAMILY_IDS:
+        for seq_len in PAPER_SEQUENCE_LENGTHS:
+            case = get_case(family_id, seq_len)
+            for block_kind in PAPER_BLOCK_KINDS:
+                if not case.candidates(block_kind):
+                    continue
+                jobs.append(
+                    _module_job(
+                        job_id=f"block_{family_id}_{seq_len}_{block_kind}",
+                        description=f"block {family_id} seq={seq_len} block={block_kind}",
+                        module=f"{STUDY_PACKAGE}.block.run",
+                        argv=[
+                            "--family",
+                            family_id,
+                            "--seq-len",
+                            str(seq_len),
+                            "--block",
+                            block_kind,
+                            "--output",
+                            str(paths["block_results"]),
+                            "--resume-input",
+                            str(paths["block_results"]),
+                        ],
+                        privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+                    )
+                )
+
+    for family_id in PAPER_FAMILY_IDS:
+        for seq_len in PAPER_SEQUENCE_LENGTHS:
+            for block_kind in PAPER_BLOCK_KINDS:
+                jobs.append(
+                    _module_job(
+                        job_id=f"memory_tile_staging_{family_id}_{seq_len}_{block_kind}",
+                        description=f"memory_tile_staging {family_id} seq={seq_len} block={block_kind}",
+                        module=f"{STUDY_PACKAGE}.memory_tile_staging.run",
+                        argv=[
+                            "--reference-input",
+                            str(paths["block_results"]),
+                            "--family",
+                            family_id,
+                            "--seq-len",
+                            str(seq_len),
+                            "--block",
+                            block_kind,
+                            "--output",
+                            str(paths["memory_tile_staging_results"]),
+                            "--resume-input",
+                            str(paths["memory_tile_staging_results"]),
+                        ],
+                        privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+                    )
+                )
+
+    for family_id in PAPER_FAMILY_IDS:
+        workload_variant = _workload_variant_for_family(family_id)
+        for seq_len in PAPER_SEQUENCE_LENGTHS:
+            for execution_mode in EXECUTION_MODES:
+                jobs.append(
+                    _module_job(
+                        job_id=f"end_to_end_{family_id}_{seq_len}_{execution_mode}",
+                        description=f"end_to_end {family_id} seq={seq_len} mode={execution_mode}",
+                        module=f"{STUDY_PACKAGE}.end_to_end.run",
+                        argv=[
+                            "--workload-variant",
+                            workload_variant,
+                            "--family",
+                            family_id,
+                            "--seq-len",
+                            str(seq_len),
+                            "--mode",
+                            execution_mode,
+                            "--power-backend",
+                            "turbostat_pkgwatt",
+                            "--output",
+                            str(paths["end_to_end_results"]),
+                            "--tuning-output",
+                            str(paths["end_to_end_tuning"]),
+                            "--resume-input",
+                            str(paths["end_to_end_results"]),
+                            "--resume-tuning-input",
+                            str(paths["end_to_end_tuning"]),
+                        ],
+                        privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+                    )
+                )
+
+    for family_id in PAPER_FAMILY_IDS:
+        workload_variant = _workload_variant_for_family(family_id)
+        for seq_len in PAPER_SEQUENCE_LENGTHS:
+            for block_kind in STAGING_BLOCK_KINDS:
+                jobs.append(
+                    _module_job(
+                        job_id=f"staging_ablation_{family_id}_{seq_len}_{block_kind}",
+                        description=f"staging_ablation {family_id} seq={seq_len} block={block_kind}",
+                        module=f"{STUDY_PACKAGE}.end_to_end.run_staging_ablation",
+                        argv=[
+                            "--results-input",
+                            str(paths["end_to_end_results"]),
+                            "--staging-results",
+                            str(paths["memory_tile_staging_results"]),
+                            "--workload-variant",
+                            workload_variant,
+                            "--family",
+                            family_id,
+                            "--seq-len",
+                            str(seq_len),
+                            "--block",
+                            block_kind,
+                            "--output",
+                            str(paths["staging_ablation_results"]),
+                            "--plot-output",
+                            str(paths["staging_ablation_plot"]),
+                            "--resume-input",
+                            str(paths["staging_ablation_results"]),
+                        ],
+                        privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+                    )
+                )
+
+    for family_id in PAPER_FAMILY_IDS:
+        for seq_len in PAPER_SEQUENCE_LENGTHS:
+            jobs.append(
+                _module_job(
+                    job_id=f"host_comparison_{family_id}_{seq_len}",
+                    description=f"host_comparison all {family_id} seq={seq_len}",
+                    module=f"{STUDY_PACKAGE}.host_comparison.run",
+                    argv=[
+                        "--reference-input",
+                        str(paths["end_to_end_results"]),
+                        "--family",
+                        family_id,
+                        "--seq-len",
+                        str(seq_len),
+                        "--host-backends",
+                        "all",
+                        "--igpu-power-backend",
+                        "rocm-smi",
+                        "--cpu-power-backend",
+                        "turbostat_pkgwatt",
+                        "--output",
+                        str(paths["host_comparison_results"]),
+                        "--resume-input",
+                        str(paths["host_comparison_results"]),
+                    ],
+                    privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+                )
+            )
+
+    jobs.extend(
+        [
+            _module_job(
+                job_id="offload_partitioning_all",
+                description="offload partitioning paper subset",
+                module=f"{STUDY_PACKAGE}.offload_partitioning.run_query_block_sweep",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--warmup-runs",
+                    str(PAPER_HELPER_WARMUP_RUNS),
+                    "--runs-per-sample",
+                    str(PAPER_HELPER_RUNS_PER_SAMPLE),
+                    "--query-block-policy",
+                    "representative",
+                    "--output",
+                    str(paths["offload_breakdown_results"]),
+                ],
+                privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+            ),
+            _module_job(
+                job_id="runlist_launch_ablation_all",
+                description="runlist launch ablation paper subset",
+                module=f"{STUDY_PACKAGE}.runlist_launch_ablation.run",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--warmup-runs",
+                    str(PAPER_HELPER_WARMUP_RUNS),
+                    "--runs-per-sample",
+                    str(PAPER_HELPER_RUNS_PER_SAMPLE),
+                    "--output",
+                    str(paths["runlist_launch_ablation_results"]),
+                ],
+                privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+            ),
+            _module_job(
+                job_id="search_validation_all",
+                description="search validation paper subset",
+                module=f"{STUDY_PACKAGE}.search_validation.run",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--tuning-input",
+                    str(paths["end_to_end_tuning"]),
+                    "--warmup-runs",
+                    str(PAPER_HELPER_WARMUP_RUNS),
+                    "--runs-per-sample",
+                    str(PAPER_HELPER_RUNS_PER_SAMPLE),
+                    "--output",
+                    str(paths["search_validation_results"]),
+                    "--taxonomy-output",
+                    str(paths["search_validation_taxonomy"]),
+                ],
+                privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="correctness_error_distribution_all",
+                description="correctness error distribution paper subset",
+                module=f"{STUDY_PACKAGE}.correctness.error_distribution",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--warmup-runs",
+                    str(PAPER_HELPER_WARMUP_RUNS),
+                    "--runs-per-sample",
+                    str(PAPER_HELPER_RUNS_PER_SAMPLE),
+                    "--output",
+                    str(paths["error_distribution_results"]),
+                ],
+                privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+            ),
+        ]
+    )
+
+    for case in iter_memcpy_cases(
+        size_filter="all",
+        num_cores_filter="all",
+        num_channels_filter="all",
+        bypass_filter="all",
+    ):
+        jobs.append(
+            _module_job(
+                job_id=f"memcpy_{case.case_id}",
+                description=f"memcpy_bandwidth {case.case_id}",
+                module=f"{STUDY_PACKAGE}.memcpy_bandwidth.run",
+                argv=[
+                    "--size",
+                    str(case.size_elements),
+                    "--num-cores",
+                    str(case.num_cores),
+                    "--num-channels",
+                    str(case.num_channels),
+                    "--bypass",
+                    "true" if case.bypass else "false",
+                    "--output",
+                    str(paths["memcpy_results"]),
+                    "--resume-input",
+                    str(paths["memcpy_results"]),
+                ],
+                privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+            )
+        )
+
+    jobs.extend(
+        [
+            _module_job(
+                job_id="resource_usage_all",
+                description="resource_usage paper subset",
+                module=f"{STUDY_PACKAGE}.resource_usage.run",
+                argv=[
+                    "--scope",
+                    "all",
+                    "--block-results-input",
+                    str(paths["block_results"]),
+                    "--end-to-end-results-input",
+                    str(paths["end_to_end_results"]),
+                    "--output-dir",
+                    str(paths["resource_usage_dir"]),
+                ],
+                privileged_setup=[_setup_ttm(None)],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="roofline_all",
+                description="roofline paper subset",
+                module=f"{STUDY_PACKAGE}.roofline.run",
+                argv=[
+                    "--end-to-end-results-input",
+                    str(paths["end_to_end_results"]),
+                    "--end-to-end-tuning-input",
+                    str(paths["end_to_end_tuning"]),
+                    "--memcpy-results-input",
+                    str(paths["memcpy_results"]),
+                    "--output-dir",
+                    str(paths["roofline_dir"]),
+                ],
+                privileged_setup=[_setup_ttm(None)],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="crossover_report_all",
+                description="analysis crossover report paper subset",
+                module=f"{STUDY_PACKAGE}.analysis.crossover_report",
+                argv=[
+                    "--end-to-end-input",
+                    str(paths["end_to_end_results"]),
+                    "--roofline-input",
+                    str(paths["roofline_dir"] / "implementation_points.csv"),
+                    "--memcpy-input",
+                    str(paths["memcpy_results"]),
+                    "--output",
+                    str(paths["crossover_report_results"]),
+                ],
+                privileged_setup=[_setup_ttm(None)],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="regenerate_plots_all",
+                description="regenerate plots paper subset",
+                module=f"{STUDY_PACKAGE}.regenerate_plots",
+                argv=[
+                    "--results-root",
+                    str(results_root),
+                    "--artifact-profile",
+                    "paper",
+                ],
+                privileged_setup=[_setup_ttm(None)],
+                max_attempts=1,
+            ),
+        ]
     )
 
     return jobs
@@ -935,11 +1378,13 @@ def build_execution_smoke_job_plan(
     *,
     results_root: Path,
     source_results_root: Path,
+    artifact_profile: str = "p0",
 ) -> list[dict[str, Any]]:
     paths = _output_paths(results_root)
     family_id = "baseline_768"
     workload_variant = "encoder_bert"
-    seq_len = 512
+    seq_len = 256
+    staging_block_kind = STAGING_BLOCK_KINDS[0]
 
     jobs = [
         _module_job(
@@ -1045,6 +1490,32 @@ def build_execution_smoke_job_plan(
     jobs.extend(
         [
             _module_job(
+                job_id="execution_smoke_staging_ablation",
+                description="execution smoke staging ablation",
+                module=f"{STUDY_PACKAGE}.end_to_end.run_staging_ablation",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--staging-results",
+                    str(paths["memory_tile_staging_results"]),
+                    "--workload-variant",
+                    workload_variant,
+                    "--family",
+                    family_id,
+                    "--seq-len",
+                    str(seq_len),
+                    "--block",
+                    staging_block_kind,
+                    "--output",
+                    str(paths["staging_ablation_results"]),
+                    "--plot-output",
+                    str(paths["staging_ablation_plot"]),
+                    "--resume-input",
+                    str(paths["staging_ablation_results"]),
+                ],
+                privileged_setup=[],
+            ),
+            _module_job(
                 job_id="execution_smoke_end_to_end_fairness",
                 description="execution smoke end_to_end fairness",
                 module=f"{STUDY_PACKAGE}.end_to_end.run_fairness_repeatability",
@@ -1069,9 +1540,11 @@ def build_execution_smoke_job_plan(
                     "--seq-len",
                     str(seq_len),
                     "--host-backends",
-                    "igpu",
+                    "all",
                     "--igpu-power-backend",
                     "rocm-smi",
+                    "--cpu-power-backend",
+                    "turbostat_pkgwatt",
                     "--output",
                     str(paths["host_comparison_results"]),
                     "--resume-input",
@@ -1084,11 +1557,86 @@ def build_execution_smoke_job_plan(
                 description="execution smoke host comparison fairness",
                 module=f"{STUDY_PACKAGE}.host_comparison.run_fairness_repeatability",
                 argv=[
+                    "--reference-input",
+                    str(paths["host_comparison_results"]),
                     "--output",
                     str(paths["host_comparison_fairness"]),
                 ],
                 privileged_setup=[],
                 max_attempts=1,
+            ),
+            _module_job(
+                job_id="execution_smoke_offload_partitioning",
+                description="execution smoke offload partitioning",
+                module=f"{STUDY_PACKAGE}.offload_partitioning.run_query_block_sweep",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--workload-variant",
+                    workload_variant,
+                    "--family",
+                    family_id,
+                    "--seq-len",
+                    str(seq_len),
+                    "--output",
+                    str(paths["offload_breakdown_results"]),
+                ],
+                privileged_setup=[],
+            ),
+            _module_job(
+                job_id="execution_smoke_runlist_launch_ablation",
+                description="execution smoke runlist launch ablation",
+                module=f"{STUDY_PACKAGE}.runlist_launch_ablation.run",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--workload-variant",
+                    workload_variant,
+                    "--family",
+                    family_id,
+                    "--seq-len",
+                    str(seq_len),
+                    "--output",
+                    str(paths["runlist_launch_ablation_results"]),
+                ],
+                privileged_setup=[],
+            ),
+            _module_job(
+                job_id="execution_smoke_search_validation",
+                description="execution smoke search validation",
+                module=f"{STUDY_PACKAGE}.search_validation.run",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--tuning-input",
+                    str(paths["end_to_end_tuning"]),
+                    "--output",
+                    str(paths["search_validation_results"]),
+                    "--taxonomy-output",
+                    str(paths["search_validation_taxonomy"]),
+                ],
+                privileged_setup=[],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="execution_smoke_error_distribution",
+                description="execution smoke correctness error distribution",
+                module=f"{STUDY_PACKAGE}.correctness.error_distribution",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--workload-variant",
+                    workload_variant,
+                    "--family",
+                    family_id,
+                    "--seq-len",
+                    str(seq_len),
+                    "--mode",
+                    "all",
+                    "--output",
+                    str(paths["error_distribution_results"]),
+                ],
+                privileged_setup=[],
             ),
             _module_job(
                 job_id="execution_smoke_resource_usage",
@@ -1131,12 +1679,31 @@ def build_execution_smoke_job_plan(
                 max_attempts=1,
             ),
             _module_job(
+                job_id="execution_smoke_crossover_report",
+                description="execution smoke crossover report",
+                module=f"{STUDY_PACKAGE}.analysis.crossover_report",
+                argv=[
+                    "--end-to-end-input",
+                    str(paths["end_to_end_results"]),
+                    "--roofline-input",
+                    str(paths["roofline_dir"] / "implementation_points.csv"),
+                    "--memcpy-input",
+                    str(paths["memcpy_results"]),
+                    "--output",
+                    str(paths["crossover_report_results"]),
+                ],
+                privileged_setup=[],
+                max_attempts=1,
+            ),
+            _module_job(
                 job_id="execution_smoke_regenerate_plots",
                 description="execution smoke regenerate plots",
                 module=f"{STUDY_PACKAGE}.regenerate_plots",
                 argv=[
                     "--results-root",
                     str(results_root),
+                    "--artifact-profile",
+                    str(artifact_profile),
                 ],
                 privileged_setup=[],
                 max_attempts=1,
@@ -1149,6 +1716,8 @@ def build_execution_smoke_job_plan(
                     "verify-execution-results",
                     "--results-root",
                     str(results_root),
+                    "--artifact-profile",
+                    str(artifact_profile),
                 ],
                 privileged_setup=[],
                 max_attempts=1,
@@ -1174,6 +1743,7 @@ def create_state(
     plan_kind: str = "full",
     plan_layout: str = "high_ttm_tail_v2",
     source_results_root: Path | None = None,
+    artifact_profile: str = "p0",
 ) -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
@@ -1183,6 +1753,7 @@ def create_state(
         "source_results_root": (
             "" if source_results_root is None else str(source_results_root)
         ),
+        "artifact_profile": str(artifact_profile),
         "plan_kind": plan_kind,
         "plan_layout": plan_layout,
         "run_user": run_user,
@@ -1203,10 +1774,14 @@ def create_state(
         "jobs": (
             list(jobs)
             if jobs is not None
-            else build_job_plan(
-                results_root=results_root,
-                host_comparison_16384_ttm_gb=host_comparison_16384_ttm_gb,
-                plan_layout=plan_layout,
+            else (
+                build_paper_p0_job_plan(results_root=results_root)
+                if plan_kind == PAPER_PLAN_KIND
+                else build_job_plan(
+                    results_root=results_root,
+                    host_comparison_16384_ttm_gb=host_comparison_16384_ttm_gb,
+                    plan_layout=plan_layout,
+                )
             )
         ),
     }
@@ -1507,6 +2082,7 @@ def _job_specs_match(
 def _expected_jobs_for_state(state: dict[str, Any]) -> list[dict[str, Any]]:
     plan_kind = str(state.get("plan_kind") or "full")
     plan_layout = str(state.get("plan_layout") or "")
+    artifact_profile = str(state.get("artifact_profile") or "p0")
     results_root = Path(state["results_root"])
     host_comparison_16384_ttm_gb = int(
         state.get(
@@ -1529,7 +2105,10 @@ def _expected_jobs_for_state(state: dict[str, Any]) -> list[dict[str, Any]]:
         return build_execution_smoke_job_plan(
             results_root=results_root,
             source_results_root=Path(source_results_root),
+            artifact_profile=artifact_profile,
         )
+    if plan_kind == PAPER_PLAN_KIND:
+        return build_paper_p0_job_plan(results_root=results_root)
     if not plan_layout:
         plan_layout = "legacy"
     return build_job_plan(
@@ -1859,6 +2438,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     start.add_argument("--state", type=Path, default=None)
     start.add_argument("--results-root", type=Path, default=None)
     start.add_argument("--run-user", default=default_run_user())
+    start.add_argument("--plan-kind", choices=("full", PAPER_PLAN_KIND), default="full")
     start.add_argument(
         "--host-comparison-16384-ttm-gb",
         type=int,
@@ -1934,6 +2514,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="true",
         help="Command used between smoke-test jobs. Defaults to a no-op.",
     )
+    execution_smoke.add_argument(
+        "--artifact-profile",
+        choices=("canonical", "p0", "paper"),
+        default="p0",
+    )
     execution_smoke.add_argument("--log-level", default="INFO")
 
     return parser.parse_args(argv)
@@ -1989,7 +2574,12 @@ def _start(args: argparse.Namespace) -> int:
         temperature_source=temperature_source,
         amd_ttm_path=amd_ttm_path,
         normal_ttm_pages_limit=normal_ttm_pages_limit,
-        plan_kind="full",
+        plan_kind=str(getattr(args, "plan_kind", "full")),
+        artifact_profile=(
+            "paper"
+            if str(getattr(args, "plan_kind", "full")) == PAPER_PLAN_KIND
+            else "p0"
+        ),
     )
     write_state(state_path, state)
     _record_baseline_temperature(results_root, state)
@@ -2137,6 +2727,7 @@ def _execution_smoke_test(args: argparse.Namespace) -> int:
     jobs = build_execution_smoke_job_plan(
         results_root=results_root,
         source_results_root=source_results_root,
+        artifact_profile=str(getattr(args, "artifact_profile", "p0")),
     )
     baseline_temperature_c, temperature_source = _read_pc_temperature_c()
     state = create_state(
@@ -2151,6 +2742,7 @@ def _execution_smoke_test(args: argparse.Namespace) -> int:
         temperature_source=temperature_source,
         plan_kind="execution_smoke",
         source_results_root=source_results_root,
+        artifact_profile=str(getattr(args, "artifact_profile", "p0")),
     )
     write_state(state_path, state)
     _record_baseline_temperature(results_root, state)

@@ -223,8 +223,8 @@ def _isolated_candidate_scope(
     return f"{prefix}_{_candidate_scope_key(candidate_config)}"
 
 
-def _new_benchmark_context(scope: str) -> AIEContext:
-    context = AIEContext()
+def _new_benchmark_context(scope: str, *, use_runlist: bool = True) -> AIEContext:
+    context = AIEContext(use_runlist=use_runlist)
     sanitized_scope = "".join(
         character if character.isalnum() or character in "-_" else "_"
         for character in scope
@@ -235,8 +235,10 @@ def _new_benchmark_context(scope: str) -> AIEContext:
     return context
 
 
-def _fresh_benchmark_context_for_build_dir(build_dir: Path) -> AIEContext:
-    context = AIEContext()
+def _fresh_benchmark_context_for_build_dir(
+    build_dir: Path, *, use_runlist: bool = True
+) -> AIEContext:
+    context = AIEContext(use_runlist=use_runlist)
     context.build_dir = build_dir
     return context
 
@@ -354,6 +356,13 @@ def _metadata_for_operator(
     *,
     compile_setup_time_ms: float | None,
 ) -> dict[str, object]:
+    runtime_submission_model = None
+    if execution_mode == "runlist":
+        runtime_submission_model = (
+            "runlist"
+            if bool(getattr(getattr(operator, "context", None), "use_runlist", True))
+            else "separate_launch"
+        )
     if execution_mode == "offload":
         query_block_count = int(getattr(operator, "query_block_count", 1))
         dispatch_count = 6 + (2 * workload.num_attention_heads * query_block_count)
@@ -367,6 +376,7 @@ def _metadata_for_operator(
                 operator, "_xclbin"
             ),
             "process_model": "in_process",
+            "runtime_submission_model": runtime_submission_model,
         }
 
     if execution_mode == "runlist" and getattr(
@@ -410,6 +420,7 @@ def _metadata_for_operator(
                 {key for key in (base_xclbins | extra_xclbins) if key is not None}
             ),
             "process_model": "in_process",
+            "runtime_submission_model": runtime_submission_model,
         }
 
     return {
@@ -420,6 +431,7 @@ def _metadata_for_operator(
         ),
         "npu_unique_xclbin_count": _unique_suffix_artifact_count(operator, "_xclbin"),
         "process_model": "in_process",
+        "runtime_submission_model": runtime_submission_model,
     }
 
 
@@ -1815,6 +1827,10 @@ def _benchmark_mode_subprocess_entry(
     operator_config: dict[str, dict[str, object]] | None,
     include_reference_output: bool | None,
     capture_latencies: bool,
+    use_runlist: bool,
+    capture_output_tensors: bool,
+    capture_runtime_breakdown: bool,
+    reference_override: dict[str, object] | None,
     scope_key_override: str | None,
     scope_suffix: str | None,
 ) -> None:
@@ -1828,6 +1844,10 @@ def _benchmark_mode_subprocess_entry(
         operator_config=operator_config,
         include_reference_output=include_reference_output,
         capture_latencies=capture_latencies,
+        use_runlist=use_runlist,
+        capture_output_tensors=capture_output_tensors,
+        capture_runtime_breakdown=capture_runtime_breakdown,
+        reference_override=reference_override,
         scope_key_override=scope_key_override,
         scope_suffix=scope_suffix,
     )
@@ -1846,6 +1866,10 @@ def benchmark_mode_subprocess(
     operator_config: dict[str, dict[str, object]] | None = None,
     include_reference_output: bool | None = None,
     capture_latencies: bool = False,
+    use_runlist: bool = True,
+    capture_output_tensors: bool = False,
+    capture_runtime_breakdown: bool = False,
+    reference_override: dict[str, object] | None = None,
     scope_key_override: str | None = None,
     scope_suffix: str | None = None,
 ) -> dict[str, object]:
@@ -1869,6 +1893,10 @@ def benchmark_mode_subprocess(
             operator_config,
             include_reference_output,
             capture_latencies,
+            use_runlist,
+            capture_output_tensors,
+            capture_runtime_breakdown,
+            reference_override,
             scope_key_override,
             scope_suffix,
         ),
@@ -1995,6 +2023,10 @@ def benchmark_mode(
     operator_config: dict[str, dict[str, object]] | None = None,
     include_reference_output: bool | None = None,
     capture_latencies: bool = False,
+    use_runlist: bool = True,
+    capture_output_tensors: bool = False,
+    capture_runtime_breakdown: bool = False,
+    reference_override: dict[str, object] | None = None,
     scope_key_override: str | None = None,
     scope_suffix: str | None = None,
 ) -> dict[str, object]:
@@ -2017,6 +2049,7 @@ def benchmark_mode(
         "npu_unique_instruction_binary_count": None,
         "npu_unique_xclbin_count": None,
         "process_model": "in_process",
+        "runtime_submission_model": None,
         "validation_error_count": 0,
         "run_status": "failed_exception",
         "failure_message": "",
@@ -2027,15 +2060,19 @@ def benchmark_mode(
         if include_reference_output is None
         else bool(include_reference_output)
     )
-    reference = generate_golden_reference(
-        workload.seq_len,
-        workload.hidden_size,
-        workload.intermediate_size,
-        workload.num_attention_heads,
-        seed=seed,
-        workload_variant=workload.workload_variant,
-        include_output=include_output,
-        include_attention_mask=False,
+    reference = (
+        reference_override
+        if reference_override is not None
+        else generate_golden_reference(
+            workload.seq_len,
+            workload.hidden_size,
+            workload.intermediate_size,
+            workload.num_attention_heads,
+            seed=seed,
+            workload_variant=workload.workload_variant,
+            include_output=include_output,
+            include_attention_mask=False,
+        )
     )
     scope_key = (
         scope_key_override
@@ -2047,7 +2084,7 @@ def benchmark_mode(
     )
     if scope_suffix:
         scope = f"{scope}_{scope_suffix}"
-    context = _new_benchmark_context(scope)
+    context = _new_benchmark_context(scope, use_runlist=use_runlist)
     operator = None
     compile_attempt = 0
     try:
@@ -2076,7 +2113,10 @@ def benchmark_mode(
                     )
                     context.reset_runtime()
                     shutil.rmtree(context.build_dir, ignore_errors=True)
-                    context = _fresh_benchmark_context_for_build_dir(context.build_dir)
+                    context = _fresh_benchmark_context_for_build_dir(
+                        context.build_dir,
+                        use_runlist=use_runlist,
+                    )
                     compile_attempt += 1
                     continue
                 raise
@@ -2102,6 +2142,13 @@ def benchmark_mode(
         if not _warm_up_pattern_runtime(operator, warmup_runs):
             for _ in range(warmup_runs):
                 forward_once()
+        if capture_runtime_breakdown:
+            enable_runtime_breakdown = getattr(operator, "enable_runtime_breakdown", None)
+            if callable(enable_runtime_breakdown):
+                enable_runtime_breakdown()
+            reset_runtime_breakdown = getattr(operator, "reset_runtime_breakdown", None)
+            if callable(reset_runtime_breakdown):
+                reset_runtime_breakdown()
 
         latencies_sec: list[float] = []
         output = None
@@ -2116,6 +2163,15 @@ def benchmark_mode(
             result["latency_samples_ms"] = [
                 latency * 1000.0 for latency in latencies_sec
             ]
+        if capture_output_tensors:
+            result["output_tensor"] = (
+                None if output is None else output.detach().cpu()
+            )
+            result["reference_output_tensor"] = (
+                None
+                if reference["output"] is None
+                else reference["output"].detach().cpu()
+            )
         result["effective_gflops_per_sec"] = effective_gflops_per_sec(
             seq_len=workload.seq_len,
             hidden_size=workload.hidden_size,
@@ -2123,6 +2179,12 @@ def benchmark_mode(
             num_attention_heads=workload.num_attention_heads,
             avg_latency_ms=summary["avg_latency_ms"],
         )
+        if capture_runtime_breakdown:
+            runtime_breakdown_summary = getattr(
+                operator, "runtime_breakdown_summary", None
+            )
+            if callable(runtime_breakdown_summary):
+                result["runtime_breakdown"] = runtime_breakdown_summary()
 
         power_stats = _measure_power(
             forward_once,
@@ -2164,6 +2226,8 @@ def benchmark_mode_power_only(
     avg_latency_ms: float | None,
     timed_total_sec: float,
     effective_gflops_per_sec_value: float | None,
+    use_runlist: bool = True,
+    reference_override: dict[str, object] | None = None,
     scope_key_override: str | None = None,
     scope_suffix: str | None = None,
 ) -> dict[str, object]:
@@ -2177,15 +2241,19 @@ def benchmark_mode_power_only(
         "failure_message": "",
     }
 
-    reference = generate_golden_reference(
-        workload.seq_len,
-        workload.hidden_size,
-        workload.intermediate_size,
-        workload.num_attention_heads,
-        seed=seed,
-        workload_variant=workload.workload_variant,
-        include_output=False,
-        include_attention_mask=False,
+    reference = (
+        reference_override
+        if reference_override is not None
+        else generate_golden_reference(
+            workload.seq_len,
+            workload.hidden_size,
+            workload.intermediate_size,
+            workload.num_attention_heads,
+            seed=seed,
+            workload_variant=workload.workload_variant,
+            include_output=False,
+            include_attention_mask=False,
+        )
     )
     scope_key = (
         scope_key_override
@@ -2197,7 +2265,7 @@ def benchmark_mode_power_only(
     )
     if scope_suffix:
         scope = f"{scope}_{scope_suffix}"
-    context = _new_benchmark_context(scope)
+    context = _new_benchmark_context(scope, use_runlist=use_runlist)
     operator = None
     compile_attempt = 0
     try:
@@ -2224,7 +2292,10 @@ def benchmark_mode_power_only(
                     )
                     context.reset_runtime()
                     shutil.rmtree(context.build_dir, ignore_errors=True)
-                    context = _fresh_benchmark_context_for_build_dir(context.build_dir)
+                    context = _fresh_benchmark_context_for_build_dir(
+                        context.build_dir,
+                        use_runlist=use_runlist,
+                    )
                     compile_attempt += 1
                     continue
                 raise

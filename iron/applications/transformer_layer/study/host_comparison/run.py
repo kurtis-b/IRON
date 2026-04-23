@@ -69,12 +69,14 @@ LOGGER = logging.getLogger(__name__)
 HOST_COMPARISON_STUDY_NAME = "transformer_layer host comparison"
 
 REFERENCE_VALIDATION_MAX_SEQ_LEN = 16384
-SUPPORTED_HOST_BACKENDS: tuple[str, ...] = ("igpu",)
+SUPPORTED_HOST_BACKENDS: tuple[str, ...] = ("igpu", "cpu")
 SUPPORTED_CPU_POWER_BACKENDS: tuple[str, ...] = ("none", "turbostat_pkgwatt")
 SUPPORTED_IGPU_POWER_BACKENDS: tuple[str, ...] = ("none", "rocm-smi")
 COMPARISON_COLUMNS: tuple[str, ...] = (
     "igpu",
     "igpu_rocm_smi",
+    "cpu",
+    "cpu_turbostat",
     *REFERENCE_EXECUTION_MODES,
 )
 RESULTS_CSV_FIELDNAMES = (
@@ -120,12 +122,14 @@ POWER_COMPARISON_METRICS: tuple[str, ...] = (
 )
 PLOT_SERIES_THROUGHPUT = (
     ("igpu", "iGPU", "#e07a5f"),
+    ("cpu", "CPU", "#7b8cde"),
     ("hybrid", "NPU Hybrid", "#1f6f8b"),
     ("runlist", "NPU Runlist", "#b85c38"),
     ("offload", "NPU Offload", "#6c9a3b"),
 )
 PLOT_SERIES_PER_WATT = (
     ("igpu_rocm_smi", "iGPU Delta Package", "#e07a5f"),
+    ("cpu_turbostat", "CPU Package", "#7b8cde"),
     ("hybrid", "NPU Hybrid", "#1f6f8b"),
     ("runlist", "NPU Runlist", "#b85c38"),
     ("offload", "NPU Offload", "#6c9a3b"),
@@ -1281,10 +1285,17 @@ def _repair_missing_igpu_rocm_smi_per_watt_rows(
                 None if avg_power_row is None else avg_power_row.get("igpu_rocm_smi")
             ),
         )
-        if repaired_value is None:
-            continue
         repaired_row = dict(row)
-        repaired_row["igpu_rocm_smi"] = repaired_value
+        if repaired_value is not None:
+            repaired_row["igpu_rocm_smi"] = repaired_value
+        cpu_repaired_value = effective_gflops_per_sec_per_watt(
+            _optional_float(None if throughput_row is None else throughput_row.get("cpu")),
+            _optional_float(
+                None if avg_power_row is None else avg_power_row.get("cpu_turbostat")
+            ),
+        )
+        if cpu_repaired_value is not None:
+            repaired_row["cpu_turbostat"] = cpu_repaired_value
         repaired_rows[row_key] = repaired_row
     return repaired_rows
 
@@ -1295,6 +1306,8 @@ def _comparison_row(
     metric: str,
     igpu_value: float | None,
     igpu_rocm_smi_value: float | None = None,
+    cpu_value: float | None = None,
+    cpu_turbostat_value: float | None = None,
     reference_values: dict[str, float | None],
     igpu_power_estimation_method: str = "delta_package_power",
     npu_power_estimation_method: str = "delta_package_power",
@@ -1318,6 +1331,8 @@ def _comparison_row(
         "npu_baseline_policy": npu_baseline_policy,
         "igpu": igpu_value,
         "igpu_rocm_smi": igpu_rocm_smi_value,
+        "cpu": cpu_value,
+        "cpu_turbostat": cpu_turbostat_value,
     }
     for execution_mode in REFERENCE_EXECUTION_MODES:
         row[execution_mode] = reference_values.get(execution_mode)
@@ -1381,6 +1396,8 @@ def _normalized_existing_row(row: dict[str, str]) -> dict[str, object] | None:
         ),
         "igpu": row.get("igpu", ""),
         "igpu_rocm_smi": row.get("igpu_rocm_smi", ""),
+        "cpu": row.get("cpu", ""),
+        "cpu_turbostat": row.get("cpu_turbostat", ""),
     }
     for execution_mode in REFERENCE_EXECUTION_MODES:
         normalized[execution_mode] = row.get(execution_mode, "")
@@ -1408,6 +1425,7 @@ def reusable_rows_for_group(
     *,
     group: ReferenceGroup,
     reference_metric_values: dict[str, dict[str, float | None]],
+    host_backends: tuple[str, ...],
 ) -> list[dict[str, object]] | None:
     reused_rows: list[dict[str, object]] = []
     for metric in DIRECT_COMPARISON_METRICS:
@@ -1424,13 +1442,17 @@ def reusable_rows_for_group(
         if row is None:
             return None
         igpu_value = _optional_float(row.get("igpu"))
-        if igpu_value is None:
+        cpu_value = _optional_float(row.get("cpu"))
+        if "igpu" in host_backends and igpu_value is None:
+            return None
+        if "cpu" in host_backends and cpu_value is None:
             return None
         reused_rows.append(
             _comparison_row(
                 group=group,
                 metric=metric,
                 igpu_value=igpu_value,
+                cpu_value=cpu_value,
                 reference_values=reference_metric_values[metric],
                 igpu_power_estimation_method=str(
                     row.get("igpu_power_estimation_method") or "delta_package_power"
@@ -1460,7 +1482,10 @@ def reusable_rows_for_group(
         if row is None:
             return None
         igpu_rocm_smi_value = _optional_float(row.get("igpu_rocm_smi"))
-        if igpu_rocm_smi_value is None:
+        cpu_turbostat_value = _optional_float(row.get("cpu_turbostat"))
+        if "igpu" in host_backends and igpu_rocm_smi_value is None:
+            return None
+        if "cpu" in host_backends and cpu_turbostat_value is None:
             return None
         reused_rows.append(
             _comparison_row(
@@ -1468,6 +1493,7 @@ def reusable_rows_for_group(
                 metric=metric,
                 igpu_value=None,
                 igpu_rocm_smi_value=igpu_rocm_smi_value,
+                cpu_turbostat_value=cpu_turbostat_value,
                 reference_values=reference_metric_values[metric],
                 igpu_power_estimation_method=str(
                     row.get("igpu_power_estimation_method") or "delta_package_power"
@@ -1769,6 +1795,9 @@ def build_rows_for_group(
     igpu_device_name: str,
     igpu_power_backend: str,
     igpu_power_sample_interval_sec: float,
+    cpu_device_name: str = "cpu",
+    cpu_power_backend: str = "turbostat_pkgwatt",
+    cpu_power_sample_interval_sec: float = 0.2,
     existing_rows: (
         dict[tuple[str, int, str, str, int, str], dict[str, object]] | None
     ) = None,
@@ -1786,6 +1815,7 @@ def build_rows_for_group(
         {} if existing_rows is None else existing_rows,
         group=group,
         reference_metric_values=reference_metric_values,
+        host_backends=host_backends,
     )
     if reused_rows is not None:
         LOGGER.info(
@@ -1795,12 +1825,20 @@ def build_rows_for_group(
         )
         return reused_rows
 
-    benchmark_results: dict[str, dict[str, object] | None] = {"igpu": None}
+    benchmark_results: dict[str, dict[str, object] | None] = {
+        "igpu": None,
+        "cpu": None,
+    }
     backend_configs = {
         "igpu": {
             "device_name": igpu_device_name,
             "power_backend": igpu_power_backend,
             "power_sample_interval_sec": igpu_power_sample_interval_sec,
+        },
+        "cpu": {
+            "device_name": cpu_device_name,
+            "power_backend": cpu_power_backend,
+            "power_sample_interval_sec": cpu_power_sample_interval_sec,
         },
     }
     for backend in host_backends:
@@ -1853,6 +1891,7 @@ def build_rows_for_group(
             group=group,
             metric=metric,
             igpu_value=_host_metric_value(benchmark_results["igpu"], metric),
+            cpu_value=_host_metric_value(benchmark_results["cpu"], metric),
             reference_values=reference_metric_values[metric],
             igpu_power_estimation_method=igpu_power_estimation_method,
             npu_power_estimation_method=npu_power_estimation_method,
@@ -1873,6 +1912,14 @@ def build_rows_for_group(
                 )
                 if metric == "effective_gflops_per_sec_per_watt"
                 else _host_metric_value(benchmark_results["igpu"], metric)
+            ),
+            cpu_turbostat_value=(
+                _host_metric_value(
+                    benchmark_results["cpu"],
+                    "effective_gflops_per_sec_per_watt",
+                )
+                if metric == "effective_gflops_per_sec_per_watt"
+                else _host_metric_value(benchmark_results["cpu"], metric)
             ),
             reference_values=reference_metric_values[metric],
             igpu_power_estimation_method=igpu_power_estimation_method,
@@ -1917,6 +1964,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="rocm-smi",
     )
     parser.add_argument("--igpu-power-sample-interval-sec", type=float, default=0.2)
+    parser.add_argument("--cpu-device", default="cpu")
+    parser.add_argument(
+        "--cpu-power-backend",
+        choices=list(SUPPORTED_CPU_POWER_BACKENDS),
+        default="turbostat_pkgwatt",
+    )
+    parser.add_argument("--cpu-power-sample-interval-sec", type=float, default=0.2)
     parser.add_argument(
         "--reference-input",
         type=Path,
@@ -2047,6 +2101,11 @@ def main(argv: list[str] | None = None) -> int:
                 igpu_power_backend=str(args.igpu_power_backend),
                 igpu_power_sample_interval_sec=float(
                     args.igpu_power_sample_interval_sec
+                ),
+                cpu_device_name=str(args.cpu_device),
+                cpu_power_backend=str(args.cpu_power_backend),
+                cpu_power_sample_interval_sec=float(
+                    args.cpu_power_sample_interval_sec
                 ),
                 existing_rows=existing_rows,
             ):

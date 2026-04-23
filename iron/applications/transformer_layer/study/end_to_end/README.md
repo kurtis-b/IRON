@@ -39,8 +39,17 @@ Helper outputs:
 - `results/end_to_end/tuning_all_power.csv`
 - `results/end_to_end/correctness_spot_checks.csv`
 - `results/end_to_end/latency_variation.csv`
+- `results/end_to_end/offload_breakdown.csv`
+- `results/end_to_end/runlist_launch_ablation.csv`
 - `results/end_to_end/staging_ablation.csv`
+- `results/end_to_end/search_validation.csv`
+- `results/end_to_end/search_validation_failure_taxonomy.csv`
+- `results/end_to_end/error_distribution.csv`
 - `results/end_to_end/fairness_repeatability.csv`
+
+Manual-only helper output:
+
+- `results/end_to_end/real_weight_sanity.csv`
 
 Validation policy:
 
@@ -82,6 +91,11 @@ Entry points:
 - `python3 -m iron.applications.transformer_layer.study.end_to_end.run_staging_ablation`
 - `python3 -m iron.applications.transformer_layer.study.end_to_end.run_fairness_repeatability`
 - `python3 -m iron.applications.transformer_layer.study.end_to_end.remeasure_power_only`
+- `python3 -m iron.applications.transformer_layer.study.offload_partitioning.run_query_block_sweep`
+- `python3 -m iron.applications.transformer_layer.study.runlist_launch_ablation.run`
+- `python3 -m iron.applications.transformer_layer.study.search_validation.run`
+- `python3 -m iron.applications.transformer_layer.study.correctness.error_distribution`
+- `python3 -m iron.applications.transformer_layer.study.correctness.real_weight_sanity`
 
 Resume reuse is manifest-gated. The canonical runner only reuses prior tuning or
 final rows when the sibling `campaign_manifest.json` matches the requested
@@ -93,3 +107,35 @@ CSV set under `results/`.
 
 `remeasure_power_only` reuses existing latency and throughput values and reruns
 only the NPU power measurement.
+
+`offload_partitioning`, `runlist_launch_ablation`, `search_validation`, and
+`correctness.error_distribution` are all derived from the selected rows in
+`results_all_power.csv`. In the submission-facing unattended `paper_p0`
+workflow, they run on the narrowed paper matrix
+`family={baseline_768,gpt2_small_768}`, `seq_len={256,2048,8192}`,
+`mode={hybrid,runlist,offload}`, with helper-study overrides
+`--warmup-runs 1 --runs-per-sample 3`. `offload_partitioning` additionally uses
+`--query-block-policy representative` for the paper bundle.
+
+The broader `full` unattended workflow keeps the wider family and sequence
+coverage, plus the appendix/debug helper outputs:
+
+- `results/end_to_end/correctness_spot_checks.csv`
+- `results/end_to_end/latency_variation.csv`
+- `results/end_to_end/fairness_repeatability.csv`
+
+`correctness.real_weight_sanity` is intentionally manual. It is not part of the
+default unattended plan because it depends on explicit local payload exports.
+Before submission, run it on one encoder payload and one decoder payload at
+`seq_len=2048`.
+Each `--reference-source` may be either:
+
+- a single `.pt` file containing a dict with `input`, `weights`, optional
+  `output`, and optional `metadata`
+- or a directory containing `metadata.json`, `input.pt`, optional `output.pt`,
+  and either `weights.pt` or individual `q_weight.pt`, `k_weight.pt`,
+  `v_weight.pt`, `attn_output_weight.pt`, `ln1_weight.pt`,
+  `ffn_up_weight.pt`, `ffn_down_weight.pt`, and `ln2_weight.pt`
+
+The payload metadata must include `study_case_id` and `seq_len` so the runner
+can match the exported tensors to the selected paper-facing row.

@@ -10,6 +10,8 @@ from pathlib import Path
 
 from iron.applications.transformer_layer.study.artifact_integrity import (
     validate_canonical_results_root,
+    validate_paper_results_root,
+    validate_p0_results_root,
 )
 from iron.applications.transformer_layer.study.end_to_end.validation import (
     REFERENCE_TOLERANCE_VALIDATION_MODE,
@@ -50,8 +52,15 @@ def _write_text(path: Path, text: str = "x\n") -> None:
 
 def _build_valid_results_root(tmp_path: Path) -> Path:
     results_root = tmp_path / "results"
+    block_dir = results_root / "block"
     end_to_end_dir = results_root / "end_to_end"
     host_dir = results_root / "host_comparison"
+    memory_tile_staging_dir = results_root / "memory_tile_staging"
+    memcpy_dir = results_root / "memcpy_bandwidth"
+    resource_usage_dir = results_root / "resource_usage"
+    roofline_dir = results_root / "roofline"
+
+    _write_text(block_dir / "results.csv", "study_id\n")
 
     _write_csv(
         end_to_end_dir / "results_all_power.csv",
@@ -149,6 +158,15 @@ def _build_valid_results_root(tmp_path: Path) -> Path:
     _write_text(end_to_end_dir / "correctness_spot_checks.csv", "study_id\n")
     _write_text(end_to_end_dir / "latency_variation.csv", "study_id\n")
     _write_text(end_to_end_dir / "fairness_repeatability.csv", "study_id\n")
+    _write_text(end_to_end_dir / "offload_breakdown.csv", "study_id\n")
+    _write_text(end_to_end_dir / "runlist_launch_ablation.csv", "study_id\n")
+    _write_text(end_to_end_dir / "staging_ablation.csv", "study_id\n")
+    _write_text(end_to_end_dir / "search_validation.csv", "study_id\n")
+    _write_text(
+        end_to_end_dir / "search_validation_failure_taxonomy.csv",
+        "execution_mode,failure_kind,count\n",
+    )
+    _write_text(end_to_end_dir / "error_distribution.csv", "study_id\n")
     _write_text(
         end_to_end_dir / "hybrid_selected_blocks_vs_pattern_latency.svg", "<svg/>"
     )
@@ -236,6 +254,21 @@ def _build_valid_results_root(tmp_path: Path) -> Path:
     _write_text(host_dir / "fairness_repeatability.csv", "study_id\n")
     _write_text(host_dir / "effective_gflops_comparison.svg", "<svg/>")
     _write_text(host_dir / "effective_gflops_per_watt_comparison.svg", "<svg/>")
+    _write_text(memory_tile_staging_dir / "results.csv", "study_id\n")
+    _write_text(memcpy_dir / "results.csv", "study_id\n")
+    _write_text(
+        resource_usage_dir / "dataflow_block_best_configs.csv",
+        "family_id,block_kind\n",
+    )
+    _write_text(resource_usage_dir / "hybrid_selected_ops.csv", "execution_mode\n")
+    _write_text(resource_usage_dir / "runlist_selected_ops.csv", "execution_mode\n")
+    _write_text(resource_usage_dir / "offload_selected_ops.csv", "execution_mode\n")
+    _write_text(roofline_dir / "kernel_points.csv", "study_case_id\n")
+    _write_text(roofline_dir / "implementation_points.csv", "study_case_id\n")
+    _write_text(
+        results_root / "analysis" / "crossover_report.csv",
+        "study_case_id,execution_mode,seq_len\n",
+    )
     _write_text(
         host_dir / "campaign_manifest.json",
         json.dumps(
@@ -290,6 +323,35 @@ def test_results_root_manifest_is_written_with_campaign_metadata(tmp_path):
         "end_to_end": "end_to_end/campaign_manifest.json",
         "host_comparison": "host_comparison/campaign_manifest.json",
     }
+    assert manifest["plan_kind"] == ""
+    assert manifest["evaluation_profile"] == ""
+
+
+def test_results_root_manifest_records_plan_metadata_from_automation_state(tmp_path):
+    results_root = _build_valid_results_root(tmp_path)
+    automation_dir = results_root / "automation"
+    automation_dir.mkdir(parents=True, exist_ok=True)
+    _write_text(
+        automation_dir / "state.json",
+        json.dumps(
+            {
+                "run_id": "paper_run",
+                "artifact_profile": "paper",
+                "plan_kind": "paper_p0",
+                "plan_layout": "paper",
+                "run_user": "runner",
+                "jobs": [],
+            }
+        ),
+    )
+
+    write_results_root_manifest(results_root)
+    manifest = load_results_root_manifest(results_root)
+
+    assert manifest is not None
+    assert manifest["plan_kind"] == "paper_p0"
+    assert manifest["evaluation_profile"] == "paper"
+    assert manifest["automation"]["artifact_profile"] == "paper"
 
 
 def test_publish_results_root_copies_validated_artifacts(tmp_path):
@@ -302,12 +364,30 @@ def test_publish_results_root_copies_validated_artifacts(tmp_path):
     )
 
     assert published_root == target_root.resolve()
-    validate_canonical_results_root(target_root)
+    validate_p0_results_root(target_root)
     manifest = load_results_root_manifest(target_root)
     assert manifest is not None
     assert manifest["source_results_root"] == str(source_root.resolve())
+    assert (target_root / "analysis" / "crossover_report.csv").exists()
     assert (target_root / "end_to_end" / "results_all_power.csv").exists()
     assert (target_root / "host_comparison" / "results.csv").exists()
+
+
+def test_publish_results_root_can_publish_paper_profile(tmp_path):
+    source_root = _build_valid_results_root(tmp_path / "source")
+    target_root = tmp_path / "published_paper"
+
+    published_root = publish_results_root(
+        source_root=source_root,
+        target_root=target_root,
+        artifact_profile="paper",
+    )
+
+    assert published_root == target_root.resolve()
+    validate_paper_results_root(target_root)
+    manifest = load_results_root_manifest(target_root)
+    assert manifest is not None
+    assert manifest["evaluation_profile"] == "paper"
 
 
 def test_publish_results_root_refuses_existing_target_without_force(tmp_path):
@@ -345,6 +425,14 @@ def test_regenerate_plots_refuses_legacy_dataflow_artifacts(monkeypatch, tmp_pat
         "iron.applications.transformer_layer.study.regenerate_plots.regenerate_host_comparison_plots",
         lambda results_root: None,
     )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.regenerate_plots.regenerate_offload_partitioning_plots",
+        lambda results_root: None,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.regenerate_plots.regenerate_correctness_plots",
+        lambda results_root: None,
+    )
 
     try:
         regenerate_plots_main(["--results-root", str(results_root)])
@@ -357,3 +445,29 @@ def test_regenerate_plots_refuses_legacy_dataflow_artifacts(monkeypatch, tmp_pat
 def _load_host_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
+
+
+def test_validate_paper_results_root_accepts_bundle_without_appendix_outputs(tmp_path):
+    results_root = _build_valid_results_root(tmp_path)
+    for relative_path in (
+        ("end_to_end", "correctness_spot_checks.csv"),
+        ("end_to_end", "latency_variation.csv"),
+        ("end_to_end", "fairness_repeatability.csv"),
+        ("host_comparison", "fairness_repeatability.csv"),
+    ):
+        results_root.joinpath(*relative_path).unlink()
+
+    validate_paper_results_root(results_root)
+
+
+def test_validate_paper_results_root_rejects_missing_required_file(tmp_path):
+    results_root = _build_valid_results_root(tmp_path)
+    missing_path = results_root / "resource_usage" / "hybrid_selected_ops.csv"
+    missing_path.unlink()
+
+    try:
+        validate_paper_results_root(results_root)
+    except FileNotFoundError as exc:
+        assert str(missing_path) in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected paper validation to fail")

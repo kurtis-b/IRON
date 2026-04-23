@@ -11,11 +11,14 @@ from pathlib import Path
 
 from matplotlib import pyplot as plt
 
-from .artifact_integrity import validate_canonical_results_root
+from .artifact_integrity import ARTIFACT_PROFILES, validate_results_root
 from .block.plot_best_latency import (
     load_best_rows as load_block_rows,
     plot_best_latency,
     variant_stem as block_variant_stem,
+)
+from .correctness.plot_error_histograms import (
+    main as render_error_histograms_main,
 )
 from .end_to_end.plot_dataflow_blocks_vs_pattern import (
     load_plot_rows as load_dataflow_rows,
@@ -29,6 +32,9 @@ from .end_to_end.plot_tps_by_pattern import (
 )
 from .host_comparison.run import write_plots as write_host_comparison_plots
 from .memory_tile_staging.plot_staging_depth import write_canonical_plots
+from .offload_partitioning.plot_breakdown import (
+    main as render_offload_breakdown_main,
+)
 from .results_manifest import write_results_root_manifest
 
 LOGGER = logging.getLogger(__name__)
@@ -144,24 +150,47 @@ def regenerate_host_comparison_plots(results_root: Path) -> None:
     LOGGER.info("Wrote host-comparison plots under %s", results_csv.parent)
 
 
+def regenerate_offload_partitioning_plots(results_root: Path) -> None:
+    input_path = results_root / "end_to_end" / "offload_breakdown.csv"
+    output_path = input_path.with_suffix(".svg")
+    _require_file(input_path)
+    render_offload_breakdown_main(
+        ["--input", str(input_path), "--output", str(output_path)]
+    )
+    LOGGER.info("Wrote offload breakdown plot under %s", input_path.parent)
+
+
+def regenerate_correctness_plots(results_root: Path) -> None:
+    input_path = results_root / "end_to_end" / "error_distribution.csv"
+    output_path = input_path.with_name("error_histograms.svg")
+    _require_file(input_path)
+    render_error_histograms_main(
+        ["--input", str(input_path), "--output", str(output_path)]
+    )
+    LOGGER.info("Wrote correctness histogram plot under %s", input_path.parent)
+
+
 def regenerate_all_plots(results_root: Path) -> None:
     regenerate_block_plots(results_root)
     regenerate_end_to_end_summary_plots(results_root)
+    regenerate_offload_partitioning_plots(results_root)
+    regenerate_correctness_plots(results_root)
     regenerate_memory_tile_staging_plots(results_root)
     regenerate_host_comparison_plots(results_root)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Regenerate summary plot suites from an existing transformer-layer results root."
+        description="Regenerate summary plot suites from an existing transformer-layer P0 results root."
     )
     parser.add_argument(
         "--results-root",
         type=Path,
         default=default_results_root(),
-        help="Root directory containing block/, end_to_end/, memory_tile_staging/, and host_comparison/ results",
+        help="Root directory containing the published transformer-layer P0 results tree",
     )
     parser.add_argument("--skip-integrity-checks", action="store_true")
+    parser.add_argument("--artifact-profile", choices=ARTIFACT_PROFILES, default="p0")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -172,11 +201,24 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
     results_root = args.results_root.expanduser()
-    write_results_root_manifest(results_root)
+    write_results_root_manifest(
+        results_root,
+        evaluation_profile=(
+            "paper" if str(args.artifact_profile) == "paper" else None
+        ),
+    )
     if not args.skip_integrity_checks:
-        validate_canonical_results_root(results_root)
+        validate_results_root(
+            results_root,
+            artifact_profile=str(args.artifact_profile),
+        )
     regenerate_all_plots(results_root)
-    write_results_root_manifest(results_root)
+    write_results_root_manifest(
+        results_root,
+        evaluation_profile=(
+            "paper" if str(args.artifact_profile) == "paper" else None
+        ),
+    )
     return 0
 
 

@@ -11,23 +11,56 @@ from pathlib import Path
 from .end_to_end.validation import REFERENCE_TOLERANCE_VALIDATION_MODE
 from .results_manifest import RESULTS_ROOT_MANIFEST_NAME
 
+ARTIFACT_PROFILES = ("canonical", "p0", "paper")
+
 CANONICAL_EXECUTION_MODES = ("hybrid", "runlist", "offload")
 SELECTION_PROVENANCE_VALUES = {
     "best_found_under_declared_topk_joint_search",
     "exhaustive_joint_search_best",
     "tuning_failed",
 }
-REQUIRED_CANONICAL_FILES = (
+REQUIRED_BASE_FILES = (
     (RESULTS_ROOT_MANIFEST_NAME,),
     ("end_to_end", "results_all_power.csv"),
     ("end_to_end", "tuning_all_power.csv"),
+    ("end_to_end", "campaign_manifest.json"),
+    ("host_comparison", "results.csv"),
+    ("host_comparison", "campaign_manifest.json"),
+)
+REQUIRED_CANONICAL_ONLY_FILES = (
     ("end_to_end", "correctness_spot_checks.csv"),
     ("end_to_end", "latency_variation.csv"),
     ("end_to_end", "fairness_repeatability.csv"),
-    ("end_to_end", "campaign_manifest.json"),
-    ("host_comparison", "results.csv"),
     ("host_comparison", "fairness_repeatability.csv"),
-    ("host_comparison", "campaign_manifest.json"),
+)
+REQUIRED_CANONICAL_FILES = REQUIRED_BASE_FILES + REQUIRED_CANONICAL_ONLY_FILES
+REQUIRED_P0_ONLY_FILES = (
+    ("end_to_end", "offload_breakdown.csv"),
+    ("end_to_end", "runlist_launch_ablation.csv"),
+    ("end_to_end", "staging_ablation.csv"),
+    ("end_to_end", "search_validation.csv"),
+    ("end_to_end", "search_validation_failure_taxonomy.csv"),
+    ("end_to_end", "error_distribution.csv"),
+    ("analysis", "crossover_report.csv"),
+)
+REQUIRED_P0_FILES = REQUIRED_CANONICAL_FILES + REQUIRED_P0_ONLY_FILES
+REQUIRED_PAPER_FILES = REQUIRED_BASE_FILES + (
+    ("block", "results.csv"),
+    ("memory_tile_staging", "results.csv"),
+    ("end_to_end", "offload_breakdown.csv"),
+    ("end_to_end", "runlist_launch_ablation.csv"),
+    ("end_to_end", "staging_ablation.csv"),
+    ("end_to_end", "search_validation.csv"),
+    ("end_to_end", "search_validation_failure_taxonomy.csv"),
+    ("end_to_end", "error_distribution.csv"),
+    ("memcpy_bandwidth", "results.csv"),
+    ("resource_usage", "dataflow_block_best_configs.csv"),
+    ("resource_usage", "hybrid_selected_ops.csv"),
+    ("resource_usage", "runlist_selected_ops.csv"),
+    ("resource_usage", "offload_selected_ops.csv"),
+    ("roofline", "kernel_points.csv"),
+    ("roofline", "implementation_points.csv"),
+    ("analysis", "crossover_report.csv"),
 )
 
 
@@ -44,15 +77,19 @@ def _load_manifest(path: Path) -> dict[str, object]:
     return payload
 
 
-def _require_files(results_root: Path) -> None:
+def _require_files(
+    results_root: Path,
+    *,
+    required_files: tuple[tuple[str, ...], ...] = REQUIRED_CANONICAL_FILES,
+) -> None:
     missing = [
         str(results_root.joinpath(*parts))
-        for parts in REQUIRED_CANONICAL_FILES
+        for parts in required_files
         if not results_root.joinpath(*parts).exists()
     ]
     if missing:
         raise FileNotFoundError(
-            "Canonical artifact root is missing required files:\n" + "\n".join(missing)
+            "Artifact root is missing required files:\n" + "\n".join(missing)
         )
 
 
@@ -212,6 +249,8 @@ def _validate_host_comparison_results(
             "npu_power_estimation_method",
             "igpu_baseline_policy",
             "npu_baseline_policy",
+            "cpu",
+            "cpu_turbostat",
             *CANONICAL_EXECUTION_MODES,
         ),
         path=results_path,
@@ -335,11 +374,36 @@ def _validate_results_root_manifest(
             raise ValueError(
                 f"artifact root manifest must include command_line entries for {study_name}"
             )
+    tool_versions_by_study = manifest.get("tool_versions_by_study")
+    if not isinstance(tool_versions_by_study, dict):
+        raise ValueError("artifact root manifest must publish tool_versions_by_study")
+    system_snapshot_by_study = manifest.get("system_snapshot_by_study")
+    if not isinstance(system_snapshot_by_study, dict):
+        raise ValueError(
+            "artifact root manifest must publish system_snapshot_by_study"
+        )
+    plan_kind = manifest.get("plan_kind")
+    if not isinstance(plan_kind, str):
+        raise ValueError("artifact root manifest must publish plan_kind")
+    evaluation_profile = manifest.get("evaluation_profile")
+    if not isinstance(evaluation_profile, str):
+        raise ValueError("artifact root manifest must publish evaluation_profile")
+    automation = manifest.get("automation")
+    if isinstance(automation, dict):
+        automation_plan_kind = str(automation.get("plan_kind") or "")
+        if automation_plan_kind and plan_kind != automation_plan_kind:
+            raise ValueError(
+                "artifact root manifest plan_kind does not match automation.plan_kind"
+            )
 
 
-def validate_canonical_results_root(results_root: str | Path) -> None:
+def _validate_results_root(
+    results_root: str | Path,
+    *,
+    required_files: tuple[tuple[str, ...], ...],
+) -> None:
     root = Path(results_root)
-    _require_files(root)
+    _require_files(root, required_files=required_files)
     results_root_manifest = _load_manifest(root / RESULTS_ROOT_MANIFEST_NAME)
     end_to_end_manifest = _load_manifest(root / "end_to_end" / "campaign_manifest.json")
     host_manifest = _load_manifest(root / "host_comparison" / "campaign_manifest.json")
@@ -359,3 +423,41 @@ def validate_canonical_results_root(results_root: str | Path) -> None:
         host_manifest=host_manifest,
     )
     _scan_legacy_dataflow_labels(root)
+
+
+def validate_canonical_results_root(results_root: str | Path) -> None:
+    _validate_results_root(
+        results_root,
+        required_files=REQUIRED_CANONICAL_FILES,
+    )
+
+
+def validate_p0_results_root(results_root: str | Path) -> None:
+    _validate_results_root(
+        results_root,
+        required_files=REQUIRED_P0_FILES,
+    )
+
+
+def validate_paper_results_root(results_root: str | Path) -> None:
+    _validate_results_root(
+        results_root,
+        required_files=REQUIRED_PAPER_FILES,
+    )
+
+
+def validate_results_root(
+    results_root: str | Path,
+    *,
+    artifact_profile: str,
+) -> None:
+    if artifact_profile == "canonical":
+        validate_canonical_results_root(results_root)
+        return
+    if artifact_profile == "p0":
+        validate_p0_results_root(results_root)
+        return
+    if artifact_profile == "paper":
+        validate_paper_results_root(results_root)
+        return
+    raise ValueError(f"Unsupported artifact profile: {artifact_profile}")

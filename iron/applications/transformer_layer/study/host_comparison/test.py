@@ -700,6 +700,8 @@ def test_build_rows_for_group_aggregates_igpu_and_npu_reference_modes(monkeypatc
                 "npu_power_estimation_method": "delta_package_power",
                 "igpu_baseline_policy": "quiescent_package_power",
                 "npu_baseline_policy": "quiescent_package_power",
+                "cpu": None,
+                "cpu_turbostat": None,
             }
         )
         row["hybrid"] = mode_values["hybrid"].get(str(row["metric"]), row["hybrid"])
@@ -1222,6 +1224,8 @@ def test_build_rows_for_group_reuses_matching_existing_rows(monkeypatch):
                 "npu_power_estimation_method": "delta_package_power",
                 "igpu_baseline_policy": "quiescent_package_power",
                 "npu_baseline_policy": "quiescent_package_power",
+                "cpu": "",
+                "cpu_turbostat": "",
             }
         )
         expected_row["hybrid"] = mode_values["hybrid"].get(
@@ -1348,6 +1352,8 @@ def test_normalized_existing_row_keeps_current_schema():
         "npu_baseline_policy": "quiescent_package_power",
         "igpu": "800.0",
         "igpu_rocm_smi": "",
+        "cpu": "",
+        "cpu_turbostat": "",
         "hybrid": "12800.0",
         "runlist": "",
         "offload": "",

@@ -9,12 +9,13 @@ import logging
 import shutil
 from pathlib import Path
 
-from .artifact_integrity import validate_canonical_results_root
+from .artifact_integrity import ARTIFACT_PROFILES, validate_results_root
 from .results_manifest import write_results_root_manifest
 
 LOGGER = logging.getLogger(__name__)
 
 PUBLISHABLE_SUBDIRS: tuple[str, ...] = (
+    "analysis",
     "block",
     "end_to_end",
     "memory_tile_staging",
@@ -47,6 +48,7 @@ def publish_results_root(
     source_root: str | Path,
     target_root: str | Path,
     force: bool = False,
+    artifact_profile: str = "p0",
 ) -> Path:
     source = Path(source_root).expanduser().resolve()
     target = Path(target_root).expanduser().resolve()
@@ -54,7 +56,7 @@ def publish_results_root(
         raise ValueError("source_root and target_root must be different paths")
 
     write_results_root_manifest(source)
-    validate_canonical_results_root(source)
+    validate_results_root(source, artifact_profile=artifact_profile)
 
     if target.exists():
         if not force:
@@ -65,8 +67,12 @@ def publish_results_root(
 
     target.mkdir(parents=True, exist_ok=True)
     _copy_publishable_tree(source, target)
-    write_results_root_manifest(target, source_results_root=source)
-    validate_canonical_results_root(target)
+    write_results_root_manifest(
+        target,
+        source_results_root=source,
+        evaluation_profile=("paper" if artifact_profile == "paper" else None),
+    )
+    validate_results_root(target, artifact_profile=artifact_profile)
     LOGGER.info("Published validated results root from %s to %s", source, target)
     return target
 
@@ -82,6 +88,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--target-root", type=Path, default=default_target_results_root()
     )
+    parser.add_argument("--artifact-profile", choices=ARTIFACT_PROFILES, default="p0")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
@@ -96,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         source_root=args.source_root,
         target_root=args.target_root,
         force=bool(args.force),
+        artifact_profile=str(args.artifact_profile),
     )
     return 0
 

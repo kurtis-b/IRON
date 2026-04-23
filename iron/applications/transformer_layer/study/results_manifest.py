@@ -82,6 +82,30 @@ def _study_tool_paths(
     return tool_paths
 
 
+def _study_tool_versions(
+    manifests: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    tool_versions: dict[str, dict[str, object]] = {}
+    for study_name, manifest in manifests.items():
+        raw = manifest.get("tool_versions")
+        if not isinstance(raw, dict):
+            continue
+        tool_versions[study_name] = {str(key): value for key, value in raw.items()}
+    return tool_versions
+
+
+def _study_system_snapshots(
+    manifests: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    snapshots: dict[str, dict[str, object]] = {}
+    for study_name, manifest in manifests.items():
+        raw = manifest.get("system_snapshot")
+        if not isinstance(raw, dict):
+            continue
+        snapshots[study_name] = {str(key): value for key, value in raw.items()}
+    return snapshots
+
+
 def _load_automation_state(results_root: Path) -> dict[str, object] | None:
     state_path = results_root / "automation" / "state.json"
     if not state_path.exists():
@@ -108,6 +132,7 @@ def _load_automation_state(results_root: Path) -> dict[str, object] | None:
             )
     return {
         "run_id": str(payload.get("run_id") or ""),
+        "artifact_profile": str(payload.get("artifact_profile") or ""),
         "plan_kind": str(payload.get("plan_kind") or ""),
         "plan_layout": str(payload.get("plan_layout") or ""),
         "run_user": str(payload.get("run_user") or ""),
@@ -116,10 +141,18 @@ def _load_automation_state(results_root: Path) -> dict[str, object] | None:
     }
 
 
+def evaluation_profile_for_plan_kind(plan_kind: str) -> str:
+    normalized = str(plan_kind or "").strip()
+    if normalized == "paper_p0":
+        return "paper"
+    return normalized
+
+
 def collect_results_root_manifest(
     results_root: str | Path,
     *,
     source_results_root: str | Path | None = None,
+    evaluation_profile: str | None = None,
 ) -> dict[str, object]:
     root = Path(results_root)
     manifests: dict[str, dict[str, object]] = {}
@@ -152,12 +185,23 @@ def collect_results_root_manifest(
         "study_manifest_files": study_manifest_files,
         "study_command_lines": _study_command_lines(manifests),
         "tool_paths_by_study": _study_tool_paths(manifests),
+        "tool_versions_by_study": _study_tool_versions(manifests),
+        "system_snapshot_by_study": _study_system_snapshots(manifests),
     }
-    if source_results_root is not None:
-        manifest["source_results_root"] = str(source_root.resolve())
     automation_state = _load_automation_state(source_root)
     if automation_state is not None:
         manifest["automation"] = automation_state
+    plan_kind = ""
+    if automation_state is not None:
+        plan_kind = str(automation_state.get("plan_kind") or "").strip()
+    manifest["plan_kind"] = plan_kind
+    manifest["evaluation_profile"] = (
+        str(evaluation_profile).strip()
+        if evaluation_profile is not None
+        else evaluation_profile_for_plan_kind(plan_kind)
+    )
+    if source_results_root is not None:
+        manifest["source_results_root"] = str(source_root.resolve())
     return manifest
 
 
@@ -165,6 +209,7 @@ def write_results_root_manifest(
     results_root: str | Path,
     *,
     source_results_root: str | Path | None = None,
+    evaluation_profile: str | None = None,
 ) -> Path:
     root = Path(results_root)
     root.mkdir(parents=True, exist_ok=True)
@@ -172,6 +217,7 @@ def write_results_root_manifest(
     payload = collect_results_root_manifest(
         root,
         source_results_root=source_results_root,
+        evaluation_profile=evaluation_profile,
     )
     path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"

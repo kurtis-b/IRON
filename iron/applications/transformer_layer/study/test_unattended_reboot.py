@@ -7,9 +7,13 @@ from __future__ import annotations
 import csv
 import io
 import json
+import shutil
 import types
 from pathlib import Path
 
+from iron.applications.transformer_layer.study.artifact_integrity import (
+    validate_paper_results_root,
+)
 from iron.applications.transformer_layer.study.unattended_reboot import (
     _cron_command,
     _current_npu_power_mode,
@@ -30,6 +34,7 @@ from iron.applications.transformer_layer.study.unattended_reboot import (
     STATE_VERSION,
     build_execution_smoke_job_plan,
     build_job_plan,
+    build_paper_p0_job_plan,
     build_smoke_test_job_plan,
     create_state,
     run_next_job,
@@ -51,7 +56,7 @@ def test_build_job_plan_sets_ttm_only_for_host_comparison_16384():
     decoder_16384 = [
         job
         for job in jobs
-        if job["id"] == "host_comparison_igpu_gpt2_medium_1024_16384"
+        if job["id"] == "host_comparison_gpt2_medium_1024_16384"
     ][0]
     assert decoder_16384["privileged_setup"] == [
         {"action": "set_turbo"},
@@ -59,7 +64,7 @@ def test_build_job_plan_sets_ttm_only_for_host_comparison_16384():
     ]
 
     decoder_8192 = [
-        job for job in jobs if job["id"] == "host_comparison_igpu_gpt2_medium_1024_8192"
+        job for job in jobs if job["id"] == "host_comparison_gpt2_medium_1024_8192"
     ][0]
     assert decoder_8192["privileged_setup"] == [
         {"action": "set_turbo"},
@@ -89,6 +94,11 @@ def test_build_job_plan_uses_per_seq_latency_and_correctness_jobs():
     ][0]
     assert "--seq-len" in latency_job["argv"]
     assert latency_job["argv"][latency_job["argv"].index("--seq-len") + 1] == "4096"
+    assert any(job["id"] == "offload_partitioning_all" for job in jobs)
+    assert any(job["id"] == "runlist_launch_ablation_all" for job in jobs)
+    assert any(job["id"] == "search_validation_all" for job in jobs)
+    assert any(job["id"] == "correctness_error_distribution_all" for job in jobs)
+    assert any(job["id"] == "crossover_report_all" for job in jobs)
 
 
 def test_build_job_plan_ends_with_plot_regeneration():
@@ -127,10 +137,92 @@ def test_build_job_plan_places_16384_host_comparison_jobs_at_tail():
     tinybert_16384_index = next(
         index
         for index, job in enumerate(jobs)
-        if job["id"] == "host_comparison_igpu_tinybert_512_16384"
+        if job["id"] == "host_comparison_tinybert_512_16384"
     )
 
     assert roofline_index < tinybert_16384_index < fairness_index < regenerate_index
+
+
+def test_build_paper_p0_job_plan_limits_scope_and_excludes_appendix_jobs():
+    jobs = build_paper_p0_job_plan(
+        results_root=Path("/tmp/results_unattended_paper"),
+    )
+
+    excluded_modules = {
+        "iron.applications.transformer_layer.study.end_to_end.run_correctness_spot_checks",
+        "iron.applications.transformer_layer.study.end_to_end.run_latency_variation",
+        "iron.applications.transformer_layer.study.end_to_end.run_fairness_repeatability",
+        "iron.applications.transformer_layer.study.host_comparison.run_fairness_repeatability",
+    }
+    assert not any(job["module"] in excluded_modules for job in jobs)
+
+    expected_families = {"baseline_768", "gpt2_small_768"}
+    expected_seq_lens = {"256", "2048", "8192"}
+    expected_blocks = {"mha_out_proj", "ffn"}
+    for job in jobs:
+        argv = list(job["argv"])
+        module = str(job["module"])
+        if module == "iron.applications.transformer_layer.study.block.run":
+            assert argv[argv.index("--family") + 1] == "baseline_768"
+            assert argv[argv.index("--seq-len") + 1] in expected_seq_lens
+            assert argv[argv.index("--block") + 1] in expected_blocks
+        if module == "iron.applications.transformer_layer.study.memory_tile_staging.run":
+            assert argv[argv.index("--family") + 1] in expected_families
+            assert argv[argv.index("--seq-len") + 1] in expected_seq_lens
+            assert argv[argv.index("--block") + 1] in expected_blocks
+        if module == "iron.applications.transformer_layer.study.end_to_end.run":
+            assert argv[argv.index("--family") + 1] in expected_families
+            assert argv[argv.index("--seq-len") + 1] in expected_seq_lens
+            assert argv[argv.index("--mode") + 1] in {"hybrid", "runlist", "offload"}
+        if (
+            module
+            == "iron.applications.transformer_layer.study.end_to_end.run_staging_ablation"
+        ):
+            assert argv[argv.index("--family") + 1] in expected_families
+            assert argv[argv.index("--seq-len") + 1] in expected_seq_lens
+            assert argv[argv.index("--block") + 1] in expected_blocks
+        if module == "iron.applications.transformer_layer.study.host_comparison.run":
+            assert argv[argv.index("--family") + 1] in expected_families
+            assert argv[argv.index("--seq-len") + 1] in expected_seq_lens
+
+
+def test_build_paper_p0_job_plan_passes_helper_caps_and_paper_profile():
+    jobs = build_paper_p0_job_plan(
+        results_root=Path("/tmp/results_unattended_paper"),
+    )
+
+    offload_job = next(job for job in jobs if job["id"] == "offload_partitioning_all")
+    assert offload_job["argv"] == [
+        "--results-input",
+        "/tmp/results_unattended_paper/end_to_end/results_all_power.csv",
+        "--warmup-runs",
+        "1",
+        "--runs-per-sample",
+        "3",
+        "--query-block-policy",
+        "representative",
+        "--output",
+        "/tmp/results_unattended_paper/end_to_end/offload_breakdown.csv",
+    ]
+
+    for job_id in (
+        "runlist_launch_ablation_all",
+        "search_validation_all",
+        "correctness_error_distribution_all",
+    ):
+        job = next(job for job in jobs if job["id"] == job_id)
+        assert "--warmup-runs" in job["argv"]
+        assert job["argv"][job["argv"].index("--warmup-runs") + 1] == "1"
+        assert "--runs-per-sample" in job["argv"]
+        assert job["argv"][job["argv"].index("--runs-per-sample") + 1] == "3"
+
+    regenerate_job = next(job for job in jobs if job["id"] == "regenerate_plots_all")
+    assert regenerate_job["argv"] == [
+        "--results-root",
+        "/tmp/results_unattended_paper",
+        "--artifact-profile",
+        "paper",
+    ]
 
 
 def test_build_smoke_test_job_plan_is_small_and_self_verifying():
@@ -211,41 +303,137 @@ def test_build_execution_smoke_job_plan_covers_three_patterns_and_exports():
         "execution_smoke_latency_variation_offload",
     ]
     assert any(job["id"] == "execution_smoke_host_comparison" for job in jobs)
+    assert any(job["id"] == "execution_smoke_staging_ablation" for job in jobs)
+    assert any(job["id"] == "execution_smoke_offload_partitioning" for job in jobs)
+    assert any(job["id"] == "execution_smoke_runlist_launch_ablation" for job in jobs)
+    assert any(job["id"] == "execution_smoke_search_validation" for job in jobs)
+    assert any(job["id"] == "execution_smoke_error_distribution" for job in jobs)
     assert any(job["id"] == "execution_smoke_resource_usage" for job in jobs)
     assert any(job["id"] == "execution_smoke_roofline" for job in jobs)
+    assert any(job["id"] == "execution_smoke_crossover_report" for job in jobs)
     assert jobs[-1]["id"] == "execution_smoke_verify_results"
     assert jobs[-1]["argv"] == [
         "verify-execution-results",
         "--results-root",
         "/tmp/results_unattended_exec_smoke",
+        "--artifact-profile",
+        "p0",
     ]
+    host_comparison_job = next(
+        job for job in jobs if job["id"] == "execution_smoke_host_comparison"
+    )
+    assert "--host-backends" in host_comparison_job["argv"]
+    assert (
+        host_comparison_job["argv"][
+            host_comparison_job["argv"].index("--host-backends") + 1
+        ]
+        == "all"
+    )
+
+
+def test_run_next_job_completes_paper_p0_plan_with_paper_validation(
+    monkeypatch, tmp_path
+):
+    from iron.applications.transformer_layer.study.test_artifact_integrity import (
+        _build_valid_results_root,
+    )
+
+    results_root = tmp_path / "paper_results"
+    state_path = tmp_path / "state.json"
+    fixture_root = _build_valid_results_root(tmp_path / "fixture")
+    jobs = build_paper_p0_job_plan(results_root=results_root)
+    state = create_state(
+        run_id="paper",
+        repo=tmp_path / "repo",
+        results_root=results_root,
+        run_user="runner",
+        host_comparison_16384_ttm_gb=26,
+        reboot_command=["reboot"],
+        jobs=jobs,
+        plan_kind="paper_p0",
+        artifact_profile="paper",
+    )
+    write_state(state_path, state)
+
+    executed_modules: list[str] = []
+    copied_fixture = False
+
+    def record_run(argv, **kwargs):
+        nonlocal copied_fixture
+        if not copied_fixture:
+            shutil.copytree(fixture_root, results_root, dirs_exist_ok=True)
+            copied_fixture = True
+        executed_modules.append(str(argv[0]))
+        return 0
+
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.unattended_reboot._ensure_baseline_temperature",
+        lambda state_path, state: (50.0, "sensors:k10temp-pci-00c3"),
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.unattended_reboot._migrate_state_for_current_runner",
+        lambda state: False,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.unattended_reboot._ttm_action_requires_reboot",
+        lambda action, state: False,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.unattended_reboot._wait_for_temperature_gate",
+        lambda **kwargs: {
+            "temperature_source": "sensors:k10temp-pci-00c3",
+            "threshold_temperature_c": 52.5,
+            "pre_run_temperature_c": 50.0,
+            "pre_run_threshold_met": True,
+            "pre_run_check_count": 1,
+            "pre_run_wait_seconds": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.unattended_reboot._run_privileged_action",
+        lambda action, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.unattended_reboot._job_command",
+        lambda repo, run_user, module, argv: [module, *argv],
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.unattended_reboot._run_subprocess",
+        record_run,
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.unattended_reboot._read_pc_temperature_c",
+        lambda: (51.0, "sensors:k10temp-pci-00c3"),
+    )
+    monkeypatch.setattr(
+        "iron.applications.transformer_layer.study.unattended_reboot.remove_crontab_entry",
+        lambda path: None,
+    )
+
+    assert run_next_job(state_path) == 0
+    saved_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved_state["status"] == "completed"
+    assert any(module.endswith(".end_to_end.run") for module in executed_modules)
+    assert any(module.endswith(".host_comparison.run") for module in executed_modules)
+    assert any(
+        module.endswith(".offload_partitioning.run_query_block_sweep")
+        for module in executed_modules
+    )
+    assert any(
+        module.endswith(".runlist_launch_ablation.run") for module in executed_modules
+    )
+    assert any(module.endswith(".resource_usage.run") for module in executed_modules)
+    assert any(module.endswith(".roofline.run") for module in executed_modules)
+
+    validate_paper_results_root(results_root)
 
 
 def test_results_root_contains_required_files(tmp_path):
     results_root = tmp_path / "results"
-    (results_root / "block").mkdir(parents=True)
-    (results_root / "end_to_end").mkdir(parents=True)
-    (results_root / "memory_tile_staging").mkdir(parents=True)
-    (results_root / "host_comparison").mkdir(parents=True)
-    (results_root / "block" / "results.csv").write_text("x\n", encoding="utf-8")
-    (results_root / "end_to_end" / "results_all_power.csv").write_text(
-        "x\n", encoding="utf-8"
-    )
-    (results_root / "end_to_end" / "tuning_all_power.csv").write_text(
-        "x\n", encoding="utf-8"
-    )
-    (results_root / "end_to_end" / "campaign_manifest.json").write_text(
-        "{}\n", encoding="utf-8"
-    )
-    (results_root / "memory_tile_staging" / "results.csv").write_text(
-        "x\n", encoding="utf-8"
-    )
-    (results_root / "host_comparison" / "results.csv").write_text(
-        "x\n", encoding="utf-8"
-    )
-    (results_root / "host_comparison" / "campaign_manifest.json").write_text(
-        "{}\n", encoding="utf-8"
-    )
+    for rel_path in REQUIRED_RESULTS_FILES:
+        target = results_root.joinpath(*rel_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x\n", encoding="utf-8")
 
     assert _results_root_contains_required_files(results_root, REQUIRED_RESULTS_FILES)
     assert not _results_root_contains_required_files(
@@ -1142,14 +1330,14 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
     prefix = [
         job
         for job in expected_jobs
-        if not str(job["id"]).startswith("host_comparison_igpu_")
+        if not str(job["id"]).startswith("host_comparison_")
         and str(job["id"]) != "host_comparison_fairness"
         and str(job["id"]) != "regenerate_plots_all"
     ]
     host_jobs_by_id = {
         str(job["id"]): job
         for job in expected_jobs
-        if str(job["id"]).startswith("host_comparison_igpu_")
+        if str(job["id"]).startswith("host_comparison_")
     }
     fairness_job = [
         job for job in expected_jobs if job["id"] == "host_comparison_fairness"
@@ -1168,7 +1356,7 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
     ]:
         for seq_len in [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]:
             legacy_host_jobs.append(
-                host_jobs_by_id[f"host_comparison_igpu_{family_id}_{seq_len}"]
+                host_jobs_by_id[f"host_comparison_{family_id}_{seq_len}"]
             )
 
     state["version"] = 1
@@ -1178,7 +1366,7 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
     state.pop("normal_ttm_pages_limit", None)
     state.pop("plan_layout", None)
 
-    baseline_job_id = "host_comparison_igpu_baseline_768_64"
+    baseline_job_id = "host_comparison_baseline_768_64"
     baseline_index = next(
         index for index, job in enumerate(state["jobs"]) if job["id"] == baseline_job_id
     )
@@ -1189,7 +1377,7 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
     tinybert_16384 = next(
         job
         for job in state["jobs"]
-        if job["id"] == "host_comparison_igpu_tinybert_512_16384"
+        if job["id"] == "host_comparison_tinybert_512_16384"
     )
     tinybert_16384["status"] = "passed"
     tinybert_16384["attempts"] = 3
@@ -1212,7 +1400,7 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
     baseline_16384_index = next(
         index
         for index, job in enumerate(state["jobs"])
-        if job["id"] == "host_comparison_igpu_baseline_768_16384"
+        if job["id"] == "host_comparison_baseline_768_16384"
     )
     fairness_index = next(
         index
@@ -1222,6 +1410,11 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
     roofline_index = next(
         index for index, job in enumerate(state["jobs"]) if job["id"] == "roofline_all"
     )
+    crossover_index = next(
+        index
+        for index, job in enumerate(state["jobs"])
+        if job["id"] == "crossover_report_all"
+    )
     regenerate_index = next(
         index
         for index, job in enumerate(state["jobs"])
@@ -1230,9 +1423,10 @@ def test_migrate_state_for_current_runner_reorders_pending_suffix(
     tinybert_16384_index = next(
         index
         for index, job in enumerate(state["jobs"])
-        if job["id"] == "host_comparison_igpu_tinybert_512_16384"
+        if job["id"] == "host_comparison_tinybert_512_16384"
     )
-    assert fairness_index < roofline_index < baseline_16384_index < regenerate_index
+    assert fairness_index < roofline_index < crossover_index < baseline_16384_index
+    assert baseline_16384_index < regenerate_index
     assert state["jobs"][tinybert_16384_index]["status"] == "passed"
     assert state["jobs"][tinybert_16384_index]["attempts"] == 3
 

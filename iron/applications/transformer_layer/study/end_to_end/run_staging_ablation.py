@@ -56,6 +56,9 @@ SEQ_COLORS = {
 }
 RESULTS_CSV_FIELDNAMES = (
     "study_id",
+    "campaign_id",
+    "repeat_index",
+    "selected_matched_run_id",
     "study_case_id",
     "study_case_label",
     "workload_variant",
@@ -76,6 +79,9 @@ RESULTS_CSV_FIELDNAMES = (
     "max_latency_ms",
     "compile_setup_time_ms",
     "effective_gflops_per_sec",
+    "npu_dispatch_count",
+    "npu_unique_instruction_binary_count",
+    "npu_unique_xclbin_count",
     "speedup_vs_source_depth",
     "speedup_vs_depth1",
     "validation_error_count",
@@ -239,6 +245,9 @@ def source_depth_row_from_selected_result(
     row = selected_row.row
     return {
         "study_id": "end_to_end_staging_ablation",
+        "campaign_id": selected_row.campaign_id,
+        "repeat_index": selected_row.repeat_index,
+        "selected_matched_run_id": selected_row.matched_run_id,
         "study_case_id": selected_row.study_case_id,
         "study_case_label": selected_row.study_case_label,
         "workload_variant": selected_row.workload_variant,
@@ -256,6 +265,11 @@ def source_depth_row_from_selected_result(
         "avg_latency_ms": row.get("avg_latency_ms", ""),
         "compile_setup_time_ms": row.get("compile_setup_time_ms", ""),
         "effective_gflops_per_sec": row.get("effective_gflops_per_sec", ""),
+        "npu_dispatch_count": row.get("npu_dispatch_count", ""),
+        "npu_unique_instruction_binary_count": row.get(
+            "npu_unique_instruction_binary_count", ""
+        ),
+        "npu_unique_xclbin_count": row.get("npu_unique_xclbin_count", ""),
         "validation_error_count": row.get("validation_error_count", ""),
         "run_status": row.get("run_status", ""),
         "failure_message": row.get("failure_message", ""),
@@ -599,6 +613,9 @@ def build_rows(
                 rows.append(
                     {
                         "study_id": "end_to_end_staging_ablation",
+                        "campaign_id": selected_row.campaign_id,
+                        "repeat_index": selected_row.repeat_index,
+                        "selected_matched_run_id": selected_row.matched_run_id,
                         "study_case_id": selected_row.study_case_id,
                         "study_case_label": selected_row.study_case_label,
                         "workload_variant": selected_row.workload_variant,
@@ -620,6 +637,13 @@ def build_rows(
                         "compile_setup_time_ms": result.get("compile_setup_time_ms"),
                         "effective_gflops_per_sec": result.get(
                             "effective_gflops_per_sec"
+                        ),
+                        "npu_dispatch_count": result.get("npu_dispatch_count"),
+                        "npu_unique_instruction_binary_count": result.get(
+                            "npu_unique_instruction_binary_count"
+                        ),
+                        "npu_unique_xclbin_count": result.get(
+                            "npu_unique_xclbin_count"
                         ),
                         "validation_error_count": result.get(
                             "validation_error_count",

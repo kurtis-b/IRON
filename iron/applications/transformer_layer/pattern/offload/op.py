@@ -58,6 +58,12 @@ _OFFLOAD_TILE_M_CANDIDATES = (64, 32, 16, 8)
 _OFFLOAD_TILE_KN_CANDIDATES = (256, 192, 160, 128, 96, 80, 64, 48, 32, 24, 16, 8)
 
 
+def _tensor_nbytes(tensor: torch.Tensor | None) -> int:
+    if tensor is None:
+        return 0
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
 def _require_supported_num_aie_columns(num_aie_columns: int) -> None:
     if int(num_aie_columns) != int(_OFFLOAD_SHARED_GEMM_DEFAULTS["num_aie_columns"]):
         raise ValueError(
@@ -342,8 +348,56 @@ class AIETransformerOffload(AIEOperatorBase):
         self.reset_buffer_names = ()
         self.enable_benchmark_buffer_reset = False
         self.host_output_buffer_names = ("output",)
+        self._runtime_breakdown_enabled = False
+        self._runtime_breakdown: dict[str, float | int] = {}
 
         AIEOperatorBase.__init__(self, context=context)
+
+    def enable_runtime_breakdown(self, enabled: bool = True) -> None:
+        self._runtime_breakdown_enabled = bool(enabled)
+        if enabled:
+            self.reset_runtime_breakdown()
+
+    def reset_runtime_breakdown(self) -> None:
+        self._runtime_breakdown = {
+            "npu_gemm_time_sec": 0.0,
+            "host_attention_time_sec": 0.0,
+            "host_elementwise_time_sec": 0.0,
+            "transfer_time_sec": 0.0,
+            "launch_count": 0,
+            "bytes_written": 0,
+            "bytes_read": 0,
+        }
+
+    def runtime_breakdown_summary(self) -> dict[str, object]:
+        summary = dict(self._runtime_breakdown)
+        summary["query_block_size"] = int(self.query_block_size)
+        summary["query_block_count"] = int(self.query_block_count)
+        return summary
+
+    def _record_transfer_write(
+        self, *, started: float, tensor: torch.Tensor | None
+    ) -> None:
+        if not self._runtime_breakdown_enabled:
+            return
+        self._runtime_breakdown["transfer_time_sec"] = float(
+            self._runtime_breakdown.get("transfer_time_sec", 0.0)
+        ) + (time.perf_counter() - started)
+        self._runtime_breakdown["bytes_written"] = int(
+            self._runtime_breakdown.get("bytes_written", 0)
+        ) + _tensor_nbytes(tensor)
+
+    def _record_transfer_read(
+        self, *, started: float, tensor: torch.Tensor | None
+    ) -> None:
+        if not self._runtime_breakdown_enabled:
+            return
+        self._runtime_breakdown["transfer_time_sec"] = float(
+            self._runtime_breakdown.get("transfer_time_sec", 0.0)
+        ) + (time.perf_counter() - started)
+        self._runtime_breakdown["bytes_read"] = int(
+            self._runtime_breakdown.get("bytes_read", 0)
+        ) + _tensor_nbytes(tensor)
 
     def _buffer_name_for_weight(self, operator_name: str) -> str:
         return _WEIGHT_BUFFER_BY_OPERATOR[operator_name]
@@ -520,14 +574,31 @@ class AIETransformerOffload(AIEOperatorBase):
     ) -> torch.Tensor:
         config = self.operator_config[operator_name]
         output_shape = (int(config["M"]), int(config["N"]))
-        self.write_buffer("gemm_a", a_tensor.contiguous())
+        contiguous_a = a_tensor.contiguous()
+        started = time.perf_counter()
+        self.write_buffer("gemm_a", contiguous_a)
+        self._record_transfer_write(started=started, tensor=contiguous_a)
         if b_tensor is None:
             b_buffer = self._buffer_name_for_weight(operator_name)
         else:
-            self.write_buffer("gemm_b_dynamic", b_tensor.contiguous())
+            contiguous_b = b_tensor.contiguous()
+            started = time.perf_counter()
+            self.write_buffer("gemm_b_dynamic", contiguous_b)
+            self._record_transfer_write(started=started, tensor=contiguous_b)
             b_buffer = "gemm_b_dynamic"
+        started = time.perf_counter()
         self.run_kernel_once(operator_name, "gemm_a", b_buffer, "gemm_c")
-        return self.read_buffer_as_torch("gemm_c", output_shape, dtype=bfloat16)
+        if self._runtime_breakdown_enabled:
+            self._runtime_breakdown["npu_gemm_time_sec"] = float(
+                self._runtime_breakdown.get("npu_gemm_time_sec", 0.0)
+            ) + (time.perf_counter() - started)
+            self._runtime_breakdown["launch_count"] = int(
+                self._runtime_breakdown.get("launch_count", 0)
+            ) + 1
+        started = time.perf_counter()
+        output = self.read_buffer_as_torch("gemm_c", output_shape, dtype=bfloat16)
+        self._record_transfer_read(started=started, tensor=output)
+        return output
 
     def _blocked_attention(
         self,
@@ -553,15 +624,25 @@ class AIETransformerOffload(AIEOperatorBase):
                 )
                 scores = scores.float() * scale
                 if causal:
+                    host_started = time.perf_counter()
                     query_positions = torch.arange(q_start, q_end, device=scores.device)
                     key_positions = torch.arange(self.seq_len, device=scores.device)
                     causal_mask = key_positions.unsqueeze(
                         0
                     ) > query_positions.unsqueeze(1)
                     scores = scores.masked_fill(causal_mask, float("-inf"))
+                    if self._runtime_breakdown_enabled:
+                        self._runtime_breakdown["host_attention_time_sec"] = float(
+                            self._runtime_breakdown.get("host_attention_time_sec", 0.0)
+                        ) + (time.perf_counter() - host_started)
+                host_started = time.perf_counter()
                 attn_probs = torch.nn.functional.softmax(scores, dim=-1).to(
                     torch.bfloat16
                 )
+                if self._runtime_breakdown_enabled:
+                    self._runtime_breakdown["host_attention_time_sec"] = float(
+                        self._runtime_breakdown.get("host_attention_time_sec", 0.0)
+                    ) + (time.perf_counter() - host_started)
                 attn_output[head_index, q_start:q_end, :] = self._run_gemm(
                     "attn_output",
                     attn_probs,
@@ -589,6 +670,7 @@ class AIETransformerOffload(AIEOperatorBase):
             attn_heads.transpose(0, 1).contiguous().view(self.seq_len, self.hidden_size)
         )
         projected = self._run_gemm("output_proj", attn_output)
+        host_started = time.perf_counter()
         residual_hidden_states = projected + input_tensor
         hidden_states = torch.nn.functional.layer_norm(
             residual_hidden_states,
@@ -596,23 +678,43 @@ class AIETransformerOffload(AIEOperatorBase):
             self.ln1_weight,
             self._zero_bias(self.ln1_weight),
         ).to(torch.bfloat16)
+        if self._runtime_breakdown_enabled:
+            self._runtime_breakdown["host_elementwise_time_sec"] = float(
+                self._runtime_breakdown.get("host_elementwise_time_sec", 0.0)
+            ) + (time.perf_counter() - host_started)
         intermediate = self._run_gemm("up_proj", hidden_states)
+        host_started = time.perf_counter()
         intermediate = torch.nn.functional.gelu(intermediate).to(torch.bfloat16)
+        if self._runtime_breakdown_enabled:
+            self._runtime_breakdown["host_elementwise_time_sec"] = float(
+                self._runtime_breakdown.get("host_elementwise_time_sec", 0.0)
+            ) + (time.perf_counter() - host_started)
         ffn_output = self._run_gemm("down_proj", intermediate)
-        return torch.nn.functional.layer_norm(
+        host_started = time.perf_counter()
+        output = torch.nn.functional.layer_norm(
             ffn_output + hidden_states,
             (self.hidden_size,),
             self.ln2_weight,
             self._zero_bias(self.ln2_weight),
         ).to(torch.bfloat16)
+        if self._runtime_breakdown_enabled:
+            self._runtime_breakdown["host_elementwise_time_sec"] = float(
+                self._runtime_breakdown.get("host_elementwise_time_sec", 0.0)
+            ) + (time.perf_counter() - host_started)
+        return output
 
     def _run_decoder(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        host_started = time.perf_counter()
         attn_input = torch.nn.functional.layer_norm(
             input_tensor,
             (self.hidden_size,),
             self.ln1_weight,
             self._zero_bias(self.ln1_weight),
         ).to(torch.bfloat16)
+        if self._runtime_breakdown_enabled:
+            self._runtime_breakdown["host_elementwise_time_sec"] = float(
+                self._runtime_breakdown.get("host_elementwise_time_sec", 0.0)
+            ) + (time.perf_counter() - host_started)
         q = self._run_gemm("q_proj", attn_input)
         k = self._run_gemm("k_proj", attn_input)
         v = self._run_gemm("v_proj", attn_input)
@@ -632,16 +734,32 @@ class AIETransformerOffload(AIEOperatorBase):
         )
         projected = self._run_gemm("output_proj", attn_output)
         residual_hidden_states = projected + input_tensor
+        host_started = time.perf_counter()
         ffn_input = torch.nn.functional.layer_norm(
             residual_hidden_states,
             (self.hidden_size,),
             self.ln2_weight,
             self._zero_bias(self.ln2_weight),
         ).to(torch.bfloat16)
+        if self._runtime_breakdown_enabled:
+            self._runtime_breakdown["host_elementwise_time_sec"] = float(
+                self._runtime_breakdown.get("host_elementwise_time_sec", 0.0)
+            ) + (time.perf_counter() - host_started)
         intermediate = self._run_gemm("up_proj", ffn_input)
+        host_started = time.perf_counter()
         intermediate = torch.nn.functional.gelu(intermediate).to(torch.bfloat16)
+        if self._runtime_breakdown_enabled:
+            self._runtime_breakdown["host_elementwise_time_sec"] = float(
+                self._runtime_breakdown.get("host_elementwise_time_sec", 0.0)
+            ) + (time.perf_counter() - host_started)
         ffn_output = self._run_gemm("down_proj", intermediate)
-        return (ffn_output + residual_hidden_states).to(torch.bfloat16)
+        host_started = time.perf_counter()
+        output = (ffn_output + residual_hidden_states).to(torch.bfloat16)
+        if self._runtime_breakdown_enabled:
+            self._runtime_breakdown["host_elementwise_time_sec"] = float(
+                self._runtime_breakdown.get("host_elementwise_time_sec", 0.0)
+            ) + (time.perf_counter() - host_started)
+        return output
 
     def _run_transformer_layer(self, input_tensor: torch.Tensor) -> torch.Tensor:
         if self.workload_variant == "decoder_gpt2":
@@ -650,14 +768,22 @@ class AIETransformerOffload(AIEOperatorBase):
 
     def run_runlist(self):
         started = time.perf_counter()
+        transfer_started = time.perf_counter()
         input_tensor = self.read_buffer_as_torch(
             "input",
             (self.seq_len, self.hidden_size),
             dtype=bfloat16,
         )
+        self._record_transfer_read(started=transfer_started, tensor=input_tensor)
         output_tensor = self._run_transformer_layer(input_tensor)
-        self.write_buffer("output", output_tensor.contiguous())
-        return time.perf_counter() - started
+        output_tensor = output_tensor.contiguous()
+        transfer_started = time.perf_counter()
+        self.write_buffer("output", output_tensor)
+        self._record_transfer_write(started=transfer_started, tensor=output_tensor)
+        elapsed_sec = time.perf_counter() - started
+        if self._runtime_breakdown_enabled:
+            self._runtime_breakdown["total_wall_time_sec"] = elapsed_sec
+        return elapsed_sec
 
     def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
         return self._run_transformer_layer(input_tensor)

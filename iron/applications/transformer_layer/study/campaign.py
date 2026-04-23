@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import platform
 import statistics
 import subprocess
@@ -184,6 +185,31 @@ def _command_output(command: list[str]) -> str | None:
         return None
 
 
+def _tool_version(tool_name: str) -> str | None:
+    return _command_output(
+        [
+            "bash",
+            "-lc",
+            (
+                f"command -v {tool_name} >/dev/null 2>&1 || exit 0; "
+                f"{tool_name} --version 2>/dev/null | head -n 1"
+            ),
+        ]
+    )
+
+
+def _system_snapshot() -> dict[str, object]:
+    return {
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "python_implementation": platform.python_implementation(),
+        "python_compiler": platform.python_compiler(),
+        "cpu_count": os.cpu_count(),
+        "release": platform.release(),
+        "uname": _command_output(["uname", "-a"]),
+    }
+
+
 def collect_campaign_manifest(
     *,
     campaign_id: str,
@@ -204,6 +230,11 @@ def collect_campaign_manifest(
             tool_name: _command_output(["bash", "-lc", f"command -v {tool_name}"])
             for tool_name in ("python3", "turbostat", "rocm-smi", "xrt-smi")
         },
+        "tool_versions": {
+            tool_name: _tool_version(tool_name)
+            for tool_name in ("python3", "turbostat", "rocm-smi", "xrt-smi")
+        },
+        "system_snapshot": _system_snapshot(),
         "output_files": [str(path) for path in output_files],
     }
     if extra:
