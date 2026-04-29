@@ -522,6 +522,72 @@ def test_dynamic_gemm_runtime_smoke_multi_block_static_weight(M, N, aie_context)
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
+    "N,use_static_weight",
+    [
+        (64, False),
+        (64, True),
+        (768, False),
+        (768, True),
+    ],
+    ids=[
+        "offload_n64_dynamic_b",
+        "offload_n64_static_weight",
+        "offload_n768_dynamic_b",
+        "offload_n768_static_weight",
+    ],
+)
+def test_dynamic_gemm_runtime_smoke_offload_tail_regressions(
+    N, use_static_weight, aie_context
+):
+    M = 512
+    K = 768
+    golden_ref = generate_golden_reference(M=M, K=K, N=N)
+
+    operator = AIEDynamicGEMM(
+        M=M,
+        K=K,
+        N=N,
+        tile_m=64,
+        tile_k=64,
+        tile_n=64,
+        num_aie_columns=8,
+        use_static_weight=use_static_weight,
+        context=aie_context,
+        prio_accuracy=False,
+        emulate_bf16_mmul_with_bfp16=True,
+    )
+    if use_static_weight:
+        operator.weight = golden_ref["input_b"]
+
+    input_buffers = {"A": golden_ref["input"].flatten()}
+    if not use_static_weight:
+        input_buffers["B"] = golden_ref["input_b"].flatten()
+
+    errors, latency_us, bandwidth_gbps = run_test(
+        operator,
+        input_buffers,
+        {"C": golden_ref["output"].flatten()},
+        rel_tol=0.1,
+        abs_tol=0.5,
+        warmup_iters=1,
+        timed_iters=1,
+    )
+
+    print(f"\nLatency (us): {latency_us:.1f}")
+    print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s")
+
+    max_acceptable_errors = int(M * N * 0.05)
+    if errors:
+        assert (
+            len(errors["C"]) <= max_acceptable_errors
+        ), f"Test failed with {len(errors['C'])} errors (max allowable: {max_acceptable_errors})"
+
+
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
+)
+@pytest.mark.parametrize(
     "M,N",
     [
         (256, 1152),

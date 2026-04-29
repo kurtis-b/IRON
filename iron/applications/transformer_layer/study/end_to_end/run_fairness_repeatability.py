@@ -8,6 +8,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 from pathlib import Path
 
 from ..run_lock import default_lock_path, hold_study_lock
@@ -33,6 +34,11 @@ RESULTS_CSV_FIELDNAMES = (
     "iteration_schedule_json",
     "observed_power_backends_json",
     "observed_selected_row_count",
+    "latency_variation_row_count",
+    "latency_variation_sample_count_min",
+    "latency_variation_sample_count_max",
+    "latency_variation_mean_cv_pct",
+    "latency_variation_max_cv_pct",
     "validation_policy",
     "latency_variation_policy",
     "selected_candidate_source",
@@ -46,6 +52,73 @@ def default_output_path() -> Path:
         / "end_to_end"
         / "fairness_repeatability.csv"
     )
+
+
+def default_latency_variation_path() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "results"
+        / "end_to_end"
+        / "latency_variation.csv"
+    )
+
+
+def _load_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _optional_float(value: object) -> float | None:
+    if value in (None, "", "None"):
+        return None
+    return float(str(value))
+
+
+def _optional_int(value: object) -> int | None:
+    if value in (None, "", "None"):
+        return None
+    return int(float(str(value)))
+
+
+def _latency_variation_summary(
+    rows: list[dict[str, str]],
+    *,
+    workload_variant: str,
+    execution_mode: str,
+) -> dict[str, object]:
+    matching_rows = [
+        row
+        for row in rows
+        if str(row.get("execution_mode") or "") == execution_mode
+        and str(row.get("workload_variant") or "") == workload_variant
+        and str(row.get("run_status") or "") == "passed"
+    ]
+    sample_counts: list[int] = []
+    cv_values: list[float] = []
+    for row in matching_rows:
+        sample_count = _optional_int(row.get("sample_count"))
+        mean_latency_ms = _optional_float(row.get("mean_latency_ms"))
+        stddev_latency_ms = _optional_float(row.get("stddev_latency_ms"))
+        if sample_count is not None:
+            sample_counts.append(sample_count)
+        if mean_latency_ms and stddev_latency_ms is not None and mean_latency_ms > 0.0:
+            cv_values.append((stddev_latency_ms / mean_latency_ms) * 100.0)
+
+    return {
+        "latency_variation_row_count": len(matching_rows),
+        "latency_variation_sample_count_min": (
+            min(sample_counts) if sample_counts else ""
+        ),
+        "latency_variation_sample_count_max": (
+            max(sample_counts) if sample_counts else ""
+        ),
+        "latency_variation_mean_cv_pct": (
+            math.fsum(cv_values) / float(len(cv_values)) if cv_values else ""
+        ),
+        "latency_variation_max_cv_pct": max(cv_values) if cv_values else "",
+    }
 
 
 def _candidate_payload_path(execution_mode: str) -> Path:
@@ -105,8 +178,16 @@ def _iteration_schedule_summary() -> dict[str, dict[str, int]]:
     }
 
 
-def build_rows(results_input: Path) -> list[dict[str, object]]:
+def build_rows(
+    results_input: Path,
+    latency_variation_input: Path | None = None,
+) -> list[dict[str, object]]:
     observed_rows = load_result_rows(results_input) if results_input.exists() else []
+    latency_variation_rows = _load_csv_rows(
+        default_latency_variation_path()
+        if latency_variation_input is None
+        else latency_variation_input
+    )
     rows: list[dict[str, object]] = []
     for workload_variant in WORKLOAD_VARIANTS:
         for execution_mode in EXECUTION_MODES:
@@ -132,6 +213,11 @@ def build_rows(results_input: Path) -> list[dict[str, object]]:
                     if str(row.get("power_backend") or "")
                 }
             )
+            latency_summary = _latency_variation_summary(
+                latency_variation_rows,
+                workload_variant=workload_variant,
+                execution_mode=execution_mode,
+            )
             rows.append(
                 {
                     "study_id": "end_to_end_fairness_repeatability",
@@ -147,14 +233,16 @@ def build_rows(results_input: Path) -> list[dict[str, object]]:
                     ),
                     "observed_power_backends_json": json.dumps(power_backends),
                     "observed_selected_row_count": len(mode_rows),
+                    **latency_summary,
                     "validation_policy": (
                         "Main end-to-end runner uses exact reference validation through "
                         "seq_len=512 and finite-output validation above that threshold; "
-                        "paper correctness spot checks rerun exact validation at 512 and 2048."
+                        "paper correctness spot checks rerun validation at 512, 2048, and 8192."
                     ),
                     "latency_variation_policy": (
                         "Latency-variation runs reuse the selected end-to-end warmup and "
-                        "timed-iteration schedule unless explicitly overridden."
+                        "timed-iteration schedule unless explicitly overridden; this summary "
+                        "reports observed coefficient-of-variation statistics when those rows exist."
                     ),
                     "selected_candidate_source": (
                         "selected end-to-end results input CSV "
@@ -185,6 +273,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=default_results_path(),
     )
+    parser.add_argument(
+        "--latency-variation-input",
+        type=Path,
+        default=default_latency_variation_path(),
+    )
     parser.add_argument("--output", type=Path, default=default_output_path())
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
@@ -200,7 +293,10 @@ def main(argv: list[str] | None = None) -> int:
         default_lock_path(output_path),
         study_name="end-to-end fairness repeatability",
     ):
-        rows = build_rows(args.results_input.expanduser())
+        rows = build_rows(
+            args.results_input.expanduser(),
+            args.latency_variation_input.expanduser(),
+        )
         write_rows(output_path, rows)
         LOGGER.info("Wrote %d fairness rows to %s", len(rows), output_path)
     return 0

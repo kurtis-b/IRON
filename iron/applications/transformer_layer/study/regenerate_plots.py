@@ -26,10 +26,16 @@ from .end_to_end.plot_tps_by_pattern import (
     render_plot as render_end_to_end_plot,
     variant_stem as end_to_end_variant_stem,
 )
+from .end_to_end.plot_selected_component_groups_vs_pattern import (
+    load_plot_rows as load_selected_component_rows,
+    render_plot as render_selected_component_plot,
+    variant_stem as selected_component_variant_stem,
+)
 from .host_comparison.run import write_plots as write_host_comparison_plots
 from .memory_tile_staging.plot_staging_depth import write_canonical_plots
 
 LOGGER = logging.getLogger(__name__)
+END_TO_END_LONG_SEQUENCE_MIN_SEQ_LEN_EXCLUSIVE = 1024
 
 
 def default_results_root() -> Path:
@@ -72,52 +78,125 @@ def regenerate_block_plots(results_root: Path) -> None:
             )
 
 
-def regenerate_end_to_end_summary_plots(results_root: Path) -> None:
+def regenerate_end_to_end_summary_plots(
+    results_root: Path,
+    *,
+    require_selected_components: bool = False,
+) -> None:
     results_csv = results_root / "end_to_end" / "results_all_power.csv"
     tuning_csv = results_root / "end_to_end" / "tuning_all_power.csv"
+    selected_components_csv = (
+        results_root / "end_to_end" / "selected_component_aggregates.csv"
+    )
     _require_file(results_csv)
     _require_file(tuning_csv)
     output_dir = results_csv.parent
 
     pattern_rows = load_end_to_end_rows(results_csv)
     for variant in ("standard", "slides"):
-        throughput_fig = render_end_to_end_plot(
-            pattern_rows,
-            metric="throughput",
-            variant=variant,
-        )
-        _write_figure(
-            throughput_fig,
-            output_dir=output_dir,
-            stem=end_to_end_variant_stem("throughput", variant),
-        )
-        for y_scale in ("log", "linear"):
-            latency_fig = render_end_to_end_plot(
+        for min_seq_len_exclusive in (
+            None,
+            END_TO_END_LONG_SEQUENCE_MIN_SEQ_LEN_EXCLUSIVE,
+        ):
+            throughput_fig = render_end_to_end_plot(
                 pattern_rows,
-                metric="latency",
+                metric="throughput",
                 variant=variant,
-                y_scale=y_scale,
+                min_seq_len_exclusive=min_seq_len_exclusive,
             )
             _write_figure(
-                latency_fig,
+                throughput_fig,
                 output_dir=output_dir,
-                stem=end_to_end_variant_stem("latency", variant, y_scale),
+                stem=end_to_end_variant_stem(
+                    "throughput",
+                    variant,
+                    min_seq_len_exclusive=min_seq_len_exclusive,
+                ),
             )
+        for y_scale in ("log", "linear"):
+            for min_seq_len_exclusive in (
+                None,
+                END_TO_END_LONG_SEQUENCE_MIN_SEQ_LEN_EXCLUSIVE,
+            ):
+                latency_fig = render_end_to_end_plot(
+                    pattern_rows,
+                    metric="latency",
+                    variant=variant,
+                    y_scale=y_scale,
+                    min_seq_len_exclusive=min_seq_len_exclusive,
+                )
+                _write_figure(
+                    latency_fig,
+                    output_dir=output_dir,
+                    stem=end_to_end_variant_stem(
+                        "latency",
+                        variant,
+                        y_scale,
+                        min_seq_len_exclusive=min_seq_len_exclusive,
+                    ),
+                )
 
     full_pattern_rows, selected_block_rows = load_dataflow_rows(results_csv, tuning_csv)
     for variant in ("standard", "slides"):
         for y_scale in ("log", "linear"):
-            fig = render_dataflow_plot(
-                full_pattern_rows,
-                selected_block_rows,
-                variant=variant,
-                y_scale=y_scale,
+            for min_seq_len_exclusive in (
+                None,
+                END_TO_END_LONG_SEQUENCE_MIN_SEQ_LEN_EXCLUSIVE,
+            ):
+                fig = render_dataflow_plot(
+                    full_pattern_rows,
+                    selected_block_rows,
+                    variant=variant,
+                    y_scale=y_scale,
+                    min_seq_len_exclusive=min_seq_len_exclusive,
+                )
+                _write_figure(
+                    fig,
+                    output_dir=output_dir,
+                    stem=dataflow_variant_stem(
+                        variant,
+                        y_scale,
+                        min_seq_len_exclusive=min_seq_len_exclusive,
+                    ),
+                )
+
+    if selected_components_csv.exists():
+        for execution_mode in ("hybrid", "runlist", "offload"):
+            pattern_rows, group_rows = load_selected_component_rows(
+                selected_components_csv,
+                execution_mode=execution_mode,
             )
-            _write_figure(
-                fig,
-                output_dir=output_dir,
-                stem=dataflow_variant_stem(variant, y_scale),
-            )
+            for variant in ("standard", "slides"):
+                for y_scale in ("log", "linear"):
+                    for min_seq_len_exclusive in (
+                        None,
+                        END_TO_END_LONG_SEQUENCE_MIN_SEQ_LEN_EXCLUSIVE,
+                    ):
+                        fig = render_selected_component_plot(
+                            pattern_rows,
+                            group_rows,
+                            execution_mode=execution_mode,
+                            variant=variant,
+                            y_scale=y_scale,
+                            min_seq_len_exclusive=min_seq_len_exclusive,
+                        )
+                        _write_figure(
+                            fig,
+                            output_dir=output_dir,
+                            stem=selected_component_variant_stem(
+                                execution_mode,
+                                variant,
+                                y_scale,
+                                min_seq_len_exclusive=min_seq_len_exclusive,
+                            ),
+                        )
+    else:
+        if require_selected_components:
+            _require_file(selected_components_csv)
+        LOGGER.info(
+            "Skipping selected-component aggregate plots because %s is missing",
+            selected_components_csv,
+        )
 
 
 def regenerate_memory_tile_staging_plots(results_root: Path) -> None:
@@ -142,9 +221,16 @@ def regenerate_host_comparison_plots(results_root: Path) -> None:
     LOGGER.info("Wrote host-comparison plots under %s", results_csv.parent)
 
 
-def regenerate_all_plots(results_root: Path) -> None:
+def regenerate_all_plots(
+    results_root: Path,
+    *,
+    require_selected_components: bool = False,
+) -> None:
     regenerate_block_plots(results_root)
-    regenerate_end_to_end_summary_plots(results_root)
+    regenerate_end_to_end_summary_plots(
+        results_root,
+        require_selected_components=require_selected_components,
+    )
     regenerate_memory_tile_staging_plots(results_root)
     regenerate_host_comparison_plots(results_root)
 
@@ -159,6 +245,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=default_results_root(),
         help="Root directory containing block/, end_to_end/, memory_tile_staging/, and host_comparison/ results",
     )
+    parser.add_argument(
+        "--require-selected-components",
+        action="store_true",
+        help="Fail if selected-component aggregate CSVs are missing.",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -168,7 +259,10 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO)
     )
-    regenerate_all_plots(args.results_root.expanduser())
+    regenerate_all_plots(
+        args.results_root.expanduser(),
+        require_selected_components=args.require_selected_components,
+    )
     return 0
 
 

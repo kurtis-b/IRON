@@ -45,6 +45,7 @@ from iron.operators.gelu.op import AIEGELU
 from iron.operators.gelu.reference import (
     generate_golden_reference as generate_gelu_reference,
 )
+from iron.operators.dynamic_gemm.op import AIEDynamicGEMM
 from iron.operators.gemm.op import AIEGEMM
 from iron.operators.gemm.reference import (
     generate_golden_reference as generate_gemm_reference,
@@ -846,6 +847,74 @@ def _benchmark_gemm(
         )
         validation = _threshold_validation_result(
             {"C": sum(len(value) for value in errors.values())},
+            max_acceptable_errors=_max_acceptable_errors(
+                total_output_size,
+                error_threshold=GEMM_ERROR_THRESHOLD,
+            ),
+        )
+        return {
+            "avg_latency_ms": latency_us / 1000.0,
+            **_latency_stats_ms_from_timing_details(timing_details),
+            "bandwidth_gbps": bandwidth_gbps,
+            **validation,
+        }
+    finally:
+        context.reset_runtime()
+
+
+def _benchmark_dynamic_gemm(
+    gemm_kwargs: dict[str, object],
+    *,
+    warmup_runs: int,
+    runs_per_sample: int,
+    seed: int,
+    use_static_weight: bool = False,
+    scope_prefix: str = "isolated_dynamic_gemm",
+) -> dict[str, object]:
+    scope_payload = {
+        "gemm_kwargs": gemm_kwargs,
+        "use_static_weight": use_static_weight,
+    }
+    context = _new_benchmark_context(
+        _isolated_candidate_scope(scope_prefix, scope_payload)
+    )
+    try:
+        b_col_maj = bool(gemm_kwargs.get("b_col_maj", False))
+        c_col_maj = bool(gemm_kwargs.get("c_col_maj", False))
+        reference = generate_gemm_reference(
+            M=int(gemm_kwargs["M"]),
+            K=int(gemm_kwargs["K"]),
+            N=int(gemm_kwargs["N"]),
+            seed=seed,
+            b_col_maj=b_col_maj,
+            c_col_maj=c_col_maj,
+        )
+        operator = AIEDynamicGEMM(
+            context=context,
+            use_static_weight=use_static_weight,
+            **gemm_kwargs,
+        )
+
+        input_buffers = {"A": reference["input"].flatten()}
+        if use_static_weight:
+            operator.weight = reference["input_b"].contiguous()
+        else:
+            input_buffers["B"] = reference["input_b"].flatten()
+        output_buffers = {"C": reference["output"].flatten()}
+        total_output_size = int(gemm_kwargs["M"]) * int(gemm_kwargs["N"])
+
+        errors, latency_us, bandwidth_gbps, timing_details = run_test(
+            operator,
+            input_buffers,
+            output_buffers,
+            rel_tol=GEMM_REL_TOL,
+            abs_tol=GEMM_ABS_TOL,
+            warmup_iters=warmup_runs,
+            timed_iters=runs_per_sample,
+            return_timing_details=True,
+        )
+        validation = _threshold_validation_result(
+            {"C": len(errors.get("C", []))},
             max_acceptable_errors=_max_acceptable_errors(
                 total_output_size,
                 error_threshold=GEMM_ERROR_THRESHOLD,
@@ -1972,13 +2041,13 @@ def _benchmark_gemm_from_offload(
             "num_heads",
         }
     }
-    return _benchmark_gemm(
+    return _benchmark_dynamic_gemm(
         kwargs,
         warmup_runs=warmup_runs,
         runs_per_sample=runs_per_sample,
         seed=seed,
         use_static_weight=bool(resolved_kwargs.get("use_static_weight", False)),
-        scope_prefix=f"offload_{operator_name}",
+        scope_prefix=f"dynamic_offload_{operator_name}",
     )
 
 

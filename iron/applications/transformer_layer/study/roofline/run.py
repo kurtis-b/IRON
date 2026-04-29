@@ -34,6 +34,11 @@ from iron.applications.transformer_layer.study.end_to_end.select import (
     load_result_rows,
     select_result_rows,
 )
+from iron.applications.transformer_layer.study.plot_families import (
+    PLOT_FAMILY_GRID_SHAPE,
+    ordered_plot_families,
+    plot_family_label,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -49,7 +54,7 @@ NPU_SHIM_TILES = 8
 MODE_LABELS = {
     "hybrid": "Hybrid",
     "runlist": "Runlist",
-    "offload": "GEMM Offload",
+    "offload": "Offload",
 }
 MODE_COLORS = {
     "hybrid": "#1f6f8b",
@@ -60,11 +65,6 @@ MODE_MARKERS = {
     "hybrid": "o",
     "runlist": "s",
     "offload": "^",
-}
-FAMILY_LABELS = {
-    "tinybert_512": "TinyBERT",
-    "baseline_768": "BERT-Base",
-    "baseline_1024": "BERT-Large",
 }
 HYBRID_OPERATOR_SHORT_LABELS = {
     "qkv_proj": "QKV",
@@ -238,8 +238,10 @@ def _normalized_execution_mode(value: object) -> str | None:
         return None
 
 
-def _family_label(study_case_id: str) -> str:
-    return FAMILY_LABELS.get(study_case_id, study_case_id)
+def _csv_family_label(study_case_id: str) -> str:
+    if study_case_id in FAMILY_SPECS:
+        return FAMILY_SPECS[study_case_id].display_label
+    return study_case_id
 
 
 def _operator_short_label(execution_mode: str, logical_operator: str) -> str:
@@ -924,7 +926,7 @@ def _kernel_point_row(
 
     return {
         "study_case_id": study_case_id,
-        "family_label": _family_label(study_case_id),
+        "family_label": _csv_family_label(study_case_id),
         "workload_variant": workload_variant,
         "execution_mode": execution_mode,
         "logical_operator": logical_operator,
@@ -1129,7 +1131,7 @@ def _implementation_point_row(
 
     return {
         "study_case_id": selected_row.study_case_id,
-        "family_label": _family_label(selected_row.study_case_id),
+        "family_label": _csv_family_label(selected_row.study_case_id),
         "workload_variant": selected_row.workload_variant,
         "execution_mode": selected_row.execution_mode,
         "seq_len": selected_row.seq_len,
@@ -1425,14 +1427,20 @@ def render_roofline_plot(
     plt.rcParams["svg.fonttype"] = "none"
 
     fig, axes_obj = plt.subplots(
-        1,
-        max(1, len(families)),
-        figsize=(8 * max(1, len(families)) + 3, 6.8),
+        *PLOT_FAMILY_GRID_SHAPE,
+        figsize=(19, 10),
         sharey=True,
     )
-    axes = [axes_obj] if len(families) == 1 else list(axes_obj)
+    axes_grid = axes_obj
+    present_families = set(families)
 
-    for ax, family_id in zip(axes, families, strict=True):
+    for family in ordered_plot_families():
+        ax = axes_grid[family.row_index][family.col_index]
+        family_id = family.family_id
+        if family_id not in present_families:
+            ax.set_axis_off()
+            continue
+
         family_points = [
             row for row in points if str(row.get("study_case_id")) == family_id
         ]
@@ -1486,7 +1494,7 @@ def render_roofline_plot(
 
         ax.set_xscale("log")
         ax.set_yscale("log")
-        ax.set_title(_family_label(family_id), fontsize=15, pad=14)
+        ax.set_title(plot_family_label(family_id), fontsize=15, pad=14)
         ax.set_xlabel("Operational Intensity (FLOP/byte)", fontsize=11)
         ax.set_xlim(left=x_lower, right=x_upper)
         ax.grid(True, which="major", alpha=0.55)
@@ -1500,8 +1508,10 @@ def render_roofline_plot(
             color="#4a433b",
             va="bottom",
         )
+        if family.col_index != 0:
+            ax.set_ylabel("")
 
-    axes[0].set_ylabel("Effective GFLOPS", fontsize=11)
+    axes_grid[0][0].set_ylabel("Effective GFLOPS", fontsize=11)
 
     legend_handles = [
         Line2D([0], [0], color="#3d405b", linewidth=2.4, label="Roofline"),
@@ -1526,10 +1536,10 @@ def render_roofline_plot(
     fig.legend(
         handles=legend_handles,
         loc="center left",
-        bbox_to_anchor=(0.985, 0.5),
+        bbox_to_anchor=(0.9, 0.5),
         frameon=False,
     )
-    fig.subplots_adjust(left=0.08, right=0.86, top=0.84, bottom=0.16, wspace=0.22)
+    fig.subplots_adjust(left=0.08, right=0.84, top=0.9, bottom=0.1, wspace=0.22)
     return fig
 
 

@@ -492,11 +492,11 @@ def test_main_writes_csv_and_canonical_plots(monkeypatch, tmp_path):
     assert svg_path.exists()
     assert speedup_path.exists()
     assert (
-        "Hybrid Block MHA + Output Projection Latency by Memory-Tile Staging Depth"
+        "Dataflow Block MHA + Output Projection Latency by Memory-Tile Staging Depth"
         in svg_path.read_text(encoding="utf-8")
     )
     assert (
-        "Hybrid Block FFN Speedup by Memory-Tile Staging Depth"
+        "Dataflow Block FFN Speedup by Memory-Tile Staging Depth"
         in speedup_path.read_text(encoding="utf-8")
     )
 

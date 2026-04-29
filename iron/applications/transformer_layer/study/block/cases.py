@@ -37,7 +37,17 @@ BLOCK_KINDS: tuple[BlockKind, ...] = (
     "elementwise_add",
     "ffn",
 )
-FAMILY_IDS: tuple[str, ...] = ("tinybert_512", "baseline_768", "baseline_1024")
+ENCODER_FAMILY_IDS: tuple[str, ...] = (
+    "tinybert_512",
+    "baseline_768",
+    "baseline_1024",
+)
+DECODER_FAMILY_IDS: tuple[str, ...] = (
+    "gpt2_512",
+    "gpt2_small_768",
+    "gpt2_medium_1024",
+)
+FAMILY_IDS: tuple[str, ...] = (*ENCODER_FAMILY_IDS, *DECODER_FAMILY_IDS)
 SEQUENCE_LADDER: tuple[int, ...] = (
     64,
     128,
@@ -640,7 +650,22 @@ def _decoder_only_block_candidates(
     family_id: str,
     seq_len: int,
 ) -> dict[str, tuple[tuple[object, ...], ...]]:
-    if family_id == "baseline_768":
+    if family_id == "gpt2_512":
+        causal_mha = (
+            ((1, 32, 32, 64, 4, 8),)
+            if seq_len == 64
+            else (
+                ((4, 32, 32, 64, 1, 8),) if seq_len == 128 else ((8, 32, 32, 64, 1, 8),)
+            )
+        )
+        return {
+            "mha_out_proj_causal": causal_mha,
+            "layer_norm": ((8, 2),),
+            "elementwise_add": ((8, 2),),
+            "causal_mask": ((8, 2),) if seq_len <= 4096 else tuple(),
+        }
+
+    if family_id == "gpt2_small_768":
         causal_mha = (
             ((1, 32, 32, 96, 6, 8),)
             if seq_len == 64
@@ -655,7 +680,7 @@ def _decoder_only_block_candidates(
             "causal_mask": ((8, 2),) if seq_len <= 4096 else tuple(),
         }
 
-    if family_id == "baseline_1024":
+    if family_id == "gpt2_medium_1024":
         causal_mha = (
             ((1, 32, 32, 128, 4, 8),)
             if seq_len == 64
@@ -680,12 +705,33 @@ def _decoder_only_block_candidates(
     }
 
 
-for _family_id in FAMILY_IDS:
-    for _seq_len in SEQUENCE_LADDER:
-        BLOCK_CASES[_family_id][_seq_len] = replace(
-            BLOCK_CASES[_family_id][_seq_len],
-            **_decoder_only_block_candidates(_family_id, _seq_len),
+def _decoder_family_case_table(
+    encoder_family_id: str,
+    decoder_family_id: str,
+) -> dict[int, BlockCase]:
+    return {
+        seq_len: replace(
+            BLOCK_CASES[encoder_family_id][seq_len],
+            family_id=decoder_family_id,
+            **_decoder_only_block_candidates(decoder_family_id, seq_len),
         )
+        for seq_len in SEQUENCE_LADDER
+    }
+
+
+BLOCK_CASES.update(
+    {
+        "gpt2_512": _decoder_family_case_table("tinybert_512", "gpt2_512"),
+        "gpt2_small_768": _decoder_family_case_table(
+            "baseline_768",
+            "gpt2_small_768",
+        ),
+        "gpt2_medium_1024": _decoder_family_case_table(
+            "baseline_1024",
+            "gpt2_medium_1024",
+        ),
+    }
+)
 
 
 def get_case(family_id: str, seq_len: int) -> BlockCase:

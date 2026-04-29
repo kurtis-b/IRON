@@ -36,9 +36,16 @@ REQUIRED_EXECUTION_OUTPUT_FILES = (
     ("block", "results.csv"),
     ("end_to_end", "results_all_power.csv"),
     ("end_to_end", "tuning_all_power.csv"),
+    ("end_to_end", "selected_component_timings.csv"),
+    ("end_to_end", "selected_component_aggregates.csv"),
     ("end_to_end", "correctness_spot_checks.csv"),
     ("end_to_end", "latency_variation.csv"),
     ("end_to_end", "latency_variation_by_pattern.svg"),
+    ("end_to_end", "staging_ablation.csv"),
+    ("end_to_end", "staging_ablation.svg"),
+    ("end_to_end", "hybrid_selected_groups_vs_pattern_latency.svg"),
+    ("end_to_end", "runlist_selected_groups_vs_pattern_latency.svg"),
+    ("end_to_end", "offload_selected_groups_vs_pattern_latency.svg"),
     ("end_to_end", "fairness_repeatability.csv"),
     ("host_comparison", "results.csv"),
     ("host_comparison", "fairness_repeatability.csv"),
@@ -50,13 +57,14 @@ REQUIRED_EXECUTION_OUTPUT_FILES = (
     ("roofline", "implementation_points.csv"),
     ("memcpy_bandwidth", "results.csv"),
     ("memory_tile_staging", "results.csv"),
+    ("results_manifest.json",),
 )
 
 
 def _copy_required_files(
     source_root: Path,
     target_root: Path,
-    required_files: tuple[tuple[str, str], ...],
+    required_files: tuple[tuple[str, ...], ...],
 ) -> None:
     for parts in required_files:
         source_path = source_root.joinpath(*parts)

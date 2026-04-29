@@ -147,7 +147,7 @@ def _result_row(
 ) -> dict[str, object]:
     workload_variant = (
         "decoder_gpt2"
-        if study_case_id in {"gpt2_small_768", "gpt2_medium_1024"}
+        if study_case_id in {"gpt2_512", "gpt2_small_768", "gpt2_medium_1024"}
         else "encoder_bert"
     )
     return {
@@ -716,5 +716,5 @@ def test_render_roofline_plot_and_main_write_outputs(tmp_path: Path) -> None:
     assert "Kernel Roofline" in kernel_text
     assert "Implementation Roofline" in implementation_text
     assert "Compute Tile" in kernel_text
-    assert "TinyBERT" in kernel_text
+    assert "B-S" in kernel_text
     assert "Hybrid" in implementation_text

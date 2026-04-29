@@ -27,6 +27,7 @@ FAMILY_IDS: tuple[str, ...] = (
     "tinybert_512",
     "baseline_768",
     "baseline_1024",
+    "gpt2_512",
     "gpt2_small_768",
     "gpt2_medium_1024",
 )
@@ -73,6 +74,13 @@ FAMILY_SPECS: dict[str, FamilySpec] = {
         intermediate_size=4096,
         num_attention_heads=16,
         display_label="BERT-Large",
+    ),
+    "gpt2_512": FamilySpec(
+        workload_variant="decoder_gpt2",
+        hidden_size=512,
+        intermediate_size=2048,
+        num_attention_heads=8,
+        display_label="GPT-2 512",
     ),
     "gpt2_small_768": FamilySpec(
         workload_variant="decoder_gpt2",
@@ -651,6 +659,8 @@ def _validate_candidates_payload(
 def load_candidate_payload(
     execution_mode: ExecutionMode,
     path: Path | None = None,
+    *,
+    augment: bool = True,
 ) -> dict[str, Any]:
     canonical_mode = canonical_execution_mode(str(execution_mode))
     candidate_path = default_candidates_path(canonical_mode) if path is None else path
@@ -660,9 +670,9 @@ def load_candidate_payload(
         source=candidate_path,
         execution_mode=canonical_mode,
     )
-    if canonical_mode == "hybrid":
+    if canonical_mode == "hybrid" and augment:
         _augment_hybrid_candidate_payload(payload)
-    elif canonical_mode == "runlist":
+    elif canonical_mode == "runlist" and augment:
         _augment_runlist_candidate_payload(payload)
     return payload
 

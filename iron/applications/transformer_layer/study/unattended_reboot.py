@@ -45,6 +45,11 @@ DEFAULT_RETRY_LIMIT = 2
 DEFAULT_TEMPERATURE_THRESHOLD_RATIO = 1.05
 DEFAULT_TEMPERATURE_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_TEMPERATURE_MAX_WAIT_SECONDS = 5.0
+SUITE_PROFILES: tuple[str, ...] = ("full", "paper")
+PAPER_HELPER_SEQUENCE_LENGTHS: tuple[int, ...] = (512, 2048, 8192)
+PAPER_STAGING_ABLATION_SEQUENCE_LENGTHS: tuple[int, ...] = (
+    STAGING_ABLATION_SEQUENCE_LENGTHS
+)
 NORMAL_TTM_PAGES_LIMIT_TOLERANCE = 1
 TTM_CONFIG_PATH = Path("/etc/modprobe.d/ttm.conf")
 TTM_PAGES_LIMIT_PATH = Path("/sys/module/ttm/parameters/pages_limit")
@@ -331,6 +336,26 @@ def _setup_ttm(gb: int | None) -> dict[str, Any]:
     return {"action": "set_ttm_gb", "value": int(gb)}
 
 
+def suite_sequence_sets(suite_profile: str) -> dict[str, list[int]]:
+    if suite_profile not in SUITE_PROFILES:
+        raise ValueError(f"Unsupported suite profile: {suite_profile}")
+    helper_seq_lens = (
+        SEQUENCE_LADDER if suite_profile == "full" else PAPER_HELPER_SEQUENCE_LENGTHS
+    )
+    return {
+        "block": list(SEQUENCE_LADDER),
+        "memory_tile_staging": list(STAGING_SEQUENCE_LENGTHS),
+        "end_to_end": list(SEQUENCE_LADDER),
+        "selected_components": list(helper_seq_lens),
+        "correctness": list(SPOT_CHECK_SEQ_LENS),
+        "latency_variation": list(helper_seq_lens),
+        "staging_ablation": list(PAPER_STAGING_ABLATION_SEQUENCE_LENGTHS),
+        "host_comparison": list(SEQUENCE_LADDER),
+        "resource_usage": list(SEQUENCE_LADDER),
+        "roofline": list(SEQUENCE_LADDER),
+    }
+
+
 def _output_paths(results_root: Path) -> dict[str, Path]:
     return {
         "block_results": results_root / "block" / "results.csv",
@@ -339,6 +364,12 @@ def _output_paths(results_root: Path) -> dict[str, Path]:
         / "results.csv",
         "end_to_end_results": results_root / "end_to_end" / "results_all_power.csv",
         "end_to_end_tuning": results_root / "end_to_end" / "tuning_all_power.csv",
+        "selected_component_timings": results_root
+        / "end_to_end"
+        / "selected_component_timings.csv",
+        "selected_component_aggregates": results_root
+        / "end_to_end"
+        / "selected_component_aggregates.csv",
         "correctness_results": results_root
         / "end_to_end"
         / "correctness_spot_checks.csv",
@@ -368,7 +399,33 @@ def _output_paths(results_root: Path) -> dict[str, Path]:
         "memcpy_results": results_root / "memcpy_bandwidth" / "results.csv",
         "resource_usage_dir": results_root / "resource_usage",
         "roofline_dir": results_root / "roofline",
+        "results_manifest": results_root / "results_manifest.json",
     }
+
+
+def _fresh_result_blockers(results_root: Path, state_path: Path) -> list[Path]:
+    blockers: list[Path] = []
+    for path in (state_path, results_root / "automation" / "state.json"):
+        if path.exists() and path not in blockers:
+            blockers.append(path)
+    for path in _output_paths(results_root).values():
+        if path.is_file() and path not in blockers:
+            blockers.append(path)
+    return blockers
+
+
+def _ensure_fresh_result_root(results_root: Path, state_path: Path) -> None:
+    blockers = _fresh_result_blockers(results_root, state_path)
+    if not blockers:
+        return
+    listed = "\n".join(f"  - {path}" for path in blockers[:10])
+    if len(blockers) > 10:
+        listed += f"\n  - ... {len(blockers) - 10} more"
+    raise RuntimeError(
+        "Refusing to start the paper suite in a result root with existing "
+        "state or result outputs. Clean the result root manually or choose a "
+        f"new --run-id/--results-root.\n{listed}"
+    )
 
 
 def _collect_temperature_inputs(node: Any) -> list[float]:
@@ -540,8 +597,16 @@ def build_job_plan(
     results_root: Path,
     host_comparison_16384_ttm_gb: int,
     plan_layout: str = "high_ttm_tail_v2",
+    suite_profile: str = "full",
+    candidate_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
+    if suite_profile not in SUITE_PROFILES:
+        raise ValueError(f"Unsupported suite profile: {suite_profile}")
     paths = _output_paths(results_root)
+    sequence_sets = suite_sequence_sets(suite_profile)
+    latency_variation_sequence_lengths = tuple(sequence_sets["latency_variation"])
+    selected_component_sequence_lengths = tuple(sequence_sets["selected_components"])
+    staging_ablation_sequence_lengths = tuple(sequence_sets["staging_ablation"])
     jobs: list[dict[str, Any]] = []
     normal_host_comparison_jobs: list[dict[str, Any]] = []
     high_ttm_host_comparison_jobs: list[dict[str, Any]] = []
@@ -605,34 +670,129 @@ def build_job_plan(
         )
         for seq_len in SEQUENCE_LADDER:
             for execution_mode in EXECUTION_MODES:
+                end_to_end_argv = [
+                    "--workload-variant",
+                    workload_variant,
+                    "--family",
+                    family_id,
+                    "--seq-len",
+                    str(seq_len),
+                    "--mode",
+                    execution_mode,
+                    "--power-backend",
+                    "turbostat_pkgwatt",
+                    "--output",
+                    str(paths["end_to_end_results"]),
+                    "--tuning-output",
+                    str(paths["end_to_end_tuning"]),
+                    "--resume-input",
+                    str(paths["end_to_end_results"]),
+                    "--resume-tuning-input",
+                    str(paths["end_to_end_tuning"]),
+                ]
+                if candidate_dir is not None:
+                    end_to_end_argv.extend(["--candidate-dir", str(candidate_dir)])
                 jobs.append(
                     _module_job(
                         job_id=f"end_to_end_{family_id}_{seq_len}_{execution_mode}",
                         description=f"end_to_end {family_id} seq={seq_len} mode={execution_mode}",
                         module=f"{STUDY_PACKAGE}.end_to_end.run",
-                        argv=[
-                            "--workload-variant",
-                            workload_variant,
-                            "--family",
-                            family_id,
-                            "--seq-len",
-                            str(seq_len),
-                            "--mode",
-                            execution_mode,
-                            "--power-backend",
-                            "turbostat_pkgwatt",
-                            "--output",
-                            str(paths["end_to_end_results"]),
-                            "--tuning-output",
-                            str(paths["end_to_end_tuning"]),
-                            "--resume-input",
-                            str(paths["end_to_end_results"]),
-                            "--resume-tuning-input",
-                            str(paths["end_to_end_tuning"]),
-                        ],
+                        argv=end_to_end_argv,
                         privileged_setup=[_setup_turbo(), _setup_ttm(None)],
                     )
                 )
+
+    if suite_profile == "paper":
+        for family_id in FAMILY_IDS:
+            for execution_mode in EXECUTION_MODES:
+                for seq_len in selected_component_sequence_lengths:
+                    jobs.append(
+                        _module_job(
+                            job_id=(
+                                "selected_component_detail_"
+                                f"{family_id}_{seq_len}_{execution_mode}"
+                            ),
+                            description=(
+                                "selected_component detail "
+                                f"{family_id} seq={seq_len} mode={execution_mode}"
+                            ),
+                            module=(
+                                f"{STUDY_PACKAGE}.end_to_end."
+                                "run_selected_component_aggregates"
+                            ),
+                            argv=[
+                                "--results",
+                                str(paths["end_to_end_results"]),
+                                "--tuning-results",
+                                str(paths["end_to_end_tuning"]),
+                                "--detailed-output",
+                                str(paths["selected_component_timings"]),
+                                "--aggregate-output",
+                                str(paths["selected_component_aggregates"]),
+                                "--npu-source",
+                                "auto",
+                                "--family",
+                                family_id,
+                                "--mode",
+                                execution_mode,
+                                "--seq-len",
+                                str(seq_len),
+                                "--resume-input",
+                                str(paths["selected_component_timings"]),
+                                "--detailed-only",
+                            ],
+                            privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+                        )
+                    )
+        jobs.append(
+            _module_job(
+                job_id="selected_component_aggregates_all",
+                description="selected_component aggregates all",
+                module=f"{STUDY_PACKAGE}.end_to_end.run_selected_component_aggregates",
+                argv=[
+                    "--results",
+                    str(paths["end_to_end_results"]),
+                    "--tuning-results",
+                    str(paths["end_to_end_tuning"]),
+                    "--detailed-output",
+                    str(paths["selected_component_timings"]),
+                    "--aggregate-output",
+                    str(paths["selected_component_aggregates"]),
+                    "--npu-source",
+                    "auto",
+                    "--seq-len",
+                    ",".join(
+                        str(seq_len) for seq_len in selected_component_sequence_lengths
+                    ),
+                    "--resume-input",
+                    str(paths["selected_component_timings"]),
+                    "--aggregate-only",
+                ],
+                privileged_setup=[_setup_ttm(None)],
+                max_attempts=1,
+            )
+        )
+    else:
+        jobs.append(
+            _module_job(
+                job_id="selected_component_aggregates_all",
+                description="selected_component aggregates all",
+                module=f"{STUDY_PACKAGE}.end_to_end.run_selected_component_aggregates",
+                argv=[
+                    "--results",
+                    str(paths["end_to_end_results"]),
+                    "--tuning-results",
+                    str(paths["end_to_end_tuning"]),
+                    "--detailed-output",
+                    str(paths["selected_component_timings"]),
+                    "--aggregate-output",
+                    str(paths["selected_component_aggregates"]),
+                    "--npu-source",
+                    "auto",
+                ],
+                privileged_setup=[_setup_turbo(), _setup_ttm(None)],
+            )
+        )
 
     for family_id in FAMILY_IDS:
         workload_variant = (
@@ -669,7 +829,7 @@ def build_job_plan(
         workload_variant = (
             "decoder_gpt2" if family_id.startswith("gpt2_") else "encoder_bert"
         )
-        for seq_len in SEQUENCE_LADDER:
+        for seq_len in latency_variation_sequence_lengths:
             for execution_mode in EXECUTION_MODES:
                 jobs.append(
                     _module_job(
@@ -702,7 +862,7 @@ def build_job_plan(
         workload_variant = (
             "decoder_gpt2" if family_id.startswith("gpt2_") else "encoder_bert"
         )
-        for seq_len in STAGING_ABLATION_SEQUENCE_LENGTHS:
+        for seq_len in staging_ablation_sequence_lengths:
             for block_kind in STAGING_BLOCK_KINDS:
                 jobs.append(
                     _module_job(
@@ -741,6 +901,8 @@ def build_job_plan(
             argv=[
                 "--results-input",
                 str(paths["end_to_end_results"]),
+                "--latency-variation-input",
+                str(paths["latency_variation_results"]),
                 "--output",
                 str(paths["end_to_end_fairness"]),
             ],
@@ -876,6 +1038,26 @@ def build_job_plan(
             argv=[
                 "--results-root",
                 str(results_root),
+                "--require-selected-components",
+            ],
+            privileged_setup=[_setup_ttm(None)],
+            max_attempts=1,
+        )
+    )
+    jobs.append(
+        _module_job(
+            job_id="results_manifest_all",
+            description="results manifest all",
+            module=f"{STUDY_PACKAGE}.results_manifest",
+            argv=[
+                "--results-root",
+                str(results_root),
+                "--output",
+                str(paths["results_manifest"]),
+                "--suite-profile",
+                suite_profile,
+                "--sequence-sets-json",
+                json.dumps(sequence_sets, sort_keys=True),
             ],
             privileged_setup=[_setup_ttm(None)],
             max_attempts=1,
@@ -988,6 +1170,27 @@ def build_execution_smoke_job_plan(
             )
         )
 
+    jobs.append(
+        _module_job(
+            job_id="execution_smoke_selected_component_aggregates",
+            description="execution smoke selected_component aggregates",
+            module=f"{STUDY_PACKAGE}.end_to_end.run_selected_component_aggregates",
+            argv=[
+                "--results",
+                str(paths["end_to_end_results"]),
+                "--tuning-results",
+                str(paths["end_to_end_tuning"]),
+                "--detailed-output",
+                str(paths["selected_component_timings"]),
+                "--aggregate-output",
+                str(paths["selected_component_aggregates"]),
+                "--npu-source",
+                "auto",
+            ],
+            privileged_setup=[],
+        )
+    )
+
     for execution_mode in EXECUTION_MODES:
         jobs.append(
             _module_job(
@@ -1042,6 +1245,36 @@ def build_execution_smoke_job_plan(
             )
         )
 
+    for block_kind in STAGING_BLOCK_KINDS:
+        jobs.append(
+            _module_job(
+                job_id=f"execution_smoke_staging_ablation_{block_kind}",
+                description=f"execution smoke staging_ablation block={block_kind}",
+                module=f"{STUDY_PACKAGE}.end_to_end.run_staging_ablation",
+                argv=[
+                    "--results-input",
+                    str(paths["end_to_end_results"]),
+                    "--staging-results",
+                    str(paths["memory_tile_staging_results"]),
+                    "--workload-variant",
+                    workload_variant,
+                    "--family",
+                    family_id,
+                    "--seq-len",
+                    str(seq_len),
+                    "--block",
+                    block_kind,
+                    "--output",
+                    str(paths["staging_ablation_results"]),
+                    "--plot-output",
+                    str(paths["staging_ablation_plot"]),
+                    "--resume-input",
+                    str(paths["staging_ablation_results"]),
+                ],
+                privileged_setup=[],
+            )
+        )
+
     jobs.extend(
         [
             _module_job(
@@ -1051,6 +1284,8 @@ def build_execution_smoke_job_plan(
                 argv=[
                     "--results-input",
                     str(paths["end_to_end_results"]),
+                    "--latency-variation-input",
+                    str(paths["latency_variation_results"]),
                     "--output",
                     str(paths["end_to_end_fairness"]),
                 ],
@@ -1137,6 +1372,20 @@ def build_execution_smoke_job_plan(
                 argv=[
                     "--results-root",
                     str(results_root),
+                    "--require-selected-components",
+                ],
+                privileged_setup=[],
+                max_attempts=1,
+            ),
+            _module_job(
+                job_id="execution_smoke_results_manifest",
+                description="execution smoke results manifest",
+                module=f"{STUDY_PACKAGE}.results_manifest",
+                argv=[
+                    "--results-root",
+                    str(results_root),
+                    "--output",
+                    str(paths["results_manifest"]),
                 ],
                 privileged_setup=[],
                 max_attempts=1,
@@ -1173,8 +1422,11 @@ def create_state(
     normal_ttm_pages_limit: int | None = None,
     plan_kind: str = "full",
     plan_layout: str = "high_ttm_tail_v2",
+    suite_profile: str = "full",
+    candidate_dir: Path | None = None,
     source_results_root: Path | None = None,
 ) -> dict[str, Any]:
+    sequence_sets = suite_sequence_sets(suite_profile)
     return {
         "version": STATE_VERSION,
         "run_id": run_id,
@@ -1185,6 +1437,9 @@ def create_state(
         ),
         "plan_kind": plan_kind,
         "plan_layout": plan_layout,
+        "suite_profile": suite_profile,
+        "suite_sequence_sets": sequence_sets,
+        "candidate_dir": "" if candidate_dir is None else str(candidate_dir),
         "run_user": run_user,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "status": "pending",
@@ -1207,6 +1462,8 @@ def create_state(
                 results_root=results_root,
                 host_comparison_16384_ttm_gb=host_comparison_16384_ttm_gb,
                 plan_layout=plan_layout,
+                suite_profile=suite_profile,
+                candidate_dir=candidate_dir,
             )
         ),
     }
@@ -1532,10 +1789,14 @@ def _expected_jobs_for_state(state: dict[str, Any]) -> list[dict[str, Any]]:
         )
     if not plan_layout:
         plan_layout = "legacy"
+    suite_profile = str(state.get("suite_profile") or "full")
+    candidate_dir_text = str(state.get("candidate_dir") or "").strip()
     return build_job_plan(
         results_root=results_root,
         host_comparison_16384_ttm_gb=host_comparison_16384_ttm_gb,
         plan_layout=plan_layout,
+        suite_profile=suite_profile,
+        candidate_dir=Path(candidate_dir_text) if candidate_dir_text else None,
     )
 
 
@@ -1550,8 +1811,16 @@ def _jobs_require_ttm_state(jobs: list[dict[str, Any]]) -> bool:
 def _migrate_state_for_current_runner(state: dict[str, Any]) -> bool:
     expected_jobs = _expected_jobs_for_state(state)
     changed = False
+    suite_profile = str(state.get("suite_profile") or "full")
+    expected_sequence_sets = suite_sequence_sets(suite_profile)
+    if state.get("suite_profile") != suite_profile:
+        state["suite_profile"] = suite_profile
+        changed = True
+    if state.get("suite_sequence_sets") != expected_sequence_sets:
+        state["suite_sequence_sets"] = expected_sequence_sets
+        changed = True
     if _jobs_require_ttm_state(expected_jobs):
-        changed = _ensure_normal_ttm_pages_limit(state)
+        changed = _ensure_normal_ttm_pages_limit(state) or changed
     expected_ids = [str(job["id"]) for job in expected_jobs]
     existing_jobs = list(state.get("jobs", []))
     existing_ids = [str(job.get("id", "")) for job in existing_jobs]
@@ -1865,6 +2134,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_HOST_COMPARISON_16384_TTM_GB,
     )
     start.add_argument(
+        "--suite-profile",
+        choices=SUITE_PROFILES,
+        default="full",
+        help="Unattended suite profile to run.",
+    )
+    start.add_argument(
+        "--candidate-dir",
+        type=Path,
+        default=None,
+        help="Optional fixed-winner end-to-end candidate directory.",
+    )
+    start.add_argument(
         "--reboot-command",
         default="sudo -n reboot",
         help="Command used to reboot after each job.",
@@ -1955,6 +2236,11 @@ def _start(args: argparse.Namespace) -> int:
         if args.state is not None
         else default_state_path(run_id)
     )
+    suite_profile = str(getattr(args, "suite_profile", "full") or "full")
+    candidate_dir = getattr(args, "candidate_dir", None)
+    candidate_dir = None if candidate_dir is None else candidate_dir.expanduser()
+    if suite_profile == "paper":
+        _ensure_fresh_result_root(results_root, state_path)
     reboot_command = shlex.split(str(args.reboot_command))
     if os.geteuid() == 0 and reboot_command == ["sudo", "-n", "reboot"]:
         reboot_command = ["reboot"]
@@ -1990,6 +2276,8 @@ def _start(args: argparse.Namespace) -> int:
         amd_ttm_path=amd_ttm_path,
         normal_ttm_pages_limit=normal_ttm_pages_limit,
         plan_kind="full",
+        suite_profile=suite_profile,
+        candidate_dir=candidate_dir,
     )
     write_state(state_path, state)
     _record_baseline_temperature(results_root, state)

@@ -92,15 +92,23 @@ def _pick_shared_offload_topology(
         if _supports_row_shape(candidate)
     )
 
+    def _shared_dimension_tile_candidates(
+        workload_values: tuple[int, ...],
+    ) -> list[int]:
+        normalized_values = tuple(int(value) for value in workload_values)
+        min_workload = min(normalized_values)
+        return [
+            candidate
+            for candidate in _OFFLOAD_TILE_KN_CANDIDATES
+            if candidate <= min_workload
+            and all(value % candidate == 0 for value in normalized_values)
+        ]
+
     valid_tile_k = [
-        candidate
-        for candidate in _OFFLOAD_TILE_KN_CANDIDATES
-        if all(value % candidate == 0 for value in k_values)
+        candidate for candidate in _shared_dimension_tile_candidates(k_values)
     ]
     valid_tile_n = [
-        candidate
-        for candidate in _OFFLOAD_TILE_KN_CANDIDATES
-        if all(value % candidate == 0 for value in n_values)
+        candidate for candidate in _shared_dimension_tile_candidates(n_values)
     ]
     if not valid_tile_k or not valid_tile_n:
         raise ValueError(
@@ -259,7 +267,25 @@ def resolve_offload_operator_config(
     resolved["attn_scores"]["M"] = query_block_size
     resolved["attn_output"]["M"] = query_block_size
 
+    shared_tile_tuples = {
+        (
+            int(config["tile_m"]),
+            int(config["tile_k"]),
+            int(config["tile_n"]),
+        )
+        for config in resolved.values()
+    }
+    if len(shared_tile_tuples) != 1:
+        raise ValueError(
+            "Offload GEMM operators require shared tile_m/tile_k/tile_n "
+            "across the pattern instance"
+        )
+    shared_tile_m, shared_tile_k, shared_tile_n = next(iter(shared_tile_tuples))
+
     for name, config in resolved.items():
+        config["tile_m"] = shared_tile_m
+        config["tile_k"] = shared_tile_k
+        config["tile_n"] = shared_tile_n
         config["num_aie_columns"] = int(
             _OFFLOAD_SHARED_GEMM_DEFAULTS["num_aie_columns"]
         )

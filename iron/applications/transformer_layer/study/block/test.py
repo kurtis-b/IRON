@@ -6,12 +6,20 @@ from __future__ import annotations
 
 import csv
 
+from matplotlib import pyplot as plt
+import pandas as pd
+
 from iron.applications.transformer_layer.study.block.cases import (
     BLOCK_CASES,
     BLOCK_KINDS,
+    DECODER_FAMILY_IDS,
+    ENCODER_FAMILY_IDS,
     FAMILY_IDS,
     SEQUENCE_LADDER,
     get_case,
+)
+from iron.applications.transformer_layer.study.block.plot_best_latency import (
+    plot_best_latency,
 )
 from iron.applications.transformer_layer.study.block.run import (
     CSV_FIELDNAMES,
@@ -26,6 +34,16 @@ from iron.applications.transformer_layer.study.block.run import (
 
 
 def test_block_case_table_covers_retained_surface():
+    assert ENCODER_FAMILY_IDS == (
+        "tinybert_512",
+        "baseline_768",
+        "baseline_1024",
+    )
+    assert DECODER_FAMILY_IDS == (
+        "gpt2_512",
+        "gpt2_small_768",
+        "gpt2_medium_1024",
+    )
     assert tuple(BLOCK_CASES) == FAMILY_IDS
 
     expected_candidate_sizes = {
@@ -60,11 +78,16 @@ def test_decoder_only_blocks_are_present_only_for_decoder_like_shapes():
     assert tinybert_case.candidates("elementwise_add") == ()
 
     bert_case = get_case("baseline_768", 256)
-    assert len(bert_case.candidates("mha_out_proj_causal")) == 1
-    assert len(bert_case.candidates("layer_norm")) == 1
-    assert len(bert_case.candidates("elementwise_add")) == 1
+    assert bert_case.candidates("mha_out_proj_causal") == ()
+    assert bert_case.candidates("layer_norm") == ()
+    assert bert_case.candidates("elementwise_add") == ()
 
-    long_seq_case = get_case("baseline_768", 8192)
+    decoder_case = get_case("gpt2_512", 256)
+    assert len(decoder_case.candidates("mha_out_proj_causal")) == 1
+    assert len(decoder_case.candidates("layer_norm")) == 1
+    assert len(decoder_case.candidates("elementwise_add")) == 1
+
+    long_seq_case = get_case("gpt2_512", 8192)
     assert len(long_seq_case.candidates("mha_out_proj_causal")) == 1
     assert len(long_seq_case.candidates("layer_norm")) == 1
     assert len(long_seq_case.candidates("elementwise_add")) == 1
@@ -77,7 +100,7 @@ def test_removed_cases_manifest_prunes_known_bad_tinybert_qkv_candidate():
 
 
 def test_operator_kwargs_expand_shared_workload_correctly():
-    case = get_case("baseline_768", 512)
+    case = get_case("gpt2_small_768", 512)
     workload = case.workload
 
     qkv_kwargs = operator_kwargs(workload, "qkv_proj", case.qkv_proj[0])
@@ -311,12 +334,79 @@ def test_main_checkpoints_after_each_case(monkeypatch, tmp_path):
     tinybert_rows = len(get_case("tinybert_512", 64).candidates("qkv_proj"))
     baseline_768_rows = len(get_case("baseline_768", 64).candidates("qkv_proj"))
     baseline_1024_rows = len(get_case("baseline_1024", 64).candidates("qkv_proj"))
-    assert checkpoint_row_counts == [
+    gpt2_512_rows = len(get_case("gpt2_512", 64).candidates("qkv_proj"))
+    gpt2_small_rows = len(get_case("gpt2_small_768", 64).candidates("qkv_proj"))
+    gpt2_medium_rows = len(get_case("gpt2_medium_1024", 64).candidates("qkv_proj"))
+    expected_counts = [
         tinybert_rows,
         tinybert_rows + baseline_768_rows,
         tinybert_rows + baseline_768_rows + baseline_1024_rows,
-        tinybert_rows + baseline_768_rows + baseline_1024_rows,
+        tinybert_rows + baseline_768_rows + baseline_1024_rows + gpt2_512_rows,
+        tinybert_rows
+        + baseline_768_rows
+        + baseline_1024_rows
+        + gpt2_512_rows
+        + gpt2_small_rows,
+        tinybert_rows
+        + baseline_768_rows
+        + baseline_1024_rows
+        + gpt2_512_rows
+        + gpt2_small_rows
+        + gpt2_medium_rows,
     ]
+    assert checkpoint_row_counts == [*expected_counts, expected_counts[-1]]
+
+
+def test_plot_best_latency_uses_shared_2x3_family_layout():
+    best = pd.DataFrame(
+        [
+            {
+                "family_id": "baseline_768",
+                "seq_len": 64,
+                "block_kind": "qkv_proj",
+                "avg_latency_ms": 1.0,
+                "block_label": "QKV Proj",
+            },
+            {
+                "family_id": "baseline_768",
+                "seq_len": 64,
+                "block_kind": "ffn",
+                "avg_latency_ms": 2.0,
+                "block_label": "FFN",
+            },
+            {
+                "family_id": "gpt2_512",
+                "seq_len": 64,
+                "block_kind": "mha_out_proj_causal",
+                "avg_latency_ms": 3.0,
+                "block_label": "MHAO",
+            },
+            {
+                "family_id": "gpt2_512",
+                "seq_len": 64,
+                "block_kind": "layer_norm",
+                "avg_latency_ms": 4.0,
+                "block_label": "Add + Norm",
+            },
+        ]
+    )
+
+    fig = plot_best_latency(
+        best,
+        "Latency Comparison of Encoder and Decoder Blocks",
+    )
+    try:
+        axes_count = len(fig.axes)
+        visible_axes = [ax for ax in fig.axes if ax.axison]
+        visible_titles = [ax.get_title(loc="left") for ax in visible_axes]
+        text_labels = [text.get_text() for text in fig.texts]
+    finally:
+        plt.close(fig)
+
+    assert axes_count == 6
+    assert visible_titles == ["B-M", "G-S"]
+    assert "Encoder" in text_labels
+    assert "Decoder" in text_labels
 
 
 def test_main_reuses_matching_passed_rows(monkeypatch, tmp_path):

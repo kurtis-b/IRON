@@ -14,6 +14,7 @@ from pathlib import Path
 from ..npu_runtime_checks import warn_if_npu_power_mode_not_turbo
 from ..run_lock import default_lock_path, hold_study_lock
 from .cases import (
+    CandidatePayloads,
     EXECUTION_MODES,
     FAMILY_IDS,
     FAMILY_SPECS,
@@ -22,6 +23,7 @@ from .cases import (
     EndToEndCase,
     candidate_table_for_case,
     iter_cases,
+    load_candidate_payload,
     mode_operators,
 )
 from .modes import (
@@ -41,7 +43,7 @@ def _pattern_label(execution_mode: str) -> str:
     if execution_mode == "runlist":
         return "Runlist"
     if execution_mode == "offload":
-        return "GEMM Offload"
+        return "Offload"
     return execution_mode
 
 
@@ -174,6 +176,17 @@ def default_resume_tuning_paths(output_path: Path) -> tuple[Path, ...]:
     if output_path.exists() and output_path not in paths:
         paths.append(output_path)
     return tuple(paths)
+
+
+def candidate_payloads_from_dir(candidate_dir: Path) -> CandidatePayloads:
+    return {
+        execution_mode: load_candidate_payload(
+            execution_mode,
+            candidate_dir / f"{execution_mode}_candidates.json",
+            augment=False,
+        )
+        for execution_mode in EXECUTION_MODES
+    }
 
 
 def _resume_execution_mode(value: object) -> str:
@@ -443,8 +456,18 @@ def tune_mode(
     existing_tuning_rows: (
         dict[tuple[str, str, str, str, int, str], dict[str, object]] | None
     ) = None,
+    candidate_payloads: CandidatePayloads | None = None,
+    benchmark_singleton_candidates: bool = False,
 ) -> tuple[list[dict[str, object]], dict[str, str], dict[str, dict[str, object]], str]:
-    candidates_by_mode = candidate_table_for_case(case.study_case_id, case.seq_len)
+    candidates_by_mode = (
+        candidate_table_for_case(case.study_case_id, case.seq_len)
+        if candidate_payloads is None
+        else candidate_table_for_case(
+            case.study_case_id,
+            case.seq_len,
+            payloads=candidate_payloads,
+        )
+    )
     tuning_rows: list[dict[str, object]] = []
     selected_candidate_ids: dict[str, str] = {}
     selected_config: dict[str, dict[str, object]] = {}
@@ -462,7 +485,7 @@ def tune_mode(
     for operator_index, operator_name in enumerate(operator_names, start=1):
         operator_rows: list[dict[str, object]] = []
         candidates = candidates_by_mode[execution_mode][operator_name]
-        if _skip_isolated_singleton_benchmark(
+        if not benchmark_singleton_candidates and _skip_isolated_singleton_benchmark(
             case,
             execution_mode=execution_mode,
             operator_name=operator_name,
@@ -686,6 +709,8 @@ def build_rows(
     existing_final_rows: (
         dict[tuple[str, str, str, int], dict[str, object]] | None
     ) = None,
+    candidate_payloads: CandidatePayloads | None = None,
+    benchmark_singleton_candidates: bool = False,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     selected_modes = EXECUTION_MODES if mode_filter == "all" else (mode_filter,)
     resolved_warmup_runs, resolved_runs_per_sample = iteration_schedule(case.seq_len)
@@ -712,6 +737,8 @@ def build_rows(
                 seed=seed,
                 validate_long_seq_runlist=False,
                 existing_tuning_rows=existing_tuning_rows,
+                candidate_payloads=candidate_payloads,
+                benchmark_singleton_candidates=benchmark_singleton_candidates,
             )
         )
         tuning_rows.extend(mode_tuning_rows)
@@ -887,6 +914,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume-input", type=Path, default=None)
     parser.add_argument("--resume-tuning-input", type=Path, default=None)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument(
+        "--candidate-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory containing fixed-winner *_candidates.json files. When set, "
+            "the runner benchmarks those selected operator candidates instead of "
+            "searching the default candidate matrix."
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -920,6 +957,11 @@ def main(argv: list[str] | None = None) -> int:
         else:
             resume_tuning_paths = default_resume_tuning_paths(tuning_output_path)
         cases = tuple(iter_cases(args.workload_variant, args.family, args.seq_len))
+        candidate_payloads = (
+            None
+            if args.candidate_dir is None
+            else candidate_payloads_from_dir(args.candidate_dir.expanduser())
+        )
 
         LOGGER.info(
             "Starting end-to-end study with %d case(s), mode=%s, power_backend=%s",
@@ -964,6 +1006,8 @@ def main(argv: list[str] | None = None) -> int:
                 power_backend=args.power_backend,
                 existing_tuning_rows=existing_tuning_rows,
                 existing_final_rows=existing_final_rows,
+                candidate_payloads=candidate_payloads,
+                benchmark_singleton_candidates=candidate_payloads is not None,
             )
             for row in case_tuning_rows:
                 tuning_row_map[

@@ -223,12 +223,16 @@ def _selection_targets(
     targets: list[tuple[str, StagingBlockKind, str]] = []
     if source_block_kind in STAGING_BLOCK_KINDS:
         targets.append((source_family_id, source_block_kind, source_block_kind))
-        if source_family_id == "baseline_768":
+        if source_family_id == "tinybert_512":
+            targets.append(("gpt2_512", source_block_kind, source_block_kind))
+        elif source_family_id == "baseline_768":
             targets.append(("gpt2_small_768", source_block_kind, source_block_kind))
         elif source_family_id == "baseline_1024":
             targets.append(("gpt2_medium_1024", source_block_kind, source_block_kind))
     elif source_block_kind == "mha_out_proj_causal":
-        if source_family_id == "baseline_768":
+        if source_family_id == "tinybert_512":
+            targets.append(("gpt2_512", "mha_out_proj", source_block_kind))
+        elif source_family_id == "baseline_768":
             targets.append(("gpt2_small_768", "mha_out_proj", source_block_kind))
         elif source_family_id == "baseline_1024":
             targets.append(("gpt2_medium_1024", "mha_out_proj", source_block_kind))

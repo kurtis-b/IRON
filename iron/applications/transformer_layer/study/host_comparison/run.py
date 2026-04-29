@@ -42,6 +42,12 @@ from iron.applications.transformer_layer.study.end_to_end.power import (
     power_probe_is_complete,
     summarize_power_samples,
 )
+from iron.applications.transformer_layer.study.plot_families import (
+    PLOT_FAMILY_GRID_SHAPE,
+    PLOT_FAMILY_ORDER,
+    ordered_plot_families,
+    plot_family_label,
+)
 
 from .select import (
     REFERENCE_EXECUTION_MODES,
@@ -102,22 +108,12 @@ POWER_COMPARISON_METRICS: tuple[str, ...] = (
 PLOT_SERIES_THROUGHPUT = (
     ("igpu", "iGPU", "#e07a5f"),
     ("hybrid", "NPU Hybrid", "#1f6f8b"),
-    ("runlist", "NPU Runlist", "#b85c38"),
-    ("offload", "NPU Offload", "#6c9a3b"),
 )
 PLOT_SERIES_PER_WATT = (
-    ("igpu_rocm_smi", "iGPU (ROCm-SMI)", "#e07a5f"),
+    ("igpu_rocm_smi", "iGPU", "#e07a5f"),
     ("hybrid", "NPU Hybrid", "#1f6f8b"),
-    ("runlist", "NPU Runlist", "#b85c38"),
-    ("offload", "NPU Offload", "#6c9a3b"),
 )
-PLOT_FAMILY_ORDER = ("tinybert_512", "baseline_768", "baseline_1024")
 PLOT_SEQ_ORDER = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
-PLOT_FAMILY_LABELS = {
-    "tinybert_512": "TinyBERT",
-    "baseline_768": "BERT-Base",
-    "baseline_1024": "BERT-Large",
-}
 SUPPORTED_PLOT_SUFFIX = ".svg"
 TORCH_DTYPES: dict[str, torch.dtype] = {
     "bf16": torch.bfloat16,
@@ -1265,13 +1261,6 @@ def _resolve_plot_path(path: Path) -> Path:
     return path
 
 
-def _format_study_case_label(study_case_id: str) -> str:
-    return PLOT_FAMILY_LABELS.get(
-        study_case_id,
-        " ".join(part.capitalize() for part in study_case_id.split("_")),
-    )
-
-
 def _ordered_study_case_ids(metric_rows: list[dict[str, object]]) -> list[str]:
     present = {
         str(row.get("study_case_id") or "")
@@ -1348,15 +1337,20 @@ def render_metric_plot(
     study_case_ids = _ordered_study_case_ids(metric_rows)
     seq_lens = _ordered_seq_lens(metric_rows)
     fig, axes_obj = plt.subplots(
-        1,
-        max(1, len(study_case_ids)),
-        figsize=(8 * max(1, len(study_case_ids)), 8),
+        *PLOT_FAMILY_GRID_SHAPE,
+        figsize=(18, 10),
         sharey=True,
     )
-    axes = [axes_obj] if len(study_case_ids) == 1 else list(axes_obj)
-    legend_ax = None
+    axes_grid = axes_obj
+    present_study_case_ids = set(study_case_ids)
 
-    for ax, study_case_id in zip(axes, study_case_ids, strict=True):
+    for family in ordered_plot_families():
+        ax = axes_grid[family.row_index][family.col_index]
+        if family.family_id not in present_study_case_ids:
+            ax.set_axis_off()
+            continue
+
+        study_case_id = family.family_id
         family_rows = [
             row
             for row in metric_rows
@@ -1402,44 +1396,35 @@ def render_metric_plot(
         ax.set_xlabel("Sequence Length", fontsize=15)
         ax.set_ylabel(y_axis_label, fontsize=15)
         ax.set_title(
-            _format_study_case_label(study_case_id),
+            plot_family_label(study_case_id),
             loc="left",
             fontsize=18 if variant == "standard" else 20,
             pad=6,
         )
         ax.grid(True, which="major", axis="y", linewidth=0.8, alpha=0.8)
         ax.tick_params(axis="both", labelsize=12 if variant == "standard" else 14)
-        if ax is not axes[0]:
+        if family.col_index != 0:
             ax.set_ylabel("")
 
     legend_handles = [
         Patch(facecolor=color, edgecolor="none", label=label)
         for _, label, color in plot_series
     ]
-    if legend_ax is not None:
-        legend_ax.legend(
-            handles=legend_handles,
-            loc="center",
-            ncol=1,
-            frameon=False,
-            fontsize=16,
-        )
-    else:
-        fig.legend(
-            handles=legend_handles,
-            loc="center left",
-            ncol=1,
-            frameon=False,
-            bbox_to_anchor=(0.87, 0.5),
-            fontsize=13 if variant == "standard" else 16,
-        )
+    fig.legend(
+        handles=legend_handles,
+        loc="center left",
+        ncol=1,
+        frameon=False,
+        bbox_to_anchor=(0.89, 0.5),
+        fontsize=13 if variant == "standard" else 16,
+    )
     fig.suptitle(
         title,
         fontsize=24 if variant == "standard" else 30,
         fontweight="bold",
         y=0.98 if variant == "standard" else 0.99,
     )
-    fig.tight_layout(rect=[0, 0.03, 0.84, 0.92])
+    fig.tight_layout(rect=[0, 0.03, 0.87, 0.94])
     return fig
 
 

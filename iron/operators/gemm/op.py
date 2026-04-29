@@ -42,6 +42,9 @@ class AIEGEMM(AIEOperatorBase):
         skip_add_to_list=False,
         **gemm_kwargs,
     ):
+        self.logical_M = M
+        self.logical_K = K
+        self.logical_N = N
         self.tile_m = tile_m
         self.tile_k = tile_k
         self.tile_n = tile_n
@@ -116,6 +119,49 @@ class AIEGEMM(AIEOperatorBase):
 
     def _uses_batched_layout(self):
         return self.batch_C[0] > 1
+
+    def _uses_split_batched_runtime(self):
+        return (
+            self._uses_batched_layout()
+            and self.logical_M == self.M
+            and self.logical_K == self.K
+            and self.logical_N == self.N
+            and self.batch_A[0] == self.batch_B[0] == self.batch_C[0]
+            and self.batch_A[1] == 1
+            and self.batch_B[1] == 1
+            and self.batch_C[1] == 0
+            and not self.b_col_maj
+            and not self.c_col_maj
+            and self.input_a_buffer_shape is None
+            and self.input_b_buffer_shape is None
+            and self.output_c_buffer_shape is None
+            and self.input_a_offset == 0
+            and self.input_b_offset == 0
+            and self.output_c_offset == 0
+            and self.weight is None
+        )
+
+    def _split_batch_buffer_name(self, base: str, batch_index: int) -> str:
+        return f"{base}_{batch_index}"
+
+    def _split_batch_prototype(self):
+        return AIEGEMM(
+            self.M,
+            self.K,
+            self.N,
+            use_static_weight=False,
+            tile_m=self.tile_m,
+            tile_k=self.tile_k,
+            tile_n=self.tile_n,
+            partition_N=1,
+            num_aie_columns=self.num_aie_columns,
+            batch_A=(1, 0),
+            batch_B=(1, 0),
+            batch_C=(1, 0),
+            context=self.context,
+            skip_add_to_list=True,
+            **self.gemm_args,
+        )
 
     @staticmethod
     def _buffer_shape_element_count(shape):
@@ -409,6 +455,14 @@ class AIEGEMM(AIEOperatorBase):
         return xclbin_artifact
 
     def set_up_artifacts(self):
+        if self._uses_split_batched_runtime():
+            xclbin_artifact, insts_artifact = (
+                self._split_batch_prototype().get_artifacts(prefix="gemm_split_batch_")
+            )
+            self.xclbin_artifact = xclbin_artifact
+            self.insts_artifact = insts_artifact
+            self.add_artifacts([self.xclbin_artifact, self.insts_artifact])
+            return
         if self.xclbin_artifact is None or self.insts_artifact is None:
             xclbin_artifact, insts_artifact = self.get_artifacts()
             self.xclbin_artifact = xclbin_artifact
@@ -428,6 +482,21 @@ class AIEGEMM(AIEOperatorBase):
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
+
+        if self._uses_split_batched_runtime():
+            batch_size = self.batch_C[0]
+            self.add_buffer("A", self.M * self.K * batch_size)
+            self.add_buffer("B", self.K * self.N * batch_size)
+            self.add_buffer("C", self.M * self.N * batch_size)
+            for batch_index in range(batch_size):
+                a_name = self._split_batch_buffer_name("A", batch_index)
+                b_name = self._split_batch_buffer_name("B", batch_index)
+                c_name = self._split_batch_buffer_name("C", batch_index)
+                self.add_buffer(a_name, self.M * self.K)
+                self.add_buffer(b_name, self.K * self.N)
+                self.add_buffer(c_name, self.M * self.N + batch_index * 2048)
+                self.add_to_runlist("gemm", a_name, b_name, c_name)
+            return
 
         if self._uses_batched_layout():
             a_count = (
@@ -470,6 +539,72 @@ class AIEGEMM(AIEOperatorBase):
         if self.b_col_maj:
             return B_shape[-1], B_shape[-2]
         return B_shape[-2], B_shape[-1]
+
+    def write_buffer(self, buffer_name, array):
+        if not self._uses_split_batched_runtime() or buffer_name not in {"A", "B", "C"}:
+            return super().write_buffer(buffer_name, array)
+
+        src = (
+            torch_to_numpy(array)
+            if isinstance(array, torch.Tensor)
+            else np.asarray(array)
+        )
+        batch_size = self.batch_C[0]
+        if buffer_name == "A":
+            a_matrix = src.reshape(self.M, self.K * batch_size)
+            for batch_index in range(batch_size):
+                super().write_buffer(
+                    self._split_batch_buffer_name("A", batch_index),
+                    a_matrix[:, batch_index * self.K : (batch_index + 1) * self.K],
+                )
+            return None
+        if buffer_name == "B":
+            b_matrix = src.reshape(self.K, self.N * batch_size)
+            for batch_index in range(batch_size):
+                super().write_buffer(
+                    self._split_batch_buffer_name("B", batch_index),
+                    b_matrix[:, batch_index * self.N : (batch_index + 1) * self.N],
+                )
+            return None
+
+        if src.dtype == np.uint8:
+            element_bytes = np.dtype(bfloat16).itemsize
+            c_bytes = src.reshape(-1)
+            per_batch_bytes = self.M * self.N * element_bytes
+            for batch_index in range(batch_size):
+                super().write_buffer(
+                    self._split_batch_buffer_name("C", batch_index),
+                    c_bytes[
+                        batch_index
+                        * per_batch_bytes : (batch_index + 1)
+                        * per_batch_bytes
+                    ],
+                )
+            return None
+
+        c_matrix = src.reshape(batch_size * self.M, self.N)
+        for batch_index in range(batch_size):
+            super().write_buffer(
+                self._split_batch_buffer_name("C", batch_index),
+                c_matrix[batch_index * self.M : (batch_index + 1) * self.M, :],
+            )
+        return None
+
+    def read_buffer(self, buffer_name, shape, copy=False, dtype=bfloat16):
+        if not self._uses_split_batched_runtime() or buffer_name != "C":
+            return super().read_buffer(buffer_name, shape, copy=copy, dtype=dtype)
+
+        parts = [
+            super().read_buffer(
+                self._split_batch_buffer_name("C", batch_index),
+                shape=(self.M, self.N),
+                copy=True,
+                dtype=dtype,
+            )
+            for batch_index in range(self.batch_C[0])
+        ]
+        result = np.concatenate(parts, axis=0).reshape(shape)
+        return np.array(result, copy=True) if copy else result
 
     def forward(self, A, B=None):
         """Forward pass through GEMM operation: C = A @ B."""

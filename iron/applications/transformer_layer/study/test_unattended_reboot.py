@@ -10,6 +10,7 @@ import json
 import types
 from pathlib import Path
 
+from iron.applications.transformer_layer.study import results_manifest
 from iron.applications.transformer_layer.study.unattended_reboot import (
     _cron_command,
     _current_npu_power_mode,
@@ -19,6 +20,7 @@ from iron.applications.transformer_layer.study.unattended_reboot import (
     _migrate_state_for_current_runner,
     _prepare_state_for_resume,
     _resolve_amd_ttm_path,
+    _ensure_fresh_result_root,
     _results_root_contains_required_files,
     _record_baseline_temperature,
     _resume,
@@ -32,6 +34,7 @@ from iron.applications.transformer_layer.study.unattended_reboot import (
     build_job_plan,
     build_smoke_test_job_plan,
     create_state,
+    suite_sequence_sets,
     run_next_job,
     write_state,
     render_status,
@@ -91,19 +94,137 @@ def test_build_job_plan_uses_per_seq_latency_and_correctness_jobs():
     assert latency_job["argv"][latency_job["argv"].index("--seq-len") + 1] == "4096"
 
 
-def test_build_job_plan_ends_with_plot_regeneration():
+def test_build_paper_job_plan_reduces_helpers_but_keeps_full_coverage():
+    jobs = build_job_plan(
+        results_root=Path("/tmp/results_unattended"),
+        host_comparison_16384_ttm_gb=26,
+        suite_profile="paper",
+    )
+
+    end_to_end_jobs = [
+        job
+        for job in jobs
+        if job["module"] == "iron.applications.transformer_layer.study.end_to_end.run"
+    ]
+    assert len(end_to_end_jobs) == 6 * 9 * 3
+    assert {
+        int(job["argv"][job["argv"].index("--seq-len") + 1]) for job in end_to_end_jobs
+    } == {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384}
+
+    selected_detail_jobs = [
+        job for job in jobs if str(job["id"]).startswith("selected_component_detail_")
+    ]
+    assert len(selected_detail_jobs) == 6 * 3 * 3
+    assert {
+        int(job["argv"][job["argv"].index("--seq-len") + 1])
+        for job in selected_detail_jobs
+    } == {512, 2048, 8192}
+    assert all("--detailed-only" in job["argv"] for job in selected_detail_jobs)
+    assert all(
+        job["argv"][job["argv"].index("--npu-source") + 1] == "auto"
+        for job in selected_detail_jobs
+    )
+
+    selected_aggregate_job = [
+        job for job in jobs if job["id"] == "selected_component_aggregates_all"
+    ][0]
+    assert "--aggregate-only" in selected_aggregate_job["argv"]
+    assert (
+        selected_aggregate_job["argv"][
+            selected_aggregate_job["argv"].index("--seq-len") + 1
+        ]
+        == "512,2048,8192"
+    )
+
+    latency_jobs = [
+        job for job in jobs if str(job["id"]).startswith("latency_variation_")
+    ]
+    assert len(latency_jobs) == 6 * 3 * 3
+    assert {
+        int(job["argv"][job["argv"].index("--seq-len") + 1]) for job in latency_jobs
+    } == {512, 2048, 8192}
+
+    staging_jobs = [
+        job for job in jobs if str(job["id"]).startswith("staging_ablation_")
+    ]
+    assert len(staging_jobs) == 6 * 6 * 2
+    assert {
+        int(job["argv"][job["argv"].index("--seq-len") + 1]) for job in staging_jobs
+    } == {256, 512, 1024, 2048, 4096, 8192}
+
+    host_jobs = [
+        job for job in jobs if str(job["id"]).startswith("host_comparison_igpu_")
+    ]
+    assert len(host_jobs) == 6 * 9
+    assert {
+        int(job["argv"][job["argv"].index("--seq-len") + 1]) for job in host_jobs
+    } == {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384}
+    assert all(
+        job["argv"][job["argv"].index("--host-backends") + 1] == "igpu"
+        for job in host_jobs
+    )
+
+    manifest_job = [job for job in jobs if job["id"] == "results_manifest_all"][0]
+    assert manifest_job["argv"][manifest_job["argv"].index("--suite-profile") + 1] == (
+        "paper"
+    )
+    assert json.loads(
+        manifest_job["argv"][manifest_job["argv"].index("--sequence-sets-json") + 1]
+    )["latency_variation"] == [512, 2048, 8192]
+
+
+def test_build_job_plan_ends_with_manifest_after_plot_regeneration():
     jobs = build_job_plan(
         results_root=Path("/tmp/results_unattended"),
         host_comparison_16384_ttm_gb=26,
     )
 
-    assert jobs[-1]["id"] == "regenerate_plots_all"
-    assert jobs[-1]["module"] == (
-        "iron.applications.transformer_layer.study.regenerate_plots"
+    selected_index = next(
+        index
+        for index, job in enumerate(jobs)
+        if job["id"] == "selected_component_aggregates_all"
     )
+    regenerate_index = next(
+        index for index, job in enumerate(jobs) if job["id"] == "regenerate_plots_all"
+    )
+    manifest_index = next(
+        index for index, job in enumerate(jobs) if job["id"] == "results_manifest_all"
+    )
+    assert jobs[-1]["id"] == "results_manifest_all"
+    assert jobs[-1]["module"] == (
+        "iron.applications.transformer_layer.study.results_manifest"
+    )
+    assert selected_index < regenerate_index < manifest_index
+    selected_job = jobs[selected_index]
+    assert selected_job["module"] == (
+        "iron.applications.transformer_layer.study.end_to_end.run_selected_component_aggregates"
+    )
+    assert selected_job["argv"] == [
+        "--results",
+        "/tmp/results_unattended/end_to_end/results_all_power.csv",
+        "--tuning-results",
+        "/tmp/results_unattended/end_to_end/tuning_all_power.csv",
+        "--detailed-output",
+        "/tmp/results_unattended/end_to_end/selected_component_timings.csv",
+        "--aggregate-output",
+        "/tmp/results_unattended/end_to_end/selected_component_aggregates.csv",
+        "--npu-source",
+        "auto",
+    ]
+    assert jobs[regenerate_index]["argv"] == [
+        "--results-root",
+        "/tmp/results_unattended",
+        "--require-selected-components",
+    ]
     assert jobs[-1]["argv"] == [
         "--results-root",
         "/tmp/results_unattended",
+        "--output",
+        "/tmp/results_unattended/results_manifest.json",
+        "--suite-profile",
+        "full",
+        "--sequence-sets-json",
+        json.dumps(suite_sequence_sets("full"), sort_keys=True),
     ]
 
 
@@ -147,6 +268,7 @@ def test_build_smoke_test_job_plan_is_small_and_self_verifying():
     assert jobs[1]["module"] == (
         "iron.applications.transformer_layer.study.regenerate_plots"
     )
+    assert "--require-selected-components" not in jobs[1]["argv"]
     assert jobs[2]["argv"] == [
         "verify-results",
         "--results-root",
@@ -210,9 +332,16 @@ def test_build_execution_smoke_job_plan_covers_three_patterns_and_exports():
         "execution_smoke_latency_variation_runlist",
         "execution_smoke_latency_variation_offload",
     ]
+    assert any(
+        job["id"] == "execution_smoke_selected_component_aggregates" for job in jobs
+    )
+    assert any(
+        str(job["id"]).startswith("execution_smoke_staging_ablation_") for job in jobs
+    )
     assert any(job["id"] == "execution_smoke_host_comparison" for job in jobs)
     assert any(job["id"] == "execution_smoke_resource_usage" for job in jobs)
     assert any(job["id"] == "execution_smoke_roofline" for job in jobs)
+    assert any(job["id"] == "execution_smoke_results_manifest" for job in jobs)
     assert jobs[-1]["id"] == "execution_smoke_verify_results"
     assert jobs[-1]["argv"] == [
         "verify-execution-results",
@@ -247,6 +376,22 @@ def test_results_root_contains_required_files(tmp_path):
     )
 
 
+def test_paper_fresh_start_rejects_existing_result_outputs(tmp_path):
+    results_root = tmp_path / "results"
+    state_path = results_root / "automation" / "state.json"
+    output_path = results_root / "end_to_end" / "results_all_power.csv"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("old\n", encoding="utf-8")
+
+    try:
+        _ensure_fresh_result_root(results_root, state_path)
+    except RuntimeError as exc:
+        assert "existing state or result outputs" in str(exc)
+        assert str(output_path) in str(exc)
+    else:
+        raise AssertionError("expected fresh result root rejection")
+
+
 def test_discover_default_smoke_source_results_root_prefers_valid_unattended_root(
     monkeypatch, tmp_path
 ):
@@ -272,6 +417,80 @@ def test_discover_default_smoke_source_results_root_prefers_valid_unattended_roo
         _discover_default_smoke_source_results_root(REQUIRED_EXECUTION_FIXTURE_FILES)
         == valid_unattended
     )
+
+
+def test_results_manifest_reports_required_file_completeness(monkeypatch, tmp_path):
+    results_root = tmp_path / "results"
+    (results_root / "end_to_end").mkdir(parents=True)
+    (results_root / "end_to_end" / "results_all_power.csv").write_text(
+        "x\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr(results_manifest, "_git_metadata", lambda _repo: {})
+    monkeypatch.setattr(results_manifest, "_system_metadata", lambda: {})
+
+    manifest = results_manifest.build_manifest(
+        results_root=results_root,
+        build_root=tmp_path / "build",
+        repo=tmp_path,
+    )
+
+    assert manifest["complete"] is False
+    assert "end_to_end/tuning_all_power.csv" in manifest["missing_files"]
+    assert any(
+        record["path"] == "results_manifest.json" and record.get("self_record")
+        for record in manifest["expected_files"]
+    )
+
+
+def test_results_manifest_reports_paper_suite_coverage(monkeypatch, tmp_path):
+    results_root = tmp_path / "results"
+    (results_root / "automation").mkdir(parents=True)
+    (results_root / "end_to_end").mkdir(parents=True)
+    (results_root / "host_comparison").mkdir(parents=True)
+    state = {
+        "suite_profile": "paper",
+        "suite_sequence_sets": suite_sequence_sets("paper"),
+    }
+    (results_root / "automation" / "state.json").write_text(
+        json.dumps(state), encoding="utf-8"
+    )
+    (results_root / "end_to_end" / "selected_component_aggregates.csv").write_text(
+        "row_kind,is_complete,study_case_id,execution_mode,seq_len,group_label\n"
+        "isolated_group,False,baseline_768,runlist,512,Attention Scale\n",
+        encoding="utf-8",
+    )
+    (results_root / "host_comparison" / "results.csv").write_text(
+        "study_case_id,seq_len,metric,igpu\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(results_manifest, "_git_metadata", lambda _repo: {})
+    monkeypatch.setattr(results_manifest, "_system_metadata", lambda: {})
+
+    manifest = results_manifest.build_manifest(
+        results_root=results_root,
+        build_root=tmp_path / "build",
+        repo=tmp_path,
+    )
+
+    suite = manifest["suite"]
+    assert suite["profile"] == "paper"
+    assert suite["coverage"]["end_to_end"]["expected_rows"] == 6 * 9 * 3
+    assert suite["coverage"]["latency_variation"]["seq_lens"] == [512, 2048, 8192]
+    assert suite["coverage"]["host_comparison"]["seq_lens"] == [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+    ]
+    assert suite["coverage"]["host_comparison"]["host_backends"] == ["igpu"]
+    assert suite["coverage"]["selected_components"]["incomplete_group_count"] == 1
 
 
 def test_render_status_reports_progress_and_failures():

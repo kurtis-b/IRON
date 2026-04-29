@@ -36,13 +36,14 @@ STAGING_ABLATION_SEQUENCE_LENGTHS = tuple(
     seq_len for seq_len in SEQUENCE_LADDER if 256 <= seq_len <= 8192
 )
 BLOCK_LABELS = {
-    "mha_out_proj": "Hybrid Pattern with MHA + Output Projection Staging Ablation",
-    "ffn": "Hybrid Pattern with FFN Staging Ablation",
+    "mha_out_proj": "Hybrid MHA + Output Projection Staging Ablation",
+    "ffn": "Hybrid FFN Staging Ablation",
 }
 FAMILY_LABELS = {
     "tinybert_512": "TinyBERT",
     "baseline_768": "BERT-Base",
     "baseline_1024": "BERT-Large",
+    "gpt2_512": "GPT-2 512",
     "gpt2_small_768": "GPT-2 Small",
     "gpt2_medium_1024": "GPT-2 Medium",
 }

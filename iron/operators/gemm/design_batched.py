@@ -737,29 +737,17 @@ def my_matmul(
     with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
         rt.start(*workers)
 
-        # Set runtime parameters
-        def set_rtps(*args):
-            for row, rtps_row in enumerate(args):
-                for col, rtp_row_col in enumerate(rtps_row):
-                    rtp_row_col[0] = K_div_k
-                    # A single runtime-sequence dispatch streams every batch_C slice
-                    # before lowering the worker barrier again, so workers must stay
-                    # active for the full batched tile count, not just one batch.
-                    rtp_row_col[1] = (
-                        batch_C_size * n_c_row_tiles_per_core * n_c_col_tiles_per_core
-                    )
+        def set_rtps(tile_count):
+            def _setter(*args):
+                for row, rtps_row in enumerate(args):
+                    for col, rtp_row_col in enumerate(rtps_row):
+                        rtp_row_col[0] = K_div_k
+                        rtp_row_col[1] = tile_count
 
-        rt.inline_ops(set_rtps, rtps)
-
-        # Set the barriers to 1 to allow the worker to read the
-        # runtime parameters and start the computation
-        for row in range(n_aie_rows):
-            for col in range(n_aie_cols):
-                rt.set_barrier(workerBarriers[row][col], 1)
+            return _setter
 
         # Task groups will be used to determine when to sync/await/free DMA runtime ops
         for batch_idx in range(batch_C_size):
-            tg = rt.task_group()
             for tb in range(ceildiv(n_c_row_tiles_per_core, tb_max_n_rows)):
                 for pingpong in [0, 1]:
                     row_base = tb * tb_max_n_rows + pingpong * tb_max_n_rows // 2
@@ -769,6 +757,13 @@ def my_matmul(
                     if current_tb_n_rows <= 0:
                         # For small input sizes, we may not even need a "pong" iteration
                         break
+                    rt.inline_ops(
+                        set_rtps(current_tb_n_rows * n_c_col_tiles_per_core), rtps
+                    )
+                    for row in range(n_aie_rows):
+                        for col in range(n_aie_cols):
+                            rt.set_barrier(workerBarriers[row][col], 1)
+                    tg = rt.task_group()
                     for col in range(n_aie_cols):
                         # C Output Transfer:
                         # The smallest transfer unit is a (m*n_aie_rows)-x-(n)-sized sub-tile of the matrix.
@@ -826,17 +821,6 @@ def my_matmul(
                             strides=C_strides,
                         )
 
-                        _emit_dma_transfer(
-                            rt,
-                            fifo_handle=C_l2l3_fifos[col].cons(),
-                            runtime_buffer=C,
-                            tap=C_tile,
-                            task_group=tg,
-                            placement=Tile(col, 0),
-                            recorded_taps=C_taps,
-                            is_fill=False,
-                            wait=True,
-                        )
                         for tile_row in range(current_tb_n_rows):
                             # A input transfer:
                             #
@@ -967,13 +951,21 @@ def my_matmul(
                                 recorded_taps=B_taps,
                                 is_fill=True,
                             )
-                    if tb > 0 or (tb == 0 and pingpong > 0):
-                        rt.finish_task_group(tg)
-                        tg = rt.task_group()
-            rt.finish_task_group(tg)
-        for row in range(n_aie_rows):
-            for col in range(n_aie_cols):
-                rt.set_barrier(workerBarriers[row][col], 0)
+                        _emit_dma_transfer(
+                            rt,
+                            fifo_handle=C_l2l3_fifos[col].cons(),
+                            runtime_buffer=C,
+                            tap=C_tile,
+                            task_group=tg,
+                            placement=Tile(col, 0),
+                            recorded_taps=C_taps,
+                            is_fill=False,
+                            wait=True,
+                        )
+                    rt.finish_task_group(tg)
+                    for row in range(n_aie_rows):
+                        for col in range(n_aie_cols):
+                            rt.set_barrier(workerBarriers[row][col], 0)
 
     if generate_taps:
         # If generate taps is true, return a representation of tensor access patterns

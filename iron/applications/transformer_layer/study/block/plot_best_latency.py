@@ -11,8 +11,14 @@ from pathlib import Path
 import pandas as pd
 import seaborn as sns
 from matplotlib import pyplot as plt
-from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+
+from ..plot_families import (
+    PLOT_FAMILY_GRID_SHAPE,
+    PLOT_ROW_LABELS,
+    ordered_plot_families,
+    plot_family_label,
+)
 
 SEQ_ORDER = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 BLOCK_LABELS = {
@@ -30,34 +36,17 @@ LEGEND_ORDER = [
     "Add + Norm",
     "FFN",
 ]
-SECTION_CONFIGS = [
-    {
-        "row_title": "Encoder Blocks",
-        "family_ids": ["tinybert_512", "baseline_768", "baseline_1024"],
-        "family_labels": {
-            "tinybert_512": "TinyBERT",
-            "baseline_768": "BERT-Base",
-            "baseline_1024": "BERT-Large",
-        },
-        "block_order": ["qkv_proj", "mha_out_proj", "addnorm", "ffn"],
-    },
-    {
-        "row_title": "Decoder Blocks",
-        "family_ids": ["baseline_768", "baseline_1024"],
-        "family_labels": {
-            "baseline_768": "GPT-2 Small",
-            "baseline_1024": "GPT-2 Medium",
-        },
-        "block_order": [
-            "qkv_proj",
-            "mha_out_proj_causal",
-            "layer_norm",
-            "elementwise_add",
-            "addnorm",
-            "ffn",
-        ],
-    },
-]
+BLOCK_ORDER_BY_VARIANT = {
+    "encoder_bert": ["qkv_proj", "mha_out_proj", "addnorm", "ffn"],
+    "decoder_gpt2": [
+        "qkv_proj",
+        "mha_out_proj_causal",
+        "layer_norm",
+        "elementwise_add",
+        "addnorm",
+        "ffn",
+    ],
+}
 PALETTE = {
     "QKV Proj": "#1f6f8b",
     "MHAO": "#e07a5f",
@@ -77,11 +66,11 @@ def variant_stem(variant: str, y_scale: str = "log") -> str:
 
 
 def load_best_rows(results_csv: Path) -> pd.DataFrame:
-    family_ids = {
-        family_id for config in SECTION_CONFIGS for family_id in config["family_ids"]
-    }
+    family_ids = {family.family_id for family in ordered_plot_families()}
     block_order = {
-        block_kind for config in SECTION_CONFIGS for block_kind in config["block_order"]
+        block_kind
+        for block_kinds in BLOCK_ORDER_BY_VARIANT.values()
+        for block_kind in block_kinds
     }
     df = pd.read_csv(results_csv)
     df = df[df["run_status"] == "passed"].copy()
@@ -111,7 +100,7 @@ def plot_best_latency(
 ):
     if variant == "slides":
         context = "poster"
-        figsize = (34, 8.5)
+        figsize = (20, 11.5)
         row_title_size = 20
         family_title_size = 18
         y_label_size = 18
@@ -119,10 +108,10 @@ def plot_best_latency(
         tick_label_size = 14
         legend_font_size = 15
         suptitle_size = 30
-        title_y = 0.97
+        title_y = 0.985
     else:
         context = "talk"
-        figsize = (30, 8)
+        figsize = (18, 10)
         row_title_size = 17
         family_title_size = 16
         y_label_size = 15
@@ -130,7 +119,7 @@ def plot_best_latency(
         tick_label_size = 11
         legend_font_size = 13
         suptitle_size = 24
-        title_y = 0.96
+        title_y = 0.975
 
     sns.set_theme(
         style="whitegrid",
@@ -145,69 +134,77 @@ def plot_best_latency(
         },
     )
 
-    fig, axes_obj = plt.subplots(1, 5, figsize=figsize, sharey=True)
-    axes = list(axes_obj)
+    fig, axes_obj = plt.subplots(
+        *PLOT_FAMILY_GRID_SHAPE,
+        figsize=figsize,
+        sharey=True,
+    )
+    axes_grid = axes_obj
 
-    axis_index = 0
+    present_family_ids = set(best["family_id"].astype(str).tolist())
     hue_order = ["QKV Proj", "MHAO", "Add + Norm", "FFN"]
-    for config in SECTION_CONFIGS:
-        for family_id in config["family_ids"]:
-            ax = axes[axis_index]
-            axis_index += 1
-            family_df = best[
-                (best["family_id"] == family_id)
-                & (best["block_kind"].isin(config["block_order"]))
-            ].copy()
-            family_df = (
-                family_df.groupby(
-                    ["family_id", "seq_len", "block_label"], as_index=False
-                )["avg_latency_ms"]
-                .sum()
-                .sort_values(["seq_len", "block_label"])
-                .reset_index(drop=True)
-            )
-            family_df["seq_label"] = pd.Categorical(
-                family_df["seq_len"].astype(str),
-                [
-                    str(seq_len)
-                    for seq_len in SEQ_ORDER
-                    if seq_len in set(family_df["seq_len"].tolist())
-                ],
-                ordered=True,
-            )
+    for family in ordered_plot_families():
+        ax = axes_grid[family.row_index][family.col_index]
+        if family.family_id not in present_family_ids:
+            ax.set_axis_off()
+            continue
 
-            sns.barplot(
-                data=family_df,
-                x="seq_label",
-                y="avg_latency_ms",
-                hue="block_label",
-                hue_order=hue_order,
-                palette=PALETTE,
-                errorbar=None,
-                ax=ax,
-            )
-            if y_scale == "log":
-                ax.set_yscale("log")
-            ax.set_ylabel(
-                (
-                    "Latency (ms, log scale)"
-                    if axis_index == 1 and y_scale == "log"
-                    else "Latency (ms)" if axis_index == 1 else ""
-                ),
-                fontsize=y_label_size,
-            )
-            ax.set_xlabel("Sequence Length", fontsize=x_label_size)
-            ax.set_title(
-                config["family_labels"][family_id],
-                loc="left",
-                fontsize=family_title_size,
-                pad=8,
-            )
-            ax.grid(True, which="major", axis="y", linewidth=0.8, alpha=0.8)
-            ax.grid(True, which="minor", axis="y", linewidth=0.4, alpha=0.4)
-            if ax.legend_ is not None:
-                ax.legend_.remove()
-            ax.tick_params(axis="both", labelsize=tick_label_size)
+        family_df = best[
+            (best["family_id"] == family.family_id)
+            & (best["block_kind"].isin(BLOCK_ORDER_BY_VARIANT[family.workload_variant]))
+        ].copy()
+        if family_df.empty:
+            ax.set_axis_off()
+            continue
+
+        family_df = (
+            family_df.groupby(["family_id", "seq_len", "block_label"], as_index=False)[
+                "avg_latency_ms"
+            ]
+            .sum()
+            .sort_values(["seq_len", "block_label"])
+            .reset_index(drop=True)
+        )
+        family_df["seq_label"] = pd.Categorical(
+            family_df["seq_len"].astype(str),
+            [
+                str(seq_len)
+                for seq_len in SEQ_ORDER
+                if seq_len in set(family_df["seq_len"].tolist())
+            ],
+            ordered=True,
+        )
+
+        sns.barplot(
+            data=family_df,
+            x="seq_label",
+            y="avg_latency_ms",
+            hue="block_label",
+            hue_order=hue_order,
+            palette=PALETTE,
+            errorbar=None,
+            ax=ax,
+        )
+        if y_scale == "log":
+            ax.set_yscale("log")
+        ax.set_ylabel(
+            "Latency (ms, log scale)" if y_scale == "log" else "Latency (ms)",
+            fontsize=y_label_size,
+        )
+        ax.set_xlabel("Sequence Length", fontsize=x_label_size)
+        ax.set_title(
+            plot_family_label(family.family_id),
+            loc="left",
+            fontsize=family_title_size,
+            pad=8,
+        )
+        ax.grid(True, which="major", axis="y", linewidth=0.8, alpha=0.8)
+        ax.grid(True, which="minor", axis="y", linewidth=0.4, alpha=0.4)
+        if ax.legend_ is not None:
+            ax.legend_.remove()
+        ax.tick_params(axis="both", labelsize=tick_label_size)
+        if family.col_index != 0:
+            ax.set_ylabel("")
 
     legend_labels = [
         label for label in LEGEND_ORDER if label in set(best["block_label"].tolist())
@@ -231,50 +228,27 @@ def plot_best_latency(
         fontweight="bold",
         y=title_y,
     )
-    fig.tight_layout(rect=[0, 0.03, 0.89, 0.91])
+    fig.tight_layout(rect=[0, 0.03, 0.89, 0.95])
 
-    encoder_axes = axes[: len(SECTION_CONFIGS[0]["family_ids"])]
-    decoder_axes = axes[len(SECTION_CONFIGS[0]["family_ids"]) :]
-    top_y = max(ax.get_position().y1 for ax in axes) + 0.018
-
-    def section_center(section_axes):
-        return (
-            section_axes[0].get_position().x0 + section_axes[-1].get_position().x1
-        ) / 2
-
-    fig.text(
-        section_center(encoder_axes),
-        top_y,
-        SECTION_CONFIGS[0]["row_title"],
-        fontsize=row_title_size,
-        fontweight="bold",
-        ha="center",
-        va="bottom",
-    )
-    fig.text(
-        section_center(decoder_axes),
-        top_y,
-        SECTION_CONFIGS[1]["row_title"],
-        fontsize=row_title_size,
-        fontweight="bold",
-        ha="center",
-        va="bottom",
-    )
-
-    separator_x = (
-        encoder_axes[-1].get_position().x1 + decoder_axes[0].get_position().x0
-    ) / 2
-    y0 = min(ax.get_position().y0 for ax in axes)
-    y1 = max(ax.get_position().y1 for ax in axes)
-    fig.add_artist(
-        Line2D(
-            [separator_x, separator_x],
-            [y0, y1],
-            transform=fig.transFigure,
-            color="#c7c1b7",
-            linewidth=1.5,
+    for row_index, row_label in enumerate(PLOT_ROW_LABELS):
+        row_axes = [
+            axes_grid[row_index][col_index]
+            for col_index in range(PLOT_FAMILY_GRID_SHAPE[1])
+            if axes_grid[row_index][col_index].axison
+        ]
+        if not row_axes:
+            continue
+        top_y = max(ax.get_position().y1 for ax in row_axes) + 0.012
+        center_x = (row_axes[0].get_position().x0 + row_axes[-1].get_position().x1) / 2
+        fig.text(
+            center_x,
+            top_y,
+            row_label,
+            fontsize=row_title_size,
+            fontweight="bold",
+            ha="center",
+            va="bottom",
         )
-    )
     return fig
 
 

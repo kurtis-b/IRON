@@ -242,6 +242,74 @@ def test_gemm(
         ), f"Test failed with {len(errors['C'])} errors (max allowable: {max_acceptable_errors})"
 
 
+@pytest.mark.metrics(
+    Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
+    Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
+    Throughput=r"Throughput: (?P<value>[\d\.e\+-]+) GFLOP/s",
+)
+@pytest.mark.parametrize(
+    "batch_size", [12, 16], ids=["bert_base_heads", "bert_large_heads"]
+)
+def test_batched_gemm_runtime_smoke_large_attn_scores_regression(
+    batch_size, aie_context
+):
+    M = 2048
+    K = 64
+    N = 2048
+    batch_A = (batch_size, 1)
+    batch_B = (batch_size, 1)
+    batch_C = (batch_size, 0)
+
+    golden_ref = generate_golden_reference(
+        M=M,
+        K=K,
+        N=N,
+        batch_A=batch_A,
+        batch_B=batch_B,
+        batch_C=batch_C,
+    )
+    operator = AIEGEMM(
+        M=M,
+        K=K,
+        N=N,
+        tile_m=64,
+        tile_k=64,
+        tile_n=64,
+        num_aie_columns=8,
+        batch_A=batch_A,
+        batch_B=batch_B,
+        batch_C=batch_C,
+        context=aie_context,
+        prio_accuracy=False,
+        emulate_bf16_mmul_with_bfp16=True,
+    )
+
+    errors, latency_us, bandwidth_gbps = run_test(
+        operator,
+        {
+            "A": golden_ref["input"].flatten(),
+            "B": golden_ref["input_b"].flatten(),
+        },
+        {"C": golden_ref["output"].flatten()},
+        rel_tol=0.1,
+        abs_tol=0.5,
+        warmup_iters=1,
+        timed_iters=1,
+    )
+
+    gflops = (2.0 * M * K * N * batch_size) / (latency_us * 1e-6) / 1e9
+
+    print(f"\nLatency (us): {latency_us:.1f}")
+    print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s")
+    print(f"Throughput: {gflops:.6e} GFLOP/s\n")
+
+    max_acceptable_errors = int(M * N * batch_size * 0.05)
+    if errors:
+        assert (
+            len(errors["C"]) <= max_acceptable_errors
+        ), f"Test failed with {len(errors['C'])} errors (max allowable: {max_acceptable_errors})"
+
+
 def test_expand_dma_tap_for_stride_limit_collapses_unit_dims_without_splitting():
     tap = TensorAccessPattern(
         (64, 196608),

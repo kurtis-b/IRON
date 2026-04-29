@@ -56,6 +56,46 @@ def test_offload_short_seq_uses_smaller_shared_tile_m():
     assert {config["tile_n"] for config in seq256.values()} == {64}
 
 
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size,num_heads",
+    (
+        (512, 2048, 8),
+        (768, 3072, 12),
+        (1024, 4096, 16),
+    ),
+)
+@pytest.mark.parametrize("seq_len", (64, 512, 2048, 16384))
+def test_offload_shared_supertile_uses_minimum_k_and_n_workloads(
+    seq_len,
+    hidden_size,
+    intermediate_size,
+    num_heads,
+):
+    resolved = resolve_offload_operator_config(
+        seq_len,
+        hidden_size,
+        intermediate_size,
+        num_heads,
+    )
+
+    assert {config["tile_k"] for config in resolved.values()} == {64}
+    assert {config["tile_n"] for config in resolved.values()} == {64}
+
+
+def test_offload_rejects_per_operator_supertile_overrides():
+    with pytest.raises(
+        ValueError,
+        match="shared tile_m/tile_k/tile_n",
+    ):
+        resolve_offload_operator_config(
+            16384,
+            768,
+            3072,
+            12,
+            operator_config={"q_proj": {"tile_k": 96, "tile_n": 48}},
+        )
+
+
 def test_offload_artifacts_share_one_xclbin(aie_context):
     operator = AIETransformerOffload(
         seq_len=512,

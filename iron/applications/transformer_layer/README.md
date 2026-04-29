@@ -12,6 +12,14 @@ the retained NPU execution patterns:
 - `pattern/runlist`
 - `pattern/offload`
 
+The paper-facing taxonomy uses three broad data patterns:
+
+| Pattern | Repo mode | Role in this study |
+| --- | --- | --- |
+| `offload` | `offload` | Host-controlled transformer layer that offloads GEMM work to the NPU. |
+| `runlist` | `runlist` | Fine-grained NPU operator sequence with explicit intermediate movement. |
+| `dataflow` | `hybrid` dataflow blocks | Fused/staged NPU subgraphs; the proposed `hybrid` mode combines runlist orchestration with these dataflow blocks. |
+
 Retained studies:
 
 - `study/block`
@@ -26,7 +34,7 @@ The shared case matrix is:
 
 - workloads: `encoder_bert`, `decoder_gpt2`
 - families: `tinybert_512`, `baseline_768`, `baseline_1024`,
-  `gpt2_small_768`, `gpt2_medium_1024`
+  `gpt2_512`, `gpt2_small_768`, `gpt2_medium_1024`
 - sequence lengths: `64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384`
 
 Canonical outputs live under a results root such as `results/` or
@@ -49,6 +57,7 @@ Canonical outputs live under a results root such as `results/` or
 - `memcpy_bandwidth/results.csv`
 - `roofline/kernel_points.csv`
 - `roofline/implementation_points.csv`
+- `results_manifest.json`
 
 ## Recommended Execution
 
@@ -68,6 +77,43 @@ cd /path/to/iron
 python3 -m iron.applications.transformer_layer.study.unattended_reboot start \
   --run-id full_suite_$(date +%Y%m%d_%H%M%S) \
   --run-user "$USER" \
+  --log-level INFO
+```
+
+For the reduced paper suite, use a fresh run id and the `paper` suite profile.
+Clean old result roots manually if needed; preserve `build/` for compile/cache
+reuse.
+
+```bash
+cd /home/cj/iron
+source /opt/xilinx/xrt/setup.sh
+source /home/cj/iron/ironenv/bin/activate
+
+sudo xrt-smi configure --pmode turbo
+xrt-smi examine -r all
+
+RUN_ID=paper_suite_$(date +%Y%m%d_%H%M%S)
+
+python3 -m iron.applications.transformer_layer.study.unattended_reboot start \
+  --suite-profile paper \
+  --run-id "$RUN_ID" \
+  --run-user "$USER" \
+  --log-level INFO
+```
+
+Status, stop, and resume for that fresh paper run:
+
+```bash
+STATE=/home/cj/iron/iron/applications/transformer_layer/results_unattended_${RUN_ID}/automation/state.json
+
+python3 -m iron.applications.transformer_layer.study.unattended_reboot status \
+  --state "$STATE"
+
+python3 -m iron.applications.transformer_layer.study.unattended_reboot stop \
+  --state "$STATE"
+
+python3 -m iron.applications.transformer_layer.study.unattended_reboot resume \
+  --state "$STATE" \
   --log-level INFO
 ```
 

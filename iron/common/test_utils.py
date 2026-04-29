@@ -91,7 +91,11 @@ def run_test(
     operator.context.compile_all()
     operator.context.prepare_runtime()
 
-    # Run warmup iterations before writing to buffers (warmup iters might corrupt the buffers)
+    # Warmups exercise the real data path. Outputs are still cleared afterwards,
+    # and inputs are rewritten after outputs to handle BO sharing.
+    for buf_name, data in input_buffers.items():
+        data_np = torch_to_numpy(data)
+        operator.write_buffer(buf_name, data_np)
     for _ in range(warmup_iters):
         operator.run_runlist()  # warmup run to configure
 

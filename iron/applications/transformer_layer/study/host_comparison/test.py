@@ -21,6 +21,7 @@ from iron.applications.transformer_layer.study.host_comparison.run import (
     configure_cpu_runtime_for_max_physical_cores,
     generate_synthetic_reference,
     load_existing_rows,
+    render_metric_plot,
     resolve_power_probe_runs,
     resolve_power_sample_interval_sec,
     resolve_power_sampling_policy,
@@ -516,6 +517,64 @@ def test_build_rows_for_group_aggregates_igpu_and_npu_reference_modes(monkeypatc
         row["offload"] = mode_values["offload"].get(str(row["metric"]))
 
     assert rows == expected_rows
+
+
+def test_render_metric_plot_only_shows_igpu_and_hybrid_series():
+    throughput_fig = render_metric_plot(
+        [
+            {
+                "study_case_id": "tinybert_512",
+                "seq_len": 64,
+                "metric": "effective_gflops_per_sec",
+                "igpu": 800.0,
+                "hybrid": 100.0,
+                "runlist": 90.0,
+                "offload": 120.0,
+            }
+        ],
+        metric="effective_gflops_per_sec",
+        title="Effective Throughput Comparison",
+        y_axis_label="GFLOPS",
+    )
+    try:
+        assert [text.get_text() for text in throughput_fig.legends[0].get_texts()] == [
+            "iGPU",
+            "NPU Hybrid",
+        ]
+        visible_axes = [axis for axis in throughput_fig.axes if axis.axison]
+        assert len(throughput_fig.axes) == 6
+        assert [axis.get_title(loc="left") for axis in visible_axes] == ["B-S"]
+        assert len(visible_axes[0].patches) == 2
+    finally:
+        throughput_fig.clear()
+
+    per_watt_fig = render_metric_plot(
+        [
+            {
+                "study_case_id": "tinybert_512",
+                "seq_len": 64,
+                "metric": "effective_gflops_per_sec_per_watt",
+                "igpu_rocm_smi": 80.0,
+                "hybrid": 10.0,
+                "runlist": 9.0,
+                "offload": 12.0,
+            }
+        ],
+        metric="effective_gflops_per_sec_per_watt",
+        title="Effective Throughput/W Comparison",
+        y_axis_label="GFLOPS / W",
+    )
+    try:
+        assert [text.get_text() for text in per_watt_fig.legends[0].get_texts()] == [
+            "iGPU",
+            "NPU Hybrid",
+        ]
+        visible_axes = [axis for axis in per_watt_fig.axes if axis.axison]
+        assert len(per_watt_fig.axes) == 6
+        assert [axis.get_title(loc="left") for axis in visible_axes] == ["B-S"]
+        assert len(visible_axes[0].patches) == 2
+    finally:
+        per_watt_fig.clear()
 
 
 def test_build_rows_for_group_blanks_missing_igpu_backend(monkeypatch):

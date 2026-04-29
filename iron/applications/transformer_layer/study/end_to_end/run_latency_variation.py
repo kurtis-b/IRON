@@ -71,12 +71,13 @@ MODE_MARKERS = {
 MODE_LABELS = {
     "hybrid": "Hybrid",
     "runlist": "Runlist",
-    "offload": "GEMM Offload",
+    "offload": "Offload",
 }
 FAMILY_LABELS = {
     "tinybert_512": "TinyBERT",
     "baseline_768": "BERT-Base",
     "baseline_1024": "BERT-Large",
+    "gpt2_512": "GPT-2 512",
     "gpt2_small_768": "GPT-2 Small",
     "gpt2_medium_1024": "GPT-2 Medium",
 }

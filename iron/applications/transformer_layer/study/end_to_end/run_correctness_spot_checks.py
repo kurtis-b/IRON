@@ -26,7 +26,7 @@ from .select import default_results_path, load_result_rows, select_result_rows
 
 LOGGER = logging.getLogger(__name__)
 
-SPOT_CHECK_SEQ_LENS: tuple[int, ...] = (512, 2048)
+SPOT_CHECK_SEQ_LENS: tuple[int, ...] = (512, 2048, 8192)
 RESULTS_CSV_FIELDNAMES = (
     "study_id",
     "study_case_id",
@@ -178,7 +178,55 @@ def _resolved_sampling(case: EndToEndCase, selected_row) -> tuple[int, int]:
 def validation_mode_for_seq_len(seq_len: int) -> str:
     if seq_len == 512:
         return "exact_reference"
+    if seq_len >= 8192:
+        return "long_numerical_spot_check"
     return "numerical_spot_check"
+
+
+def _can_reuse_end_to_end_validation(selected_row) -> bool:
+    if str(selected_row.row.get("run_status") or "") != "passed":
+        return False
+    try:
+        validation_error_count = int(
+            float(str(selected_row.row.get("validation_error_count") or ""))
+        )
+    except ValueError:
+        return False
+    return validation_error_count == 0
+
+
+def _reused_end_to_end_validation_row(
+    selected_row,
+    *,
+    warmup_runs: int,
+    runs_per_sample: int,
+    selected_candidate_ids_json: str,
+    selected_config_json: str,
+) -> dict[str, object]:
+    return {
+        "study_id": "end_to_end_correctness_spot_checks",
+        "study_case_id": selected_row.study_case_id,
+        "study_case_label": selected_row.study_case_label,
+        "workload_variant": selected_row.workload_variant,
+        "execution_mode": selected_row.execution_mode,
+        "validation_mode": "reused_end_to_end_validation",
+        "seq_len": selected_row.seq_len,
+        "hidden_size": selected_row.hidden_size,
+        "intermediate_size": selected_row.intermediate_size,
+        "num_attention_heads": selected_row.num_attention_heads,
+        "attention_head_size": selected_row.attention_head_size,
+        "warmup_runs": warmup_runs,
+        "runs_per_sample": runs_per_sample,
+        "avg_latency_ms": selected_row.row.get("avg_latency_ms", ""),
+        "latency_sample_count": selected_row.row.get("latency_sample_count", ""),
+        "min_latency_ms": selected_row.row.get("min_latency_ms", ""),
+        "max_latency_ms": selected_row.row.get("max_latency_ms", ""),
+        "validation_error_count": selected_row.row.get("validation_error_count", "0"),
+        "run_status": "passed",
+        "failure_message": "",
+        "selected_candidate_ids_json": selected_candidate_ids_json,
+        "selected_config_json": selected_config_json,
+    }
 
 
 def _matches_seq_len_filter(seq_len: int, seq_len_filter: str) -> bool:
@@ -236,6 +284,17 @@ def build_rows(
         if reused_row is not None:
             rows.append(
                 {field: reused_row.get(field, "") for field in RESULTS_CSV_FIELDNAMES}
+            )
+            continue
+        if _can_reuse_end_to_end_validation(selected_row):
+            rows.append(
+                _reused_end_to_end_validation_row(
+                    selected_row,
+                    warmup_runs=warmup_runs,
+                    runs_per_sample=runs_per_sample,
+                    selected_candidate_ids_json=selected_candidate_ids_json,
+                    selected_config_json=selected_config_json,
+                )
             )
             continue
         LOGGER.info(
