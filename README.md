@@ -60,6 +60,11 @@ The IRON Python API for Ryzen™ AI NPUs is described in the following paper:
 | [AveragePool]() | AveragePool | bfloat16 | | | ⚪ |  |
 | [Tanh](./aie_kernels/aie2/tanh.cc) | Tanh kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/tanh/](./iron/operators/tanh/) |
 | [Sigmoid](./aie_kernels/aie2/sigmoid.cc) | Sigmoid kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/sigmoid/](./iron/operators/sigmoid/) |
+| [AddNorm](./aie_kernels/aie2p/layer_norm.cc) | Fused residual add and LayerNorm | bfloat16 | | ✓ | 🟢 | [iron/operators/addnorm/](./iron/operators/addnorm/) |
+| [Dynamic GEMM](./aie_kernels/aie2p/mm.cc) | GEMM over a runtime-selected sequence length | bfloat16 | | ✓ | 🟢 | [iron/operators/dynamic_gemm/](./iron/operators/dynamic_gemm/) |
+| [FFN](./aie_kernels/aie2p/mm.cc) | Transformer feed-forward network (up projection, GeLU, down projection) | bfloat16 | | ✓ | 🟢 | [iron/operators/ffn/](./iron/operators/ffn/) |
+| [MHA Output Projection](./aie_kernels/aie2p/mha.cc) | Multi-head attention fused with its output projection | bfloat16 | | ✓ | 🟢 | [iron/operators/mha_out_proj/](./iron/operators/mha_out_proj/) |
+| [QKV Projection](./aie_kernels/aie2p/mm.cc) | Fused query, key, and value projections | bfloat16 | | ✓ | 🟢 | [iron/operators/qkv_proj/](./iron/operators/qkv_proj/) |
 
 > Use this dashboard to quickly check the status of each kernel and locate relevant setup, build, and usage information.
 
@@ -70,6 +75,19 @@ The IRON Python API for Ryzen™ AI NPUs is described in the following paper:
 | 🟢     | **Done**           |
 | 🟡     | **In Development** |
 | ⚪     | **Not Assigned**   |
+
+#### 📦 Applications
+
+Beyond the individual operators, `iron/applications` holds larger end-to-end
+designs that compose them:
+
+| Application | Description |
+|:------------|:------------|
+| [transformer_layer](./iron/applications/transformer_layer/) | A full transformer layer built three ways — `offload`, `runlist`, and coarse runlist — plus the benchmark studies that compare them on latency, throughput, power, and resource usage. |
+| [llama_3.2_1b](./iron/applications/llama_3.2_1b/) | Golden-model Llama-3.2-1B inference used as a reference implementation. |
+
+Each application directory has its own README covering prerequisites and how to
+run it.
 
 
 ## Installation (Linux)
@@ -149,6 +167,27 @@ To run a specific operator's tests:
 ``` bash
 pytest iron/operators/axpy/
 ```
+
+#### Test Iterations and Metrics
+
+Each test is run several times so per-test metrics can be reported as
+statistics. Two options control this:
+
+* `--iterations N` (default `5`): run each test `N` times. Every test is parametrized with ids `iter0 … iterN-1`. Use `--iterations 1` for a single fast pass -- this is what CI uses.
+* `--csv-output PATH` (default `tests_latest.csv`): where the per-test metrics table is written.
+
+A test opts into metrics collection with a `metrics` marker whose keyword
+arguments are regexes containing a named `value` group, matched against the
+test's stdout:
+
+``` python
+@pytest.mark.metrics(Latency=r"Latency \(us\): (?P<value>[\d\.]+)")
+def test_gemv(...):
+    ...
+```
+
+The CSV gets `Commit`, `Date`, `Test`, and `Checks` columns plus mean, median,
+min, max, and stddev for each named metric.
 
 ### Git Hooks (Optional but Recommended)
 

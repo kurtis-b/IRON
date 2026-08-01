@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+import gc
 import logging
-from pathlib import Path
 import os
+from pathlib import Path
 
 from .aie_device_manager import AIEDeviceManager, pyxrt
-from . import compilation as comp
 import aie.utils.config
 
 
@@ -27,12 +27,13 @@ class AIEContext:
         self.mlir_verbose = bool(mlir_verbose)
         self._runtime_prepared = False
 
-    def register_operator(self, operator):
+    def register_operator(self, operator, skip_add_to_list=False):
         """Register an operator with this context"""
         if self._runtime_prepared:
             raise RuntimeError("Cannot register operators after runtime is prepared")
         operator.context = self
-        self.operators.append(operator)
+        if not skip_add_to_list:
+            self.operators.append(operator)
 
     def compile_all(self):
         """Compile all registered operators"""
@@ -66,6 +67,7 @@ class AIEContext:
                 0x10000,
             )
             bo.write(np.frombuffer(buffer_data, dtype=np.uint8), 0)
+            bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
             self.static_data_pool[buffer_data] = bo
 
         for op in self.operators:
@@ -85,6 +87,7 @@ class AIEContext:
                     handle.insts_bo,
                     len(handle.insts),
                 )
+                op._sync_insts_bo_to_device_if_needed(handle.insts_bo)
 
             # If multiple buffers (of the same binned size) are used in the
             # same kernel invocation OR across different invocations with shared
@@ -97,41 +100,41 @@ class AIEContext:
                 for arg in args:
                     buffer_to_runlist_entries.setdefault(arg, set()).add(idx)
 
-            # Second pass: determine conflicts
-            for idx, (kernel, *args) in enumerate(op.runlist):
-                for arg in args:
-                    if arg in op.buffer_static_data:
-                        # Static buffers never conflict
+            producer_entry = {}
+            for idx, (_, *args) in enumerate(op.runlist):
+                if not args:
+                    continue
+                output_buffer = args[-1]
+                if (
+                    output_buffer in op.buffers
+                    and output_buffer not in op.buffer_static_data
+                ):
+                    producer_entry.setdefault(output_buffer, idx)
+
+            live_ranges = {}
+            for buffer_name in buffer_to_runlist_entries:
+                if buffer_name in op.buffer_static_data:
+                    continue
+                if buffer_name not in op.buffers:
+                    continue
+                start_idx = producer_entry.get(buffer_name, -1)
+                end_idx = max(buffer_to_runlist_entries[buffer_name])
+                live_ranges[buffer_name] = (start_idx, end_idx)
+
+            # Buffers with overlapping lifetimes cannot share the same BO.
+            # Host-written source buffers use start_idx=-1 so they remain live
+            # from the beginning of the run until their last consuming kernel.
+            live_range_items = list(live_ranges.items())
+            for i, (buffer_name, (start_idx, end_idx)) in enumerate(live_range_items):
+                pool_sz = get_pool_sz(op.buffers[buffer_name])
+                conflicts = conflicting_buffers.setdefault(buffer_name, set())
+                for other_name, (other_start, other_end) in live_range_items[i + 1 :]:
+                    if get_pool_sz(op.buffers[other_name]) != pool_sz:
                         continue
-                    pool_sz = get_pool_sz(op.buffers[arg])
-
-                    # Buffers conflict if they're in the same runlist entry
-                    conflicting_args = {
-                        a for a in args if get_pool_sz(op.buffers[a]) == pool_sz
-                    } - {arg}
-
-                    # Also conflict with buffers in other runlist entries that share
-                    # a buffer with this entry
-                    for other_arg in args:
-                        if other_arg == arg:
-                            continue
-                        for other_idx in buffer_to_runlist_entries.get(
-                            other_arg, set()
-                        ):
-                            if other_idx != idx:
-                                _, *other_args = op.runlist[other_idx]
-                                conflicting_args.update(
-                                    {
-                                        a
-                                        for a in other_args
-                                        if get_pool_sz(op.buffers[a]) == pool_sz
-                                        and a != arg
-                                    }
-                                )
-
-                    conflicting_buffers[arg] = conflicting_buffers.get(
-                        arg, set()
-                    ).union(conflicting_args)
+                    if end_idx < other_start or other_end < start_idx:
+                        continue
+                    conflicts.add(other_name)
+                    conflicting_buffers.setdefault(other_name, set()).add(buffer_name)
 
             # Allocate buffers
             buffer_allocations = {}
@@ -162,31 +165,40 @@ class AIEContext:
                 buffer_allocations[buffer_name] = (alloc_pool, alloc_idx)
                 op.buffer_bos[buffer_name] = bo_pools[alloc_pool][alloc_idx]
 
+            op._buffer_dirty_to_device = {
+                buffer_name: False
+                for buffer_name in op.buffers
+                if buffer_name not in op.buffer_static_data
+            }
+
             # Setup runlist
-            _, (first_xclbin, first_xclbin_kernel_name, first_insts) = next(
-                iter(op.kernels.items())
-            )
-            handle = self.device_manager.get_kernel_handle(
-                str(first_xclbin.path), first_xclbin_kernel_name, str(first_insts.path)
-            )
-            context = handle.context
-            if self.use_runlist:
-                op.xrt_runlist = pyxrt.runlist(context)
-                for i, (kernel_name, *buffer_args) in enumerate(op.runlist):
-                    this_context, xrt_kernel, insts_bo, insts_len = op.xrt_kernels[
-                        kernel_name
-                    ]
-                    assert this_context == context
-                    opcode = 3
-                    run = pyxrt.run(xrt_kernel)
-                    run.set_arg(0, opcode)
-                    run.set_arg(1, insts_bo)
-                    run.set_arg(2, insts_len)
-                    for j, buffer_arg in enumerate(buffer_args):
-                        run.set_arg(j + 3, op.buffer_bos[buffer_arg])
-                    op.xrt_runlist.add(run)
-            else:
+            if not op.xrt_kernels:
                 op.xrt_runlist = None
+            else:
+                context = next(iter(op.xrt_kernels.values()))[0]
+                if self.use_runlist:
+                    if any(
+                        op.xrt_kernels[kernel_name][0] != context
+                        for (kernel_name, *_) in op.runlist
+                    ):
+                        op.xrt_runlist = None
+                        continue
+                    op.xrt_runlist = pyxrt.runlist(context)
+                    for i, (kernel_name, *buffer_args) in enumerate(op.runlist):
+                        this_context, xrt_kernel, insts_bo, insts_len = op.xrt_kernels[
+                            kernel_name
+                        ]
+                        assert this_context == context
+                        opcode = 3
+                        run = pyxrt.run(xrt_kernel)
+                        run.set_arg(0, opcode)
+                        run.set_arg(1, insts_bo)
+                        run.set_arg(2, insts_len)
+                        for j, buffer_arg in enumerate(buffer_args):
+                            run.set_arg(j + 3, op.buffer_bos[buffer_arg])
+                        op.xrt_runlist.add(run)
+                else:
+                    op.xrt_runlist = None
 
         # Log allocation info
         bo_count = sum(len(pool) for pool in bo_pools.values())
@@ -210,3 +222,25 @@ class AIEContext:
         )
 
         self._runtime_prepared = True
+
+    def reset_runtime(self, *, reset_device=True):
+        """Drop prepared XRT runtime state so it can be reloaded."""
+        if not self._runtime_prepared:
+            return
+
+        for op in self.operators:
+            op.buffer_bos = {}
+            op.xrt_kernels = {}
+            op.xrt_runlist = None
+            op._buffer_dirty_to_device = {}
+            op._insts_bos_synced_to_device = set()
+
+        if reset_device:
+            # Drop Python references to XRT objects before the host runtime's
+            # atexit cleanup runs. Calling CachedXRTRuntime.cleanup() here causes
+            # a second cleanup pass later and can double-free when multiple staged
+            # xclbins have been loaded in one process.
+            gc.collect()
+            self.device_manager.reset()
+
+        self._runtime_prepared = False

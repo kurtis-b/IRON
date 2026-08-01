@@ -9,15 +9,34 @@ from pathlib import Path
 import pytest
 import sys
 import statistics
+import zlib
 
 from iron.common import AIEContext
+
+
+def _normalized_test_nodeid(nodeid: str) -> str:
+    return re.sub(r"\[iter\d+-", "[", nodeid)
+
+
+def _build_dir_for_test(nodeid: str) -> Path:
+    normalized = _normalized_test_nodeid(nodeid)
+    digest = f"{zlib.crc32(normalized.encode('utf-8')):08x}"
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "_", normalized).strip("_")
+    if len(label) > 96:
+        label = label[-96:]
+    return Path.cwd() / "build" / "pytest" / f"{digest}_{label}"
 
 
 @pytest.fixture
 def aie_context(request):
     """Create a fresh AIEContext for each test"""
     verbose_mlir = request.config.option.verbose > 0
-    return AIEContext(mlir_verbose=verbose_mlir)
+    context = AIEContext(mlir_verbose=verbose_mlir)
+    context.build_dir = _build_dir_for_test(request.node.nodeid)
+    try:
+        yield context
+    finally:
+        context.reset_runtime()
 
 
 def pytest_addoption(parser):
@@ -125,13 +144,19 @@ def pytest_runtest_makereport(item, call):
         if csv_reporter:
             # The pytest nodeid looks like this:
             # iron/operators/dequant/test.py::test_dequant[iter0-dequant_8_cols_2_channels_2048_tile_128]
-            # Extract only the stem out of that.
+            # Extract only the stem out of that. Tests without parameters have no
+            # bracketed suffix at all, which is also what --iterations 1 leaves
+            # behind, so fall back to the bare test function name.
             nodeid_components = re.match(
                 r"^(.+?)::(.+?)\[(iter\d+-)?(.+?)\]$", item.nodeid
             )
-            if not nodeid_components:
-                raise RuntimeError(f"Unexpected test nodeid format: {item.nodeid}")
-            test_name = nodeid_components.group(4)
+            if nodeid_components:
+                test_name = nodeid_components.group(4)
+            else:
+                unparametrized = re.match(r"^(.+?)::(.+)$", item.nodeid)
+                if not unparametrized:
+                    raise RuntimeError(f"Unexpected test nodeid format: {item.nodeid}")
+                test_name = unparametrized.group(2)
 
             passed = report.outcome == "passed"
             captured = report.capstdout

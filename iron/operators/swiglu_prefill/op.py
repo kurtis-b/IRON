@@ -154,6 +154,14 @@ class AIESwiGLUPrefill(AIEOperatorBase):
         self.add_artifacts(artifacts)
 
     def set_up_runtime(self):
+        self.device_input_buffer_names = ("input",)
+        self.host_output_buffer_names = (
+            "left",
+            "left_swished",
+            "right",
+            "intermediate",
+            "output",
+        )
         # Runtime setup
         # ---
         self.add_buffer("input", self.seq_len_padded * self.embedding_dim_padded)

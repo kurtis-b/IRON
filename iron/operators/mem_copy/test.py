@@ -12,6 +12,22 @@ from iron.operators.mem_copy.reference import generate_golden_reference
 from iron.common.test_utils import run_test
 
 
+class _DummyDeviceManager:
+    device_type = "npu1"
+
+
+class _DummyContext:
+    def __init__(self):
+        self.device_manager = _DummyDeviceManager()
+        self.base_dir = Path(__file__).resolve().parents[2]
+        self.build_dir = Path.cwd() / "build" / "mem_copy_test"
+        self.static_data_pool = {}
+
+    def register_operator(self, operator, skip_add_to_list=False):
+        del skip_add_to_list
+        operator.context = self
+
+
 def generate_test_params(extensive=False):
     input_lengths = [2048] if not extensive else [1024, 2048, 4096, 8192]
     bypass_modes = [False] if not extensive else [False, True]
@@ -97,3 +113,22 @@ def test_mem_copy(
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
     assert not errors, f"Test failed with errors: {errors}"
+
+
+def test_mem_copy_artifacts_use_full_transfer_size():
+    operator = AIEMemCopy(
+        size=65536,
+        num_cores=2,
+        num_channels=2,
+        bypass=True,
+        tile_size=4096,
+        context=_DummyContext(),
+    )
+
+    operator.set_up_artifacts()
+
+    mlir_artifact = operator.xclbin_artifact.depends[0]
+    assert "65536" in operator.xclbin_artifact.path.name
+    assert "65536" in mlir_artifact.path.name
+    assert "65536" in operator.insts_artifact.path.name
+    assert mlir_artifact.callback_args[1] == 65536

@@ -8,8 +8,63 @@ from pathlib import Path
 
 import pytest
 from iron.operators.transpose.op import AIETranspose
+from iron.operators.transpose.design import _expand_dma_tap_for_bd_limits
 from iron.operators.transpose.reference import generate_golden_reference
+from iron.common import AIEOperatorConstraintError
 from iron.common.test_utils import run_test
+from aie.helpers.taplib.tap import TensorAccessPattern
+
+
+def test_expand_dma_tap_for_bd_limits_splits_outer_rank_dimension():
+    tap = TensorAccessPattern(
+        (16384, 1024),
+        offset=0,
+        sizes=[128, 2, 64, 64],
+        strides=[65536, 64, 1024, 1],
+    )
+
+    planned_taps, was_split = _expand_dma_tap_for_bd_limits(tap)
+
+    assert was_split is True
+    assert len(planned_taps) == 128
+    assert all(len(planned.sizes) == 3 for planned in planned_taps)
+    assert all(planned.sizes == [2, 64, 64] for planned in planned_taps)
+    assert planned_taps[0].offset == 0
+    assert planned_taps[1].offset == 65536
+
+
+def test_expand_dma_tap_for_bd_limits_recursively_splits_large_outer_rank():
+    tap = TensorAccessPattern(
+        (16384, 1024),
+        offset=0,
+        sizes=[256, 4, 64, 32],
+        strides=[65536, 32, 1024, 1],
+    )
+
+    planned_taps, was_split = _expand_dma_tap_for_bd_limits(tap)
+
+    assert was_split is True
+    assert len(planned_taps) == 256
+    assert all(len(planned.sizes) == 3 for planned in planned_taps)
+    assert all(planned.sizes == [4, 64, 32] for planned in planned_taps)
+    assert planned_taps[0].offset == 0
+    assert planned_taps[1].offset == 65536
+
+
+def test_transpose_rejects_per_column_tiles_that_do_not_cover_column_partition():
+    with pytest.raises(
+        AIEOperatorConstraintError,
+        match="per-column column partition must be divisible by n",
+    ):
+        AIETranspose(
+            M=512,
+            N=768,
+            num_aie_columns=8,
+            num_channels=2,
+            m=64,
+            n=64,
+            s=8,
+        )
 
 
 def generate_test_params(extensive=False):

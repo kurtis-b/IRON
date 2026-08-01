@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Install this after the repo-root requirements.txt when running the ROCm iGPU
+# study on Ubuntu 24.04 / Python 3.12 Ryzen APU systems.
+# The ROCm torch wheel depends on a matching ROCm Triton wheel hosted in the
+# same Radeon wheel directory, so expose that directory to pip resolution.
+--find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
+torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1.lw.gitff65f5bc-cp312-cp312-linux_x86_64.whl ; python_version == "3.12" and platform_system == "Linux" and platform_machine == "x86_64"
