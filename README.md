@@ -1,210 +1,231 @@
 <!--
-SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
+SPDX-FileCopyrightText: Copyright (C) 2025-2026 Advanced Micro Devices, Inc. All rights reserved.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# 🦾 - IRON: Unlocking the Full Potential of NPUs - 🦾
+# 🦾 IRON Transformer Layer Study
 
 <a href="https://discord.gg/cW99Ds85e8">
     <img src="https://img.shields.io/badge/Discord-7289DA?logo=discord&logoColor=white" alt="Discord" /></a>
 <a href="https://github.com/amd/iron/releases/latest" title="Download the latest release">
    <img src="https://img.shields.io/github/v/release/amd/iron?include_prereleases" alt="Latest Release" /></a>
-<a href="https://tooomm.github.io/github-release-stats/?username=amd&repository=iron">
-   <img src="https://img.shields.io/github/downloads/amd/iron/total.svg" alt="GitHub downloads" /></a>
 <a href="https://github.com/amd/iron/actions" title="Check out our tests">
    <img src="https://github.com/amd/iron/actions/workflows/small.yml/badge.svg" alt="Iron Tests" /></a>
-<a href="https://github.com/amd/iron/blob/main/docs/contribute.md" title="Contribution Guide">
+<a href="https://github.com/amd/iron/blob/main/CONTRIBUTING.md" title="Contribution Guide">
     <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 <a href="https://github.com/amd/iron/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/license-Apache-yellow.svg" alt="license: Apache" /></a>
-<a href="https://github.com/psf/black">
-    <img src="https://img.shields.io/badge/code%20style-black-000000.svg" alt="Code style: black" /></a>
 
 <p align="center">
-   <img src="./images/XDNA2.png" alt="IRONCLAD Logo" style="max-width: 100%; height: auto;">
+   <img src="./images/XDNA2.png" alt="IRON on AMD Ryzen AI" style="max-width: 100%; height: auto;">
 </p>
 
-IRON is an open-source & close-to-metal Python API enabling fast and efficient execution on [AMD Ryzen™ AI NPUs](https://www.amd.com/en/products/processors/consumer/ryzen-ai.html). It relies on language bindings around the [MLIR-AIE](https://github.com/Xilinx/mlir-aie) dialect. 
+This repository's primary application compares three ways to execute a full
+transformer layer on AMD Ryzen™ AI NPUs. It measures how the boundary between
+the host and NPU affects latency, effective throughput, power efficiency, and
+device-resource use.
 
+**Choose a run:** [validate the complete setup in minutes](#quick-run) or
+[launch the full benchmark suite](#full-benchmark-suite). For recovery,
+troubleshooting, and every study entrypoint, use the
+[detailed transformer-layer guide](./iron/applications/transformer_layer/README.md).
 
-The IRON Python API for Ryzen™ AI NPUs is described in the following paper:
+## What the Study Compares
 
-> E. Hunhoff, J. Melber, K. Denolf, A. Bisca, S. Bayliss, S. Neuendorffer, J. Fifield, J. Lo, P. Vasireddy, P. James-Roxby, E. Keller. "[Efficiency, Expressivity, and Extensibility in a Close-to-Metal NPU Programming Interface](https://arxiv.org/abs/2504.18430)". In 33rd IEEE International Symposium On Field-Programmable Custom Computing Machines, May 2025.
+| Paper label | Repo mode | Execution boundary |
+| --- | --- | --- |
+| `offload` | `offload` | The host executes the layer and offloads its GEMMs to the NPU. |
+| `runlist` | `runlist` | A fine-grained NPU operator sequence moves intermediates explicitly. |
+| `coarse runlist` | `hybrid` | An NPU runlist sequences a few fused, staged kernels. |
 
-#### 🎯 Operator Dashboard
-
-| Section | Description | Datatype | AIE2 | AIE2P | Status | Design Example |
-|:--------|:------------|:---------|:-----|:------|:-------|:-------------|
-| [Element-wise Add](./aie_kernels/generic/add.cc) | Element-wise addition kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/elementwise_add/](./iron/operators/elementwise_add/) |
-| [Element-wise Mul](./aie_kernels/generic/mul.cc) | Element-wise multiplication kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/elementwise_mul/](./iron/operators/elementwise_mul/) |
-| [GEMM](./aie_kernels/aie2p/mm.cc) | General Matrix Multiplication kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/gemm/](./iron/operators/gemm/) |
-| [GEMV](./aie_kernels/generic/mv.cc) | General Matrix-Vector Multiplication kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/gemv/](./iron/operators/gemv/) |
-| [GQA](./aie_kernels/aie2p/mha.cc) | Grouped Query Attention kernel (Single pipeline) | bfloat16 | | ✓ | 🟢 | [iron/operators/mha/](./iron/operators/mha/) |
-| [MHA](./aie_kernels/aie2p/mha.cc) | Multi-Head Attention kernel & Grouped Query Attention | bfloat16 | | ✓ | 🟢 | [iron/operators/mha/](./iron/operators/mha/) |
-| [RMSNorm](./aie_kernels/aie2/rms_norm.cc) | RMSNorm kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/rms_norm/](./iron/operators/rms_norm/) |
-| [RoPE](./aie_kernels/generic/rope.cc) | Rotary Positional Embedding kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/rope/](./iron/operators/rope/) |
-| [SiLU](./aie_kernels/aie2/silu.cc) | Sigmoid Linear Unit activation kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/silu/](./iron/operators/silu/) |
-| [Softmax](./aie_kernels/aie2/softmax.cc) | Softmax kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/softmax/](./iron/operators/softmax/) |
-| [Weighted RMSNorm](./aie_kernels/aie2/rms_norm.cc) | Weighted RMSNorm kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/rms_norm/](./iron/operators/rms_norm/) |
-| [Copy](./aie_kernels/generic/passThrough.cc) | Copy | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/mem_copy/](./iron/operators/mem_copy/) |
-| [Transpose](./aie_kernels/generic/transpose.cc) | Transpose | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/transpose/](./iron/operators/transpose/) |
-| [AXPY](./aie_kernels/generic/axpy.cc) | AXPY | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/axpy/](./iron/operators/axpy/) |
-| [Reduction]() | Reduction | bfloat16 | | | 🟡 |  |
-| [Dequant](./aie_kernels/generic/expand.cc) | Dequant Q4NX from [AWQ](https://github.com/mit-han-lab/llm-awq) to bfloat16 | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/dequant/](./iron/operators/dequant/) |
-| [RELU](./aie_kernels/aie2/relu.cc) | RELU | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/relu/](./iron/operators/relu/) |
-| [Leaky RELU](./aie_kernels/aie2p/leaky_relu.cc) (WIP) | Leaky RELU kernel | bfloat16 | | ✓ | ⚪ | [iron/operators/leaky_relu/](./iron/operators/leaky_relu/) |
-| [GELU](./aie_kernels/aie2/gelu.cc) | GELU | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/gelu/](./iron/operators/gelu/) |
-| [LayerNorm](./aie_kernels/aie2/layer_norm.cc) | LayerNorm | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/layer_norm/](./iron/operators/layer_norm/) |
-| [Convolution]() | Convolution | bfloat16 | | | 🟡 |  |
-| [MaxPool]() | MaxPool | bfloat16 | | | ⚪ |  |
-| [AveragePool]() | AveragePool | bfloat16 | | | ⚪ |  |
-| [Tanh](./aie_kernels/aie2/tanh.cc) | Tanh kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/tanh/](./iron/operators/tanh/) |
-| [Sigmoid](./aie_kernels/aie2/sigmoid.cc) | Sigmoid kernel | bfloat16 | ✓ | ✓ | 🟢 | [iron/operators/sigmoid/](./iron/operators/sigmoid/) |
-| [AddNorm](./aie_kernels/aie2p/layer_norm.cc) | Fused residual add and LayerNorm | bfloat16 | | ✓ | 🟢 | [iron/operators/addnorm/](./iron/operators/addnorm/) |
-| [Dynamic GEMM](./aie_kernels/aie2p/mm.cc) | GEMM over a runtime-selected sequence length | bfloat16 | | ✓ | 🟢 | [iron/operators/dynamic_gemm/](./iron/operators/dynamic_gemm/) |
-| [FFN](./aie_kernels/aie2p/mm.cc) | Transformer feed-forward network (up projection, GeLU, down projection) | bfloat16 | | ✓ | 🟢 | [iron/operators/ffn/](./iron/operators/ffn/) |
-| [MHA Output Projection](./aie_kernels/aie2p/mha.cc) | Multi-head attention fused with its output projection | bfloat16 | | ✓ | 🟢 | [iron/operators/mha_out_proj/](./iron/operators/mha_out_proj/) |
-| [QKV Projection](./aie_kernels/aie2p/mm.cc) | Fused query, key, and value projections | bfloat16 | | ✓ | 🟢 | [iron/operators/qkv_proj/](./iron/operators/qkv_proj/) |
-
-> Use this dashboard to quickly check the status of each kernel and locate relevant setup, build, and usage information.
-
-#### 📌 Legend
-
-| Status | Meaning            |
-|--------|--------------------|
-| 🟢     | **Done**           |
-| 🟡     | **In Development** |
-| ⚪     | **Not Assigned**   |
-
-#### 📦 Applications
-
-Beyond the individual operators, `iron/applications` holds larger end-to-end
-designs that compose them:
-
-| Application | Description |
-|:------------|:------------|
-| [transformer_layer](./iron/applications/transformer_layer/) | A full transformer layer built three ways — `offload`, `runlist`, and coarse runlist — plus the benchmark studies that compare them on latency, throughput, power, and resource usage. |
-| [llama_3.2_1b](./iron/applications/llama_3.2_1b/) | Golden-model Llama-3.2-1B inference used as a reference implementation. |
-
-Each application directory has its own README covering prerequisites and how to
-run it.
-
+The case matrix covers BERT encoder and GPT-2 decoder layers, six model
+families, and sequence lengths from 64 through 16384 tokens. Seven studies
+measure block tuning, end-to-end behavior, memory-tile staging, host/iGPU
+comparison, memcpy bandwidth, resource use, and roofline placement. The source
+tree does not include measured results; each run produces its own result tree.
 
 ## Installation (Linux)
 
-These instructions will guide you through everything required for building and executing a program on the Ryzen™ AI NPU, starting from a fresh bare-bones **Ubuntu 24.04** or **Ubuntu 24.10** install.
+The documented and validated path is **Ubuntu 24.04**, **Python 3.12**, and
+**ROCm 7.2.1** on a machine with both an AMD XDNA NPU and AMD iGPU. The
+21-job quick run uses both devices. The three fixture-generation commands are
+NPU-only, but the final execution smoke test also measures the iGPU baseline.
 
-### Initial Setup
+### 1. Install the device stacks
 
-  > Be sure you have the latest BIOS on your laptop or mini-PC that enables the NPU. See [here](#update-bios).
+1. Install the XDNA driver and XRT using the
+   [MLIR-AIE instructions](https://github.com/Xilinx/mlir-aie?tab=readme-ov-file#install-the-xdna-driver-and-xrt).
+   The study expects XRT's setup script at `/opt/xilinx/xrt/setup.sh`.
+2. Install ROCm 7.2.1 for the Ryzen iGPU using the
+   [AMD Ryzen Linux instructions](https://rocm.docs.amd.com/projects/radeon-ryzen/en/docs-7.2.1/docs/install/installryz/native_linux/install-ryzen.html).
+3. Install the build, Python, power-sampling, temperature, and cron packages:
 
-If starting from `Ubuntu 24.04` you may need to update the Linux kernel to 6.11+ by installing the Hardware Enablement (HWE) stack:
-
-  ```bash
-  sudo apt update
-  sudo apt install --install-recommends linux-generic-hwe-24.04
-  sudo reboot
-  ```
-
-1. Install XDNA™ Driver and XRT:
-
-    > [Instructions from mlir-aie repository](https://github.com/Xilinx/mlir-aie?tab=readme-ov-file#build-and-install-the-xdna-driver-and-xrt)
-
-1. Install the packages needed for IRON and MLIR-AIE:
-
-    ```bash
-    # Python versions 3.10, 3.12 and 3.13 are currently supported by our wheels
-    sudo apt install \
-    build-essential clang clang-14 lld lld-14 python3-venv python3-pip
-    ```
-
-1. Setup a virtual environment and activate it:
    ```bash
-   python3 -m venv ironenv
-   source ironenv/bin/activate
-   python3 -m pip install --upgrade pip
+   sudo apt update
+   sudo apt install \
+     build-essential clang clang-14 lld lld-14 cmake ninja-build uuid-dev \
+     python3-venv python3-pip \
+     "linux-tools-$(uname -r)" lm-sensors cron
    ```
 
-1. Source XRT (installed in step 1):
-   ```bash
-   source /opt/xilinx/xrt/setup.sh
-   ```
+`turbostat` is supplied by the `linux-tools` package for the running kernel.
+After a kernel change, install the corresponding package before rerunning the
+study.
 
-1. Install required Python packages (from requirements.txt):
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 2. Create the required Python environment
 
-1. To test your installation, you can try to build and run the example below:
-   ```bash
-   ./iron/operators/axpy/test.py
-   ```
-
-### Building/Using & Testing Operators
-
-All available operators can be found in `iron/operators`. These each contain:
-
-* `op.py`: The Python operator interface -- an easy access point to integrate operators into your project that prescribes how to compile the operator (build artifacts) and how to call it at runtime (buffer sizes, etc.)
-* `design.py`: The implementation of the operator's NPU code. Often references a kernel in `aie_kernels` for the compute core code and describes the data movement using ObjectFIFOs.
-* `reference.py`: A reference CPU implementation to validate the correctness of the NPU implementation.
-* `test.py`: An end-to-end test that instantiates and builds the operator, runs it and verifies its outputs against the reference.
-
-> NOTE: Be sure the XRT setup script has been sourced and the Python environment is activated: 
->       `source /opt/xilinx/xrt/setup.sh`
->       `source /path/to/ironenv/bin/activate`
-
-To build and test all the operators:
-``` bash
-pytest iron/operators/ -m "not extensive"
-``` 
-
-To run the extensive test suite:
-``` bash
-pytest iron/operators/
-```
-
-To run a specific operator's tests:
-``` bash
-pytest iron/operators/axpy/
-```
-
-#### Test Iterations and Metrics
-
-Each test is run several times so per-test metrics can be reported as
-statistics. Two options control this:
-
-* `--iterations N` (default `5`): run each test `N` times. Every test is parametrized with ids `iter0 … iterN-1`. Use `--iterations 1` for a single fast pass -- this is what CI uses.
-* `--csv-output PATH` (default `tests_latest.csv`): where the per-test metrics table is written.
-
-A test opts into metrics collection with a `metrics` marker whose keyword
-arguments are regexes containing a named `value` group, matched against the
-test's stdout:
-
-``` python
-@pytest.mark.metrics(Latency=r"Latency \(us\): (?P<value>[\d\.]+)")
-def test_gemv(...):
-    ...
-```
-
-The CSV gets `Commit`, `Date`, `Test`, and `Checks` columns plus mean, median,
-min, max, and stddev for each named metric.
-
-### Git Hooks (Optional but Recommended)
-
-To ensure your code passes CI linting checks before pushing, install the pre-push hook:
+Run these commands from the repository root. The runner deliberately expects
+the virtual environment at `<repo>/ironenv`; a differently named or located
+environment will not work.
 
 ```bash
-cp scripts/hooks/pre-push .git/hooks/pre-push
-chmod +x .git/hooks/pre-push
+python3 -m venv ironenv
+source ironenv/bin/activate
+source /opt/xilinx/xrt/setup.sh
+
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+python3 -m pip install -r iron/applications/transformer_layer/requirements.txt
 ```
 
-The hook will run the same linting checks as CI:
-- License checks (reuse)
-- Python formatting (black)
-- C++ formatting (clang-format)
+The repository requirements initially install CPU-only Torch. The application
+requirements replace it with the validated `torch 2.9.1+rocm7.2.1` wheel for
+Ubuntu 24.04 and Python 3.12.
 
-To bypass the hook if needed: `git push --no-verify`
+### 3. Allow non-interactive power sampling
 
------
+The execution smoke test invokes `sudo -n turbostat`, so it cannot prompt for a
+password. Add the narrow rule below, replacing `<your-user>` with your login:
 
-<p align="center">Copyright&copy; 2025 Advanced Micro Devices, Inc</p>
+```bash
+sudo visudo -f /etc/sudoers.d/transformer-layer-smoke
+```
+
+```text
+<your-user> ALL=(root) NOPASSWD: /usr/bin/turbostat
+```
+
+The full suite needs additional passwordless commands; use its
+[complete prerequisite list](./iron/applications/transformer_layer/README.md#passwordless-sudo)
+before starting it.
+
+### 4. Verify the setup
+
+```bash
+source ironenv/bin/activate
+source /opt/xilinx/xrt/setup.sh
+
+python3 --version
+python3 -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+xrt-smi examine -r all
+rocm-smi --showpower --json
+sensors
+sudo -n turbostat --version
+command -v crontab
+```
+
+Python must report 3.12, the Torch command must report `True`, `xrt-smi` must
+see the NPU, and `rocm-smi`, `turbostat`, and the `crontab` lookup must complete
+successfully. It is okay if `sensors` does not recognize the machine because
+`rocm-smi` can also supply the runner's temperature reading.
+
+## Quick Run
+
+Start at the repository root with the environment active. First put the NPU in
+turbo mode and generate the three input fixtures required by the smoke runner:
+
+```bash
+source ironenv/bin/activate
+source /opt/xilinx/xrt/setup.sh
+
+sudo xrt-smi configure --pmode turbo
+xrt-smi examine -r all          # Confirm "Power Mode : Turbo".
+
+python3 -m iron.applications.transformer_layer.study.block.run \
+  --family baseline_768 --seq-len 512
+python3 -m iron.applications.transformer_layer.study.memory_tile_staging.run \
+  --family baseline_768 --seq-len 512
+python3 -m iron.applications.transformer_layer.study.memcpy_bandwidth.run
+```
+
+Keep that order: the memory-tile staging study reads the block-study CSV. The
+commands create:
+
+- `iron/applications/transformer_layer/results/block/results.csv`
+- `iron/applications/transformer_layer/results/memory_tile_staging/results.csv`
+- `iron/applications/transformer_layer/results/memcpy_bandwidth/results.csv`
+
+Now run the reduced end-to-end plan:
+
+```bash
+python3 -m iron.applications.transformer_layer.study.unattended_reboot \
+  execution-smoke-test --log-level INFO
+```
+
+This runs 21 jobs for `baseline_768`, BERT encoder, and sequence length 512
+across all three execution modes, then exercises the downstream studies and
+output manifest. It takes minutes, installs no boot hook, and does not reboot.
+Success ends with a completed state and a new
+`iron/applications/transformer_layer/results_unattended_execution_smoke_*`
+directory. Per-job logs are under its `automation/logs/` directory.
+
+## Full Benchmark Suite
+
+The full suite covers the entire shared case matrix and is designed to continue
+across the two reboots needed by the longest iGPU cases.
+
+| Profile | Jobs | Expected wall clock |
+| --- | ---: | --- |
+| `full` (default) | 888 | 11 hours to 2 days |
+| `paper` | 834 | About 20 hours |
+
+Before launching it, complete the detailed guide's
+[full prerequisites](./iron/applications/transformer_layer/README.md#prerequisites),
+including `amd-ttm`, passwordless NPU/TTM/reboot commands, and the TTM-state
+check. A completed run uses about 2.4 GB. Do not invoke `start` with `sudo`.
+
+```bash
+python3 -m iron.applications.transformer_layer.study.unattended_reboot start \
+  --run-id full_suite_$(date +%Y%m%d_%H%M%S) \
+  --run-user "$USER" \
+  --log-level INFO
+```
+
+See [Running the Full Suite](./iron/applications/transformer_layer/README.md#running-the-full-suite)
+for boot-hook behavior, status and recovery commands, result completeness, and
+the paper profile.
+
+## Results and Documentation
+
+Study runs write CSV measurements, SVG/PNG plots, automation logs, and a
+provenance manifest under `iron/applications/transformer_layer/`. Results are
+gitignored and are not part of the repository checkout.
+
+- [Detailed transformer-layer guide](./iron/applications/transformer_layer/README.md)
+- [Output inventory](./iron/applications/transformer_layer/README.md#outputs)
+- [Execution-mode and per-study documentation](./iron/applications/transformer_layer/README.md#documentation)
+- [Comparing two result trees](./iron/applications/transformer_layer/README.md#comparing-runs-against-a-reference)
+
+## Other IRON Components
+
+IRON is a close-to-metal Python API built on MLIR-AIE for AMD Ryzen AI NPUs.
+The transformer application composes the reusable kernels and operators in the
+rest of the repository:
+
+- [NPU operators](./iron/operators/)
+- [AIE kernels](./aie_kernels/)
+- [Llama 3.2 1B reference application](./iron/applications/llama_3.2_1b/)
+- [Contribution guide](./CONTRIBUTING.md)
+- [License](./LICENSE)
+
+The IRON Python API is described in:
+
+> E. Hunhoff, J. Melber, K. Denolf, A. Bisca, S. Bayliss, S. Neuendorffer,
+> J. Fifield, J. Lo, P. Vasireddy, P. James-Roxby, and E. Keller. “Efficiency,
+> Expressivity, and Extensibility in a Close-to-Metal NPU Programming
+> Interface.” 33rd IEEE International Symposium on Field-Programmable Custom
+> Computing Machines, 2025. [arXiv:2504.18430](https://arxiv.org/abs/2504.18430)
+
+---
+
+<p align="center">Copyright&copy; 2025-2026 Advanced Micro Devices, Inc.</p>

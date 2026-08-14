@@ -46,8 +46,8 @@ results, so the smoke tests cannot run until you have generated some.
 ### Hardware
 
 An AMD NPU (XDNA) and an AMD iGPU on the same host. `study/host_comparison`
-benchmarks the iGPU as the host baseline, so a machine without one can run
-every other study but not the full suite.
+benchmarks the iGPU as the host baseline, so a machine without one can run the
+NPU-only studies but cannot run `execution-smoke-test` or the full suite.
 
 ### System packages
 
@@ -107,25 +107,23 @@ sudo -n turbostat --version   # must not warn about the running kernel
 
 ### Python environment
 
-Follow the repository `README.md` `## Installation (Linux)` first, then note
-one deviation that matters here:
-
-`requirements.txt` sets `--index-url https://download.pytorch.org/whl/cpu`,
-so a plain install gives you a CPU-only torch. That wheel cannot run any
-`study/host_comparison` job. Reinstall torch from a ROCm index instead —
-pick the one matching your ROCm release from
-[pytorch.org](https://pytorch.org/get-started/locally/):
+Follow the root README's
+[`## Installation (Linux)`](../../../README.md#installation-linux). It creates
+the required repository-root `ironenv` and installs both dependency files in
+the correct order:
 
 ```bash
-pip install --force-reinstall \
-  --index-url https://download.pytorch.org/whl/rocm<version> torch
-python3 -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python3 -m pip install -r requirements.txt
+python3 -m pip install -r iron/applications/transformer_layer/requirements.txt
 ```
 
-`torch.cuda.is_available()` must print `True` — ROCm exposes AMD GPUs through
-the `cuda` device type. The suite was last validated with
-`torch 2.9.1+rocm7.2.1`. This is only checked when the first `host_comparison`
-job runs, job 821 of 888, so verify it up front rather than losing a day.
+The first file installs CPU-only Torch; the application requirements replace
+it with the validated `torch 2.9.1+rocm7.2.1` wheel on Ubuntu 24.04 and Python
+3.12. `torch.cuda.is_available()` must print `True` because ROCm exposes AMD
+GPUs through the `cuda` device type. This is only checked when an iGPU benchmark
+runs, so verify it before starting. Environments outside the validated stack
+need a compatible ROCm Torch wheel from
+[PyTorch's installation guide](https://pytorch.org/get-started/locally/).
 
 ### Paths the runner assumes
 
@@ -171,7 +169,12 @@ through `--reference-input`.
 These write to `results/block/results.csv`,
 `results/memory_tile_staging/results.csv`, and
 `results/memcpy_bandwidth/results.csv`. That is exactly the tree the smoke
-tests look for first, so you can now run one without `--source-results-root`:
+tests look for first.
+
+The 21-job execution smoke test also exercises the iGPU host comparison and
+power collection. Before continuing, verify the ROCm Torch, `rocm-smi`,
+`turbostat`, temperature source, `crontab`, and passwordless-sudo prerequisites
+above. You can then run it without `--source-results-root`:
 
 ```bash
 python3 -m iron.applications.transformer_layer.study.unattended_reboot \
